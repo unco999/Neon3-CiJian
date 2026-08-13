@@ -1,0 +1,10 @@
+[package]
+name = "neon-wgpu-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+neon-protocol = { path = "../neon-protocol" }
+neon-observability = { path = "../neon-observability" }
+neon-ui-schema = { path = "../neon-ui-schema" }

@@ -1,0 +1,20 @@
+[workspace]
+members = [
+    "crates/neon-protocol",
+    "crates/neon-ipc",
+    "crates/neon-observability",
+    "crates/neon-ui-schema",
+    "crates/neon-wgpu-runtime",
+    "crates/neon-ui-runtime",
+    "crates/neon-cli",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "MIT OR Apache-2.0"
+version = "0.1.0"
+
+[workspace.dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"

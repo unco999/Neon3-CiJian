@@ -1,0 +1,9 @@
+[package]
+name = "neon-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+neon-protocol = { path = "../neon-protocol" }
+neon-ipc = { path = "../neon-ipc" }
