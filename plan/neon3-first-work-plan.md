@@ -651,6 +651,14 @@ remaining: M2 公共协议 schema
 next: 读取当前 Progress、目录和 Git 状态后，为 `neon-protocol` 新增 request/response fixture round-trip 测试
 user_acceptance: 未开始；未授权启动 Neon3 窗口
 
+2026-08-13 | M2 | 已完成
+files: `crates/neon-protocol/src/lib.rs`, `crates/neon-protocol/tests/protocol_contract.rs`, `plan/neon3-first-work-plan.md`
+checks: `cargo test -p neon-protocol` = passed（7 tests: 1 dependency-boundary unit test, 6 protocol contract tests）; `cargo check --workspace` = passed; 未启动窗口
+commit: none
+remaining: M3 IPC framing 与 request lifecycle
+next: 读取当前 Progress、目录和 Git 状态后，为 `neon-ipc` 建立 framing boundary tests
+user_acceptance: 未开始；未授权启动 Neon3 窗口
+
 2026-08-13 | M1 | 已完成
 files: `plan/neon3-first-work-plan.md`
 checks: `git diff --check` = passed; `git status --short` = passed（M1 workspace 已提交，预存未跟踪 `Neon3/.git` 未纳入）；未启动窗口
