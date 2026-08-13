@@ -125,7 +125,7 @@ neon-sessiond       可选监督与服务发现
 | M4 | 可观察性与 command journal | M2 | contract-ready | 已完成 |
 | M5 | UI declaration schema | M2 | contract-ready | 已完成 |
 | M6 | WGPU runtime ownership skeleton | M3、M5 | gpu-ready / composition-ready | 已完成 |
-| M7 | UI runtime 静态 fragment sender | M3、M5 | service-ready | 未完成 |
+| M7 | UI runtime 静态 fragment sender | M3、M5 | service-ready | 已完成 |
 | M8 | CLI 与 headless vertical slice | M4、M6、M7 | service-ready / composition-ready | 未完成 |
 | M9 | 第一阶段审计与用户窗口验收准备 | M8 | acceptance handoff | 未完成 |
 | M10 | 高速交互数据面评估与可选 fast path | M9 | latency-ready | 未完成 |
@@ -605,10 +605,10 @@ blocker: none|...
 
 ### 当前状态
 
-- 当前里程碑：`M6`
+- 当前里程碑：`M7`
 - 当前状态：`已完成`
-- acceptance level：`composition-ready`（headless fragment registry/diagnostics 已验证；未初始化 GPU、未启动窗口，故不宣称 `gpu-ready` 或 `wgpu-rendered`）
-- 下一步：下一 cycle 重新读取固定上下文，选择 M7 并先建立 UI static fragment sender tests
+- acceptance level：`service-ready`（M7 static fragment submit/rejection/service-method tests 均通过；未启动窗口）
+- 下一步：下一 cycle 重新读取固定上下文，选择 M8 并先建立 CLI headless scenario contract tests
 - 用户拥有的验收：尚未开始；没有授权启动 Neon3 窗口
 
 ### 记录规则
@@ -626,6 +626,22 @@ user_acceptance: not requested; no window launched
 ```
 
 ### 施工日志
+
+2026-08-13 | M7 | 已完成
+files: `Cargo.lock`, `crates/neon-ui-runtime/Cargo.toml`, `crates/neon-ui-runtime/src/lib.rs`, `crates/neon-ui-runtime/src/main.rs`, `plan/neon3-first-work-plan.md`
+checks: `cargo test -p neon-ui-runtime` = passed（4 tests）; `cargo check -p neon-ui-runtime` = passed; `cargo test --workspace` = passed; `git diff --check` = passed; 未启动窗口
+commit: pending（仅提交 M7 files 和本条 Progress 记录；不包含用户/并行修改的 `.gitignore` 或未跟踪 `AGENTS.md`）
+remaining: M8 CLI 与 headless vertical slice；UI cache 是固定 fixture 产生的可丢弃显示缓存，尚未由 terrain/resource/project snapshot 恢复
+next: 重新读取 `AGENTS.md`、Progress、目录和 Git 状态后，为 `neon-cli` 先新增 `ui.static-fragment.submit.v1` scenario tests
+user_acceptance: 未开始；未授权启动 Neon3 窗口
+
+2026-08-13 | M7 | 进行中
+files: `crates/neon-ui-runtime/Cargo.toml`, `crates/neon-ui-runtime/src/lib.rs`, `crates/neon-ui-runtime/src/main.rs`, `plan/neon3-first-work-plan.md`
+checks: `cargo test -p neon-ui-runtime` = not-run; `cargo check -p neon-ui-runtime` = not-run; `cargo test --workspace` = not-run; 未启动窗口
+commit: none
+remaining: 运行 M7 static fragment schema, loopback submit and revision-conflict rejection tests；cache 是可丢弃 fixture cache，不是业务权威状态
+next: 运行 `cargo test -p neon-ui-runtime`
+user_acceptance: 未开始；未授权启动 Neon3 窗口
 
 2026-08-13 | M6 | 已完成
 files: `Cargo.lock`, `crates/neon-wgpu-runtime/Cargo.toml`, `crates/neon-wgpu-runtime/src/lib.rs`, `crates/neon-wgpu-runtime/src/main.rs`, `plan/neon3-first-work-plan.md`
