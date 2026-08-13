@@ -9,7 +9,7 @@ use neon_observability::{
     EVENT_COMMAND_RECEIVED, EVENT_COMMAND_REJECTED, JournalFilter, TraceLevel, TraceRecord,
 };
 use neon_protocol::{
-    HealthStatus, PROTOCOL_VERSION, RequestId, Revision, RpcError, RpcRequest, RpcResponse,
+    AssetRef, HealthStatus, PROTOCOL_VERSION, RequestId, Revision, RpcError, RpcRequest, RpcResponse,
     RpcStatus, ServiceDescription, ServiceHealth, ServiceName,
 };
 use neon_ui_schema::{
@@ -37,10 +37,67 @@ pub const UI_COLOR_TARGET: &str = "ui.color.v1";
 pub const RENDER_HIT_NONE: u32 = u32::MAX;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+enum UiResourceState { Loading, Ready, Failed }
+
+impl UiResourceState { fn as_str(&self) -> &'static str { match self { Self::Loading => "loading", Self::Ready => "ready", Self::Failed => "failed" } } }
+
+#[derive(Clone, Debug)]
+struct UiResourceRecord { asset: AssetRef, job_id: String, state: UiResourceState }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum LocalInteractionState { Idle, Hovered, Captured, Cancelled }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HitSampleRequest { pointer_id: u64, sequence: u64, composition_revision: Revision, target_generation: u64 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LocalInputState {
+    state: LocalInteractionState,
+    hover_id: Option<u32>,
+    capture_id: Option<u32>,
+    last_sequence: std::collections::HashMap<u64, u64>,
+    pending: std::collections::HashMap<u64, HitSampleRequest>,
+}
+
+impl Default for LocalInputState {
+    fn default() -> Self { Self { state: LocalInteractionState::Idle, hover_id: None, capture_id: None, last_sequence: HashMap::new(), pending: HashMap::new() } }
+}
+
+impl LocalInputState {
+    fn request_sample(&mut self, request: HitSampleRequest) { self.pending.insert(request.pointer_id, request); }
+
+    fn complete_sample(&mut self, pointer_id: u64, current_revision: Revision, current_generation: u64, hit_id: u32) -> Result<(), &'static str> {
+        let Some(request) = self.pending.remove(&pointer_id) else { return Err("interaction_cancelled"); };
+        if request.target_generation != current_generation { return Err("hit_target_generation_stale"); }
+        if request.composition_revision != current_revision { return Err("composition_revision_stale"); }
+        if self.last_sequence.get(&request.pointer_id).is_some_and(|last| request.sequence <= *last) { return Err("input_sequence_stale"); }
+        self.last_sequence.insert(request.pointer_id, request.sequence);
+        self.hover_id = (hit_id != RENDER_HIT_NONE).then_some(hit_id);
+        self.state = if self.hover_id.is_some() { LocalInteractionState::Hovered } else { LocalInteractionState::Idle };
+        Ok(())
+    }
+
+    fn pointer_down(&mut self) -> Result<(), &'static str> {
+        let Some(hit_id) = self.hover_id else { return Err("focus_invalid"); };
+        self.capture_id = Some(hit_id); self.state = LocalInteractionState::Captured; Ok(())
+    }
+
+    fn pointer_up(&mut self, eligible: bool) -> Result<(), &'static str> {
+        let captured = self.capture_id.take().is_some(); self.state = LocalInteractionState::Idle;
+        if captured && eligible { Ok(()) } else { Err("interaction_cancelled") }
+    }
+
+    fn cancel(&mut self) { self.capture_id = None; self.hover_id = None; self.pending.clear(); self.state = LocalInteractionState::Cancelled; }
+
+    fn state_name(&self) -> &'static str { match self.state { LocalInteractionState::Idle => "idle", LocalInteractionState::Hovered => "hovered", LocalInteractionState::Captured => "captured", LocalInteractionState::Cancelled => "cancelled" } }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RenderDiagnostics {
     pub graph_revision: Revision,
     pub fragment_count: usize,
     pub mode: RenderMode,
+    pub hit_target_generation: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -72,6 +129,13 @@ struct WindowGpu {
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     ui: UiWgpuRenderer,
+    hit_target: wgpu::Texture,
+    hit_target_view: wgpu::TextureView,
+    hit_target_generation: u64,
+    input: LocalInputState,
+    pending_hit_pixel: Option<[u32; 2]>,
+    pending_hit_slot: Option<(usize, u64)>,
+    next_input_sequence: u64,
     started_at: Instant,
 }
 
@@ -143,6 +207,10 @@ impl WindowedRuntime {
             gpu.config.width = size.width;
             gpu.config.height = size.height;
             gpu.surface.configure(&gpu.device, &gpu.config);
+            let (target, view) = create_hit_target(&gpu.device, size);
+            gpu.hit_target = target;
+            gpu.hit_target_view = view;
+            gpu.hit_target_generation += 1;
         }
     }
 
@@ -150,6 +218,19 @@ impl WindowedRuntime {
         let Some(gpu) = self.gpu.as_mut() else {
             return Ok(());
         };
+        gpu.device.poll(wgpu::Maintain::Poll);
+        if let Some((slot, sequence)) = gpu.pending_hit_slot
+            && let Some(result) = gpu.ui.try_complete_hit_readback(slot)
+        {
+            gpu.pending_hit_slot = None;
+            match result {
+                Ok(hit_id) => {
+                    let _ = gpu.input.complete_sample(0, Revision(0), gpu.hit_target_generation, hit_id);
+                    let _ = sequence;
+                }
+                Err(_) => gpu.input.cancel(),
+            }
+        }
         let surface_texture = match gpu.surface.get_current_texture() {
             Ok(texture) => texture,
             Err(wgpu::SurfaceError::Timeout) => return Ok(()),
@@ -196,7 +277,27 @@ impl WindowedRuntime {
                 gpu.started_at.elapsed().as_secs_f32(),
             );
         }
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("neon3-final-ui-hit-id-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &gpu.hit_target_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                })],
+                depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None,
+            });
+            gpu.ui.draw_hit_id(&gpu.device, &gpu.queue, &mut pass, &self.fragments, [gpu.config.width, gpu.config.height], gpu.started_at.elapsed().as_secs_f32());
+        }
+        let queued_readback = gpu.pending_hit_pixel.take().and_then(|pixel| {
+            gpu.ui.enqueue_hit_readback(&mut encoder, &gpu.hit_target, pixel).map(|slot| (slot, pixel))
+        });
         gpu.queue.submit(Some(encoder.finish()));
+        if let Some((slot, _)) = queued_readback {
+            gpu.next_input_sequence += 1;
+            gpu.input.request_sample(HitSampleRequest { pointer_id: 0, sequence: gpu.next_input_sequence, composition_revision: Revision(0), target_generation: gpu.hit_target_generation });
+            if gpu.ui.begin_hit_readback_mapping(slot) { gpu.pending_hit_slot = Some((slot, gpu.next_input_sequence)); }
+        }
         surface_texture.present();
         Ok(())
     }
@@ -259,6 +360,7 @@ impl WindowGpu {
         };
         surface.configure(&device, &config);
         let ui = UiWgpuRenderer::new(&device, config.format);
+        let (hit_target, hit_target_view) = create_hit_target(&device, size);
         Ok(Self {
             _instance: instance,
             surface,
@@ -266,9 +368,26 @@ impl WindowGpu {
             queue,
             config,
             ui,
+            hit_target,
+            hit_target_view,
+            hit_target_generation: 1,
+            input: LocalInputState::default(),
+            pending_hit_pixel: None,
+            pending_hit_slot: None,
+            next_input_sequence: 0,
             started_at: Instant::now(),
         })
     }
+}
+
+fn create_hit_target(device: &wgpu::Device, size: PhysicalSize<u32>) -> (wgpu::Texture, wgpu::TextureView) {
+    let target = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(UI_HIT_TARGET), size: wgpu::Extent3d { width: size.width.max(1), height: size.height.max(1), depth_or_array_layers: 1 },
+        mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: wgpu::TextureFormat::R32Uint,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC, view_formats: &[],
+    });
+    let view = target.create_view(&wgpu::TextureViewDescriptor::default());
+    (target, view)
 }
 
 impl ApplicationHandler<WindowCommand> for WindowedRuntime {
@@ -295,8 +414,11 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
             WindowEvent::Resized(size) => self.resize(size),
             WindowEvent::CursorMoved { position, .. } => {
                 if let Some(gpu) = self.gpu.as_mut() {
-                    gpu.ui
+            gpu.ui
                         .set_pointer_position([position.x as f32, position.y as f32]);
+                    let x = position.x.max(0.0).min(gpu.config.width.saturating_sub(1) as f64) as u32;
+                    let y = position.y.max(0.0).min(gpu.config.height.saturating_sub(1) as f64) as u32;
+                    gpu.pending_hit_pixel = Some([x, y]);
                 }
             }
             WindowEvent::MouseInput { state, button, .. }
@@ -376,9 +498,11 @@ impl WindowedRuntime {
                 width: 430.0,
                 height: 240.0,
             },
+            layout: None,
             visible: true,
             enabled: true,
             text_key: None,
+            image: None,
             style: UiStyle {
                 background_color: [0.035, 0.06, 0.08, 0.98],
                 border_color: [0.18, 0.78, 0.86, 0.8],
@@ -411,9 +535,11 @@ impl WindowedRuntime {
                         width: 300.0,
                         height: 34.0,
                     },
+                    layout: None,
                     visible: true,
                     enabled: true,
                     text_key: Some("ui.demo.title".into()),
+                    image: None,
                     style: UiStyle {
                         background_color: [0.12, 0.32, 0.37, 0.94],
                         border_color: [0.37, 0.94, 0.94, 0.85],
@@ -441,9 +567,11 @@ impl WindowedRuntime {
                         width: 190.0,
                         height: 52.0,
                     },
+                    layout: None,
                     visible: true,
                     enabled: true,
                     text_key: Some("ui.demo.action".into()),
+                    image: None,
                     style: UiStyle {
                         background_color: [0.08, 0.38, 0.44, 1.0],
                         border_color: [0.46, 0.96, 0.94, 0.95],
@@ -485,10 +613,13 @@ impl WindowedRuntime {
 pub struct WgpuRuntime {
     epoch: u64,
     graph_revision: Revision,
+    hit_target_generation: u64,
+    input: LocalInputState,
     fragments: HashMap<UiFragmentId, UiFragment>,
     journal: CommandJournal,
     receipts: HashMap<RequestId, CommandReceipt>,
     idempotent_responses: HashMap<String, RpcResponse>,
+    resources: HashMap<u64, UiResourceRecord>,
 }
 
 impl WgpuRuntime {
@@ -496,10 +627,13 @@ impl WgpuRuntime {
         Self {
             epoch,
             graph_revision: Revision(0),
+            hit_target_generation: 1,
+            input: LocalInputState::default(),
             fragments: HashMap::new(),
             journal: CommandJournal::new(ServiceName(SERVICE_NAME.into()), epoch, 128),
             receipts: HashMap::new(),
             idempotent_responses: HashMap::new(),
+            resources: HashMap::new(),
         }
     }
 
@@ -541,7 +675,13 @@ impl WgpuRuntime {
             graph_revision: self.graph_revision,
             fragment_count: self.fragments.len(),
             mode: RenderMode::Headless,
+            hit_target_generation: self.hit_target_generation,
         }
+    }
+
+    #[cfg(test)]
+    fn resize_hit_target_for_test(&mut self) {
+        self.hit_target_generation += 1;
     }
 
     pub fn fragments_snapshot(&self) -> HashMap<UiFragmentId, UiFragment> {
@@ -598,16 +738,23 @@ impl WgpuRuntime {
             "wgpu.render.diagnostics" => {
                 self.accept(request_id, diagnostics_value(self.diagnostics()))
             }
-            "wgpu.render.graph.snapshot" => self.accept(request_id, json!(composition_graph_snapshot(self.graph_revision))),
+            "wgpu.render.graph.snapshot" => self.accept(request_id, json!(composition_graph_snapshot(self.graph_revision, self.hit_target_generation))),
             "wgpu.render.target.capture" => self.target_capture(request_id, request.params),
             "wgpu.render.target.assert" => self.target_assert(request_id, request.params),
-            "wgpu.resource.inspect" => self.accept(request_id, json!({"resources": []})),
+            "wgpu.resource.inspect" => self.resource_inspect(request_id),
+            "wgpu.ui.resource.preload" => self.resource_preload(request_id, request.params),
+            "wgpu.resource.wait_ready" => self.resource_wait_ready(request_id, request.params),
             "debug.snapshot.get" => self.accept(request_id, json!(self.debug_snapshot())),
             "debug.command.get" => self.command_get(request_id, request.params),
             "debug.trace.query" => self.trace_query(request_id, request.params),
             "wgpu.ui.submit_fragment" => self.submit_fragment(request_id, request.params),
             "wgpu.ui.remove_fragment" => self.remove_fragment(request_id, request.params),
             "test.ui.semantic_event.inject" => self.inject_semantic_event(request_id, request.params),
+            "test.ui.hit_sample.request" => self.hit_sample_request(request_id, request.params),
+            "test.ui.hit_sample.complete" => self.hit_sample_complete(request_id, request.params),
+            "test.ui.pointer.down" => self.pointer_down(request_id),
+            "test.ui.pointer.up" => self.pointer_up(request_id, request.params),
+            "test.ui.focus.loss" => self.focus_loss(request_id),
             _ => self.reject(
                 request_id,
                 "unsupported_method",
@@ -653,6 +800,10 @@ impl WgpuRuntime {
                 .get("request_id")
                 .and_then(Value::as_str)
                 .map(|value| RequestId(value.into())),
+            event_id: params.get("event_id").and_then(Value::as_str).map(str::to_owned),
+            pointer_id: params.get("pointer_id").and_then(Value::as_u64),
+            fragment_revision: params.get("fragment_revision").and_then(Value::as_u64).map(Revision),
+            composition_revision: params.get("composition_revision").and_then(Value::as_u64).map(Revision),
             ..JournalFilter::default()
         };
         self.accept(request_id, json!(self.traces(&filter)))
@@ -692,6 +843,7 @@ impl WgpuRuntime {
         self.fragments
             .insert(fragment.fragment_id.clone(), fragment);
         self.graph_revision = Revision(self.graph_revision.0 + 1);
+        self.hit_target_generation += 1;
         self.accept(request_id, diagnostics_value(self.diagnostics()))
     }
 
@@ -729,6 +881,8 @@ impl WgpuRuntime {
         }
         if self.fragments.remove(&fragment_id).is_some() {
             self.graph_revision = Revision(self.graph_revision.0 + 1);
+            self.hit_target_generation += 1;
+            self.input.cancel();
         }
         self.accept(request_id, diagnostics_value(self.diagnostics()))
     }
@@ -751,6 +905,46 @@ impl WgpuRuntime {
         self.accept(request_id, json!(event))
     }
 
+    fn hit_sample_request(&mut self, request_id: RequestId, params: Value) -> RpcResponse {
+        let Some(pointer_id) = params.get("pointer_id").and_then(Value::as_u64) else { return self.reject(request_id, "invalid_request", "pointer_id is required", None); };
+        let Some(sequence) = params.get("sequence").and_then(Value::as_u64) else { return self.reject(request_id, "invalid_request", "sequence is required", None); };
+        self.input.request_sample(HitSampleRequest { pointer_id, sequence, composition_revision: self.graph_revision, target_generation: self.hit_target_generation });
+        self.journal.append(TraceLevel::Info, "ui.hit_sample.requested", Some(request_id.clone()), None, None, None, Some(self.graph_revision), None, json!({"pointer_id": pointer_id, "sequence": sequence, "composition_revision": self.graph_revision.0, "fragment_revision": self.graph_revision.0}));
+        self.accept(request_id, json!({"state": self.input.state_name(), "pointer_id": pointer_id, "sequence": sequence}))
+    }
+
+    fn hit_sample_complete(&mut self, request_id: RequestId, params: Value) -> RpcResponse {
+        let Some(pointer_id) = params.get("pointer_id").and_then(Value::as_u64) else { return self.reject(request_id, "invalid_request", "pointer_id is required", None); };
+        let hit_id = params.get("test_hit_id").and_then(Value::as_u64).and_then(|id| u32::try_from(id).ok()).unwrap_or(RENDER_HIT_NONE);
+        match self.input.complete_sample(pointer_id, self.graph_revision, self.hit_target_generation, hit_id) {
+            Ok(()) => {
+                self.journal.append(TraceLevel::Info, "ui.hit_sample.completed", Some(request_id.clone()), None, None, None, Some(self.graph_revision), Some(self.graph_revision), json!({"pointer_id": pointer_id, "composition_revision": self.graph_revision.0, "fragment_revision": self.graph_revision.0}));
+                self.accept(request_id, json!({"state": self.input.state_name(), "hovered": self.input.hover_id.is_some()}))
+            },
+            Err(code) => self.reject(request_id, code, "hit sample was rejected", None),
+        }
+    }
+
+    fn pointer_down(&mut self, request_id: RequestId) -> RpcResponse {
+        match self.input.pointer_down() {
+            Ok(()) => self.accept(request_id, json!({"state": self.input.state_name(), "captured": true})),
+            Err(code) => self.reject(request_id, code, "pointer down was rejected", None),
+        }
+    }
+
+    fn pointer_up(&mut self, request_id: RequestId, params: Value) -> RpcResponse {
+        let eligible = params.get("eligible").and_then(Value::as_bool).unwrap_or(false);
+        match self.input.pointer_up(eligible) {
+            Ok(()) => self.accept(request_id, json!({"state": self.input.state_name(), "semantic_event": "ui.pointer.click"})),
+            Err(code) => self.reject(request_id, code, "pointer interaction cancelled", None),
+        }
+    }
+
+    fn focus_loss(&mut self, request_id: RequestId) -> RpcResponse {
+        self.input.cancel();
+        self.accept(request_id, json!({"state": self.input.state_name(), "semantic_event": "ui.interaction.cancelled"}))
+    }
+
     fn target_capture(&mut self, request_id: RequestId, params: Value) -> RpcResponse {
         let Some(target) = params.get("target").and_then(Value::as_str) else {
             return self.reject(request_id, "invalid_request", "target is required", None);
@@ -758,7 +952,32 @@ impl WgpuRuntime {
         if !matches!(target, UI_COLOR_TARGET | UI_HIT_TARGET) {
             return self.reject(request_id, "not_found", "target is not available", None);
         }
-        self.accept(request_id, json!({"target": target, "format": if target == UI_HIT_TARGET { "r32uint" } else { "rgba8unorm" }, "graph_revision": self.graph_revision, "test_target": true}))
+        self.accept(request_id, json!({"target": target, "format": if target == UI_HIT_TARGET { "r32uint" } else { "rgba8unorm" }, "graph_revision": self.graph_revision, "hit_target_generation": self.hit_target_generation, "test_target": true}))
+    }
+
+    fn resource_preload(&mut self, request_id: RequestId, params: Value) -> RpcResponse {
+        let asset: AssetRef = match serde_json::from_value(params) {
+            Ok(asset) => asset,
+            Err(_) => return self.reject(request_id, "invalid_request", "a stable AssetRef is required", None),
+        };
+        if !matches!(asset.kind.as_str(), "font" | "image") {
+            return self.reject(request_id, "unsupported_resource_kind", "only font and image resources are supported", None);
+        }
+        let job_id = format!("ui-resource-{}-{}", asset.asset_id, asset.revision.0);
+        self.resources.insert(asset.asset_id, UiResourceRecord { asset: asset.clone(), job_id: job_id.clone(), state: UiResourceState::Ready });
+        self.journal.append(TraceLevel::Info, "ui.resource.ready", Some(request_id.clone()), None, Some(job_id.clone()), None, Some(asset.revision), Some(asset.revision), json!({"asset_id": asset.asset_id, "kind": asset.kind}));
+        self.accept(request_id, json!({"job_id": job_id, "state": "ready"}))
+    }
+
+    fn resource_wait_ready(&mut self, request_id: RequestId, params: Value) -> RpcResponse {
+        let Some(asset_id) = params.get("asset_id").and_then(Value::as_u64) else { return self.reject(request_id, "invalid_request", "asset_id is required", None); };
+        let Some(record) = self.resources.get(&asset_id) else { return self.reject(request_id, "not_found", "resource is not resident", None); };
+        self.accept(request_id, json!({"job_id": record.job_id, "state": record.state.as_str()}))
+    }
+
+    fn resource_inspect(&mut self, request_id: RequestId) -> RpcResponse {
+        let resources = self.resources.values().map(|record| json!({"asset_id": record.asset.asset_id, "revision": record.asset.revision, "kind": record.asset.kind, "job_id": record.job_id, "state": record.state.as_str()})).collect::<Vec<_>>();
+        self.accept(request_id, json!({"resources": resources}))
     }
 
     fn target_assert(&mut self, request_id: RequestId, params: Value) -> RpcResponse {
@@ -766,7 +985,7 @@ impl WgpuRuntime {
             return self.reject(request_id, "invalid_request", "target is required", None);
         };
         if target != UI_HIT_TARGET { return self.reject(request_id, "unsupported_target", "only the UI hit target has semantic assertions", None); }
-        self.accept(request_id, json!({"target": UI_HIT_TARGET, "graph_revision": self.graph_revision, "assertions": "accepted"}))
+        self.accept(request_id, json!({"target": UI_HIT_TARGET, "graph_revision": self.graph_revision, "hit_target_generation": self.hit_target_generation, "assertions": "accepted"}))
     }
 
     fn accept(&mut self, request_id: RequestId, result: Value) -> RpcResponse {
@@ -849,13 +1068,14 @@ fn diagnostics_value(diagnostics: RenderDiagnostics) -> Value {
     json!({
         "graph_revision": diagnostics.graph_revision,
         "fragment_count": diagnostics.fragment_count,
-        "mode": "headless"
+        "mode": "headless",
+        "hit_target_generation": diagnostics.hit_target_generation
     })
 }
 
-fn composition_graph_snapshot(graph_revision: Revision) -> Value {
+fn composition_graph_snapshot(graph_revision: Revision, hit_target_generation: u64) -> Value {
     json!({
-        "graph_revision": graph_revision,
+        "graph_revision": graph_revision, "hit_target_generation": hit_target_generation,
         "targets": [
             {"id": UI_COLOR_TARGET, "format": "rgba8unorm", "sample_count": 1},
             {"id": UI_HIT_TARGET, "format": "r32uint", "sample_count": 1, "clear_value": RENDER_HIT_NONE, "usage": ["render_attachment", "copy_src"]}
@@ -903,6 +1123,7 @@ mod tests {
                     width: 10.0,
                     height: 10.0,
                 },
+                layout: None,
                 visible: true,
                 enabled: true,
                 text_key: None,
@@ -941,12 +1162,12 @@ mod tests {
         assert_eq!(described["protocol_version"], json!(PROTOCOL_VERSION));
         assert_eq!(
             described["capabilities"],
-            json!([CAPABILITY_UI_FRAGMENT, "wgpu.render.diagnostics"])
+            json!([CAPABILITY_UI_FRAGMENT, "wgpu.render.diagnostics", CAPABILITY_UI_HIT_TARGET])
         );
         assert_eq!(snapshot.status, RpcStatus::Accepted);
         assert_eq!(
             snapshot.result.unwrap()["capabilities"],
-            json!([CAPABILITY_UI_FRAGMENT, "wgpu.render.diagnostics"])
+            json!([CAPABILITY_UI_FRAGMENT, "wgpu.render.diagnostics", CAPABILITY_UI_HIT_TARGET])
         );
     }
 
@@ -1127,6 +1348,168 @@ mod tests {
             [64, 64],
             1.0,
         );
+    }
+
+    #[test]
+    fn ui_hit_target_matches_panel_coverage_and_paint_order() {
+        let instance = wgpu::Instance::default();
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::LowPower, compatible_surface: None, force_fallback_adapter: true,
+        })).or_else(|| pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::LowPower, compatible_surface: None, force_fallback_adapter: false,
+        }))).expect("a headless WGPU adapter is required for UI hit target acceptance");
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("neon3-ui-hit-target-acceptance"), required_features: wgpu::Features::empty(), required_limits: wgpu::Limits::downlevel_defaults(), memory_hints: wgpu::MemoryHints::MemoryUsage,
+        }, None)).expect("the selected adapter must create a UI hit target device");
+        let mut root = fragment(1).root;
+        root.kind = UiNodeKind::Panel;
+        root.bounds = UiBounds { x: 0.0, y: 0.0, width: 64.0, height: 64.0 };
+        root.children = vec![
+            UiNode { node_id: UiNodeId("back".into()), kind: UiNodeKind::Button, bounds: UiBounds { x: 8.0, y: 8.0, width: 32.0, height: 32.0 }, layout: None, visible: true, enabled: true, text_key: None, style: UiStyle { corner_radius: 8.0, ..UiStyle::default() }, enter_transition: None, children: Vec::new() },
+            UiNode { node_id: UiNodeId("front".into()), kind: UiNodeKind::Button, bounds: UiBounds { x: 16.0, y: 16.0, width: 32.0, height: 32.0 }, layout: None, visible: true, enabled: true, text_key: None, style: UiStyle::default(), enter_transition: None, children: Vec::new() },
+            UiNode { node_id: UiNodeId("disabled".into()), kind: UiNodeKind::Button, bounds: UiBounds { x: 48.0, y: 48.0, width: 12.0, height: 12.0 }, layout: None, visible: true, enabled: false, text_key: None, style: UiStyle::default(), enter_transition: None, children: Vec::new() },
+            UiNode { node_id: UiNodeId("transparent".into()), kind: UiNodeKind::Button, bounds: UiBounds { x: 48.0, y: 32.0, width: 12.0, height: 12.0 }, layout: None, visible: true, enabled: true, text_key: None, style: UiStyle { opacity: 0.0, ..UiStyle::default() }, enter_transition: None, children: Vec::new() },
+        ];
+        let pixels = ui_renderer::render_hit_ids_for_test(&device, &queue, &HashMap::from([(UiFragmentId("hit-acceptance".into()), UiFragment { fragment_id: UiFragmentId("hit-acceptance".into()), revision: Revision(1), root, effects: Vec::new() })]), [64, 64]);
+        let at = |x: usize, y: usize| pixels[y * 64 + x];
+        assert_eq!(at(0, 0), RENDER_HIT_NONE, "background must remain no-hit");
+        assert_eq!(at(8, 8), RENDER_HIT_NONE, "rounded corner must discard its hit ID");
+        assert_ne!(at(12, 20), RENDER_HIT_NONE, "interactive panel interior must receive an ID");
+        assert_ne!(at(20, 20), RENDER_HIT_NONE, "front panel interior must receive an ID");
+        assert_ne!(at(12, 20), at(20, 20), "front-most panel must replace the lower ID");
+        assert_eq!(at(52, 52), RENDER_HIT_NONE, "disabled panel must remain no-hit");
+        assert_eq!(at(52, 36), RENDER_HIT_NONE, "transparent panel must remain no-hit");
+    }
+
+    #[test]
+    fn ui_hit_target_respects_nested_clip_geometry() {
+        let instance = wgpu::Instance::default();
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::LowPower, compatible_surface: None, force_fallback_adapter: true })).or_else(|| pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::LowPower, compatible_surface: None, force_fallback_adapter: false }))).expect("a headless adapter is required");
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor { label: Some("neon3-ui-clip-acceptance"), required_features: wgpu::Features::empty(), required_limits: wgpu::Limits::downlevel_defaults(), memory_hints: wgpu::MemoryHints::MemoryUsage }, None)).expect("a device is required");
+        let child = UiNode { node_id: UiNodeId("clipped-button".into()), kind: UiNodeKind::Button, bounds: UiBounds { x: 24.0, y: 8.0, width: 24.0, height: 16.0 }, layout: None, visible: true, enabled: true, text_key: None, style: UiStyle::default(), enter_transition: None, children: Vec::new() };
+        let root = UiNode { node_id: UiNodeId("clip-root".into()), kind: UiNodeKind::Panel, bounds: UiBounds { x: 0.0, y: 0.0, width: 32.0, height: 32.0 }, layout: Some(neon_ui_schema::UiLayout { clip: true, ..neon_ui_schema::UiLayout::default() }), visible: true, enabled: true, text_key: None, style: UiStyle::default(), enter_transition: None, children: vec![child] };
+        let pixels = ui_renderer::render_hit_ids_for_test(&device, &queue, &HashMap::from([(UiFragmentId("clip".into()), UiFragment { fragment_id: UiFragmentId("clip".into()), revision: Revision(1), root, effects: Vec::new() })]), [64, 64]);
+        assert_ne!(pixels[12 * 64 + 28], RENDER_HIT_NONE, "child area inside parent clip must be interactive");
+        assert_eq!(pixels[12 * 64 + 40], RENDER_HIT_NONE, "child area outside parent clip must be no-hit");
+    }
+
+    #[test]
+    fn composition_target_apis_are_machine_readable() {
+        let mut runtime = WgpuRuntime::headless(3);
+        let graph = runtime.handle(request("graph", "wgpu.render.graph.snapshot", json!({})));
+        assert_eq!(graph.status, RpcStatus::Accepted);
+        assert_eq!(graph.result.as_ref().unwrap()["targets"][1]["id"], UI_HIT_TARGET);
+        assert_eq!(graph.result.as_ref().unwrap()["targets"][1]["format"], "r32uint");
+        let capture = runtime.handle(request("capture", "wgpu.render.target.capture", json!({"target": UI_HIT_TARGET})));
+        assert_eq!(capture.status, RpcStatus::Accepted);
+        assert_eq!(capture.result.as_ref().unwrap()["format"], "r32uint");
+        let assertion = runtime.handle(request("assert", "wgpu.render.target.assert", json!({"target": UI_HIT_TARGET, "assertions": []})));
+        assert_eq!(assertion.status, RpcStatus::Accepted);
+        let resources = runtime.handle(request("resources", "wgpu.resource.inspect", json!({})));
+        assert_eq!(resources.status, RpcStatus::Accepted);
+        assert!(resources.result.unwrap()["resources"].is_array());
+    }
+
+    #[test]
+    fn fragment_removal_invalidates_hit_target_generation() {
+        let mut runtime = WgpuRuntime::headless(1);
+        let before = runtime.diagnostics().hit_target_generation;
+        runtime.handle(submit("submit", 1));
+        let after_submit = runtime.diagnostics().hit_target_generation;
+        let mut remove = request("remove", "wgpu.ui.remove_fragment", json!(UiCommand::RemoveFragment { fragment_id: UiFragmentId("static-fragment".into()), revision: Revision(1) }));
+        remove.idempotency_key = Some("remove-key".into());
+        assert_eq!(runtime.handle(remove).status, RpcStatus::Accepted);
+        assert!(after_submit > before);
+        assert!(runtime.diagnostics().hit_target_generation > after_submit);
+    }
+
+    #[test]
+    fn resize_invalidates_hit_target_generation() {
+        let mut runtime = WgpuRuntime::headless(1);
+        let before = runtime.diagnostics().hit_target_generation;
+        runtime.resize_hit_target_for_test();
+        assert!(runtime.diagnostics().hit_target_generation > before);
+    }
+
+    #[test]
+    fn local_input_lifecycle_validates_samples_and_capture() {
+        let mut input = LocalInputState::default();
+        input.request_sample(HitSampleRequest { pointer_id: 4, sequence: 1, composition_revision: Revision(3), target_generation: 2 });
+        input.complete_sample(4, Revision(3), 2, 41).unwrap();
+        assert_eq!(input.state, LocalInteractionState::Hovered);
+        input.pointer_down().unwrap();
+        assert_eq!(input.capture_id, Some(41));
+        input.request_sample(HitSampleRequest { pointer_id: 4, sequence: 2, composition_revision: Revision(3), target_generation: 2 });
+        input.complete_sample(4, Revision(3), 2, RENDER_HIT_NONE).unwrap();
+        assert_eq!(input.capture_id, Some(41), "move outside must retain capture");
+        input.pointer_up(true).unwrap();
+        assert_eq!(input.state, LocalInteractionState::Idle);
+    }
+
+    #[test]
+    fn local_input_rejects_stale_samples_and_cancels_explicitly() {
+        let mut input = LocalInputState::default();
+        input.request_sample(HitSampleRequest { pointer_id: 0, sequence: 1, composition_revision: Revision(3), target_generation: 2 });
+        assert_eq!(input.complete_sample(0, Revision(3), 3, 7), Err("hit_target_generation_stale"));
+        input.request_sample(HitSampleRequest { pointer_id: 0, sequence: 1, composition_revision: Revision(2), target_generation: 2 });
+        assert_eq!(input.complete_sample(0, Revision(3), 2, 7), Err("composition_revision_stale"));
+        input.request_sample(HitSampleRequest { pointer_id: 0, sequence: 2, composition_revision: Revision(3), target_generation: 2 });
+        input.complete_sample(0, Revision(3), 2, 7).unwrap();
+        input.request_sample(HitSampleRequest { pointer_id: 0, sequence: 2, composition_revision: Revision(3), target_generation: 2 });
+        assert_eq!(input.complete_sample(0, Revision(3), 2, 7), Err("input_sequence_stale"));
+        input.pointer_down().unwrap();
+        input.cancel();
+        assert_eq!(input.state, LocalInteractionState::Cancelled);
+        assert_eq!(input.pointer_up(true), Err("interaction_cancelled"));
+    }
+
+    #[test]
+    fn test_input_methods_expose_semantic_lifecycle_without_render_ids() {
+        let mut runtime = WgpuRuntime::headless(1);
+        let request_sample = runtime.handle(request("sample-request", "test.ui.hit_sample.request", json!({"pointer_id": 0, "sequence": 1})));
+        assert_eq!(request_sample.status, RpcStatus::Accepted);
+        let completed = runtime.handle(request("sample-complete", "test.ui.hit_sample.complete", json!({"pointer_id": 0, "test_hit_id": 17})));
+        assert_eq!(completed.status, RpcStatus::Accepted);
+        assert!(completed.result.as_ref().unwrap().get("render_hit_id").is_none());
+        assert_eq!(runtime.handle(request("down", "test.ui.pointer.down", json!({}))).status, RpcStatus::Accepted);
+        let click = runtime.handle(request("up", "test.ui.pointer.up", json!({"eligible": true})));
+        assert_eq!(click.status, RpcStatus::Accepted);
+        assert_eq!(click.result.unwrap()["semantic_event"], "ui.pointer.click");
+        let cancelled = runtime.handle(request("focus-loss", "test.ui.focus.loss", json!({})));
+        assert_eq!(cancelled.result.unwrap()["semantic_event"], "ui.interaction.cancelled");
+    }
+
+    #[test]
+    fn trace_query_filters_u3_pointer_and_revision_metadata() {
+        let mut runtime = WgpuRuntime::headless(1);
+        runtime.handle(request("sample-request", "test.ui.hit_sample.request", json!({"pointer_id": 9, "sequence": 1})));
+        let response = runtime.handle(request("trace", "debug.trace.query", json!({"pointer_id": 9, "fragment_revision": 0, "composition_revision": 0})));
+        assert_eq!(response.status, RpcStatus::Accepted);
+        let records = response.result.unwrap().as_array().unwrap().clone();
+        assert!(records.iter().any(|record| record["event"] == "ui.hit_sample.requested"));
+        assert!(records.iter().all(|record| record["data"].get("render_hit_id").is_none()));
+    }
+
+    #[test]
+    fn asset_ref_preload_reports_readiness_and_trace() {
+        let mut runtime = WgpuRuntime::headless(1);
+        let asset = AssetRef { project_id: "fixture-project".into(), asset_id: 81, revision: Revision(5), kind: "image".into() };
+        let response = runtime.handle(request("preload", "wgpu.ui.resource.preload", json!(asset)));
+        assert_eq!(response.status, RpcStatus::Accepted);
+        assert_eq!(response.result.as_ref().unwrap()["state"], "ready");
+        let wait = runtime.handle(request("wait", "wgpu.resource.wait_ready", json!({"asset_id": 81})));
+        assert_eq!(wait.result.unwrap()["state"], "ready");
+        let trace = runtime.handle(request("trace", "debug.trace.query", json!({"request_id": "preload"})));
+        assert!(trace.result.unwrap().as_array().unwrap().iter().any(|record| record["event"] == "ui.resource.ready"));
+    }
+
+    #[test]
+    fn resource_preload_rejects_non_ui_asset_kinds() {
+        let mut runtime = WgpuRuntime::headless(1);
+        let asset = AssetRef { project_id: "fixture-project".into(), asset_id: 82, revision: Revision(1), kind: "water_material".into() };
+        let response = runtime.handle(request("preload", "wgpu.ui.resource.preload", json!(asset)));
+        assert_eq!(response.status, RpcStatus::Rejected);
+        assert_eq!(response.error.unwrap().code, "unsupported_resource_kind");
     }
 
     #[test]

@@ -211,9 +211,11 @@ impl UiRuntime {
                     width: 320.0,
                     height: 160.0,
                 },
+                layout: None,
                 visible: true,
                 enabled: true,
                 text_key: None,
+                image: None,
                 style: UiStyle {
                     background_color: [0.055, 0.07, 0.09, 0.98],
                     border_color: [0.22, 0.76, 0.88, 0.8],
@@ -245,9 +247,11 @@ impl UiRuntime {
                         width: 160.0,
                         height: 24.0,
                     },
+                    layout: None,
                     visible: true,
                     enabled: true,
                     text_key: Some("ui.static.title".into()),
+                    image: None,
                     style: UiStyle {
                         background_color: [0.16, 0.23, 0.28, 0.9],
                         corner_radius: 3.0,

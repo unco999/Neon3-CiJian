@@ -79,6 +79,10 @@ pub struct JournalFilter {
     pub session_id: Option<String>,
     pub job_id: Option<String>,
     pub revision: Option<Revision>,
+    pub event_id: Option<String>,
+    pub pointer_id: Option<u64>,
+    pub fragment_revision: Option<Revision>,
+    pub composition_revision: Option<Revision>,
 }
 
 pub struct CommandJournal {
@@ -177,6 +181,10 @@ fn matches_filter(record: &TraceRecord, filter: &JournalFilter) -> bool {
         && filter.revision.is_none_or(|value| {
             record.revision_before == Some(value) || record.revision_after == Some(value)
         })
+        && filter.event_id.as_ref().is_none_or(|value| record.data.get("event_id").and_then(Value::as_str) == Some(value))
+        && filter.pointer_id.is_none_or(|value| record.data.get("pointer_id").and_then(Value::as_u64) == Some(value))
+        && filter.fragment_revision.is_none_or(|value| record.data.get("fragment_revision").and_then(Value::as_u64) == Some(value.0))
+        && filter.composition_revision.is_none_or(|value| record.data.get("composition_revision").and_then(Value::as_u64) == Some(value.0))
 }
 
 fn redact_value(value: Value) -> Value {

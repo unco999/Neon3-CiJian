@@ -1,7 +1,7 @@
 //! GPU-independent UI declaration schema types.
 //! This crate must not create GPU or window objects.
 
-use neon_protocol::Revision;
+use neon_protocol::{AssetRef, Revision};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -28,9 +28,13 @@ pub struct UiNode {
     pub node_id: UiNodeId,
     pub kind: UiNodeKind,
     pub bounds: UiBounds,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layout: Option<UiLayout>,
     pub visible: bool,
     pub enabled: bool,
     pub text_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<AssetRef>,
     #[serde(default, skip_serializing_if = "UiStyle::is_default")]
     pub style: UiStyle,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -54,6 +58,57 @@ pub struct UiBounds {
     pub width: f32,
     pub height: f32,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UiLayoutMode { Absolute, Overlay, Row, Column }
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct UiLayout {
+    pub mode: UiLayoutMode,
+    pub padding: [f32; 4],
+    pub margin: [f32; 4],
+    pub gap: f32,
+    pub min_size: Option<[f32; 2]>,
+    pub max_size: Option<[f32; 2]>,
+    pub preferred_size: Option<[f32; 2]>,
+    pub clip: bool,
+    pub scroll_offset: [f32; 2],
+}
+
+impl Default for UiLayout {
+    fn default() -> Self { Self { mode: UiLayoutMode::Absolute, padding: [0.0; 4], margin: [0.0; 4], gap: 0.0, min_size: None, max_size: None, preferred_size: None, clip: false, scroll_offset: [0.0; 2] } }
+}
+
+pub fn resolve_layout(node: &UiNode, parent: UiBounds, scale_factor: f32) -> Result<Vec<UiBounds>, UiSchemaError> {
+    if !scale_factor.is_finite() || scale_factor <= 0.0 { return Err(UiSchemaError::InvalidLayout); }
+    let layout = node.layout.unwrap_or_default();
+    if !layout.is_valid() { return Err(UiSchemaError::InvalidLayout); }
+    let own = clamp_bounds(UiBounds { x: parent.x + node.bounds.x, y: parent.y + node.bounds.y, width: node.bounds.width, height: node.bounds.height }, layout);
+    let mut output = vec![physical_bounds(own, scale_factor)];
+    let inner = UiBounds { x: own.x + layout.padding[3], y: own.y + layout.padding[0], width: (own.width - layout.padding[1] - layout.padding[3]).max(0.0), height: (own.height - layout.padding[0] - layout.padding[2]).max(0.0) };
+    let mut cursor = [inner.x - layout.scroll_offset[0], inner.y - layout.scroll_offset[1]];
+    for child in &node.children {
+        let child_layout = child.layout.unwrap_or_default();
+        let mut child_bounds = UiBounds { x: inner.x + child.bounds.x, y: inner.y + child.bounds.y, width: child.bounds.width, height: child.bounds.height };
+        if matches!(layout.mode, UiLayoutMode::Row | UiLayoutMode::Column) {
+            child_bounds.x = cursor[0] + child_layout.margin[3]; child_bounds.y = cursor[1] + child_layout.margin[0];
+            if layout.mode == UiLayoutMode::Row { cursor[0] += child_bounds.width + child_layout.margin[1] + layout.gap; } else { cursor[1] += child_bounds.height + child_layout.margin[2] + layout.gap; }
+        }
+        output.extend(resolve_layout(child, child_bounds, scale_factor)?);
+    }
+    Ok(output)
+}
+
+fn clamp_bounds(mut bounds: UiBounds, layout: UiLayout) -> UiBounds {
+    if let Some([width, height]) = layout.preferred_size { bounds.width = width; bounds.height = height; }
+    if let Some([width, height]) = layout.min_size { bounds.width = bounds.width.max(width); bounds.height = bounds.height.max(height); }
+    if let Some([width, height]) = layout.max_size { bounds.width = bounds.width.min(width); bounds.height = bounds.height.min(height); }
+    bounds
+}
+
+fn physical_bounds(bounds: UiBounds, scale: f32) -> UiBounds { UiBounds { x: bounds.x * scale, y: bounds.y * scale, width: bounds.width * scale, height: bounds.height * scale } }
 
 /// Renderer-independent visual properties for a screen-space UI node.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -201,6 +256,8 @@ pub enum UiSchemaError {
     InvalidBounds,
     InvalidStyle,
     InvalidTransition,
+    InvalidLayout,
+    DuplicateNodeId,
 }
 
 impl UiFragment {
@@ -227,6 +284,11 @@ impl UiNode {
         if !self.style.is_valid() {
             return Err(UiSchemaError::InvalidStyle);
         }
+        if self.layout.is_some_and(|layout| !layout.is_valid()) { return Err(UiSchemaError::InvalidLayout); }
+        let mut child_ids = std::collections::HashSet::new();
+        for child in &self.children {
+            if !child_ids.insert(child.node_id.0.as_str()) { return Err(UiSchemaError::DuplicateNodeId); }
+        }
         if let Some(transition) = &self.enter_transition
             && !transition.is_valid()
         {
@@ -247,6 +309,16 @@ impl UiBounds {
             && self.height.is_finite()
             && self.width >= 0.0
             && self.height >= 0.0
+    }
+}
+
+impl UiLayout {
+    fn is_valid(self) -> bool {
+        self.padding.iter().chain(self.margin.iter()).all(|value| value.is_finite() && *value >= 0.0)
+            && self.gap.is_finite() && self.gap >= 0.0 && self.scroll_offset.iter().all(|value| value.is_finite())
+            && self.min_size.is_none_or(|size| size.iter().all(|value| value.is_finite() && *value >= 0.0))
+            && self.max_size.is_none_or(|size| size.iter().all(|value| value.is_finite() && *value >= 0.0))
+            && self.preferred_size.is_none_or(|size| size.iter().all(|value| value.is_finite() && *value >= 0.0))
     }
 }
 
@@ -422,5 +494,48 @@ mod tests {
         assert!(encoded.get("render_hit_id").is_none());
         assert!(encoded.get("node_id").is_none());
         assert!(encoded.get("pixel_position").is_none());
+    }
+
+    fn layout_node(mode: UiLayoutMode) -> UiNode {
+        UiNode {
+            node_id: UiNodeId("root".into()), kind: UiNodeKind::Panel,
+            bounds: UiBounds { x: 0.0, y: 0.0, width: 100.0, height: 60.0 },
+            layout: Some(UiLayout { mode, padding: [4.0, 4.0, 4.0, 4.0], gap: 3.0, ..UiLayout::default() }),
+            visible: true, enabled: true, text_key: None, style: UiStyle::default(), enter_transition: None,
+            children: vec![
+                UiNode { node_id: UiNodeId("a".into()), kind: UiNodeKind::Button, bounds: UiBounds { x: 0.0, y: 0.0, width: 20.0, height: 10.0 }, layout: Some(UiLayout { margin: [1.0, 2.0, 3.0, 4.0], ..UiLayout::default() }), visible: true, enabled: true, text_key: None, style: UiStyle::default(), enter_transition: None, children: Vec::new() },
+                UiNode { node_id: UiNodeId("b".into()), kind: UiNodeKind::Button, bounds: UiBounds { x: 0.0, y: 0.0, width: 20.0, height: 10.0 }, layout: None, visible: true, enabled: true, text_key: None, style: UiStyle::default(), enter_transition: None, children: Vec::new() },
+            ],
+        }
+    }
+
+    #[test]
+    fn row_column_dpi_and_scroll_layout_are_deterministic() {
+        let row = resolve_layout(&layout_node(UiLayoutMode::Row), UiBounds { x: 0.0, y: 0.0, width: 0.0, height: 0.0 }, 2.0).unwrap();
+        assert_eq!(row[1], UiBounds { x: 16.0, y: 10.0, width: 40.0, height: 20.0 });
+        assert_eq!(row[2].x, 58.0);
+        let column = resolve_layout(&layout_node(UiLayoutMode::Column), UiBounds { x: 0.0, y: 0.0, width: 0.0, height: 0.0 }, 1.0).unwrap();
+        assert_eq!(column[1].y, 5.0);
+        assert_eq!(column[2].y, 20.0);
+        let mut scrolled = layout_node(UiLayoutMode::Column);
+        scrolled.layout.as_mut().unwrap().scroll_offset = [0.0, 2.0];
+        assert_eq!(resolve_layout(&scrolled, UiBounds { x: 0.0, y: 0.0, width: 0.0, height: 0.0 }, 1.0).unwrap()[1].y, 3.0);
+    }
+
+    #[test]
+    fn layout_clamps_sizes_and_rejects_invalid_values() {
+        let mut node = layout_node(UiLayoutMode::Absolute);
+        node.layout.as_mut().unwrap().min_size = Some([120.0, 70.0]);
+        node.layout.as_mut().unwrap().max_size = Some([130.0, 80.0]);
+        assert_eq!(resolve_layout(&node, UiBounds { x: 0.0, y: 0.0, width: 0.0, height: 0.0 }, 1.0).unwrap()[0].width, 120.0);
+        node.layout.as_mut().unwrap().gap = -1.0;
+        assert_eq!(resolve_layout(&node, UiBounds { x: 0.0, y: 0.0, width: 0.0, height: 0.0 }, 1.0), Err(UiSchemaError::InvalidLayout));
+    }
+
+    #[test]
+    fn duplicate_sibling_node_identity_is_rejected_as_layout_error() {
+        let mut node = layout_node(UiLayoutMode::Overlay);
+        node.children[1].node_id = node.children[0].node_id.clone();
+        assert_eq!(node.validate(), Err(UiSchemaError::DuplicateNodeId));
     }
 }
