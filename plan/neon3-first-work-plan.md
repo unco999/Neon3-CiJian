@@ -124,7 +124,7 @@ neon-sessiond       可选监督与服务发现
 | M3 | IPC framing 与 request lifecycle | M2 | contract-ready | 已完成 |
 | M4 | 可观察性与 command journal | M2 | contract-ready | 已完成 |
 | M5 | UI declaration schema | M2 | contract-ready | 已完成 |
-| M6 | WGPU runtime ownership skeleton | M3、M5 | gpu-ready / composition-ready | 未完成 |
+| M6 | WGPU runtime ownership skeleton | M3、M5 | gpu-ready / composition-ready | 已完成 |
 | M7 | UI runtime 静态 fragment sender | M3、M5 | service-ready | 未完成 |
 | M8 | CLI 与 headless vertical slice | M4、M6、M7 | service-ready / composition-ready | 未完成 |
 | M9 | 第一阶段审计与用户窗口验收准备 | M8 | acceptance handoff | 未完成 |
@@ -605,10 +605,10 @@ blocker: none|...
 
 ### 当前状态
 
-- 当前里程碑：`M5`
+- 当前里程碑：`M6`
 - 当前状态：`已完成`
-- acceptance level：`contract-ready`（M5 static declaration fixture、validation 与 serialization tests 均通过）
-- 下一步：下一 cycle 重新读取固定上下文，选择 M6 并先建立 headless ownership/service tests
+- acceptance level：`composition-ready`（headless fragment registry/diagnostics 已验证；未初始化 GPU、未启动窗口，故不宣称 `gpu-ready` 或 `wgpu-rendered`）
+- 下一步：下一 cycle 重新读取固定上下文，选择 M7 并先建立 UI static fragment sender tests
 - 用户拥有的验收：尚未开始；没有授权启动 Neon3 窗口
 
 ### 记录规则
@@ -626,6 +626,22 @@ user_acceptance: not requested; no window launched
 ```
 
 ### 施工日志
+
+2026-08-13 | M6 | 已完成
+files: `Cargo.lock`, `crates/neon-wgpu-runtime/Cargo.toml`, `crates/neon-wgpu-runtime/src/lib.rs`, `crates/neon-wgpu-runtime/src/main.rs`, `plan/neon3-first-work-plan.md`
+checks: `cargo test -p neon-wgpu-runtime` = passed（6 tests）; `cargo check -p neon-wgpu-runtime` = passed; `cargo test --workspace` = passed; `git diff --check` = passed; 未启动窗口
+commit: pending（仅提交 M6 files 和本条 Progress 记录；不包含用户/并行修改的 `.gitignore` 或未跟踪 `AGENTS.md`）
+remaining: M7 UI runtime static fragment sender；M6 当前为 headless composition registry，不初始化 GPU resource，故 `gpu-ready` 仍未获得且 `wgpu-rendered` 未开始
+next: 重新读取 `AGENTS.md`、Progress、目录和 Git 状态后，为 `neon-ui-runtime` 先新增 static fragment sender 与 rejection tests
+user_acceptance: 未开始；未授权启动 Neon3 窗口
+
+2026-08-13 | M6 | 进行中
+files: `crates/neon-wgpu-runtime/Cargo.toml`, `crates/neon-wgpu-runtime/src/lib.rs`, `crates/neon-wgpu-runtime/src/main.rs`, `plan/neon3-first-work-plan.md`
+checks: `cargo test -p neon-wgpu-runtime` = not-run; `cargo check -p neon-wgpu-runtime` = not-run; `cargo test --workspace` = not-run; 未启动窗口
+commit: none
+remaining: 运行 M6 headless handler/ownership tests；当前仅证明 headless composition registry，不宣称 GPU resource readiness 或 window pixels
+next: 运行 `cargo test -p neon-wgpu-runtime`
+user_acceptance: 未开始；未授权启动 Neon3 窗口
 
 2026-08-13 | M5 | 已完成
 files: `Cargo.lock`, `crates/neon-ui-schema/Cargo.toml`, `crates/neon-ui-schema/src/lib.rs`, `tests/fixtures/ui/static-fragment.json`, `plan/neon3-first-work-plan.md`

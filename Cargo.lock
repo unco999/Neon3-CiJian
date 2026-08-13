@@ -74,6 +74,7 @@ dependencies = [
  "neon-observability",
  "neon-protocol",
  "neon-ui-schema",
+ "serde_json",
 ]
 
 [[package]]
