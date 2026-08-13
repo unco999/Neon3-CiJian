@@ -6,3 +6,5 @@ license.workspace = true
 
 [dependencies]
 neon-protocol = { path = "../neon-protocol" }
+serde_json.workspace = true
+serde.workspace = true

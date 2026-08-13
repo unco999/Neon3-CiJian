@@ -121,7 +121,7 @@ neon-sessiond       可选监督与服务发现
 | M0 | 工作区与施工记录 | 无 | contract-ready | 已完成 |
 | M1 | Cargo workspace 与依赖边界 | M0 | contract-ready | 已完成 |
 | M2 | 公共协议 schema | M1 | contract-ready | 已完成 |
-| M3 | IPC framing 与 request lifecycle | M2 | contract-ready | 未完成 |
+| M3 | IPC framing 与 request lifecycle | M2 | contract-ready | 已完成 |
 | M4 | 可观察性与 command journal | M2 | contract-ready | 未完成 |
 | M5 | UI declaration schema | M2 | contract-ready | 未完成 |
 | M6 | WGPU runtime ownership skeleton | M3、M5 | gpu-ready / composition-ready | 未完成 |
@@ -605,10 +605,10 @@ blocker: none|...
 
 ### 当前状态
 
-- 当前里程碑：`M2`
+- 当前里程碑：`M3`
 - 当前状态：`已完成`
-- acceptance level：`contract-ready`（公开 schema、兼容策略与 fixture contract tests 均通过）
-- 下一步：按依赖顺序施工 M3 IPC framing 与 request lifecycle
+- acceptance level：`contract-ready`（M3 framing、loopback transport 与 lifecycle tests 均通过）
+- 下一步：下一 cycle 重新读取固定上下文，选择 M4 并先建立 observability contract tests
 - 用户拥有的验收：尚未开始；没有授权启动 Neon3 窗口
 
 ### 记录规则
@@ -627,12 +627,60 @@ user_acceptance: not requested; no window launched
 
 ### 施工日志
 
+2026-08-13 | M3 | 已完成
+files: `Cargo.lock`, `crates/neon-ipc/Cargo.toml`, `crates/neon-ipc/src/lib.rs`, `plan/neon3-first-work-plan.md`
+checks: `cargo test -p neon-ipc` = passed（8 tests）; `cargo test --workspace` = passed; `cargo check --workspace` = passed; `git diff --check` = passed; 未启动窗口
+commit: pending（仅提交 M3 IPC 和本条 Progress 记录；不包含未跟踪 `.opencode/`、`AGENTS.md`）
+remaining: M4 可观察性与 command journal
+next: 重新读取 `AGENTS.md`、Progress、目录和 Git 状态后，为 `neon-observability` 先新增 journal 与脱敏 contract tests
+user_acceptance: 未开始；未授权启动 Neon3 窗口
+
+2026-08-13 | M3 | 进行中
+files: `crates/neon-ipc/src/lib.rs`, `plan/neon3-first-work-plan.md`
+checks: `cargo test -p neon-ipc` = failed（45+ duplicate-definition/API-mismatch errors；同一文件被并行追加为两套不兼容实现）; 未启动窗口
+commit: none
+remaining: 已按计划 API 收敛为唯一 loopback length-prefixed JSON 实现及完整 M3 test suite；需运行 M3 最小检查并修复结果
+next: 运行 `cargo test -p neon-ipc`
+user_acceptance: 未开始；未授权启动 Neon3 窗口
+
 2026-08-13 | M0 | 已完成
 files: `plan/neon3-first-work-plan.md`
 checks: 计划已写入；Neon3 当前只有 `AGENTS.md`，尚无 Cargo workspace；未启动窗口
 commit: none（`D:\Neon3` 当前不是 Git 仓库）
 remaining: M1 到 M9
 next: 创建 workspace 和第一期 crate 空骨架
+user_acceptance: 未开始；未授权启动 Neon3 窗口
+
+2026-08-13 | M3 | 阻塞
+files: `crates/neon-ipc/Cargo.toml`, `crates/neon-ipc/src/lib.rs`, `plan/neon3-first-work-plan.md`
+checks: `cargo test -p neon-ipc` = failed; `cargo test --workspace` = failed。已排查：先缺少直接 `serde` 依赖，随后发现并行编辑追加第二套不兼容 IPC 实现；当前同一文件包含重复 `TransportError`、`encode_frame`、`decode_frames`、`RpcClient`、`RpcServer`、helper 与 test module，编译报告 45+ duplicate-definition/API-mismatch errors；未启动窗口
+commit: none
+remaining: 合并或选择唯一的 M3 IPC API 和对应测试，消除冲突后运行 M3 最小检查
+next: 用户指定保留当前文件前半段实现、后半段实现，或授权我以计划 API 为准统一重写 `crates/neon-ipc/src/lib.rs`
+user_acceptance: 未开始；未授权启动 Neon3 窗口
+
+2026-08-13 | M3 | 进行中
+files: `crates/neon-ipc/Cargo.toml`, `plan/neon3-first-work-plan.md`
+checks: `cargo test -p neon-ipc` = failed（并行变更造成重复 `serde_json.workspace` manifest key）; `cargo test --workspace` = failed（同一原因）; 未启动窗口
+commit: none
+remaining: 移除重复 manifest key 后重跑 M3 检查
+next: 运行 `cargo test -p neon-ipc`
+user_acceptance: 未开始；未授权启动 Neon3 窗口
+
+2026-08-13 | M3 | 进行中
+files: `crates/neon-ipc/Cargo.toml`, `crates/neon-ipc/src/lib.rs`, `plan/neon3-first-work-plan.md`
+checks: `cargo test -p neon-ipc` = failed（缺少直接 `serde` 依赖，无法解析 transport serialization trait bounds）; `cargo test --workspace` = failed（同一原因）; 未启动窗口
+commit: none
+remaining: 添加 `serde.workspace = true` 并重跑 M3 检查
+next: 运行 `cargo test -p neon-ipc`
+user_acceptance: 未开始；未授权启动 Neon3 窗口
+
+2026-08-13 | M3 | 进行中
+files: `crates/neon-ipc/Cargo.toml`, `crates/neon-ipc/src/lib.rs`, `plan/neon3-first-work-plan.md`
+checks: `cargo test -p neon-ipc` = not-run; `cargo test --workspace` = not-run; M3 无 service，故 `service.describe` / snapshot = not available; 未启动窗口
+commit: none
+remaining: 运行 M3 framing/lifecycle tests 与 workspace tests
+next: 运行 `cargo test -p neon-ipc`
 user_acceptance: 未开始；未授权启动 Neon3 窗口
 
 2026-08-13 | M2 | 已完成
