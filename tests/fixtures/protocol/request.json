@@ -1,0 +1,16 @@
+{
+  "protocol": "neon3.rpc",
+  "version": { "major": 1, "minor": 0 },
+  "request_id": "request-001",
+  "client": {
+    "kind": "cli",
+    "instance_id": "cli-001",
+    "pid": 4242,
+    "origin": "test"
+  },
+  "target": "wgpu-runtime",
+  "method": "service.health",
+  "params": {},
+  "expected_revision": null,
+  "idempotency_key": null
+}

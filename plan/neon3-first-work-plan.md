@@ -120,7 +120,7 @@ neon-sessiond       可选监督与服务发现
 | --- | --- | --- | --- | --- |
 | M0 | 工作区与施工记录 | 无 | contract-ready | 已完成 |
 | M1 | Cargo workspace 与依赖边界 | M0 | contract-ready | 已完成 |
-| M2 | 公共协议 schema | M1 | contract-ready | 未完成 |
+| M2 | 公共协议 schema | M1 | contract-ready | 已完成 |
 | M3 | IPC framing 与 request lifecycle | M2 | contract-ready | 未完成 |
 | M4 | 可观察性与 command journal | M2 | contract-ready | 未完成 |
 | M5 | UI declaration schema | M2 | contract-ready | 未完成 |
@@ -605,10 +605,10 @@ blocker: none|...
 
 ### 当前状态
 
-- 当前里程碑：`M1`
-- 当前状态：`进行中`
-- acceptance level：`contract-ready`（M1 已完成；M2 schema 与 fixture tests 待检查）
-- 下一步：运行 `cargo test -p neon-protocol`，修复任何 M2 contract failure
+- 当前里程碑：`M2`
+- 当前状态：`已完成`
+- acceptance level：`contract-ready`（公开 schema、兼容策略与 fixture contract tests 均通过）
+- 下一步：按依赖顺序施工 M3 IPC framing 与 request lifecycle
 - 用户拥有的验收：尚未开始；没有授权启动 Neon3 窗口
 
 ### 记录规则
@@ -635,11 +635,27 @@ remaining: M1 到 M9
 next: 创建 workspace 和第一期 crate 空骨架
 user_acceptance: 未开始；未授权启动 Neon3 窗口
 
+2026-08-13 | M2 | 已完成
+files: `crates/neon-protocol/src/lib.rs`, `tests/fixtures/protocol/request.json`, `tests/fixtures/protocol/accepted-response.json`, `tests/fixtures/protocol/revision-conflict-response.json`, `tests/protocol_contract.rs`（并行工作产生的同范围 contract coverage）, `plan/neon3-first-work-plan.md`
+checks: `cargo test -p neon-protocol` = failed（初始 JSON 字段顺序断言）；`cargo check --workspace` = passed; `cargo test -p neon-protocol` = passed（13 tests）; `cargo check --workspace` = passed; 未启动窗口
+commit: pending M2 diff inspection
+remaining: M3 IPC framing 与 request lifecycle
+next: 下一 cycle 重新读取固定上下文，选择 M3 后先为 length-prefixed frame 边界建立测试
+user_acceptance: 未开始；未授权启动 Neon3 窗口
+
 2026-08-13 | M2 | 进行中
 files: `crates/neon-protocol/src/lib.rs`, `tests/fixtures/protocol/request.json`, `tests/fixtures/protocol/accepted-response.json`, `tests/fixtures/protocol/revision-conflict-response.json`, `plan/neon3-first-work-plan.md`
 checks: `cargo test -p neon-protocol` = not-run; `cargo check --workspace` = not-run; M2 无 service，故 `service.describe` / snapshot = not available; 未启动窗口
 commit: none
 remaining: 运行 M2 contract tests 与 workspace check
+next: 运行 `cargo test -p neon-protocol`
+user_acceptance: 未开始；未授权启动 Neon3 窗口
+
+2026-08-13 | M2 | 进行中
+files: `crates/neon-protocol/src/lib.rs`, `plan/neon3-first-work-plan.md`
+checks: `cargo test -p neon-protocol` = failed（fixture round-trip 测试比较 JSON 字段顺序而非结构化值）; `cargo check --workspace` = passed; 未启动窗口
+commit: none
+remaining: 以结构化 JSON 比较修复 fixture round-trip tests 后重跑 M2 检查
 next: 运行 `cargo test -p neon-protocol`
 user_acceptance: 未开始；未授权启动 Neon3 窗口
 

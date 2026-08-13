@@ -1,0 +1,8 @@
+{
+  "request_id": "request-001",
+  "status": "accepted",
+  "revision": 43,
+  "result": { "status": "healthy" },
+  "snapshot": null,
+  "error": null
+}

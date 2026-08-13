@@ -1,0 +1,13 @@
+{
+  "request_id": "request-001",
+  "status": "rejected",
+  "revision": null,
+  "result": null,
+  "snapshot": null,
+  "error": {
+    "code": "revision_conflict",
+    "message": "resource changed",
+    "current_revision": 43,
+    "object_id": "asset:81"
+  }
+}

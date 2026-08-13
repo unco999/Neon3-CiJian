@@ -134,8 +134,15 @@ pub struct ServiceEvent {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use std::fs;
     use std::path::Path;
+
+    const REQUEST_FIXTURE: &str = include_str!("../../../tests/fixtures/protocol/request.json");
+    const ACCEPTED_RESPONSE_FIXTURE: &str =
+        include_str!("../../../tests/fixtures/protocol/accepted-response.json");
+    const REVISION_CONFLICT_FIXTURE: &str =
+        include_str!("../../../tests/fixtures/protocol/revision-conflict-response.json");
 
     #[test]
     fn only_the_wgpu_runtime_may_declare_gpu_dependencies() {
@@ -157,5 +164,61 @@ mod tests {
                 "{crate_name} must not declare wgpu or winit"
             );
         }
+    }
+
+    #[test]
+    fn request_fixture_round_trips() {
+        let request: RpcRequest = serde_json::from_str(REQUEST_FIXTURE).unwrap();
+        assert_eq!(request.protocol, RPC_PROTOCOL);
+        assert_eq!(request.request_id.0, "request-001");
+        assert_eq!(
+            serde_json::to_value(&request).unwrap(),
+            serde_json::from_str::<Value>(REQUEST_FIXTURE).unwrap()
+        );
+    }
+
+    #[test]
+    fn accepted_response_fixture_round_trips() {
+        let response: RpcResponse = serde_json::from_str(ACCEPTED_RESPONSE_FIXTURE).unwrap();
+        assert_eq!(response.status, RpcStatus::Accepted);
+        assert_eq!(response.request_id.0, "request-001");
+        assert_eq!(
+            serde_json::to_value(&response).unwrap(),
+            serde_json::from_str::<Value>(ACCEPTED_RESPONSE_FIXTURE).unwrap()
+        );
+    }
+
+    #[test]
+    fn revision_conflict_preserves_request_and_revision() {
+        let response: RpcResponse = serde_json::from_str(REVISION_CONFLICT_FIXTURE).unwrap();
+        assert_eq!(response.status, RpcStatus::Rejected);
+        assert_eq!(response.request_id.0, "request-001");
+        assert_eq!(response.error.unwrap().current_revision, Some(Revision(43)));
+    }
+
+    #[test]
+    fn missing_required_request_field_is_rejected() {
+        let json = r#"{"protocol":"neon3.rpc","version":{"major":1,"minor":0}}"#;
+        assert!(serde_json::from_str::<RpcRequest>(json).is_err());
+    }
+
+    #[test]
+    fn unknown_request_fields_are_rejected_by_contract() {
+        let json = r#"{"protocol":"neon3.rpc","version":{"major":1,"minor":0},"request_id":"request-001","client":{"kind":"cli","instance_id":"cli-001","pid":1,"origin":"test"},"target":"wgpu-runtime","method":"service.health","params":{},"expected_revision":null,"idempotency_key":null,"unexpected":true}"#;
+        assert!(serde_json::from_str::<RpcRequest>(json).is_err());
+    }
+
+    #[test]
+    fn asset_ref_is_a_stable_identity_without_a_local_path() {
+        let asset = AssetRef {
+            project_id: "project-001".into(),
+            asset_id: 81,
+            revision: Revision(5),
+            kind: "water_material".into(),
+        };
+        let json = serde_json::to_value(asset).unwrap();
+        assert!(json.get("path").is_none());
+        assert!(json.get("local_path").is_none());
+        assert_eq!(json["asset_id"], 81);
     }
 }
