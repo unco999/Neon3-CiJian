@@ -36,6 +36,8 @@ name = "neon-observability"
 version = "0.1.0"
 dependencies = [
  "neon-protocol",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

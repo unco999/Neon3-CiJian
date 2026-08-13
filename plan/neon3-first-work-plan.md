@@ -122,7 +122,7 @@ neon-sessiond       可选监督与服务发现
 | M1 | Cargo workspace 与依赖边界 | M0 | contract-ready | 已完成 |
 | M2 | 公共协议 schema | M1 | contract-ready | 已完成 |
 | M3 | IPC framing 与 request lifecycle | M2 | contract-ready | 已完成 |
-| M4 | 可观察性与 command journal | M2 | contract-ready | 未完成 |
+| M4 | 可观察性与 command journal | M2 | contract-ready | 已完成 |
 | M5 | UI declaration schema | M2 | contract-ready | 未完成 |
 | M6 | WGPU runtime ownership skeleton | M3、M5 | gpu-ready / composition-ready | 未完成 |
 | M7 | UI runtime 静态 fragment sender | M3、M5 | service-ready | 未完成 |
@@ -605,10 +605,10 @@ blocker: none|...
 
 ### 当前状态
 
-- 当前里程碑：`M3`
+- 当前里程碑：`M4`
 - 当前状态：`已完成`
-- acceptance level：`contract-ready`（M3 framing、loopback transport 与 lifecycle tests 均通过）
-- 下一步：下一 cycle 重新读取固定上下文，选择 M4 并先建立 observability contract tests
+- acceptance level：`contract-ready`（M4 typed trace、receipt、snapshot 与 bounded journal tests 均通过）
+- 下一步：下一 cycle 重新读取固定上下文，选择 M5 并先建立 UI declaration schema tests
 - 用户拥有的验收：尚未开始；没有授权启动 Neon3 窗口
 
 ### 记录规则
@@ -626,6 +626,22 @@ user_acceptance: not requested; no window launched
 ```
 
 ### 施工日志
+
+2026-08-13 | M4 | 已完成
+files: `Cargo.lock`, `crates/neon-observability/Cargo.toml`, `crates/neon-observability/src/lib.rs`, `plan/neon3-first-work-plan.md`
+checks: `cargo test -p neon-observability` = passed（6 tests）; `cargo test --workspace` = passed; `cargo check --workspace` = passed; `git diff --check` = passed; 未启动窗口
+commit: pending（仅提交 M4 files 和本条 Progress 记录；不包含用户/并行修改的 `.gitignore` 或未跟踪 `AGENTS.md`）
+remaining: M5 UI declaration schema
+next: 重新读取 `AGENTS.md`、Progress、目录和 Git 状态后，为 `neon-ui-schema` 先新增 static fragment schema tests
+user_acceptance: 未开始；未授权启动 Neon3 窗口
+
+2026-08-13 | M4 | 进行中
+files: `crates/neon-observability/Cargo.toml`, `crates/neon-observability/src/lib.rs`, `plan/neon3-first-work-plan.md`
+checks: `cargo test -p neon-observability` = not-run; `cargo test --workspace` = not-run; M4 无 service，故 `service.describe` / snapshot = not available; 未启动窗口
+commit: none
+remaining: 运行 M4 journal/redaction contract tests 与 workspace tests
+next: 运行 `cargo test -p neon-observability`
+user_acceptance: 未开始；未授权启动 Neon3 窗口
 
 2026-08-13 | M3 | 已完成
 files: `Cargo.lock`, `crates/neon-ipc/Cargo.toml`, `crates/neon-ipc/src/lib.rs`, `plan/neon3-first-work-plan.md`
