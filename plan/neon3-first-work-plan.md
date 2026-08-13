@@ -646,7 +646,15 @@ user_acceptance: 未开始；未授权启动 Neon3 窗口
 2026-08-13 | M1 | 已完成
 files: `.gitignore`, `Cargo.toml`, `Cargo.lock`, `crates/neon-protocol/Cargo.toml`, `crates/neon-protocol/src/lib.rs`, `crates/neon-ipc/Cargo.toml`, `crates/neon-ipc/src/lib.rs`, `crates/neon-observability/Cargo.toml`, `crates/neon-observability/src/lib.rs`, `crates/neon-ui-schema/Cargo.toml`, `crates/neon-ui-schema/src/lib.rs`, `crates/neon-wgpu-runtime/Cargo.toml`, `crates/neon-wgpu-runtime/src/main.rs`, `crates/neon-ui-runtime/Cargo.toml`, `crates/neon-ui-runtime/src/main.rs`, `crates/neon-cli/Cargo.toml`, `crates/neon-cli/src/main.rs`, `tests/.gitkeep`, `tests/fixtures/.gitkeep`, `plan/neon3-first-work-plan.md`
 checks: `git rev-parse --is-inside-work-tree` = failed（初始化前）; `git init` = passed; `cargo check --workspace` = passed; `cargo test --workspace` = passed（1 个依赖边界测试通过）; 未启动窗口
-commit: pending M1 diff inspection
+commit: `d378d0b` (`Create Neon3 workspace skeleton`); Progress completion record follows in a separate bookkeeping commit
 remaining: M2 公共协议 schema
 next: 读取当前 Progress、目录和 Git 状态后，为 `neon-protocol` 新增 request/response fixture round-trip 测试
+user_acceptance: 未开始；未授权启动 Neon3 窗口
+
+2026-08-13 | M1 | 已完成
+files: `plan/neon3-first-work-plan.md`
+checks: `git diff --check` = passed; `git status --short` = passed（M1 workspace 已提交，预存未跟踪 `Neon3/.git` 未纳入）；未启动窗口
+commit: `d378d0b`（workspace 骨架）；本条 Progress bookkeeping commit 待创建
+remaining: M2 公共协议 schema
+next: 下一 cycle 重新读取 `AGENTS.md`、Progress、目录与 Git 状态，选择 M2 并先新增 protocol fixture tests
 user_acceptance: 未开始；未授权启动 Neon3 窗口
