@@ -638,9 +638,17 @@ user_acceptance: 未开始；未授权启动 Neon3 窗口
 2026-08-13 | M2 | 已完成
 files: `crates/neon-protocol/src/lib.rs`, `tests/fixtures/protocol/request.json`, `tests/fixtures/protocol/accepted-response.json`, `tests/fixtures/protocol/revision-conflict-response.json`, `tests/protocol_contract.rs`（并行工作产生的同范围 contract coverage）, `plan/neon3-first-work-plan.md`
 checks: `cargo test -p neon-protocol` = failed（初始 JSON 字段顺序断言）；`cargo check --workspace` = passed; `cargo test -p neon-protocol` = passed（13 tests）; `cargo check --workspace` = passed; 未启动窗口
-commit: pending M2 diff inspection
+commit: `8876071` (`Define public protocol schema`); completion bookkeeping record follows in a separate commit
 remaining: M3 IPC framing 与 request lifecycle
 next: 下一 cycle 重新读取固定上下文，选择 M3 后先为 length-prefixed frame 边界建立测试
+user_acceptance: 未开始；未授权启动 Neon3 窗口
+
+2026-08-13 | M2 | 已完成
+files: `plan/neon3-first-work-plan.md`
+checks: `git diff --check` = passed; M2 required checks remain `cargo test -p neon-protocol` = passed（13 tests）与 `cargo check --workspace` = passed; 未启动窗口
+commit: `8876071`（公共协议 schema）；本条 Progress bookkeeping commit 待创建
+remaining: M3 IPC framing 与 request lifecycle
+next: 下一 cycle 重新读取 `AGENTS.md`、Progress、目录与 Git 状态，选择 M3 后先建立 framing boundary tests
 user_acceptance: 未开始；未授权启动 Neon3 窗口
 
 2026-08-13 | M2 | 进行中
