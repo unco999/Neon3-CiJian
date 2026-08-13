@@ -630,7 +630,7 @@ user_acceptance: not requested; no window launched
 2026-08-13 | M9 | 已完成
 files: `plan/neon3-first-work-plan.md`
 checks: `Glob crates/*/Cargo.toml` = passed（7 个第一期 crates）; `Grep crates -- *.rs -- wgpu/winit/Window/Device/Queue` = passed（仅 `neon-wgpu-runtime` 实际引用 WGPU owner API；UI/CLI 仅被 WGPU crate 静态 ownership test 扫描）; `Grep` service/mutation/journal terms = passed（WGPU/UI 均显式有 health/describe/shutdown；WGPU mutation 强制 `idempotency_key`，全请求拥有 `request_id`，CLI scenario 查询 receipt/trace）; `cargo test --workspace` = passed（全部 tests，含 headless adapter/device/queue readiness）; `cargo run -p neon-cli -- scenario ui.static-fragment.submit.v1 --headless` = passed（独立 WGPU process，graph revision `1`、fragment count `1`、receipt 与 request `submit-1` trace sequence `5`/`6`）; `git diff --check` = passed; 未启动窗口
-commit: pending（仅提交 M9 Progress record；不包含用户/并行修改的 `.gitignore` 或未跟踪 `AGENTS.md`）
+commit: `23a4c75` (`Record first slice audit evidence`；仅提交 M9 Progress record，不包含用户/并行修改的 `.gitignore` 或未跟踪 `AGENTS.md`)
 remaining: 用户拥有的窗口验收尚未开始。未创建 `winit::Window` 或 surface target capture，故不写 `wgpu-rendered`；未获用户确认，故不写 `interactive-accepted`
 next: 用户明确授权后，运行约定 interactive command，使用 CLI 提交 static fragment，并由用户记录平台、adapter、window size、graph revision 与最终像素验收
 user_acceptance: pending explicit authorization; 未启动窗口
@@ -638,7 +638,7 @@ user_acceptance: pending explicit authorization; 未启动窗口
 2026-08-13 | M6 | 已完成（M9 审计后修正）
 files: `Cargo.toml`, `Cargo.lock`, `crates/neon-wgpu-runtime/Cargo.toml`, `crates/neon-wgpu-runtime/src/lib.rs`, `plan/neon3-first-work-plan.md`
 checks: `cargo test -p neon-wgpu-runtime` = passed（8 tests，含 `headless_gpu_adapter_device_and_queue_are_ready`）；`cargo check -p neon-wgpu-runtime` = passed; `cargo test --workspace` = passed; `git diff --check` = passed; 未启动窗口
-commit: pending（仅提交 M6 GPU-ready correction 和相关 Progress records；不包含用户/并行修改的 `.gitignore` 或未跟踪 `AGENTS.md`）
+commit: `4ac2287` (`Verify headless GPU readiness`；仅提交 M6 GPU-ready correction 和相关 Progress records，不包含用户/并行修改的 `.gitignore` 或未跟踪 `AGENTS.md`)
 remaining: 恢复 M9 audit；headless adapter/device/queue 证明 `gpu-ready`，registry 证明 `composition-ready`，但没有 surface target capture，不能写 `wgpu-rendered` 或 `interactive-accepted`
 next: 重新读取 `AGENTS.md`、Progress、目录和 Git 状态后，恢复 M9 并执行 workspace/M8 scenario 与 final architecture audit
 user_acceptance: 未开始；未授权启动 Neon3 窗口
