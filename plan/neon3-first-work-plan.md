@@ -2,11 +2,11 @@
 
 ## 0. 计划用途
 
-这不是产品需求说明，也不是一次性重写任务。这是一份供 `D:\goal` 自动驱动器和 low 模型逐步执行的施工合同。
+这不是产品需求说明，也不是一次性重写任务。这是一份供 `D:\goal` 自动驱动器和模型逐步执行的施工合同。
 
 施工目录：`D:\Neon3`
 
-施工入口：`D:\goal\Start-GoalDriver.cmd`
+施工入口：`D:\goal\Start-GoalDriver.cmd`；施工计划、状态与代码均保留在 `D:\Neon3`。
 
 本计划的唯一施工目标是：在不迁移 Neon2 旧功能的前提下，建立 Neon3 的最小多进程工作区，并证明第一条公开协议链路可以被 headless client 调用、被 UI runtime 接收、被 WGPU runtime 作为唯一 renderer 接收一个静态 UI fragment。
 
@@ -142,8 +142,9 @@ neon-sessiond       可选监督与服务发现
 
 - `D:\Neon3\AGENTS.md`
 - `D:\Neon3\plan\neon3-first-work-plan.md`
-- `D:\goal\goal-driver.json` 指向本计划
-- `D:\goal\goal-prompt.md` 要求按本计划施工
+- `D:\goal\goal-driver.json` 只引用工作区内的本计划
+- `D:\goal\goal-prompt.md` 只引用工作区内文件并要求按本计划施工
+- `opencode.json` 仅允许驱动器目录 `D:\goal` 作为工作区外例外
 
 不要在 M0 中创建 Cargo 代码。
 

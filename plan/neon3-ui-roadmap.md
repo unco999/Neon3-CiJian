@@ -1,7 +1,8 @@
 # Neon3 UI Platform Roadmap
 
-This decision record is governed by `D:\goal\neon3-ui-construction-plan.md` and
-`D:\Neon3\AGENTS.md`. Construction follows U0 through U10 in dependency order.
+This decision record is governed by the `D:\goal` driver configuration, which must
+reference only plans under `D:\Neon3\plan`, together with `D:\Neon3\AGENTS.md`.
+Construction follows U0 through U10 in dependency order.
 
 ## U0 Baseline
 

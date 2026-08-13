@@ -34,6 +34,7 @@ use ui_renderer::UiWgpuRenderer;
 pub const SERVICE_NAME: &str = "wgpu-runtime";
 pub const CAPABILITY_UI_FRAGMENT: &str = "wgpu.ui.fragment.v1";
 pub const CAPABILITY_UI_HIT_TARGET: &str = "wgpu.ui.hit_target.v1";
+pub const CAPABILITY_UI_SEMANTIC_EVENT: &str = "wgpu.ui.semantic_event.v1";
 pub const UI_HIT_TARGET: &str = "ui.hit_id.v1";
 pub const UI_COLOR_TARGET: &str = "ui.color.v1";
 pub const RENDER_HIT_NONE: u32 = u32::MAX;
@@ -660,6 +661,7 @@ impl WgpuRuntime {
                 CAPABILITY_UI_FRAGMENT.into(),
                 "wgpu.render.diagnostics".into(),
                 CAPABILITY_UI_HIT_TARGET.into(),
+                CAPABILITY_UI_SEMANTIC_EVENT.into(),
             ],
         }
     }
@@ -782,7 +784,7 @@ impl WgpuRuntime {
             "debug.trace.query" => self.trace_query(request_id, request.params),
             "wgpu.ui.submit_fragment" => self.submit_fragment(request_id, request.params),
             "wgpu.ui.remove_fragment" => self.remove_fragment(request_id, request.params),
-            "test.ui.semantic_event.inject" => self.inject_semantic_event(request_id, request.params),
+            "wgpu.ui.semantic_event.validate" | "test.ui.semantic_event.inject" => self.inject_semantic_event(request_id, request.params),
             "test.ui.hit_sample.request" => self.hit_sample_request(request_id, request.params),
             "test.ui.hit_sample.complete" => self.hit_sample_complete(request_id, request.params),
             "test.ui.pointer.down" => self.pointer_down(request_id),
@@ -1195,12 +1197,12 @@ mod tests {
         assert_eq!(described["protocol_version"], json!(PROTOCOL_VERSION));
         assert_eq!(
             described["capabilities"],
-            json!([CAPABILITY_UI_FRAGMENT, "wgpu.render.diagnostics", CAPABILITY_UI_HIT_TARGET])
+            json!([CAPABILITY_UI_FRAGMENT, "wgpu.render.diagnostics", CAPABILITY_UI_HIT_TARGET, CAPABILITY_UI_SEMANTIC_EVENT])
         );
         assert_eq!(snapshot.status, RpcStatus::Accepted);
         assert_eq!(
             snapshot.result.unwrap()["capabilities"],
-            json!([CAPABILITY_UI_FRAGMENT, "wgpu.render.diagnostics", CAPABILITY_UI_HIT_TARGET])
+            json!([CAPABILITY_UI_FRAGMENT, "wgpu.render.diagnostics", CAPABILITY_UI_HIT_TARGET, CAPABILITY_UI_SEMANTIC_EVENT])
         );
     }
 
