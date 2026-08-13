@@ -606,9 +606,9 @@ blocker: none|...
 ### 当前状态
 
 - 当前里程碑：`M1`
-- 当前状态：`已完成`
-- acceptance level：`contract-ready`（M1 workspace、依赖边界测试与编译检查均通过）
-- 下一步：按依赖顺序施工 M2 公共协议 schema
+- 当前状态：`进行中`
+- acceptance level：`contract-ready`（M1 已完成；M2 schema 与 fixture tests 待检查）
+- 下一步：运行 `cargo test -p neon-protocol`，修复任何 M2 contract failure
 - 用户拥有的验收：尚未开始；没有授权启动 Neon3 窗口
 
 ### 记录规则
@@ -619,7 +619,7 @@ blocker: none|...
 2026-08-13 | M1 | 进行中
 files: Cargo.toml, crates/...
 checks: cargo check --workspace = passed; cargo test --workspace = not_run
-commit: none
+commit: `5a39b54` (`Add public protocol schema`); this Progress bookkeeping update is committed separately
 remaining: protocol types not implemented
 next: create M2 request/response fixtures
 user_acceptance: not requested; no window launched
@@ -633,6 +633,14 @@ checks: 计划已写入；Neon3 当前只有 `AGENTS.md`，尚无 Cargo workspac
 commit: none（`D:\Neon3` 当前不是 Git 仓库）
 remaining: M1 到 M9
 next: 创建 workspace 和第一期 crate 空骨架
+user_acceptance: 未开始；未授权启动 Neon3 窗口
+
+2026-08-13 | M2 | 进行中
+files: `crates/neon-protocol/src/lib.rs`, `tests/fixtures/protocol/request.json`, `tests/fixtures/protocol/accepted-response.json`, `tests/fixtures/protocol/revision-conflict-response.json`, `plan/neon3-first-work-plan.md`
+checks: `cargo test -p neon-protocol` = not-run; `cargo check --workspace` = not-run; M2 无 service，故 `service.describe` / snapshot = not available; 未启动窗口
+commit: none
+remaining: 运行 M2 contract tests 与 workspace check
+next: 运行 `cargo test -p neon-protocol`
 user_acceptance: 未开始；未授权启动 Neon3 窗口
 
 2026-08-13 | M1 | 进行中
