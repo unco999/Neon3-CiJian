@@ -127,7 +127,7 @@ neon-sessiond       可选监督与服务发现
 | M6 | WGPU runtime ownership skeleton | M3、M5 | gpu-ready / composition-ready | 已完成 |
 | M7 | UI runtime 静态 fragment sender | M3、M5 | service-ready | 已完成 |
 | M8 | CLI 与 headless vertical slice | M4、M6、M7 | service-ready / composition-ready | 已完成 |
-| M9 | 第一阶段审计与用户窗口验收准备 | M8 | acceptance handoff | 未完成 |
+| M9 | 第一阶段审计与用户窗口验收准备 | M8 | acceptance handoff | 已完成 |
 | M10 | 高速交互数据面评估与可选 fast path | M9 | latency-ready | 未完成 |
 
 ## 5. 里程碑详细施工说明
@@ -605,10 +605,10 @@ blocker: none|...
 
 ### 当前状态
 
-- 当前里程碑：`M6`
+- 当前里程碑：`M9`
 - 当前状态：`已完成`
-- acceptance level：`gpu-ready` / `composition-ready`（唯一 WGPU runtime 已在 headless mode 成功创建 adapter/device/queue，并验证 fragment registry；未启动窗口或 surface）
-- 下一步：下一 cycle 重新读取固定上下文，恢复 M9 并重跑 cross-process M8 scenario 后完成审计
+- acceptance level：`contract-ready` / `service-ready` / `gpu-ready` / `composition-ready`（协议、服务、headless adapter/device/queue、fragment registry 与跨进程 scenario 已验证；未启动窗口或 surface target）
+- 下一步：等待用户明确授权后，才可启动交互窗口并进行用户拥有的 `interactive-accepted` 验收
 - 用户拥有的验收：尚未开始；没有授权启动 Neon3 窗口
 
 ### 记录规则
@@ -626,6 +626,14 @@ user_acceptance: not requested; no window launched
 ```
 
 ### 施工日志
+
+2026-08-13 | M9 | 已完成
+files: `plan/neon3-first-work-plan.md`
+checks: `Glob crates/*/Cargo.toml` = passed（7 个第一期 crates）; `Grep crates -- *.rs -- wgpu/winit/Window/Device/Queue` = passed（仅 `neon-wgpu-runtime` 实际引用 WGPU owner API；UI/CLI 仅被 WGPU crate 静态 ownership test 扫描）; `Grep` service/mutation/journal terms = passed（WGPU/UI 均显式有 health/describe/shutdown；WGPU mutation 强制 `idempotency_key`，全请求拥有 `request_id`，CLI scenario 查询 receipt/trace）; `cargo test --workspace` = passed（全部 tests，含 headless adapter/device/queue readiness）; `cargo run -p neon-cli -- scenario ui.static-fragment.submit.v1 --headless` = passed（独立 WGPU process，graph revision `1`、fragment count `1`、receipt 与 request `submit-1` trace sequence `5`/`6`）; `git diff --check` = passed; 未启动窗口
+commit: pending（仅提交 M9 Progress record；不包含用户/并行修改的 `.gitignore` 或未跟踪 `AGENTS.md`）
+remaining: 用户拥有的窗口验收尚未开始。未创建 `winit::Window` 或 surface target capture，故不写 `wgpu-rendered`；未获用户确认，故不写 `interactive-accepted`
+next: 用户明确授权后，运行约定 interactive command，使用 CLI 提交 static fragment，并由用户记录平台、adapter、window size、graph revision 与最终像素验收
+user_acceptance: pending explicit authorization; 未启动窗口
 
 2026-08-13 | M6 | 已完成（M9 审计后修正）
 files: `Cargo.toml`, `Cargo.lock`, `crates/neon-wgpu-runtime/Cargo.toml`, `crates/neon-wgpu-runtime/src/lib.rs`, `plan/neon3-first-work-plan.md`
