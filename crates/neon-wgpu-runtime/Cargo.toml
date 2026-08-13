@@ -9,6 +9,8 @@ neon-protocol = { path = "../neon-protocol" }
 neon-observability = { path = "../neon-observability" }
 neon-ui-schema = { path = "../neon-ui-schema" }
 neon-ipc = { path = "../neon-ipc" }
+bytemuck.workspace = true
 pollster.workspace = true
 serde_json.workspace = true
 wgpu.workspace = true
+winit.workspace = true

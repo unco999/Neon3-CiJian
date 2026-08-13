@@ -24,7 +24,9 @@ pub enum TransportError {
 impl fmt::Display for TransportError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::FrameTooLarge { size, max } => write!(formatter, "frame_too_large: {size} exceeds {max}"),
+            Self::FrameTooLarge { size, max } => {
+                write!(formatter, "frame_too_large: {size} exceeds {max}")
+            }
             Self::InvalidFrameLength => write!(formatter, "invalid_frame_length"),
             Self::Serialization(error) => write!(formatter, "invalid_json: {error}"),
             Self::RequestIdMismatch => write!(formatter, "request_id_mismatch"),
@@ -61,7 +63,10 @@ pub fn encode_frame(payload: &[u8], max_frame_size: usize) -> Result<Vec<u8>, Tr
     Ok(frame)
 }
 
-pub fn decode_frames(buffer: &mut Vec<u8>, max_frame_size: usize) -> Result<Vec<Vec<u8>>, TransportError> {
+pub fn decode_frames(
+    buffer: &mut Vec<u8>,
+    max_frame_size: usize,
+) -> Result<Vec<Vec<u8>>, TransportError> {
     let mut frames = Vec::new();
     let mut consumed = 0;
 
@@ -109,8 +114,12 @@ impl RpcClient {
     }
 
     pub fn with_timeout(self, timeout: Duration) -> Result<Self, TransportError> {
-        self.stream.set_read_timeout(Some(timeout)).map_err(map_io_error)?;
-        self.stream.set_write_timeout(Some(timeout)).map_err(map_io_error)?;
+        self.stream
+            .set_read_timeout(Some(timeout))
+            .map_err(map_io_error)?;
+        self.stream
+            .set_write_timeout(Some(timeout))
+            .map_err(map_io_error)?;
         Ok(self)
     }
 
@@ -204,7 +213,9 @@ fn map_io_error(error: io::Error) -> TransportError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use neon_protocol::{ClientIdentity, ClientKind, ProtocolVersion, RequestId, RpcStatus, ServiceName};
+    use neon_protocol::{
+        ClientIdentity, ClientKind, ProtocolVersion, RequestId, RpcStatus, ServiceName,
+    };
     use serde_json::json;
     use std::net::{IpAddr, Ipv4Addr};
     use std::thread;
@@ -273,7 +284,10 @@ mod tests {
         let endpoint = server.local_addr().unwrap();
         let thread = thread::spawn(move || server.serve_one(accepted));
         let mut client = RpcClient::connect(endpoint).unwrap();
-        assert_eq!(client.call(&request("health-001")).unwrap().status, RpcStatus::Accepted);
+        assert_eq!(
+            client.call(&request("health-001")).unwrap().status,
+            RpcStatus::Accepted
+        );
         thread.join().unwrap().unwrap();
     }
 
@@ -316,8 +330,14 @@ mod tests {
     #[test]
     fn rejects_non_loopback_endpoints() {
         let endpoint = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 4000);
-        assert!(matches!(RpcClient::connect(endpoint), Err(TransportError::Io(_))));
-        assert!(matches!(RpcServer::bind(endpoint), Err(TransportError::Io(_))));
+        assert!(matches!(
+            RpcClient::connect(endpoint),
+            Err(TransportError::Io(_))
+        ));
+        assert!(matches!(
+            RpcServer::bind(endpoint),
+            Err(TransportError::Io(_))
+        ));
     }
 
     #[test]

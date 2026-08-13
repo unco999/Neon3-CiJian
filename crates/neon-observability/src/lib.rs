@@ -162,9 +162,18 @@ fn current_unix_ms() -> u64 {
 }
 
 fn matches_filter(record: &TraceRecord, filter: &JournalFilter) -> bool {
-    filter.request_id.as_ref().is_none_or(|value| record.request_id.as_ref() == Some(value))
-        && filter.session_id.as_ref().is_none_or(|value| record.session_id.as_ref() == Some(value))
-        && filter.job_id.as_ref().is_none_or(|value| record.job_id.as_ref() == Some(value))
+    filter
+        .request_id
+        .as_ref()
+        .is_none_or(|value| record.request_id.as_ref() == Some(value))
+        && filter
+            .session_id
+            .as_ref()
+            .is_none_or(|value| record.session_id.as_ref() == Some(value))
+        && filter
+            .job_id
+            .as_ref()
+            .is_none_or(|value| record.job_id.as_ref() == Some(value))
         && filter.revision.is_none_or(|value| {
             record.revision_before == Some(value) || record.revision_after == Some(value)
         })
@@ -192,9 +201,16 @@ fn redact_value(value: Value) -> Value {
 
 fn is_sensitive_key(key: &str) -> bool {
     let key = key.to_ascii_lowercase();
-    ["password", "token", "secret", "credential", "private_key", "access_key"]
-        .iter()
-        .any(|needle| key.contains(needle))
+    [
+        "password",
+        "token",
+        "secret",
+        "credential",
+        "private_key",
+        "access_key",
+    ]
+    .iter()
+    .any(|needle| key.contains(needle))
 }
 
 #[cfg(test)]
@@ -223,7 +239,11 @@ mod tests {
     #[test]
     fn request_lifecycle_is_queryable() {
         let mut journal = journal(8);
-        for event in [EVENT_COMMAND_RECEIVED, EVENT_COMMAND_VALIDATED, EVENT_COMMAND_ACCEPTED] {
+        for event in [
+            EVENT_COMMAND_RECEIVED,
+            EVENT_COMMAND_VALIDATED,
+            EVENT_COMMAND_ACCEPTED,
+        ] {
             append(&mut journal, "request-1", event);
         }
         let records = journal.query(&JournalFilter {
@@ -237,8 +257,14 @@ mod tests {
     #[test]
     fn sequence_is_monotonic_within_an_epoch() {
         let mut journal = journal(8);
-        assert_eq!(append(&mut journal, "one", EVENT_COMMAND_RECEIVED).sequence, 1);
-        assert_eq!(append(&mut journal, "two", EVENT_COMMAND_COMPLETED).sequence, 2);
+        assert_eq!(
+            append(&mut journal, "one", EVENT_COMMAND_RECEIVED).sequence,
+            1
+        );
+        assert_eq!(
+            append(&mut journal, "two", EVENT_COMMAND_COMPLETED).sequence,
+            2
+        );
     }
 
     #[test]

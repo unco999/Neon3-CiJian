@@ -16,11 +16,22 @@ fn main() -> ExitCode {
     }
 
     let reservation = TcpListener::bind("127.0.0.1:0").expect("must reserve loopback endpoint");
-    let endpoint = reservation.local_addr().expect("reserved endpoint must have address");
+    let endpoint = reservation
+        .local_addr()
+        .expect("reserved endpoint must have address");
     drop(reservation);
     let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let mut server = Command::new("cargo")
-        .args(["run", "--quiet", "-p", "neon-wgpu-runtime", "--", "--headless-server", &endpoint.to_string(), "7"])
+        .args([
+            "run",
+            "--quiet",
+            "-p",
+            "neon-wgpu-runtime",
+            "--",
+            "--headless-server",
+            &endpoint.to_string(),
+            "7",
+        ])
         .current_dir(workspace)
         .spawn()
         .expect("must start headless WGPU runtime");
@@ -32,12 +43,22 @@ fn main() -> ExitCode {
             Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
             Err(error) => {
                 let _ = server.kill();
-                eprintln!("{}", serde_json::json!({"scenario": neon_cli::SCENARIO_ID, "status": "failed", "error": error.to_string()}));
+                eprintln!(
+                    "{}",
+                    serde_json::json!({"scenario": neon_cli::SCENARIO_ID, "status": "failed", "error": error.to_string()})
+                );
                 return ExitCode::from(1);
             }
         }
     };
     let _ = server.wait();
-    println!("{}", serde_json::to_string(&outcome).expect("scenario JSON must serialize"));
-    if outcome["status"] == "passed" { ExitCode::SUCCESS } else { ExitCode::from(1) }
+    println!(
+        "{}",
+        serde_json::to_string(&outcome).expect("scenario JSON must serialize")
+    );
+    if outcome["status"] == "passed" {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    }
 }
