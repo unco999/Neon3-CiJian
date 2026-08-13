@@ -56,6 +56,18 @@ pub struct AssetRef {
     pub kind: String,
 }
 
+/// Revisioned, owner-provided asset content. Only project/resource services create this value.
+/// Consumers may use the bytes locally but must not persist or forward renderer residency handles.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AssetBytes {
+    pub asset: AssetRef,
+    pub media_type: String,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub bytes: Vec<u8>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RpcRequest {
@@ -151,6 +163,7 @@ mod tests {
             "neon-protocol",
             "neon-ipc",
             "neon-observability",
+            "neon-projectd",
             "neon-ui-schema",
             "neon-ui-runtime",
             "neon-cli",
@@ -220,5 +233,17 @@ mod tests {
         assert!(json.get("path").is_none());
         assert!(json.get("local_path").is_none());
         assert_eq!(json["asset_id"], 81);
+    }
+
+    #[test]
+    fn asset_bytes_are_revisioned_content_without_a_local_path() {
+        let content = AssetBytes {
+            asset: AssetRef { project_id: "project-001".into(), asset_id: 81, revision: Revision(5), kind: "image".into() },
+            media_type: "application/x-neon-rgba8".into(), width: Some(1), height: Some(1), bytes: vec![1, 2, 3, 4],
+        };
+        let value = serde_json::to_value(content).unwrap();
+        assert!(value.get("path").is_none());
+        assert!(value.get("local_path").is_none());
+        assert_eq!(value["asset"]["revision"], 5);
     }
 }

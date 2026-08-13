@@ -9,13 +9,15 @@ use neon_observability::{
     EVENT_COMMAND_RECEIVED, EVENT_COMMAND_REJECTED, JournalFilter, TraceLevel, TraceRecord,
 };
 use neon_protocol::{
-    AssetRef, HealthStatus, PROTOCOL_VERSION, RequestId, Revision, RpcError, RpcRequest, RpcResponse,
+    AssetBytes, AssetRef, HealthStatus, PROTOCOL_VERSION, RequestId, Revision, RpcError, RpcRequest, RpcResponse,
     RpcStatus, ServiceDescription, ServiceHealth, ServiceName,
 };
 use neon_ui_schema::{
     UiBounds, UiCommand, UiFragment, UiFragmentId, UiNode, UiNodeKind, UiStyle, UiTransition,
     UiTransitionState, UiSemanticEvent,
 };
+#[cfg(test)]
+use neon_ui_schema::UiFragmentSubmission;
 use serde_json::{Value, json};
 use winit::{
     application::ApplicationHandler,
@@ -502,6 +504,7 @@ impl WindowedRuntime {
             visible: true,
             enabled: true,
             text_key: None,
+            text: None,
             image: None,
             style: UiStyle {
                 background_color: [0.035, 0.06, 0.08, 0.98],
@@ -539,6 +542,7 @@ impl WindowedRuntime {
                     visible: true,
                     enabled: true,
                     text_key: Some("ui.demo.title".into()),
+                    text: None,
                     image: None,
                     style: UiStyle {
                         background_color: [0.12, 0.32, 0.37, 0.94],
@@ -571,6 +575,7 @@ impl WindowedRuntime {
                     visible: true,
                     enabled: true,
                     text_key: Some("ui.demo.action".into()),
+                    text: None,
                     image: None,
                     style: UiStyle {
                         background_color: [0.08, 0.38, 0.44, 1.0],
@@ -694,6 +699,34 @@ impl WgpuRuntime {
 
     pub fn traces(&self, filter: &JournalFilter) -> Vec<TraceRecord> {
         self.journal.query(filter)
+    }
+
+    /// Accepts an owner response that was obtained by querying project/resource through the public protocol.
+    /// The raw bytes stay in the renderer process and are never exposed by a WGPU RPC response.
+    pub fn preload_resource_from_owner(&mut self, request: RpcRequest, content: AssetBytes) -> RpcResponse {
+        let request_id = request.request_id.clone();
+        let asset: AssetRef = match serde_json::from_value(request.params) {
+            Ok(asset) => asset,
+            Err(_) => return self.reject(request_id, "invalid_request", "a stable AssetRef is required", None),
+        };
+        let job_id = format!("ui-resource-{}-{}", asset.asset_id, asset.revision.0);
+        self.resources.insert(asset.asset_id, UiResourceRecord { asset: asset.clone(), job_id: job_id.clone(), state: UiResourceState::Loading });
+        self.journal.append(TraceLevel::Info, "ui.resource.loading", Some(request_id.clone()), None, Some(job_id.clone()), None, Some(asset.revision), None, json!({"asset_id": asset.asset_id, "kind": asset.kind}));
+        if asset != content.asset {
+            return self.fail_resource(request_id, asset, job_id, "asset_revision_mismatch", "owner content does not match the requested AssetRef");
+        }
+        if !matches!(asset.kind.as_str(), "font" | "image") || content.bytes.is_empty() {
+            return self.fail_resource(request_id, asset, job_id, "invalid_resource_content", "owner returned unusable UI resource content");
+        }
+        self.resources.insert(asset.asset_id, UiResourceRecord { asset: asset.clone(), job_id: job_id.clone(), state: UiResourceState::Ready });
+        self.journal.append(TraceLevel::Info, "ui.resource.ready", Some(request_id.clone()), None, Some(job_id.clone()), None, Some(asset.revision), Some(asset.revision), json!({"asset_id": asset.asset_id, "kind": asset.kind, "media_type": content.media_type}));
+        self.accept(request_id, json!({"job_id": job_id, "state": "ready"}))
+    }
+
+    fn fail_resource(&mut self, request_id: RequestId, asset: AssetRef, job_id: String, code: &'static str, message: &'static str) -> RpcResponse {
+        self.resources.insert(asset.asset_id, UiResourceRecord { asset: asset.clone(), job_id: job_id.clone(), state: UiResourceState::Failed });
+        self.journal.append(TraceLevel::Error, "ui.resource.failed", Some(request_id.clone()), None, Some(job_id), None, Some(asset.revision), Some(asset.revision), json!({"asset_id": asset.asset_id, "kind": asset.kind, "code": code}));
+        self.reject(request_id, code, message, Some(asset.revision))
     }
 
     pub fn handle(&mut self, request: RpcRequest) -> RpcResponse {
@@ -824,12 +857,13 @@ impl WgpuRuntime {
                 return self.reject(request_id, "invalid_request", "invalid UI command", None);
             }
         };
-        let UiCommand::SubmitFragment { fragment } = command else {
+        let UiCommand::SubmitFragment { submission } = command else {
             unreachable!()
         };
-        if fragment.validate().is_err() {
-            return self.reject(request_id, "invalid_request", "invalid UI fragment", None);
+        if submission.validate().is_err() {
+            return self.reject(request_id, "invalid_request", "invalid UI fragment submission", None);
         }
+        let fragment = submission.fragment;
         if let Some(current) = self.fragments.get(&fragment.fragment_id)
             && fragment.revision <= current.revision
         {
@@ -963,10 +997,7 @@ impl WgpuRuntime {
         if !matches!(asset.kind.as_str(), "font" | "image") {
             return self.reject(request_id, "unsupported_resource_kind", "only font and image resources are supported", None);
         }
-        let job_id = format!("ui-resource-{}-{}", asset.asset_id, asset.revision.0);
-        self.resources.insert(asset.asset_id, UiResourceRecord { asset: asset.clone(), job_id: job_id.clone(), state: UiResourceState::Ready });
-        self.journal.append(TraceLevel::Info, "ui.resource.ready", Some(request_id.clone()), None, Some(job_id.clone()), None, Some(asset.revision), Some(asset.revision), json!({"asset_id": asset.asset_id, "kind": asset.kind}));
-        self.accept(request_id, json!({"job_id": job_id, "state": "ready"}))
+        self.reject(request_id, "asset_content_required", "query project/resource for revisioned asset bytes before preloading", Some(asset.revision))
     }
 
     fn resource_wait_ready(&mut self, request_id: RequestId, params: Value) -> RpcResponse {
@@ -1127,6 +1158,8 @@ mod tests {
                 visible: true,
                 enabled: true,
                 text_key: None,
+                text: None,
+                image: None,
                 style: UiStyle::default(),
                 enter_transition: None,
                 children: Vec::new(),
@@ -1142,7 +1175,7 @@ mod tests {
             id,
             "wgpu.ui.submit_fragment",
             json!(UiCommand::SubmitFragment {
-                fragment: fragment(revision)
+                submission: UiFragmentSubmission::new(fragment(revision))
             }),
         );
         request.idempotency_key = Some(format!("key-{id}"));
@@ -1194,6 +1227,28 @@ mod tests {
         let response = runtime.handle(submit("stale", 1));
         assert_eq!(response.status, RpcStatus::Rejected);
         assert_eq!(response.error.unwrap().code, "revision_conflict");
+    }
+
+    #[test]
+    fn submit_rejects_unsupported_ui_schema_version() {
+        let mut runtime = WgpuRuntime::headless(1);
+        let request = RpcRequest {
+            idempotency_key: Some("unsupported-schema-key".into()),
+            ..request(
+                "unsupported-schema",
+                "wgpu.ui.submit_fragment",
+                json!(UiCommand::SubmitFragment {
+                    submission: UiFragmentSubmission {
+                        schema_version: neon_ui_schema::UI_FRAGMENT_SCHEMA_VERSION + 1,
+                        fragment: fragment(1),
+                    }
+                }),
+            )
+        };
+        let response = runtime.handle(request);
+        assert_eq!(response.status, RpcStatus::Rejected);
+        assert_eq!(response.error.unwrap().code, "invalid_request");
+        assert_eq!(runtime.diagnostics().fragment_count, 0);
     }
 
     #[test]
@@ -1340,14 +1395,16 @@ mod tests {
             None,
         ))
         .expect("the selected adapter must create a UI acceptance device");
-        ui_renderer::render_offscreen_for_test(
+        let pixels = ui_renderer::render_offscreen_for_test(
             &device,
             &queue,
             wgpu::TextureFormat::Rgba8Unorm,
             &HashMap::from([(UiFragmentId("acceptance".into()), fragment(1))]),
             [64, 64],
             1.0,
+            &[],
         );
+        assert!(pixels.iter().any(|value| *value != 0), "UI render target must contain visible pixels");
     }
 
     #[test]
@@ -1365,10 +1422,10 @@ mod tests {
         root.kind = UiNodeKind::Panel;
         root.bounds = UiBounds { x: 0.0, y: 0.0, width: 64.0, height: 64.0 };
         root.children = vec![
-            UiNode { node_id: UiNodeId("back".into()), kind: UiNodeKind::Button, bounds: UiBounds { x: 8.0, y: 8.0, width: 32.0, height: 32.0 }, layout: None, visible: true, enabled: true, text_key: None, style: UiStyle { corner_radius: 8.0, ..UiStyle::default() }, enter_transition: None, children: Vec::new() },
-            UiNode { node_id: UiNodeId("front".into()), kind: UiNodeKind::Button, bounds: UiBounds { x: 16.0, y: 16.0, width: 32.0, height: 32.0 }, layout: None, visible: true, enabled: true, text_key: None, style: UiStyle::default(), enter_transition: None, children: Vec::new() },
-            UiNode { node_id: UiNodeId("disabled".into()), kind: UiNodeKind::Button, bounds: UiBounds { x: 48.0, y: 48.0, width: 12.0, height: 12.0 }, layout: None, visible: true, enabled: false, text_key: None, style: UiStyle::default(), enter_transition: None, children: Vec::new() },
-            UiNode { node_id: UiNodeId("transparent".into()), kind: UiNodeKind::Button, bounds: UiBounds { x: 48.0, y: 32.0, width: 12.0, height: 12.0 }, layout: None, visible: true, enabled: true, text_key: None, style: UiStyle { opacity: 0.0, ..UiStyle::default() }, enter_transition: None, children: Vec::new() },
+            UiNode { node_id: UiNodeId("back".into()), kind: UiNodeKind::Button, bounds: UiBounds { x: 8.0, y: 8.0, width: 32.0, height: 32.0 }, layout: None, visible: true, enabled: true, text_key: None, text: None, image: None, style: UiStyle { corner_radius: 8.0, ..UiStyle::default() }, enter_transition: None, children: Vec::new() },
+            UiNode { node_id: UiNodeId("front".into()), kind: UiNodeKind::Button, bounds: UiBounds { x: 16.0, y: 16.0, width: 32.0, height: 32.0 }, layout: None, visible: true, enabled: true, text_key: None, text: None, image: None, style: UiStyle::default(), enter_transition: None, children: Vec::new() },
+            UiNode { node_id: UiNodeId("disabled".into()), kind: UiNodeKind::Button, bounds: UiBounds { x: 48.0, y: 48.0, width: 12.0, height: 12.0 }, layout: None, visible: true, enabled: false, text_key: None, text: None, image: None, style: UiStyle::default(), enter_transition: None, children: Vec::new() },
+            UiNode { node_id: UiNodeId("transparent".into()), kind: UiNodeKind::Button, bounds: UiBounds { x: 48.0, y: 32.0, width: 12.0, height: 12.0 }, layout: None, visible: true, enabled: true, text_key: None, text: None, image: None, style: UiStyle { opacity: 0.0, ..UiStyle::default() }, enter_transition: None, children: Vec::new() },
         ];
         let pixels = ui_renderer::render_hit_ids_for_test(&device, &queue, &HashMap::from([(UiFragmentId("hit-acceptance".into()), UiFragment { fragment_id: UiFragmentId("hit-acceptance".into()), revision: Revision(1), root, effects: Vec::new() })]), [64, 64]);
         let at = |x: usize, y: usize| pixels[y * 64 + x];
@@ -1386,8 +1443,8 @@ mod tests {
         let instance = wgpu::Instance::default();
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::LowPower, compatible_surface: None, force_fallback_adapter: true })).or_else(|| pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::LowPower, compatible_surface: None, force_fallback_adapter: false }))).expect("a headless adapter is required");
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor { label: Some("neon3-ui-clip-acceptance"), required_features: wgpu::Features::empty(), required_limits: wgpu::Limits::downlevel_defaults(), memory_hints: wgpu::MemoryHints::MemoryUsage }, None)).expect("a device is required");
-        let child = UiNode { node_id: UiNodeId("clipped-button".into()), kind: UiNodeKind::Button, bounds: UiBounds { x: 24.0, y: 8.0, width: 24.0, height: 16.0 }, layout: None, visible: true, enabled: true, text_key: None, style: UiStyle::default(), enter_transition: None, children: Vec::new() };
-        let root = UiNode { node_id: UiNodeId("clip-root".into()), kind: UiNodeKind::Panel, bounds: UiBounds { x: 0.0, y: 0.0, width: 32.0, height: 32.0 }, layout: Some(neon_ui_schema::UiLayout { clip: true, ..neon_ui_schema::UiLayout::default() }), visible: true, enabled: true, text_key: None, style: UiStyle::default(), enter_transition: None, children: vec![child] };
+        let child = UiNode { node_id: UiNodeId("clipped-button".into()), kind: UiNodeKind::Button, bounds: UiBounds { x: 24.0, y: 8.0, width: 24.0, height: 16.0 }, layout: None, visible: true, enabled: true, text_key: None, text: None, image: None, style: UiStyle::default(), enter_transition: None, children: Vec::new() };
+        let root = UiNode { node_id: UiNodeId("clip-root".into()), kind: UiNodeKind::Panel, bounds: UiBounds { x: 0.0, y: 0.0, width: 32.0, height: 32.0 }, layout: Some(neon_ui_schema::UiLayout { clip: true, ..neon_ui_schema::UiLayout::default() }), visible: true, enabled: true, text_key: None, text: None, image: None, style: UiStyle::default(), enter_transition: None, children: vec![child] };
         let pixels = ui_renderer::render_hit_ids_for_test(&device, &queue, &HashMap::from([(UiFragmentId("clip".into()), UiFragment { fragment_id: UiFragmentId("clip".into()), revision: Revision(1), root, effects: Vec::new() })]), [64, 64]);
         assert_ne!(pixels[12 * 64 + 28], RENDER_HIT_NONE, "child area inside parent clip must be interactive");
         assert_eq!(pixels[12 * 64 + 40], RENDER_HIT_NONE, "child area outside parent clip must be no-hit");
@@ -1491,16 +1548,124 @@ mod tests {
     }
 
     #[test]
-    fn asset_ref_preload_reports_readiness_and_trace() {
+    fn owner_asset_bytes_preload_reports_readiness_and_trace() {
         let mut runtime = WgpuRuntime::headless(1);
         let asset = AssetRef { project_id: "fixture-project".into(), asset_id: 81, revision: Revision(5), kind: "image".into() };
-        let response = runtime.handle(request("preload", "wgpu.ui.resource.preload", json!(asset)));
+        let missing_content = runtime.handle(request("missing-content", "wgpu.ui.resource.preload", json!(asset.clone())));
+        assert_eq!(missing_content.error.unwrap().code, "asset_content_required");
+        let owner_content = AssetBytes { asset: asset.clone(), media_type: "application/x-neon-rgba8".into(), width: Some(2), height: Some(1), bytes: vec![51, 204, 102, 255, 51, 204, 102, 0] };
+        let response = runtime.preload_resource_from_owner(request("preload", "wgpu.ui.resource.preload", json!(asset)), owner_content);
         assert_eq!(response.status, RpcStatus::Accepted);
         assert_eq!(response.result.as_ref().unwrap()["state"], "ready");
         let wait = runtime.handle(request("wait", "wgpu.resource.wait_ready", json!({"asset_id": 81})));
         assert_eq!(wait.result.unwrap()["state"], "ready");
         let trace = runtime.handle(request("trace", "debug.trace.query", json!({"request_id": "preload"})));
         assert!(trace.result.unwrap().as_array().unwrap().iter().any(|record| record["event"] == "ui.resource.ready"));
+    }
+
+    #[test]
+    fn owner_resource_failure_is_queryable_by_job_and_trace() {
+        let mut runtime = WgpuRuntime::headless(1);
+        let asset = AssetRef { project_id: "fixture-project".into(), asset_id: 82, revision: Revision(5), kind: "font".into() };
+        let response = runtime.preload_resource_from_owner(
+            request("font-invalid", "wgpu.ui.resource.preload", json!(asset.clone())),
+            AssetBytes { asset: asset.clone(), media_type: "font/ttf".into(), width: None, height: None, bytes: Vec::new() },
+        );
+        assert_eq!(response.status, RpcStatus::Rejected);
+        assert_eq!(response.error.unwrap().code, "invalid_resource_content");
+        let wait = runtime.handle(request("font-wait", "wgpu.resource.wait_ready", json!({"asset_id": 82})));
+        assert_eq!(wait.status, RpcStatus::Accepted);
+        assert_eq!(wait.result.unwrap()["state"], "failed");
+        let trace = runtime.handle(request("font-trace", "debug.trace.query", json!({"request_id": "font-invalid"})));
+        assert!(trace.result.unwrap().as_array().unwrap().iter().any(|record| record["event"] == "ui.resource.failed"));
+    }
+
+    #[test]
+    fn project_asset_bytes_drive_renderer_private_image_residency() {
+        let asset = AssetRef { project_id: "fixture-project".into(), asset_id: 81, revision: Revision(5), kind: "image".into() };
+        let mut projectd = neon_projectd::Projectd::fixture(3);
+        let describe = projectd.handle(request("project-describe", "service.describe", json!({})));
+        assert_eq!(describe.status, RpcStatus::Accepted);
+        assert!(describe.result.as_ref().unwrap()["capabilities"].as_array().unwrap().iter().any(|capability| capability == neon_projectd::CAPABILITY_ASSET_BYTES));
+        let snapshot = projectd.handle(request("project-snapshot", "debug.snapshot.get", json!({})));
+        assert_eq!(snapshot.status, RpcStatus::Accepted);
+        assert_eq!(snapshot.result.as_ref().unwrap()["revision"], 5);
+        let owner_response = projectd.handle(request("project-asset", "asset.get_bytes", json!(asset.clone())));
+        assert_eq!(owner_response.status, RpcStatus::Accepted);
+        let content: AssetBytes = serde_json::from_value(owner_response.result.unwrap()).unwrap();
+
+        let mut runtime = WgpuRuntime::headless(1);
+        let preload = runtime.preload_resource_from_owner(request("preload", "wgpu.ui.resource.preload", json!(asset.clone())), content.clone());
+        assert_eq!(preload.status, RpcStatus::Accepted);
+        assert_eq!(preload.result.as_ref().unwrap()["job_id"], "ui-resource-81-5");
+        let instance = wgpu::Instance::default();
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::LowPower, compatible_surface: None, force_fallback_adapter: true })).or_else(|| pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::LowPower, compatible_surface: None, force_fallback_adapter: false }))).expect("a headless adapter is required");
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor { label: Some("neon3-ui-image-alpha"), required_features: wgpu::Features::empty(), required_limits: wgpu::Limits::downlevel_defaults(), memory_hints: wgpu::MemoryHints::MemoryUsage }, None)).expect("a device is required");
+        let mut image = fragment(1).root;
+        image.kind = UiNodeKind::Image;
+        image.bounds = UiBounds { x: 0.0, y: 0.0, width: 64.0, height: 64.0 };
+        image.image = Some(AssetRef { project_id: "fixture-project".into(), asset_id: 81, revision: Revision(5), kind: "image".into() });
+        image.style = UiStyle { background_color: [0.2, 0.8, 0.4, 1.0], border_color: [0.0; 4], border_width: 0.0, corner_radius: 0.0, opacity: 1.0 };
+        let fragments = HashMap::from([(UiFragmentId("image".into()), UiFragment { fragment_id: UiFragmentId("image".into()), revision: Revision(1), root: image, effects: Vec::new() })]);
+        let unresolved = ui_renderer::render_offscreen_for_test(&device, &queue, wgpu::TextureFormat::Rgba8Unorm, &fragments, [64, 64], 1.0, &[]);
+        assert_eq!(unresolved[4 * (16 * 64 + 16) + 3], 0, "an unresolved AssetRef must not render a fixture image");
+        let pixels = ui_renderer::render_offscreen_for_test(&device, &queue, wgpu::TextureFormat::Rgba8Unorm, &fragments, [64, 64], 1.0, &[content]);
+        assert!(pixels[4 * (16 * 64 + 16) + 3] > 0, "the opaque image half must render alpha");
+        assert_eq!(pixels[4 * (16 * 64 + 48) + 3], 0, "the transparent image half must preserve alpha");
+    }
+
+    #[test]
+    fn project_font_bytes_drive_renderer_private_readiness() {
+        let asset = AssetRef { project_id: "fixture-project".into(), asset_id: 82, revision: Revision(5), kind: "font".into() };
+        let mut projectd = neon_projectd::Projectd::fixture(3);
+        assert_eq!(projectd.handle(request("font-project-describe", "service.describe", json!({}))).status, RpcStatus::Accepted);
+        assert_eq!(projectd.handle(request("font-project-snapshot", "debug.snapshot.get", json!({}))).status, RpcStatus::Accepted);
+        let owner_response = projectd.handle(request("font-project-asset", "asset.get_bytes", json!(asset.clone())));
+        let content: AssetBytes = serde_json::from_value(owner_response.result.unwrap()).unwrap();
+        assert_eq!(content.media_type, "font/ttf");
+
+        let mut runtime = WgpuRuntime::headless(1);
+        let preload = runtime.preload_resource_from_owner(request("font-preload", "wgpu.ui.resource.preload", json!(asset)), content);
+        assert_eq!(preload.status, RpcStatus::Accepted);
+        assert_eq!(preload.result.unwrap()["job_id"], "ui-resource-82-5");
+        let wait = runtime.handle(request("font-wait", "wgpu.resource.wait_ready", json!({"asset_id": 82})));
+        assert_eq!(wait.result.unwrap()["state"], "ready");
+        let trace = runtime.handle(request("font-trace", "debug.trace.query", json!({"request_id": "font-preload"})));
+        assert!(trace.result.unwrap().as_array().unwrap().iter().any(|record| record["event"] == "ui.resource.ready"));
+    }
+
+    #[test]
+    fn project_font_preload_job_drives_private_text_glyph_residency() {
+        let asset = AssetRef { project_id: "fixture-project".into(), asset_id: 82, revision: Revision(5), kind: "font".into() };
+        let mut projectd = neon_projectd::Projectd::fixture(3);
+        assert_eq!(projectd.handle(request("font-glyph-project-describe", "service.describe", json!({}))).status, RpcStatus::Accepted);
+        assert_eq!(projectd.handle(request("font-glyph-project-snapshot", "debug.snapshot.get", json!({}))).status, RpcStatus::Accepted);
+        let owner_response = projectd.handle(request("font-glyph-project-asset", "asset.get_bytes", json!(asset.clone())));
+        assert_eq!(owner_response.status, RpcStatus::Accepted);
+        let content: AssetBytes = serde_json::from_value(owner_response.result.unwrap()).unwrap();
+
+        let mut runtime = WgpuRuntime::headless(1);
+        let preload = runtime.preload_resource_from_owner(request("font-glyph-preload", "wgpu.ui.resource.preload", json!(asset)), content.clone());
+        assert_eq!(preload.status, RpcStatus::Accepted);
+        assert_eq!(preload.result.as_ref().unwrap()["job_id"], "ui-resource-82-5");
+        let trace = runtime.handle(request("font-glyph-trace", "debug.trace.query", json!({"request_id": "font-glyph-preload"})));
+        assert!(trace.result.unwrap().as_array().unwrap().iter().any(|record| record["event"] == "ui.resource.ready"));
+
+        let instance = wgpu::Instance::default();
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::LowPower, compatible_surface: None, force_fallback_adapter: true }))
+            .or_else(|| pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::LowPower, compatible_surface: None, force_fallback_adapter: false })))
+            .expect("a headless adapter is required");
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor { label: Some("neon3-ui-font-glyph"), required_features: wgpu::Features::empty(), required_limits: wgpu::Limits::downlevel_defaults(), memory_hints: wgpu::MemoryHints::MemoryUsage }, None)).expect("a device is required");
+        let mut text = fragment(1).root;
+        text.kind = UiNodeKind::Label;
+        text.bounds = UiBounds { x: 4.0, y: 4.0, width: 56.0, height: 24.0 };
+        text.text = Some(neon_ui_schema::TextRef::Literal { value: "A".into() });
+        text.style = UiStyle { background_color: [0.0; 4], border_color: [0.0; 4], border_width: 0.0, corner_radius: 0.0, opacity: 1.0 };
+        let fragments = HashMap::from([(UiFragmentId("font-glyph".into()), UiFragment { fragment_id: UiFragmentId("font-glyph".into()), revision: Revision(1), root: text, effects: Vec::new() })]);
+        let unresolved = ui_renderer::render_offscreen_for_test(&device, &queue, wgpu::TextureFormat::Rgba8Unorm, &fragments, [64, 32], 1.0, &[]);
+        assert!(!unresolved.chunks_exact(4).any(|pixel| pixel[3] > 0), "unresolved TextRef must not render glyph pixels");
+        let pixels = ui_renderer::render_offscreen_for_test(&device, &queue, wgpu::TextureFormat::Rgba8Unorm, &fragments, [64, 32], 1.0, &[content]);
+        assert!(pixels.chunks_exact(4).any(|pixel| pixel[3] > 0), "accepted owner font content must drive private glyph pixels");
     }
 
     #[test]
@@ -1526,7 +1691,7 @@ mod tests {
         let mut submit_request = request(
             "submit",
             "wgpu.ui.submit_fragment",
-            json!(UiCommand::SubmitFragment { fragment: semantic_fragment }),
+            json!(UiCommand::SubmitFragment { submission: UiFragmentSubmission::new(semantic_fragment) }),
         );
         submit_request.idempotency_key = Some("submit-key".into());
         runtime.handle(submit_request);

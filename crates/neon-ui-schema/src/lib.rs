@@ -4,6 +4,10 @@
 use neon_protocol::{AssetRef, Revision};
 use serde::{Deserialize, Serialize};
 
+/// Version of the renderer-independent UI declaration contract.
+/// This is deliberately separate from the RPC transport version.
+pub const UI_FRAGMENT_SCHEMA_VERSION: u16 = 1;
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct UiFragmentId(pub String);
@@ -22,6 +26,29 @@ pub struct UiFragment {
     pub effects: Vec<UiEffect>,
 }
 
+/// The only payload accepted by `wgpu.ui.submit_fragment`.
+/// It contains declarative UI data only; React/TS component state and render handles
+/// are intentionally outside this contract.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiFragmentSubmission {
+    pub schema_version: u16,
+    pub fragment: UiFragment,
+}
+
+impl UiFragmentSubmission {
+    pub fn new(fragment: UiFragment) -> Self {
+        Self { schema_version: UI_FRAGMENT_SCHEMA_VERSION, fragment }
+    }
+
+    pub fn validate(&self) -> Result<(), UiSchemaError> {
+        if self.schema_version != UI_FRAGMENT_SCHEMA_VERSION {
+            return Err(UiSchemaError::UnsupportedSchemaVersion);
+        }
+        self.fragment.validate()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UiNode {
@@ -33,6 +60,8 @@ pub struct UiNode {
     pub visible: bool,
     pub enabled: bool,
     pub text_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<TextRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<AssetRef>,
     #[serde(default, skip_serializing_if = "UiStyle::is_default")]
@@ -48,6 +77,15 @@ pub enum UiNodeKind {
     Panel,
     Label,
     Button,
+    Image,
+}
+
+/// Source-independent text declaration. Renderers receive resolved immutable content only.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TextRef {
+    Key { key: String, arguments: serde_json::Value },
+    Literal { value: String },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -240,7 +278,7 @@ pub const ERROR_INPUT_SEQUENCE_STALE: &str = "input_sequence_stale";
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum UiCommand {
     SubmitFragment {
-        fragment: UiFragment,
+        submission: UiFragmentSubmission,
     },
     RemoveFragment {
         fragment_id: UiFragmentId,
@@ -250,6 +288,7 @@ pub enum UiCommand {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UiSchemaError {
+    UnsupportedSchemaVersion,
     EmptyFragmentId,
     EmptyNodeId,
     EmptyAction,
@@ -258,6 +297,8 @@ pub enum UiSchemaError {
     InvalidTransition,
     InvalidLayout,
     DuplicateNodeId,
+    MissingImageAsset,
+    InvalidText,
 }
 
 impl UiFragment {
@@ -284,6 +325,10 @@ impl UiNode {
         if !self.style.is_valid() {
             return Err(UiSchemaError::InvalidStyle);
         }
+        if self.kind == UiNodeKind::Image && self.image.is_none() {
+            return Err(UiSchemaError::MissingImageAsset);
+        }
+        if self.text.as_ref().is_some_and(|text| !text.is_valid()) { return Err(UiSchemaError::InvalidText); }
         if self.layout.is_some_and(|layout| !layout.is_valid()) { return Err(UiSchemaError::InvalidLayout); }
         let mut child_ids = std::collections::HashSet::new();
         for child in &self.children {
@@ -387,6 +432,15 @@ impl UiIntent {
     }
 }
 
+impl TextRef {
+    fn is_valid(&self) -> bool {
+        match self {
+            Self::Key { key, .. } => !key.trim().is_empty(),
+            Self::Literal { value } => !value.is_empty(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -402,6 +456,25 @@ mod tests {
             serde_json::to_value(fragment).unwrap(),
             serde_json::from_str::<Value>(STATIC_FRAGMENT).unwrap()
         );
+    }
+
+    #[test]
+    fn submission_is_versioned_declarative_data() {
+        let fragment: UiFragment = serde_json::from_str(STATIC_FRAGMENT).unwrap();
+        let submission = UiFragmentSubmission::new(fragment);
+        submission.validate().unwrap();
+        let encoded = serde_json::to_value(&submission).unwrap().to_string();
+        assert!(encoded.contains("schema_version"));
+        for forbidden in ["react", "jsx", "callback", "wgpu", "window", "handle"] {
+            assert!(!encoded.contains(forbidden), "submission contains {forbidden}");
+        }
+    }
+
+    #[test]
+    fn submission_rejects_unknown_schema_version() {
+        let fragment: UiFragment = serde_json::from_str(STATIC_FRAGMENT).unwrap();
+        let submission = UiFragmentSubmission { schema_version: UI_FRAGMENT_SCHEMA_VERSION + 1, fragment };
+        assert_eq!(submission.validate(), Err(UiSchemaError::UnsupportedSchemaVersion));
     }
 
     #[test]
@@ -501,10 +574,10 @@ mod tests {
             node_id: UiNodeId("root".into()), kind: UiNodeKind::Panel,
             bounds: UiBounds { x: 0.0, y: 0.0, width: 100.0, height: 60.0 },
             layout: Some(UiLayout { mode, padding: [4.0, 4.0, 4.0, 4.0], gap: 3.0, ..UiLayout::default() }),
-            visible: true, enabled: true, text_key: None, style: UiStyle::default(), enter_transition: None,
+            visible: true, enabled: true, text_key: None, text: None, image: None, style: UiStyle::default(), enter_transition: None,
             children: vec![
-                UiNode { node_id: UiNodeId("a".into()), kind: UiNodeKind::Button, bounds: UiBounds { x: 0.0, y: 0.0, width: 20.0, height: 10.0 }, layout: Some(UiLayout { margin: [1.0, 2.0, 3.0, 4.0], ..UiLayout::default() }), visible: true, enabled: true, text_key: None, style: UiStyle::default(), enter_transition: None, children: Vec::new() },
-                UiNode { node_id: UiNodeId("b".into()), kind: UiNodeKind::Button, bounds: UiBounds { x: 0.0, y: 0.0, width: 20.0, height: 10.0 }, layout: None, visible: true, enabled: true, text_key: None, style: UiStyle::default(), enter_transition: None, children: Vec::new() },
+                UiNode { node_id: UiNodeId("a".into()), kind: UiNodeKind::Button, bounds: UiBounds { x: 0.0, y: 0.0, width: 20.0, height: 10.0 }, layout: Some(UiLayout { margin: [1.0, 2.0, 3.0, 4.0], ..UiLayout::default() }), visible: true, enabled: true, text_key: None, text: None, image: None, style: UiStyle::default(), enter_transition: None, children: Vec::new() },
+                UiNode { node_id: UiNodeId("b".into()), kind: UiNodeKind::Button, bounds: UiBounds { x: 0.0, y: 0.0, width: 20.0, height: 10.0 }, layout: None, visible: true, enabled: true, text_key: None, text: None, image: None, style: UiStyle::default(), enter_transition: None, children: Vec::new() },
             ],
         }
     }
@@ -537,5 +610,35 @@ mod tests {
         let mut node = layout_node(UiLayoutMode::Overlay);
         node.children[1].node_id = node.children[0].node_id.clone();
         assert_eq!(node.validate(), Err(UiSchemaError::DuplicateNodeId));
+    }
+
+    #[test]
+    fn image_nodes_require_a_stable_asset_ref_without_a_path() {
+        let mut node = layout_node(UiLayoutMode::Absolute);
+        node.kind = UiNodeKind::Image;
+        assert_eq!(node.validate(), Err(UiSchemaError::MissingImageAsset));
+        node.image = Some(AssetRef {
+            project_id: "fixture-project".into(),
+            asset_id: 81,
+            revision: Revision(5),
+            kind: "image".into(),
+        });
+        node.validate().unwrap();
+        let value = serde_json::to_value(node).unwrap();
+        assert!(value["image"].get("path").is_none());
+        assert_eq!(value["image"]["asset_id"], 81);
+    }
+
+    #[test]
+    fn text_ref_is_source_independent_and_rejects_empty_content() {
+        let mut node = layout_node(UiLayoutMode::Absolute);
+        node.text = Some(TextRef::Key { key: "ui.fixture.label".into(), arguments: serde_json::json!({"count": 2}) });
+        node.validate().unwrap();
+        let encoded = serde_json::to_value(&node).unwrap().to_string();
+        for forbidden in ["path", "font_file", "wgpu", "handle"] {
+            assert!(!encoded.contains(forbidden), "text declaration contains {forbidden}");
+        }
+        node.text = Some(TextRef::Literal { value: String::new() });
+        assert_eq!(node.validate(), Err(UiSchemaError::InvalidText));
     }
 }

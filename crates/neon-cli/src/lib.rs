@@ -8,7 +8,7 @@ use neon_protocol::{
     RpcStatus, ServiceName,
 };
 use neon_ui_schema::{
-    UiBounds, UiCommand, UiEffect, UiFragment, UiFragmentId, UiNode, UiNodeId, UiNodeKind, UiStyle,
+    UiBounds, UiCommand, UiEffect, UiFragment, UiFragmentId, UiFragmentSubmission, UiNode, UiNodeId, UiNodeKind, UiStyle,
 };
 use serde_json::{Value, json};
 
@@ -31,7 +31,7 @@ pub fn run_headless_scenario(endpoint: SocketAddr) -> Result<Value, TransportErr
     }
 
     let command = UiCommand::SubmitFragment {
-        fragment: static_fragment(Revision(1)),
+        submission: UiFragmentSubmission::new(static_fragment(Revision(1))),
     };
     let submit = call(
         endpoint,
@@ -50,7 +50,7 @@ pub fn run_headless_scenario(endpoint: SocketAddr) -> Result<Value, TransportErr
         "submit-duplicate-1",
         "wgpu.ui.submit_fragment",
         json!(UiCommand::SubmitFragment {
-            fragment: static_fragment(Revision(2))
+            submission: UiFragmentSubmission::new(static_fragment(Revision(2)))
         }),
         Some("submit-key-1"),
     )?;
@@ -133,6 +133,7 @@ pub fn static_fragment(revision: Revision) -> UiFragment {
             visible: true,
             enabled: true,
             text_key: None,
+            text: None,
             image: None,
             style: UiStyle::default(),
             enter_transition: None,

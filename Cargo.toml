@@ -3,6 +3,7 @@ members = [
     "crates/neon-protocol",
     "crates/neon-ipc",
     "crates/neon-observability",
+    "crates/neon-projectd",
     "crates/neon-ui-schema",
     "crates/neon-wgpu-runtime",
     "crates/neon-ui-runtime",
@@ -22,3 +23,4 @@ bytemuck = { version = "1.24", features = ["derive"] }
 pollster = "0.4"
 wgpu = "24.0"
 winit = "0.30"
+fontdue = "0.9"

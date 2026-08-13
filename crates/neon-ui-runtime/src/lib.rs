@@ -12,7 +12,7 @@ use neon_protocol::{
     Revision, RpcError, RpcRequest, RpcResponse, RpcStatus, ServiceDescription, ServiceHealth, ServiceName,
 };
 use neon_ui_schema::{
-    UiBounds, UiCommand, UiEffect, UiFragment, UiFragmentId, UiNode, UiNodeId, UiNodeKind, UiStyle,
+    UiBounds, UiCommand, UiEffect, UiFragment, UiFragmentId, UiFragmentSubmission, UiNode, UiNodeId, UiNodeKind, UiStyle,
     UiSemanticEvent, UiTransition, UiTransitionState, ERROR_FRAGMENT_REVISION_STALE,
     ERROR_INPUT_SEQUENCE_STALE, ERROR_INTENT_NOT_BOUND, ERROR_RENDERER_EPOCH_MISMATCH,
 };
@@ -215,6 +215,7 @@ impl UiRuntime {
                 visible: true,
                 enabled: true,
                 text_key: None,
+                text: None,
                 image: None,
                 style: UiStyle {
                     background_color: [0.055, 0.07, 0.09, 0.98],
@@ -251,6 +252,7 @@ impl UiRuntime {
                     visible: true,
                     enabled: true,
                     text_key: Some("ui.static.title".into()),
+                    text: None,
                     image: None,
                     style: UiStyle {
                         background_color: [0.16, 0.23, 0.28, 0.9],
@@ -294,7 +296,7 @@ impl UiRuntime {
             target: ServiceName("wgpu-runtime".into()),
             method: "wgpu.ui.submit_fragment".into(),
             params: json!(UiCommand::SubmitFragment {
-                fragment: fragment.clone()
+                submission: UiFragmentSubmission::new(fragment.clone())
             }),
             expected_revision: None,
             idempotency_key: Some(idempotency_key),
