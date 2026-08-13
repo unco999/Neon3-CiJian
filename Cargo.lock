@@ -20,6 +20,8 @@ version = "0.1.0"
 dependencies = [
  "neon-ipc",
  "neon-protocol",
+ "neon-ui-schema",
+ "serde_json",
 ]
 
 [[package]]
@@ -72,6 +74,7 @@ dependencies = [
 name = "neon-wgpu-runtime"
 version = "0.1.0"
 dependencies = [
+ "neon-ipc",
  "neon-observability",
  "neon-protocol",
  "neon-ui-schema",

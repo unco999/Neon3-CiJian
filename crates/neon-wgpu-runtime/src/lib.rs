@@ -35,6 +35,7 @@ pub struct WgpuRuntime {
     fragments: HashMap<UiFragmentId, UiFragment>,
     journal: CommandJournal,
     receipts: HashMap<RequestId, CommandReceipt>,
+    idempotent_responses: HashMap<String, RpcResponse>,
 }
 
 impl WgpuRuntime {
@@ -45,6 +46,7 @@ impl WgpuRuntime {
             fragments: HashMap::new(),
             journal: CommandJournal::new(ServiceName(SERVICE_NAME.into()), epoch, 128),
             receipts: HashMap::new(),
+            idempotent_responses: HashMap::new(),
         }
     }
 
@@ -108,16 +110,36 @@ impl WgpuRuntime {
         );
         self.record_receipt(&request_id, CommandState::Received, None);
 
-        match request.method.as_str() {
+        if matches!(request.method.as_str(), "wgpu.ui.submit_fragment" | "wgpu.ui.remove_fragment") {
+            let Some(idempotency_key) = request.idempotency_key.as_ref() else {
+                return self.reject(request_id, "invalid_request", "idempotency_key is required", None);
+            };
+            if let Some(response) = self.idempotent_responses.get(idempotency_key) {
+                let mut response = response.clone();
+                response.request_id = request_id.clone();
+                self.record_receipt(&request_id, CommandState::Accepted, None);
+                return response;
+            }
+        }
+
+        let response = match request.method.as_str() {
             "service.health" => self.accept(request_id, json!(self.service_health())),
             "service.describe" => self.accept(request_id, json!(self.service_description())),
             "wgpu.render.diagnostics" => self.accept(request_id, diagnostics_value(self.diagnostics())),
             "debug.snapshot.get" => self.accept(request_id, json!(self.debug_snapshot())),
             "debug.command.get" => self.command_get(request_id, request.params),
+            "debug.trace.query" => self.trace_query(request_id, request.params),
             "wgpu.ui.submit_fragment" => self.submit_fragment(request_id, request.params),
             "wgpu.ui.remove_fragment" => self.remove_fragment(request_id, request.params),
             _ => self.reject(request_id, "unsupported_method", "method is not supported", None),
+        };
+        if matches!(request.method.as_str(), "wgpu.ui.submit_fragment" | "wgpu.ui.remove_fragment")
+            && response.status == RpcStatus::Accepted
+            && let Some(idempotency_key) = request.idempotency_key
+        {
+            self.idempotent_responses.insert(idempotency_key, response.clone());
         }
+        response
     }
 
     fn command_get(&mut self, request_id: RequestId, params: Value) -> RpcResponse {
@@ -128,6 +150,17 @@ impl WgpuRuntime {
             Some(receipt) => self.accept(request_id, json!(receipt)),
             None => self.reject(request_id, "not_found", "command receipt was not found", None),
         }
+    }
+
+    fn trace_query(&mut self, request_id: RequestId, params: Value) -> RpcResponse {
+        let filter = JournalFilter {
+            request_id: params
+                .get("request_id")
+                .and_then(Value::as_str)
+                .map(|value| RequestId(value.into())),
+            ..JournalFilter::default()
+        };
+        self.accept(request_id, json!(self.traces(&filter)))
     }
 
     fn submit_fragment(&mut self, request_id: RequestId, params: Value) -> RpcResponse {
@@ -295,7 +328,9 @@ mod tests {
     }
 
     fn submit(id: &str, revision: u64) -> RpcRequest {
-        request(id, "wgpu.ui.submit_fragment", json!(UiCommand::SubmitFragment { fragment: fragment(revision) }))
+        let mut request = request(id, "wgpu.ui.submit_fragment", json!(UiCommand::SubmitFragment { fragment: fragment(revision) }));
+        request.idempotency_key = Some(format!("key-{id}"));
+        request
     }
 
     #[test]
@@ -335,9 +370,26 @@ mod tests {
             fragment_id: UiFragmentId("static-fragment".into()),
             revision: Revision(1),
         });
-        assert_eq!(runtime.handle(request("remove-one", "wgpu.ui.remove_fragment", params.clone())).status, RpcStatus::Accepted);
-        assert_eq!(runtime.handle(request("remove-two", "wgpu.ui.remove_fragment", params)).status, RpcStatus::Accepted);
+        let mut first = request("remove-one", "wgpu.ui.remove_fragment", params.clone());
+        first.idempotency_key = Some("remove-one".into());
+        let mut second = request("remove-two", "wgpu.ui.remove_fragment", params);
+        second.idempotency_key = Some("remove-two".into());
+        assert_eq!(runtime.handle(first).status, RpcStatus::Accepted);
+        assert_eq!(runtime.handle(second).status, RpcStatus::Accepted);
         assert_eq!(runtime.diagnostics().fragment_count, 0);
+    }
+
+    #[test]
+    fn repeated_idempotency_key_does_not_mutate_twice() {
+        let mut runtime = WgpuRuntime::headless(1);
+        let first = runtime.handle(submit("first", 1));
+        let mut repeat = submit("repeat", 2);
+        repeat.idempotency_key = Some("key-first".into());
+        let repeated = runtime.handle(repeat);
+        assert_eq!(first.status, RpcStatus::Accepted);
+        assert_eq!(repeated.status, RpcStatus::Accepted);
+        assert_eq!(runtime.diagnostics().graph_revision, Revision(1));
+        assert_eq!(runtime.diagnostics().fragment_count, 1);
     }
 
     #[test]

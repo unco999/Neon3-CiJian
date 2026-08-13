@@ -126,7 +126,7 @@ neon-sessiond       可选监督与服务发现
 | M5 | UI declaration schema | M2 | contract-ready | 已完成 |
 | M6 | WGPU runtime ownership skeleton | M3、M5 | gpu-ready / composition-ready | 已完成 |
 | M7 | UI runtime 静态 fragment sender | M3、M5 | service-ready | 已完成 |
-| M8 | CLI 与 headless vertical slice | M4、M6、M7 | service-ready / composition-ready | 未完成 |
+| M8 | CLI 与 headless vertical slice | M4、M6、M7 | service-ready / composition-ready | 已完成 |
 | M9 | 第一阶段审计与用户窗口验收准备 | M8 | acceptance handoff | 未完成 |
 | M10 | 高速交互数据面评估与可选 fast path | M9 | latency-ready | 未完成 |
 
@@ -605,10 +605,10 @@ blocker: none|...
 
 ### 当前状态
 
-- 当前里程碑：`M7`
+- 当前里程碑：`M8`
 - 当前状态：`已完成`
-- acceptance level：`service-ready`（M7 static fragment submit/rejection/service-method tests 均通过；未启动窗口）
-- 下一步：下一 cycle 重新读取固定上下文，选择 M8 并先建立 CLI headless scenario contract tests
+- acceptance level：`service-ready` / `composition-ready`（跨进程 headless protocol scenario、WGPU registry diagnostics、receipt/trace 查询均通过；未初始化 GPU、未启动窗口）
+- 下一步：下一 cycle 重新读取固定上下文，选择 M9 并执行第一阶段架构/验收审计
 - 用户拥有的验收：尚未开始；没有授权启动 Neon3 窗口
 
 ### 记录规则
@@ -626,6 +626,22 @@ user_acceptance: not requested; no window launched
 ```
 
 ### 施工日志
+
+2026-08-13 | M8 | 已完成
+files: `Cargo.lock`, `crates/neon-wgpu-runtime/Cargo.toml`, `crates/neon-wgpu-runtime/src/lib.rs`, `crates/neon-wgpu-runtime/src/main.rs`, `crates/neon-cli/Cargo.toml`, `crates/neon-cli/src/lib.rs`, `crates/neon-cli/src/main.rs`, `plan/neon3-first-work-plan.md`
+checks: `cargo test --workspace` = failed（CLI failure-result JSON 的 `&String` / `&str` type mismatch）; `cargo test --workspace` = passed; `cargo run -p neon-cli -- --help` = passed; `cargo run -p neon-cli -- scenario ui.static-fragment.submit.v1 --headless` = passed（machine JSON: `status=passed`, graph revision `1`, fragment count `1`, request IDs `health-1`, `describe-1`, `submit-1`, `submit-duplicate-1`, `diagnostics-1`, `receipt-1`, `traces-1`; submit trace records sequence `5` and `6`）；`git diff --check` = passed; 未启动窗口
+commit: pending（仅提交 M8 files 和本条 Progress 记录；不包含用户/并行修改的 `.gitignore` 或未跟踪 `AGENTS.md`）
+remaining: M9 第一阶段审计与用户窗口验收准备；M8 重复 idempotency key 未使 graph revision 从 `1` 增加，且每个 RPC 使用新 loopback connection，describe 在 health connection 关闭后完成
+next: 重新读取 `AGENTS.md`、Progress、目录和 Git 状态后，执行 M9 dependency/service/mutation/journal/ownership audit 并重跑 workspace/M8 scenario
+user_acceptance: 未开始；未授权启动 Neon3 窗口
+
+2026-08-13 | M8 | 进行中
+files: `crates/neon-wgpu-runtime/Cargo.toml`, `crates/neon-wgpu-runtime/src/lib.rs`, `crates/neon-wgpu-runtime/src/main.rs`, `crates/neon-cli/Cargo.toml`, `crates/neon-cli/src/lib.rs`, `crates/neon-cli/src/main.rs`, `plan/neon3-first-work-plan.md`
+checks: `cargo test --workspace` = failed（`neon-cli` scenario failure JSON mixed `&String` 与 `&str`）; `cargo run -p neon-cli -- --help` = not-run; `cargo run -p neon-cli -- scenario ui.static-fragment.submit.v1 --headless` = not-run; 未启动窗口
+commit: none
+remaining: 验证 CLI 启动独立 headless WGPU process，依公开 TCP protocol 读取 health/describe、提交 idempotent static fragment、查询 diagnostics/receipt/trace 并输出 JSON；不创建窗口
+next: 运行 `cargo test --workspace`
+user_acceptance: 未开始；未授权启动 Neon3 窗口
 
 2026-08-13 | M7 | 已完成
 files: `Cargo.lock`, `crates/neon-ui-runtime/Cargo.toml`, `crates/neon-ui-runtime/src/lib.rs`, `crates/neon-ui-runtime/src/main.rs`, `plan/neon3-first-work-plan.md`
