@@ -605,10 +605,10 @@ blocker: none|...
 
 ### 当前状态
 
-- 当前里程碑：`M8`
+- 当前里程碑：`M6`
 - 当前状态：`已完成`
-- acceptance level：`service-ready` / `composition-ready`（跨进程 headless protocol scenario、WGPU registry diagnostics、receipt/trace 查询均通过；未初始化 GPU、未启动窗口）
-- 下一步：下一 cycle 重新读取固定上下文，选择 M9 并执行第一阶段架构/验收审计
+- acceptance level：`gpu-ready` / `composition-ready`（唯一 WGPU runtime 已在 headless mode 成功创建 adapter/device/queue，并验证 fragment registry；未启动窗口或 surface）
+- 下一步：下一 cycle 重新读取固定上下文，恢复 M9 并重跑 cross-process M8 scenario 后完成审计
 - 用户拥有的验收：尚未开始；没有授权启动 Neon3 窗口
 
 ### 记录规则
@@ -626,6 +626,22 @@ user_acceptance: not requested; no window launched
 ```
 
 ### 施工日志
+
+2026-08-13 | M6 | 已完成（M9 审计后修正）
+files: `Cargo.toml`, `Cargo.lock`, `crates/neon-wgpu-runtime/Cargo.toml`, `crates/neon-wgpu-runtime/src/lib.rs`, `plan/neon3-first-work-plan.md`
+checks: `cargo test -p neon-wgpu-runtime` = passed（8 tests，含 `headless_gpu_adapter_device_and_queue_are_ready`）；`cargo check -p neon-wgpu-runtime` = passed; `cargo test --workspace` = passed; `git diff --check` = passed; 未启动窗口
+commit: pending（仅提交 M6 GPU-ready correction 和相关 Progress records；不包含用户/并行修改的 `.gitignore` 或未跟踪 `AGENTS.md`）
+remaining: 恢复 M9 audit；headless adapter/device/queue 证明 `gpu-ready`，registry 证明 `composition-ready`，但没有 surface target capture，不能写 `wgpu-rendered` 或 `interactive-accepted`
+next: 重新读取 `AGENTS.md`、Progress、目录和 Git 状态后，恢复 M9 并执行 workspace/M8 scenario 与 final architecture audit
+user_acceptance: 未开始；未授权启动 Neon3 窗口
+
+2026-08-13 | M9 | 进行中
+files: `plan/neon3-first-work-plan.md`
+checks: `Glob crates/*/Cargo.toml` = passed; `Grep crates -- *.rs -- wgpu/winit/Window/Device/Queue` = passed（仅 `neon-wgpu-runtime` 的 ownership test 保存 forbidden-token list）; `Grep` mutation/service/journal terms = passed（WGPU mutation handler enforces idempotency key，CLI scenario queries `debug.command.get` and `debug.trace.query`）; `rg` = failed（executable not installed，已用 workspace Glob/Grep 替代）; `cargo search wgpu --limit 1` = passed; `cargo info wgpu@24.0.0` = passed; 未启动窗口
+commit: none
+remaining: M9 不可完成：审计发现 M6 只有 headless registry evidence，未初始化 adapter/device/queue，不能按计划写 `gpu-ready`。M6 已恢复为进行中；需在唯一允许的 `neon-wgpu-runtime` crate 增加 headless GPU check，再重跑 M6/M8/M9 checks
+next: 修改 `crates/neon-wgpu-runtime`，添加 WGPU-only headless adapter/device/queue test 与 `service.shutdown` handler
+user_acceptance: 未开始；未授权启动 Neon3 窗口
 
 2026-08-13 | M8 | 已完成
 files: `Cargo.lock`, `crates/neon-wgpu-runtime/Cargo.toml`, `crates/neon-wgpu-runtime/src/lib.rs`, `crates/neon-wgpu-runtime/src/main.rs`, `crates/neon-cli/Cargo.toml`, `crates/neon-cli/src/lib.rs`, `crates/neon-cli/src/main.rs`, `plan/neon3-first-work-plan.md`

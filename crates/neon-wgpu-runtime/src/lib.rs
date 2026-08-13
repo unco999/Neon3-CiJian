@@ -125,6 +125,7 @@ impl WgpuRuntime {
         let response = match request.method.as_str() {
             "service.health" => self.accept(request_id, json!(self.service_health())),
             "service.describe" => self.accept(request_id, json!(self.service_description())),
+            "service.shutdown" => self.accept(request_id, json!({"state": "accepted"})),
             "wgpu.render.diagnostics" => self.accept(request_id, diagnostics_value(self.diagnostics())),
             "debug.snapshot.get" => self.accept(request_id, json!(self.debug_snapshot())),
             "debug.command.get" => self.command_get(request_id, request.params),
@@ -414,5 +415,30 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn headless_gpu_adapter_device_and_queue_are_ready() {
+        let instance = wgpu::Instance::default();
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::LowPower,
+            compatible_surface: None,
+            force_fallback_adapter: true,
+        }))
+        .or_else(|| {
+            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::LowPower,
+                compatible_surface: None,
+                force_fallback_adapter: false,
+            }))
+        })
+        .expect("a headless WGPU adapter is required for gpu-ready evidence");
+        let (_device, _queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("neon3-headless-acceptance"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::downlevel_defaults(),
+            memory_hints: wgpu::MemoryHints::MemoryUsage,
+        }, None))
+        .expect("the selected headless adapter must create a device and queue");
     }
 }
