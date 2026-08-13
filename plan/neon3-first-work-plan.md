@@ -123,7 +123,7 @@ neon-sessiond       可选监督与服务发现
 | M2 | 公共协议 schema | M1 | contract-ready | 已完成 |
 | M3 | IPC framing 与 request lifecycle | M2 | contract-ready | 已完成 |
 | M4 | 可观察性与 command journal | M2 | contract-ready | 已完成 |
-| M5 | UI declaration schema | M2 | contract-ready | 未完成 |
+| M5 | UI declaration schema | M2 | contract-ready | 已完成 |
 | M6 | WGPU runtime ownership skeleton | M3、M5 | gpu-ready / composition-ready | 未完成 |
 | M7 | UI runtime 静态 fragment sender | M3、M5 | service-ready | 未完成 |
 | M8 | CLI 与 headless vertical slice | M4、M6、M7 | service-ready / composition-ready | 未完成 |
@@ -605,10 +605,10 @@ blocker: none|...
 
 ### 当前状态
 
-- 当前里程碑：`M4`
+- 当前里程碑：`M5`
 - 当前状态：`已完成`
-- acceptance level：`contract-ready`（M4 typed trace、receipt、snapshot 与 bounded journal tests 均通过）
-- 下一步：下一 cycle 重新读取固定上下文，选择 M5 并先建立 UI declaration schema tests
+- acceptance level：`contract-ready`（M5 static declaration fixture、validation 与 serialization tests 均通过）
+- 下一步：下一 cycle 重新读取固定上下文，选择 M6 并先建立 headless ownership/service tests
 - 用户拥有的验收：尚未开始；没有授权启动 Neon3 窗口
 
 ### 记录规则
@@ -626,6 +626,22 @@ user_acceptance: not requested; no window launched
 ```
 
 ### 施工日志
+
+2026-08-13 | M5 | 已完成
+files: `Cargo.lock`, `crates/neon-ui-schema/Cargo.toml`, `crates/neon-ui-schema/src/lib.rs`, `tests/fixtures/ui/static-fragment.json`, `plan/neon3-first-work-plan.md`
+checks: `cargo test -p neon-ui-schema` = passed（6 tests）; `cargo test --workspace` = passed; `cargo check --workspace` = passed; `git diff --check` = passed; 未启动窗口
+commit: pending（仅提交 M5 files 和本条 Progress 记录；不包含用户/并行修改的 `.gitignore` 或未跟踪 `AGENTS.md`）
+remaining: M6 WGPU runtime ownership skeleton
+next: 重新读取 `AGENTS.md`、Progress、目录和 Git 状态后，为 `neon-wgpu-runtime` 先新增 headless service/ownership tests
+user_acceptance: 未开始；未授权启动 Neon3 窗口
+
+2026-08-13 | M5 | 进行中
+files: `crates/neon-ui-schema/Cargo.toml`, `crates/neon-ui-schema/src/lib.rs`, `tests/fixtures/ui/static-fragment.json`, `plan/neon3-first-work-plan.md`
+checks: `cargo test -p neon-ui-schema` = not-run; `cargo test --workspace` = not-run; M5 无 service，故 `service.describe` / snapshot = not available; 未启动窗口
+commit: none
+remaining: 运行 M5 schema validation/fixture tests 与 workspace tests
+next: 运行 `cargo test -p neon-ui-schema`
+user_acceptance: 未开始；未授权启动 Neon3 窗口
 
 2026-08-13 | M4 | 已完成
 files: `Cargo.lock`, `crates/neon-observability/Cargo.toml`, `crates/neon-observability/src/lib.rs`, `plan/neon3-first-work-plan.md`

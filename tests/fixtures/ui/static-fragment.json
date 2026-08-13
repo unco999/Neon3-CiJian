@@ -1,0 +1,35 @@
+{
+  "fragment_id": "static-editor-shell",
+  "revision": 1,
+  "root": {
+    "node_id": "root-panel",
+    "kind": "panel",
+    "bounds": { "x": 0.0, "y": 0.0, "width": 320.0, "height": 160.0 },
+    "visible": true,
+    "enabled": true,
+    "text_key": null,
+    "children": [
+      {
+        "node_id": "title-label",
+        "kind": "label",
+        "bounds": { "x": 16.0, "y": 16.0, "width": 160.0, "height": 24.0 },
+        "visible": true,
+        "enabled": true,
+        "text_key": "ui.static.title",
+        "children": []
+      },
+      {
+        "node_id": "disabled-button",
+        "kind": "button",
+        "bounds": { "x": 16.0, "y": 56.0, "width": 120.0, "height": 32.0 },
+        "visible": true,
+        "enabled": false,
+        "text_key": "ui.static.action",
+        "children": []
+      }
+    ]
+  },
+  "effects": [
+    { "kind": "semantic_action", "action": "ui.static.ready" }
+  ]
+}
