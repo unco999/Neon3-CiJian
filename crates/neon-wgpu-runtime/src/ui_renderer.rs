@@ -513,14 +513,7 @@ impl UiWgpuRenderer {
     pub(crate) fn draw_hit_id<'a>(&'a mut self, device: &wgpu::Device, queue: &wgpu::Queue, pass: &mut wgpu::RenderPass<'a>, fragments: &HashMap<neon_ui_schema::UiFragmentId, UiFragment>, viewport_size: [u32; 2], _time_seconds: f32) {
         pass.set_pipeline(&self.hit_clear_pipeline);
         pass.draw(0..3, 0..1);
-        let mut declarations = HashMap::new();
-        for fragment in fragments.values() {
-            for effect in &fragment.effects {
-                if let neon_ui_schema::UiEffect::BoundSemanticIntent { node_id, intent } = effect {
-                    declarations.insert(format!("{}/{}", fragment.fragment_id.0, node_id.0), UiHitBinding { fragment: UiFragmentRevision { id: fragment.fragment_id.clone(), revision: fragment.revision }, intent: intent.clone() });
-                }
-            }
-        }
+        let declarations = collect_hit_declarations(fragments);
         self.hit_bindings.clear();
         let mut instances = Vec::new();
         for (node_path, visual, _) in flatten_fragments(fragments) {
@@ -866,6 +859,7 @@ pub(crate) fn render_offscreen_for_test(
             label: Some("neon3-ui-offscreen-pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: &view,
+                depth_slice: None,
                 resolve_target: None,
                 ops: wgpu::Operations {
                     load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
@@ -875,6 +869,7 @@ pub(crate) fn render_offscreen_for_test(
             depth_stencil_attachment: None,
             timestamp_writes: None,
             occlusion_query_set: None,
+            multiview_mask: None,
         });
         renderer.draw(device, queue, &mut pass, fragments, size, time_seconds);
     }
@@ -906,9 +901,9 @@ pub(crate) fn render_offscreen_for_test(
         .map_async(wgpu::MapMode::Read, move |result| {
             sender.send(result).unwrap()
         });
-    device.poll(wgpu::Maintain::Wait);
+    device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
     receiver.recv().unwrap().unwrap();
-    let pixels = readback.slice(..).get_mapped_range();
+    let pixels = readback.slice(..).get_mapped_range().unwrap();
     pixels.to_vec()
 }
 
@@ -942,8 +937,8 @@ pub(crate) fn render_hit_ids_for_test(
     {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("neon3-ui-hit-id-test-pass"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &view, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store } })],
-            depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None,
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &view, depth_slice: None, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store } })],
+            depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None, multiview_mask: None,
         });
         renderer.draw_hit_id(device, queue, &mut pass, fragments, size, 1.0);
     }
@@ -955,8 +950,8 @@ pub(crate) fn render_hit_ids_for_test(
     queue.submit(Some(encoder.finish()));
     let (sender, receiver) = std::sync::mpsc::channel();
     readback.slice(..).map_async(wgpu::MapMode::Read, move |result| { sender.send(result).unwrap() });
-    device.poll(wgpu::Maintain::Wait); receiver.recv().unwrap().unwrap();
-    let bytes = readback.slice(..).get_mapped_range();
+    device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap(); receiver.recv().unwrap().unwrap();
+    let bytes = readback.slice(..).get_mapped_range().unwrap();
     bytes.chunks_exact(4).map(|pixel| u32::from_ne_bytes(pixel.try_into().unwrap())).collect()
 }
 
@@ -1046,6 +1041,18 @@ fn flatten_fragments(
         );
     }
     result
+}
+
+fn collect_hit_declarations(fragments: &HashMap<neon_ui_schema::UiFragmentId, UiFragment>) -> HashMap<String, UiHitBinding> {
+    let mut declarations = HashMap::new();
+    for fragment in fragments.values() {
+        for effect in &fragment.effects {
+            if let neon_ui_schema::UiEffect::BoundSemanticIntent { node_id, intent } = effect {
+                declarations.insert(format!("{}/{}", fragment.fragment_id.0, node_id.0), UiHitBinding { fragment: UiFragmentRevision { id: fragment.fragment_id.clone(), revision: fragment.revision }, intent: intent.clone() });
+            }
+        }
+    }
+    declarations
 }
 
 fn flatten_node(
@@ -1207,7 +1214,7 @@ fn contains(bounds: UiBounds, position: [f32; 2]) -> bool {
 mod tests {
     use super::*;
     use neon_protocol::Revision;
-    use neon_ui_schema::{TextRef, UiFragmentId, UiNodeId, UiTransitionState};
+    use neon_ui_schema::{TextRef, UiEffect, UiFragmentId, UiIntent, UiNodeId, UiTransitionState};
 
     fn fixture_font() -> AssetBytes {
         AssetBytes {
@@ -1217,6 +1224,14 @@ mod tests {
             height: None,
             bytes: include_bytes!("../../../assets/fonts/SarasaUiSC-Light.ttf").to_vec(),
         }
+    }
+
+    fn test_device(label: &'static str) -> (wgpu::Device, wgpu::Queue) {
+        let instance = wgpu::Instance::default();
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::LowPower, compatible_surface: None, force_fallback_adapter: true, apply_limit_buckets: false }))
+            .or_else(|_| pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::LowPower, compatible_surface: None, force_fallback_adapter: false, apply_limit_buckets: false })))
+            .expect("a headless adapter is required");
+        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor { label: Some(label), required_features: wgpu::Features::empty(), required_limits: wgpu::Limits::downlevel_defaults(), experimental_features: wgpu::ExperimentalFeatures::default(), memory_hints: wgpu::MemoryHints::MemoryUsage, trace: wgpu::Trace::Off })).expect("a device is required")
     }
 
     fn node() -> UiNode {
@@ -1300,23 +1315,24 @@ mod tests {
     }
 
     #[test]
+    fn bound_intents_compile_to_a_local_flexible_hit_map() {
+        let mut root = node();
+        root.kind = UiNodeKind::Button;
+        root.enter_transition = None;
+        let intent = UiIntent::Invoke { action: "ui.surface.event".into(), params: serde_json::json!({"schema_version": 1, "surface_id": "surface.test", "event": {"type": "DIAGNOSTICS_TOGGLE"}}) };
+        let fragment = UiFragment {
+            fragment_id: UiFragmentId("surface.test".into()), revision: Revision(4), root,
+            effects: vec![UiEffect::BoundSemanticIntent { node_id: UiNodeId("root".into()), intent: intent.clone() }],
+        };
+        let bindings = collect_hit_declarations(&HashMap::from([(UiFragmentId("surface.test".into()), fragment)]));
+        let binding = bindings.get("surface.test/root").expect("bound node must resolve locally");
+        assert_eq!(binding.fragment.revision, Revision(4));
+        assert_eq!(binding.intent, intent);
+    }
+
+    #[test]
     fn owner_font_and_text_ref_produce_glyph_pixels_without_background_fill() {
-        let instance = wgpu::Instance::default();
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::LowPower,
-            compatible_surface: None,
-            force_fallback_adapter: true,
-        })).or_else(|| pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::LowPower,
-            compatible_surface: None,
-            force_fallback_adapter: false,
-        }))).expect("a headless adapter is required");
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("neon3-ui-text-acceptance"),
-            required_features: wgpu::Features::empty(),
-            required_limits: wgpu::Limits::downlevel_defaults(),
-            memory_hints: wgpu::MemoryHints::MemoryUsage,
-        }, None)).expect("a device is required");
+        let (device, queue) = test_device("neon3-ui-text-acceptance");
         let font = fixture_font();
         let text = UiNode {
             node_id: UiNodeId("text".into()), kind: UiNodeKind::Label,
@@ -1334,22 +1350,7 @@ mod tests {
 
     #[test]
     fn text_wraps_within_label_width_and_respects_parent_clip() {
-        let instance = wgpu::Instance::default();
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::LowPower,
-            compatible_surface: None,
-            force_fallback_adapter: true,
-        })).or_else(|| pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::LowPower,
-            compatible_surface: None,
-            force_fallback_adapter: false,
-        }))).expect("a headless adapter is required");
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("neon3-ui-text-wrap-clip"),
-            required_features: wgpu::Features::empty(),
-            required_limits: wgpu::Limits::downlevel_defaults(),
-            memory_hints: wgpu::MemoryHints::MemoryUsage,
-        }, None)).expect("a device is required");
+        let (device, queue) = test_device("neon3-ui-text-wrap-clip");
         let font = fixture_font();
         let label = UiNode {
             node_id: UiNodeId("wrapped-text".into()), kind: UiNodeKind::Label,
@@ -1466,11 +1467,7 @@ mod tests {
 
     #[test]
     fn animation_activity_expires_after_transition_end() {
-        let instance = wgpu::Instance::default();
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::LowPower, compatible_surface: None, force_fallback_adapter: true }))
-            .or_else(|| pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::LowPower, compatible_surface: None, force_fallback_adapter: false })))
-            .expect("a headless adapter is required");
-        let (device, _queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor { label: Some("neon3-ui-animation-activity"), required_features: wgpu::Features::empty(), required_limits: wgpu::Limits::downlevel_defaults(), memory_hints: wgpu::MemoryHints::MemoryUsage }, None)).expect("a device is required");
+        let (device, _queue) = test_device("neon3-ui-animation-activity");
         let mut renderer = UiWgpuRenderer::new(&device, wgpu::TextureFormat::Rgba8Unorm);
         let target = UiVisual { bounds: UiBounds { x: 0.0, y: 0.0, width: 10.0, height: 10.0 }, style: UiStyle::default(), kind: UiNodeKind::Panel, enabled: true, clip: UiBounds { x: 0.0, y: 0.0, width: 10.0, height: 10.0 }, image: None, text: None };
         UiWgpuRenderer::sample(&mut renderer.current, &mut renderer.active, "animated", &target, Some(&UiTransition { delay_ms: 0, duration_ms: 10, easing: UiEasing::Linear, from: UiTransitionState { opacity: Some(0.0), ..UiTransitionState::default() } }), 1.0);
@@ -1488,15 +1485,7 @@ mod tests {
 
     #[test]
     fn hit_readback_ring_copies_one_r32uint_texel_asynchronously() {
-        let instance = wgpu::Instance::default();
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::LowPower, compatible_surface: None, force_fallback_adapter: true,
-        })).or_else(|| pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::LowPower, compatible_surface: None, force_fallback_adapter: false,
-        }))).expect("a headless adapter is required for hit readback testing");
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("neon3-hit-readback-test"), required_features: wgpu::Features::empty(), required_limits: wgpu::Limits::downlevel_defaults(), memory_hints: wgpu::MemoryHints::MemoryUsage,
-        }, None)).expect("a device is required for hit readback testing");
+        let (device, queue) = test_device("neon3-hit-readback-test");
         let target = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("neon3-hit-readback-source"), size: wgpu::Extent3d { width: 64, height: 1, depth_or_array_layers: 1 },
             mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: wgpu::TextureFormat::R32Uint,
@@ -1514,7 +1503,7 @@ mod tests {
         let slot = ring.enqueue(&mut encoder, &target, [1, 0]).expect("a ring slot must be available");
         queue.submit(Some(encoder.finish()));
         assert!(ring.begin_mapping(slot));
-        device.poll(wgpu::Maintain::Wait);
+        device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
         assert_eq!(ring.try_complete(slot).unwrap().unwrap(), 37);
     }
 }

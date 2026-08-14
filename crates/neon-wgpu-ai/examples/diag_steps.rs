@@ -99,6 +99,23 @@ fn main() {
     engine.load_model(&bytes).expect("model load failed");
 
     let (model, ctx) = engine.model_and_ctx();
+
+    let (mbuf, wbuf) = (
+        ctx.upload(bytemuck::cast_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]), "mat_a"),
+        ctx.upload(
+            bytemuck::cast_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0, 18.0, 19.0, 20.0, 21.0, 22.0, 23.0, 24.0, 25.0, 26.0, 27.0, 28.0, 29.0, 30.0, 31.0, 32.0]),
+            "mat_w",
+        ),
+    );
+    for (k, n) in [(8usize, 4usize)] {
+        let out = ops::matmul_t(ctx, &mbuf, &wbuf, 1, n as u32, k as u32, false, true);
+        let v = ctx.readback_f32(&out.buffer, n).expect("mat out");
+        let expect: Vec<f32> = (0..n)
+            .map(|j| (0..k).map(|i| [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0][i] * ((j * k + i) as f32 + 1.0)).sum())
+            .collect();
+        println!("matmul m=1 k={k} n={n}: got={v:?} expect={expect:?}");
+    }
+
     let noise = ops::randn(ctx, len, seed);
     stats("randn", &ctx.readback_f32(&noise.buffer, len as usize).expect("readback randn"));
 

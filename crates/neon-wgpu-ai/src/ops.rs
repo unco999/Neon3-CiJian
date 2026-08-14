@@ -260,6 +260,7 @@ pub fn group_norm(
     h: u32,
     w_: u32,
     eps: f32,
+    tag: &str,
 ) -> Result<Buf, AiError> {
     if c % groups != 0 {
         return Err(AiError::Shape(format!(
@@ -290,6 +291,20 @@ pub fn group_norm(
         &[x, w, b, &partial.buffer, &stats.buffer, &y.buffer],
         [groups, 1, 1],
     );
+    if std::env::var("NEON_AI_DIAG").is_ok() {
+        let sv = ctx.readback_f32(&stats.buffer, groups as usize * 2);
+        if let Ok(v) = sv {
+            let (mut mlo, mut mhi) = (f32::INFINITY, f32::NEG_INFINITY);
+            let (mut ilo, mut ihi) = (f32::INFINITY, f32::NEG_INFINITY);
+            for g in 0..groups as usize {
+                mlo = mlo.min(v[g * 2]);
+                mhi = mhi.max(v[g * 2]);
+                ilo = ilo.min(v[g * 2 + 1]);
+                ihi = ihi.max(v[g * 2 + 1]);
+            }
+            println!("diag {tag} stats: mean [{mlo}, {mhi}] inv [{ilo}, {ihi}]");
+        }
+    }
     ctx.run(
         "gn_apply",
         &uniform,
@@ -308,7 +323,7 @@ pub fn layer_norm(
     len: u32,
     eps: f32,
 ) -> Result<Buf, AiError> {
-    group_norm(ctx, x, w, b, 1, len, 1, 1, eps)
+    group_norm(ctx, x, w, b, 1, len, 1, 1, eps, "ln")
 }
 
 /// 2x2 average pool with stride 2.

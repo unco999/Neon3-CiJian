@@ -114,6 +114,9 @@ impl<'a> UnetExecutor<'a> {
         let (tw2, tb2) = self.model.tensor_pair("temb.mlp.2")?;
         let te4 = ops::lin(self.ctx, &te3.buffer, tw2, 256, 1024);
         let te = ops::add(self.ctx, &te4.buffer, tb2, 256);
+        diag_check(self.ctx, &te0.buffer, 256, "te0");
+        diag_check(self.ctx, &te1.buffer, 1024, "te1");
+        diag_check(self.ctx, &te.buffer, 256, "te");
 
         // ce = cond_proj(cond_norm(sum of embeddings))
         let ce0 = ops::gather_sum(
@@ -132,6 +135,9 @@ impl<'a> UnetExecutor<'a> {
         let (qw, qb) = self.model.tensor_pair("cond_proj.2")?;
         let ce5 = ops::lin(self.ctx, &ce4.buffer, qw, 256, 256);
         let ce = ops::add(self.ctx, &ce5.buffer, qb, 256);
+        diag_check(self.ctx, &ce0.buffer, 256, "ce0");
+        diag_check(self.ctx, &ce1.buffer, 256, "ce1_ln");
+        diag_check(self.ctx, &ce.buffer, 256, "ce");
 
         // FiLM conditioning vector for this timestep
         Ok(ops::add(self.ctx, &te.buffer, &ce.buffer, 256))
@@ -151,8 +157,9 @@ impl<'a> UnetExecutor<'a> {
         let (n2w, n2b) = self.model.tensor_pair(&format!("{name}.n2"))?;
         let (c2w, c2b) = self.model.tensor_pair(&format!("{name}.c2"))?;
         let (fw, fb) = self.model.tensor_pair(&format!("{name}.film"))?;
+        diag_check(self.ctx, x, (cin * res * res) as usize, &format!("{name}.in"));
 
-        let g1 = ops::group_norm(self.ctx, x, n1w, n1b, 8, cin, res, res, GN_EPS)?;
+        let g1 = ops::group_norm(self.ctx, x, n1w, n1b, 8, cin, res, res, GN_EPS, &format!("{name}.n1"))?;
         let s1 = ops::silu(
             self.ctx,
             &g1.buffer,
@@ -161,7 +168,7 @@ impl<'a> UnetExecutor<'a> {
         diag_check(self.ctx, &s1.buffer, (cin * res * res) as usize, &format!("{name}.s1"));
         let h1 = ops::conv2d(self.ctx, &s1.buffer, c1w, c1b, cin, cout, res, res, 3, 3, 1, 1);
         diag_check(self.ctx, &h1.buffer, (cout * res * res) as usize, &format!("{name}.h1"));
-        let g2 = ops::group_norm(self.ctx, &h1.buffer, n2w, n2b, 8, cout, res, res, GN_EPS)?;
+        let g2 = ops::group_norm(self.ctx, &h1.buffer, n2w, n2b, 8, cout, res, res, GN_EPS, &format!("{name}.n2"))?;
         let s2 = ops::silu(
             self.ctx,
             &g2.buffer,
@@ -171,7 +178,10 @@ impl<'a> UnetExecutor<'a> {
         diag_check(self.ctx, &h2.buffer, (cout * res * res) as usize, &format!("{name}.h2"));
 
         // film params = c @ film.weight^T + film.bias  (2*cout)
+        diag_check(self.ctx, c, 256, &format!("{name}.c_at_film"));
+        diag_check(self.ctx, fw, 192 * 256, &format!("{name}.fw"));
         let film0 = ops::lin(self.ctx, c, fw, cout * 2, 256);
+        diag_check(self.ctx, &film0.buffer, (cout * 2) as usize, &format!("{name}.film0"));
         let film = ops::add(self.ctx, &film0.buffer, fb, cout as u64 * 2);
         diag_check(self.ctx, &film.buffer, (cout * 2) as usize, &format!("{name}.film"));
         let h3 = ops::film(
@@ -267,7 +277,7 @@ impl<'a> UnetExecutor<'a> {
             );
         }
 
-        let gn = ops::group_norm(self.ctx, &attn.buffer, nw, nb, 8, c, res, res, GN_EPS)?;
+        let gn = ops::group_norm(self.ctx, &attn.buffer, nw, nb, 8, c, res, res, GN_EPS, &format!("{name}.n"))?;
         let o = ops::conv2d(self.ctx, &gn.buffer, ow, ob, c, c, res, res, 1, 1, 1, 0);
         Ok(ops::add(self.ctx, x, &o.buffer, c as u64 * hw as u64))
     }
@@ -330,7 +340,7 @@ impl<'a> UnetExecutor<'a> {
         h = self.res_block(&h.buffer, "ups.3.b2", c96, c96, res, cbuf)?;
 
         let (ow, ob) = self.model.tensor_pair("out.0")?;
-        h = ops::group_norm(self.ctx, &h.buffer, ow, ob, 8, c96, res, res, GN_EPS)?;
+        h = ops::group_norm(self.ctx, &h.buffer, ow, ob, 8, c96, res, res, GN_EPS, "out.n")?;
         h = ops::silu(self.ctx, &h.buffer, c96 as u64 * res as u64 * res as u64);
         diag_check(self.ctx, &h.buffer, (c96 * res * res) as usize, "out_silu");
         let (cw, cb) = self.model.tensor_pair("out.2")?;
