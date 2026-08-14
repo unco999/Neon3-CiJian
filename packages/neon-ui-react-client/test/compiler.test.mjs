@@ -33,7 +33,7 @@ test("compiles stable semantic node paths without numeric element ids", () => {
   assert.equal(fragment.fragment_id, "surface.terrain.inspector");
   assert.match(fragment.root.children[0].node_id, /^node\.[0-9a-f]{8}$/);
   assert.equal(fragment.root.children[0].children[0].text.value, "Water tool");
-  assert.deepEqual(fragment.effects, [{ kind: "semantic_intent", intent: { kind: "invoke", action: "terrain.tool.select", params: { tool: "water_inject" } } }]);
+  assert.deepEqual(fragment.effects, [{ kind: "bound_semantic_intent", node_id: fragment.root.children[0].children[0].node_id, intent: { kind: "invoke", action: "terrain.tool.select", params: { tool: "water_inject" } } }]);
   assert.equal(JSON.stringify(fragment).includes("elementId"), false);
 });
 
@@ -45,7 +45,8 @@ test("Button event compiles to the typed UI surface intent", () => {
   });
   const fragment = compileContainer(surface([panel("toolbar", [button])]));
   assert.deepEqual(fragment.effects, [{
-    kind: "semantic_intent",
+    kind: "bound_semantic_intent",
+    node_id: fragment.root.children[0].children[0].node_id,
     intent: { kind: "invoke", action: "ui.surface.event", params: { event: { type: "INSPECTOR_TAB_SELECT", tab: "materials" } } },
   }]);
   assert.throws(() => compileContainer(surface([panel("not-a-button", [], { event: { type: "DIAGNOSTICS_TOGGLE" } })])), /only valid on Button/);

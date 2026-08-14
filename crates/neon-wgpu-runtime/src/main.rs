@@ -36,8 +36,11 @@ fn main() {
             .expect("window server endpoint is required")
             .parse()
             .expect("window server endpoint must be a socket address");
+        let ui_endpoint = args
+            .get(3)
+            .map(|endpoint| endpoint.parse().expect("UI runtime endpoint must be a socket address"));
         if let Err(error) =
-            neon_wgpu_runtime::WindowedRuntime::run_server(1, endpoint)
+            neon_wgpu_runtime::WindowedRuntime::run_server(1, endpoint, ui_endpoint)
         {
             eprintln!("neon-wgpu-runtime failed: {error}");
             std::process::exit(1);
@@ -45,7 +48,7 @@ fn main() {
         return;
     }
     eprintln!(
-        "usage: neon-wgpu-runtime --window | --window-server <loopback-endpoint> | --headless-server <loopback-endpoint>"
+        "usage: neon-wgpu-runtime --window | --window-server <loopback-endpoint> [ui-runtime-endpoint] | --headless-server <loopback-endpoint>"
     );
     std::process::exit(2);
 }

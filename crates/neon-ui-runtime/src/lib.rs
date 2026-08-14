@@ -343,7 +343,7 @@ impl UiRuntime {
         if event.renderer_epoch != self.epoch { return Err(ERROR_RENDERER_EPOCH_MISMATCH); }
         let Some(fragment) = self.cached_fragment.as_ref() else { return Err(ERROR_INTENT_NOT_BOUND); };
         if fragment.fragment_id != event.fragment.id || fragment.revision != event.fragment.revision { return Err(ERROR_FRAGMENT_REVISION_STALE); }
-        if !fragment.effects.iter().any(|effect| matches!(effect, UiEffect::SemanticIntent { intent } if intent == &event.intent)) {
+        if !fragment.effects.iter().any(|effect| matches!(effect, UiEffect::SemanticIntent { intent } | UiEffect::BoundSemanticIntent { intent, .. } if intent == &event.intent)) {
             return Err(ERROR_INTENT_NOT_BOUND);
         }
         if let Some(pointer) = &event.pointer {

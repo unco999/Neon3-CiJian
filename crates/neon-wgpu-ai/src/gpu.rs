@@ -137,8 +137,8 @@ impl GpuCtx {
     fn build_pipelines(&mut self) {
         macro_rules! add {
             ($key:literal, $src:expr, $entry:literal, $rw:expr, $bindings:expr) => {
-                // Binding 0 is the uniform; `$rw` is the single read-write
-                // storage binding; all other storage bindings are read-only,
+                // Binding 0 is the uniform; `$rw` lists the read-write storage
+                // bindings (indexes); every other storage binding is read-only,
                 // matching the module declarations exactly (wgpu requires the
                 // layout access flags to match the shader usage).
                 let entries: Vec<wgpu::BindGroupLayoutEntry> = (0..$bindings)
@@ -150,7 +150,7 @@ impl GpuCtx {
                                 wgpu::BufferBindingType::Uniform
                             } else {
                                 wgpu::BufferBindingType::Storage {
-                                    read_only: binding != $rw,
+                                    read_only: !$rw.contains(&binding),
                                 }
                             },
                             has_dynamic_offset: false,
@@ -197,26 +197,26 @@ impl GpuCtx {
                 );
             };
         }
-        // bindings: uniform(0) + storage(1..n). rw is the read-write storage binding.
-        add!("silu", SHADER_ELEM, "main_silu", 4, 5);
-        add!("add", SHADER_ELEM, "main_add", 4, 5);
-        add!("mul", SHADER_ELEM, "main_mul", 4, 5);
-        add!("cfg", SHADER_ELEM, "main_cfg", 4, 5);
-        add!("ddim", SHADER_ELEM, "main_ddim", 4, 5);
-        add!("film", SHADER_ELEM, "main_film", 4, 5);
-        add!("transpose", SHADER_TRANSPOSE, "main", 2, 3);
-        add!("conv2d", SHADER_CONV2D, "main", 4, 5);
-        add!("gn_reduce", SHADER_GROUPNORM, "main_reduce", 4, 7);
-        add!("gn_finalize", SHADER_GROUPNORM, "main_finalize", 5, 7);
-        add!("gn_apply", SHADER_GROUPNORM, "main_apply", 6, 7);
-        add!("avgpool", SHADER_RESIZE, "main_avgpool", 3, 4);
-        add!("upsample", SHADER_RESIZE, "main_upsample", 3, 4);
-        add!("concat", SHADER_RESIZE, "main_concat", 3, 4);
-        add!("matmul", SHADER_MATMUL, "main", 3, 4);
-        add!("softmax", SHADER_SOFTMAX, "main", 1, 2);
-        add!("randn", SHADER_RANDN, "main", 1, 2);
-        add!("timefreq", SHADER_COND, "main_timefreq", 4, 5);
-        add!("gather", SHADER_COND, "main_gather", 4, 5);
+        // bindings: uniform(0) + storage(1..n). `&[..]` lists the read-write storage bindings.
+        add!("silu", SHADER_ELEM, "main_silu", &[4], 5);
+        add!("add", SHADER_ELEM, "main_add", &[4], 5);
+        add!("mul", SHADER_ELEM, "main_mul", &[4], 5);
+        add!("cfg", SHADER_ELEM, "main_cfg", &[4], 5);
+        add!("ddim", SHADER_ELEM, "main_ddim", &[4], 5);
+        add!("film", SHADER_ELEM, "main_film", &[4], 5);
+        add!("transpose", SHADER_TRANSPOSE, "main", &[2], 3);
+        add!("conv2d", SHADER_CONV2D, "main", &[4], 5);
+        add!("gn_reduce", SHADER_GROUPNORM, "main_reduce", &[4], 7);
+        add!("gn_finalize", SHADER_GROUPNORM, "main_finalize", &[4, 5], 7);
+        add!("gn_apply", SHADER_GROUPNORM, "main_apply", &[5, 6], 7);
+        add!("avgpool", SHADER_RESIZE, "main_avgpool", &[3], 4);
+        add!("upsample", SHADER_RESIZE, "main_upsample", &[3], 4);
+        add!("concat", SHADER_RESIZE, "main_concat", &[3], 4);
+        add!("matmul", SHADER_MATMUL, "main", &[3], 4);
+        add!("softmax", SHADER_SOFTMAX, "main", &[1], 2);
+        add!("randn", SHADER_RANDN, "main", &[1], 2);
+        add!("timefreq", SHADER_COND, "main_timefreq", &[4], 5);
+        add!("gather", SHADER_COND, "main_gather", &[4], 5);
     }
 
     /// Create a uniform buffer from a POD value.
@@ -260,6 +260,7 @@ impl GpuCtx {
             entries: &entries,
         });
         let started = std::time::Instant::now();
+        self.device.push_error_scope(wgpu::ErrorFilter::Validation);
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
@@ -271,6 +272,13 @@ impl GpuCtx {
             pass.set_pipeline(&pipeline.pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
             pass.dispatch_workgroups(workgroups[0], workgroups[1], workgroups[2]);
+        }
+        self.queue.submit(Some(encoder.finish()));
+        self.device.poll(wgpu::Maintain::Wait);
+        if let Some(pending) = self.device.pop_error_scope()
+            && let Ok(Some(message)) = pollster::block_on(pending)
+        {
+            panic!("compute pass '{key}' failed: {message}");
         }
         self.queue.submit(Some(encoder.finish()));
         self.elapsed_ms += started.elapsed().as_secs_f64() * 1000.0;

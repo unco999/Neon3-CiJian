@@ -4,12 +4,13 @@
 use std::time::Instant;
 use std::{collections::HashMap, net::SocketAddr, thread};
 
+use neon_ipc::RpcClient;
 use neon_observability::{
     CommandJournal, CommandReceipt, CommandState, DebugSnapshot, EVENT_COMMAND_ACCEPTED,
     EVENT_COMMAND_RECEIVED, EVENT_COMMAND_REJECTED, JournalFilter, TraceLevel, TraceRecord,
 };
 use neon_protocol::{
-    AssetBytes, AssetRef, ClientKind, HealthStatus, PROTOCOL_VERSION, RequestId, Revision, RpcError, RpcRequest, RpcResponse,
+    AssetBytes, AssetRef, ClientIdentity, ClientKind, HealthStatus, PROTOCOL_VERSION, RequestId, Revision, RpcError, RpcRequest, RpcResponse,
     RpcStatus, ServiceDescription, ServiceHealth, ServiceName,
 };
 use neon_ui_schema::{
@@ -29,7 +30,7 @@ use winit::{
 
 mod ui_renderer;
 
-use ui_renderer::UiWgpuRenderer;
+use ui_renderer::{UiHitBinding, UiWgpuRenderer};
 
 pub const SERVICE_NAME: &str = "wgpu-runtime";
 pub const CAPABILITY_UI_FRAGMENT: &str = "wgpu.ui.fragment.v1";
@@ -121,6 +122,7 @@ pub struct WindowedRuntime {
     redraw_pending: bool,
     animation_active: bool,
     pending_composition_ack: Option<std::sync::mpsc::Sender<usize>>,
+    ui_endpoint: Option<SocketAddr>,
 }
 
 #[derive(Clone, Debug)]
@@ -147,6 +149,7 @@ struct WindowGpu {
     pending_hit_pixel: Option<[u32; 2]>,
     pending_hit_slot: Option<(usize, u64)>,
     next_input_sequence: u64,
+    next_semantic_sequence: u64,
     started_at: Instant,
     last_draw_instance_count: usize,
     hit_target_dirty: bool,
@@ -167,23 +170,26 @@ impl WindowedRuntime {
             redraw_pending: true,
             animation_active: false,
             pending_composition_ack: None,
+            ui_endpoint: None,
         }
     }
 
     pub fn run(epoch: u64) -> Result<(), String> {
-        Self::run_with_server(epoch, None, true)
+        Self::run_with_server(epoch, None, None, true)
     }
 
     pub fn run_server(
         epoch: u64,
         endpoint: SocketAddr,
+        ui_endpoint: Option<SocketAddr>,
     ) -> Result<(), String> {
-        Self::run_with_server(epoch, Some(endpoint), false)
+        Self::run_with_server(epoch, Some(endpoint), ui_endpoint, false)
     }
 
     fn run_with_server(
         epoch: u64,
         endpoint: Option<SocketAddr>,
+        ui_endpoint: Option<SocketAddr>,
         demo: bool,
     ) -> Result<(), String> {
         let event_loop = EventLoop::<WindowCommand>::with_user_event()
@@ -191,6 +197,7 @@ impl WindowedRuntime {
             .map_err(|error| format!("create event loop: {error}"))?;
         let proxy = event_loop.create_proxy();
         let mut runtime = Self::new(epoch);
+        runtime.ui_endpoint = ui_endpoint;
         if demo {
             runtime.fragments = runtime.demo_fragments();
             runtime.applied_composition_revision = Revision(1);
@@ -457,6 +464,7 @@ impl WindowGpu {
             pending_hit_pixel: None,
             pending_hit_slot: None,
             next_input_sequence: 0,
+            next_semantic_sequence: 0,
             started_at: Instant::now(),
             last_draw_instance_count: 0,
             hit_target_dirty: true,
@@ -475,6 +483,39 @@ fn create_hit_target(device: &wgpu::Device, size: PhysicalSize<u32>) -> (wgpu::T
     });
     let view = target.create_view(&wgpu::TextureViewDescriptor::default());
     (target, view)
+}
+
+fn forward_pointer_click(
+    endpoint: SocketAddr,
+    renderer_epoch: u64,
+    composition_revision: Revision,
+    sequence: u64,
+    binding: UiHitBinding,
+) {
+    thread::spawn(move || {
+        let request_id = RequestId(format!("wgpu-pointer-click-{sequence}"));
+        let event = UiSemanticEvent {
+            event: neon_ui_schema::UiSemanticEventType::PointerClick,
+            event_id: request_id.0.clone(),
+            renderer_epoch,
+            composition_revision,
+            fragment: binding.fragment,
+            intent: binding.intent,
+            pointer: Some(neon_ui_schema::UiPointerMetadata { id: 0, sequence }),
+            focus: None,
+        };
+        let request = RpcRequest {
+            protocol: "neon3.rpc".into(), version: PROTOCOL_VERSION, request_id: request_id.clone(),
+            client: ClientIdentity { kind: ClientKind::WgpuRuntime, instance_id: format!("window-{renderer_epoch}"), pid: std::process::id(), origin: "neon-wgpu-runtime".into() },
+            target: ServiceName("ui-runtime".into()), method: "ui.input.event".into(), params: json!(&event),
+            expected_revision: Some(event.fragment.revision), idempotency_key: Some(format!("wgpu-pointer-click:{renderer_epoch}:{sequence}")),
+        };
+        match RpcClient::connect(endpoint).and_then(|mut client| client.call(&request)) {
+            Ok(response) if response.status == RpcStatus::Accepted => {}
+            Ok(response) => eprintln!("ui pointer event rejected: {}", response.error.map_or("unknown".into(), |error| error.code)),
+            Err(error) => eprintln!("ui pointer event delivery failed: {error}"),
+        }
+    });
 }
 
 impl ApplicationHandler<WindowCommand> for WindowedRuntime {
@@ -511,11 +552,27 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
             }
             WindowEvent::MouseInput { state, button, .. }
                 if state == winit::event::ElementState::Pressed
-                    && button == winit::event::MouseButton::Left =>
+                && button == winit::event::MouseButton::Left =>
             {
                 if let Some(gpu) = self.gpu.as_mut() {
-                    gpu.ui.press_hovered(gpu.started_at.elapsed().as_secs_f32());
-                    self.redraw_pending = true;
+                    if gpu.input.pointer_down().is_ok() {
+                        gpu.ui.press_hovered(gpu.started_at.elapsed().as_secs_f32());
+                        self.redraw_pending = true;
+                    }
+                }
+            }
+            WindowEvent::MouseInput { state, button, .. }
+                if state == winit::event::ElementState::Released
+                && button == winit::event::MouseButton::Left =>
+            {
+                let binding = self.gpu.as_mut().and_then(|gpu| {
+                    let hit_id = gpu.input.capture_id?;
+                    gpu.input.pointer_up(true).ok()?;
+                    gpu.next_semantic_sequence += 1;
+                    gpu.ui.hit_binding(hit_id).map(|binding| (gpu.next_semantic_sequence, binding))
+                });
+                if let (Some(endpoint), Some((sequence, binding))) = (self.ui_endpoint, binding) {
+                    forward_pointer_click(endpoint, self.epoch, self.applied_composition_revision, sequence, binding);
                 }
             }
             WindowEvent::RedrawRequested => {
@@ -1063,7 +1120,7 @@ impl WgpuRuntime {
         if fragment.revision != event.fragment.revision {
             return self.reject(request_id, "fragment_revision_stale", "fragment revision is stale", Some(fragment.revision));
         }
-        if !fragment.effects.iter().any(|effect| matches!(effect, neon_ui_schema::UiEffect::SemanticIntent { intent } if intent == &event.intent)) {
+        if !fragment.effects.iter().any(|effect| matches!(effect, neon_ui_schema::UiEffect::SemanticIntent { intent } | neon_ui_schema::UiEffect::BoundSemanticIntent { intent, .. } if intent == &event.intent)) {
             return self.reject(request_id, "intent_not_bound", "semantic intent is not bound", Some(fragment.revision));
         }
         self.accept(request_id, json!(event))

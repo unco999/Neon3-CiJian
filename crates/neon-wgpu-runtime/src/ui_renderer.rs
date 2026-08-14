@@ -6,7 +6,7 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 use bytemuck::{Pod, Zeroable};
 use neon_protocol::{AssetBytes, AssetRef};
-use neon_ui_schema::{TextRef, UiBounds, UiEasing, UiFragment, UiLayoutMode, UiNode, UiNodeKind, UiStyle, UiTransition};
+use neon_ui_schema::{TextRef, UiBounds, UiEasing, UiFragment, UiFragmentRevision, UiIntent, UiLayoutMode, UiNode, UiNodeKind, UiStyle, UiTransition};
 
 const SHADER: &str = r#"
 struct View { viewport: vec2<f32>, _pad: vec2<f32> }
@@ -162,6 +162,12 @@ struct UiView {
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct UiHitInstance { rect: [f32; 4], params: [f32; 4], hit_id: u32, _pad: [u32; 3], clip: [f32; 4] }
 
+#[derive(Clone, Debug)]
+pub(crate) struct UiHitBinding {
+    pub fragment: UiFragmentRevision,
+    pub intent: UiIntent,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct UiImageInstance { rect: [f32; 4], tint: [f32; 4], clip: [f32; 4], asset_id: u32, _pad: [u32; 3] }
@@ -301,6 +307,7 @@ pub struct UiWgpuRenderer {
     hit_buffer: wgpu::Buffer,
     hit_capacity: usize,
     hit_readbacks: HitReadbackRing,
+    hit_bindings: HashMap<u32, UiHitBinding>,
     image_pipeline: wgpu::RenderPipeline,
     image_buffer: wgpu::Buffer,
     image_capacity: usize,
@@ -484,6 +491,7 @@ impl UiWgpuRenderer {
             hit_buffer: create_hit_buffer(device, 1),
             hit_capacity: 1,
             hit_readbacks: HitReadbackRing::new(device, 3),
+            hit_bindings: HashMap::new(),
             image_pipeline,
             image_buffer: create_image_buffer(device, 1),
             image_capacity: 1,
@@ -502,10 +510,24 @@ impl UiWgpuRenderer {
     pub(crate) fn draw_hit_id<'a>(&'a mut self, device: &wgpu::Device, queue: &wgpu::Queue, pass: &mut wgpu::RenderPass<'a>, fragments: &HashMap<neon_ui_schema::UiFragmentId, UiFragment>, viewport_size: [u32; 2], _time_seconds: f32) {
         pass.set_pipeline(&self.hit_clear_pipeline);
         pass.draw(0..3, 0..1);
-        let nodes = flatten_fragments(fragments);
-        let instances = nodes.into_iter().enumerate().filter_map(|(index, (_, visual, _))| {
-            (visual.kind == UiNodeKind::Button && visual.enabled && visual.style.opacity > 0.0).then_some(UiHitInstance { rect: [visual.bounds.x, visual.bounds.y, visual.bounds.width, visual.bounds.height], params: [visual.style.border_width, visual.style.corner_radius, visual.style.opacity, 0.0], hit_id: index as u32 + 1, _pad: [0; 3], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height] })
-        }).collect::<Vec<_>>();
+        let mut declarations = HashMap::new();
+        for fragment in fragments.values() {
+            for effect in &fragment.effects {
+                if let neon_ui_schema::UiEffect::BoundSemanticIntent { node_id, intent } = effect {
+                    declarations.insert(format!("{}/{}", fragment.fragment_id.0, node_id.0), UiHitBinding { fragment: UiFragmentRevision { id: fragment.fragment_id.clone(), revision: fragment.revision }, intent: intent.clone() });
+                }
+            }
+        }
+        self.hit_bindings.clear();
+        let mut instances = Vec::new();
+        for (node_path, visual, _) in flatten_fragments(fragments) {
+            if visual.kind != UiNodeKind::Button || !visual.enabled || visual.style.opacity <= 0.0 { continue; }
+            let hit_id = instances.len() as u32 + 1;
+            if let Some(binding) = declarations.get(&node_path) {
+                self.hit_bindings.insert(hit_id, binding.clone());
+            }
+            instances.push(UiHitInstance { rect: [visual.bounds.x, visual.bounds.y, visual.bounds.width, visual.bounds.height], params: [visual.style.border_width, visual.style.corner_radius, visual.style.opacity, 0.0], hit_id, _pad: [0; 3], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height] });
+        }
         if instances.is_empty() { return; }
         if instances.len() > self.hit_capacity { self.hit_capacity = instances.len().next_power_of_two(); self.hit_buffer = create_hit_buffer(device, self.hit_capacity); }
         queue.write_buffer(&self.hit_buffer, 0, bytemuck::cast_slice(&instances));
@@ -522,6 +544,8 @@ impl UiWgpuRenderer {
     }
 
     pub(crate) fn begin_hit_readback_mapping(&mut self, slot: usize) -> bool { self.hit_readbacks.begin_mapping(slot) }
+
+    pub(crate) fn hit_binding(&self, hit_id: u32) -> Option<UiHitBinding> { self.hit_bindings.get(&hit_id).cloned() }
 
     pub fn set_pointer_position(&mut self, position: [f32; 2]) {
         self.pointer_position = Some(position);
