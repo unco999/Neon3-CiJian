@@ -1,4 +1,4 @@
-import type { JsonValue, Revision, RpcRequest, RpcResponse, RpcTransport, UiFragment, UiIntent, UiIntentSpec, UiSurfaceEvent, UiSurfaceEventRequest, UiSurfaceSnapshot } from "./protocol.js";
+import type { AiTerrainPanelSnapshot, JsonValue, Revision, RpcRequest, RpcResponse, RpcTransport, UiFragment, UiIntent, UiIntentSpec, UiSurfaceEvent, UiSurfaceEventRequest, UiSurfaceSnapshot } from "./protocol.js";
 
 export class NeonUiClient {
   constructor(private readonly transport: RpcTransport, private readonly instanceId = `react-${crypto.randomUUID()}`) {}
@@ -23,6 +23,12 @@ export class NeonUiClient {
     const response = await this.call("ui-runtime", "ui.surface.event", params, snapshot.revision, `surface-event:${event.type}:${snapshot.revision}:${"tab" in event ? event.tab : ""}`);
     if (response.status !== "accepted" || !response.result) throw new Error(response.error?.message ?? "UI surface event was rejected");
     return response.result as unknown as UiSurfaceSnapshot;
+  }
+
+  async aiTerrainSnapshot(): Promise<AiTerrainPanelSnapshot> {
+    const response = await this.call("ui-runtime", "ui.ai.terrain.snapshot.get", {}, null, `ai-terrain-snapshot:${crypto.randomUUID()}`);
+    if (response.status !== "accepted" || !response.result) throw new Error(response.error?.message ?? "AI terrain panel snapshot was rejected");
+    return response.result as unknown as AiTerrainPanelSnapshot;
   }
 
   private call(target: string, method: string, params: JsonValue, expectedRevision: Revision | null, idempotencyKey: string): Promise<RpcResponse> {

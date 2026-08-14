@@ -45,36 +45,50 @@ impl<'a> DdimSampler<'a> {
         let idx = cond.indices();
         let null_idx = TerrainCond::default().indices();
         let use_cfg = guidance > 0.0;
+        let batch_steps = std::env::var("NEON_AI_DIAG").is_err();
         let mut previews: Vec<Vec<f32>> = Vec::new();
         let mut carried: Option<Buf> = None;
         let mut current = x;
         for i in 0..steps {
-            let (t, t0) = self.model.schedule.ddim_times(steps, i);
-            let ec = self.forward(current, t, idx, size)?;
-            let e = if use_cfg {
-                let eu = self.forward(current, t, null_idx, size)?;
-                ops::cfg_combine(self.ctx, &ec.buffer, &eu.buffer, guidance, len)
-            } else {
-                ec
-            };
-            let (sab_t, s1ab_t) = (
-                self.model.schedule.sab[t as usize],
-                self.model.schedule.s1ab[t as usize],
-            );
-            let (sab_t0, s1ab_t0) = (
-                self.model.schedule.sab[t0 as usize],
-                self.model.schedule.s1ab[t0 as usize],
-            );
-            let next = ops::ddim_step(
-                self.ctx,
-                current,
-                &e.buffer,
-                sab_t,
-                s1ab_t,
-                sab_t0,
-                s1ab_t0,
-                len,
-            );
+            if batch_steps {
+                self.ctx.begin_batch();
+            }
+            let step_result = (|| -> Result<Buf, AiError> {
+                let (t, t0) = self.model.schedule.ddim_times(steps, i);
+                let ec = self.forward(current, t, idx, size)?;
+                let e = if use_cfg {
+                    let eu = self.forward(current, t, null_idx, size)?;
+                    ops::cfg_combine(self.ctx, &ec.buffer, &eu.buffer, guidance, len)
+                } else {
+                    ec
+                };
+                let (sab_t, s1ab_t) = (
+                    self.model.schedule.sab[t as usize],
+                    self.model.schedule.s1ab[t as usize],
+                );
+                let (sab_t0, s1ab_t0) = (
+                    self.model.schedule.sab[t0 as usize],
+                    self.model.schedule.s1ab[t0 as usize],
+                );
+                Ok(ops::ddim_step(
+                    self.ctx,
+                    current,
+                    &e.buffer,
+                    sab_t,
+                    s1ab_t,
+                    sab_t0,
+                    s1ab_t0,
+                    len,
+                ))
+            })();
+            if batch_steps {
+                if step_result.is_ok() {
+                    self.ctx.submit_batch();
+                } else {
+                    self.ctx.discard_batch();
+                }
+            }
+            let next = step_result?;
             if preview_every > 0 && (i + 1) % preview_every == 0 {
                 previews.push(self.ctx.readback_f32(&next.buffer, len as usize)?);
             }

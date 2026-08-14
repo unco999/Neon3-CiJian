@@ -14,6 +14,10 @@ export type AssetRef = {
   kind: string;
 };
 
+export type RenderSurfaceRef = {
+  target_id: string;
+};
+
 export type UiStyle = {
   background_color?: Rgba;
   border_color?: Rgba;
@@ -40,7 +44,7 @@ export type UiTransition = { durationMs: number; easing?: "linear" | "ease_in" |
 
 export type UiNode = {
   node_id: string;
-  kind: "panel" | "label" | "button" | "image";
+  kind: "panel" | "label" | "button" | "image" | "render_surface";
   bounds: Bounds;
   layout: UiLayout | null;
   visible: boolean;
@@ -48,6 +52,7 @@ export type UiNode = {
   text_key: string | null;
   text: { kind: "literal"; value: string } | { kind: "key"; key: string; arguments: JsonValue } | null;
   image: AssetRef | null;
+  surface: RenderSurfaceRef | null;
   style: UiStyle;
   enter_transition: { delay_ms: number; duration_ms: number; easing: "linear" | "ease_in" | "ease_out" | "ease_in_out"; from: { bounds: Bounds | null; background_color: null; border_color: null; border_width: null; corner_radius: null; opacity: number | null } } | null;
   children: UiNode[];
@@ -99,6 +104,22 @@ export type RpcTransport = {
 export type UiSurfaceEvent = { type: "DIAGNOSTICS_TOGGLE" } | { type: "INSPECTOR_TAB_SELECT"; tab: "overview" | "materials" | "history" };
 export type UiSurfaceEventRequest = { schema_version: 1; surface_id: SurfaceId; event: UiSurfaceEvent };
 export type UiSurfaceSnapshot = { schema_version: 1; surface_id: SurfaceId; revision: Revision; value: { diagnostics: "collapsed" | "expanded"; inspector: { tab: "overview" | "materials" | "history" } }; available_events: Array<UiSurfaceEvent["type"]> };
+export type AiTerrainPanelSnapshot = {
+  schema_version: 1;
+  surface_id: "surface.ai.terrain-generator";
+  revision: Revision;
+  condition: { sub: number | null; parent: number | null; relief: number | null; texture: number | null; water: number | null };
+  guidance: number;
+  steps: number;
+  seed: number;
+  last_seed: number | null;
+  size: number;
+  target_id: string;
+  state: "idle" | "queued" | "generating" | "ready" | "failed";
+  job_id: string | null;
+  elapsed_ms: number | null;
+  error_code: string | null;
+};
 
 export type SubmitFragment = (fragment: UiFragment) => Promise<RpcResponse> | RpcResponse | void;
 
@@ -122,6 +143,7 @@ export type NodeProps = {
   textKey?: string;
   textArguments?: JsonValue;
   asset?: AssetRef;
+  surface?: RenderSurfaceRef;
   intent?: UiIntentSpec;
   event?: UiSurfaceEvent;
   enterTransition?: UiTransition;

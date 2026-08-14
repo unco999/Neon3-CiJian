@@ -16,7 +16,7 @@ struct Params {
 
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
+    let i = gid.x + gid.y * 16776960u;
     if (i >= p.len) { return; }
     let n = i / p.k;
     let k = i % p.k;

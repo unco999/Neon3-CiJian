@@ -18,7 +18,7 @@ pub mod ops;
 pub mod schedule;
 pub mod unet;
 
-pub use engine::{AiEngine, GenerateRequest, Generation, ModelInfo};
+pub use engine::{AiEngine, GenerateRequest, Generation, GpuGeneration, ModelInfo};
 pub use format::{TerrainCond, WeightPack};
 pub use gpu::GpuCtx;
 

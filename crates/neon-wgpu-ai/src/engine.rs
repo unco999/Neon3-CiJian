@@ -67,6 +67,16 @@ pub struct Generation {
     pub elapsed_ms: f64,
 }
 
+/// One finished generation whose heightmap remains resident on the runtime's GPU.
+pub struct GpuGeneration {
+    pub size: u32,
+    pub steps: u32,
+    pub seed: u64,
+    pub guidance: f32,
+    pub heightmap: wgpu::Buffer,
+    pub elapsed_ms: f64,
+}
+
 pub struct AiEngine {
     ctx: GpuCtx,
     model: Option<Model>,
@@ -133,7 +143,41 @@ impl AiEngine {
     }
 
     pub fn generate(&mut self, request: GenerateRequest) -> Result<Generation, AiError> {
-        validate_request(&request)?;
+        let len = request.size as u64 * request.size as u64;
+        let (final_buf, previews, elapsed_ms) = self.sample(&request)?;
+        let heightmap = self.ctx.readback_f32(&final_buf.buffer, len as usize)?;
+        Ok(Generation {
+            size: request.size,
+            steps: request.steps,
+            seed: request.seed,
+            guidance: request.guidance,
+            heightmap,
+            previews,
+            elapsed_ms,
+        })
+    }
+
+    /// Generate a heightmap without reading it back to CPU memory.
+    pub fn generate_gpu(&mut self, request: GenerateRequest) -> Result<GpuGeneration, AiError> {
+        if request.preview_every != 0 {
+            return Err(AiError::InvalidRequest(
+                "GPU-resident generation does not support CPU previews".into(),
+            ));
+        }
+        let (final_buf, previews, elapsed_ms) = self.sample(&request)?;
+        debug_assert!(previews.is_empty());
+        Ok(GpuGeneration {
+            size: request.size,
+            steps: request.steps,
+            seed: request.seed,
+            guidance: request.guidance,
+            heightmap: final_buf.into_inner(),
+            elapsed_ms,
+        })
+    }
+
+    fn sample(&mut self, request: &GenerateRequest) -> Result<(crate::gpu::Buf, Vec<Vec<f32>>, f64), AiError> {
+        validate_request(request)?;
         let model = self
             .model
             .as_ref()
@@ -153,17 +197,9 @@ impl AiEngine {
                 request.preview_every,
             )?
         };
-        let heightmap = self.ctx.readback_f32(&final_buf.buffer, len as usize)?;
+        self.ctx.wait()?;
         let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
-        Ok(Generation {
-            size: request.size,
-            steps: request.steps,
-            seed: request.seed,
-            guidance: request.guidance,
-            heightmap,
-            previews,
-            elapsed_ms,
-        })
+        Ok((final_buf, previews, elapsed_ms))
     }
 }
 

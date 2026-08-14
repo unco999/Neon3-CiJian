@@ -10,7 +10,7 @@ use neon_observability::{
     EVENT_COMMAND_RECEIVED, EVENT_COMMAND_REJECTED, JournalFilter, TraceLevel, TraceRecord,
 };
 use neon_protocol::{
-    AssetBytes, AssetRef, ClientIdentity, ClientKind, HealthStatus, PROTOCOL_VERSION, RequestId, Revision, RpcError, RpcRequest, RpcResponse,
+    AiTerrainGenerateCommand, AiTerrainGenerationResult, AssetBytes, AssetRef, ClientIdentity, ClientKind, HealthStatus, PROTOCOL_VERSION, RequestId, Revision, RpcError, RpcRequest, RpcResponse,
     RpcStatus, ServiceDescription, ServiceHealth, ServiceName,
 };
 use neon_ui_schema::{
@@ -29,13 +29,17 @@ use winit::{
 };
 
 mod ui_renderer;
+mod gpu_preview;
 
 use ui_renderer::{UiHitBinding, UiWgpuRenderer};
+use gpu_preview::HeightmapPreviewConverter;
 
 pub const SERVICE_NAME: &str = "wgpu-runtime";
 pub const CAPABILITY_UI_FRAGMENT: &str = "wgpu.ui.fragment.v1";
 pub const CAPABILITY_UI_HIT_TARGET: &str = "wgpu.ui.hit_target.v1";
 pub const CAPABILITY_UI_SEMANTIC_EVENT: &str = "wgpu.ui.semantic_event.v1";
+pub const CAPABILITY_UI_RENDER_SURFACE: &str = "wgpu.ui.render_surface.v1";
+pub const CAPABILITY_AI_TERRAIN_GENERATION: &str = "wgpu.ai.terrain_generation.v1";
 pub const UI_HIT_TARGET: &str = "ui.hit_id.v1";
 pub const UI_COLOR_TARGET: &str = "ui.color.v1";
 pub const RENDER_HIT_NONE: u32 = u32::MAX;
@@ -132,6 +136,14 @@ enum WindowCommand {
         fragments: HashMap<UiFragmentId, UiFragment>,
         applied: Option<std::sync::mpsc::Sender<usize>>,
     },
+    GenerateTerrainPreview {
+        command: AiTerrainGenerateCommand,
+        job_id: String,
+        completed: std::sync::mpsc::Sender<Result<AiTerrainGenerationResult, String>>,
+    },
+    AiModelStatus {
+        completed: std::sync::mpsc::Sender<Option<neon_wgpu_ai::ModelInfo>>,
+    },
     Shutdown,
 }
 
@@ -142,6 +154,8 @@ struct WindowGpu {
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     ui: UiWgpuRenderer,
+    ai: neon_wgpu_ai::AiEngine,
+    heightmap_preview: HeightmapPreviewConverter,
     hit_target: wgpu::Texture,
     hit_target_view: wgpu::TextureView,
     hit_target_generation: u64,
@@ -219,7 +233,10 @@ impl WindowedRuntime {
                     .with_inner_size(PhysicalSize::new(1440, 900)),
             )
             .map_err(|error| format!("create window: {error}"))?;
-        let gpu = WindowGpu::new(&window)?;
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_with_display_handle(
+            Box::new(event_loop.owned_display_handle()),
+        ));
+        let gpu = WindowGpu::new(&window, instance)?;
         self.window = Some(window);
         self.gpu = Some(gpu);
         self.redraw_pending = true;
@@ -395,8 +412,7 @@ impl WindowedRuntime {
 }
 
 impl WindowGpu {
-    fn new(window: &Window) -> Result<Self, String> {
-        let instance = wgpu::Instance::default();
+    fn new(window: &Window, instance: wgpu::Instance) -> Result<Self, String> {
         // SAFETY: `WindowedRuntime` declares `gpu` before `window`, so the surface is dropped
         // before the window handle it references.
         let surface = unsafe {
@@ -461,6 +477,23 @@ impl WindowGpu {
         surface.configure(&device, &config);
         eprintln!("neon-wgpu surface present mode: {:?}", config.present_mode);
         let ui = UiWgpuRenderer::new(&device, config.format);
+        let heightmap_preview = HeightmapPreviewConverter::new(&device);
+        let mut ai = neon_wgpu_ai::AiEngine::new(device.clone(), queue.clone());
+        let configured_pack = std::env::var_os("NEON_AI_PACK")
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                let path = std::path::PathBuf::from("assets/ai/terrain_run1/terrain_run1.pack");
+                path.exists().then_some(path)
+            });
+        if let Some(path) = configured_pack {
+            match std::fs::read(&path)
+                .map_err(|error| error.to_string())
+                .and_then(|bytes| ai.load_model(&bytes).map(|_| ()).map_err(|error| error.to_string()))
+            {
+                Ok(()) => eprintln!("neon-wgpu AI model loaded from {}", path.display()),
+                Err(error) => eprintln!("neon-wgpu AI model unavailable: {error}"),
+            }
+        }
         let (hit_target, hit_target_view) = create_hit_target(&device, size);
         Ok(Self {
             _instance: instance,
@@ -469,6 +502,8 @@ impl WindowGpu {
             queue,
             config,
             ui,
+            ai,
+            heightmap_preview,
             hit_target,
             hit_target_view,
             hit_target_generation: 1,
@@ -483,6 +518,59 @@ impl WindowGpu {
             last_present: Instant::now(),
             frame_count: 0,
             longest_frame_gap_ms: 0.0,
+        })
+    }
+
+    fn generate_terrain_preview(
+        &mut self,
+        command: AiTerrainGenerateCommand,
+        job_id: String,
+    ) -> Result<AiTerrainGenerationResult, String> {
+        if command.target_id.trim().is_empty()
+            || matches!(command.target_id.as_str(), UI_COLOR_TARGET | UI_HIT_TARGET)
+        {
+            return Err("invalid_render_surface_target".into());
+        }
+        if !self.ai.has_model() {
+            return Err("ai_model_not_loaded".into());
+        }
+        let generation = self
+            .ai
+            .generate_gpu(neon_wgpu_ai::GenerateRequest {
+                cond: neon_wgpu_ai::format::TerrainCond {
+                    sub: command.condition.sub,
+                    parent: command.condition.parent,
+                    relief: command.condition.relief,
+                    texture: command.condition.texture,
+                    water: command.condition.water,
+                },
+                guidance: command.guidance,
+                steps: command.steps,
+                seed: command.seed,
+                size: command.size,
+                preview_every: 0,
+            })
+            .map_err(|error| error.to_string())?;
+        let output = self.ui.ensure_render_surface(
+            &self.device,
+            &command.target_id,
+            [generation.size, generation.size],
+        );
+        self.heightmap_preview.convert_into(
+            &self.device,
+            &self.queue,
+            &generation.heightmap,
+            generation.size,
+            &output,
+        );
+        Ok(AiTerrainGenerationResult {
+            job_id,
+            target_id: command.target_id,
+            state: "ready".into(),
+            seed: generation.seed,
+            width: generation.size,
+            height: generation.size,
+            elapsed_ms: generation.elapsed_ms,
         })
     }
 }
@@ -607,6 +695,21 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                     let _ = applied.send(0);
                 }
             }
+            WindowCommand::GenerateTerrainPreview { command, job_id, completed } => {
+                let result = self
+                    .gpu
+                    .as_mut()
+                    .ok_or_else(|| "window_gpu_unavailable".to_owned())
+                    .and_then(|gpu| gpu.generate_terrain_preview(command, job_id));
+                if result.is_ok() {
+                    self.redraw_pending = true;
+                }
+                let _ = completed.send(result);
+            }
+            WindowCommand::AiModelStatus { completed } => {
+                let status = self.gpu.as_ref().and_then(|gpu| gpu.ai.model_info());
+                let _ = completed.send(status);
+            }
             WindowCommand::Shutdown => event_loop.exit(),
         }
     }
@@ -617,6 +720,146 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
         {
             window.request_redraw();
         }
+    }
+}
+
+fn handle_window_ai_generate(
+    runtime: &mut WgpuRuntime,
+    proxy: &EventLoopProxy<WindowCommand>,
+    request: RpcRequest,
+) -> RpcResponse {
+    let request_id = request.request_id.clone();
+    runtime.journal.append(
+        TraceLevel::Info,
+        EVENT_COMMAND_RECEIVED,
+        Some(request_id.clone()),
+        None,
+        None,
+        None,
+        request.expected_revision,
+        None,
+        json!({"method": request.method}),
+    );
+    runtime.record_receipt(&request_id, CommandState::Received, None);
+    let Some(idempotency_key) = request.idempotency_key.clone() else {
+        return runtime.reject(request_id, "invalid_request", "idempotency_key is required", None);
+    };
+    if request.expected_revision.is_none() {
+        return runtime.reject(request_id, "invalid_request", "expected_revision is required", None);
+    }
+    if let Some(response) = runtime.idempotent_responses.get(&idempotency_key) {
+        let mut response = response.clone();
+        response.request_id = request_id;
+        return response;
+    }
+    let command: AiTerrainGenerateCommand = match serde_json::from_value(request.params) {
+        Ok(command) => command,
+        Err(_) => {
+            return runtime.reject(
+                request_id,
+                "invalid_request",
+                "a typed AI terrain generation command is required",
+                None,
+            );
+        }
+    };
+    let job_id = format!("ai-terrain-{}", request_id.0);
+    runtime.journal.append(
+        TraceLevel::Info,
+        "ai.terrain.generation.started",
+        Some(request_id.clone()),
+        None,
+        Some(job_id.clone()),
+        Some(command.target_id.clone()),
+        request.expected_revision,
+        None,
+        json!({"steps": command.steps, "size": command.size, "seed": command.seed}),
+    );
+    let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+    if proxy
+        .send_event(WindowCommand::GenerateTerrainPreview {
+            command,
+            job_id: job_id.clone(),
+            completed: completed_tx,
+        })
+        .is_err()
+    {
+        return runtime.reject(
+            request_id,
+            "window_compositor_unavailable",
+            "window compositor is unavailable",
+            None,
+        );
+    }
+    match completed_rx.recv_timeout(std::time::Duration::from_secs(300)) {
+        Ok(Ok(result)) => {
+            runtime.graph_revision = Revision(runtime.graph_revision.0 + 1);
+            runtime.journal.append(
+                TraceLevel::Info,
+                "ai.terrain.generation.ready",
+                Some(request_id.clone()),
+                None,
+                Some(job_id),
+                Some(result.target_id.clone()),
+                request.expected_revision,
+                Some(runtime.graph_revision),
+                json!({"width": result.width, "height": result.height, "elapsed_ms": result.elapsed_ms}),
+            );
+            let response = runtime.accept(request_id, json!(result));
+            runtime.idempotent_responses.insert(idempotency_key, response.clone());
+            response
+        }
+        Ok(Err(error)) => {
+            runtime.journal.append(
+                TraceLevel::Error,
+                "ai.terrain.generation.failed",
+                Some(request_id.clone()),
+                None,
+                Some(job_id),
+                None,
+                request.expected_revision,
+                Some(runtime.graph_revision),
+                json!({"code": error}),
+            );
+            runtime.reject(request_id, "ai_generation_failed", &error, Some(runtime.graph_revision))
+        }
+        Err(_) => runtime.reject(
+            request_id,
+            "ai_generation_timeout",
+            "AI terrain generation did not complete before the deadline",
+            Some(runtime.graph_revision),
+        ),
+    }
+}
+
+fn handle_window_ai_model_status(
+    runtime: &mut WgpuRuntime,
+    proxy: &EventLoopProxy<WindowCommand>,
+    request_id: RequestId,
+) -> RpcResponse {
+    let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+    if proxy
+        .send_event(WindowCommand::AiModelStatus { completed: completed_tx })
+        .is_err()
+    {
+        return runtime.reject(
+            request_id,
+            "window_compositor_unavailable",
+            "window compositor is unavailable",
+            None,
+        );
+    }
+    match completed_rx.recv_timeout(std::time::Duration::from_secs(5)) {
+        Ok(model) => runtime.accept(
+            request_id,
+            json!({"loaded": model.is_some(), "model": model}),
+        ),
+        Err(_) => runtime.reject(
+            request_id,
+            "window_compositor_timeout",
+            "window compositor did not report AI model status",
+            None,
+        ),
     }
 }
 
@@ -634,11 +877,17 @@ fn spawn_window_server(
                 return;
             }
         };
-        let mut runtime = WgpuRuntime::headless(epoch);
+        let mut runtime = WgpuRuntime::window_control(epoch);
         if let Err(error) = server.serve_until(|request| {
             let shutdown = request.method == "service.shutdown";
             let mutates_composition = matches!(request.method.as_str(), "wgpu.ui.submit_fragment" | "wgpu.ui.remove_fragment");
-            let response = runtime.handle(request);
+            let response = if request.method == "wgpu.ai.terrain.generate" {
+                handle_window_ai_generate(&mut runtime, &proxy, request)
+            } else if request.method == "wgpu.ai.model.status" {
+                handle_window_ai_model_status(&mut runtime, &proxy, request.request_id)
+            } else {
+                runtime.handle(request)
+            };
             if mutates_composition && response.status == RpcStatus::Accepted {
                 let (applied_tx, applied_rx) = std::sync::mpsc::channel();
                 let send = proxy.send_event(WindowCommand::Fragments {
@@ -680,6 +929,7 @@ impl WindowedRuntime {
             text_key: None,
             text: None,
             image: None,
+            surface: None,
             style: UiStyle {
                 background_color: [0.035, 0.06, 0.08, 0.98],
                 border_color: [0.18, 0.78, 0.86, 0.8],
@@ -718,6 +968,7 @@ impl WindowedRuntime {
                     text_key: Some("ui.demo.title".into()),
                     text: None,
                     image: None,
+                    surface: None,
                     style: UiStyle {
                         background_color: [0.12, 0.32, 0.37, 0.94],
                         border_color: [0.37, 0.94, 0.94, 0.85],
@@ -751,6 +1002,7 @@ impl WindowedRuntime {
                     text_key: Some("ui.demo.action".into()),
                     text: None,
                     image: None,
+                    surface: None,
                     style: UiStyle {
                         background_color: [0.08, 0.38, 0.44, 1.0],
                         border_color: [0.46, 0.96, 0.94, 0.95],
@@ -791,6 +1043,7 @@ impl WindowedRuntime {
 
 pub struct WgpuRuntime {
     epoch: u64,
+    window_gpu_available: bool,
     graph_revision: Revision,
     hit_target_generation: u64,
     input: LocalInputState,
@@ -805,6 +1058,7 @@ impl WgpuRuntime {
     pub fn headless(epoch: u64) -> Self {
         Self {
             epoch,
+            window_gpu_available: false,
             graph_revision: Revision(0),
             hit_target_generation: 1,
             input: LocalInputState::default(),
@@ -816,6 +1070,12 @@ impl WgpuRuntime {
         }
     }
 
+    fn window_control(epoch: u64) -> Self {
+        let mut runtime = Self::headless(epoch);
+        runtime.window_gpu_available = true;
+        runtime
+    }
+
     pub fn service_health(&self) -> ServiceHealth {
         ServiceHealth {
             service: ServiceName(SERVICE_NAME.into()),
@@ -825,17 +1085,22 @@ impl WgpuRuntime {
     }
 
     pub fn service_description(&self) -> ServiceDescription {
+        let mut capabilities = vec![
+            CAPABILITY_UI_FRAGMENT.into(),
+            "wgpu.render.diagnostics".into(),
+            CAPABILITY_UI_HIT_TARGET.into(),
+            CAPABILITY_UI_SEMANTIC_EVENT.into(),
+            CAPABILITY_UI_RENDER_SURFACE.into(),
+        ];
+        if self.window_gpu_available {
+            capabilities.push(CAPABILITY_AI_TERRAIN_GENERATION.into());
+        }
         ServiceDescription {
             service: ServiceName(SERVICE_NAME.into()),
             protocol_version: PROTOCOL_VERSION,
             endpoint: "headless://wgpu-runtime".into(),
             epoch: self.epoch,
-            capabilities: vec![
-                CAPABILITY_UI_FRAGMENT.into(),
-                "wgpu.render.diagnostics".into(),
-                CAPABILITY_UI_HIT_TARGET.into(),
-                CAPABILITY_UI_SEMANTIC_EVENT.into(),
-            ],
+            capabilities,
         }
     }
 
@@ -1348,6 +1613,34 @@ mod tests {
         pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor { label: Some(label), required_features: wgpu::Features::empty(), required_limits: wgpu::Limits::downlevel_defaults(), experimental_features: wgpu::ExperimentalFeatures::default(), memory_hints: wgpu::MemoryHints::MemoryUsage, trace: wgpu::Trace::Off })).expect("the selected adapter must create a device and queue")
     }
 
+    fn ai_test_device(label: &'static str) -> (wgpu::Device, wgpu::Queue) {
+        let backends = if cfg!(target_os = "windows") {
+            wgpu::Backends::VULKAN
+        } else {
+            wgpu::Backends::PRIMARY
+        };
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends,
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
+        });
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+            apply_limit_buckets: false,
+        }))
+        .expect("AI GPU acceptance requires a compute adapter");
+        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some(label),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::default(),
+            experimental_features: wgpu::ExperimentalFeatures::default(),
+            memory_hints: wgpu::MemoryHints::MemoryUsage,
+            trace: wgpu::Trace::Off,
+        }))
+        .expect("the AI acceptance adapter must create a device and queue")
+    }
+
     fn fragment(revision: u64) -> UiFragment {
         UiFragment {
             fragment_id: UiFragmentId("static-fragment".into()),
@@ -1367,6 +1660,7 @@ mod tests {
                 text_key: None,
                 text: None,
                 image: None,
+                surface: None,
                 style: UiStyle::default(),
                 enter_transition: None,
                 children: Vec::new(),
@@ -1402,13 +1696,21 @@ mod tests {
         assert_eq!(described["protocol_version"], json!(PROTOCOL_VERSION));
         assert_eq!(
             described["capabilities"],
-            json!([CAPABILITY_UI_FRAGMENT, "wgpu.render.diagnostics", CAPABILITY_UI_HIT_TARGET, CAPABILITY_UI_SEMANTIC_EVENT])
+            json!([CAPABILITY_UI_FRAGMENT, "wgpu.render.diagnostics", CAPABILITY_UI_HIT_TARGET, CAPABILITY_UI_SEMANTIC_EVENT, CAPABILITY_UI_RENDER_SURFACE])
         );
         assert_eq!(snapshot.status, RpcStatus::Accepted);
         assert_eq!(
             snapshot.result.unwrap()["capabilities"],
-            json!([CAPABILITY_UI_FRAGMENT, "wgpu.render.diagnostics", CAPABILITY_UI_HIT_TARGET, CAPABILITY_UI_SEMANTIC_EVENT])
+            json!([CAPABILITY_UI_FRAGMENT, "wgpu.render.diagnostics", CAPABILITY_UI_HIT_TARGET, CAPABILITY_UI_SEMANTIC_EVENT, CAPABILITY_UI_RENDER_SURFACE])
         );
+    }
+
+    #[test]
+    fn window_control_advertises_gpu_generation_capability_only_there() {
+        let headless = WgpuRuntime::headless(1);
+        let window = WgpuRuntime::window_control(1);
+        assert!(!headless.service_description().capabilities.iter().any(|capability| capability == CAPABILITY_AI_TERRAIN_GENERATION));
+        assert!(window.service_description().capabilities.iter().any(|capability| capability == CAPABILITY_AI_TERRAIN_GENERATION));
     }
 
     #[test]
@@ -1580,6 +1882,255 @@ mod tests {
     }
 
     #[test]
+    fn film_applies_scale_and_bias_by_nchw_channel() {
+        let (device, queue) = ai_test_device("neon3-film-nchw-acceptance");
+        let mut ctx = neon_wgpu_ai::GpuCtx::new(device, queue);
+        let input = [1.0f32, 2.0, 3.0, 10.0, 20.0, 30.0];
+        let params = [0.5f32, -0.25, 1.0, -2.0];
+        let input_buffer = ctx.upload(bytemuck::cast_slice(&input), "film-acceptance-input");
+        let params_buffer = ctx.upload(bytemuck::cast_slice(&params), "film-acceptance-params");
+        ctx.begin_batch();
+        let output = neon_wgpu_ai::ops::film(
+            &mut ctx,
+            &input_buffer,
+            &params_buffer,
+            2,
+            input.len() as u64,
+        );
+        ctx.submit_batch();
+        assert_eq!(ctx.submission_count(), 1);
+        let actual = ctx
+            .readback_f32(&output.buffer, input.len())
+            .expect("FiLM output must read back");
+        let expected = [2.5f32, 4.0, 5.5, 5.5, 13.0, 20.5];
+        for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            assert!(
+                (actual - expected).abs() < 1e-6,
+                "FiLM NCHW channel mismatch at {index}: {actual} != {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn tiled_conv2d_matches_nchw_cpu_reference() {
+        let (device, queue) = ai_test_device("neon3-tiled-conv2d-acceptance");
+        let mut ctx = neon_wgpu_ai::GpuCtx::new(device, queue);
+        let (in_c, out_c, h, w, k) = (2u32, 3u32, 4u32, 5u32, 3u32);
+        let input: Vec<f32> = (0..in_c * h * w)
+            .map(|index| index as f32 * 0.03125 - 0.5)
+            .collect();
+        let weights: Vec<f32> = (0..out_c * in_c * k * k)
+            .map(|index| (index as i32 % 11 - 5) as f32 * 0.025)
+            .collect();
+        let bias = [0.1f32, -0.2, 0.3];
+        let input_buffer = ctx.upload(bytemuck::cast_slice(&input), "conv-acceptance-input");
+        let weight_buffer = ctx.upload(bytemuck::cast_slice(&weights), "conv-acceptance-weights");
+        let bias_buffer = ctx.upload(bytemuck::cast_slice(&bias), "conv-acceptance-bias");
+        ctx.begin_batch();
+        let output = neon_wgpu_ai::ops::conv2d(
+            &mut ctx,
+            &input_buffer,
+            &weight_buffer,
+            &bias_buffer,
+            in_c,
+            out_c,
+            h,
+            w,
+            k,
+            k,
+            1,
+            1,
+        );
+        ctx.submit_batch();
+        let actual = ctx
+            .readback_f32(&output.buffer, (out_c * h * w) as usize)
+            .expect("conv2d output must read back");
+        let mut expected = vec![0.0f32; actual.len()];
+        for oc in 0..out_c {
+            for oy in 0..h {
+                for ox in 0..w {
+                    let mut sum = bias[oc as usize];
+                    for ic in 0..in_c {
+                        for ky in 0..k {
+                            for kx in 0..k {
+                                let iy = oy as i32 + ky as i32 - 1;
+                                let ix = ox as i32 + kx as i32 - 1;
+                                if iy >= 0 && iy < h as i32 && ix >= 0 && ix < w as i32 {
+                                    let input_index = (ic * h * w + iy as u32 * w + ix as u32) as usize;
+                                    let weight_index = (oc * in_c * k * k + ic * k * k + ky * k + kx) as usize;
+                                    sum += input[input_index] * weights[weight_index];
+                                }
+                            }
+                        }
+                    }
+                    expected[(oc * h * w + oy * w + ox) as usize] = sum;
+                }
+            }
+        }
+        for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            assert!(
+                (actual - expected).abs() < 1e-4,
+                "tiled conv2d mismatch at {index}: {actual} != {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn persistent_render_surface_updates_content_without_replacing_the_slot() {
+        use wgpu::util::DeviceExt;
+
+        let (device, queue) = test_device("neon3-persistent-render-surface");
+        let converter = HeightmapPreviewConverter::new(&device);
+        let mut renderer = UiWgpuRenderer::new(&device, wgpu::TextureFormat::Rgba8Unorm);
+        let root = UiNode {
+            node_id: UiNodeId("preview".into()),
+            kind: UiNodeKind::RenderSurface,
+            bounds: UiBounds { x: 0.0, y: 0.0, width: 64.0, height: 64.0 },
+            layout: None,
+            visible: true,
+            enabled: true,
+            text_key: None,
+            text: None,
+            image: None,
+            surface: Some(neon_ui_schema::RenderSurfaceRef { target_id: "ai.terrain.preview".into() }),
+            style: UiStyle { opacity: 1.0, ..UiStyle::default() },
+            enter_transition: None,
+            children: Vec::new(),
+        };
+        let fragments = HashMap::from([(
+            UiFragmentId("persistent-preview".into()),
+            UiFragment {
+                fragment_id: UiFragmentId("persistent-preview".into()),
+                revision: Revision(1),
+                root,
+                effects: Vec::new(),
+            },
+        )]);
+        let mut rendered = Vec::new();
+        for value in [-3.0f32, 3.0f32] {
+            let source = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("neon3-persistent-render-surface-source"),
+                contents: bytemuck::cast_slice(&vec![value; 64 * 64]),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+            let output = renderer.ensure_render_surface(&device, "ai.terrain.preview", [64, 64]);
+            converter.convert_into(&device, &queue, &source, 64, &output);
+            rendered.push(ui_renderer::render_renderer_offscreen_for_test(
+                &mut renderer,
+                &device,
+                &queue,
+                wgpu::TextureFormat::Rgba8Unorm,
+                &fragments,
+                [64, 64],
+                1.0,
+            ));
+        }
+        let center = 4 * (32 * 64 + 32);
+        assert_eq!(&rendered[0][center..center + 4], [0, 0, 0, 255]);
+        assert_eq!(&rendered[1][center..center + 4], [255, 255, 255, 255]);
+    }
+
+    #[test]
+    #[ignore = "loads the 257 MB real model pack"]
+    fn real_ai_generation_composes_through_a_gpu_render_surface() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::VULKAN,
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
+        });
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+            apply_limit_buckets: false,
+        }))
+        .expect("a Vulkan adapter is required for the real-model acceptance test");
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("neon3-ai-render-surface-acceptance"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::default(),
+            experimental_features: wgpu::ExperimentalFeatures::default(),
+            memory_hints: wgpu::MemoryHints::Performance,
+            trace: wgpu::Trace::Off,
+        }))
+        .expect("the Vulkan adapter must create a device and queue");
+        let pack_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../assets/ai/terrain_run1/terrain_run1.pack");
+        let pack = std::fs::read(&pack_path).expect("real terrain model pack must exist");
+        let mut engine = neon_wgpu_ai::AiEngine::new(device.clone(), queue.clone());
+        engine.load_model(&pack).expect("real terrain model must load");
+        let converter = gpu_preview::HeightmapPreviewConverter::new(&device);
+        let root = UiNode {
+            node_id: UiNodeId("terrain-preview".into()),
+            kind: UiNodeKind::RenderSurface,
+            bounds: UiBounds { x: 0.0, y: 0.0, width: 64.0, height: 64.0 },
+            layout: None,
+            visible: true,
+            enabled: true,
+            text_key: None,
+            text: None,
+            image: None,
+            surface: Some(neon_ui_schema::RenderSurfaceRef {
+                target_id: "ai.terrain.preview".into(),
+            }),
+            style: UiStyle { opacity: 1.0, ..UiStyle::default() },
+            enter_transition: None,
+            children: Vec::new(),
+        };
+        let fragments = HashMap::from([(
+            UiFragmentId("ai-terrain-preview".into()),
+            UiFragment {
+                fragment_id: UiFragmentId("ai-terrain-preview".into()),
+                revision: Revision(1),
+                root,
+                effects: Vec::new(),
+            },
+        )]);
+        let mut renderer = UiWgpuRenderer::new(&device, wgpu::TextureFormat::Rgba8Unorm);
+        let mut previous = None;
+        for seed in [42, 43, 44] {
+            let generation = engine
+                .generate_gpu(neon_wgpu_ai::GenerateRequest {
+                    cond: neon_wgpu_ai::format::TerrainCond {
+                        sub: None,
+                        parent: Some(1),
+                        relief: None,
+                        texture: None,
+                        water: None,
+                    },
+                    guidance: 7.0,
+                    steps: 1,
+                    seed,
+                    size: 32,
+                    preview_every: 0,
+                })
+                .expect("GPU-resident terrain generation must complete repeatedly");
+            let texture = converter.convert(&device, &queue, &generation.heightmap, generation.size);
+            renderer.register_render_surface(&device, "ai.terrain.preview", texture);
+            let pixels = ui_renderer::render_renderer_offscreen_for_test(
+                &mut renderer,
+                &device,
+                &queue,
+                wgpu::TextureFormat::Rgba8Unorm,
+                &fragments,
+                [64, 64],
+                1.0,
+            );
+            let mut minimum = u8::MAX;
+            let mut maximum = u8::MIN;
+            for pixel in pixels.chunks_exact(4) {
+                minimum = minimum.min(pixel[0]);
+                maximum = maximum.max(pixel[0]);
+                assert_eq!(pixel[3], 255, "the composed preview must remain opaque");
+            }
+            assert!(maximum.saturating_sub(minimum) > 16, "the AI preview must contain visible height variation");
+            if let Some(previous) = previous.as_ref() {
+                assert_ne!(previous, &pixels, "a new seed must replace the existing surface pixels");
+            }
+            previous = Some(pixels);
+        }
+    }
+
+    #[test]
     fn ui_fragment_renders_visible_pixels_to_offscreen_target() {
         let (device, queue) = test_device("neon3-ui-render-acceptance");
         let pixels = ui_renderer::render_offscreen_for_test(
@@ -1590,6 +2141,7 @@ mod tests {
             [64, 64],
             1.0,
             &[],
+            Vec::new(),
         );
         assert!(pixels.iter().any(|value| *value != 0), "UI render target must contain visible pixels");
     }
@@ -1597,9 +2149,9 @@ mod tests {
     #[test]
     fn ui_fragment_renders_visible_pixels_to_srgb_surface_format() {
         let (device, queue) = test_device("neon3-srgb-ui-acceptance");
-        let root = UiNode { node_id: UiNodeId("srgb-root".into()), kind: UiNodeKind::Panel, bounds: UiBounds { x: 0.0, y: 0.0, width: 64.0, height: 64.0 }, layout: None, visible: true, enabled: true, text_key: None, text: None, image: None, style: UiStyle { background_color: [0.0, 0.7, 0.9, 1.0], border_color: [1.0; 4], border_width: 0.0, corner_radius: 0.0, opacity: 1.0 }, enter_transition: None, children: Vec::new() };
+        let root = UiNode { node_id: UiNodeId("srgb-root".into()), kind: UiNodeKind::Panel, bounds: UiBounds { x: 0.0, y: 0.0, width: 64.0, height: 64.0 }, layout: None, visible: true, enabled: true, text_key: None, text: None, image: None, surface: None, style: UiStyle { background_color: [0.0, 0.7, 0.9, 1.0], border_color: [1.0; 4], border_width: 0.0, corner_radius: 0.0, opacity: 1.0 }, enter_transition: None, children: Vec::new() };
         let fragments = HashMap::from([(UiFragmentId("srgb-acceptance".into()), UiFragment { fragment_id: UiFragmentId("srgb-acceptance".into()), revision: Revision(1), root, effects: Vec::new() })]);
-        let pixels = ui_renderer::render_offscreen_for_test(&device, &queue, wgpu::TextureFormat::Bgra8UnormSrgb, &fragments, [64, 64], 1.0, &[]);
+        let pixels = ui_renderer::render_offscreen_for_test(&device, &queue, wgpu::TextureFormat::Bgra8UnormSrgb, &fragments, [64, 64], 1.0, &[], Vec::new());
         assert!(pixels.iter().any(|value| *value != 0), "sRGB composition target must contain visible UI pixels");
     }
 
@@ -1610,10 +2162,10 @@ mod tests {
         root.kind = UiNodeKind::Panel;
         root.bounds = UiBounds { x: 0.0, y: 0.0, width: 64.0, height: 64.0 };
         root.children = vec![
-            UiNode { node_id: UiNodeId("back".into()), kind: UiNodeKind::Button, bounds: UiBounds { x: 8.0, y: 8.0, width: 32.0, height: 32.0 }, layout: None, visible: true, enabled: true, text_key: None, text: None, image: None, style: UiStyle { corner_radius: 8.0, ..UiStyle::default() }, enter_transition: None, children: Vec::new() },
-            UiNode { node_id: UiNodeId("front".into()), kind: UiNodeKind::Button, bounds: UiBounds { x: 16.0, y: 16.0, width: 32.0, height: 32.0 }, layout: None, visible: true, enabled: true, text_key: None, text: None, image: None, style: UiStyle::default(), enter_transition: None, children: Vec::new() },
-            UiNode { node_id: UiNodeId("disabled".into()), kind: UiNodeKind::Button, bounds: UiBounds { x: 48.0, y: 48.0, width: 12.0, height: 12.0 }, layout: None, visible: true, enabled: false, text_key: None, text: None, image: None, style: UiStyle::default(), enter_transition: None, children: Vec::new() },
-            UiNode { node_id: UiNodeId("transparent".into()), kind: UiNodeKind::Button, bounds: UiBounds { x: 48.0, y: 32.0, width: 12.0, height: 12.0 }, layout: None, visible: true, enabled: true, text_key: None, text: None, image: None, style: UiStyle { opacity: 0.0, ..UiStyle::default() }, enter_transition: None, children: Vec::new() },
+            UiNode { node_id: UiNodeId("back".into()), kind: UiNodeKind::Button, bounds: UiBounds { x: 8.0, y: 8.0, width: 32.0, height: 32.0 }, layout: None, visible: true, enabled: true, text_key: None, text: None, image: None, surface: None, style: UiStyle { corner_radius: 8.0, ..UiStyle::default() }, enter_transition: None, children: Vec::new() },
+            UiNode { node_id: UiNodeId("front".into()), kind: UiNodeKind::Button, bounds: UiBounds { x: 16.0, y: 16.0, width: 32.0, height: 32.0 }, layout: None, visible: true, enabled: true, text_key: None, text: None, image: None, surface: None, style: UiStyle::default(), enter_transition: None, children: Vec::new() },
+            UiNode { node_id: UiNodeId("disabled".into()), kind: UiNodeKind::Button, bounds: UiBounds { x: 48.0, y: 48.0, width: 12.0, height: 12.0 }, layout: None, visible: true, enabled: false, text_key: None, text: None, image: None, surface: None, style: UiStyle::default(), enter_transition: None, children: Vec::new() },
+            UiNode { node_id: UiNodeId("transparent".into()), kind: UiNodeKind::Button, bounds: UiBounds { x: 48.0, y: 32.0, width: 12.0, height: 12.0 }, layout: None, visible: true, enabled: true, text_key: None, text: None, image: None, surface: None, style: UiStyle { opacity: 0.0, ..UiStyle::default() }, enter_transition: None, children: Vec::new() },
         ];
         let pixels = ui_renderer::render_hit_ids_for_test(&device, &queue, &HashMap::from([(UiFragmentId("hit-acceptance".into()), UiFragment { fragment_id: UiFragmentId("hit-acceptance".into()), revision: Revision(1), root, effects: Vec::new() })]), [64, 64]);
         let at = |x: usize, y: usize| pixels[y * 64 + x];
@@ -1629,8 +2181,8 @@ mod tests {
     #[test]
     fn ui_hit_target_respects_nested_clip_geometry() {
         let (device, queue) = test_device("neon3-ui-clip-acceptance");
-        let child = UiNode { node_id: UiNodeId("clipped-button".into()), kind: UiNodeKind::Button, bounds: UiBounds { x: 24.0, y: 8.0, width: 24.0, height: 16.0 }, layout: None, visible: true, enabled: true, text_key: None, text: None, image: None, style: UiStyle::default(), enter_transition: None, children: Vec::new() };
-        let root = UiNode { node_id: UiNodeId("clip-root".into()), kind: UiNodeKind::Panel, bounds: UiBounds { x: 0.0, y: 0.0, width: 32.0, height: 32.0 }, layout: Some(neon_ui_schema::UiLayout { clip: true, ..neon_ui_schema::UiLayout::default() }), visible: true, enabled: true, text_key: None, text: None, image: None, style: UiStyle::default(), enter_transition: None, children: vec![child] };
+        let child = UiNode { node_id: UiNodeId("clipped-button".into()), kind: UiNodeKind::Button, bounds: UiBounds { x: 24.0, y: 8.0, width: 24.0, height: 16.0 }, layout: None, visible: true, enabled: true, text_key: None, text: None, image: None, surface: None, style: UiStyle::default(), enter_transition: None, children: Vec::new() };
+        let root = UiNode { node_id: UiNodeId("clip-root".into()), kind: UiNodeKind::Panel, bounds: UiBounds { x: 0.0, y: 0.0, width: 32.0, height: 32.0 }, layout: Some(neon_ui_schema::UiLayout { clip: true, ..neon_ui_schema::UiLayout::default() }), visible: true, enabled: true, text_key: None, text: None, image: None, surface: None, style: UiStyle::default(), enter_transition: None, children: vec![child] };
         let pixels = ui_renderer::render_hit_ids_for_test(&device, &queue, &HashMap::from([(UiFragmentId("clip".into()), UiFragment { fragment_id: UiFragmentId("clip".into()), revision: Revision(1), root, effects: Vec::new() })]), [64, 64]);
         assert_ne!(pixels[12 * 64 + 28], RENDER_HIT_NONE, "child area inside parent clip must be interactive");
         assert_eq!(pixels[12 * 64 + 40], RENDER_HIT_NONE, "child area outside parent clip must be no-hit");
@@ -1791,9 +2343,9 @@ mod tests {
         image.image = Some(AssetRef { project_id: "fixture-project".into(), asset_id: 81, revision: Revision(5), kind: "image".into() });
         image.style = UiStyle { background_color: [0.2, 0.8, 0.4, 1.0], border_color: [0.0; 4], border_width: 0.0, corner_radius: 0.0, opacity: 1.0 };
         let fragments = HashMap::from([(UiFragmentId("image".into()), UiFragment { fragment_id: UiFragmentId("image".into()), revision: Revision(1), root: image, effects: Vec::new() })]);
-        let unresolved = ui_renderer::render_offscreen_for_test(&device, &queue, wgpu::TextureFormat::Rgba8Unorm, &fragments, [64, 64], 1.0, &[]);
+        let unresolved = ui_renderer::render_offscreen_for_test(&device, &queue, wgpu::TextureFormat::Rgba8Unorm, &fragments, [64, 64], 1.0, &[], Vec::new());
         assert_eq!(unresolved[4 * (16 * 64 + 16) + 3], 0, "an unresolved AssetRef must not render a fixture image");
-        let pixels = ui_renderer::render_offscreen_for_test(&device, &queue, wgpu::TextureFormat::Rgba8Unorm, &fragments, [64, 64], 1.0, &[content]);
+        let pixels = ui_renderer::render_offscreen_for_test(&device, &queue, wgpu::TextureFormat::Rgba8Unorm, &fragments, [64, 64], 1.0, &[content], Vec::new());
         assert!(pixels[4 * (16 * 64 + 16) + 3] > 0, "the opaque image half must render alpha");
         assert_eq!(pixels[4 * (16 * 64 + 48) + 3], 0, "the transparent image half must preserve alpha");
     }
@@ -1819,7 +2371,7 @@ mod tests {
     }
 
     #[test]
-    fn project_font_preload_job_drives_private_text_glyph_residency() {
+    fn project_font_preload_job_can_override_bundled_text_glyph_residency() {
         let asset = AssetRef { project_id: "fixture-project".into(), asset_id: 82, revision: Revision(5), kind: "font".into() };
         let mut projectd = neon_projectd::Projectd::fixture(3);
         assert_eq!(projectd.handle(request("font-glyph-project-describe", "service.describe", json!({}))).status, RpcStatus::Accepted);
@@ -1842,9 +2394,9 @@ mod tests {
         text.text = Some(neon_ui_schema::TextRef::Literal { value: "A".into() });
         text.style = UiStyle { background_color: [0.0; 4], border_color: [0.0; 4], border_width: 0.0, corner_radius: 0.0, opacity: 1.0 };
         let fragments = HashMap::from([(UiFragmentId("font-glyph".into()), UiFragment { fragment_id: UiFragmentId("font-glyph".into()), revision: Revision(1), root: text, effects: Vec::new() })]);
-        let unresolved = ui_renderer::render_offscreen_for_test(&device, &queue, wgpu::TextureFormat::Rgba8Unorm, &fragments, [64, 32], 1.0, &[]);
-        assert!(!unresolved.chunks_exact(4).any(|pixel| pixel[3] > 0), "unresolved TextRef must not render glyph pixels");
-        let pixels = ui_renderer::render_offscreen_for_test(&device, &queue, wgpu::TextureFormat::Rgba8Unorm, &fragments, [64, 32], 1.0, &[content]);
+        let bundled = ui_renderer::render_offscreen_for_test(&device, &queue, wgpu::TextureFormat::Rgba8Unorm, &fragments, [64, 32], 1.0, &[], Vec::new());
+        assert!(bundled.chunks_exact(4).any(|pixel| pixel[3] > 0), "bundled UI font must render glyph pixels");
+        let pixels = ui_renderer::render_offscreen_for_test(&device, &queue, wgpu::TextureFormat::Rgba8Unorm, &fragments, [64, 32], 1.0, &[content], Vec::new());
         assert!(pixels.chunks_exact(4).any(|pixel| pixel[3] > 0), "accepted owner font content must drive private glyph pixels");
     }
 

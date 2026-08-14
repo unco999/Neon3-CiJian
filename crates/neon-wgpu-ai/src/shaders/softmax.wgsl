@@ -16,8 +16,8 @@ var<workgroup> smax: array<f32, 256>;
 var<workgroup> ssum: array<f32, 256>;
 
 @compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
-    let row = gid.x;
+fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let row = wgid.x + wgid.y * 65535u;
     if (row >= p.rows) { return; }
     let base = p.off + row * p.cols;
     let per = (p.cols + 255u) / 256u;

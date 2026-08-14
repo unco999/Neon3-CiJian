@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+neon-wgpu-ai = { path = "../neon-wgpu-ai" }
 neon-protocol = { path = "../neon-protocol" }
 neon-observability = { path = "../neon-observability" }
 neon-ui-schema = { path = "../neon-ui-schema" }

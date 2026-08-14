@@ -63,6 +63,22 @@ test("duplicate sibling node keys and legacy numeric ids are rejected", () => {
   assert.throws(() => compileContainer(surface([createHost("neon-panel", { id: 640060, nodeKey: "panel", bounds: { x: 0, y: 0, width: 10, height: 10 } })])), /id is not/);
 });
 
+test("RenderSurface compiles an opaque renderer target reference", () => {
+  const preview = createHost("neon-render-surface", {
+    nodeKey: "terrain-preview",
+    bounds: { x: 0, y: 0, width: 128, height: 128 },
+    surface: { target_id: "ai.terrain.preview" },
+  });
+  const fragment = compileContainer(surface([preview]));
+  assert.equal(fragment.root.children[0].kind, "render_surface");
+  assert.deepEqual(fragment.root.children[0].surface, { target_id: "ai.terrain.preview" });
+  assert.equal(JSON.stringify(fragment).includes("texture"), false);
+  assert.throws(
+    () => compileContainer(surface([createHost("neon-render-surface", { nodeKey: "bad", bounds: { x: 0, y: 0, width: 1, height: 1 } })])),
+    /requires surface.target_id/,
+  );
+});
+
 test("React reconciler produces a protocol fragment without DOM", async () => {
   const fragmentPromise = new Promise((resolve, reject) => {
     const root = createNeonRoot({
@@ -86,7 +102,7 @@ test("client submits declarations to ui-runtime, never directly to renderer", as
   const transport = { call: async (value) => { request = value; return { request_id: value.request_id, status: "accepted", revision: 1, result: null, snapshot: null, error: null }; } };
   const { NeonUiClient } = await import("../dist/client.js");
   const client = new NeonUiClient(transport, "react-test");
-  await client.submitFragment({ fragment_id: "surface.test", revision: 1, root: { node_id: "node.root", kind: "panel", bounds: { x: 0, y: 0, width: 1, height: 1 }, layout: null, visible: true, enabled: true, text_key: null, text: null, image: null, style: {}, enter_transition: null, children: [] }, effects: [] });
+  await client.submitFragment({ fragment_id: "surface.test", revision: 1, root: { node_id: "node.root", kind: "panel", bounds: { x: 0, y: 0, width: 1, height: 1 }, layout: null, visible: true, enabled: true, text_key: null, text: null, image: null, surface: null, style: {}, enter_transition: null, children: [] }, effects: [] });
   assert.equal(request.target, "ui-runtime");
   assert.equal(request.method, "ui.fragment.submit");
   assert.equal(request.client.origin, "neon-ui-react-client");

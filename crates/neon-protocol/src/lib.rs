@@ -69,6 +69,39 @@ pub struct AssetBytes {
     pub bytes: Vec<u8>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AiTerrainCondition {
+    pub sub: Option<u32>,
+    pub parent: Option<u32>,
+    pub relief: Option<u32>,
+    pub texture: Option<u32>,
+    pub water: Option<u32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AiTerrainGenerateCommand {
+    pub condition: AiTerrainCondition,
+    pub guidance: f32,
+    pub steps: u32,
+    pub seed: u64,
+    pub size: u32,
+    pub target_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AiTerrainGenerationResult {
+    pub job_id: String,
+    pub target_id: String,
+    pub state: String,
+    pub seed: u64,
+    pub width: u32,
+    pub height: u32,
+    pub elapsed_ms: f64,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RpcRequest {
@@ -143,6 +176,40 @@ pub struct ServiceEvent {
     pub epoch: u64,
     pub sequence: u64,
     pub payload: Value,
+}
+
+/// Cursor supplied by a client after it has fetched a full service snapshot.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubscriptionRequest {
+    pub epoch: u64,
+    pub from_sequence: Option<u64>,
+}
+
+/// A polling subscription result. The current IPC transport has no server push channel.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubscriptionResponse {
+    pub epoch: u64,
+    pub next_sequence: u64,
+    pub events: Vec<ServiceEvent>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectSummary {
+    pub project_id: String,
+    pub revision: Revision,
+    pub epoch: u64,
+    pub sequence: u64,
+    pub asset_count: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectSnapshot {
+    pub summary: ProjectSummary,
+    pub assets: Vec<AssetRef>,
 }
 
 #[cfg(test)]
@@ -246,5 +313,29 @@ mod tests {
         assert!(value.get("path").is_none());
         assert!(value.get("local_path").is_none());
         assert_eq!(value["asset"]["revision"], 5);
+    }
+
+    #[test]
+    fn ai_generation_command_contains_labels_and_parameters_but_no_gpu_handle() {
+        let command = AiTerrainGenerateCommand {
+            condition: AiTerrainCondition {
+                sub: Some(6),
+                parent: Some(1),
+                relief: Some(3),
+                texture: Some(2),
+                water: Some(2),
+            },
+            guidance: 7.0,
+            steps: 2,
+            seed: 42,
+            size: 32,
+            target_id: "ai.terrain.preview".into(),
+        };
+        let value = serde_json::to_value(command).unwrap();
+        assert_eq!(value["condition"]["parent"], 1);
+        assert_eq!(value["target_id"], "ai.terrain.preview");
+        for forbidden in ["texture", "buffer", "handle", "path"] {
+            assert!(value.get(forbidden).is_none());
+        }
     }
 }

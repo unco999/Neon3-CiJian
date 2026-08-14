@@ -1,7 +1,7 @@
 import type React from "react";
-import type { AssetRef, Bounds, JsonValue, NodeKey, UiFragment, UiIntent, UiIntentSpec, UiLayout, UiNode, UiStyle, UiSurfaceEvent, UiTransition } from "./protocol.js";
+import type { AssetRef, Bounds, JsonValue, NodeKey, RenderSurfaceRef, UiFragment, UiIntent, UiIntentSpec, UiLayout, UiNode, UiStyle, UiSurfaceEvent, UiTransition } from "./protocol.js";
 
-type HostType = "neon-surface" | "neon-panel" | "neon-label" | "neon-button" | "neon-image";
+type HostType = "neon-surface" | "neon-panel" | "neon-label" | "neon-button" | "neon-image" | "neon-render-surface";
 type HostProps = Record<string, unknown>;
 type TextNode = { kind: "text"; value: string; hidden: boolean };
 export type HostNode = { kind: "host"; type: HostType; props: HostProps; children: Child[]; hidden: boolean };
@@ -46,7 +46,7 @@ export function compileContainer(container: NeonContainer): UiFragment {
   const root: UiNode = {
     node_id: nodeId(surfaceId, "@root"), kind: "panel", bounds: rootBounds, layout: null,
     visible: boolProp(node.props.visible, true), enabled: boolProp(node.props.enabled, true),
-    text_key: null, text: null, image: null, style: styleProp(node.props.style), enter_transition: null,
+    text_key: null, text: null, image: null, surface: null, style: styleProp(node.props.style), enter_transition: null,
     children: compileChildren(node.children, surfaceId, "@root", effects),
   };
   return { fragment_id: surfaceId, revision, root, effects };
@@ -74,6 +74,10 @@ function compileChildren(children: Child[], surfaceId: string, parentPath: strin
     }
     const asset = child.props.asset as AssetRef | undefined;
     if (kind === "image" && !asset) throw new Error(`Image ${key} requires asset`);
+    const surface = child.props.surface as RenderSurfaceRef | undefined;
+    if (kind === "render_surface" && (!surface || typeof surface.target_id !== "string" || !surface.target_id.trim())) {
+      throw new Error(`RenderSurface ${key} requires surface.target_id`);
+    }
     const text = textProp(child);
     const textKey = typeof child.props.textKey === "string" ? child.props.textKey : null;
     nodes.push({
@@ -81,7 +85,7 @@ function compileChildren(children: Child[], surfaceId: string, parentPath: strin
       layout: (child.props.layout as UiLayout | undefined) ?? null,
       visible: boolProp(child.props.visible, true), enabled: boolProp(child.props.enabled, true),
       text_key: textKey, text: textKey ? { kind: "key", key: textKey, arguments: (child.props.textArguments as JsonValue | undefined) ?? {} } : text,
-      image: asset ?? null, style: styleProp(child.props.style), enter_transition: transitionProp(child.props.enterTransition),
+      image: asset ?? null, surface: surface ?? null, style: styleProp(child.props.style), enter_transition: transitionProp(child.props.enterTransition),
       children: compileChildren(child.children, surfaceId, path, effects),
     });
   }
@@ -102,10 +106,10 @@ function sanitizeProps(props: HostProps): HostProps {
 }
 
 function hostKind(type: HostType): UiNode["kind"] {
-  switch (type) { case "neon-panel": return "panel"; case "neon-label": return "label"; case "neon-button": return "button"; case "neon-image": return "image"; default: throw new Error(`invalid node type: ${type}`); }
+  switch (type) { case "neon-panel": return "panel"; case "neon-label": return "label"; case "neon-button": return "button"; case "neon-image": return "image"; case "neon-render-surface": return "render_surface"; default: throw new Error(`invalid node type: ${type}`); }
 }
 
-function isHostType(type: string): type is HostType { return ["neon-surface", "neon-panel", "neon-label", "neon-button", "neon-image"].includes(type); }
+function isHostType(type: string): type is HostType { return ["neon-surface", "neon-panel", "neon-label", "neon-button", "neon-image", "neon-render-surface"].includes(type); }
 function requiredString(value: unknown, name: string): string { if (typeof value !== "string" || !value.trim()) throw new Error(`${name} is required`); return value; }
 function requiredNodeKey(value: unknown): NodeKey { const key = requiredString(value, "nodeKey"); if (!/^[a-z][a-z0-9._-]*$/.test(key)) throw new Error(`nodeKey must be a semantic kebab-case token: ${key}`); return key; }
 function requiredRevision(value: unknown): number { if (!Number.isSafeInteger(value) || (value as number) < 0) throw new Error("Surface.revision must be a non-negative integer"); return value as number; }

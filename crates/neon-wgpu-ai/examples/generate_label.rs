@@ -102,6 +102,7 @@ fn main() {
         info.resident_bytes / 1_048_576
     );
 
+    let submissions_before = engine.ctx().submission_count();
     let generation = engine
         .generate(GenerateRequest {
             cond,
@@ -112,6 +113,7 @@ fn main() {
             preview_every: 0,
         })
         .expect("generation failed");
+    let submission_count = engine.ctx().submission_count() - submissions_before;
     let map = &generation.heightmap;
     let (mut lo, mut hi, mut sum) = (f32::INFINITY, f32::NEG_INFINITY, 0.0f64);
     for v in map {
@@ -126,6 +128,7 @@ fn main() {
         var.sqrt(),
         generation.elapsed_ms / 1000.0
     );
+    println!("gpu submissions: {submission_count}");
     assert!(map.iter().all(|v| v.is_finite()), "heightmap must be finite");
 
     if let Some(out_path) = out_path {

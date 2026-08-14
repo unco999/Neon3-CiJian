@@ -8,7 +8,7 @@ use neon_observability::{
     EVENT_COMMAND_RECEIVED, EVENT_COMMAND_REJECTED, JournalFilter, TraceLevel, TraceRecord,
 };
 use neon_protocol::{
-    ClientIdentity, ClientKind, HealthStatus, PROTOCOL_VERSION, ProtocolVersion, RequestId,
+    AiTerrainCondition, ClientIdentity, ClientKind, HealthStatus, PROTOCOL_VERSION, ProtocolVersion, RequestId,
     Revision, RpcError, RpcRequest, RpcResponse, RpcStatus, ServiceDescription, ServiceHealth, ServiceName,
 };
 use neon_ui_schema::{
@@ -21,6 +21,73 @@ use serde_json::{Value, json};
 
 pub const SERVICE_NAME: &str = "ui-runtime";
 pub const WORKBENCH_SURFACE_ID: &str = "surface.ui-workbench";
+pub const AI_TERRAIN_SURFACE_ID: &str = "surface.ai.terrain-generator";
+
+#[derive(Clone, Debug, PartialEq)]
+struct AiTerrainPanelState {
+    revision: Revision,
+    condition: AiTerrainCondition,
+    guidance: f32,
+    steps: u32,
+    seed: u64,
+    last_seed: Option<u64>,
+    size: u32,
+    target_id: String,
+    state: String,
+    job_id: Option<String>,
+    elapsed_ms: Option<f64>,
+    error_code: Option<String>,
+}
+
+impl Default for AiTerrainPanelState {
+    fn default() -> Self {
+        Self {
+            revision: Revision(1),
+            condition: AiTerrainCondition {
+                sub: Some(6),
+                parent: Some(1),
+                relief: Some(3),
+                texture: Some(2),
+                water: Some(2),
+            },
+            guidance: 0.0,
+            steps: 4,
+            seed: 42,
+            last_seed: None,
+            size: 256,
+            target_id: "ai.terrain.preview".into(),
+            state: "idle".into(),
+            job_id: None,
+            elapsed_ms: None,
+            error_code: None,
+        }
+    }
+}
+
+impl AiTerrainPanelState {
+    fn snapshot(&self) -> Value {
+        json!({
+            "schema_version": 1,
+            "surface_id": AI_TERRAIN_SURFACE_ID,
+            "revision": self.revision,
+            "condition": self.condition,
+            "guidance": self.guidance,
+            "steps": self.steps,
+            "seed": self.seed,
+            "last_seed": self.last_seed,
+            "size": self.size,
+            "target_id": self.target_id,
+            "state": self.state,
+            "job_id": self.job_id,
+            "elapsed_ms": self.elapsed_ms,
+            "error_code": self.error_code,
+        })
+    }
+
+    fn advance(&mut self) {
+        self.revision = Revision(self.revision.0 + 1);
+    }
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct UiSurfaceTransition {
@@ -64,6 +131,7 @@ pub struct UiRuntime {
     last_input_sequence: HashMap<u64, u64>,
     idempotent_responses: HashMap<String, RpcResponse>,
     surface: UiSurfaceMachine,
+    ai_terrain: AiTerrainPanelState,
 }
 
 impl UiRuntime {
@@ -82,6 +150,7 @@ impl UiRuntime {
             last_input_sequence: HashMap::new(),
             idempotent_responses: HashMap::new(),
             surface: UiSurfaceMachine::new(UiSurfaceId(WORKBENCH_SURFACE_ID.into())),
+            ai_terrain: AiTerrainPanelState::default(),
         }
     }
 
@@ -105,6 +174,7 @@ impl UiRuntime {
                 "ui.semantic_input.v1".into(),
                 "ui.intent_dispatch.v1".into(),
                 "ui.surface.machine.v1".into(),
+                "ui.ai.terrain.panel.v1".into(),
             ],
         }
     }
@@ -129,8 +199,11 @@ impl UiRuntime {
             "service.describe" => Some(json!(self.service_description())),
             "service.shutdown" => Some(json!({"state": "accepted"})),
             "debug.snapshot.get" => Some(json!(self.debug_snapshot())),
+            "debug.command.get" => return self.handle_debug_command(request),
+            "debug.trace.query" => return self.handle_debug_trace(request),
             "ui.fragment.submit" => return self.handle_fragment_submit(request),
             "ui.surface.snapshot.get" => Some(self.surface_value()),
+            "ui.ai.terrain.snapshot.get" => Some(self.ai_terrain.snapshot()),
             "ui.surface.event" => return self.handle_surface_event(request),
             "ui.input.event" => return self.handle_input_event(request),
             "ui.intent.dispatch" => return self.handle_intent_dispatch(request),
@@ -189,6 +262,70 @@ impl UiRuntime {
         json!(self.surface.snapshot())
     }
 
+    fn handle_debug_command(&mut self, request: RpcRequest) -> RpcResponse {
+        let Some(request_id) = request.params.get("request_id").and_then(Value::as_str) else {
+            return self.rejected(request.request_id, "invalid_request", "request_id is required");
+        };
+        match self.command_receipt(&RequestId(request_id.into())).cloned() {
+            Some(receipt) => self.accepted(request.request_id, json!(receipt)),
+            None => self.rejected(request.request_id, "not_found", "command receipt was not found"),
+        }
+    }
+
+    fn handle_debug_trace(&mut self, request: RpcRequest) -> RpcResponse {
+        let filter = JournalFilter {
+            request_id: request
+                .params
+                .get("request_id")
+                .and_then(Value::as_str)
+                .map(|value| RequestId(value.into())),
+            event_id: request.params.get("event_id").and_then(Value::as_str).map(str::to_owned),
+            ..JournalFilter::default()
+        };
+        self.accepted(request.request_id, json!(self.traces(&filter)))
+    }
+
+    fn apply_ai_terrain_intent(
+        &mut self,
+        action: &str,
+        params: &Value,
+    ) -> Result<Option<Value>, (&'static str, &'static str)> {
+        match action {
+            "ai.terrain.condition.set" => {
+                let dimension = params.get("dimension").and_then(Value::as_str).ok_or(("invalid_request", "condition dimension is required"))?;
+                let index = params.get("index").and_then(Value::as_u64).and_then(|value| u32::try_from(value).ok()).ok_or(("invalid_request", "condition index is required"))?;
+                let slot = match dimension {
+                    "sub" if index < 23 => &mut self.ai_terrain.condition.sub,
+                    "parent" if index < 8 => &mut self.ai_terrain.condition.parent,
+                    "relief" if index < 5 => &mut self.ai_terrain.condition.relief,
+                    "texture" if index < 4 => &mut self.ai_terrain.condition.texture,
+                    "water" if index < 3 => &mut self.ai_terrain.condition.water,
+                    _ => return Err(("invalid_request", "condition index is out of range")),
+                };
+                *slot = Some(index);
+            }
+            "ai.terrain.condition.reset" => self.ai_terrain.condition = AiTerrainCondition::default(),
+            "ai.terrain.settings.set" => {
+                if let Some(steps) = params.get("steps").and_then(Value::as_u64).and_then(|value| u32::try_from(value).ok()) {
+                    if !(1..=200).contains(&steps) { return Err(("invalid_request", "steps must be in 1..=200")); }
+                    self.ai_terrain.steps = steps;
+                }
+                if let Some(guidance) = params.get("guidance").and_then(Value::as_f64) {
+                    if !(0.0..=16.0).contains(&guidance) { return Err(("invalid_request", "guidance must be in 0..=16")); }
+                    self.ai_terrain.guidance = guidance as f32;
+                }
+            }
+            "ai.terrain.seed.next" => self.ai_terrain.seed = self.ai_terrain.seed.wrapping_add(1),
+            _ => return Ok(None),
+        }
+        self.ai_terrain.state = "idle".into();
+        self.ai_terrain.job_id = None;
+        self.ai_terrain.elapsed_ms = None;
+        self.ai_terrain.error_code = None;
+        self.ai_terrain.advance();
+        Ok(Some(self.ai_terrain.snapshot()))
+    }
+
     /// Runs the UI declaration control plane. A React client can only submit to this
     /// service; the service forwards a validated declaration to the sole renderer.
     pub fn serve_forwarder(
@@ -203,6 +340,10 @@ impl UiRuntime {
             let request_id = request.request_id.clone();
             let response = if request.method == "ui.fragment.submit" {
                 runtime.forward_fragment(wgpu_endpoint, request).unwrap_or_else(|error| {
+                    runtime.rejected(request_id, "service_unavailable", &error.to_string())
+                })
+            } else if request.method == "ui.input.event" && renderer_event_targets_wgpu(&request) {
+                runtime.forward_wgpu_event(wgpu_endpoint, request).unwrap_or_else(|error| {
                     runtime.rejected(request_id, "service_unavailable", &error.to_string())
                 })
             } else {
@@ -305,6 +446,105 @@ impl UiRuntime {
         Ok(response)
     }
 
+    pub fn forward_wgpu_event(
+        &mut self,
+        wgpu_endpoint: SocketAddr,
+        request: RpcRequest,
+    ) -> Result<RpcResponse, TransportError> {
+        let event: UiSemanticEvent = serde_json::from_value(request.params.clone())
+            .map_err(|_| TransportError::Io(std::io::Error::other("invalid UI semantic event")))?;
+        self.validate_semantic_event(&event)
+            .map_err(|code| TransportError::Io(std::io::Error::other(code)))?;
+        let neon_ui_schema::UiIntent::Invoke { action, params } = event.intent.clone();
+        if action != "ai.terrain.generate" {
+            return Err(TransportError::Io(std::io::Error::other(
+                "intent is not a WGPU AI command",
+            )));
+        }
+        let request_id = request.request_id.clone();
+        let forwarded = RpcRequest {
+            protocol: "neon3.rpc".into(),
+            version: PROTOCOL_VERSION,
+            request_id: request_id.clone(),
+            client: self.client.clone(),
+            target: ServiceName("wgpu-runtime".into()),
+            method: "wgpu.ai.terrain.generate".into(),
+            params,
+            expected_revision: Some(event.fragment.revision),
+            idempotency_key: request.idempotency_key,
+        };
+        self.record_receipt(&request_id, CommandState::Received, None);
+        self.journal.append(
+            TraceLevel::Info,
+            EVENT_COMMAND_RECEIVED,
+            Some(request_id.clone()),
+            None,
+            None,
+            None,
+            Some(event.fragment.revision),
+            None,
+            json!({"event_id": event.event_id, "target": "wgpu-runtime", "method": forwarded.method}),
+        );
+        self.ai_terrain.state = "generating".into();
+        self.ai_terrain.job_id = None;
+        self.ai_terrain.elapsed_ms = None;
+        self.ai_terrain.error_code = None;
+        self.ai_terrain.advance();
+        let response = match RpcClient::connect(wgpu_endpoint).and_then(|mut client| client.call(&forwarded)) {
+            Ok(response) => response,
+            Err(error) => {
+                self.ai_terrain.state = "failed".into();
+                self.ai_terrain.error_code = Some("service_unavailable".into());
+                self.ai_terrain.advance();
+                return Err(error);
+            }
+        };
+        let accepted = response.status == RpcStatus::Accepted;
+        if accepted {
+            self.ai_terrain.state = "ready".into();
+            self.ai_terrain.job_id = response
+                .result
+                .as_ref()
+                .and_then(|result| result.get("job_id"))
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let rendered_seed = response
+                .result
+                .as_ref()
+                .and_then(|result| result.get("seed"))
+                .and_then(Value::as_u64)
+                .unwrap_or(self.ai_terrain.seed);
+            self.ai_terrain.last_seed = Some(rendered_seed);
+            self.ai_terrain.seed = rendered_seed.wrapping_add(1);
+            self.ai_terrain.elapsed_ms = response
+                .result
+                .as_ref()
+                .and_then(|result| result.get("elapsed_ms"))
+                .and_then(Value::as_f64);
+        } else {
+            self.ai_terrain.state = "failed".into();
+            self.ai_terrain.error_code = response.error.as_ref().map(|error| error.code.clone());
+        }
+        self.ai_terrain.advance();
+        self.record_receipt(
+            &request_id,
+            if accepted { CommandState::Accepted } else { CommandState::Rejected },
+            response.error.as_ref().map(|error| error.code.clone()),
+        );
+        self.journal.append(
+            if accepted { TraceLevel::Info } else { TraceLevel::Warn },
+            if accepted { EVENT_COMMAND_ACCEPTED } else { EVENT_COMMAND_REJECTED },
+            Some(request_id),
+            None,
+            None,
+            None,
+            Some(event.fragment.revision),
+            response.revision,
+            json!({"event_id": event.event_id, "target": "wgpu-runtime", "method": forwarded.method}),
+        );
+        Ok(response)
+    }
+
     pub fn command_receipt(&self, request_id: &RequestId) -> Option<&CommandReceipt> { self.receipts.get(request_id) }
 
     fn handle_input_event(&mut self, mut request: RpcRequest) -> RpcResponse {
@@ -320,6 +560,11 @@ impl UiRuntime {
                     request.params = params;
                     request.expected_revision = Some(event.fragment.revision);
                     return self.handle_surface_event(request);
+                }
+                match self.apply_ai_terrain_intent(&action, &params) {
+                    Ok(Some(snapshot)) => return self.accepted(request.request_id, snapshot),
+                    Ok(None) => {}
+                    Err((code, message)) => return self.rejected(request.request_id, code, message),
                 }
                 self.accepted(request.request_id, json!({"event_id": event.event_id, "intent": event.intent}))
             }
@@ -338,6 +583,11 @@ impl UiRuntime {
             request.method = "ui.surface.event".into();
             request.params = params;
             return self.handle_surface_event(request);
+        }
+        match self.apply_ai_terrain_intent(&action, &params) {
+            Ok(Some(snapshot)) => return self.accepted(request.request_id, snapshot),
+            Ok(None) => {}
+            Err((code, message)) => return self.rejected(request.request_id, code, message),
         }
         self.accepted(request.request_id, json!({"intent": intent}))
     }
@@ -390,6 +640,7 @@ impl UiRuntime {
                 text_key: None,
                 text: None,
                 image: None,
+                surface: None,
                 style: UiStyle {
                     background_color: [0.055, 0.07, 0.09, 0.98],
                     border_color: [0.22, 0.76, 0.88, 0.8],
@@ -427,6 +678,7 @@ impl UiRuntime {
                     text_key: Some("ui.static.title".into()),
                     text: None,
                     image: None,
+                    surface: None,
                     style: UiStyle {
                         background_color: [0.16, 0.23, 0.28, 0.9],
                         corner_radius: 3.0,
@@ -508,6 +760,14 @@ impl UiRuntime {
     pub fn traces(&self, filter: &JournalFilter) -> Vec<TraceRecord> {
         self.journal.query(filter)
     }
+}
+
+fn renderer_event_targets_wgpu(request: &RpcRequest) -> bool {
+    serde_json::from_value::<UiSemanticEvent>(request.params.clone())
+        .ok()
+        .is_some_and(|event| {
+            matches!(event.intent, neon_ui_schema::UiIntent::Invoke { ref action, .. } if action == "ai.terrain.generate")
+        })
 }
 
 #[cfg(test)]
@@ -761,6 +1021,132 @@ mod tests {
         assert_eq!(runtime.command_receipt(&RequestId("terrain-request-1".into())).unwrap().state, CommandState::Accepted);
         assert_eq!(runtime.traces(&JournalFilter { request_id: Some(RequestId("terrain-request-1".into())), ..JournalFilter::default() }).len(), 2);
         receiver.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn render_once_event_forwards_one_typed_wgpu_generation_command() {
+        use neon_ui_schema::{UiFragmentRevision, UiIntent, UiPointerMetadata, UiSemanticEventType};
+
+        let renderer = RpcServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let endpoint = renderer.local_addr().unwrap();
+        let receiver = thread::spawn(move || {
+            renderer.serve_one(|request| {
+                assert_eq!(request.client.kind, ClientKind::UiRuntime);
+                assert_eq!(request.target.0, "wgpu-runtime");
+                assert_eq!(request.method, "wgpu.ai.terrain.generate");
+                assert_eq!(request.params["condition"]["parent"], 1);
+                assert_eq!(request.params["target_id"], "ai.terrain.preview");
+                assert_eq!(request.expected_revision, Some(Revision(3)));
+                assert_eq!(request.idempotency_key.as_deref(), Some("render-once:7:1"));
+                RpcResponse {
+                    request_id: request.request_id,
+                    status: RpcStatus::Accepted,
+                    revision: Some(Revision(4)),
+                    result: Some(json!({"job_id": "ai-terrain-render-1", "state": "ready", "seed": 42, "elapsed_ms": 100.0})),
+                    snapshot: None,
+                    error: None,
+                }
+            })
+        });
+        let params = json!({
+            "condition": {"sub": 6, "parent": 1, "relief": 3, "texture": 2, "water": 2},
+            "guidance": 7.0,
+            "steps": 2,
+            "seed": 42,
+            "size": 32,
+            "target_id": "ai.terrain.preview"
+        });
+        let intent = UiIntent::Invoke { action: "ai.terrain.generate".into(), params };
+        let mut runtime = UiRuntime::new(7, "ui-ai-render-test");
+        let mut fragment = runtime.static_fragment(Revision(3));
+        fragment.effects.push(UiEffect::SemanticIntent { intent: intent.clone() });
+        runtime.cached_fragment = Some(fragment);
+        let event = UiSemanticEvent {
+            event: UiSemanticEventType::PointerClick,
+            event_id: "render-1".into(),
+            renderer_epoch: 7,
+            composition_revision: Revision(3),
+            fragment: UiFragmentRevision {
+                id: UiFragmentId("static-editor-shell".into()),
+                revision: Revision(3),
+            },
+            intent,
+            pointer: Some(UiPointerMetadata { id: 0, sequence: 1 }),
+            focus: None,
+        };
+        let request = RpcRequest {
+            protocol: "neon3.rpc".into(),
+            version: PROTOCOL_VERSION,
+            request_id: RequestId("render-1".into()),
+            client: ClientIdentity {
+                kind: ClientKind::WgpuRuntime,
+                instance_id: "window-7".into(),
+                pid: 1,
+                origin: "neon-wgpu-runtime".into(),
+            },
+            target: ServiceName(SERVICE_NAME.into()),
+            method: "ui.input.event".into(),
+            params: json!(event),
+            expected_revision: Some(Revision(3)),
+            idempotency_key: Some("render-once:7:1".into()),
+        };
+        let response = runtime.forward_wgpu_event(endpoint, request).unwrap();
+        assert_eq!(response.status, RpcStatus::Accepted);
+        assert_eq!(
+            runtime.command_receipt(&RequestId("render-1".into())).unwrap().state,
+            CommandState::Accepted
+        );
+        assert_eq!(runtime.ai_terrain.last_seed, Some(42));
+        assert_eq!(runtime.ai_terrain.seed, 43);
+        receiver.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn label_selection_updates_only_the_panel_snapshot_without_generation() {
+        use neon_ui_schema::{UiFragmentRevision, UiIntent, UiPointerMetadata, UiSemanticEventType};
+
+        let intent = UiIntent::Invoke {
+            action: "ai.terrain.condition.set".into(),
+            params: json!({"dimension": "parent", "index": 7, "label": "volcanic"}),
+        };
+        let mut runtime = UiRuntime::new(7, "ui-ai-label-test");
+        let mut fragment = runtime.static_fragment(Revision(1));
+        fragment.effects.push(UiEffect::SemanticIntent { intent: intent.clone() });
+        runtime.cached_fragment = Some(fragment);
+        let event = UiSemanticEvent {
+            event: UiSemanticEventType::PointerClick,
+            event_id: "label-1".into(),
+            renderer_epoch: 7,
+            composition_revision: Revision(1),
+            fragment: UiFragmentRevision {
+                id: UiFragmentId("static-editor-shell".into()),
+                revision: Revision(1),
+            },
+            intent,
+            pointer: Some(UiPointerMetadata { id: 0, sequence: 1 }),
+            focus: None,
+        };
+        let response = runtime.handle_service_request(RpcRequest {
+            protocol: "neon3.rpc".into(),
+            version: PROTOCOL_VERSION,
+            request_id: RequestId("label-1".into()),
+            client: ClientIdentity {
+                kind: ClientKind::WgpuRuntime,
+                instance_id: "window-7".into(),
+                pid: 1,
+                origin: "neon-wgpu-runtime".into(),
+            },
+            target: ServiceName(SERVICE_NAME.into()),
+            method: "ui.input.event".into(),
+            params: json!(event),
+            expected_revision: Some(Revision(1)),
+            idempotency_key: Some("label:7:1".into()),
+        });
+        assert_eq!(response.status, RpcStatus::Accepted);
+        assert_eq!(response.result.as_ref().unwrap()["condition"]["parent"], 7);
+        assert_eq!(response.result.as_ref().unwrap()["state"], "idle");
+        assert!(response.result.as_ref().unwrap()["job_id"].is_null());
+        assert_eq!(runtime.ai_terrain.revision, Revision(2));
     }
 
     #[test]

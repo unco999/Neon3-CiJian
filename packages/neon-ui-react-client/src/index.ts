@@ -1,13 +1,15 @@
-export { Button, Image, Label, Panel, Surface } from "./components.js";
+export { Button, Image, Label, Panel, RenderSurface, Surface } from "./components.js";
 export { createNeonRoot } from "./renderer.js";
 export { NeonUiClient } from "./client.js";
 export { createLoopbackTransport } from "./node-transport.js";
 export { TerrainEditorSurface } from "./examples/TerrainEditorSurface.js";
+export { TerrainGenerationSurface, TERRAIN_PARENT_LABELS, TERRAIN_RELIEF_LABELS, TERRAIN_SUB_LABELS, TERRAIN_TEXTURE_LABELS, TERRAIN_WATER_LABELS } from "./examples/TerrainGenerationSurface.js";
 export { UiWorkbenchSurface } from "./examples/UiWorkbenchSurface.js";
 export { UiAnimationSurface } from "./examples/UiAnimationSurface.js";
 export { UiNestedAnimationSurface } from "./examples/UiNestedAnimationSurface.js";
 export type { NeonRoot } from "./renderer.js";
 export type { TerrainEditorSurfaceProps, TerrainEditorSnapshot, TerrainMaterialSnapshot, TerrainToolSnapshot } from "./examples/TerrainEditorSurface.js";
+export type { TerrainGenerationCondition, TerrainGenerationSnapshot } from "./examples/TerrainGenerationSurface.js";
 export type { UiAnimationPhase } from "./examples/UiAnimationSurface.js";
 export type { UiNestedAnimationPhase } from "./examples/UiNestedAnimationSurface.js";
-export type { AssetRef, Bounds, JsonValue, NodeKey, NodeProps, Revision, Rgba, RpcResponse, RpcTransport, SurfaceId, SurfaceProps, UiFragment, UiIntent, UiIntentSpec, UiLayout, UiStyle, UiSurfaceEvent, UiSurfaceEventRequest, UiTransition, UiSurfaceSnapshot } from "./protocol.js";
+export type { AiTerrainPanelSnapshot, AssetRef, Bounds, JsonValue, NodeKey, NodeProps, RenderSurfaceRef, Revision, Rgba, RpcResponse, RpcTransport, SurfaceId, SurfaceProps, UiFragment, UiIntent, UiIntentSpec, UiLayout, UiStyle, UiSurfaceEvent, UiSurfaceEventRequest, UiTransition, UiSurfaceSnapshot } from "./protocol.js";

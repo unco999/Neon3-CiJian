@@ -237,11 +237,13 @@ def main():
                 e = ec
             x0h = (x - s1ab[t][:, None, None, None] * e) / sab[t][:, None, None, None]
             x0h = x0h.clamp(-3, 3)
-            x = sab[t0][:, None, None, None] * x0h + s1ab[t0][:, None, None, None] * e
+            t0v = torch.tensor([t0], device=device)
+            x = sab[t0v][:, None, None, None] * x0h + s1ab[t0v][:, None, None, None] * e
 
     from PIL import Image
     for i in range(args.n):
         z = x[i, 0].cpu().numpy()
+        print(f"sample {i}: min={z.min():.6f} max={z.max():.6f} mean={z.mean():.6f} std={z.std():.6f}")
         z = z - z.min()
         z = z / (z.max() + 1e-9)
         u16 = (z * 65535).astype(np.uint16)

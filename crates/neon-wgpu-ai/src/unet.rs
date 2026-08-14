@@ -242,6 +242,7 @@ impl<'a> UnetExecutor<'a> {
         // (hw x hd) v^T buffer, reused across heads to bound scratch memory.
         let scores = self.ctx.scratch(hw as u64 * hw as u64 * 4);
         let v_t = self.ctx.scratch(hw as u64 * hd as u64 * 4);
+        let head_out = self.ctx.scratch(hw as u64 * hd as u64 * 4);
         let attn = self.ctx.scratch(c as u64 * hw as u64 * 4);
         for head in 0..heads {
             let off = head * hd * hw;
@@ -272,14 +273,18 @@ impl<'a> UnetExecutor<'a> {
                 hw,
                 false,
                 false,
-                &attn.buffer,
-                off,
+                &head_out.buffer,
+                0,
             );
+            ops::transpose_into(self.ctx, &head_out.buffer, &attn.buffer, hw, hd, 0, off);
         }
 
+        diag_check(self.ctx, &attn.buffer, (c * hw) as usize, &format!("{name}.weighted"));
         let gn = ops::group_norm(self.ctx, &attn.buffer, nw, nb, 8, c, res, res, GN_EPS, &format!("{name}.n"))?;
         let o = ops::conv2d(self.ctx, &gn.buffer, ow, ob, c, c, res, res, 1, 1, 1, 0);
-        Ok(ops::add(self.ctx, x, &o.buffer, c as u64 * hw as u64))
+        let y = ops::add(self.ctx, x, &o.buffer, c as u64 * hw as u64);
+        diag_check(self.ctx, &y.buffer, (c * hw) as usize, name);
+        Ok(y)
     }
 
     /// Full UNet forward; returns epsilon prediction (1, 1, size, size).

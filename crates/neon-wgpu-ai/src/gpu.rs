@@ -101,10 +101,12 @@ pub struct GpuCtx {
     pub queue: wgpu::Queue,
     pub arena: Arena,
     pipelines: HashMap<&'static str, Pipeline>,
+    pending_encoder: Option<wgpu::CommandEncoder>,
     /// Zero buffer used to satisfy read-only bindings a shader does not use.
     dummy: wgpu::Buffer,
     /// Accumulated GPU submission time for diagnostics.
     pub elapsed_ms: f64,
+    submission_count: u64,
     /// Total bytes of resident model weights (diagnostics).
     pub resident_bytes: u64,
 }
@@ -123,8 +125,10 @@ impl GpuCtx {
             queue,
             arena,
             pipelines: HashMap::new(),
+            pending_encoder: None,
             dummy,
             elapsed_ms: 0.0,
+            submission_count: 0,
             resident_bytes: 0,
         };
         ctx.build_pipelines();
@@ -240,7 +244,10 @@ impl GpuCtx {
         inputs: &[&wgpu::Buffer],
         workgroups: [u32; 3],
     ) {
-        let pipeline = self.pipeline(key);
+        let (compute_pipeline, layout) = {
+            let pipeline = self.pipeline(key);
+            (pipeline.pipeline.clone(), pipeline.layout.clone())
+        };
         let mut entries = Vec::with_capacity(inputs.len() + 1);
         entries.push(wgpu::BindGroupEntry {
             binding: 0,
@@ -257,31 +264,75 @@ impl GpuCtx {
         }
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
-            layout: &pipeline.layout,
+            layout: &layout,
             entries: &entries,
         });
         let started = std::time::Instant::now();
-        let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        {
+        if let Some(encoder) = self.pending_encoder.as_mut() {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some(key),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&pipeline.pipeline);
+            pass.set_pipeline(&compute_pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
             pass.dispatch_workgroups(workgroups[0], workgroups[1], workgroups[2]);
-        }
-        self.queue.submit(Some(encoder.finish()));
-        self.device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .expect("device poll");
-        if let Some(message) = pollster::block_on(scope.pop()) {
-            panic!("compute pass '{key}' failed: {message}");
+        } else {
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some(key),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&compute_pipeline);
+                pass.set_bind_group(0, &bind_group, &[]);
+                pass.dispatch_workgroups(workgroups[0], workgroups[1], workgroups[2]);
+            }
+            self.queue.submit(Some(encoder.finish()));
+            self.submission_count += 1;
         }
         self.elapsed_ms += started.elapsed().as_secs_f64() * 1000.0;
+    }
+
+    /// Record subsequent compute passes into one command encoder. The caller
+    /// must submit or discard the batch before readback or waiting.
+    pub fn begin_batch(&mut self) {
+        assert!(self.pending_encoder.is_none(), "GPU compute batch already active");
+        self.pending_encoder = Some(
+            self.device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("neon-ai-ddim-step"),
+                }),
+        );
+    }
+
+    /// Submit the active compute batch, if any.
+    pub fn submit_batch(&mut self) {
+        if let Some(encoder) = self.pending_encoder.take() {
+            let started = std::time::Instant::now();
+            self.queue.submit(Some(encoder.finish()));
+            self.submission_count += 1;
+            self.elapsed_ms += started.elapsed().as_secs_f64() * 1000.0;
+        }
+    }
+
+    /// Drop an incomplete batch after an error without submitting partial work.
+    pub fn discard_batch(&mut self) {
+        self.pending_encoder = None;
+    }
+
+    pub fn submission_count(&self) -> u64 {
+        self.submission_count
+    }
+
+    /// Wait for all queued inference work once at a public operation boundary.
+    pub fn wait(&self) -> Result<(), AiError> {
+        assert!(self.pending_encoder.is_none(), "cannot wait with an active GPU compute batch");
+        self.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .map_err(|error| AiError::Gpu(format!("device poll failed: {error}")))?;
+        Ok(())
     }
 
     /// Acquire a scratch buffer of at least `bytes`.
@@ -308,6 +359,7 @@ impl GpuCtx {
 
     /// Synchronous buffer readback (copy + map + poll). Diagnostic/test path.
     pub fn readback(&self, buffer: &wgpu::Buffer, bytes: u64) -> Result<Vec<u8>, AiError> {
+        assert!(self.pending_encoder.is_none(), "cannot read back with an active GPU compute batch");
         let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("neon-ai-staging"),
             size: bytes,

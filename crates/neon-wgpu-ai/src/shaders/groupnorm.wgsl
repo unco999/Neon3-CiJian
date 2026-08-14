@@ -65,9 +65,9 @@ fn main_reduce(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_inv
 
 // Dispatch: (groups, 1, 1)
 @compute @workgroup_size(256)
-fn main_finalize(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+fn main_finalize(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
     if (lid.x != 0u) { return; }
-    let group = gid.x;
+    let group = wgid.x;
     let hw = p.h * p.w;
     let cpg = p.c / p.groups;
     let total = cpg * hw;
@@ -88,7 +88,7 @@ fn main_finalize(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_i
 // Dispatch: (c*h*w, 1, 1)
 @compute @workgroup_size(256)
 fn main_apply(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
+    let i = gid.x + gid.y * 16776960u;
     if (i >= p.c * p.h * p.w) { return; }
     let hw = p.h * p.w;
     let c = i / hw;

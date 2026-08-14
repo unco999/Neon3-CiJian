@@ -20,3 +20,7 @@ export function Button(props: NodeProps) {
 export function Image(props: Omit<NodeProps, "children">) {
   return React.createElement("neon-image", props);
 }
+
+export function RenderSurface(props: Omit<NodeProps, "children">) {
+  return React.createElement("neon-render-surface", props);
+}

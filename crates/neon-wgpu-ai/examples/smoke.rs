@@ -44,14 +44,15 @@ fn random_pack(seed: u64) -> Vec<u8> {
 }
 
 fn main() {
-    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends: wgpu::Backends::PRIMARY,
-        ..Default::default()
+        ..wgpu::InstanceDescriptor::new_without_display_handle()
     });
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
         power_preference: wgpu::PowerPreference::HighPerformance,
         force_fallback_adapter: false,
         compatible_surface: None,
+        apply_limit_buckets: false,
     }))
     .expect("no wgpu adapter available");
     let info = adapter.get_info();
@@ -61,9 +62,10 @@ fn main() {
             label: Some("neon-wgpu-ai smoke"),
             required_features: wgpu::Features::empty(),
             required_limits: wgpu::Limits::default(),
+            experimental_features: wgpu::ExperimentalFeatures::default(),
             memory_hints: wgpu::MemoryHints::default(),
+            trace: wgpu::Trace::Off,
         },
-        None,
     ))
     .expect("device request failed");
 

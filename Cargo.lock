@@ -897,6 +897,7 @@ dependencies = [
 name = "neon-projectd"
 version = "0.1.0"
 dependencies = [
+ "neon-ipc",
  "neon-observability",
  "neon-protocol",
  "serde_json",
@@ -952,6 +953,7 @@ dependencies = [
  "neon-projectd",
  "neon-protocol",
  "neon-ui-schema",
+ "neon-wgpu-ai",
  "pollster",
  "serde_json",
  "wgpu",

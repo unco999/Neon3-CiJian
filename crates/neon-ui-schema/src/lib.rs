@@ -22,6 +22,14 @@ pub struct UiSurfaceId(pub String);
 #[serde(transparent)]
 pub struct UiNodeId(pub String);
 
+/// Opaque lookup key for a render target owned by the destination WGPU runtime.
+/// This is not a GPU handle, project asset identifier, or persistent reference.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RenderSurfaceRef {
+    pub target_id: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UiFragment {
@@ -118,6 +126,8 @@ pub struct UiNode {
     pub text: Option<TextRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<AssetRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub surface: Option<RenderSurfaceRef>,
     #[serde(default, skip_serializing_if = "UiStyle::is_default")]
     pub style: UiStyle,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -132,6 +142,7 @@ pub enum UiNodeKind {
     Label,
     Button,
     Image,
+    RenderSurface,
 }
 
 /// Source-independent text declaration. Renderers receive resolved immutable content only.
@@ -352,6 +363,8 @@ pub enum UiSchemaError {
     InvalidLayout,
     DuplicateNodeId,
     MissingImageAsset,
+    MissingRenderSurfaceRef,
+    InvalidRenderSurfaceRef,
     InvalidText,
 }
 
@@ -381,6 +394,16 @@ impl UiNode {
         }
         if self.kind == UiNodeKind::Image && self.image.is_none() {
             return Err(UiSchemaError::MissingImageAsset);
+        }
+        if self.kind == UiNodeKind::RenderSurface && self.surface.is_none() {
+            return Err(UiSchemaError::MissingRenderSurfaceRef);
+        }
+        if self
+            .surface
+            .as_ref()
+            .is_some_and(|surface| surface.target_id.trim().is_empty())
+        {
+            return Err(UiSchemaError::InvalidRenderSurfaceRef);
         }
         if self.text.as_ref().is_some_and(|text| !text.is_valid()) { return Err(UiSchemaError::InvalidText); }
         if self.layout.is_some_and(|layout| !layout.is_valid()) { return Err(UiSchemaError::InvalidLayout); }
@@ -667,10 +690,10 @@ mod tests {
             node_id: UiNodeId("root".into()), kind: UiNodeKind::Panel,
             bounds: UiBounds { x: 0.0, y: 0.0, width: 100.0, height: 60.0 },
             layout: Some(UiLayout { mode, padding: [4.0, 4.0, 4.0, 4.0], gap: 3.0, ..UiLayout::default() }),
-            visible: true, enabled: true, text_key: None, text: None, image: None, style: UiStyle::default(), enter_transition: None,
+            visible: true, enabled: true, text_key: None, text: None, image: None, surface: None, style: UiStyle::default(), enter_transition: None,
             children: vec![
-                UiNode { node_id: UiNodeId("a".into()), kind: UiNodeKind::Button, bounds: UiBounds { x: 0.0, y: 0.0, width: 20.0, height: 10.0 }, layout: Some(UiLayout { margin: [1.0, 2.0, 3.0, 4.0], ..UiLayout::default() }), visible: true, enabled: true, text_key: None, text: None, image: None, style: UiStyle::default(), enter_transition: None, children: Vec::new() },
-                UiNode { node_id: UiNodeId("b".into()), kind: UiNodeKind::Button, bounds: UiBounds { x: 0.0, y: 0.0, width: 20.0, height: 10.0 }, layout: None, visible: true, enabled: true, text_key: None, text: None, image: None, style: UiStyle::default(), enter_transition: None, children: Vec::new() },
+                UiNode { node_id: UiNodeId("a".into()), kind: UiNodeKind::Button, bounds: UiBounds { x: 0.0, y: 0.0, width: 20.0, height: 10.0 }, layout: Some(UiLayout { margin: [1.0, 2.0, 3.0, 4.0], ..UiLayout::default() }), visible: true, enabled: true, text_key: None, text: None, image: None, surface: None, style: UiStyle::default(), enter_transition: None, children: Vec::new() },
+                UiNode { node_id: UiNodeId("b".into()), kind: UiNodeKind::Button, bounds: UiBounds { x: 0.0, y: 0.0, width: 20.0, height: 10.0 }, layout: None, visible: true, enabled: true, text_key: None, text: None, image: None, surface: None, style: UiStyle::default(), enter_transition: None, children: Vec::new() },
             ],
         }
     }
@@ -720,6 +743,23 @@ mod tests {
         let value = serde_json::to_value(node).unwrap();
         assert!(value["image"].get("path").is_none());
         assert_eq!(value["image"]["asset_id"], 81);
+    }
+
+    #[test]
+    fn render_surface_nodes_require_an_opaque_runtime_target() {
+        let mut node = layout_node(UiLayoutMode::Absolute);
+        node.kind = UiNodeKind::RenderSurface;
+        assert_eq!(node.validate(), Err(UiSchemaError::MissingRenderSurfaceRef));
+        node.surface = Some(RenderSurfaceRef { target_id: " ".into() });
+        assert_eq!(node.validate(), Err(UiSchemaError::InvalidRenderSurfaceRef));
+        node.surface = Some(RenderSurfaceRef { target_id: "ai.terrain.preview".into() });
+        node.validate().unwrap();
+        let value = serde_json::to_value(node).unwrap();
+        assert_eq!(value["kind"], "render_surface");
+        assert_eq!(value["surface"]["target_id"], "ai.terrain.preview");
+        for forbidden in ["wgpu", "texture", "handle", "project_id", "asset_id"] {
+            assert!(value["surface"].get(forbidden).is_none());
+        }
     }
 
     #[test]

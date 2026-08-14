@@ -18,7 +18,7 @@ struct Params {
 fn main_avgpool(@builtin(global_invocation_id) gid: vec3<u32>) {
     let oh = p.h / 2u;
     let ow = p.w / 2u;
-    let i = gid.x;
+    let i = gid.x + gid.y * 16776960u;
     let total = p.c * oh * ow;
     if (i >= total) { return; }
     let c = i / (oh * ow);
@@ -33,7 +33,7 @@ fn main_avgpool(@builtin(global_invocation_id) gid: vec3<u32>) {
 @compute @workgroup_size(256)
 fn main_upsample(@builtin(global_invocation_id) gid: vec3<u32>) {
     let hw = p.h * p.w;
-    let i = gid.x;
+    let i = gid.x + gid.y * 16776960u;
     if (i >= p.c * hw * 4u) { return; }
     let c = i / (hw * 4u);
     let r = i % (hw * 4u);
@@ -47,7 +47,7 @@ fn main_upsample(@builtin(global_invocation_id) gid: vec3<u32>) {
 @compute @workgroup_size(256)
 fn main_concat(@builtin(global_invocation_id) gid: vec3<u32>) {
     let hw = p.h * p.w;
-    let i = gid.x;
+    let i = gid.x + gid.y * 16776960u;
     if (i >= (p.c + p.c2) * hw) { return; }
     let c = i / hw;
     let r = i % hw;

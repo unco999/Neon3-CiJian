@@ -26,12 +26,15 @@ var<workgroup> atile: array<f32, 256>;
 var<workgroup> btile: array<f32, 256>;
 
 @compute @workgroup_size(TILE, TILE)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+fn main(
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(workgroup_id) wgid: vec3<u32>,
+) {
     let m = p.m;
     let n = p.n;
     let k = p.k;
-    let m0 = gid.y * TILE;
-    let n0 = gid.x * TILE;
+    let m0 = wgid.y * TILE;
+    let n0 = wgid.x * TILE;
     let li = lid.y * TILE + lid.x;
     let ktiles = (k + TILE - 1u) / TILE;
     var acc = 0.0;

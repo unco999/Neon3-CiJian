@@ -6,7 +6,7 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 use bytemuck::{Pod, Zeroable};
 use neon_protocol::{AssetBytes, AssetRef};
-use neon_ui_schema::{TextRef, UiBounds, UiEasing, UiFragment, UiFragmentRevision, UiIntent, UiLayoutMode, UiNode, UiNodeKind, UiStyle, UiTransition};
+use neon_ui_schema::{RenderSurfaceRef, TextRef, UiBounds, UiEasing, UiFragment, UiFragmentRevision, UiIntent, UiLayoutMode, UiNode, UiNodeKind, UiStyle, UiTransition};
 
 const SHADER: &str = r#"
 struct View { viewport: vec2<f32>, _pad: vec2<f32> }
@@ -141,6 +141,8 @@ struct VsOut { @builtin(position) position: vec4<f32>, @location(0) local: vec2<
 }
 "#;
 
+const BUILTIN_UI_FONT: &[u8] = include_bytes!("../../../assets/fonts/SarasaUiSC-Light.ttf");
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
 struct UiInstance {
@@ -178,6 +180,13 @@ struct UiTextInstance { rect: [f32; 4], color: [f32; 4], clip: [f32; 4], uv: [f3
 
 struct ResidentImage { bind_group: wgpu::BindGroup }
 
+struct ResidentRenderSurface {
+    _texture: wgpu::Texture,
+    _view: wgpu::TextureView,
+    bind_group: wgpu::BindGroup,
+    size: Option<[u32; 2]>,
+}
+
 struct ResidentFont {
     font: fontdue::Font,
     _atlas: wgpu::Texture,
@@ -191,10 +200,10 @@ struct ResidentFont {
 }
 
 #[derive(Clone, Copy)]
-struct AtlasGlyph { uv: [f32; 4], width: f32, height: f32, xmin: f32, ymin: f32, advance: f32 }
+struct AtlasGlyph { uv: [f32; 4], width: f32, height: f32, xmin: f32, plane_min_y: f32, advance: f32 }
 
-const FONT_ATLAS_SIZE: u32 = 1024;
-const FONT_RASTER_SIZE: f32 = 32.0;
+const FONT_ATLAS_SIZE: u32 = 2048;
+const FONT_RASTER_SIZE: f32 = 16.0;
 
 const HIT_READBACK_BYTES_PER_ROW: u32 = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
 
@@ -272,6 +281,7 @@ struct UiVisual {
     enabled: bool,
     clip: UiBounds,
     image: Option<AssetRef>,
+    surface: Option<RenderSurfaceRef>,
     text: Option<TextRef>,
 }
 
@@ -316,6 +326,7 @@ pub struct UiWgpuRenderer {
     image_buffer: wgpu::Buffer,
     image_capacity: usize,
     resident_images: HashMap<(String, u64, u64), ResidentImage>,
+    resident_render_surfaces: HashMap<String, ResidentRenderSurface>,
     image_texture_layout: wgpu::BindGroupLayout,
     text_pipeline: wgpu::RenderPipeline,
     text_buffer: wgpu::Buffer,
@@ -499,6 +510,7 @@ impl UiWgpuRenderer {
             image_buffer: create_image_buffer(device, 1),
             image_capacity: 1,
             resident_images: HashMap::new(),
+            resident_render_surfaces: HashMap::new(),
             image_texture_layout,
             text_pipeline,
             text_buffer: create_text_buffer(device, 1),
@@ -579,9 +591,125 @@ impl UiWgpuRenderer {
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn register_render_surface(
+        &mut self,
+        device: &wgpu::Device,
+        target_id: impl Into<String>,
+        texture: wgpu::Texture,
+    ) {
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("neon3-ui-render-surface-sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("neon3-ui-render-surface-bind-group"),
+            layout: &self.image_texture_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+            ],
+        });
+        self.resident_render_surfaces.insert(
+            target_id.into(),
+            ResidentRenderSurface {
+                _texture: texture,
+                _view: view,
+                bind_group,
+                size: None,
+            },
+        );
+    }
+
+    pub(crate) fn ensure_render_surface(
+        &mut self,
+        device: &wgpu::Device,
+        target_id: &str,
+        size: [u32; 2],
+    ) -> wgpu::TextureView {
+        if let Some(surface) = self.resident_render_surfaces.get(target_id)
+            && surface.size == Some(size)
+        {
+            return surface._view.clone();
+        }
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("neon3-ui-resident-render-surface"),
+            size: wgpu::Extent3d {
+                width: size[0],
+                height: size[1],
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::STORAGE_BINDING
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("neon3-ui-render-surface-sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("neon3-ui-render-surface-bind-group"),
+            layout: &self.image_texture_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+            ],
+        });
+        self.resident_render_surfaces.insert(
+            target_id.into(),
+            ResidentRenderSurface {
+                _texture: texture,
+                _view: view.clone(),
+                bind_group,
+                size: Some(size),
+            },
+        );
+        view
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn preload_font(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, content: &AssetBytes) -> Result<(), &'static str> {
         if content.asset.kind != "font" || content.bytes.is_empty() { return Err("invalid_font_content"); }
-        let font = fontdue::Font::from_bytes(content.bytes.as_slice(), fontdue::FontSettings::default()).map_err(|_| "invalid_font_content")?;
+        self.install_font(device, queue, content.bytes.as_slice())
+    }
+
+    fn ensure_builtin_font(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        if self.resident_font.is_none() {
+            self.install_font(device, queue, BUILTIN_UI_FONT)
+                .expect("the bundled Sarasa UI font must be valid");
+        }
+    }
+
+    fn install_font(
+        &mut self,
+        device: &wgpu::Device,
+        _queue: &wgpu::Queue,
+        bytes: &[u8],
+    ) -> Result<(), &'static str> {
+        let font = fontdue::Font::from_bytes(bytes, fontdue::FontSettings::default())
+            .map_err(|_| "invalid_font_content")?;
         let line_metrics = font.horizontal_line_metrics(FONT_RASTER_SIZE).ok_or("invalid_font_metrics")?;
         let atlas = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("neon3-ui-font-atlas"), size: wgpu::Extent3d { width: FONT_ATLAS_SIZE, height: FONT_ATLAS_SIZE, depth_or_array_layers: 1 },
@@ -605,8 +733,6 @@ impl UiWgpuRenderer {
             next_y: 1,
             row_height: 0,
         });
-        let font = self.resident_font.as_mut().unwrap();
-        for ch in ' '..='~' { let _ = ensure_glyph(device, queue, font, ch); }
         Ok(())
     }
 
@@ -685,29 +811,31 @@ impl UiWgpuRenderer {
                 let _ = index;
             }
         }
+        let surfaces = self.sampled.iter().filter_map(|visual| {
+            let surface = visual.surface.as_ref()?;
+            self.resident_render_surfaces.contains_key(&surface.target_id).then_some((surface.target_id.clone(), UiImageInstance {
+                rect: [visual.bounds.x, visual.bounds.y, visual.bounds.width, visual.bounds.height],
+                tint: [1.0, 1.0, 1.0, visual.style.opacity],
+                clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height],
+                asset_id: 0, _pad: [0; 3],
+            }))
+        }).collect::<Vec<_>>();
+        if !surfaces.is_empty() {
+            pass.set_pipeline(&self.image_pipeline);
+            pass.set_bind_group(0, &self.view_bind_group, &[]);
+            for (key, surface) in &surfaces {
+                queue.write_buffer(&self.image_buffer, 0, bytemuck::bytes_of(surface));
+                pass.set_bind_group(1, &self.resident_render_surfaces[key].bind_group, &[]);
+                pass.set_vertex_buffer(0, self.image_buffer.slice(..));
+                pass.draw(0..6, 0..1);
+            }
+        }
+        self.ensure_builtin_font(device, queue);
         let texts = self.resident_font.as_mut().map(|font| {
             self.sampled.iter().filter_map(|visual| {
                 let text = visual.text.as_ref().and_then(text_ref_value);
                 if !matches!(visual.kind, UiNodeKind::Label | UiNodeKind::Button) || text.is_none() { return None; }
-                let text = text.unwrap();
-                let mut x = visual.bounds.x;
-                let mut baseline = visual.bounds.y + font.ascent;
-                let mut first = true;
-                let mut result = Vec::new();
-                for ch in text.chars() {
-                    if ch == '\n' { x = visual.bounds.x; baseline += font.line_height; continue; }
-                    let glyph = ensure_glyph(device, queue, font, ch).ok()?;
-                    if x > visual.bounds.x && x + glyph.advance > visual.bounds.x + visual.bounds.width {
-                        x = visual.bounds.x;
-                        baseline += font.line_height;
-                    }
-                    let y = baseline - glyph.height - glyph.ymin;
-                    result.push(UiTextInstance { rect: [x + glyph.xmin, y, glyph.width, glyph.height], color: [0.86, 0.95, 0.98, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv: glyph.uv });
-                    x += glyph.advance;
-                    first = false;
-                }
-                let _ = first;
-                Some(result)
+                layout_text(device, queue, font, visual, text.unwrap())
             }).flatten().collect::<Vec<_>>()
         }).unwrap_or_default();
         if !texts.is_empty() {
@@ -735,7 +863,7 @@ impl UiWgpuRenderer {
         self.sampled.clear();
         self.instances.clear();
         for (id, target, transition) in nodes {
-            let instance_index = (target.kind != UiNodeKind::Image).then(|| self.instances.len());
+            let instance_index = (!matches!(target.kind, UiNodeKind::Image | UiNodeKind::RenderSurface)).then(|| self.instances.len());
             if let Some(instance_index) = instance_index {
                 self.instances.push(UiInstance::zeroed());
                 debug_assert_eq!(instance_index, self.instances.len() - 1);
@@ -824,12 +952,40 @@ pub(crate) fn render_offscreen_for_test(
     size: [u32; 2],
     time_seconds: f32,
     resident_images: &[AssetBytes],
+    resident_surfaces: Vec<(String, wgpu::Texture)>,
 ) -> Vec<u8> {
     let mut renderer = UiWgpuRenderer::new(device, format);
     for asset in resident_images {
         if asset.asset.kind == "image" { renderer.preload_image(device, queue, asset).unwrap(); }
         if asset.asset.kind == "font" { renderer.preload_font(device, queue, asset).unwrap(); }
     }
+    for (target_id, texture) in resident_surfaces {
+        renderer.register_render_surface(device, target_id, texture);
+    }
+    render_renderer_offscreen_for_test(
+        &mut renderer,
+        device,
+        queue,
+        format,
+        fragments,
+        size,
+        time_seconds,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn render_renderer_offscreen_for_test(
+    renderer: &mut UiWgpuRenderer,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    format: wgpu::TextureFormat,
+    fragments: &HashMap<neon_ui_schema::UiFragmentId, UiFragment>,
+    size: [u32; 2],
+    time_seconds: f32,
+) -> Vec<u8> {
+    let row_bytes = size[0] * 4;
+    let padded_bytes_per_row = row_bytes.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
+        * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
     let target = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("neon3-ui-offscreen-target"),
         size: wgpu::Extent3d {
@@ -846,7 +1002,7 @@ pub(crate) fn render_offscreen_for_test(
     });
     let readback = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("neon3-ui-offscreen-readback"),
-        size: (size[0] * size[1] * 4) as u64,
+        size: (padded_bytes_per_row * size[1]) as u64,
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
     });
@@ -884,7 +1040,7 @@ pub(crate) fn render_offscreen_for_test(
             buffer: &readback,
             layout: wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(size[0] * 4),
+                bytes_per_row: Some(padded_bytes_per_row),
                 rows_per_image: Some(size[1]),
             },
         },
@@ -904,7 +1060,11 @@ pub(crate) fn render_offscreen_for_test(
     device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
     receiver.recv().unwrap().unwrap();
     let pixels = readback.slice(..).get_mapped_range().unwrap();
-    pixels.to_vec()
+    let mut tight = Vec::with_capacity((row_bytes * size[1]) as usize);
+    for row in pixels.chunks_exact(padded_bytes_per_row as usize) {
+        tight.extend_from_slice(&row[..row_bytes as usize]);
+    }
+    tight
 }
 
 #[cfg(test)]
@@ -989,7 +1149,7 @@ fn ensure_glyph(_device: &wgpu::Device, queue: &wgpu::Queue, font: &mut Resident
     let width = metrics.width as u32;
     let height = metrics.height as u32;
     if width == 0 || height == 0 {
-        let glyph = AtlasGlyph { uv: [0.0, 0.0, 0.0, 0.0], width: 0.0, height: 0.0, xmin: metrics.xmin as f32, ymin: metrics.ymin as f32, advance: metrics.advance_width };
+        let glyph = AtlasGlyph { uv: [0.0, 0.0, 0.0, 0.0], width: 0.0, height: 0.0, xmin: metrics.xmin as f32, plane_min_y: 0.0, advance: metrics.advance_width };
         font.glyphs.insert(ch, glyph);
         return Ok(glyph);
     }
@@ -1020,9 +1180,72 @@ fn ensure_glyph(_device: &wgpu::Device, queue: &wgpu::Queue, font: &mut Resident
     font.next_x = x + width + padding;
     font.row_height = font.row_height.max(height);
     let atlas = FONT_ATLAS_SIZE as f32;
-    let glyph = AtlasGlyph { uv: [x as f32 / atlas, y as f32 / atlas, width as f32 / atlas, height as f32 / atlas], width: width as f32, height: height as f32, xmin: metrics.xmin as f32, ymin: metrics.ymin as f32, advance: metrics.advance_width };
+    // Keep the geometric baseline offset instead of reconstructing it from rounded bitmap pixels.
+    let plane_min_y = -metrics.bounds.height - metrics.bounds.ymin;
+    let glyph = AtlasGlyph { uv: [x as f32 / atlas, y as f32 / atlas, width as f32 / atlas, height as f32 / atlas], width: width as f32, height: height as f32, xmin: metrics.xmin as f32, plane_min_y, advance: metrics.advance_width };
     font.glyphs.insert(ch, glyph);
     Ok(glyph)
+}
+
+fn text_clip(visual: &UiVisual) -> Option<[f32; 4]> {
+    let left = visual.bounds.x.max(visual.clip.x);
+    let top = visual.bounds.y.max(visual.clip.y);
+    let right = (visual.bounds.x + visual.bounds.width).min(visual.clip.x + visual.clip.width);
+    let bottom = (visual.bounds.y + visual.bounds.height).min(visual.clip.y + visual.clip.height);
+    (left < right && top < bottom).then_some([left, top, right, bottom])
+}
+
+fn layout_text(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    font: &mut ResidentFont,
+    visual: &UiVisual,
+    text: &str,
+) -> Option<Vec<UiTextInstance>> {
+    let clip = text_clip(visual)?;
+    let mut lines = Vec::<Vec<AtlasGlyph>>::new();
+    let mut line = Vec::<AtlasGlyph>::new();
+    let mut line_width = 0.0;
+    for ch in text.chars() {
+        if ch == '\n' {
+            lines.push(std::mem::take(&mut line));
+            line_width = 0.0;
+            continue;
+        }
+        let glyph = ensure_glyph(device, queue, font, ch).ok()?;
+        if !line.is_empty() && line_width + glyph.advance > visual.bounds.width {
+            lines.push(std::mem::take(&mut line));
+            line_width = 0.0;
+        }
+        line_width += glyph.advance;
+        line.push(glyph);
+    }
+    if !line.is_empty() || lines.is_empty() {
+        lines.push(line);
+    }
+
+    let block_height = font.line_height * lines.len() as f32;
+    let top = visual.bounds.y + ((visual.bounds.height - block_height).max(0.0) * 0.5);
+    let mut result = Vec::new();
+    for (line_index, glyphs) in lines.into_iter().enumerate() {
+        let advance = glyphs.iter().map(|glyph| glyph.advance).sum::<f32>();
+        let mut x = if visual.kind == UiNodeKind::Button {
+            visual.bounds.x + ((visual.bounds.width - advance).max(0.0) * 0.5)
+        } else {
+            visual.bounds.x
+        };
+        let baseline = top + font.ascent + line_index as f32 * font.line_height;
+        for glyph in glyphs {
+            result.push(UiTextInstance {
+                rect: [x + glyph.xmin, baseline + glyph.plane_min_y, glyph.width, glyph.height],
+                color: [0.86, 0.95, 0.98, visual.style.opacity],
+                clip,
+                uv: glyph.uv,
+            });
+            x += glyph.advance;
+        }
+    }
+    Some(result)
 }
 
 fn flatten_fragments(
@@ -1081,6 +1304,7 @@ fn flatten_node(
                 enabled: node.enabled,
                 clip: effective_clip,
                 image: node.image.clone(),
+                surface: node.surface.clone(),
                 text: node.text.clone(),
             },
             node.enter_transition.clone(),
@@ -1123,6 +1347,7 @@ fn transition_source(target: &UiVisual, transition: &UiTransition) -> UiVisual {
         enabled: target.enabled,
         clip: target.clip,
         image: target.image.clone(),
+        surface: target.surface.clone(),
         text: target.text.clone(),
     }
 }
@@ -1162,6 +1387,7 @@ fn sample_transition(active: &ActiveTransition, time_seconds: f32) -> UiVisual {
         enabled: active.target.enabled,
         clip: active.target.clip,
         image: active.target.image.clone(),
+        surface: active.target.surface.clone(),
         text: active.target.text.clone(),
     }
 }
@@ -1250,6 +1476,7 @@ mod tests {
             text_key: None,
             text: None,
             image: None,
+            surface: None,
             style: UiStyle::default(),
             enter_transition: Some(UiTransition {
                 delay_ms: 0,
@@ -1288,6 +1515,7 @@ mod tests {
             text_key: None,
             text: None,
             image: None,
+            surface: None,
             style: UiStyle::default(),
             enter_transition: None,
             children: Vec::new(),
@@ -1315,6 +1543,158 @@ mod tests {
     }
 
     #[test]
+    fn render_surface_samples_a_renderer_owned_gpu_texture() {
+        let (device, queue) = test_device("neon3-ui-render-surface");
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("neon3-ui-render-surface-source"),
+            size: wgpu::Extent3d { width: 64, height: 64, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("neon3-ui-render-surface-source-encoder"),
+        });
+        {
+            let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("neon3-ui-render-surface-source-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::GREEN),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+        }
+        queue.submit(Some(encoder.finish()));
+
+        let root = UiNode {
+            node_id: UiNodeId("preview".into()),
+            kind: UiNodeKind::RenderSurface,
+            bounds: UiBounds { x: 0.0, y: 0.0, width: 64.0, height: 64.0 },
+            layout: None,
+            visible: true,
+            enabled: true,
+            text_key: None,
+            text: None,
+            image: None,
+            surface: Some(RenderSurfaceRef { target_id: "ai.terrain.preview".into() }),
+            style: UiStyle { opacity: 1.0, ..UiStyle::default() },
+            enter_transition: None,
+            children: Vec::new(),
+        };
+        let fragment = UiFragment {
+            fragment_id: UiFragmentId("ai-preview".into()),
+            revision: Revision(1),
+            root,
+            effects: Vec::new(),
+        };
+        let pixels = render_offscreen_for_test(
+            &device,
+            &queue,
+            wgpu::TextureFormat::Rgba8Unorm,
+            &HashMap::from([(UiFragmentId("ai-preview".into()), fragment)]),
+            [64, 64],
+            1.0,
+            &[],
+            vec![("ai.terrain.preview".into(), texture)],
+        );
+        let center = &pixels[4 * (32 * 64 + 32)..][..4];
+        assert_eq!(center, [0, 255, 0, 255]);
+    }
+
+    #[test]
+    fn render_surface_refreshes_when_the_same_target_is_replaced_repeatedly() {
+        let (device, queue) = test_device("neon3-ui-render-surface-refresh");
+        let root = UiNode {
+            node_id: UiNodeId("preview".into()),
+            kind: UiNodeKind::RenderSurface,
+            bounds: UiBounds { x: 0.0, y: 0.0, width: 64.0, height: 64.0 },
+            layout: None,
+            visible: true,
+            enabled: true,
+            text_key: None,
+            text: None,
+            image: None,
+            surface: Some(RenderSurfaceRef { target_id: "ai.terrain.preview".into() }),
+            style: UiStyle { opacity: 1.0, ..UiStyle::default() },
+            enter_transition: None,
+            children: Vec::new(),
+        };
+        let fragments = HashMap::from([(
+            UiFragmentId("ai-preview".into()),
+            UiFragment {
+                fragment_id: UiFragmentId("ai-preview".into()),
+                revision: Revision(1),
+                root,
+                effects: Vec::new(),
+            },
+        )]);
+        let mut renderer = UiWgpuRenderer::new(&device, wgpu::TextureFormat::Rgba8Unorm);
+        for (color, expected) in [
+            (wgpu::Color { r: 1.0, g: 0.0, b: 0.0, a: 1.0 }, [255, 0, 0, 255]),
+            (wgpu::Color { r: 0.0, g: 1.0, b: 0.0, a: 1.0 }, [0, 255, 0, 255]),
+            (wgpu::Color { r: 0.0, g: 0.0, b: 1.0, a: 1.0 }, [0, 0, 255, 255]),
+        ] {
+            let texture = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("neon3-ui-render-surface-refresh-source"),
+                size: wgpu::Extent3d { width: 64, height: 64, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("neon3-ui-render-surface-refresh-encoder"),
+            });
+            {
+                let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("neon3-ui-render-surface-refresh-pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(color),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+            }
+            queue.submit(Some(encoder.finish()));
+            renderer.register_render_surface(&device, "ai.terrain.preview", texture);
+            let pixels = render_renderer_offscreen_for_test(
+                &mut renderer,
+                &device,
+                &queue,
+                wgpu::TextureFormat::Rgba8Unorm,
+                &fragments,
+                [64, 64],
+                1.0,
+            );
+            assert_eq!(&pixels[4 * (32 * 64 + 32)..][..4], expected);
+        }
+    }
+
+    #[test]
     fn bound_intents_compile_to_a_local_flexible_hit_map() {
         let mut root = node();
         root.kind = UiNodeKind::Button;
@@ -1338,14 +1718,31 @@ mod tests {
             node_id: UiNodeId("text".into()), kind: UiNodeKind::Label,
             bounds: UiBounds { x: 4.0, y: 4.0, width: 56.0, height: 24.0 }, layout: None,
             visible: true, enabled: true, text_key: None,
-            text: Some(TextRef::Literal { value: "A".into() }), image: None,
+            text: Some(TextRef::Literal { value: "A".into() }), image: None, surface: None,
             style: UiStyle { background_color: [0.0; 4], border_color: [0.0; 4], border_width: 0.0, corner_radius: 0.0, opacity: 1.0 },
             enter_transition: None, children: Vec::new(),
         };
         let fragment = UiFragment { fragment_id: UiFragmentId("text".into()), revision: Revision(1), root: text, effects: Vec::new() };
         let pixels = render_offscreen_for_test(&device, &queue, wgpu::TextureFormat::Rgba8Unorm,
-            &HashMap::from([(UiFragmentId("text".into()), fragment)]), [64, 32], 1.0, &[font]);
+            &HashMap::from([(UiFragmentId("text".into()), fragment)]), [64, 32], 1.0, &[font], Vec::new());
         assert!(pixels.chunks_exact(4).any(|pixel| pixel[3] > 0), "text must produce glyph alpha without a panel background");
+    }
+
+    #[test]
+    fn bundled_font_renders_cjk_text_without_an_owner_font_asset() {
+        let (device, queue) = test_device("neon3-ui-bundled-cjk-text");
+        let text = UiNode {
+            node_id: UiNodeId("text".into()), kind: UiNodeKind::Label,
+            bounds: UiBounds { x: 4.0, y: 4.0, width: 84.0, height: 24.0 }, layout: None,
+            visible: true, enabled: true, text_key: None,
+            text: Some(TextRef::Literal { value: "地形 UI".into() }), image: None, surface: None,
+            style: UiStyle { background_color: [0.0; 4], border_color: [0.0; 4], border_width: 0.0, corner_radius: 0.0, opacity: 1.0 },
+            enter_transition: None, children: Vec::new(),
+        };
+        let fragment = UiFragment { fragment_id: UiFragmentId("bundled-cjk-text".into()), revision: Revision(1), root: text, effects: Vec::new() };
+        let pixels = render_offscreen_for_test(&device, &queue, wgpu::TextureFormat::Rgba8Unorm,
+            &HashMap::from([(UiFragmentId("bundled-cjk-text".into()), fragment)]), [96, 32], 1.0, &[], Vec::new());
+        assert!(pixels.chunks_exact(4).any(|pixel| pixel[3] > 0), "bundled CJK font must produce glyph alpha");
     }
 
     #[test]
@@ -1356,7 +1753,7 @@ mod tests {
             node_id: UiNodeId("wrapped-text".into()), kind: UiNodeKind::Label,
             bounds: UiBounds { x: 4.0, y: 0.0, width: 24.0, height: 96.0 }, layout: None,
             visible: true, enabled: true, text_key: None,
-            text: Some(TextRef::Literal { value: "AAA".into() }), image: None,
+            text: Some(TextRef::Literal { value: "AAA".into() }), image: None, surface: None,
             style: UiStyle { background_color: [0.0; 4], border_color: [0.0; 4], border_width: 0.0, corner_radius: 0.0, opacity: 1.0 },
             enter_transition: None, children: Vec::new(),
         };
@@ -1364,15 +1761,15 @@ mod tests {
             node_id: UiNodeId("clip-root".into()), kind: UiNodeKind::Panel,
             bounds: UiBounds { x: 0.0, y: 0.0, width: 32.0, height: 64.0 },
             layout: Some(neon_ui_schema::UiLayout { clip: true, ..neon_ui_schema::UiLayout::default() }),
-            visible: true, enabled: true, text_key: None, text: None, image: None,
+            visible: true, enabled: true, text_key: None, text: None, image: None, surface: None,
             style: UiStyle { background_color: [0.0; 4], border_color: [0.0; 4], border_width: 0.0, corner_radius: 0.0, opacity: 1.0 },
             enter_transition: None, children: vec![label],
         };
         let pixels = render_offscreen_for_test(&device, &queue, wgpu::TextureFormat::Rgba8Unorm,
-            &HashMap::from([(UiFragmentId("wrap-clip".into()), UiFragment { fragment_id: UiFragmentId("wrap-clip".into()), revision: Revision(1), root, effects: Vec::new() })]), [64, 96], 1.0, &[font]);
+            &HashMap::from([(UiFragmentId("wrap-clip".into()), UiFragment { fragment_id: UiFragmentId("wrap-clip".into()), revision: Revision(1), root, effects: Vec::new() })]), [64, 96], 1.0, &[font], Vec::new());
         let has_alpha_in_rows = |from: usize, until: usize| pixels.chunks_exact(4).enumerate().any(|(index, pixel)| index / 64 >= from && index / 64 < until && pixel[3] > 0);
         assert!(has_alpha_in_rows(8, 36), "first wrapped line must produce glyph coverage");
-        assert!(has_alpha_in_rows(40, 64), "second wrapped line must produce glyph coverage");
+        assert!(has_alpha_in_rows(18, 64), "second wrapped line must produce glyph coverage");
         assert!(!has_alpha_in_rows(64, 96), "parent clip must discard glyph coverage outside its bounds");
     }
 
@@ -1382,8 +1779,8 @@ mod tests {
         root.bounds = UiBounds { x: 0.0, y: 0.0, width: 100.0, height: 100.0 };
         root.layout = Some(neon_ui_schema::UiLayout { mode: UiLayoutMode::Column, padding: [4.0; 4], gap: 2.0, scroll_offset: [0.0, 3.0], ..neon_ui_schema::UiLayout::default() });
         root.children = vec![
-            UiNode { node_id: UiNodeId("first".into()), kind: UiNodeKind::Button, bounds: UiBounds { x: 0.0, y: 0.0, width: 20.0, height: 10.0 }, layout: None, visible: true, enabled: true, text_key: None, text: None, image: None, style: UiStyle::default(), enter_transition: None, children: Vec::new() },
-            UiNode { node_id: UiNodeId("second".into()), kind: UiNodeKind::Button, bounds: UiBounds { x: 0.0, y: 0.0, width: 20.0, height: 10.0 }, layout: None, visible: true, enabled: true, text_key: None, text: None, image: None, style: UiStyle::default(), enter_transition: None, children: Vec::new() },
+            UiNode { node_id: UiNodeId("first".into()), kind: UiNodeKind::Button, bounds: UiBounds { x: 0.0, y: 0.0, width: 20.0, height: 10.0 }, layout: None, visible: true, enabled: true, text_key: None, text: None, image: None, surface: None, style: UiStyle::default(), enter_transition: None, children: Vec::new() },
+            UiNode { node_id: UiNodeId("second".into()), kind: UiNodeKind::Button, bounds: UiBounds { x: 0.0, y: 0.0, width: 20.0, height: 10.0 }, layout: None, visible: true, enabled: true, text_key: None, text: None, image: None, surface: None, style: UiStyle::default(), enter_transition: None, children: Vec::new() },
         ];
         let fragments = HashMap::from([(UiFragmentId("layout".into()), UiFragment { fragment_id: UiFragmentId("layout".into()), revision: Revision(1), root, effects: Vec::new() })]);
         let nodes = flatten_fragments(&fragments);
@@ -1405,6 +1802,7 @@ mod tests {
             enabled: true,
             clip: UiBounds { x: -1_000_000.0, y: -1_000_000.0, width: 2_000_000.0, height: 2_000_000.0 },
             image: None,
+            surface: None,
             text: None,
         };
         let transition = node().enter_transition.unwrap();
@@ -1435,6 +1833,7 @@ mod tests {
             enabled: true,
             clip: UiBounds { x: -1_000_000.0, y: -1_000_000.0, width: 2_000_000.0, height: 2_000_000.0 },
             image: None,
+            surface: None,
             text: None,
         };
         let target = UiVisual {
@@ -1449,6 +1848,7 @@ mod tests {
             enabled: true,
             clip: UiBounds { x: -1_000_000.0, y: -1_000_000.0, width: 2_000_000.0, height: 2_000_000.0 },
             image: None,
+            surface: None,
             text: None,
         };
         let active = ActiveTransition {
@@ -1469,7 +1869,7 @@ mod tests {
     fn animation_activity_expires_after_transition_end() {
         let (device, _queue) = test_device("neon3-ui-animation-activity");
         let mut renderer = UiWgpuRenderer::new(&device, wgpu::TextureFormat::Rgba8Unorm);
-        let target = UiVisual { bounds: UiBounds { x: 0.0, y: 0.0, width: 10.0, height: 10.0 }, style: UiStyle::default(), kind: UiNodeKind::Panel, enabled: true, clip: UiBounds { x: 0.0, y: 0.0, width: 10.0, height: 10.0 }, image: None, text: None };
+        let target = UiVisual { bounds: UiBounds { x: 0.0, y: 0.0, width: 10.0, height: 10.0 }, style: UiStyle::default(), kind: UiNodeKind::Panel, enabled: true, clip: UiBounds { x: 0.0, y: 0.0, width: 10.0, height: 10.0 }, image: None, surface: None, text: None };
         UiWgpuRenderer::sample(&mut renderer.current, &mut renderer.active, "animated", &target, Some(&UiTransition { delay_ms: 0, duration_ms: 10, easing: UiEasing::Linear, from: UiTransitionState { opacity: Some(0.0), ..UiTransitionState::default() } }), 1.0);
         assert!(renderer.has_active_animation(1.005));
         assert!(!renderer.has_active_animation(1.020));

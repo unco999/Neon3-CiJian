@@ -188,11 +188,11 @@ pub fn detail_fragment(revision: Revision, detail_visible: bool) -> UiFragment {
     let lower_text = if detail_visible { "Inspector details are now visible." } else { "Select Show details to inspect this item." };
     UiFragment {
         fragment_id: UiFragmentId("cli-detail-toggle".into()), revision,
-        root: UiNode { node_id: UiNodeId("editor-shell".into()), kind: UiNodeKind::Panel, bounds: UiBounds { x: 24.0, y: 24.0, width: 420.0, height: 240.0 }, layout: None, visible: true, enabled: true, text_key: None, text: None, image: None, style: UiStyle::default(), enter_transition: None,
+        root: UiNode { node_id: UiNodeId("editor-shell".into()), kind: UiNodeKind::Panel, bounds: UiBounds { x: 24.0, y: 24.0, width: 420.0, height: 240.0 }, layout: None, visible: true, enabled: true, text_key: None, text: None, image: None, surface: None, style: UiStyle::default(), enter_transition: None,
             children: vec![
-                UiNode { node_id: UiNodeId("title".into()), kind: UiNodeKind::Label, bounds: UiBounds { x: 20.0, y: 18.0, width: 220.0, height: 28.0 }, layout: None, visible: true, enabled: true, text_key: None, text: Some(TextRef::Literal { value: "Terrain Inspector".into() }), image: None, style: UiStyle::default(), enter_transition: None, children: Vec::new() },
-                UiNode { node_id: UiNodeId("show-details".into()), kind: UiNodeKind::Button, bounds: UiBounds { x: 250.0, y: 16.0, width: 145.0, height: 34.0 }, layout: None, visible: true, enabled: true, text_key: None, text: Some(TextRef::Literal { value: "Show details".into() }), image: None, style: UiStyle::default(), enter_transition: None, children: Vec::new() },
-                UiNode { node_id: UiNodeId("detail-region".into()), kind: UiNodeKind::Label, bounds: UiBounds { x: 20.0, y: 82.0, width: 376.0, height: 120.0 }, layout: None, visible: true, enabled: true, text_key: None, text: Some(TextRef::Literal { value: lower_text.into() }), image: None, style: UiStyle::default(), enter_transition: None, children: Vec::new() },
+                UiNode { node_id: UiNodeId("title".into()), kind: UiNodeKind::Label, bounds: UiBounds { x: 20.0, y: 18.0, width: 220.0, height: 28.0 }, layout: None, visible: true, enabled: true, text_key: None, text: Some(TextRef::Literal { value: "Terrain Inspector".into() }), image: None, surface: None, style: UiStyle::default(), enter_transition: None, children: Vec::new() },
+                UiNode { node_id: UiNodeId("show-details".into()), kind: UiNodeKind::Button, bounds: UiBounds { x: 250.0, y: 16.0, width: 145.0, height: 34.0 }, layout: None, visible: true, enabled: true, text_key: None, text: Some(TextRef::Literal { value: "Show details".into() }), image: None, surface: None, style: UiStyle::default(), enter_transition: None, children: Vec::new() },
+                UiNode { node_id: UiNodeId("detail-region".into()), kind: UiNodeKind::Label, bounds: UiBounds { x: 20.0, y: 82.0, width: 376.0, height: 120.0 }, layout: None, visible: true, enabled: true, text_key: None, text: Some(TextRef::Literal { value: lower_text.into() }), image: None, surface: None, style: UiStyle::default(), enter_transition: None, children: Vec::new() },
             ] },
         effects: vec![UiEffect::SemanticIntent { intent: UiIntent::Invoke { action: "ui.detail.toggle".into(), params: json!({"section": "inspector"}) } }],
     }
@@ -217,6 +217,7 @@ pub fn static_fragment(revision: Revision) -> UiFragment {
             text_key: None,
             text: None,
             image: None,
+            surface: None,
             style: UiStyle::default(),
             enter_transition: None,
             children: Vec::new(),

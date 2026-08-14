@@ -100,8 +100,21 @@ struct TransposeParams {
     out_off: u32,
 }
 
-fn wgs(len: u64) -> u32 {
-    len.div_ceil(256).max(1) as u32
+const MAX_DISPATCH_DIM: u64 = 65_535;
+
+fn dispatch_1d(len: u64) -> [u32; 3] {
+    let total = len.div_ceil(256).max(1);
+    let x = total.min(MAX_DISPATCH_DIM);
+    let y = total.div_ceil(x);
+    assert!(y <= MAX_DISPATCH_DIM, "1D dispatch exceeds WGPU limits");
+    [x as u32, y as u32, 1]
+}
+
+fn dispatch_rows(rows: u32) -> [u32; 3] {
+    let total = rows.max(1) as u64;
+    let x = total.min(MAX_DISPATCH_DIM);
+    let y = total.div_ceil(x);
+    [x as u32, y as u32, 1]
 }
 
 /// y = silu(x)
@@ -115,7 +128,7 @@ pub fn silu(ctx: &mut GpuCtx, x: &wgpu::Buffer, len: u64) -> Buf {
         d: 0.0,
         pad: 0,
     });
-    ctx.run("silu", &uniform, &[x, x, x, &y.buffer], [wgs(len), 1, 1]);
+    ctx.run("silu", &uniform, &[x, x, x, &y.buffer], dispatch_1d(len));
     y
 }
 
@@ -130,7 +143,7 @@ pub fn add(ctx: &mut GpuCtx, a: &wgpu::Buffer, b: &wgpu::Buffer, len: u64) -> Bu
         d: 0.0,
         pad: 0,
     });
-    ctx.run("add", &uniform, &[a, b, a, &y.buffer], [wgs(len), 1, 1]);
+    ctx.run("add", &uniform, &[a, b, a, &y.buffer], dispatch_1d(len));
     y
 }
 
@@ -145,7 +158,7 @@ pub fn mul(ctx: &mut GpuCtx, a: &wgpu::Buffer, b: &wgpu::Buffer, len: u64) -> Bu
         d: 0.0,
         pad: 0,
     });
-    ctx.run("mul", &uniform, &[a, b, a, &y.buffer], [wgs(len), 1, 1]);
+    ctx.run("mul", &uniform, &[a, b, a, &y.buffer], dispatch_1d(len));
     y
 }
 
@@ -166,7 +179,7 @@ pub fn cfg_combine(
         d: 0.0,
         pad: 0,
     });
-    ctx.run("cfg", &uniform, &[eu, ec, eu, &y.buffer], [wgs(len), 1, 1]);
+    ctx.run("cfg", &uniform, &[eu, ec, eu, &y.buffer], dispatch_1d(len));
     y
 }
 
@@ -190,7 +203,7 @@ pub fn ddim_step(
         d: s1ab_t0,
         pad: 0,
     });
-    ctx.run("ddim", &uniform, &[x, e, x, &y.buffer], [wgs(len), 1, 1]);
+    ctx.run("ddim", &uniform, &[x, e, x, &y.buffer], dispatch_1d(len));
     y
 }
 
@@ -205,7 +218,7 @@ pub fn film(ctx: &mut GpuCtx, h: &wgpu::Buffer, film_buf: &wgpu::Buffer, c: u32,
         d: 0.0,
         pad: 0,
     });
-    ctx.run("film", &uniform, &[h, film_buf, film_buf, &y.buffer], [wgs(len), 1, 1]);
+    ctx.run("film", &uniform, &[h, film_buf, film_buf, &y.buffer], dispatch_1d(len));
     y
 }
 
@@ -225,6 +238,7 @@ pub fn conv2d(
     stride: u32,
     pad: u32,
 ) -> Buf {
+    assert!(stride == 1 && kh <= 3 && kw <= 3, "tiled conv2d supports stride 1 and kernels up to 3x3");
     let out_h = (in_h + 2 * pad - kh) / stride + 1;
     let out_w = (in_w + 2 * pad - kw) / stride + 1;
     let y = ctx.scratch(out_c as u64 * out_h as u64 * out_w as u64 * 4);
@@ -309,7 +323,7 @@ pub fn group_norm(
         "gn_apply",
         &uniform,
         &[x, w, b, &partial.buffer, &stats.buffer, &y.buffer],
-        [wgs(len), 1, 1],
+        dispatch_1d(len),
     );
     Ok(y)
 }
@@ -336,7 +350,7 @@ pub fn avg_pool2d(ctx: &mut GpuCtx, x: &wgpu::Buffer, c: u32, in_h: u32, in_w: u
         "avgpool",
         &uniform,
         &[x, x, &y.buffer],
-        [wgs(c as u64 * out_h as u64 * out_w as u64), 1, 1],
+        dispatch_1d(c as u64 * out_h as u64 * out_w as u64),
     );
     y
 }
@@ -349,7 +363,7 @@ pub fn upsample2x(ctx: &mut GpuCtx, x: &wgpu::Buffer, c: u32, in_h: u32, in_w: u
         "upsample",
         &uniform,
         &[x, x, &y.buffer],
-        [wgs(c as u64 * in_h as u64 * in_w as u64 * 4), 1, 1],
+        dispatch_1d(c as u64 * in_h as u64 * in_w as u64 * 4),
     );
     y
 }
@@ -369,7 +383,7 @@ pub fn concat_c(
         "concat",
         &uniform,
         &[a, b, &y.buffer],
-        [wgs((c1 as u64 + c2 as u64) * hw), 1, 1],
+        dispatch_1d((c1 as u64 + c2 as u64) * hw),
     );
     y
 }
@@ -393,7 +407,7 @@ pub fn transpose_into(
         in_off,
         out_off,
     });
-    ctx.run("transpose", &uniform, &[x, y], [wgs(len), 1, 1]);
+    ctx.run("transpose", &uniform, &[x, y], dispatch_1d(len));
 }
 
 /// Fresh-output transpose of a whole (K, N) buffer.
@@ -476,7 +490,7 @@ pub fn softmax_rows(
     scale: f32,
 ) {
     let uniform = ctx.uniform(&SoftmaxParams { rows, cols, off, scale });
-    ctx.run("softmax", &uniform, &[x], [rows, 1, 1]);
+    ctx.run("softmax", &uniform, &[x], dispatch_rows(rows));
 }
 
 /// Deterministic standard normal noise.
@@ -486,7 +500,7 @@ pub fn randn(ctx: &mut GpuCtx, len: u64, seed: u64) -> Buf {
         len: len as u32,
         seed: (seed ^ (seed >> 32)) as u32,
     });
-    ctx.run("randn", &uniform, &[&y.buffer], [wgs(len), 1, 1]);
+    ctx.run("randn", &uniform, &[&y.buffer], dispatch_1d(len));
     y
 }
 
@@ -500,7 +514,7 @@ pub fn timefreq(ctx: &mut GpuCtx, t: u32, dim: u32) -> Buf {
         table_count: 0,
     });
     let yb = &y.buffer;
-    ctx.run("timefreq", &uniform, &[yb], [wgs(dim as u64), 1, 1]);
+    ctx.run("timefreq", &uniform, &[yb], dispatch_1d(dim as u64));
     y
 }
 
@@ -527,7 +541,7 @@ pub fn gather_sum(
         "gather",
         &uniform,
         &[tables, &indices_buf, &bases_buf, &y.buffer],
-        [wgs(row_len as u64), 1, 1],
+        dispatch_1d(row_len as u64),
     );
     y
 }

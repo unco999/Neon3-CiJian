@@ -19,7 +19,7 @@ struct Params {
 
 @compute @workgroup_size(256)
 fn main_timefreq(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
+    let i = gid.x + gid.y * 16776960u;
     if (i >= p.dim) { return; }
     let half = p.dim / 2u;
     let k = f32(i % half);
@@ -33,7 +33,7 @@ fn main_timefreq(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 @compute @workgroup_size(256)
 fn main_gather(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
+    let i = gid.x + gid.y * 16776960u;
     if (i >= p.row_len) { return; }
     var acc = 0.0;
     for (var t: u32 = 0u; t < p.table_count; t++) {
