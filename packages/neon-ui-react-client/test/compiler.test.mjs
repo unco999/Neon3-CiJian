@@ -37,6 +37,21 @@ test("compiles stable semantic node paths without numeric element ids", () => {
   assert.equal(JSON.stringify(fragment).includes("elementId"), false);
 });
 
+test("Button event compiles to the typed UI surface intent", () => {
+  const button = createHost("neon-button", {
+    nodeKey: "materials-tab",
+    bounds: { x: 4, y: 4, width: 90, height: 28 },
+    event: { type: "INSPECTOR_TAB_SELECT", tab: "materials" },
+  });
+  const fragment = compileContainer(surface([panel("toolbar", [button])]));
+  assert.deepEqual(fragment.effects, [{
+    kind: "semantic_intent",
+    intent: { kind: "invoke", action: "ui.surface.event", params: { event: { type: "INSPECTOR_TAB_SELECT", tab: "materials" } } },
+  }]);
+  assert.throws(() => compileContainer(surface([panel("not-a-button", [], { event: { type: "DIAGNOSTICS_TOGGLE" } })])), /only valid on Button/);
+  assert.throws(() => compileContainer(surface([createHost("neon-button", { nodeKey: "ambiguous", bounds: { x: 0, y: 0, width: 20, height: 20 }, event: { type: "DIAGNOSTICS_TOGGLE" }, intent: { action: "ui.surface.event", params: {} } })])), /both intent and event/);
+});
+
 test("node ids are stable across rerenders and revisions", () => {
   const make = () => compileContainer(surface([panel("toolbar", [panel("water-tool")])])).root.children[0].children[0].node_id;
   assert.equal(make(), make());

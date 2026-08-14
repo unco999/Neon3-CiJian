@@ -53,11 +53,12 @@ export type UiNode = {
   children: UiNode[];
 };
 
+export type UiEffect = { kind: "semantic_action"; action: string } | { kind: "semantic_intent"; intent: UiIntent } | { kind: "bound_semantic_intent"; node_id: string; intent: UiIntent };
 export type UiFragment = {
   fragment_id: SurfaceId;
   revision: Revision;
   root: UiNode;
-  effects: Array<{ kind: "semantic_action"; action: string } | { kind: "semantic_intent"; intent: UiIntent }>;
+  effects: UiEffect[];
 };
 
 export type UiFragmentSubmission = { schema_version: 1; fragment: UiFragment };
@@ -95,7 +96,8 @@ export type RpcTransport = {
   call(request: RpcRequest): Promise<RpcResponse>;
 };
 
-export type UiSurfaceSnapshot = { revision: Revision; value: { diagnostics: "collapsed" | "expanded"; inspector: { tab: "overview" | "materials" | "history" } }; available_events: Array<"DIAGNOSTICS_TOGGLE" | "INSPECTOR_TAB_SELECT"> };
+export type UiSurfaceEvent = { type: "DIAGNOSTICS_TOGGLE" } | { type: "INSPECTOR_TAB_SELECT"; tab: "overview" | "materials" | "history" };
+export type UiSurfaceSnapshot = { revision: Revision; value: { diagnostics: "collapsed" | "expanded"; inspector: { tab: "overview" | "materials" | "history" } }; available_events: Array<UiSurfaceEvent["type"]> };
 
 export type SubmitFragment = (fragment: UiFragment) => Promise<RpcResponse> | RpcResponse | void;
 
@@ -120,6 +122,7 @@ export type NodeProps = {
   textArguments?: JsonValue;
   asset?: AssetRef;
   intent?: UiIntentSpec;
+  event?: UiSurfaceEvent;
   enterTransition?: UiTransition;
   children?: React.ReactNode;
 };

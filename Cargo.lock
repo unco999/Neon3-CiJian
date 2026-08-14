@@ -948,6 +948,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "neon-wgpu-ai"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "pollster",
+ "serde",
+ "serde_json",
+ "wgpu",
+]
+
+[[package]]
 name = "neon-wgpu-runtime"
 version = "0.1.0"
 dependencies = [

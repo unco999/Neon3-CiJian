@@ -47,25 +47,28 @@ fn main_cfg(@builtin(global_invocation_id) gid: vec3<u32>) {
     y[i] = x0[i] + p.a * (x1[i] - x0[i]);
 }
 
-// Fused DDIM step: y = p.d * clamp((x0 - p.b * x1) / p.c, -3.0, 3.0) + p.a * x1
-// where p.a = sqrt(alpha_bar[t0]), p.b = sqrt(1 - alpha_bar[t]), p.c = sqrt(alpha_bar[t]),
-// p.d = sqrt(1 - alpha_bar[t0]).
+// Fused DDIM step: y = p.d * clamp((x0 - p.b * x1) / sab_t, -3.0, 3.0) + p.a * x1
+// where p.a = sqrt(alpha_bar[t0]), p.b = sqrt(1 - alpha_bar[t]),
+// sab_t = bitcast<f32>(p.c) = sqrt(alpha_bar[t]), p.d = sqrt(1 - alpha_bar[t0]).
 @compute @workgroup_size(256)
 fn main_ddim(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
     if (i >= p.len) { return; }
     let x = x0[i];
     let e = x1[i];
-    let x0h = clamp((x - p.b * e) / p.c, -3.0, 3.0);
+    let sab_t = bitcast<f32>(p.c);
+    let x0h = clamp((x - p.b * e) / sab_t, -3.0, 3.0);
     y[i] = p.d * x0h + p.a * e;
 }
 
-// FiLM: y = x0 * (1 + x1[i % c]) + x2[i % c]
+// FiLM: y = x0 * (1 + x1[i % c]) + x1[c + (i % c)]
+// x1 holds the 2c film parameters (scale half, then bias half).
 @compute @workgroup_size(256)
 fn main_film(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
     if (i >= p.len) { return; }
-    let s = x1[i % p.c];
-    let b = x2[i % p.c];
+    let c = p.c;
+    let s = x1[i % c];
+    let b = x1[c + (i % c)];
     y[i] = x0[i] * (1.0 + s) + b;
 }

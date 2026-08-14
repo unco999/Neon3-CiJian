@@ -26,6 +26,49 @@ pub struct UiFragment {
     pub effects: Vec<UiEffect>,
 }
 
+/// Public statechart wire contract for a revisioned UI surface.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiSurfaceSnapshot {
+    pub revision: Revision,
+    pub value: UiSurfaceState,
+    pub available_events: Vec<UiSurfaceEventKind>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiSurfaceState {
+    pub diagnostics: UiDiagnosticsState,
+    pub inspector: UiInspectorState,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UiDiagnosticsState { Collapsed, Expanded }
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiInspectorState { pub tab: UiInspectorTab }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UiInspectorTab { Overview, Materials, History }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum UiSurfaceEventKind { DiagnosticsToggle, InspectorTabSelect }
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum UiSurfaceEvent {
+    DiagnosticsToggle,
+    InspectorTabSelect { tab: UiInspectorTab },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiSurfaceEventRequest { pub event: UiSurfaceEvent }
+
 /// The only payload accepted by `wgpu.ui.submit_fragment`.
 /// It contains declarative UI data only; React/TS component state and render handles
 /// are intentionally outside this contract.
@@ -216,6 +259,7 @@ pub struct UiTransitionState {
 pub enum UiEffect {
     SemanticAction { action: String },
     SemanticIntent { intent: UiIntent },
+    BoundSemanticIntent { node_id: UiNodeId, intent: UiIntent },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -418,6 +462,7 @@ impl UiEffect {
             }
             Self::SemanticAction { .. } => Ok(()),
             Self::SemanticIntent { intent } => intent.validate(),
+            Self::BoundSemanticIntent { intent, .. } => intent.validate(),
         }
     }
 }
@@ -455,6 +500,27 @@ mod tests {
             serde_json::to_value(fragment).unwrap(),
             serde_json::from_str::<Value>(STATIC_FRAGMENT).unwrap()
         );
+    }
+
+    #[test]
+    fn surface_machine_event_and_snapshot_use_stable_json_contracts() {
+        let request: UiSurfaceEventRequest = serde_json::from_value(serde_json::json!({
+            "event": { "type": "INSPECTOR_TAB_SELECT", "tab": "materials" }
+        })).unwrap();
+        assert_eq!(request.event, UiSurfaceEvent::InspectorTabSelect { tab: UiInspectorTab::Materials });
+        let snapshot = UiSurfaceSnapshot {
+            revision: Revision(7),
+            value: UiSurfaceState {
+                diagnostics: UiDiagnosticsState::Expanded,
+                inspector: UiInspectorState { tab: UiInspectorTab::Materials },
+            },
+            available_events: vec![UiSurfaceEventKind::DiagnosticsToggle, UiSurfaceEventKind::InspectorTabSelect],
+        };
+        assert_eq!(serde_json::to_value(snapshot).unwrap(), serde_json::json!({
+            "revision": 7,
+            "value": { "diagnostics": "expanded", "inspector": { "tab": "materials" } },
+            "available_events": ["DIAGNOSTICS_TOGGLE", "INSPECTOR_TAB_SELECT"]
+        }));
     }
 
     #[test]

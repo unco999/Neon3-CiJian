@@ -13,6 +13,7 @@ use neon_protocol::{
 };
 use neon_ui_schema::{
     UiBounds, UiCommand, UiEffect, UiFragment, UiFragmentId, UiFragmentSubmission, UiNode, UiNodeId, UiNodeKind, UiStyle,
+    UiDiagnosticsState, UiInspectorState, UiInspectorTab, UiSurfaceEvent, UiSurfaceEventKind, UiSurfaceEventRequest, UiSurfaceSnapshot, UiSurfaceState,
     UiSemanticEvent, UiTransition, UiTransitionState, ERROR_FRAGMENT_REVISION_STALE,
     ERROR_INPUT_SEQUENCE_STALE, ERROR_INTENT_NOT_BOUND, ERROR_RENDERER_EPOCH_MISMATCH,
 };
@@ -21,14 +22,37 @@ use serde_json::{Value, json};
 pub const SERVICE_NAME: &str = "ui-runtime";
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct UiSurfaceSnapshot {
-    pub revision: Revision,
-    pub diagnostics_expanded: bool,
-    pub inspector_tab: String,
+pub struct UiSurfaceTransition {
+    pub snapshot: UiSurfaceSnapshot,
+    pub effects: Vec<UiEffect>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-enum UiSurfaceEvent { DiagnosticsToggle, InspectorTabSelect { tab: String } }
+pub struct UiSurfaceMachine { revision: Revision, state: UiSurfaceState }
+
+impl UiSurfaceMachine {
+    fn new() -> Self {
+        Self { revision: Revision(0), state: UiSurfaceState { diagnostics: UiDiagnosticsState::Collapsed, inspector: UiInspectorState { tab: UiInspectorTab::Overview } } }
+    }
+
+    fn snapshot(&self) -> UiSurfaceSnapshot {
+        UiSurfaceSnapshot { revision: self.revision, value: self.state.clone(), available_events: vec![UiSurfaceEventKind::DiagnosticsToggle, UiSurfaceEventKind::InspectorTabSelect] }
+    }
+
+    fn transition(&mut self, event: UiSurfaceEvent) -> Result<UiSurfaceTransition, (&'static str, &'static str)> {
+        match event {
+            UiSurfaceEvent::DiagnosticsToggle => {
+                self.state.diagnostics = match self.state.diagnostics { UiDiagnosticsState::Collapsed => UiDiagnosticsState::Expanded, UiDiagnosticsState::Expanded => UiDiagnosticsState::Collapsed };
+            }
+            UiSurfaceEvent::InspectorTabSelect { tab } => {
+                if self.state.inspector.tab == tab { return Err(("ui_guard_rejected", "inspector tab is already selected")); }
+                self.state.inspector.tab = tab;
+            }
+        }
+        self.revision = Revision(self.revision.0 + 1);
+        Ok(UiSurfaceTransition { snapshot: self.snapshot(), effects: Vec::new() })
+    }
+}
 
 pub struct UiRuntime {
     epoch: u64,
@@ -38,7 +62,7 @@ pub struct UiRuntime {
     receipts: HashMap<RequestId, CommandReceipt>,
     last_input_sequence: HashMap<u64, u64>,
     idempotent_responses: HashMap<String, RpcResponse>,
-    surface: UiSurfaceSnapshot,
+    surface: UiSurfaceMachine,
 }
 
 impl UiRuntime {
@@ -56,7 +80,7 @@ impl UiRuntime {
             receipts: HashMap::new(),
             last_input_sequence: HashMap::new(),
             idempotent_responses: HashMap::new(),
-            surface: UiSurfaceSnapshot { revision: Revision(0), diagnostics_expanded: false, inspector_tab: "overview".into() },
+            surface: UiSurfaceMachine::new(),
         }
     }
 
@@ -79,7 +103,7 @@ impl UiRuntime {
                 "ui.fragment.submit.v1".into(),
                 "ui.semantic_input.v1".into(),
                 "ui.intent_dispatch.v1".into(),
-                "ui.surface.action.v1".into(),
+                "ui.surface.machine.v1".into(),
             ],
         }
     }
@@ -106,7 +130,7 @@ impl UiRuntime {
             "debug.snapshot.get" => Some(json!(self.debug_snapshot())),
             "ui.fragment.submit" => return self.handle_fragment_submit(request),
             "ui.surface.snapshot.get" => Some(self.surface_value()),
-            "ui.surface.action" => return self.handle_surface_action(request),
+            "ui.surface.event" => return self.handle_surface_event(request),
             "ui.input.event" => return self.handle_input_event(request),
             "ui.intent.dispatch" => return self.handle_intent_dispatch(request),
             _ => None,
@@ -140,33 +164,26 @@ impl UiRuntime {
         }
     }
 
-    fn handle_surface_action(&mut self, request: RpcRequest) -> RpcResponse {
+    fn handle_surface_event(&mut self, request: RpcRequest) -> RpcResponse {
         let Some(key) = request.idempotency_key.clone() else { return self.rejected(request.request_id, "invalid_request", "idempotency_key is required"); };
         if let Some(response) = self.idempotent_responses.get(&key) { let mut response = response.clone(); response.request_id = request.request_id; return response; }
         if request.expected_revision != Some(self.surface.revision) { return self.rejected(request.request_id, "revision_conflict", "UI surface revision is stale"); }
         let event = match self.parse_surface_event(&request.params) { Ok(event) => event, Err((code, message)) => return self.rejected(request.request_id, code, message) };
-        match event { UiSurfaceEvent::DiagnosticsToggle => self.surface.diagnostics_expanded = !self.surface.diagnostics_expanded, UiSurfaceEvent::InspectorTabSelect { tab } => self.surface.inspector_tab = tab }
-        self.surface.revision = Revision(self.surface.revision.0 + 1);
+        let transition = match self.surface.transition(event) { Ok(transition) => transition, Err((code, message)) => return self.rejected(request.request_id, code, message) };
         self.record_receipt(&request.request_id, CommandState::Accepted, None);
-        let response = RpcResponse { request_id: request.request_id, status: RpcStatus::Accepted, revision: Some(self.surface.revision), result: Some(self.surface_value()), snapshot: None, error: None };
+        let response = RpcResponse { request_id: request.request_id, status: RpcStatus::Accepted, revision: Some(transition.snapshot.revision), result: Some(json!(transition.snapshot)), snapshot: None, error: None };
         self.idempotent_responses.insert(key, response.clone());
         response
     }
 
     fn parse_surface_event(&self, params: &Value) -> Result<UiSurfaceEvent, (&'static str, &'static str)> {
-        let event = params.get("event").and_then(Value::as_object).ok_or(("invalid_request", "a UI surface event is required"))?;
-        match event.get("type").and_then(Value::as_str) {
-            Some("DIAGNOSTICS_TOGGLE") => Ok(UiSurfaceEvent::DiagnosticsToggle),
-            Some("INSPECTOR_TAB_SELECT") => {
-                let tab = event.get("tab").and_then(Value::as_str).filter(|tab| matches!(*tab, "overview" | "materials" | "history")).ok_or(("invalid_request", "a supported inspector tab is required"))?;
-                Ok(UiSurfaceEvent::InspectorTabSelect { tab: tab.into() })
-            }
-            _ => Err(("unsupported_ui_event", "UI surface event is not supported")),
-        }
+        serde_json::from_value::<UiSurfaceEventRequest>(params.clone())
+            .map(|request| request.event)
+            .map_err(|_| ("invalid_request", "a supported UI surface event is required"))
     }
 
     fn surface_value(&self) -> Value {
-        json!({"revision": self.surface.revision, "value": {"diagnostics": if self.surface.diagnostics_expanded { "expanded" } else { "collapsed" }, "inspector": {"tab": self.surface.inspector_tab}}, "available_events": ["DIAGNOSTICS_TOGGLE", "INSPECTOR_TAB_SELECT"]})
+        json!(self.surface.snapshot())
     }
 
     /// Runs the UI declaration control plane. A React client can only submit to this
@@ -287,23 +304,38 @@ impl UiRuntime {
 
     pub fn command_receipt(&self, request_id: &RequestId) -> Option<&CommandReceipt> { self.receipts.get(request_id) }
 
-    fn handle_input_event(&mut self, request: RpcRequest) -> RpcResponse {
-        let event: UiSemanticEvent = match serde_json::from_value(request.params) {
+    fn handle_input_event(&mut self, mut request: RpcRequest) -> RpcResponse {
+        let event: UiSemanticEvent = match serde_json::from_value(request.params.clone()) {
             Ok(event) => event,
             Err(_) => return self.rejected(request.request_id, "invalid_request", "invalid UI semantic event"),
         };
         match self.validate_semantic_event(&event) {
-            Ok(()) => self.accepted(request.request_id, json!({"event_id": event.event_id, "intent": event.intent})),
+            Ok(()) => {
+                let neon_ui_schema::UiIntent::Invoke { action, params } = event.intent.clone();
+                if action == "ui.surface.event" {
+                    request.method = "ui.surface.event".into();
+                    request.params = params;
+                    request.expected_revision = Some(event.fragment.revision);
+                    return self.handle_surface_event(request);
+                }
+                self.accepted(request.request_id, json!({"event_id": event.event_id, "intent": event.intent}))
+            }
             Err(code) => self.rejected(request.request_id, code, "UI semantic event was rejected"),
         }
     }
 
-    fn handle_intent_dispatch(&mut self, request: RpcRequest) -> RpcResponse {
-        let intent: neon_ui_schema::UiIntent = match serde_json::from_value(request.params) {
+    fn handle_intent_dispatch(&mut self, mut request: RpcRequest) -> RpcResponse {
+        let intent: neon_ui_schema::UiIntent = match serde_json::from_value(request.params.clone()) {
             Ok(intent) => intent,
             Err(_) => return self.rejected(request.request_id, "invalid_request", "invalid UI intent"),
         };
         if intent.validate().is_err() { return self.rejected(request.request_id, ERROR_INTENT_NOT_BOUND, "UI intent is not bound"); }
+        let neon_ui_schema::UiIntent::Invoke { action, params } = intent.clone();
+        if action == "ui.surface.event" {
+            request.method = "ui.surface.event".into();
+            request.params = params;
+            return self.handle_surface_event(request);
+        }
         self.accepted(request.request_id, json!({"intent": intent}))
     }
 
@@ -546,7 +578,7 @@ mod tests {
         let action = |id: &str, expected_revision, key: &str, params| RpcRequest {
             protocol: "neon3.rpc".into(), version: PROTOCOL_VERSION, request_id: RequestId(id.into()),
             client: ClientIdentity { kind: ClientKind::UiReactClient, instance_id: "react-client".into(), pid: 1, origin: "neon-ui-react-client".into() },
-            target: ServiceName(SERVICE_NAME.into()), method: "ui.surface.action".into(), params, expected_revision: Some(Revision(expected_revision)), idempotency_key: Some(key.into()),
+            target: ServiceName(SERVICE_NAME.into()), method: "ui.surface.event".into(), params, expected_revision: Some(Revision(expected_revision)), idempotency_key: Some(key.into()),
         };
         let first = runtime.handle_service_request(action("toggle-1", 0, "toggle-key", json!({"event": {"type": "DIAGNOSTICS_TOGGLE"}})));
         assert_eq!(first.status, RpcStatus::Accepted);
@@ -560,8 +592,27 @@ mod tests {
         assert_eq!(stale.error.unwrap().code, "revision_conflict");
         let tab = runtime.handle_service_request(action("tab-1", 1, "tab-key", json!({"event": {"type": "INSPECTOR_TAB_SELECT", "tab": "materials"}})));
         assert_eq!(tab.status, RpcStatus::Accepted);
-        assert_eq!(runtime.surface.inspector_tab, "materials");
+        assert_eq!(runtime.surface.state.inspector.tab, UiInspectorTab::Materials);
         assert_eq!(runtime.surface.revision, Revision(2));
+        let duplicate = runtime.handle_service_request(action("tab-duplicate", 2, "tab-duplicate-key", json!({"event": {"type": "INSPECTOR_TAB_SELECT", "tab": "materials"}})));
+        assert_eq!(duplicate.status, RpcStatus::Rejected);
+        assert_eq!(duplicate.error.unwrap().code, "ui_guard_rejected");
+    }
+
+    #[test]
+    fn local_surface_intent_dispatches_through_the_typed_machine() {
+        let mut runtime = UiRuntime::new(1, "ui-surface-intent-test");
+        let request = RpcRequest {
+            protocol: "neon3.rpc".into(), version: PROTOCOL_VERSION, request_id: RequestId("surface-intent-1".into()),
+            client: ClientIdentity { kind: ClientKind::UiReactClient, instance_id: "react-client".into(), pid: 1, origin: "neon-ui-react-client".into() },
+            target: ServiceName(SERVICE_NAME.into()), method: "ui.intent.dispatch".into(),
+            params: json!(neon_ui_schema::UiIntent::Invoke { action: "ui.surface.event".into(), params: json!({"event": {"type": "DIAGNOSTICS_TOGGLE"}}) }),
+            expected_revision: Some(Revision(0)), idempotency_key: Some("surface-intent-key-1".into()),
+        };
+        let response = runtime.handle_service_request(request);
+        assert_eq!(response.status, RpcStatus::Accepted);
+        assert_eq!(response.result.unwrap()["value"]["diagnostics"], "expanded");
+        assert_eq!(runtime.surface.revision, Revision(1));
     }
 
     #[test]

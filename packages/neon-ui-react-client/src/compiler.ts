@@ -1,5 +1,5 @@
 import type React from "react";
-import type { AssetRef, Bounds, JsonValue, NodeKey, UiFragment, UiIntent, UiIntentSpec, UiLayout, UiNode, UiStyle, UiTransition } from "./protocol.js";
+import type { AssetRef, Bounds, JsonValue, NodeKey, UiFragment, UiIntent, UiIntentSpec, UiLayout, UiNode, UiStyle, UiSurfaceEvent, UiTransition } from "./protocol.js";
 
 type HostType = "neon-surface" | "neon-panel" | "neon-label" | "neon-button" | "neon-image";
 type HostProps = Record<string, unknown>;
@@ -63,19 +63,21 @@ function compileChildren(children: Child[], surfaceId: string, parentPath: strin
     const path = `${parentPath}/${key}`;
     const kind = hostKind(child.type);
     const intentSpec = child.props.intent as UiIntentSpec | undefined;
-    const intent = intentSpec ? toWireIntent(intentSpec) : undefined;
+    const surfaceEvent = child.props.event as UiSurfaceEvent | undefined;
+    if (intentSpec && surfaceEvent) throw new Error(`${path} cannot declare both intent and event`);
+    if (surfaceEvent && kind !== "button") throw new Error(`${path}.event is only valid on Button`);
+    const intent = surfaceEvent ? toSurfaceEventIntent(surfaceEvent) : intentSpec ? toWireIntent(intentSpec) : undefined;
+    const id = nodeId(surfaceId, path);
     if (intent) {
       validateIntent(intent);
-      if (!effects.some((effect) => effect.kind === "semantic_intent" && equalJson(effect.intent, intent))) {
-        effects.push({ kind: "semantic_intent", intent });
-      }
+      effects.push({ kind: "bound_semantic_intent", node_id: id, intent });
     }
     const asset = child.props.asset as AssetRef | undefined;
     if (kind === "image" && !asset) throw new Error(`Image ${key} requires asset`);
     const text = textProp(child);
     const textKey = typeof child.props.textKey === "string" ? child.props.textKey : null;
     nodes.push({
-      node_id: nodeId(surfaceId, path), kind, bounds: requiredBounds(child.props.bounds, `${path}.bounds`),
+      node_id: id, kind, bounds: requiredBounds(child.props.bounds, `${path}.bounds`),
       layout: (child.props.layout as UiLayout | undefined) ?? null,
       visible: boolProp(child.props.visible, true), enabled: boolProp(child.props.enabled, true),
       text_key: textKey, text: textKey ? { kind: "key", key: textKey, arguments: (child.props.textArguments as JsonValue | undefined) ?? {} } : text,
@@ -112,6 +114,12 @@ function boolProp(value: unknown, fallback: boolean): boolean { return value ===
 function styleProp(style: unknown): UiStyle { return (style as UiStyle | undefined) ?? {}; }
 function toWireIntent(spec: UiIntentSpec): UiIntent { validateIntent(spec); return { kind: "invoke", action: spec.action, params: spec.params }; }
 function validateIntent(intent: UiIntentSpec) { if (!intent || typeof intent.action !== "string" || !intent.action.trim()) throw new Error("intent.action is required"); }
+function toSurfaceEventIntent(event: UiSurfaceEvent): UiIntent {
+  if (!event || typeof event !== "object" || typeof event.type !== "string") throw new Error("Button.event is invalid");
+  if (event.type === "DIAGNOSTICS_TOGGLE") return { kind: "invoke", action: "ui.surface.event", params: { event } };
+  if (event.type === "INSPECTOR_TAB_SELECT" && ["overview", "materials", "history"].includes(event.tab)) return { kind: "invoke", action: "ui.surface.event", params: { event } };
+  throw new Error("Button.event is invalid");
+}
 function transitionProp(value: unknown): UiNode["enter_transition"] {
   if (!value) return null;
   const transition = value as UiTransition;

@@ -8,7 +8,8 @@
     "test": "npm run build && node --test test/*.test.mjs",
     "demo:terrain": "npm run build && node dist/demo-terrain.js",
     "demo:workbench": "npm run build && node dist/demo-workbench.js",
-    "demo:animation": "npm run build && node dist/demo-animation.js"
+    "demo:animation": "npm run build && node dist/demo-animation.js",
+    "demo:nested-animation": "npm run build && node dist/demo-nested-animation.js"
   },
   "peerDependencies": {
     "react": "^19.0.0"
