@@ -249,7 +249,11 @@ impl HitReadbackRing {
         let slot = self.slots.get_mut(index)?;
         match slot.completion.as_ref()?.try_recv() {
             Ok(Ok(())) => {
-                let bytes = slot.buffer.slice(..).get_mapped_range();
+                let bytes = slot
+                    .buffer
+                    .slice(..)
+                    .get_mapped_range()
+                    .expect("mapped readback range");
                 let hit_id = u32::from_ne_bytes(bytes[..4].try_into().expect("readback slot has four bytes"));
                 drop(bytes); slot.buffer.unmap(); slot.completion = None; Some(Ok(hit_id))
             }
@@ -357,8 +361,8 @@ impl UiWgpuRenderer {
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("neon3-ui-panel-layout"),
-            bind_group_layouts: &[&view_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&view_layout)],
+            immediate_size: 0,
         });
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("neon3-ui-panel-pipeline"),
@@ -366,7 +370,7 @@ impl UiWgpuRenderer {
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("vs_main"),
-                buffers: &[wgpu::VertexBufferLayout {
+                buffers: &[Some(wgpu::VertexBufferLayout {
                     array_stride: std::mem::size_of::<UiInstance>() as u64,
                     step_mode: wgpu::VertexStepMode::Instance,
                     attributes: &[
@@ -392,7 +396,7 @@ impl UiWgpuRenderer {
                         },
                         wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 64, shader_location: 4 },
                     ],
-                }],
+                })],
                 compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
@@ -408,7 +412,7 @@ impl UiWgpuRenderer {
             primitive: wgpu::PrimitiveState::default(),
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
         let hit_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("neon3-ui-hit-id-shader"), source: wgpu::ShaderSource::Wgsl(HIT_SHADER.into()) });
@@ -417,7 +421,7 @@ impl UiWgpuRenderer {
             label: Some("neon3-ui-hit-id-pipeline"), layout: Some(&layout),
             vertex: wgpu::VertexState {
                 module: &hit_shader, entry_point: Some("vs_main"),
-                buffers: &[wgpu::VertexBufferLayout {
+                buffers: &[Some(wgpu::VertexBufferLayout {
                     array_stride: std::mem::size_of::<UiHitInstance>() as u64,
                     step_mode: wgpu::VertexStepMode::Instance,
                     attributes: &[
@@ -426,7 +430,7 @@ impl UiWgpuRenderer {
                         wgpu::VertexAttribute { format: wgpu::VertexFormat::Uint32, offset: 32, shader_location: 2 },
                         wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 48, shader_location: 3 },
                     ],
-                }],
+                })],
                 compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
@@ -435,27 +439,26 @@ impl UiWgpuRenderer {
                 compilation_options: Default::default(),
             }),
             primitive: wgpu::PrimitiveState::default(), depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(), multiview: None, cache: None,
+            multisample: wgpu::MultisampleState::default(), multiview_mask: None, cache: None,
         });
         let hit_clear_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("neon3-ui-hit-clear-pipeline"), layout: None,
             vertex: wgpu::VertexState { module: &hit_clear_shader, entry_point: Some("vs_main"), buffers: &[], compilation_options: Default::default() },
             fragment: Some(wgpu::FragmentState { module: &hit_clear_shader, entry_point: Some("fs_main"), targets: &[Some(wgpu::ColorTargetState { format: wgpu::TextureFormat::R32Uint, blend: None, write_mask: wgpu::ColorWrites::ALL })], compilation_options: Default::default() }),
-            primitive: wgpu::PrimitiveState::default(), depth_stencil: None, multisample: wgpu::MultisampleState::default(), multiview: None, cache: None,
+            primitive: wgpu::PrimitiveState::default(), depth_stencil: None, multisample: wgpu::MultisampleState::default(), multiview_mask: None, cache: None,
         });
         let image_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("neon3-ui-image-shader"), source: wgpu::ShaderSource::Wgsl(IMAGE_SHADER.into()) });
         let image_texture_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("neon3-ui-image-texture-layout"), entries: &[
             wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Texture { multisampled: false, view_dimension: wgpu::TextureViewDimension::D2, sample_type: wgpu::TextureSampleType::Float { filterable: true } }, count: None },
             wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None },
         ] });
-        let image_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("neon3-ui-image-layout"), bind_group_layouts: &[&view_layout, &image_texture_layout], push_constant_ranges: &[] });
+        let image_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("neon3-ui-image-layout"), bind_group_layouts: &[Some(&view_layout), Some(&image_texture_layout)], immediate_size: 0 });
         let image_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("neon3-ui-image-pipeline"), layout: Some(&image_layout),
-            vertex: wgpu::VertexState { module: &image_shader, entry_point: Some("vs_main"), buffers: &[wgpu::VertexBufferLayout { array_stride: std::mem::size_of::<UiImageInstance>() as u64, step_mode: wgpu::VertexStepMode::Instance, attributes: &[
+            vertex: wgpu::VertexState { module: &image_shader, entry_point: Some("vs_main"), buffers: &[Some(wgpu::VertexBufferLayout { array_stride: std::mem::size_of::<UiImageInstance>() as u64, step_mode: wgpu::VertexStepMode::Instance, attributes: &[
                 wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 0, shader_location: 0 }, wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 16, shader_location: 1 }, wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 32, shader_location: 2 },
-            ] }], compilation_options: Default::default() },
-            fragment: Some(wgpu::FragmentState { module: &image_shader, entry_point: Some("fs_main"), targets: &[Some(wgpu::ColorTargetState { format, blend: Some(wgpu::BlendState::ALPHA_BLENDING), write_mask: wgpu::ColorWrites::ALL })], compilation_options: Default::default() }),
-            primitive: wgpu::PrimitiveState::default(), depth_stencil: None, multisample: wgpu::MultisampleState::default(), multiview: None, cache: None,
+            ] })], compilation_options: Default::default() },
+            fragment: Some(wgpu::FragmentState { module: &image_shader, entry_point: Some("fs_main"), targets: &[Some(wgpu::ColorTargetState { format, blend: Some(wgpu::BlendState::ALPHA_BLENDING), write_mask: wgpu::ColorWrites::ALL })], compilation_options: Default::default() }),            primitive: wgpu::PrimitiveState::default(), depth_stencil: None, multisample: wgpu::MultisampleState::default(), multiview_mask: None, cache: None,
         });
         let text_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("neon3-ui-text-shader"), source: wgpu::ShaderSource::Wgsl(TEXT_SHADER.into()) });
         let text_texture_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -464,11 +467,11 @@ impl UiWgpuRenderer {
                 wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None },
             ]
         });
-        let text_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("neon3-ui-text-layout"), bind_group_layouts: &[&view_layout, &text_texture_layout], push_constant_ranges: &[] });
+        let text_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("neon3-ui-text-layout"), bind_group_layouts: &[Some(&view_layout), Some(&text_texture_layout)], immediate_size: 0 });
         let text_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("neon3-ui-text-pipeline"), layout: Some(&text_layout),
-            vertex: wgpu::VertexState { module: &text_shader, entry_point: Some("vs_main"), buffers: &[wgpu::VertexBufferLayout { array_stride: std::mem::size_of::<UiTextInstance>() as u64, step_mode: wgpu::VertexStepMode::Instance, attributes: &[wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 0, shader_location: 0 }, wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 16, shader_location: 1 }, wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 32, shader_location: 2 }, wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 48, shader_location: 3 }] }], compilation_options: Default::default() },
-            fragment: Some(wgpu::FragmentState { module: &text_shader, entry_point: Some("fs_main"), targets: &[Some(wgpu::ColorTargetState { format, blend: Some(wgpu::BlendState::ALPHA_BLENDING), write_mask: wgpu::ColorWrites::ALL })], compilation_options: Default::default() }), primitive: wgpu::PrimitiveState::default(), depth_stencil: None, multisample: wgpu::MultisampleState::default(), multiview: None, cache: None,
+            vertex: wgpu::VertexState { module: &text_shader, entry_point: Some("vs_main"), buffers: &[Some(wgpu::VertexBufferLayout { array_stride: std::mem::size_of::<UiTextInstance>() as u64, step_mode: wgpu::VertexStepMode::Instance, attributes: &[wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 0, shader_location: 0 }, wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 16, shader_location: 1 }, wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 32, shader_location: 2 }, wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 48, shader_location: 3 }] })], compilation_options: Default::default() },
+            fragment: Some(wgpu::FragmentState { module: &text_shader, entry_point: Some("fs_main"), targets: &[Some(wgpu::ColorTargetState { format, blend: Some(wgpu::BlendState::ALPHA_BLENDING), write_mask: wgpu::ColorWrites::ALL })], compilation_options: Default::default() }), primitive: wgpu::PrimitiveState::default(), depth_stencil: None, multisample: wgpu::MultisampleState::default(), multiview_mask: None, cache: None,
         });
         Self {
             pipeline,

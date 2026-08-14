@@ -485,14 +485,7 @@ pub fn timefreq(ctx: &mut GpuCtx, t: u32, dim: u32) -> Buf {
         table_count: 0,
     });
     let yb = &y.buffer;
-    // The shared cond layout has 4 storage bindings; the timefreq entry only
-    // touches `out`, the other three are satisfied with dummy bindings.
-    ctx.run(
-        "timefreq",
-        &uniform,
-        &[yb, yb, yb, yb],
-        [wgs(dim as u64), 1, 1],
-    );
+    ctx.run("timefreq", &uniform, &[yb], [wgs(dim as u64), 1, 1]);
     y
 }
 

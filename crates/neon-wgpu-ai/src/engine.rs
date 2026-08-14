@@ -85,6 +85,16 @@ impl AiEngine {
         &mut self.ctx
     }
 
+    /// Read-only access to the loaded model (diagnostic path).
+    pub fn model(&self) -> &Model {
+        self.model.as_ref().expect("no model loaded")
+    }
+
+    /// Diagnostic access to the model plus the compute context.
+    pub fn model_and_ctx(&mut self) -> (&Model, &mut GpuCtx) {
+        (self.model.as_ref().expect("no model loaded"), &mut self.ctx)
+    }
+
     pub fn has_model(&self) -> bool {
         self.model.is_some()
     }

@@ -18,6 +18,7 @@ pub const SHADER_MATMUL: &str = include_str!("shaders/matmul.wgsl");
 pub const SHADER_SOFTMAX: &str = include_str!("shaders/softmax.wgsl");
 pub const SHADER_RANDN: &str = include_str!("shaders/randn.wgsl");
 pub const SHADER_COND: &str = include_str!("shaders/cond.wgsl");
+pub const SHADER_TIMEFREQ: &str = include_str!("shaders/timefreq.wgsl");
 pub const SHADER_TRANSPOSE: &str = include_str!("shaders/transpose.wgsl");
 
 /// Scratch arena; buffers returned by `acquire` are returned to the pool when
@@ -169,8 +170,8 @@ impl GpuCtx {
                     .device
                     .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                         label: None,
-                        bind_group_layouts: &[&layout],
-                        push_constant_ranges: &[],
+                        bind_group_layouts: &[Some(&layout)],
+                        immediate_size: 0,
                     });
                 let module = self
                     .device
@@ -215,7 +216,7 @@ impl GpuCtx {
         add!("matmul", SHADER_MATMUL, "main", &[3], 4);
         add!("softmax", SHADER_SOFTMAX, "main", &[1], 2);
         add!("randn", SHADER_RANDN, "main", &[1], 2);
-        add!("timefreq", SHADER_COND, "main_timefreq", &[4], 5);
+        add!("timefreq", SHADER_TIMEFREQ, "main_timefreq", &[1], 2);
         add!("gather", SHADER_COND, "main_gather", &[4], 5);
     }
 
@@ -260,7 +261,7 @@ impl GpuCtx {
             entries: &entries,
         });
         let started = std::time::Instant::now();
-        self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
@@ -274,13 +275,12 @@ impl GpuCtx {
             pass.dispatch_workgroups(workgroups[0], workgroups[1], workgroups[2]);
         }
         self.queue.submit(Some(encoder.finish()));
-        self.device.poll(wgpu::Maintain::Wait);
-        if let Some(pending) = self.device.pop_error_scope()
-            && let Ok(Some(message)) = pollster::block_on(pending)
-        {
+        self.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("device poll");
+        if let Some(message) = pollster::block_on(scope.pop()) {
             panic!("compute pass '{key}' failed: {message}");
         }
-        self.queue.submit(Some(encoder.finish()));
         self.elapsed_ms += started.elapsed().as_secs_f64() * 1000.0;
     }
 
@@ -324,11 +324,16 @@ impl GpuCtx {
         slice.map_async(wgpu::MapMode::Read, move |result| {
             let _ = tx.send(result);
         });
-        self.device.poll(wgpu::Maintain::Wait);
+        self.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .map_err(|error| AiError::Gpu(format!("device poll failed: {error}")))?;
         rx.recv_timeout(std::time::Duration::from_secs(30))
             .map_err(|_| AiError::Gpu("readback timed out".into()))?
             .map_err(|error| AiError::Gpu(format!("readback map failed: {error}")))?;
-        let data = slice.get_mapped_range().to_vec();
+        let data = slice
+            .get_mapped_range()
+            .map_err(|error| AiError::Gpu(format!("mapped range failed: {error}")))?
+            .to_vec();
         staging.unmap();
         Ok(data)
     }

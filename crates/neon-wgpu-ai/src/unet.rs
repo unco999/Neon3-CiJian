@@ -79,6 +79,26 @@ pub struct UnetExecutor<'a> {
     model: &'a Model,
 }
 
+/// Temporary NaN checkpoint (diagnostic only; gated by NEON_AI_DIAG=1).
+fn diag_check(ctx: &mut GpuCtx, buf: &wgpu::Buffer, n: usize, tag: &str) {
+    if std::env::var("NEON_AI_DIAG").is_err() {
+        return;
+    }
+    let data = ctx.readback_f32(buf, n).expect("diag readback");
+    let (mut nan, mut inf, mut lo, mut hi) = (0usize, 0usize, f32::INFINITY, f32::NEG_INFINITY);
+    for v in data {
+        if v.is_nan() {
+            nan += 1;
+        } else if v.is_infinite() {
+            inf += 1;
+        } else {
+            lo = lo.min(v);
+            hi = hi.max(v);
+        }
+    }
+    eprintln!("DIAG {tag}: nan={nan} inf={inf} min={lo} max={hi}");
+}
+
 impl<'a> UnetExecutor<'a> {
     pub fn new(ctx: &'a mut GpuCtx, model: &'a Model) -> Self {
         Self { ctx, model }

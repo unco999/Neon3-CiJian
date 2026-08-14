@@ -7,9 +7,7 @@ description = "GPU inference kernels and model executors for Neon3. Compute only
 
 [dependencies]
 bytemuck.workspace = true
+pollster.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 wgpu.workspace = true
-
-[dev-dependencies]
-pollster.workspace = true

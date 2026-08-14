@@ -250,7 +250,7 @@ impl WindowedRuntime {
         let was_animation_active = self.animation_active;
         let frame_started = Instant::now();
         if gpu.pending_hit_slot.is_some() {
-            gpu.device.poll(wgpu::Maintain::Poll);
+            let _ = gpu.device.poll(wgpu::PollType::Poll);
         }
         if let Some((slot, sequence)) = gpu.pending_hit_slot
             && let Some(result) = gpu.ui.try_complete_hit_readback(slot)
@@ -265,13 +265,18 @@ impl WindowedRuntime {
             }
         }
         let surface_texture = match gpu.surface.get_current_texture() {
-            Ok(texture) => texture,
-            Err(wgpu::SurfaceError::Timeout) => return Ok(()),
-            Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => {
+            wgpu::CurrentSurfaceTexture::Success(texture)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(texture) => texture,
+            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
+                return Ok(());
+            }
+            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
                 gpu.surface.configure(&gpu.device, &gpu.config);
                 return Ok(());
             }
-            Err(error) => return Err(format!("acquire surface texture: {error}")),
+            wgpu::CurrentSurfaceTexture::Validation => {
+                return Err("acquire surface texture: validation error".to_owned());
+            }
         };
         let acquired_at = Instant::now();
         let view = surface_texture
@@ -287,6 +292,7 @@ impl WindowedRuntime {
                 label: Some("neon3-final-clear-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
+                    depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
@@ -301,6 +307,7 @@ impl WindowedRuntime {
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
             gpu.ui.draw(
                 &gpu.device,
@@ -318,10 +325,12 @@ impl WindowedRuntime {
                 label: Some("neon3-final-ui-hit-id-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &gpu.hit_target_view,
+                    depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
                 })],
                 depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None,
+                multiview_mask: None,
             });
             gpu.ui.draw_hit_id(&gpu.device, &gpu.queue, &mut pass, &self.fragments, [gpu.config.width, gpu.config.height], gpu.started_at.elapsed().as_secs_f32());
             gpu.hit_target_dirty = false;
@@ -336,7 +345,7 @@ impl WindowedRuntime {
             gpu.input.request_sample(HitSampleRequest { pointer_id: 0, sequence: gpu.next_input_sequence, composition_revision: Revision(0), target_generation: gpu.hit_target_generation });
             if gpu.ui.begin_hit_readback_mapping(slot) { gpu.pending_hit_slot = Some((slot, gpu.next_input_sequence)); }
         }
-        surface_texture.present();
+        gpu.queue.present(surface_texture);
         let now = Instant::now();
         let frame_gap_ms = now.duration_since(gpu.last_present).as_secs_f32() * 1000.0;
         gpu.longest_frame_gap_ms = gpu.longest_frame_gap_ms.max(frame_gap_ms);
@@ -402,16 +411,18 @@ impl WindowGpu {
             power_preference: wgpu::PowerPreference::HighPerformance,
             compatible_surface: Some(&surface),
             force_fallback_adapter: false,
+            apply_limit_buckets: false,
         }))
-        .ok_or_else(|| "request adapter: no compatible adapter was found".to_owned())?;
+        .map_err(|error| format!("request adapter: {error}"))?;
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
                 label: Some("neon3-wgpu-runtime-device"),
                 required_features: wgpu::Features::empty(),
                 required_limits: wgpu::Limits::default(),
+                experimental_features: wgpu::ExperimentalFeatures::default(),
                 memory_hints: wgpu::MemoryHints::Performance,
+                trace: wgpu::Trace::Off,
             },
-            None,
         ))
         .map_err(|error| format!("request device: {error}"))?;
         let capabilities = surface.get_capabilities(&adapter);
@@ -439,6 +450,7 @@ impl WindowGpu {
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
+            color_space: wgpu::SurfaceColorSpace::Auto,
             width: size.width.max(1),
             height: size.height.max(1),
             present_mode,
