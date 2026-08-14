@@ -161,6 +161,23 @@ impl RpcServer {
         let response = handler(request);
         write_json_frame(&mut stream, &response, self.max_frame_size)
     }
+
+    /// Serves one request per loopback connection until the handler returns false.
+    /// The handler owns shutdown policy; transport never infers it from a method name.
+    pub fn serve_until<F>(&self, mut handler: F) -> Result<(), TransportError>
+    where
+        F: FnMut(RpcRequest) -> (RpcResponse, bool),
+    {
+        loop {
+            let (mut stream, _) = self.listener.accept().map_err(map_io_error)?;
+            let request = read_json_frame(&mut stream, self.max_frame_size)?;
+            let (response, keep_serving) = handler(request);
+            write_json_frame(&mut stream, &response, self.max_frame_size)?;
+            if !keep_serving {
+                return Ok(());
+            }
+        }
+    }
 }
 
 fn ensure_loopback(endpoint: SocketAddr) -> Result<(), TransportError> {
@@ -324,6 +341,25 @@ mod tests {
         let ids = [first.join().unwrap(), second.join().unwrap()];
         assert!(ids.contains(&"first".to_owned()));
         assert!(ids.contains(&"second".to_owned()));
+        thread.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn persistent_server_stops_only_after_explicit_shutdown() {
+        let server = RpcServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let endpoint = server.local_addr().unwrap();
+        let thread = thread::spawn(move || {
+            server.serve_until(|request| {
+                let shutdown = request.method == "service.shutdown";
+                (accepted(request), !shutdown)
+            })
+        });
+        for method in ["service.health", "service.shutdown"] {
+            let mut client = RpcClient::connect(endpoint).unwrap();
+            let mut request = request(method);
+            request.method = method.into();
+            assert_eq!(client.call(&request).unwrap().status, RpcStatus::Accepted);
+        }
         thread.join().unwrap().unwrap();
     }
 

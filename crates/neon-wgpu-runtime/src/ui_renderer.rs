@@ -12,6 +12,12 @@ const SHADER: &str = r#"
 struct View { viewport: vec2<f32>, _pad: vec2<f32> }
 @group(0) @binding(0) var<uniform> view: View;
 
+fn srgb_to_linear(value: vec3<f32>) -> vec3<f32> {
+    let low = value / 12.92;
+    let high = pow((value + vec3<f32>(0.055)) / 1.055, vec3<f32>(2.4));
+    return select(low, high, value > vec3<f32>(0.04045));
+}
+
 struct VsIn {
     @location(0) rect: vec4<f32>,
     @location(1) fill: vec4<f32>,
@@ -61,7 +67,7 @@ fn fs_main(input: VsOut) -> @location(0) vec4<f32> {
     let shape_alpha = 1.0 - smoothstep(0.0, 1.0, corner_distance);
     let border_alpha = 1.0 - smoothstep(-input.params.x - 1.0, -input.params.x + 1.0, corner_distance);
     let color = mix(input.fill, input.border, border_alpha);
-    return vec4<f32>(color.rgb, color.a * input.params.z * shape_alpha);
+    return vec4<f32>(srgb_to_linear(color.rgb), color.a * input.params.z * shape_alpha);
 }
 "#;
 
@@ -95,6 +101,9 @@ struct View { viewport: vec2<f32>, _pad: vec2<f32> }
 @group(0) @binding(0) var<uniform> view: View;
 @group(1) @binding(0) var image_texture: texture_2d<f32>;
 @group(1) @binding(1) var image_sampler: sampler;
+fn srgb_to_linear(value: vec3<f32>) -> vec3<f32> {
+ let low = value / 12.92; let high = pow((value + vec3<f32>(0.055)) / 1.055, vec3<f32>(2.4)); return select(low, high, value > vec3<f32>(0.04045));
+}
 struct VsIn { @location(0) rect: vec4<f32>, @location(1) tint: vec4<f32>, @location(2) clip: vec4<f32> }
 struct VsOut { @builtin(position) position: vec4<f32>, @location(0) local: vec2<f32>, @location(1) tint: vec4<f32>, @location(2) clip: vec4<f32>, @location(3) pixel: vec2<f32> }
 @vertex fn vs_main(@builtin(vertex_index) index: u32, input: VsIn) -> VsOut {
@@ -104,7 +113,8 @@ struct VsOut { @builtin(position) position: vec4<f32>, @location(0) local: vec2<
 }
 @fragment fn fs_main(input: VsOut) -> @location(0) vec4<f32> {
  if (input.pixel.x < input.clip.x || input.pixel.y < input.clip.y || input.pixel.x > input.clip.z || input.pixel.y > input.clip.w) { discard; }
- return textureSample(image_texture, image_sampler, input.local) * input.tint;
+  let sample = textureSample(image_texture, image_sampler, input.local);
+  return vec4<f32>(sample.rgb * srgb_to_linear(input.tint.rgb), sample.a * input.tint.a);
 }
 "#;
 
@@ -113,6 +123,9 @@ struct View { viewport: vec2<f32>, _pad: vec2<f32> }
 @group(0) @binding(0) var<uniform> view: View;
 @group(1) @binding(0) var glyph_atlas: texture_2d<f32>;
 @group(1) @binding(1) var glyph_sampler: sampler;
+fn srgb_to_linear(value: vec3<f32>) -> vec3<f32> {
+ let low = value / 12.92; let high = pow((value + vec3<f32>(0.055)) / 1.055, vec3<f32>(2.4)); return select(low, high, value > vec3<f32>(0.04045));
+}
 struct VsIn { @location(0) rect: vec4<f32>, @location(1) color: vec4<f32>, @location(2) clip: vec4<f32>, @location(3) uv: vec4<f32> }
 struct VsOut { @builtin(position) position: vec4<f32>, @location(0) local: vec2<f32>, @location(1) color: vec4<f32>, @location(2) clip: vec4<f32>, @location(3) pixel: vec2<f32>, @location(4) uv: vec2<f32> }
 @vertex fn vs_main(@builtin(vertex_index) index: u32, input: VsIn) -> VsOut {
@@ -124,7 +137,7 @@ struct VsOut { @builtin(position) position: vec4<f32>, @location(0) local: vec2<
  if (input.pixel.x < input.clip.x || input.pixel.y < input.clip.y || input.pixel.x > input.clip.z || input.pixel.y > input.clip.w) { discard; }
  let coverage = textureSample(glyph_atlas, glyph_sampler, input.uv).a;
  if (coverage <= 0.001) { discard; }
- return vec4<f32>(input.color.rgb, input.color.a * coverage);
+  return vec4<f32>(srgb_to_linear(input.color.rgb), input.color.a * coverage);
 }
 "#;
 
@@ -164,6 +177,8 @@ struct ResidentFont {
     _atlas: wgpu::Texture,
     bind_group: wgpu::BindGroup,
     glyphs: HashMap<char, AtlasGlyph>,
+    ascent: f32,
+    line_height: f32,
     next_x: u32,
     next_y: u32,
     row_height: u32,
@@ -258,12 +273,25 @@ struct ActiveTransition {
     transition: UiTransition,
 }
 
+struct PlannedNode {
+    id: String,
+    target: UiVisual,
+    transition: Option<UiTransition>,
+    instance_index: Option<usize>,
+}
+
 pub struct UiWgpuRenderer {
     pipeline: wgpu::RenderPipeline,
     view_buffer: wgpu::Buffer,
     view_bind_group: wgpu::BindGroup,
     instance_buffer: wgpu::Buffer,
     instance_capacity: usize,
+    plan_revisions: HashMap<neon_ui_schema::UiFragmentId, neon_protocol::Revision>,
+    plan: Vec<PlannedNode>,
+    sampled: Vec<UiVisual>,
+    instances: Vec<UiInstance>,
+    dirty_instances: Vec<usize>,
+    viewport_size: [u32; 2],
     current: HashMap<String, UiVisual>,
     active: HashMap<String, ActiveTransition>,
     pointer_position: Option<[f32; 2]>,
@@ -283,6 +311,8 @@ pub struct UiWgpuRenderer {
     text_capacity: usize,
     _text_texture_layout: wgpu::BindGroupLayout,
     resident_font: Option<ResidentFont>,
+    last_panel_instance_count: usize,
+    pointer_visual_dirty: bool,
 }
 
 impl UiWgpuRenderer {
@@ -439,6 +469,12 @@ impl UiWgpuRenderer {
             view_bind_group,
             instance_buffer: create_instance_buffer(device, 1),
             instance_capacity: 1,
+            plan_revisions: HashMap::new(),
+            plan: Vec::new(),
+            sampled: Vec::new(),
+            instances: Vec::new(),
+            dirty_instances: Vec::new(),
+            viewport_size: [0, 0],
             current: HashMap::new(),
             active: HashMap::new(),
             pointer_position: None,
@@ -458,16 +494,17 @@ impl UiWgpuRenderer {
             text_capacity: 1,
             _text_texture_layout: text_texture_layout,
             resident_font: None,
+            last_panel_instance_count: 0,
+            pointer_visual_dirty: false,
         }
     }
 
-    pub(crate) fn draw_hit_id<'a>(&'a mut self, device: &wgpu::Device, queue: &wgpu::Queue, pass: &mut wgpu::RenderPass<'a>, fragments: &HashMap<neon_ui_schema::UiFragmentId, UiFragment>, viewport_size: [u32; 2], time_seconds: f32) {
+    pub(crate) fn draw_hit_id<'a>(&'a mut self, device: &wgpu::Device, queue: &wgpu::Queue, pass: &mut wgpu::RenderPass<'a>, fragments: &HashMap<neon_ui_schema::UiFragmentId, UiFragment>, viewport_size: [u32; 2], _time_seconds: f32) {
         pass.set_pipeline(&self.hit_clear_pipeline);
         pass.draw(0..3, 0..1);
-        let mut nodes = flatten_fragments(fragments); nodes.sort_by(|left, right| left.0.cmp(&right.0));
-        let instances = nodes.into_iter().enumerate().filter_map(|(index, (_, visual, transition))| {
-            let sampled = self.sample("hit", visual, transition, time_seconds);
-            (sampled.kind == UiNodeKind::Button && sampled.enabled && sampled.style.opacity > 0.0).then_some(UiHitInstance { rect: [sampled.bounds.x, sampled.bounds.y, sampled.bounds.width, sampled.bounds.height], params: [sampled.style.border_width, sampled.style.corner_radius, sampled.style.opacity, 0.0], hit_id: index as u32 + 1, _pad: [0; 3], clip: [sampled.clip.x, sampled.clip.y, sampled.clip.x + sampled.clip.width, sampled.clip.y + sampled.clip.height] })
+        let nodes = flatten_fragments(fragments);
+        let instances = nodes.into_iter().enumerate().filter_map(|(index, (_, visual, _))| {
+            (visual.kind == UiNodeKind::Button && visual.enabled && visual.style.opacity > 0.0).then_some(UiHitInstance { rect: [visual.bounds.x, visual.bounds.y, visual.bounds.width, visual.bounds.height], params: [visual.style.border_width, visual.style.corner_radius, visual.style.opacity, 0.0], hit_id: index as u32 + 1, _pad: [0; 3], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height] })
         }).collect::<Vec<_>>();
         if instances.is_empty() { return; }
         if instances.len() > self.hit_capacity { self.hit_capacity = instances.len().next_power_of_two(); self.hit_buffer = create_hit_buffer(device, self.hit_capacity); }
@@ -488,10 +525,21 @@ impl UiWgpuRenderer {
 
     pub fn set_pointer_position(&mut self, position: [f32; 2]) {
         self.pointer_position = Some(position);
+        self.pointer_visual_dirty = true;
     }
 
     pub fn press_hovered(&mut self, time_seconds: f32) {
         self.pressed_until_seconds = time_seconds + 0.14;
+        self.pointer_visual_dirty = true;
+    }
+
+    pub(crate) fn has_active_animation(&mut self, time_seconds: f32) -> bool {
+        self.active.retain(|_, active| {
+            let end = active.started_at_seconds
+                + (active.transition.delay_ms + active.transition.duration_ms) as f32 / 1000.0;
+            time_seconds < end
+        });
+        !self.active.is_empty() || time_seconds < self.pressed_until_seconds
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -510,9 +558,11 @@ impl UiWgpuRenderer {
         Ok(())
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn preload_font(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, content: &AssetBytes) -> Result<(), &'static str> {
         if content.asset.kind != "font" || content.bytes.is_empty() { return Err("invalid_font_content"); }
         let font = fontdue::Font::from_bytes(content.bytes.as_slice(), fontdue::FontSettings::default()).map_err(|_| "invalid_font_content")?;
+        let line_metrics = font.horizontal_line_metrics(FONT_RASTER_SIZE).ok_or("invalid_font_metrics")?;
         let atlas = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("neon3-ui-font-atlas"), size: wgpu::Extent3d { width: FONT_ATLAS_SIZE, height: FONT_ATLAS_SIZE, depth_or_array_layers: 1 },
             mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: wgpu::TextureFormat::Rgba8Unorm,
@@ -524,7 +574,17 @@ impl UiWgpuRenderer {
             wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
             wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&sampler) },
         ] });
-        self.resident_font = Some(ResidentFont { font, _atlas: atlas, bind_group, glyphs: HashMap::new(), next_x: 1, next_y: 1, row_height: 0 });
+        self.resident_font = Some(ResidentFont {
+            font,
+            _atlas: atlas,
+            bind_group,
+            glyphs: HashMap::new(),
+            ascent: line_metrics.ascent,
+            line_height: line_metrics.new_line_size,
+            next_x: 1,
+            next_y: 1,
+            row_height: 0,
+        });
         let font = self.resident_font.as_mut().unwrap();
         for ch in ' '..='~' { let _ = ensure_glyph(device, queue, font, ch); }
         Ok(())
@@ -539,42 +599,55 @@ impl UiWgpuRenderer {
         viewport_size: [u32; 2],
         time_seconds: f32,
     ) {
-        let mut nodes = flatten_fragments(fragments);
-        nodes.sort_by(|left, right| left.0.cmp(&right.0));
-        let live: HashSet<_> = nodes.iter().map(|(id, _, _)| id.clone()).collect();
-        self.current.retain(|id, _| live.contains(id));
-        self.active.retain(|id, _| live.contains(id));
-
-        let visuals = nodes
-            .into_iter()
-            .map(|(id, visual, transition)| {
-                let sampled = self.sample(id.as_str(), visual, transition, time_seconds);
-                (id, sampled)
-            })
-            .collect::<Vec<_>>();
-        let instances = visuals
-            .iter()
-            .filter(|(_, visual)| visual.kind != UiNodeKind::Image)
-            .map(|(_, visual)| self.instance(visual, time_seconds))
-            .collect::<Vec<_>>();
-        if instances.len() > self.instance_capacity {
-            self.instance_capacity = instances.len().next_power_of_two();
-            self.instance_buffer = create_instance_buffer(device, self.instance_capacity);
+        let plan_changed = self.refresh_plan(fragments);
+        let pointer_active = self.pointer_visual_dirty || time_seconds < self.pressed_until_seconds;
+        self.dirty_instances.clear();
+        for index in 0..self.plan.len() {
+            let node = &self.plan[index];
+            let should_sample = plan_changed || pointer_active || self.active.contains_key(&node.id);
+            if !should_sample {
+                continue;
+            }
+            let sampled = Self::sample(
+                &mut self.current,
+                &mut self.active,
+                &node.id,
+                &node.target,
+                node.transition.as_ref(),
+                time_seconds,
+            );
+            self.sampled[index] = sampled;
+            if let Some(instance_index) = node.instance_index {
+                self.instances[instance_index] = self.instance(&self.sampled[index], time_seconds);
+                self.dirty_instances.push(instance_index);
+            }
         }
-        queue.write_buffer(&self.instance_buffer, 0, bytemuck::cast_slice(&instances));
-        let view = UiView {
-            viewport: [
-                viewport_size[0].max(1) as f32,
-                viewport_size[1].max(1) as f32,
-            ],
-            _pad: [0.0; 2],
-        };
-        queue.write_buffer(&self.view_buffer, 0, bytemuck::bytes_of(&view));
+        self.pointer_visual_dirty = false;
+        self.last_panel_instance_count = self.instances.len();
+        let mut instance_buffer_recreated = false;
+        if self.instances.len() > self.instance_capacity {
+            self.instance_capacity = self.instances.len().next_power_of_two();
+            self.instance_buffer = create_instance_buffer(device, self.instance_capacity);
+            instance_buffer_recreated = true;
+        }
+        if plan_changed || instance_buffer_recreated {
+            queue.write_buffer(&self.instance_buffer, 0, bytemuck::cast_slice(&self.instances));
+        } else {
+            for &index in &self.dirty_instances {
+                let offset = (index * std::mem::size_of::<UiInstance>()) as u64;
+                queue.write_buffer(&self.instance_buffer, offset, bytemuck::bytes_of(&self.instances[index]));
+            }
+        }
+        let viewport_size = [viewport_size[0].max(1), viewport_size[1].max(1)];
+        if self.viewport_size != viewport_size {
+            self.viewport_size = viewport_size;
+            queue.write_buffer(&self.view_buffer, 0, bytemuck::bytes_of(&UiView { viewport: [viewport_size[0] as f32, viewport_size[1] as f32], _pad: [0.0; 2] }));
+        }
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.view_bind_group, &[]);
         pass.set_vertex_buffer(0, self.instance_buffer.slice(..));
-        pass.draw(0..6, 0..instances.len() as u32);
-        let images = visuals.iter().filter_map(|(_, visual)| {
+        pass.draw(0..6, 0..self.instances.len() as u32);
+        let images = self.sampled.iter().filter_map(|visual| {
             let asset = visual.image.as_ref()?;
             let key = (asset.project_id.clone(), asset.asset_id, asset.revision.0);
             self.resident_images.contains_key(&key).then_some((key, UiImageInstance {
@@ -593,18 +666,22 @@ impl UiWgpuRenderer {
             }
         }
         let texts = self.resident_font.as_mut().map(|font| {
-            visuals.iter().filter_map(|(_, visual)| {
+            self.sampled.iter().filter_map(|visual| {
                 let text = visual.text.as_ref().and_then(text_ref_value);
                 if !matches!(visual.kind, UiNodeKind::Label | UiNodeKind::Button) || text.is_none() { return None; }
                 let text = text.unwrap();
                 let mut x = visual.bounds.x;
-                let baseline = visual.bounds.y + FONT_RASTER_SIZE;
+                let mut baseline = visual.bounds.y + font.ascent;
                 let mut first = true;
                 let mut result = Vec::new();
                 for ch in text.chars() {
-                    if ch == '\n' { x = visual.bounds.x; continue; }
+                    if ch == '\n' { x = visual.bounds.x; baseline += font.line_height; continue; }
                     let glyph = ensure_glyph(device, queue, font, ch).ok()?;
-                    let y = baseline + glyph.ymin;
+                    if x > visual.bounds.x && x + glyph.advance > visual.bounds.x + visual.bounds.width {
+                        x = visual.bounds.x;
+                        baseline += font.line_height;
+                    }
+                    let y = baseline - glyph.height - glyph.ymin;
                     result.push(UiTextInstance { rect: [x + glyph.xmin, y, glyph.width, glyph.height], color: [0.86, 0.95, 0.98, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv: glyph.uv });
                     x += glyph.advance;
                     first = false;
@@ -620,37 +697,69 @@ impl UiWgpuRenderer {
         }
     }
 
+    pub(crate) fn last_panel_instance_count(&self) -> usize {
+        self.last_panel_instance_count
+    }
+
+    fn refresh_plan(&mut self, fragments: &HashMap<neon_ui_schema::UiFragmentId, UiFragment>) -> bool {
+        let matches = self.plan_revisions.len() == fragments.len()
+            && fragments.iter().all(|(id, fragment)| self.plan_revisions.get(id) == Some(&fragment.revision));
+        if matches {
+            return false;
+        }
+        let nodes = flatten_fragments(fragments);
+        let live: HashSet<_> = nodes.iter().map(|(id, _, _)| id.clone()).collect();
+        self.current.retain(|id, _| live.contains(id));
+        self.active.retain(|id, _| live.contains(id));
+        self.plan.clear();
+        self.sampled.clear();
+        self.instances.clear();
+        for (id, target, transition) in nodes {
+            let instance_index = (target.kind != UiNodeKind::Image).then(|| self.instances.len());
+            if let Some(instance_index) = instance_index {
+                self.instances.push(UiInstance::zeroed());
+                debug_assert_eq!(instance_index, self.instances.len() - 1);
+            }
+            self.sampled.push(target.clone());
+            self.plan.push(PlannedNode { id, target, transition, instance_index });
+        }
+        self.plan_revisions.clear();
+        self.plan_revisions.extend(fragments.iter().map(|(id, fragment)| (id.clone(), fragment.revision)));
+        true
+    }
+
     fn sample(
-        &mut self,
+        current: &mut HashMap<String, UiVisual>,
+        active: &mut HashMap<String, ActiveTransition>,
         id: &str,
-        target: UiVisual,
-        transition: Option<UiTransition>,
+        target: &UiVisual,
+        transition: Option<&UiTransition>,
         time_seconds: f32,
     ) -> UiVisual {
-        if let Some(active) = self.active.get(id)
-            && active.target == target
+        if let Some(active_transition) = active.get(id)
+            && active_transition.target == *target
         {
-            let sampled = sample_transition(active, time_seconds);
-            self.current.insert(id.to_owned(), sampled.clone());
+            let sampled = sample_transition(active_transition, time_seconds);
+            current.insert(id.to_owned(), sampled.clone());
             return sampled;
         }
-        let source = self.current.get(id).cloned();
+        let source = current.get(id).cloned();
         let sampled = match transition {
             Some(transition) if transition.duration_ms > 0 => {
-                let from = source.unwrap_or_else(|| transition_source(&target, &transition));
-                let active = ActiveTransition {
+                let from = source.unwrap_or_else(|| transition_source(target, transition));
+                let next_active = ActiveTransition {
                     from,
-                    target,
+                    target: target.clone(),
                     started_at_seconds: time_seconds,
-                    transition,
+                    transition: transition.clone(),
                 };
-                let sampled = sample_transition(&active, time_seconds);
-                self.active.insert(id.to_owned(), active);
+                let sampled = sample_transition(&next_active, time_seconds);
+                active.insert(id.to_owned(), next_active);
                 sampled
             }
-            _ => target,
+            _ => target.clone(),
         };
-        self.current.insert(id.to_owned(), sampled.clone());
+        current.insert(id.to_owned(), sampled.clone());
         sampled
     }
 
@@ -1073,6 +1182,16 @@ mod tests {
     use neon_protocol::Revision;
     use neon_ui_schema::{TextRef, UiFragmentId, UiNodeId, UiTransitionState};
 
+    fn fixture_font() -> AssetBytes {
+        AssetBytes {
+            asset: AssetRef { project_id: "fixture-project".into(), asset_id: 82, revision: Revision(5), kind: "font".into() },
+            media_type: "font/ttf".into(),
+            width: None,
+            height: None,
+            bytes: include_bytes!("../../../assets/fonts/SarasaUiSC-Light.ttf").to_vec(),
+        }
+    }
+
     fn node() -> UiNode {
         UiNode {
             node_id: UiNodeId("root".into()),
@@ -1171,10 +1290,7 @@ mod tests {
             required_limits: wgpu::Limits::downlevel_defaults(),
             memory_hints: wgpu::MemoryHints::MemoryUsage,
         }, None)).expect("a device is required");
-        let font = AssetBytes {
-            asset: AssetRef { project_id: "fixture-project".into(), asset_id: 82, revision: Revision(5), kind: "font".into() },
-            media_type: "font/ttf".into(), width: None, height: None, bytes: vec![0, 1, 0, 0],
-        };
+        let font = fixture_font();
         let text = UiNode {
             node_id: UiNodeId("text".into()), kind: UiNodeKind::Label,
             bounds: UiBounds { x: 4.0, y: 4.0, width: 56.0, height: 24.0 }, layout: None,
@@ -1207,10 +1323,7 @@ mod tests {
             required_limits: wgpu::Limits::downlevel_defaults(),
             memory_hints: wgpu::MemoryHints::MemoryUsage,
         }, None)).expect("a device is required");
-        let font = AssetBytes {
-            asset: AssetRef { project_id: "fixture-project".into(), asset_id: 82, revision: Revision(5), kind: "font".into() },
-            media_type: "font/ttf".into(), width: None, height: None, bytes: vec![0, 1, 0, 0],
-        };
+        let font = fixture_font();
         let label = UiNode {
             node_id: UiNodeId("wrapped-text".into()), kind: UiNodeKind::Label,
             bounds: UiBounds { x: 4.0, y: 0.0, width: 24.0, height: 96.0 }, layout: None,
@@ -1322,6 +1435,28 @@ mod tests {
             },
         };
         assert_eq!(sample_transition(&active, 0.05).bounds.x, 50.0);
+    }
+
+    #[test]
+    fn animation_activity_expires_after_transition_end() {
+        let instance = wgpu::Instance::default();
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::LowPower, compatible_surface: None, force_fallback_adapter: true }))
+            .or_else(|| pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::LowPower, compatible_surface: None, force_fallback_adapter: false })))
+            .expect("a headless adapter is required");
+        let (device, _queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor { label: Some("neon3-ui-animation-activity"), required_features: wgpu::Features::empty(), required_limits: wgpu::Limits::downlevel_defaults(), memory_hints: wgpu::MemoryHints::MemoryUsage }, None)).expect("a device is required");
+        let mut renderer = UiWgpuRenderer::new(&device, wgpu::TextureFormat::Rgba8Unorm);
+        let target = UiVisual { bounds: UiBounds { x: 0.0, y: 0.0, width: 10.0, height: 10.0 }, style: UiStyle::default(), kind: UiNodeKind::Panel, enabled: true, clip: UiBounds { x: 0.0, y: 0.0, width: 10.0, height: 10.0 }, image: None, text: None };
+        UiWgpuRenderer::sample(&mut renderer.current, &mut renderer.active, "animated", &target, Some(&UiTransition { delay_ms: 0, duration_ms: 10, easing: UiEasing::Linear, from: UiTransitionState { opacity: Some(0.0), ..UiTransitionState::default() } }), 1.0);
+        assert!(renderer.has_active_animation(1.005));
+        assert!(!renderer.has_active_animation(1.020));
+    }
+
+    #[test]
+    fn srgb_conversion_matches_the_surface_encoding_contract() {
+        let convert = |value: f32| if value <= 0.04045 { value / 12.92 } else { ((value + 0.055) / 1.055).powf(2.4) };
+        assert!((convert(0.25) - 0.050876).abs() < 0.00001);
+        assert!((convert(0.5) - 0.214041).abs() < 0.00001);
+        assert!((convert(0.75) - 0.522522).abs() < 0.00001);
     }
 
     #[test]

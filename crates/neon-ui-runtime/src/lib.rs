@@ -2,7 +2,7 @@
 
 use std::{collections::HashMap, net::SocketAddr};
 
-use neon_ipc::{RpcClient, TransportError};
+use neon_ipc::{RpcClient, RpcServer, TransportError};
 use neon_observability::{
     CommandJournal, CommandReceipt, CommandState, DebugSnapshot, EVENT_COMMAND_ACCEPTED,
     EVENT_COMMAND_RECEIVED, EVENT_COMMAND_REJECTED, JournalFilter, TraceLevel, TraceRecord,
@@ -20,6 +20,16 @@ use serde_json::{Value, json};
 
 pub const SERVICE_NAME: &str = "ui-runtime";
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct UiSurfaceSnapshot {
+    pub revision: Revision,
+    pub diagnostics_expanded: bool,
+    pub inspector_tab: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum UiSurfaceEvent { DiagnosticsToggle, InspectorTabSelect { tab: String } }
+
 pub struct UiRuntime {
     epoch: u64,
     client: ClientIdentity,
@@ -27,6 +37,8 @@ pub struct UiRuntime {
     journal: CommandJournal,
     receipts: HashMap<RequestId, CommandReceipt>,
     last_input_sequence: HashMap<u64, u64>,
+    idempotent_responses: HashMap<String, RpcResponse>,
+    surface: UiSurfaceSnapshot,
 }
 
 impl UiRuntime {
@@ -43,6 +55,8 @@ impl UiRuntime {
             journal: CommandJournal::new(ServiceName(SERVICE_NAME.into()), epoch, 128),
             receipts: HashMap::new(),
             last_input_sequence: HashMap::new(),
+            idempotent_responses: HashMap::new(),
+            surface: UiSurfaceSnapshot { revision: Revision(0), diagnostics_expanded: false, inspector_tab: "overview".into() },
         }
     }
 
@@ -62,8 +76,10 @@ impl UiRuntime {
             epoch: self.epoch,
             capabilities: vec![
                 "ui.static_fragment.submit.v1".into(),
+                "ui.fragment.submit.v1".into(),
                 "ui.semantic_input.v1".into(),
                 "ui.intent_dispatch.v1".into(),
+                "ui.surface.action.v1".into(),
             ],
         }
     }
@@ -88,6 +104,9 @@ impl UiRuntime {
             "service.describe" => Some(json!(self.service_description())),
             "service.shutdown" => Some(json!({"state": "accepted"})),
             "debug.snapshot.get" => Some(json!(self.debug_snapshot())),
+            "ui.fragment.submit" => return self.handle_fragment_submit(request),
+            "ui.surface.snapshot.get" => Some(self.surface_value()),
+            "ui.surface.action" => return self.handle_surface_action(request),
             "ui.input.event" => return self.handle_input_event(request),
             "ui.intent.dispatch" => return self.handle_intent_dispatch(request),
             _ => None,
@@ -119,6 +138,125 @@ impl UiRuntime {
                 }),
             },
         }
+    }
+
+    fn handle_surface_action(&mut self, request: RpcRequest) -> RpcResponse {
+        let Some(key) = request.idempotency_key.clone() else { return self.rejected(request.request_id, "invalid_request", "idempotency_key is required"); };
+        if let Some(response) = self.idempotent_responses.get(&key) { let mut response = response.clone(); response.request_id = request.request_id; return response; }
+        if request.expected_revision != Some(self.surface.revision) { return self.rejected(request.request_id, "revision_conflict", "UI surface revision is stale"); }
+        let event = match self.parse_surface_event(&request.params) { Ok(event) => event, Err((code, message)) => return self.rejected(request.request_id, code, message) };
+        match event { UiSurfaceEvent::DiagnosticsToggle => self.surface.diagnostics_expanded = !self.surface.diagnostics_expanded, UiSurfaceEvent::InspectorTabSelect { tab } => self.surface.inspector_tab = tab }
+        self.surface.revision = Revision(self.surface.revision.0 + 1);
+        self.record_receipt(&request.request_id, CommandState::Accepted, None);
+        let response = RpcResponse { request_id: request.request_id, status: RpcStatus::Accepted, revision: Some(self.surface.revision), result: Some(self.surface_value()), snapshot: None, error: None };
+        self.idempotent_responses.insert(key, response.clone());
+        response
+    }
+
+    fn parse_surface_event(&self, params: &Value) -> Result<UiSurfaceEvent, (&'static str, &'static str)> {
+        let event = params.get("event").and_then(Value::as_object).ok_or(("invalid_request", "a UI surface event is required"))?;
+        match event.get("type").and_then(Value::as_str) {
+            Some("DIAGNOSTICS_TOGGLE") => Ok(UiSurfaceEvent::DiagnosticsToggle),
+            Some("INSPECTOR_TAB_SELECT") => {
+                let tab = event.get("tab").and_then(Value::as_str).filter(|tab| matches!(*tab, "overview" | "materials" | "history")).ok_or(("invalid_request", "a supported inspector tab is required"))?;
+                Ok(UiSurfaceEvent::InspectorTabSelect { tab: tab.into() })
+            }
+            _ => Err(("unsupported_ui_event", "UI surface event is not supported")),
+        }
+    }
+
+    fn surface_value(&self) -> Value {
+        json!({"revision": self.surface.revision, "value": {"diagnostics": if self.surface.diagnostics_expanded { "expanded" } else { "collapsed" }, "inspector": {"tab": self.surface.inspector_tab}}, "available_events": ["DIAGNOSTICS_TOGGLE", "INSPECTOR_TAB_SELECT"]})
+    }
+
+    /// Runs the UI declaration control plane. A React client can only submit to this
+    /// service; the service forwards a validated declaration to the sole renderer.
+    pub fn serve_forwarder(
+        endpoint: SocketAddr,
+        wgpu_endpoint: SocketAddr,
+        epoch: u64,
+    ) -> Result<(), TransportError> {
+        let server = RpcServer::bind(endpoint)?;
+        let mut runtime = Self::new(epoch, "ui-runtime-forwarder");
+        server.serve_until(|request| {
+            let shutdown = request.method == "service.shutdown";
+            let request_id = request.request_id.clone();
+            let response = if request.method == "ui.fragment.submit" {
+                runtime.forward_fragment(wgpu_endpoint, request).unwrap_or_else(|error| {
+                    runtime.rejected(request_id, "service_unavailable", &error.to_string())
+                })
+            } else {
+                runtime.handle_service_request(request)
+            };
+            (response, !shutdown)
+        })
+    }
+
+    /// The cache is published only after the renderer accepted the exact declaration.
+    pub fn forward_fragment(
+        &mut self,
+        wgpu_endpoint: SocketAddr,
+        request: RpcRequest,
+    ) -> Result<RpcResponse, TransportError> {
+        let request_id = request.request_id.clone();
+        let Some(idempotency_key) = request.idempotency_key.clone() else {
+            return Ok(self.rejected(request_id, "invalid_request", "idempotency_key is required"));
+        };
+        if let Some(cached) = self.idempotent_responses.get(&idempotency_key) {
+            let mut response = cached.clone();
+            response.request_id = request_id;
+            return Ok(response);
+        }
+        let fragment = match self.validate_fragment_submission(&request) {
+            Ok(fragment) => fragment,
+            Err((code, message)) => return Ok(self.rejected(request_id, code, message)),
+        };
+        self.record_receipt(&request.request_id, CommandState::Received, None);
+        self.journal.append(TraceLevel::Info, EVENT_COMMAND_RECEIVED, Some(request.request_id.clone()), None, None, None, Some(self.debug_snapshot().revision), None, json!({"method": "ui.fragment.submit", "fragment_id": fragment.fragment_id.0, "fragment_revision": fragment.revision.0}));
+        let forwarded = RpcRequest {
+            protocol: "neon3.rpc".into(), version: PROTOCOL_VERSION, request_id: request.request_id.clone(),
+            client: self.client.clone(), target: ServiceName("wgpu-runtime".into()), method: "wgpu.ui.submit_fragment".into(),
+            params: request.params, expected_revision: None, idempotency_key: Some(idempotency_key.clone()),
+        };
+        let response = RpcClient::connect(wgpu_endpoint)?.call(&forwarded)?;
+        if response.status == RpcStatus::Accepted {
+            self.cached_fragment = Some(fragment);
+            self.record_receipt(&request.request_id, CommandState::Accepted, None);
+            self.journal.append(TraceLevel::Info, EVENT_COMMAND_ACCEPTED, Some(request.request_id.clone()), None, None, None, response.revision, response.revision, json!({"target": "wgpu-runtime", "state": "accepted"}));
+            self.idempotent_responses.insert(idempotency_key, response.clone());
+        } else {
+            self.record_receipt(&request.request_id, CommandState::Rejected, response.error.as_ref().map(|error| error.code.clone()));
+            self.journal.append(TraceLevel::Warn, EVENT_COMMAND_REJECTED, Some(request.request_id.clone()), None, None, None, Some(self.debug_snapshot().revision), response.revision, json!({"target": "wgpu-runtime", "state": "rejected", "code": response.error.as_ref().map(|error| error.code.clone())}));
+        }
+        Ok(response)
+    }
+
+    fn handle_fragment_submit(&mut self, request: RpcRequest) -> RpcResponse {
+        let fragment = match self.validate_fragment_submission(&request) {
+            Ok(fragment) => fragment,
+            Err((code, message)) => return self.rejected(request.request_id, code, message),
+        };
+        let revision = fragment.revision;
+        self.cached_fragment = Some(fragment);
+        self.accepted(request.request_id, json!({"fragment_revision": revision, "state": "accepted"}))
+    }
+
+    fn validate_fragment_submission(&self, request: &RpcRequest) -> Result<UiFragment, (&'static str, &'static str)> {
+        let command: UiCommand = serde_json::from_value(request.params.clone())
+            .map_err(|_| ("invalid_request", "invalid UI command"))?;
+        let UiCommand::SubmitFragment { submission } = command else {
+            return Err(("invalid_request", "expected submit_fragment command"));
+        };
+        if submission.validate().is_err() {
+            return Err(("invalid_request", "invalid UI fragment submission"));
+        }
+        if request.expected_revision.is_some_and(|expected| expected != self.debug_snapshot().revision) {
+            return Err(("revision_conflict", "UI fragment revision is stale"));
+        }
+        if self.cached_fragment.as_ref().is_some_and(|current| submission.fragment.revision <= current.revision) {
+            return Err(("revision_conflict", "UI fragment revision is stale"));
+        }
+        Ok(submission.fragment)
     }
 
     /// Forwards a renderer-resolved semantic event as a typed domain RPC.
@@ -386,6 +524,95 @@ mod tests {
     }
 
     #[test]
+    fn react_fragment_submission_is_cached_and_revisioned() {
+        let mut runtime = UiRuntime::new(1, "ui-react-test");
+        let fragment = runtime.static_fragment(Revision(1));
+        let response = runtime.handle_service_request(RpcRequest {
+            protocol: "neon3.rpc".into(), version: PROTOCOL_VERSION,
+            request_id: RequestId("react-fragment-1".into()),
+            client: ClientIdentity { kind: ClientKind::UiReactClient, instance_id: "react-client".into(), pid: 1, origin: "neon-ui-react-client".into() },
+            target: ServiceName(SERVICE_NAME.into()), method: "ui.fragment.submit".into(),
+            params: json!(UiCommand::SubmitFragment { submission: UiFragmentSubmission::new(fragment) }),
+            expected_revision: None, idempotency_key: Some("react-fragment-key-1".into()),
+        });
+        assert_eq!(response.status, RpcStatus::Accepted);
+        assert_eq!(runtime.cached_fragment().unwrap().revision, Revision(1));
+        assert_eq!(runtime.service_description().capabilities.iter().filter(|capability| *capability == "ui.fragment.submit.v1").count(), 1);
+    }
+
+    #[test]
+    fn surface_actions_are_revisioned_idempotent_discrete_state() {
+        let mut runtime = UiRuntime::new(1, "ui-surface-test");
+        let action = |id: &str, expected_revision, key: &str, params| RpcRequest {
+            protocol: "neon3.rpc".into(), version: PROTOCOL_VERSION, request_id: RequestId(id.into()),
+            client: ClientIdentity { kind: ClientKind::UiReactClient, instance_id: "react-client".into(), pid: 1, origin: "neon-ui-react-client".into() },
+            target: ServiceName(SERVICE_NAME.into()), method: "ui.surface.action".into(), params, expected_revision: Some(Revision(expected_revision)), idempotency_key: Some(key.into()),
+        };
+        let first = runtime.handle_service_request(action("toggle-1", 0, "toggle-key", json!({"event": {"type": "DIAGNOSTICS_TOGGLE"}})));
+        assert_eq!(first.status, RpcStatus::Accepted);
+        assert_eq!(first.result.as_ref().unwrap()["value"]["diagnostics"], "expanded");
+        assert_eq!(first.revision, Some(Revision(1)));
+        let retry = runtime.handle_service_request(action("toggle-retry", 0, "toggle-key", json!({"event": {"type": "DIAGNOSTICS_TOGGLE"}})));
+        assert_eq!(retry.status, RpcStatus::Accepted);
+        assert_eq!(retry.revision, Some(Revision(1)));
+        assert_eq!(runtime.surface.revision, Revision(1));
+        let stale = runtime.handle_service_request(action("tab-stale", 0, "tab-key", json!({"event": {"type": "INSPECTOR_TAB_SELECT", "tab": "materials"}})));
+        assert_eq!(stale.error.unwrap().code, "revision_conflict");
+        let tab = runtime.handle_service_request(action("tab-1", 1, "tab-key", json!({"event": {"type": "INSPECTOR_TAB_SELECT", "tab": "materials"}})));
+        assert_eq!(tab.status, RpcStatus::Accepted);
+        assert_eq!(runtime.surface.inspector_tab, "materials");
+        assert_eq!(runtime.surface.revision, Revision(2));
+    }
+
+    #[test]
+    fn forwarder_caches_only_the_renderer_accepted_revision() {
+        let renderer = RpcServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let endpoint = renderer.local_addr().unwrap();
+        let receiver = thread::spawn(move || renderer.serve_one(|request| {
+            assert_eq!(request.client.kind, ClientKind::UiRuntime);
+            assert_eq!(request.method, "wgpu.ui.submit_fragment");
+            assert_eq!(request.request_id.0, "forward-1");
+            RpcResponse { request_id: request.request_id, status: RpcStatus::Accepted, revision: Some(Revision(9)), result: Some(json!({"state": "ready"})), snapshot: None, error: None }
+        }));
+        let mut runtime = UiRuntime::new(1, "ui-forward-test");
+        let fragment = runtime.static_fragment(Revision(4));
+        let request = RpcRequest {
+            protocol: "neon3.rpc".into(), version: PROTOCOL_VERSION, request_id: RequestId("forward-1".into()),
+            client: ClientIdentity { kind: ClientKind::UiReactClient, instance_id: "react-client".into(), pid: 1, origin: "neon-ui-react-client".into() },
+            target: ServiceName(SERVICE_NAME.into()), method: "ui.fragment.submit".into(),
+            params: json!(UiCommand::SubmitFragment { submission: UiFragmentSubmission::new(fragment) }), expected_revision: None, idempotency_key: Some("forward-key-1".into()),
+        };
+        let response = runtime.forward_fragment(endpoint, request).unwrap();
+        assert_eq!(response.status, RpcStatus::Accepted);
+        assert_eq!(runtime.cached_fragment().unwrap().revision, Revision(4));
+        assert_eq!(runtime.command_receipt(&RequestId("forward-1".into())).unwrap().state, CommandState::Accepted);
+        receiver.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn renderer_rejection_does_not_advance_the_ui_cache() {
+        let renderer = RpcServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let endpoint = renderer.local_addr().unwrap();
+        let receiver = thread::spawn(move || renderer.serve_one(|request| RpcResponse {
+            request_id: request.request_id, status: RpcStatus::Rejected, revision: Some(Revision(9)), result: None, snapshot: None,
+            error: Some(RpcError { code: "revision_conflict".into(), message: "renderer has a newer fragment".into(), current_revision: Some(Revision(9)), object_id: None }),
+        }));
+        let mut runtime = UiRuntime::new(1, "ui-forward-test");
+        let fragment = runtime.static_fragment(Revision(4));
+        let request = RpcRequest {
+            protocol: "neon3.rpc".into(), version: PROTOCOL_VERSION, request_id: RequestId("forward-reject-1".into()),
+            client: ClientIdentity { kind: ClientKind::UiReactClient, instance_id: "react-client".into(), pid: 1, origin: "neon-ui-react-client".into() },
+            target: ServiceName(SERVICE_NAME.into()), method: "ui.fragment.submit".into(),
+            params: json!(UiCommand::SubmitFragment { submission: UiFragmentSubmission::new(fragment) }), expected_revision: None, idempotency_key: Some("forward-reject-key-1".into()),
+        };
+        let response = runtime.forward_fragment(endpoint, request).unwrap();
+        assert_eq!(response.status, RpcStatus::Rejected);
+        assert!(runtime.cached_fragment().is_none());
+        assert_eq!(runtime.command_receipt(&RequestId("forward-reject-1".into())).unwrap().state, CommandState::Rejected);
+        receiver.join().unwrap().unwrap();
+    }
+
+    #[test]
     fn sends_static_fragment_to_loopback_wgpu_server() {
         let server = RpcServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
         let endpoint = server.local_addr().unwrap();
@@ -472,7 +699,7 @@ mod tests {
             event_id: "event-1".into(), renderer_epoch: 7, composition_revision: Revision(9),
             fragment: UiFragmentRevision { id: UiFragmentId("static-editor-shell".into()), revision: Revision(3) },
             intent: UiIntent::Invoke { action: "terrain.tool.select".into(), params: json!({"tool": "water_inject"}) },
-            pointer: Some(UiPointerMetadata { id: 0, sequence: 1, logical_position: [12.0, 6.0] }), focus: None,
+            pointer: Some(UiPointerMetadata { id: 0, sequence: 1 }), focus: None,
         };
         let response = runtime.dispatch_semantic_event(endpoint, event, RequestId("terrain-request-1".into()), "terrain-key-1".into()).unwrap();
         assert_eq!(response.status, RpcStatus::Accepted);
@@ -490,7 +717,7 @@ mod tests {
             event: UiSemanticEventType::PointerClick, event_id: "event-reject".into(), renderer_epoch: epoch, composition_revision: Revision(9),
             fragment: UiFragmentRevision { id: UiFragmentId("static-editor-shell".into()), revision: Revision(revision) },
             intent: UiIntent::Invoke { action: action.into(), params: json!({"tool": "water_inject"}) },
-            pointer: Some(UiPointerMetadata { id: 0, sequence, logical_position: [0.0, 0.0] }), focus: None,
+            pointer: Some(UiPointerMetadata { id: 0, sequence }), focus: None,
         };
         assert_eq!(runtime.validate_semantic_event(&event(8, 3, "terrain.tool.select", 1)), Err(ERROR_RENDERER_EPOCH_MISMATCH));
         assert_eq!(runtime.validate_semantic_event(&event(7, 2, "terrain.tool.select", 1)), Err(ERROR_FRAGMENT_REVISION_STALE));

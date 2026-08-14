@@ -244,7 +244,6 @@ pub struct UiFragmentRevision {
 pub struct UiPointerMetadata {
     pub id: u64,
     pub sequence: u64,
-    pub logical_position: [f32; 2],
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -542,7 +541,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_event_serialization_has_no_render_or_node_identifier() {
+    fn semantic_event_serialization_has_no_renderer_local_or_coordinate_data() {
         let event = UiSemanticEvent {
             event: UiSemanticEventType::PointerClick,
             event_id: "event-1".into(),
@@ -559,7 +558,6 @@ mod tests {
             pointer: Some(UiPointerMetadata {
                 id: 0,
                 sequence: 4,
-                logical_position: [12.5, 8.0],
             }),
             focus: None,
         };
@@ -567,6 +565,18 @@ mod tests {
         assert!(encoded.get("render_hit_id").is_none());
         assert!(encoded.get("node_id").is_none());
         assert!(encoded.get("pixel_position").is_none());
+        assert!(encoded.get("logical_position").is_none());
+    }
+
+    #[test]
+    fn public_schema_has_no_renderer_or_web_runtime_dependency() {
+        let manifest = include_str!("../Cargo.toml");
+        for forbidden in ["wgpu", "winit", "react", "typescript", "tauri", "webview"] {
+            assert!(
+                !manifest.lines().any(|line| line.trim_start().starts_with(&format!("{forbidden} ="))),
+                "public UI schema must not depend on {forbidden}"
+            );
+        }
     }
 
     fn layout_node(mode: UiLayoutMode) -> UiNode {

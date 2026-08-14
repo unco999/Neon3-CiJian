@@ -31,6 +31,12 @@ pub fn run_headless_scenario(endpoint: SocketAddr) -> Result<Value, TransportErr
         return Ok(failed(steps, &describe));
     }
 
+    let snapshot = call(endpoint, "snapshot-1", "debug.snapshot.get", json!({}), None)?;
+    record_step(&mut steps, "debug.snapshot.get", &snapshot);
+    if snapshot.status != RpcStatus::Accepted {
+        return Ok(failed(steps, &snapshot));
+    }
+
     let command = UiCommand::SubmitFragment {
         submission: UiFragmentSubmission::new(static_fragment(Revision(1))),
     };
@@ -58,6 +64,24 @@ pub fn run_headless_scenario(endpoint: SocketAddr) -> Result<Value, TransportErr
     record_step(&mut steps, "wgpu.ui.submit_fragment.retry", &duplicate);
     if duplicate.status != RpcStatus::Accepted {
         return Ok(failed(steps, &duplicate));
+    }
+
+    let fragment_snapshot = call(
+        endpoint,
+        "fragment-snapshot-1",
+        "wgpu.ui.fragment.snapshot",
+        json!({"fragment_id": "cli-static-fragment"}),
+        None,
+    )?;
+    record_step(&mut steps, "wgpu.ui.fragment.snapshot", &fragment_snapshot);
+    if fragment_snapshot.status != RpcStatus::Accepted {
+        return Ok(failed(steps, &fragment_snapshot));
+    }
+
+    let graph = call(endpoint, "graph-1", "wgpu.render.graph.snapshot", json!({}), None)?;
+    record_step(&mut steps, "wgpu.render.graph.snapshot", &graph);
+    if graph.status != RpcStatus::Accepted {
+        return Ok(failed(steps, &graph));
     }
 
     let diagnostics = call(
@@ -111,9 +135,11 @@ pub fn run_headless_scenario(endpoint: SocketAddr) -> Result<Value, TransportErr
         "scenario": SCENARIO_ID,
         "status": "passed",
         "steps": steps,
-        "request_ids": ["health-1", "describe-1", "submit-1", "submit-duplicate-1", "diagnostics-1", "receipt-1", "traces-1"],
+        "request_ids": ["health-1", "describe-1", "snapshot-1", "submit-1", "submit-duplicate-1", "fragment-snapshot-1", "graph-1", "diagnostics-1", "receipt-1", "traces-1"],
         "trace_records": traces.result,
         "diagnostics": diagnostics.result,
+        "fragment_snapshot": fragment_snapshot.result,
+        "render_graph": graph.result,
     }))
 }
 
@@ -135,7 +161,7 @@ pub fn run_detail_toggle_scenario(endpoint: SocketAddr) -> Result<Value, Transpo
         composition_revision: initial.revision.unwrap_or(Revision(0)),
         fragment: UiFragmentRevision { id: UiFragmentId("cli-detail-toggle".into()), revision: Revision(1) },
         intent,
-        pointer: Some(UiPointerMetadata { id: 0, sequence: 1, logical_position: [208.0, 32.0] }),
+        pointer: Some(UiPointerMetadata { id: 0, sequence: 1 }),
         focus: None,
     };
     let validated = call(endpoint, "detail-event-1", "wgpu.ui.semantic_event.validate", json!(event), None)?;
@@ -266,7 +292,10 @@ mod tests {
         let result = match request.method.as_str() {
             "service.health" => json!({"status": "healthy"}),
             "service.describe" => json!({"epoch": 1, "capabilities": ["wgpu.ui.fragment.v1"]}),
+            "debug.snapshot.get" => json!({"epoch": 1, "revision": 0}),
             "wgpu.ui.submit_fragment" => json!({"fragment_count": 1}),
+            "wgpu.ui.fragment.snapshot" => json!({"epoch": 1, "sequence": 1, "fragment_revision": 1}),
+            "wgpu.render.graph.snapshot" => json!({"graph_revision": 1, "targets": []}),
             "wgpu.ui.semantic_event.validate" => request.params,
             "wgpu.render.diagnostics" => json!({"fragment_count": 1, "mode": "headless"}),
             "debug.command.get" => json!({"state": "accepted"}),
@@ -288,13 +317,13 @@ mod tests {
         let server = RpcServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
         let endpoint = server.local_addr().unwrap();
         let thread = thread::spawn(move || {
-            for _ in 0..7 {
+            for _ in 0..10 {
                 server.serve_one(response).unwrap();
             }
         });
         let outcome = run_headless_scenario(endpoint).unwrap();
         assert_eq!(outcome["status"], "passed");
-        assert_eq!(outcome["steps"].as_array().unwrap().len(), 7);
+        assert_eq!(outcome["steps"].as_array().unwrap().len(), 10);
         serde_json::from_value::<Value>(outcome).unwrap();
         thread.join().unwrap();
     }

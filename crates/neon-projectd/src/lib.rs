@@ -8,6 +8,7 @@ use serde_json::{json, Value};
 
 pub const SERVICE_NAME: &str = "projectd";
 pub const CAPABILITY_ASSET_BYTES: &str = "project.asset_bytes.v1";
+const FIXTURE_SARASA_UI_SC_LIGHT_TTF: &[u8] = include_bytes!("../../../assets/fonts/SarasaUiSC-Light.ttf");
 
 pub struct Projectd {
     epoch: u64,
@@ -24,8 +25,8 @@ impl Projectd {
             bytes: vec![51, 204, 102, 255, 51, 204, 102, 0],
         };
         let font_asset = AssetRef { project_id: "fixture-project".into(), asset_id: 82, revision: Revision(5), kind: "font".into() };
-        // Fixture bytes establish ownership/protocol flow only; glyph parsing belongs to the renderer's later U5 text path.
-        let font = AssetBytes { asset: font_asset.clone(), media_type: "font/ttf".into(), width: None, height: None, bytes: vec![0, 1, 0, 0] };
+        // The fixture is a workspace-owned, licensed font; only the renderer parses its bytes.
+        let font = AssetBytes { asset: font_asset.clone(), media_type: "font/ttf".into(), width: None, height: None, bytes: FIXTURE_SARASA_UI_SC_LIGHT_TTF.to_vec() };
         let mut assets = HashMap::new();
         assets.insert(key(&image_asset), image);
         assets.insert(key(&font_asset), font);

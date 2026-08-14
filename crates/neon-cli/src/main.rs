@@ -24,7 +24,7 @@ fn main() -> ExitCode {
         .expect("reserved endpoint must have address");
     drop(reservation);
     let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let request_count = if scenario == neon_cli::DETAIL_TOGGLE_SCENARIO_ID { "5" } else { "7" };
+    let request_count = if scenario == neon_cli::DETAIL_TOGGLE_SCENARIO_ID { "5" } else { "10" };
     let mut server = Command::new("cargo")
         .args([
             "run",

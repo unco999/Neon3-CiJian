@@ -1,0 +1,25 @@
+{
+  "name": "neon-ui-react-client",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build && node --test test/*.test.mjs",
+    "demo:terrain": "npm run build && node dist/demo-terrain.js",
+    "demo:workbench": "npm run build && node dist/demo-workbench.js",
+    "demo:animation": "npm run build && node dist/demo-animation.js"
+  },
+  "peerDependencies": {
+    "react": "^19.0.0"
+  },
+  "dependencies": {
+    "react-reconciler": "^0.33.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/react": "^19.0.0",
+    "react": "^19.0.0",
+    "typescript": "^5.7.3"
+  }
+}

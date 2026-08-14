@@ -23,6 +23,7 @@ pub struct RequestId(pub String);
 #[serde(rename_all = "snake_case")]
 pub enum ClientKind {
     Cli,
+    UiReactClient,
     UiRuntime,
     TerrainRuntime,
     ResourceRuntime,

@@ -1,0 +1,11 @@
+export { Button, Image, Label, Panel, Surface } from "./components.js";
+export { createNeonRoot } from "./renderer.js";
+export { NeonUiClient } from "./client.js";
+export { createLoopbackTransport } from "./node-transport.js";
+export { TerrainEditorSurface } from "./examples/TerrainEditorSurface.js";
+export { UiWorkbenchSurface } from "./examples/UiWorkbenchSurface.js";
+export { UiAnimationSurface } from "./examples/UiAnimationSurface.js";
+export type { NeonRoot } from "./renderer.js";
+export type { TerrainEditorSurfaceProps, TerrainEditorSnapshot, TerrainMaterialSnapshot, TerrainToolSnapshot } from "./examples/TerrainEditorSurface.js";
+export type { UiAnimationPhase } from "./examples/UiAnimationSurface.js";
+export type { AssetRef, Bounds, JsonValue, NodeKey, NodeProps, Revision, Rgba, RpcResponse, RpcTransport, SurfaceId, SurfaceProps, UiFragment, UiIntent, UiIntentSpec, UiLayout, UiStyle, UiTransition, UiSurfaceSnapshot } from "./protocol.js";

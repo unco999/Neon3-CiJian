@@ -1,2 +1,6 @@
 /target/
 /.opencode
+/packages/neon-ui-react-client/node_modules/
+/packages/neon-ui-react-client/dist/
+*.pt
+*.ttf

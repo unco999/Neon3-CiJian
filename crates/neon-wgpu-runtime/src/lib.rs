@@ -9,7 +9,7 @@ use neon_observability::{
     EVENT_COMMAND_RECEIVED, EVENT_COMMAND_REJECTED, JournalFilter, TraceLevel, TraceRecord,
 };
 use neon_protocol::{
-    AssetBytes, AssetRef, HealthStatus, PROTOCOL_VERSION, RequestId, Revision, RpcError, RpcRequest, RpcResponse,
+    AssetBytes, AssetRef, ClientKind, HealthStatus, PROTOCOL_VERSION, RequestId, Revision, RpcError, RpcRequest, RpcResponse,
     RpcStatus, ServiceDescription, ServiceHealth, ServiceName,
 };
 use neon_ui_schema::{
@@ -117,11 +117,19 @@ pub struct WindowedRuntime {
     window: Option<Window>,
     exit_error: Option<String>,
     fragments: HashMap<UiFragmentId, UiFragment>,
+    applied_composition_revision: Revision,
+    redraw_pending: bool,
+    animation_active: bool,
+    pending_composition_ack: Option<std::sync::mpsc::Sender<usize>>,
 }
 
 #[derive(Clone, Debug)]
 enum WindowCommand {
-    Fragments(HashMap<UiFragmentId, UiFragment>),
+    Fragments {
+        composition_revision: Revision,
+        fragments: HashMap<UiFragmentId, UiFragment>,
+        applied: Option<std::sync::mpsc::Sender<usize>>,
+    },
     Shutdown,
 }
 
@@ -140,6 +148,11 @@ struct WindowGpu {
     pending_hit_slot: Option<(usize, u64)>,
     next_input_sequence: u64,
     started_at: Instant,
+    last_draw_instance_count: usize,
+    hit_target_dirty: bool,
+    last_present: Instant,
+    frame_count: u64,
+    longest_frame_gap_ms: f32,
 }
 
 impl WindowedRuntime {
@@ -150,25 +163,27 @@ impl WindowedRuntime {
             window: None,
             exit_error: None,
             fragments: HashMap::new(),
+            applied_composition_revision: Revision(0),
+            redraw_pending: true,
+            animation_active: false,
+            pending_composition_ack: None,
         }
     }
 
     pub fn run(epoch: u64) -> Result<(), String> {
-        Self::run_with_server(epoch, None, 0, true)
+        Self::run_with_server(epoch, None, true)
     }
 
     pub fn run_server(
         epoch: u64,
         endpoint: SocketAddr,
-        request_count: usize,
     ) -> Result<(), String> {
-        Self::run_with_server(epoch, Some(endpoint), request_count, false)
+        Self::run_with_server(epoch, Some(endpoint), false)
     }
 
     fn run_with_server(
         epoch: u64,
         endpoint: Option<SocketAddr>,
-        request_count: usize,
         demo: bool,
     ) -> Result<(), String> {
         let event_loop = EventLoop::<WindowCommand>::with_user_event()
@@ -178,9 +193,10 @@ impl WindowedRuntime {
         let mut runtime = Self::new(epoch);
         if demo {
             runtime.fragments = runtime.demo_fragments();
+            runtime.applied_composition_revision = Revision(1);
         }
         if let Some(endpoint) = endpoint {
-            spawn_window_server(epoch, endpoint, request_count, proxy);
+            spawn_window_server(epoch, endpoint, proxy);
         }
         event_loop
             .run_app(&mut runtime)
@@ -193,12 +209,13 @@ impl WindowedRuntime {
             .create_window(
                 Window::default_attributes()
                     .with_title(format!("Neon3 - WGPU Runtime (epoch {})", self.epoch))
-                    .with_inner_size(PhysicalSize::new(1280, 800)),
+                    .with_inner_size(PhysicalSize::new(1440, 900)),
             )
             .map_err(|error| format!("create window: {error}"))?;
         let gpu = WindowGpu::new(&window)?;
         self.window = Some(window);
         self.gpu = Some(gpu);
+        self.redraw_pending = true;
         Ok(())
     }
 
@@ -214,6 +231,8 @@ impl WindowedRuntime {
             gpu.hit_target = target;
             gpu.hit_target_view = view;
             gpu.hit_target_generation += 1;
+            gpu.hit_target_dirty = true;
+            self.redraw_pending = true;
         }
     }
 
@@ -221,7 +240,11 @@ impl WindowedRuntime {
         let Some(gpu) = self.gpu.as_mut() else {
             return Ok(());
         };
-        gpu.device.poll(wgpu::Maintain::Poll);
+        let was_animation_active = self.animation_active;
+        let frame_started = Instant::now();
+        if gpu.pending_hit_slot.is_some() {
+            gpu.device.poll(wgpu::Maintain::Poll);
+        }
         if let Some((slot, sequence)) = gpu.pending_hit_slot
             && let Some(result) = gpu.ui.try_complete_hit_readback(slot)
         {
@@ -243,6 +266,7 @@ impl WindowedRuntime {
             }
             Err(error) => return Err(format!("acquire surface texture: {error}")),
         };
+        let acquired_at = Instant::now();
         let view = surface_texture
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -279,8 +303,10 @@ impl WindowedRuntime {
                 [gpu.config.width, gpu.config.height],
                 gpu.started_at.elapsed().as_secs_f32(),
             );
+            drop(pass);
+            gpu.last_draw_instance_count = gpu.ui.last_panel_instance_count();
         }
-        {
+        if gpu.hit_target_dirty || gpu.pending_hit_pixel.is_some() {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("neon3-final-ui-hit-id-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -291,18 +317,64 @@ impl WindowedRuntime {
                 depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None,
             });
             gpu.ui.draw_hit_id(&gpu.device, &gpu.queue, &mut pass, &self.fragments, [gpu.config.width, gpu.config.height], gpu.started_at.elapsed().as_secs_f32());
+            gpu.hit_target_dirty = false;
         }
         let queued_readback = gpu.pending_hit_pixel.take().and_then(|pixel| {
             gpu.ui.enqueue_hit_readback(&mut encoder, &gpu.hit_target, pixel).map(|slot| (slot, pixel))
         });
         gpu.queue.submit(Some(encoder.finish()));
+        let submitted_at = Instant::now();
         if let Some((slot, _)) = queued_readback {
             gpu.next_input_sequence += 1;
             gpu.input.request_sample(HitSampleRequest { pointer_id: 0, sequence: gpu.next_input_sequence, composition_revision: Revision(0), target_generation: gpu.hit_target_generation });
             if gpu.ui.begin_hit_readback_mapping(slot) { gpu.pending_hit_slot = Some((slot, gpu.next_input_sequence)); }
         }
         surface_texture.present();
+        let now = Instant::now();
+        let frame_gap_ms = now.duration_since(gpu.last_present).as_secs_f32() * 1000.0;
+        gpu.longest_frame_gap_ms = gpu.longest_frame_gap_ms.max(frame_gap_ms);
+        gpu.last_present = now;
+        gpu.frame_count += 1;
+        if let Some(applied) = self.pending_composition_ack.take() {
+            let _ = applied.send(gpu.last_draw_instance_count);
+        }
+        self.redraw_pending = false;
+        self.animation_active = gpu.ui.has_active_animation(gpu.started_at.elapsed().as_secs_f32());
+        if was_animation_active && frame_gap_ms > 34.0 {
+            eprintln!(
+                "neon-wgpu animation frame gap: {:.1}ms (frame {}, acquire {:.1}ms, encode {:.1}ms, submit+present {:.1}ms)",
+                frame_gap_ms,
+                gpu.frame_count,
+                acquired_at.duration_since(frame_started).as_secs_f32() * 1000.0,
+                submitted_at.duration_since(acquired_at).as_secs_f32() * 1000.0,
+                now.duration_since(submitted_at).as_secs_f32() * 1000.0,
+            );
+        }
+        if self.animation_active {
+            if let Some(window) = self.window.as_ref() {
+                window.request_redraw();
+            }
+        }
         Ok(())
+    }
+
+    fn apply_fragments(&mut self, composition_revision: Revision, fragments: HashMap<UiFragmentId, UiFragment>) -> bool {
+        if composition_revision <= self.applied_composition_revision {
+            return false;
+        }
+        self.applied_composition_revision = composition_revision;
+        self.fragments = fragments;
+        self.redraw_pending = true;
+        if let Some(gpu) = self.gpu.as_mut() {
+            gpu.hit_target_dirty = true;
+        }
+        true
+    }
+
+    fn needs_redraw(&self) -> bool {
+        self.redraw_pending
+            || self.animation_active
+            || self.gpu.as_ref().is_some_and(|gpu| gpu.pending_hit_slot.is_some())
     }
 }
 
@@ -350,18 +422,25 @@ impl WindowGpu {
             .find(|mode| *mode == wgpu::CompositeAlphaMode::Opaque)
             .or_else(|| capabilities.alpha_modes.first().copied())
             .ok_or_else(|| "surface reported no supported alpha modes".to_owned())?;
+        let present_mode = capabilities
+            .present_modes
+            .iter()
+            .copied()
+            .find(|mode| *mode == wgpu::PresentMode::Mailbox)
+            .unwrap_or(wgpu::PresentMode::Fifo);
         let size = window.inner_size();
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
             width: size.width.max(1),
             height: size.height.max(1),
-            present_mode: wgpu::PresentMode::Fifo,
+            present_mode,
             alpha_mode,
             view_formats: Vec::new(),
-            desired_maximum_frame_latency: 2,
+            desired_maximum_frame_latency: 1,
         };
         surface.configure(&device, &config);
+        eprintln!("neon-wgpu surface present mode: {:?}", config.present_mode);
         let ui = UiWgpuRenderer::new(&device, config.format);
         let (hit_target, hit_target_view) = create_hit_target(&device, size);
         Ok(Self {
@@ -379,6 +458,11 @@ impl WindowGpu {
             pending_hit_slot: None,
             next_input_sequence: 0,
             started_at: Instant::now(),
+            last_draw_instance_count: 0,
+            hit_target_dirty: true,
+            last_present: Instant::now(),
+            frame_count: 0,
+            longest_frame_gap_ms: 0.0,
         })
     }
 }
@@ -422,6 +506,7 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                     let x = position.x.max(0.0).min(gpu.config.width.saturating_sub(1) as f64) as u32;
                     let y = position.y.max(0.0).min(gpu.config.height.saturating_sub(1) as f64) as u32;
                     gpu.pending_hit_pixel = Some([x, y]);
+                    self.redraw_pending = true;
                 }
             }
             WindowEvent::MouseInput { state, button, .. }
@@ -430,6 +515,7 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
             {
                 if let Some(gpu) = self.gpu.as_mut() {
                     gpu.ui.press_hovered(gpu.started_at.elapsed().as_secs_f32());
+                    self.redraw_pending = true;
                 }
             }
             WindowEvent::RedrawRequested => {
@@ -444,13 +530,22 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: WindowCommand) {
         match event {
-            WindowCommand::Fragments(fragments) => self.fragments = fragments,
+            WindowCommand::Fragments { composition_revision, fragments, applied } => {
+                let accepted = self.apply_fragments(composition_revision, fragments);
+                if accepted {
+                    self.pending_composition_ack = applied;
+                } else if let Some(applied) = applied {
+                    let _ = applied.send(0);
+                }
+            }
             WindowCommand::Shutdown => event_loop.exit(),
         }
     }
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        if let Some(window) = self.window.as_ref() {
+        if let Some(window) = self.window.as_ref()
+            && self.needs_redraw()
+        {
             window.request_redraw();
         }
     }
@@ -459,7 +554,6 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
 fn spawn_window_server(
     epoch: u64,
     endpoint: SocketAddr,
-    request_count: usize,
     proxy: EventLoopProxy<WindowCommand>,
 ) {
     thread::spawn(move || {
@@ -472,19 +566,29 @@ fn spawn_window_server(
             }
         };
         let mut runtime = WgpuRuntime::headless(epoch);
-        for _ in 0..request_count {
-            let proxy = proxy.clone();
-            if let Err(error) = server.serve_one(|request| {
-                let response = runtime.handle(request);
-                if response.status == RpcStatus::Accepted {
-                    let _ =
-                        proxy.send_event(WindowCommand::Fragments(runtime.fragments_snapshot()));
+        if let Err(error) = server.serve_until(|request| {
+            let shutdown = request.method == "service.shutdown";
+            let mutates_composition = matches!(request.method.as_str(), "wgpu.ui.submit_fragment" | "wgpu.ui.remove_fragment");
+            let response = runtime.handle(request);
+            if mutates_composition && response.status == RpcStatus::Accepted {
+                let (applied_tx, applied_rx) = std::sync::mpsc::channel();
+                let send = proxy.send_event(WindowCommand::Fragments {
+                    composition_revision: runtime.diagnostics().graph_revision,
+                    fragments: runtime.fragments_snapshot(),
+                    applied: Some(applied_tx),
+                });
+                if send.is_err() {
+                    return (runtime.reject(response.request_id, "window_compositor_unavailable", "window compositor is unavailable", None), !shutdown);
                 }
-                response
-            }) {
-                eprintln!("window RPC server request failed: {error}");
-                break;
+                match applied_rx.recv_timeout(std::time::Duration::from_secs(2)) {
+                    Ok(count) if count > 0 => {}
+                    Ok(_) => return (runtime.reject(response.request_id, "window_compositor_stale", "window compositor rejected a stale composition revision", Some(runtime.diagnostics().graph_revision)), !shutdown),
+                    Err(_) => return (runtime.reject(response.request_id, "window_compositor_timeout", "window compositor did not apply the fragment", Some(runtime.diagnostics().graph_revision)), !shutdown),
+                }
             }
+            (response, !shutdown)
+        }) {
+            eprintln!("window RPC server request failed: {error}");
         }
         let _ = proxy.send_event(WindowCommand::Shutdown);
     });
@@ -750,6 +854,14 @@ impl WgpuRuntime {
             request.method.as_str(),
             "wgpu.ui.submit_fragment" | "wgpu.ui.remove_fragment"
         ) {
+            if request.client.kind == ClientKind::UiReactClient {
+                return self.reject(
+                    request_id,
+                    "renderer_submission_requires_ui_runtime",
+                    "React declarations must be submitted through ui-runtime",
+                    None,
+                );
+            }
             let Some(idempotency_key) = request.idempotency_key.as_ref() else {
                 return self.reject(
                     request_id,
@@ -774,6 +886,7 @@ impl WgpuRuntime {
                 self.accept(request_id, diagnostics_value(self.diagnostics()))
             }
             "wgpu.render.graph.snapshot" => self.accept(request_id, json!(composition_graph_snapshot(self.graph_revision, self.hit_target_generation))),
+            "wgpu.ui.fragment.snapshot" => self.fragment_snapshot(request_id, request.params),
             "wgpu.render.target.capture" => self.target_capture(request_id, request.params),
             "wgpu.render.target.assert" => self.target_assert(request_id, request.params),
             "wgpu.resource.inspect" => self.resource_inspect(request_id),
@@ -921,6 +1034,21 @@ impl WgpuRuntime {
             self.input.cancel();
         }
         self.accept(request_id, diagnostics_value(self.diagnostics()))
+    }
+
+    fn fragment_snapshot(&mut self, request_id: RequestId, params: Value) -> RpcResponse {
+        let Some(fragment_id) = params.get("fragment_id").and_then(Value::as_str) else {
+            return self.reject(request_id, "invalid_request", "fragment_id is required", None);
+        };
+        let Some(fragment) = self.fragments.get(&UiFragmentId(fragment_id.into())) else {
+            return self.reject(request_id, "not_found", "fragment is not present", None);
+        };
+        self.accept(request_id, json!({
+            "epoch": self.epoch,
+            "sequence": self.graph_revision,
+            "fragment_revision": fragment.revision,
+            "fragment": fragment,
+        }))
     }
 
     /// Test-only U1 scenario bridge. It accepts a semantic event, never a hit ID or node key.
@@ -1223,12 +1351,38 @@ mod tests {
     }
 
     #[test]
+    fn window_mailbox_ignores_stale_composition_and_idles_without_dirty_work() {
+        let mut window = WindowedRuntime::new(1);
+        window.redraw_pending = false;
+        assert!(!window.needs_redraw());
+        assert!(window.apply_fragments(Revision(4), HashMap::from([(UiFragmentId("fresh".into()), fragment(4))])));
+        assert!(window.needs_redraw());
+        window.redraw_pending = false;
+        assert!(!window.apply_fragments(Revision(3), HashMap::from([(UiFragmentId("stale".into()), fragment(3))])));
+        assert!(window.fragments.contains_key(&UiFragmentId("fresh".into())));
+        assert!(!window.fragments.contains_key(&UiFragmentId("stale".into())));
+        assert!(!window.needs_redraw());
+    }
+
+    #[test]
     fn stale_fragment_revision_is_rejected() {
         let mut runtime = WgpuRuntime::headless(1);
         runtime.handle(submit("fresh", 2));
         let response = runtime.handle(submit("stale", 1));
         assert_eq!(response.status, RpcStatus::Rejected);
         assert_eq!(response.error.unwrap().code, "revision_conflict");
+    }
+
+    #[test]
+    fn react_client_cannot_bypass_ui_runtime_to_submit_a_fragment() {
+        let mut runtime = WgpuRuntime::headless(1);
+        let mut request = submit("react-direct", 1);
+        request.client.kind = ClientKind::UiReactClient;
+        request.client.origin = "neon-ui-react-client".into();
+        let response = runtime.handle(request);
+        assert_eq!(response.status, RpcStatus::Rejected);
+        assert_eq!(response.error.unwrap().code, "renderer_submission_requires_ui_runtime");
+        assert_eq!(runtime.diagnostics().fragment_count, 0);
     }
 
     #[test]
@@ -1407,6 +1561,19 @@ mod tests {
             &[],
         );
         assert!(pixels.iter().any(|value| *value != 0), "UI render target must contain visible pixels");
+    }
+
+    #[test]
+    fn ui_fragment_renders_visible_pixels_to_srgb_surface_format() {
+        let instance = wgpu::Instance::default();
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::LowPower, compatible_surface: None, force_fallback_adapter: true }))
+            .or_else(|| pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::LowPower, compatible_surface: None, force_fallback_adapter: false })))
+            .expect("a headless adapter is required");
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor { label: Some("neon3-srgb-ui-acceptance"), required_features: wgpu::Features::empty(), required_limits: wgpu::Limits::downlevel_defaults(), memory_hints: wgpu::MemoryHints::MemoryUsage }, None)).expect("a device is required");
+        let root = UiNode { node_id: UiNodeId("srgb-root".into()), kind: UiNodeKind::Panel, bounds: UiBounds { x: 0.0, y: 0.0, width: 64.0, height: 64.0 }, layout: None, visible: true, enabled: true, text_key: None, text: None, image: None, style: UiStyle { background_color: [0.0, 0.7, 0.9, 1.0], border_color: [1.0; 4], border_width: 0.0, corner_radius: 0.0, opacity: 1.0 }, enter_transition: None, children: Vec::new() };
+        let fragments = HashMap::from([(UiFragmentId("srgb-acceptance".into()), UiFragment { fragment_id: UiFragmentId("srgb-acceptance".into()), revision: Revision(1), root, effects: Vec::new() })]);
+        let pixels = ui_renderer::render_offscreen_for_test(&device, &queue, wgpu::TextureFormat::Bgra8UnormSrgb, &fragments, [64, 64], 1.0, &[]);
+        assert!(pixels.iter().any(|value| *value != 0), "sRGB composition target must contain visible UI pixels");
     }
 
     #[test]
@@ -1713,7 +1880,6 @@ mod tests {
             pointer: Some(UiPointerMetadata {
                 id: 0,
                 sequence: 1,
-                logical_position: [4.0, 4.0],
             }),
             focus: None,
         };
