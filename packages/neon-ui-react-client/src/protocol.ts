@@ -97,7 +97,8 @@ export type RpcTransport = {
 };
 
 export type UiSurfaceEvent = { type: "DIAGNOSTICS_TOGGLE" } | { type: "INSPECTOR_TAB_SELECT"; tab: "overview" | "materials" | "history" };
-export type UiSurfaceSnapshot = { revision: Revision; value: { diagnostics: "collapsed" | "expanded"; inspector: { tab: "overview" | "materials" | "history" } }; available_events: Array<UiSurfaceEvent["type"]> };
+export type UiSurfaceEventRequest = { schema_version: 1; surface_id: SurfaceId; event: UiSurfaceEvent };
+export type UiSurfaceSnapshot = { schema_version: 1; surface_id: SurfaceId; revision: Revision; value: { diagnostics: "collapsed" | "expanded"; inspector: { tab: "overview" | "materials" | "history" } }; available_events: Array<UiSurfaceEvent["type"]> };
 
 export type SubmitFragment = (fragment: UiFragment) => Promise<RpcResponse> | RpcResponse | void;
 

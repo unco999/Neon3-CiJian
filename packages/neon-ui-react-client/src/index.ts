@@ -10,4 +10,4 @@ export type { NeonRoot } from "./renderer.js";
 export type { TerrainEditorSurfaceProps, TerrainEditorSnapshot, TerrainMaterialSnapshot, TerrainToolSnapshot } from "./examples/TerrainEditorSurface.js";
 export type { UiAnimationPhase } from "./examples/UiAnimationSurface.js";
 export type { UiNestedAnimationPhase } from "./examples/UiNestedAnimationSurface.js";
-export type { AssetRef, Bounds, JsonValue, NodeKey, NodeProps, Revision, Rgba, RpcResponse, RpcTransport, SurfaceId, SurfaceProps, UiFragment, UiIntent, UiIntentSpec, UiLayout, UiStyle, UiSurfaceEvent, UiTransition, UiSurfaceSnapshot } from "./protocol.js";
+export type { AssetRef, Bounds, JsonValue, NodeKey, NodeProps, Revision, Rgba, RpcResponse, RpcTransport, SurfaceId, SurfaceProps, UiFragment, UiIntent, UiIntentSpec, UiLayout, UiStyle, UiSurfaceEvent, UiSurfaceEventRequest, UiTransition, UiSurfaceSnapshot } from "./protocol.js";

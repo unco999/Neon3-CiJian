@@ -66,7 +66,7 @@ function compileChildren(children: Child[], surfaceId: string, parentPath: strin
     const surfaceEvent = child.props.event as UiSurfaceEvent | undefined;
     if (intentSpec && surfaceEvent) throw new Error(`${path} cannot declare both intent and event`);
     if (surfaceEvent && kind !== "button") throw new Error(`${path}.event is only valid on Button`);
-    const intent = surfaceEvent ? toSurfaceEventIntent(surfaceEvent) : intentSpec ? toWireIntent(intentSpec) : undefined;
+    const intent = surfaceEvent ? toSurfaceEventIntent(surfaceId, surfaceEvent) : intentSpec ? toWireIntent(intentSpec) : undefined;
     const id = nodeId(surfaceId, path);
     if (intent) {
       validateIntent(intent);
@@ -114,10 +114,11 @@ function boolProp(value: unknown, fallback: boolean): boolean { return value ===
 function styleProp(style: unknown): UiStyle { return (style as UiStyle | undefined) ?? {}; }
 function toWireIntent(spec: UiIntentSpec): UiIntent { validateIntent(spec); return { kind: "invoke", action: spec.action, params: spec.params }; }
 function validateIntent(intent: UiIntentSpec) { if (!intent || typeof intent.action !== "string" || !intent.action.trim()) throw new Error("intent.action is required"); }
-function toSurfaceEventIntent(event: UiSurfaceEvent): UiIntent {
+function toSurfaceEventIntent(surfaceId: string, event: UiSurfaceEvent): UiIntent {
   if (!event || typeof event !== "object" || typeof event.type !== "string") throw new Error("Button.event is invalid");
-  if (event.type === "DIAGNOSTICS_TOGGLE") return { kind: "invoke", action: "ui.surface.event", params: { event } };
-  if (event.type === "INSPECTOR_TAB_SELECT" && ["overview", "materials", "history"].includes(event.tab)) return { kind: "invoke", action: "ui.surface.event", params: { event } };
+  const params = { schema_version: 1, surface_id: surfaceId, event };
+  if (event.type === "DIAGNOSTICS_TOGGLE") return { kind: "invoke", action: "ui.surface.event", params };
+  if (event.type === "INSPECTOR_TAB_SELECT" && ["overview", "materials", "history"].includes(event.tab)) return { kind: "invoke", action: "ui.surface.event", params };
   throw new Error("Button.event is invalid");
 }
 function transitionProp(value: unknown): UiNode["enter_transition"] {

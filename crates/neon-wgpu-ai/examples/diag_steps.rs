@@ -73,8 +73,29 @@ fn main() {
     ))
     .expect("device request failed");
 
-    let mut engine = AiEngine::new(device, queue);
     let bytes = std::fs::read(&pack_path).unwrap_or_else(|error| panic!("read {pack_path}: {error}"));
+    let pack = WeightPack::parse(&bytes).expect("pack parse");
+    for name in [
+        "downs.0.b1.n1.weight",
+        "downs.0.b2.n1.weight",
+        "downs.0.b1.c1.weight",
+        "downs.0.b2.c1.weight",
+        "downs.0.b1.film.weight",
+        "downs.0.b2.film.weight",
+        "downs.0.b1.n1.bias",
+        "downs.0.b2.n1.bias",
+    ] {
+        let t = pack.tensor(name).expect("tensor");
+        let v = t.to_f32().expect("f32");
+        let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+        for x in &v {
+            lo = lo.min(*x);
+            hi = hi.max(*x);
+        }
+        println!("cpu {name}: n={} min={lo} max={hi}", v.len());
+    }
+
+    let mut engine = AiEngine::new(device, queue);
     engine.load_model(&bytes).expect("model load failed");
 
     let (model, ctx) = engine.model_and_ctx();

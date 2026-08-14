@@ -7,10 +7,15 @@ use serde::{Deserialize, Serialize};
 /// Version of the renderer-independent UI declaration contract.
 /// This is deliberately separate from the RPC transport version.
 pub const UI_FRAGMENT_SCHEMA_VERSION: u16 = 1;
+pub const UI_SURFACE_SCHEMA_VERSION: u16 = 1;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct UiFragmentId(pub String);
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct UiSurfaceId(pub String);
 
 /// Fragment-local declaration identity. This is never a public input or domain identifier.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -30,6 +35,8 @@ pub struct UiFragment {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UiSurfaceSnapshot {
+    pub schema_version: u16,
+    pub surface_id: UiSurfaceId,
     pub revision: Revision,
     pub value: UiSurfaceState,
     pub available_events: Vec<UiSurfaceEventKind>,
@@ -67,7 +74,11 @@ pub enum UiSurfaceEvent {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct UiSurfaceEventRequest { pub event: UiSurfaceEvent }
+pub struct UiSurfaceEventRequest {
+    pub schema_version: u16,
+    pub surface_id: UiSurfaceId,
+    pub event: UiSurfaceEvent,
+}
 
 /// The only payload accepted by `wgpu.ui.submit_fragment`.
 /// It contains declarative UI data only; React/TS component state and render handles
@@ -505,10 +516,14 @@ mod tests {
     #[test]
     fn surface_machine_event_and_snapshot_use_stable_json_contracts() {
         let request: UiSurfaceEventRequest = serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "surface_id": "surface.ui-workbench",
             "event": { "type": "INSPECTOR_TAB_SELECT", "tab": "materials" }
         })).unwrap();
         assert_eq!(request.event, UiSurfaceEvent::InspectorTabSelect { tab: UiInspectorTab::Materials });
         let snapshot = UiSurfaceSnapshot {
+            schema_version: UI_SURFACE_SCHEMA_VERSION,
+            surface_id: UiSurfaceId("surface.ui-workbench".into()),
             revision: Revision(7),
             value: UiSurfaceState {
                 diagnostics: UiDiagnosticsState::Expanded,
@@ -517,6 +532,8 @@ mod tests {
             available_events: vec![UiSurfaceEventKind::DiagnosticsToggle, UiSurfaceEventKind::InspectorTabSelect],
         };
         assert_eq!(serde_json::to_value(snapshot).unwrap(), serde_json::json!({
+            "schema_version": 1,
+            "surface_id": "surface.ui-workbench",
             "revision": 7,
             "value": { "diagnostics": "expanded", "inspector": { "tab": "materials" } },
             "available_events": ["DIAGNOSTICS_TOGGLE", "INSPECTOR_TAB_SELECT"]

@@ -47,7 +47,7 @@ test("Button event compiles to the typed UI surface intent", () => {
   assert.deepEqual(fragment.effects, [{
     kind: "bound_semantic_intent",
     node_id: fragment.root.children[0].children[0].node_id,
-    intent: { kind: "invoke", action: "ui.surface.event", params: { event: { type: "INSPECTOR_TAB_SELECT", tab: "materials" } } },
+    intent: { kind: "invoke", action: "ui.surface.event", params: { schema_version: 1, surface_id: "surface.terrain.inspector", event: { type: "INSPECTOR_TAB_SELECT", tab: "materials" } } },
   }]);
   assert.throws(() => compileContainer(surface([panel("not-a-button", [], { event: { type: "DIAGNOSTICS_TOGGLE" } })])), /only valid on Button/);
   assert.throws(() => compileContainer(surface([createHost("neon-button", { nodeKey: "ambiguous", bounds: { x: 0, y: 0, width: 20, height: 20 }, event: { type: "DIAGNOSTICS_TOGGLE" }, intent: { action: "ui.surface.event", params: {} } })])), /both intent and event/);

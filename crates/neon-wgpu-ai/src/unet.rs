@@ -158,7 +158,9 @@ impl<'a> UnetExecutor<'a> {
             &g1.buffer,
             cin as u64 * res as u64 * res as u64,
         );
+        diag_check(self.ctx, &s1.buffer, (cin * res * res) as usize, &format!("{name}.s1"));
         let h1 = ops::conv2d(self.ctx, &s1.buffer, c1w, c1b, cin, cout, res, res, 3, 3, 1, 1);
+        diag_check(self.ctx, &h1.buffer, (cout * res * res) as usize, &format!("{name}.h1"));
         let g2 = ops::group_norm(self.ctx, &h1.buffer, n2w, n2b, 8, cout, res, res, GN_EPS)?;
         let s2 = ops::silu(
             self.ctx,
@@ -166,10 +168,12 @@ impl<'a> UnetExecutor<'a> {
             cout as u64 * res as u64 * res as u64,
         );
         let h2 = ops::conv2d(self.ctx, &s2.buffer, c2w, c2b, cout, cout, res, res, 3, 3, 1, 1);
+        diag_check(self.ctx, &h2.buffer, (cout * res * res) as usize, &format!("{name}.h2"));
 
         // film params = c @ film.weight^T + film.bias  (2*cout)
         let film0 = ops::lin(self.ctx, c, fw, cout * 2, 256);
         let film = ops::add(self.ctx, &film0.buffer, fb, cout as u64 * 2);
+        diag_check(self.ctx, &film.buffer, (cout * 2) as usize, &format!("{name}.film"));
         let h3 = ops::film(
             self.ctx,
             &h2.buffer,
@@ -278,11 +282,13 @@ impl<'a> UnetExecutor<'a> {
     ) -> Result<Buf, AiError> {
         let c = self.cond_vector(t, indices)?;
         let cbuf = &c.buffer;
+        diag_check(self.ctx, cbuf, 256, "cond");
         let chs = self.model.spec.channels();
         let [c96, _, _, c768] = chs;
 
         let (iw, ib) = self.model.tensor_pair("input")?;
         let mut h = ops::conv2d(self.ctx, x, iw, ib, 1, c96, size, size, 3, 3, 1, 1);
+        diag_check(self.ctx, &h.buffer, (c96 * size * size) as usize, "input_conv");
 
         let mut skips: Vec<Buf> = Vec::new();
         let mut res = size;
@@ -291,6 +297,7 @@ impl<'a> UnetExecutor<'a> {
             let cin = if i == 0 { cout } else { chs[i - 1] };
             h = self.res_block(&h.buffer, &format!("downs.{i}.b1"), cin, cout, res, cbuf)?;
             h = self.res_block(&h.buffer, &format!("downs.{i}.b2"), cout, cout, res, cbuf)?;
+            diag_check(self.ctx, &h.buffer, (cout * res * res) as usize, &format!("downs.{i}.b2"));
             if i >= self.model.spec.attn_from_level as usize {
                 h = self.attn_block(&h.buffer, &format!("downs.{i}.attn"), cout, res)?;
             }
@@ -304,6 +311,7 @@ impl<'a> UnetExecutor<'a> {
         h = self.res_block(&h.buffer, "mid.0.b1", c768, c768, res, cbuf)?;
         h = self.attn_block(&h.buffer, "mid.1.attn", c768, res)?;
         h = self.res_block(&h.buffer, "mid.2.b1", c768, c768, res, cbuf)?;
+        diag_check(self.ctx, &h.buffer, (c768 * res * res) as usize, "mid_end");
 
         for i in 0..3 {
             let cout = chs[2 - i];
@@ -317,12 +325,14 @@ impl<'a> UnetExecutor<'a> {
             }
             res *= 2;
         }
+        diag_check(self.ctx, &h.buffer, (c96 * res * res) as usize, "ups_end");
         h = self.res_block(&h.buffer, "ups.3.b1", c96, c96, res, cbuf)?;
         h = self.res_block(&h.buffer, "ups.3.b2", c96, c96, res, cbuf)?;
 
         let (ow, ob) = self.model.tensor_pair("out.0")?;
         h = ops::group_norm(self.ctx, &h.buffer, ow, ob, 8, c96, res, res, GN_EPS)?;
         h = ops::silu(self.ctx, &h.buffer, c96 as u64 * res as u64 * res as u64);
+        diag_check(self.ctx, &h.buffer, (c96 * res * res) as usize, "out_silu");
         let (cw, cb) = self.model.tensor_pair("out.2")?;
         Ok(ops::conv2d(self.ctx, &h.buffer, cw, cb, c96, 1, res, res, 3, 3, 1, 1))
     }

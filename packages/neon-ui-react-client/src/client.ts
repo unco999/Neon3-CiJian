@@ -1,4 +1,4 @@
-import type { JsonValue, Revision, RpcRequest, RpcResponse, RpcTransport, UiFragment, UiIntent, UiIntentSpec, UiSurfaceEvent, UiSurfaceSnapshot } from "./protocol.js";
+import type { JsonValue, Revision, RpcRequest, RpcResponse, RpcTransport, UiFragment, UiIntent, UiIntentSpec, UiSurfaceEvent, UiSurfaceEventRequest, UiSurfaceSnapshot } from "./protocol.js";
 
 export class NeonUiClient {
   constructor(private readonly transport: RpcTransport, private readonly instanceId = `react-${crypto.randomUUID()}`) {}
@@ -19,7 +19,8 @@ export class NeonUiClient {
   }
 
   async surfaceEvent(event: UiSurfaceEvent, snapshot: UiSurfaceSnapshot): Promise<UiSurfaceSnapshot> {
-    const response = await this.call("ui-runtime", "ui.surface.event", { event }, snapshot.revision, `surface-event:${event.type}:${snapshot.revision}:${"tab" in event ? event.tab : ""}`);
+    const params: UiSurfaceEventRequest = { schema_version: 1, surface_id: snapshot.surface_id, event };
+    const response = await this.call("ui-runtime", "ui.surface.event", params, snapshot.revision, `surface-event:${event.type}:${snapshot.revision}:${"tab" in event ? event.tab : ""}`);
     if (response.status !== "accepted" || !response.result) throw new Error(response.error?.message ?? "UI surface event was rejected");
     return response.result as unknown as UiSurfaceSnapshot;
   }
