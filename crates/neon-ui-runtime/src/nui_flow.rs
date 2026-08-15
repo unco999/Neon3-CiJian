@@ -128,6 +128,8 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
                 node_key: node.node.node_id.0.clone(),
                 intent: intent.clone(),
                 allowed_payload_keys: Vec::new(),
+                literal_payload: std::collections::BTreeMap::new(),
+                bound_input_keys: Vec::new(),
             });
         }
         if let Some(predicate) = &node.branch_predicate {

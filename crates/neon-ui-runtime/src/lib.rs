@@ -25,6 +25,8 @@ use neon_ui_schema::{
     UiProgramLiteralText, UiProgramNode, UiProgramResourceKind, UiProgramRevision,
     UiBranchPredicate, UiBranchRecord, UiTemplateRecord, UiRepeatFrame,
     UiResolvedInputValue, UiResolvedInputs, UiResourceBudget, UiSchemaError, UiSemanticEvent,
+    UiProgramSemanticEvent, UiProgramSemanticEventKind, UiProgramSemanticEventResult,
+    UiProgramSemanticEventStatus, UiSemanticPayloadValue, UiEventTraceRecord,
     UiStyle, UiSurfaceEvent, UiSurfaceEventKind, UiSurfaceEventRequest, UiSurfaceId,
     UiSurfaceSnapshot, UiSurfaceState, UiTextHandle, UiTextHandleDiagnostic, UiTextHandleStatus,
     UiTextRecord, UiTextRegistryDebugSnapshot, UiTextRegistryEntryMetadata, UiTextRegistrySnapshot,
@@ -38,6 +40,9 @@ use neon_ui_schema::{
     ERROR_UI_PROGRAM_UNKNOWN_INPUT_KEY, ERROR_UI_PROGRAM_UNKNOWN_TEXT_HANDLE,
     UI_SURFACE_SCHEMA_VERSION, ERROR_UI_PROGRAM_INVALID_BRANCH_TEMPLATE,
     ERROR_UI_PROGRAM_CAPACITY_OVERFLOW,
+    ERROR_UI_PROGRAM_EVENT_CONTROL_UNAVAILABLE, ERROR_UI_PROGRAM_EVENT_DUPLICATE_IDEMPOTENCY_KEY,
+    ERROR_UI_PROGRAM_EVENT_INTERACTION_EPOCH_MISMATCH, ERROR_UI_PROGRAM_EVENT_INVALID_SOURCE,
+    ERROR_UI_PROGRAM_EVENT_PAYLOAD_REJECTED, ERROR_UI_PROGRAM_EVENT_STALE_REVISION,
 };
 use serde_json::{json, Value};
 
@@ -759,6 +764,99 @@ pub struct UiLocalPresentationState {
     pub revision: Revision,
 }
 
+/// UI-program semantic event gate. It validates only declaration and resolved
+/// UI state; routing an accepted intent to its domain owner remains the caller's
+/// responsibility. This keeps the CPU backend useful without a WGPU dependency.
+#[derive(Clone, Debug)]
+pub struct UiProgramSemanticEventRouter {
+    program: UiProgram,
+    inputs: UiResolvedInputs,
+    renderer_epoch: u64,
+    next_trace_sequence: u64,
+    idempotent_results: HashMap<String, UiProgramSemanticEventResult>,
+    trace: Vec<UiEventTraceRecord>,
+}
+
+impl UiProgramSemanticEventRouter {
+    pub fn new(program: UiProgram, inputs: UiResolvedInputs, renderer_epoch: u64) -> Self {
+        Self { program, inputs, renderer_epoch, next_trace_sequence: 0, idempotent_results: HashMap::new(), trace: Vec::new() }
+    }
+
+    pub fn replace_resolved_inputs(&mut self, inputs: UiResolvedInputs) { self.inputs = inputs; }
+    pub fn set_renderer_epoch(&mut self, renderer_epoch: u64) { self.renderer_epoch = renderer_epoch; }
+    pub fn trace(&self) -> &[UiEventTraceRecord] { &self.trace }
+
+    pub fn validate(&mut self, event: &UiProgramSemanticEvent) -> UiProgramSemanticEventResult {
+        if let Some(result) = self.idempotent_results.get(&event.idempotency_key) {
+            let mut replay = result.clone();
+            replay.status = UiProgramSemanticEventStatus::Duplicate;
+            replay.code = Some(ERROR_UI_PROGRAM_EVENT_DUPLICATE_IDEMPOTENCY_KEY.into());
+            self.record(event, &replay);
+            return replay;
+        }
+        let failure = self.validate_fresh(event).err();
+        let result = match failure {
+            Some((code, message)) => UiProgramSemanticEventResult { event_id: event.event_id.clone(), status: UiProgramSemanticEventStatus::Rejected, code: Some(code.into()), accepted_input_revision: None, message: message.into() },
+            None => UiProgramSemanticEventResult { event_id: event.event_id.clone(), status: UiProgramSemanticEventStatus::Accepted, code: None, accepted_input_revision: Some(self.inputs.input_revision), message: "semantic event accepted; controlled values remain pending until an external input frame arrives".into() },
+        };
+        self.idempotent_results.insert(event.idempotency_key.clone(), result.clone());
+        self.record(event, &result);
+        result
+    }
+
+    fn validate_fresh(&self, event: &UiProgramSemanticEvent) -> Result<(), (&'static str, &'static str)> {
+        if event.event_id.trim().is_empty() || event.request_id.trim().is_empty() || event.idempotency_key.trim().is_empty() || event.interaction.interaction_id.trim().is_empty() {
+            return Err((ERROR_UI_PROGRAM_EVENT_INVALID_SOURCE, "event identity and interaction metadata are required"));
+        }
+        if event.program_revision != self.program.revision || event.input_revision != self.inputs.input_revision {
+            return Err((ERROR_UI_PROGRAM_EVENT_STALE_REVISION, "program or input revision is stale"));
+        }
+        if event.interaction.renderer_epoch != self.renderer_epoch {
+            return Err((ERROR_UI_PROGRAM_EVENT_INTERACTION_EPOCH_MISMATCH, "renderer epoch does not match the active event gate"));
+        }
+        let node = self.program.nodes.iter().find(|node| node.key == event.source_node_key)
+            .ok_or((ERROR_UI_PROGRAM_EVENT_INVALID_SOURCE, "event source node is not declared by this program"))?;
+        let declaration = self.program.event_records.iter().find(|declaration| declaration.node_key == node.key && declaration.intent == event.intent)
+            .ok_or((ERROR_UI_PROGRAM_EVENT_INVALID_SOURCE, "event intent is not declared by the source node"))?;
+        let state = evaluate_ui_program(&self.program, &self.inputs, UiCpuViewport { logical_bounds: UiBounds { x: 0.0, y: 0.0, width: f32::MAX, height: f32::MAX }, revision: Revision(0) }, &UiLocalPresentationState { revision: Revision(0) })
+            .nodes.into_iter().find(|state| state.node_key == event.source_node_key)
+            .ok_or((ERROR_UI_PROGRAM_EVENT_INVALID_SOURCE, "event source has no evaluated state"))?;
+        if !state.visible || !state.enabled {
+            return Err((ERROR_UI_PROGRAM_EVENT_CONTROL_UNAVAILABLE, "event source is hidden or disabled"));
+        }
+        if matches!(event.kind, UiProgramSemanticEventKind::TextEditCommit) && !event.payload.values().any(|value| matches!(value, UiSemanticPayloadValue::TextHandle { .. })) {
+            return Err((ERROR_UI_PROGRAM_EVENT_PAYLOAD_REJECTED, "text edit commits require a bounded text handle payload"));
+        }
+        let mut expected = declaration.literal_payload.clone();
+        for key in &declaration.bound_input_keys {
+            let value = self.inputs.values.get(key).ok_or((ERROR_UI_PROGRAM_EVENT_PAYLOAD_REJECTED, "event references an absent bound input"))?;
+            expected.insert(key.clone(), input_value_as_event_payload(&value.value).ok_or((ERROR_UI_PROGRAM_EVENT_PAYLOAD_REJECTED, "bound input kind cannot cross the semantic event boundary"))?);
+        }
+        if event.payload != expected {
+            return Err((ERROR_UI_PROGRAM_EVENT_PAYLOAD_REJECTED, "event payload differs from declared literals or resolved bound inputs"));
+        }
+        Ok(())
+    }
+
+    fn record(&mut self, event: &UiProgramSemanticEvent, result: &UiProgramSemanticEventResult) {
+        self.next_trace_sequence += 1;
+        self.trace.push(UiEventTraceRecord { sequence: self.next_trace_sequence, event_id: event.event_id.clone(), intent: event.intent.clone(), source_node_key: event.source_node_key.clone(), program_revision: event.program_revision.revision, input_revision: event.input_revision, renderer_epoch: event.interaction.renderer_epoch, result: result.status, code: result.code.clone(), timestamp_unix_ms: 0 });
+    }
+}
+
+fn input_value_as_event_payload(value: &UiInputValue) -> Option<UiSemanticPayloadValue> {
+    Some(match value {
+        UiInputValue::Bool { value } => UiSemanticPayloadValue::Bool { value: *value },
+        UiInputValue::I32 { value } => UiSemanticPayloadValue::I32 { value: *value },
+        UiInputValue::U32 { value } => UiSemanticPayloadValue::U32 { value: *value },
+        UiInputValue::F32 { value } => UiSemanticPayloadValue::F32 { value: *value },
+        UiInputValue::Enum { value } => UiSemanticPayloadValue::Enum { value: value.clone() },
+        UiInputValue::TextHandle { value } => UiSemanticPayloadValue::TextHandle { value: *value },
+        UiInputValue::AssetHandle { id, generation } => UiSemanticPayloadValue::AssetHandle { id: *id, generation: *generation },
+        UiInputValue::Vec2 { .. } | UiInputValue::Vec4 { .. } | UiInputValue::Color { .. } => return None,
+    })
+}
+
 /// UI-owned cache of bounded, domain-prepared repeat rows. It preserves row
 /// identity by stable key and never sorts, filters, or derives business data.
 #[derive(Clone, Debug, Default)]
@@ -964,6 +1062,29 @@ pub fn compile_ui_program(
                 "ui_program_invalid_event",
                 "event declaration must target a node and have a nonempty typed intent",
             ));
+        }
+        let mut payload_keys = HashSet::new();
+        for key in event.literal_payload.keys().chain(event.bound_input_keys.iter()) {
+            if key.trim().is_empty() || !payload_keys.insert(key) {
+                return Err(compile_error(
+                    "ui_program_invalid_event",
+                    "event payload keys must be nonempty and unique",
+                ));
+            }
+        }
+        for input_key in &event.bound_input_keys {
+            let Some(slot) = schema.slots.iter().find(|slot| &slot.key == input_key) else {
+                return Err(compile_error(
+                    ERROR_UI_PROGRAM_UNKNOWN_INPUT_KEY,
+                    "event binding references an unknown input slot",
+                ));
+            };
+            if input_value_as_event_payload(&slot.default_value).is_none() {
+                return Err(compile_error(
+                    ERROR_UI_PROGRAM_INPUT_TYPE_MISMATCH,
+                    "event bindings support only scalar, enum, handle, and text-handle inputs",
+                ));
+            }
         }
     }
     let node_to_source_span = nodes
@@ -3242,6 +3363,8 @@ mod tests {
                 node_key: "commit".into(),
                 intent: "terrain.commit".into(),
                 allowed_payload_keys: Vec::new(),
+                literal_payload: BTreeMap::new(),
+                bound_input_keys: Vec::new(),
             }],
             resources: Vec::new(),
             branches: Vec::new(),
@@ -3297,6 +3420,32 @@ mod tests {
                 .visible
         );
         assert_eq!(output.semantic_targets[0].node_key, "commit");
+    }
+
+    #[test]
+    fn program_semantic_events_require_current_enabled_declarations_and_are_idempotent() {
+        use neon_ui_schema::{UiProgramSemanticEvent, UiProgramSemanticEventKind, UiSemanticInteractionMetadata};
+        let mut document = compiler_document();
+        document.events[0].literal_payload.insert("tool".into(), UiSemanticPayloadValue::Enum { value: "water".into() });
+        let revision = compiler_program_revision();
+        let program = compile_ui_program(&document, revision.clone(), &compiler_schema(true)).unwrap();
+        let inputs = UiInputStore::activate(revision.clone(), compiler_schema(true)).unwrap().snapshot();
+        let mut router = UiProgramSemanticEventRouter::new(program, inputs.clone(), 7);
+        let event = UiProgramSemanticEvent {
+            event_id: "event-1".into(), kind: UiProgramSemanticEventKind::Activate,
+            intent: "terrain.commit".into(), source_node_key: "commit".into(),
+            payload: BTreeMap::from([("tool".into(), UiSemanticPayloadValue::Enum { value: "water".into() })]),
+            program_revision: revision, input_revision: inputs.input_revision,
+            request_id: "request-1".into(), idempotency_key: "key-1".into(),
+            interaction: UiSemanticInteractionMetadata { interaction_id: "interaction-1".into(), sequence: 1, renderer_epoch: 7 },
+        };
+        assert_eq!(router.validate(&event).status, UiProgramSemanticEventStatus::Accepted);
+        assert_eq!(router.validate(&event).status, UiProgramSemanticEventStatus::Duplicate);
+        let mut stale = event;
+        stale.idempotency_key = "key-2".into();
+        stale.input_revision = Revision(99);
+        assert_eq!(router.validate(&stale).code.as_deref(), Some(ERROR_UI_PROGRAM_EVENT_STALE_REVISION));
+        assert_eq!(router.trace().len(), 3);
     }
 
     #[test]

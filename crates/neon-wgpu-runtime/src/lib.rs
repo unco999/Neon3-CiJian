@@ -41,6 +41,7 @@ pub const SERVICE_NAME: &str = "wgpu-runtime";
 pub const CAPABILITY_UI_FRAGMENT: &str = "wgpu.ui.fragment.v1";
 pub const CAPABILITY_UI_HIT_TARGET: &str = "wgpu.ui.hit_target.v1";
 pub const CAPABILITY_UI_SEMANTIC_EVENT: &str = "wgpu.ui.semantic_event.v1";
+pub const CAPABILITY_UI_PROGRAM_SEMANTIC_EVENT: &str = "wgpu.ui.program.semantic_event.v1";
 pub const CAPABILITY_UI_RENDER_SURFACE: &str = "wgpu.ui.render_surface.v1";
 pub const CAPABILITY_AI_TERRAIN_GENERATION: &str = "wgpu.ai.terrain_generation.v1";
 pub const UI_HIT_TARGET: &str = "ui.hit_id.v1";
@@ -57,6 +58,19 @@ struct UiResourceRecord { asset: AssetRef, job_id: String, state: UiResourceStat
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum LocalInteractionState { Idle, Hovered, Captured, Cancelled }
+
+/// Renderer-owned feedback only. Its semantic keys are diagnostic labels; the
+/// actual hit IDs, pointer positions, selection geometry, and capture handles
+/// stay private to this process. No field in this type is domain authority.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct UiLocalPresentationState {
+    pub hovered_node_key: Option<String>,
+    pub pressed_node_key: Option<String>,
+    pub captured_node_key: Option<String>,
+    pub scroll_preview_active: bool,
+    pub text_edit_active: bool,
+    pub renderer_epoch: u64,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct HitSampleRequest { pointer_id: u64, sequence: u64, composition_revision: Revision, target_generation: u64 }
@@ -1223,6 +1237,7 @@ impl WgpuRuntime {
             "wgpu.render.diagnostics".into(),
             CAPABILITY_UI_HIT_TARGET.into(),
             CAPABILITY_UI_SEMANTIC_EVENT.into(),
+            CAPABILITY_UI_PROGRAM_SEMANTIC_EVENT.into(),
             CAPABILITY_UI_RENDER_SURFACE.into(),
         ];
         if self.window_gpu_available {
@@ -1829,12 +1844,12 @@ mod tests {
         assert_eq!(described["protocol_version"], json!(PROTOCOL_VERSION));
         assert_eq!(
             described["capabilities"],
-            json!([CAPABILITY_UI_FRAGMENT, "wgpu.render.diagnostics", CAPABILITY_UI_HIT_TARGET, CAPABILITY_UI_SEMANTIC_EVENT, CAPABILITY_UI_RENDER_SURFACE])
+            json!([CAPABILITY_UI_FRAGMENT, "wgpu.render.diagnostics", CAPABILITY_UI_HIT_TARGET, CAPABILITY_UI_SEMANTIC_EVENT, CAPABILITY_UI_PROGRAM_SEMANTIC_EVENT, CAPABILITY_UI_RENDER_SURFACE])
         );
         assert_eq!(snapshot.status, RpcStatus::Accepted);
         assert_eq!(
             snapshot.result.unwrap()["capabilities"],
-            json!([CAPABILITY_UI_FRAGMENT, "wgpu.render.diagnostics", CAPABILITY_UI_HIT_TARGET, CAPABILITY_UI_SEMANTIC_EVENT, CAPABILITY_UI_RENDER_SURFACE])
+            json!([CAPABILITY_UI_FRAGMENT, "wgpu.render.diagnostics", CAPABILITY_UI_HIT_TARGET, CAPABILITY_UI_SEMANTIC_EVENT, CAPABILITY_UI_PROGRAM_SEMANTIC_EVENT, CAPABILITY_UI_RENDER_SURFACE])
         );
     }
 

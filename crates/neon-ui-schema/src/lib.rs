@@ -16,6 +16,7 @@ pub const UI_PROGRAM_SCHEMA_VERSION: u16 = 1;
 pub const UI_PROGRAM_CAPABILITY_NAME: &str = "ui.program.v1";
 pub const UI_PROGRAM_TEXT_REGISTRY_CAPABILITY_NAME: &str = "ui.program.text_registry.v1";
 pub const UI_PROGRAM_BOUNDED_STRUCTURE_CAPABILITY_NAME: &str = "ui.program.bounded_structure.v1";
+pub const UI_PROGRAM_SEMANTIC_EVENT_CAPABILITY_NAME: &str = "ui.program.semantic_event.v1";
 
 pub const ERROR_UI_PROGRAM_UNSUPPORTED_SCHEMA: &str = "ui_program_unsupported_schema";
 pub const ERROR_UI_PROGRAM_UNSUPPORTED_CAPABILITY: &str = "ui_program_unsupported_capability";
@@ -29,6 +30,12 @@ pub const ERROR_UI_PROGRAM_UNKNOWN_BINDING_TARGET: &str = "ui_program_unknown_bi
 pub const ERROR_UI_PROGRAM_CAPACITY_OVERFLOW: &str = "ui_program_capacity_overflow";
 pub const ERROR_UI_PROGRAM_INVALID_BRANCH_TEMPLATE: &str = "ui_program_invalid_branch_template";
 pub const ERROR_UI_PROGRAM_FORBIDDEN_FLOW_FEATURE: &str = "ui_program_forbidden_flow_feature";
+pub const ERROR_UI_PROGRAM_EVENT_STALE_REVISION: &str = "ui_program_event_stale_revision";
+pub const ERROR_UI_PROGRAM_EVENT_INVALID_SOURCE: &str = "ui_program_event_invalid_source";
+pub const ERROR_UI_PROGRAM_EVENT_CONTROL_UNAVAILABLE: &str = "ui_program_event_control_unavailable";
+pub const ERROR_UI_PROGRAM_EVENT_PAYLOAD_REJECTED: &str = "ui_program_event_payload_rejected";
+pub const ERROR_UI_PROGRAM_EVENT_DUPLICATE_IDEMPOTENCY_KEY: &str = "ui_program_event_duplicate_idempotency_key";
+pub const ERROR_UI_PROGRAM_EVENT_INTERACTION_EPOCH_MISMATCH: &str = "ui_program_event_interaction_epoch_mismatch";
 pub const ERROR_UI_PROGRAM_UNKNOWN_INPUT_KEY: &str = "ui_program_unknown_input_key";
 pub const ERROR_UI_PROGRAM_INPUT_UPDATE_FORBIDDEN: &str = "ui_program_input_update_forbidden";
 pub const ERROR_UI_PROGRAM_DUPLICATE_INPUT_CHANGE: &str = "ui_program_duplicate_input_change";
@@ -182,7 +189,7 @@ impl UiProgramRevision {
             if !names.insert((capability.name.as_str(), capability.version)) {
                 return Err(UiSchemaError::DuplicateProgramCapability);
             }
-            if !matches!(capability.name.as_str(), UI_PROGRAM_CAPABILITY_NAME | UI_PROGRAM_TEXT_REGISTRY_CAPABILITY_NAME | UI_PROGRAM_BOUNDED_STRUCTURE_CAPABILITY_NAME) || capability.version != 1 {
+            if !matches!(capability.name.as_str(), UI_PROGRAM_CAPABILITY_NAME | UI_PROGRAM_TEXT_REGISTRY_CAPABILITY_NAME | UI_PROGRAM_BOUNDED_STRUCTURE_CAPABILITY_NAME | UI_PROGRAM_SEMANTIC_EVENT_CAPABILITY_NAME) || capability.version != 1 {
                 return Err(UiSchemaError::UnsupportedProgramCapability);
             }
         }
@@ -715,9 +722,83 @@ pub struct UiRepeatRow { pub stable_row_key: String, pub values: std::collection
 #[serde(deny_unknown_fields)]
 pub struct UiRepeatFrame { pub template_key: String, pub list_revision: Revision, pub rows: Vec<UiRepeatRow>, pub expected_program_revision: UiProgramRevision }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiProgramEventDeclaration {
+    pub node_key: String,
+    pub intent: String,
+    /// Compatibility list retained for existing IR documents. New declarations
+    /// must use the typed literal or bound payload tables below.
+    #[serde(default)] pub allowed_payload_keys: Vec<String>,
+    #[serde(default)] pub literal_payload: std::collections::BTreeMap<String, UiSemanticPayloadValue>,
+    #[serde(default)] pub bound_input_keys: Vec<String>,
+}
+
+/// The finite payload vocabulary accepted at the program semantic boundary.
+/// It deliberately excludes arbitrary JSON, raw text, coordinates, GPU data,
+/// and renderer-local identifiers.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum UiSemanticPayloadValue {
+    Bool { value: bool }, I32 { value: i32 }, U32 { value: u32 }, F32 { value: f32 },
+    Enum { value: String }, TextHandle { value: UiTextHandle }, AssetHandle { id: u64, generation: u32 },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UiProgramSemanticEventKind { Activate, ValueTentative, TextEditCommit, InteractionCancel }
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct UiProgramEventDeclaration { pub node_key: String, pub intent: String, #[serde(default)] pub allowed_payload_keys: Vec<String> }
+pub struct UiSemanticInteractionMetadata { pub interaction_id: String, pub sequence: u64, pub renderer_epoch: u64 }
+
+/// Program-native semantic event. Unlike the legacy fragment event, this is
+/// revisioned against the compiled program and resolved input snapshot.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiProgramSemanticEvent {
+    pub event_id: String,
+    pub kind: UiProgramSemanticEventKind,
+    pub intent: String,
+    pub source_node_key: String,
+    pub payload: std::collections::BTreeMap<String, UiSemanticPayloadValue>,
+    pub program_revision: UiProgramRevision,
+    pub input_revision: Revision,
+    pub request_id: String,
+    pub idempotency_key: String,
+    pub interaction: UiSemanticInteractionMetadata,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UiProgramSemanticEventStatus { Accepted, Rejected, Duplicate }
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiProgramSemanticEventResult {
+    pub event_id: String,
+    pub status: UiProgramSemanticEventStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub accepted_input_revision: Option<Revision>,
+    pub message: String,
+}
+
+/// Cross-process safe trace data. Renderer-local hit IDs and physical pointer
+/// coordinates are intentionally absent.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiEventTraceRecord {
+    pub sequence: u64,
+    pub event_id: String,
+    pub intent: String,
+    pub source_node_key: String,
+    pub program_revision: Revision,
+    pub input_revision: Revision,
+    pub renderer_epoch: u64,
+    pub result: UiProgramSemanticEventStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub code: Option<String>,
+    pub timestamp_unix_ms: u64,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

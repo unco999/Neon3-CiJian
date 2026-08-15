@@ -113,6 +113,28 @@ preview remain inside WGPU Runtime. Domain-affecting action is accepted only by
 the receiving authority and its resulting value returns through a new resolved
 input revision.
 
+### Program Semantic Event Boundary
+
+`ui.program.semantic_event.v1` uses `UiProgramSemanticEvent` for the compiled
+program path. Each declaration names a stable semantic node key and intent, then
+lists exact literal payload values and/or direct bound input keys. The emitted
+payload must exactly equal those declared values resolved from the accepted
+input snapshot. Arbitrary JSON, raw text, coordinates, renderer hit IDs, and
+GPU identifiers are rejected. Text edit commits carry a `UiTextHandle`; the
+text registry remains responsible for bounded text storage and validation.
+
+The UI runtime validates program and input revision, renderer epoch, source
+node, declared intent, effective visible/enabled state, payload shape, and
+idempotency key before an event is routed to a domain authority. Replaying an
+idempotency key returns the original result as a duplicate rather than applying
+the intent twice. A controlled control may display renderer-local tentative
+feedback, but only a later reliable external input frame is authoritative;
+rejection or cancellation clears that local prediction.
+
+`UiEventTraceRecord` exposes event identity, semantic key, intent, revisions,
+epoch, result code, and timestamp. It never exposes physical positions, render
+hit IDs, selection rectangles, native handles, or GPU state.
+
 ## Capacity and Diagnostics
 
 `UiResourceBudget` declares finite limits for nodes, bindings, branch/template
@@ -142,6 +164,12 @@ pixel coordinates.
 | `ui_program_capacity_overflow` | A declared program or runtime capacity was exceeded. |
 | `ui_program_invalid_branch_template` | A branch/template is not static, bounded, or directly typed. |
 | `ui_program_forbidden_flow_feature` | NUI Flow attempted a scripting or other forbidden feature. |
+| `ui_program_event_stale_revision` | An event targets an outdated program or input snapshot. |
+| `ui_program_event_invalid_source` | The semantic source node or declared intent is invalid. |
+| `ui_program_event_control_unavailable` | The source control is hidden or disabled. |
+| `ui_program_event_payload_rejected` | Payload values differ from the typed declaration. |
+| `ui_program_event_duplicate_idempotency_key` | A repeated event key is recorded as a duplicate result. |
+| `ui_program_event_interaction_epoch_mismatch` | The event belongs to a previous renderer epoch. |
 
 Future revisions may add failure codes but must not repurpose these meanings.
 They must include the associated request, program/input revision, and semantic
