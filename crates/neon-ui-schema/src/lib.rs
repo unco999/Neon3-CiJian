@@ -860,6 +860,30 @@ pub struct UiCpuSemanticTarget { pub node_key: String, pub intents: Vec<String>,
 #[serde(deny_unknown_fields)]
 pub struct UiCpuFrameOutput { pub program_revision: UiProgramRevision, pub input_revision: Revision, pub nodes: Vec<UiCpuNodeState>, pub logical_layout: Vec<UiProgramLayoutRecord>, pub clips: std::collections::BTreeMap<String, UiBounds>, pub render_primitives: Vec<UiCpuRenderPrimitive>, pub semantic_targets: Vec<UiCpuSemanticTarget>, pub diagnostics: Vec<UiDiagnostic> }
 
+/// Compact, semantic inspection data. These records deliberately use stable
+/// node keys and logical bounds; render hit IDs and physical pixels are absent.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiIrOutlineEntry { pub node_key: String, #[serde(default, skip_serializing_if = "Option::is_none")] pub parent_key: Option<String>, pub kind: UiNodeKind, pub static_properties: std::collections::BTreeMap<String, serde_json::Value>, pub binding_summary: Vec<String>, #[serde(default, skip_serializing_if = "Option::is_none")] pub branch_key: Option<String>, #[serde(default, skip_serializing_if = "Option::is_none")] pub template_key: Option<String>, #[serde(default, skip_serializing_if = "Option::is_none")] pub source_span: Option<UiSourceSpan>, pub diagnostic_count: u32 }
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiIrOutlinePage { pub entries: Vec<UiIrOutlineEntry>, pub offset: u32, pub limit: u32, pub total: u32, #[serde(default, skip_serializing_if = "Option::is_none")] pub next_offset: Option<u32> }
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiNodeInspection { pub node: UiProgramNode, pub declared_properties: serde_json::Value, pub effective_properties: serde_json::Value, pub provenance: std::collections::BTreeMap<String, String>, #[serde(default, skip_serializing_if = "Option::is_none")] pub layout: Option<UiProgramLayoutRecord>, #[serde(default, skip_serializing_if = "Option::is_none")] pub clip: Option<UiBounds>, pub visibility_reason: String, pub resources: Vec<UiProgramResource>, pub events: Vec<UiProgramEventDeclaration>, #[serde(default, skip_serializing_if = "Option::is_none")] pub source_span: Option<UiSourceSpan>, pub diagnostics: Vec<UiDiagnostic> }
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiPatchDryRun { pub accepted: bool, pub base_revision: Revision, pub resulting_revision: Revision, pub diff: serde_json::Value, pub impacted_nodes: Vec<String>, pub required_input_schema_changes: Vec<String>, pub budget: UiResourceBudget, pub diagnostics: Vec<UiDiagnostic> }
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiLayoutDiagnosticSnapshot { pub program_revision: UiProgramRevision, pub input_revision: Revision, pub logical_layout: Vec<UiProgramLayoutRecord>, pub clips: std::collections::BTreeMap<String, UiBounds>, pub visibility_reasons: std::collections::BTreeMap<String, String>, pub diagnostics: Vec<UiDiagnostic>, #[serde(default)] pub gpu_differential_mismatches: Vec<UiDiagnostic> }
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiProgramDescription { pub revision: UiProgramRevision, pub layout_hash: String, pub active_capabilities: Vec<UiProgramCapability>, pub resource_budget: UiResourceBudget, pub runtime_high_water_marks: std::collections::BTreeMap<String, u32>, pub overflow_counters: std::collections::BTreeMap<String, u64> }
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiDebugBundle { pub version: u16, pub flow_source_hash: String, pub ir_hash: String, pub program: UiProgram, pub schema: UiInputSchema, pub initial_inputs: UiResolvedInputs, pub input_timeline: Vec<UiInputFrame>, pub repeat_timeline: Vec<UiRepeatFrame>, pub text_registry: UiTextRegistryDebugSnapshot, pub event_timeline: Vec<UiProgramSemanticEvent>, pub viewport: UiCpuViewport, pub expected_frames: Vec<UiCpuFrameOutput>, pub diagnostics: Vec<UiDiagnostic>, #[serde(default, skip_serializing_if = "Option::is_none")] pub gpu_readbacks: Option<Vec<UiGpuLayoutReadback>> }
+
 /// Renderer-owned GPU state exposed only as revisioned diagnostics. Buffer
 /// handles deliberately do not cross this contract boundary.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

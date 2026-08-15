@@ -47,6 +47,7 @@ use neon_ui_schema::{
 use serde_json::{json, Value};
 
 pub mod nui_flow;
+pub mod debug;
 pub use nui_flow::{
     apply_nui_ir_patch, compile_nui_flow_program, format_nui_flow, lower_nui_flow, parse_nui_flow,
     parse_nui_flow_patch, NuiFlowError,
@@ -524,6 +525,14 @@ impl UiTextRegistry {
                     resident: false,
                 })
                 .collect(),
+        }
+    }
+    pub fn handle_diagnostic(&self, handle: UiTextHandle) -> UiTextHandleDiagnostic {
+        match self.entries.get(&handle.id) {
+            Some(entry) if entry.record.handle.generation == handle.generation => UiTextHandleDiagnostic { handle, status: UiTextHandleStatus::Ready, reference_count: entry.reference_count, resident: false, message: "text handle is registered".into() },
+            Some(_) => UiTextHandleDiagnostic { handle, status: UiTextHandleStatus::GenerationMismatch, reference_count: 0, resident: false, message: "text handle generation is stale".into() },
+            None if self.released_generations.contains_key(&handle.id) => UiTextHandleDiagnostic { handle, status: UiTextHandleStatus::Released, reference_count: 0, resident: false, message: "text handle has been released".into() },
+            None => UiTextHandleDiagnostic { handle, status: UiTextHandleStatus::Missing, reference_count: 0, resident: false, message: "text handle is not registered".into() },
         }
     }
     pub fn insert_dynamic(
