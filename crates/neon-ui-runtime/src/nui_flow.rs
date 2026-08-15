@@ -11,8 +11,8 @@ use neon_ui_schema::{
     UiBounds, UiDiagnosticSeverity, UiInputKind, UiInputPacking, UiInputSchema, UiInputSlot,
     UiInputUpdateClass, UiInputValue, UiIrBinding, UiIrDocument, UiIrPatch, UiIrPatchOperation,
     UiIrPatchOperationKind, UiJustifyContent, UiLayout, UiLayoutMode, UiNode, UiNodeId, UiNodeKind,
-    UiProgramEventDeclaration, UiResourceBudget, UiSourceSpan, UiStyle, UiSurfaceId, UiProgram,
-    UiProgramRevision,
+    RenderSurfaceRef, UiProgramEventDeclaration, UiResourceBudget, UiSourceSpan, UiStyle,
+    UiSurfaceId, UiProgram, UiProgramRevision,
 };
 use serde_json::json;
 
@@ -327,23 +327,23 @@ pub fn apply_nui_ir_patch(document: &UiIrDocument, patch: &UiIrPatch) -> FlowRes
     }
     let mut result = document.clone();
     for operation in &patch.operations {
-        let key = operation.target_path.trim_start_matches('/');
+        let path = StablePath::parse(&operation.target_path, &operation.source_span)?;
         match operation.kind {
             UiIrPatchOperationKind::Set => set_node(
                 &mut result.root,
-                key,
+                path.last(),
                 operation.payload.as_ref(),
                 &operation.source_span,
             )?,
             UiIrPatchOperationKind::Remove => {
-                if result.root.node_id.0 == key {
+                if path.matches_root(&result.root.node_id.0) {
                     return Err(error_at(
                         "nui_flow_invalid_patch",
                         "the root node cannot be removed",
                         &operation.source_span,
                     ));
                 }
-                if !remove_node(&mut result.root, key) {
+                if !remove_node_at_path(&mut result.root, path.segments()) {
                     return Err(error_at(
                         "nui_flow_unknown_patch_target",
                         "patch target does not exist",
@@ -353,13 +353,13 @@ pub fn apply_nui_ir_patch(document: &UiIrDocument, patch: &UiIrPatch) -> FlowRes
             }
             UiIrPatchOperationKind::Insert => insert_node(
                 &mut result.root,
-                key,
+                path.last(),
                 operation.payload.as_ref(),
                 &operation.source_span,
             )?,
             UiIrPatchOperationKind::Move => move_node(
                 &mut result.root,
-                key,
+                path.last(),
                 operation.payload.as_ref(),
                 &operation.source_span,
             )?,
@@ -381,6 +381,36 @@ struct Header {
     surface_id: String,
     revision: u64,
     budget: UiResourceBudget,
+}
+
+/// A patch address is a semantic key or slash-separated semantic key path.
+/// Numeric/index addressing is deliberately rejected so a reordered sibling list
+/// cannot retarget a persisted patch.
+struct StablePath(Vec<String>);
+
+impl StablePath {
+    fn parse(value: &str, source_span: &NuiSourceSpan) -> FlowResult<Self> {
+        let segments = value
+            .trim_matches('/')
+            .split('/')
+            .filter(|segment| !segment.is_empty())
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        if segments.is_empty()
+            || segments.iter().any(|segment| !valid_key(segment) || segment.bytes().all(|b| b.is_ascii_digit()))
+        {
+            return Err(error_at(
+                "nui_flow_invalid_patch_path",
+                "patch targets use stable semantic keys or paths, never array indexes",
+                source_span,
+            ));
+        }
+        Ok(Self(segments))
+    }
+
+    fn last(&self) -> &str { self.0.last().expect("validated path") }
+    fn segments(&self) -> &[String] { &self.0 }
+    fn matches_root(&self, root: &str) -> bool { self.0.len() == 1 && self.0[0] == root }
 }
 impl Default for Header {
     fn default() -> Self {
@@ -572,6 +602,7 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
             1,
         ));
     }
+    let is_render_surface = kind == UiNodeKind::RenderSurface;
     let mut node = UiNode {
         node_id: UiNodeId(parts[1].into()),
         kind,
@@ -592,6 +623,11 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
         enter_transition: None,
         children: Vec::new(),
     };
+    if is_render_surface {
+        node.surface = Some(RenderSurfaceRef {
+            target_id: format!("render.{}", node.node_id.0),
+        });
+    }
     let mut bindings = Vec::new();
     let mut intents = Vec::new();
     let mut used = HashSet::new();
@@ -1125,6 +1161,24 @@ fn remove_node(parent: &mut UiNode, key: &str) -> bool {
         .iter_mut()
         .any(|child| remove_node(child, key))
 }
+
+fn remove_node_at_path(root: &mut UiNode, segments: &[String]) -> bool {
+    let segments = if segments.first().is_some_and(|segment| segment == &root.node_id.0) {
+        &segments[1..]
+    } else {
+        segments
+    };
+    match segments {
+        [] => false,
+        [key] => remove_node(root, key),
+        [parent, rest @ ..] => {
+            let Some(parent) = find_node_mut(root, parent) else {
+                return false;
+            };
+            remove_node_at_path(parent, rest)
+        }
+    }
+}
 fn insert_node(
     root: &mut UiNode,
     parent_key: &str,
@@ -1197,7 +1251,7 @@ fn move_node(
     payload: Option<&serde_json::Value>,
     span: &NuiSourceSpan,
 ) -> FlowResult<()> {
-    let parent_key = payload
+    let parent_path = payload
         .and_then(|p| p.get("parent"))
         .and_then(|v| v.as_str())
         .ok_or_else(|| {
@@ -1206,8 +1260,8 @@ fn move_node(
                 "move requires a destination parent",
                 span,
             )
-        })?
-        .to_owned();
+        })?;
+    let parent_key = StablePath::parse(parent_path, span)?.last().to_owned();
     if key == root.node_id.0 || key == parent_key {
         return Err(error_at(
             "nui_flow_invalid_patch",
@@ -1287,5 +1341,34 @@ panel workspace row gap 8
         let patch = parse_nui_flow_patch("@ revision 12\n~ water enabled false\n").unwrap();
         let patched = apply_nui_ir_patch(&document.ir, &patch).unwrap();
         assert_eq!(patched.revision, Revision(13));
+    }
+
+    #[test]
+    fn patch_accepts_semantic_paths_but_rejects_indexes() {
+        let document = parse_nui_flow(WORKBENCH).unwrap();
+        let patch = parse_nui_flow_patch("@ revision 12\n- /workspace/rail/water\n").unwrap();
+        let patched = apply_nui_ir_patch(&document.ir, &patch).unwrap();
+        assert!(patched.root.children[0].children.is_empty());
+
+        let indexed = parse_nui_flow_patch("@ revision 12\n- /workspace/0\n").unwrap();
+        let error = apply_nui_ir_patch(&document.ir, &indexed).unwrap_err();
+        assert_eq!(error.diagnostics[0].code, "nui_flow_invalid_patch_path");
+    }
+
+    #[test]
+    fn formatter_and_quoted_text_are_deterministic() {
+        let formatted = format_nui_flow(WORKBENCH).unwrap();
+        assert_eq!(format_nui_flow(&formatted).unwrap(), formatted);
+        let error = parse_nui_flow("text title value terrain name").unwrap_err();
+        assert_eq!(error.diagnostics[0].code, "nui_flow_unquoted_text");
+    }
+
+    #[test]
+    fn render_declaration_lowers_to_a_nonempty_render_target() {
+        let document = parse_nui_flow("surface workbench\n  render terrain_view\n").unwrap();
+        assert_eq!(
+            document.ir.root.children[0].surface.as_ref().unwrap().target_id,
+            "render.terrain_view"
+        );
     }
 }
