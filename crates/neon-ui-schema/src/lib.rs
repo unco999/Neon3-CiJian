@@ -27,6 +27,43 @@ pub const ERROR_UI_PROGRAM_UNKNOWN_BINDING_TARGET: &str = "ui_program_unknown_bi
 pub const ERROR_UI_PROGRAM_CAPACITY_OVERFLOW: &str = "ui_program_capacity_overflow";
 pub const ERROR_UI_PROGRAM_INVALID_BRANCH_TEMPLATE: &str = "ui_program_invalid_branch_template";
 pub const ERROR_UI_PROGRAM_FORBIDDEN_FLOW_FEATURE: &str = "ui_program_forbidden_flow_feature";
+pub const ERROR_UI_PROGRAM_UNKNOWN_INPUT_KEY: &str = "ui_program_unknown_input_key";
+pub const ERROR_UI_PROGRAM_INPUT_UPDATE_FORBIDDEN: &str = "ui_program_input_update_forbidden";
+pub const ERROR_UI_PROGRAM_DUPLICATE_INPUT_CHANGE: &str = "ui_program_duplicate_input_change";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)] #[serde(rename_all = "snake_case")]
+pub enum UiGpuScalarRepresentation { Bool32, I32, U32, F32, Vec2F32, Vec4F32, HandleUvec2 }
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)] #[serde(deny_unknown_fields)]
+pub struct UiInputPacking { pub alignment: u32, pub lanes: u8, pub offset: u32, pub representation: UiGpuScalarRepresentation }
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)] #[serde(tag = "kind", rename_all = "snake_case")]
+pub enum UiInputKind { Bool, I32, U32, F32, Vec2, Vec4, Color, Enum { variants: Vec<String> }, TextHandle, AssetHandle, I32Range { minimum: i32, maximum: i32 }, U32Range { minimum: u32, maximum: u32 } }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)] #[serde(rename_all = "snake_case")]
+pub enum UiInputUpdateClass { StaticAtProgramActivation, ReliableExternal, LocalPresentation, TextRegistryReference }
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)] #[serde(tag = "kind", rename_all = "snake_case")]
+pub enum UiInputValue { Bool { value: bool }, I32 { value: i32 }, U32 { value: u32 }, F32 { value: f32 }, Vec2 { value: [f32; 2] }, Vec4 { value: [f32; 4] }, Color { value: [f32; 4] }, Enum { value: String }, TextHandle { id: u64, generation: u32 }, AssetHandle { id: u64, generation: u32 } }
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)] #[serde(deny_unknown_fields)]
+pub struct UiInputSlot { pub key: String, pub kind: UiInputKind, pub default_value: UiInputValue, pub update_class: UiInputUpdateClass, pub semantic_label: String, pub packing: UiInputPacking }
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)] #[serde(deny_unknown_fields)]
+pub struct UiInputSchema { pub schema_id: String, pub version: u16, pub slots: Vec<UiInputSlot>, pub layout_hash: String }
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)] #[serde(deny_unknown_fields)]
+pub struct UiInputChange { pub key: String, pub value: UiInputValue }
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)] #[serde(deny_unknown_fields)]
+pub struct UiInputFrame { pub program_revision: UiProgramRevision, pub expected_input_revision: Revision, pub request_id: String, pub idempotency_key: String, pub changes: Vec<UiInputChange> }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)] #[serde(rename_all = "snake_case")]
+pub enum UiInputValueSource { Default, ReliableExternal, LocalPresentation, TextRegistryReference }
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)] #[serde(deny_unknown_fields)]
+pub struct UiResolvedInputValue { pub value: UiInputValue, pub source: UiInputValueSource, pub last_update_revision: Revision }
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)] #[serde(deny_unknown_fields)]
+pub struct UiResolvedInputs { pub program_revision: UiProgramRevision, pub input_revision: Revision, pub values: std::collections::BTreeMap<String, UiResolvedInputValue>, pub changed_slots: Vec<String> }
+
+impl UiInputKind {
+    pub fn packing(&self) -> (u32, u8, UiGpuScalarRepresentation) { match self { Self::Bool => (4, 1, UiGpuScalarRepresentation::Bool32), Self::I32 | Self::I32Range { .. } => (4, 1, UiGpuScalarRepresentation::I32), Self::U32 | Self::U32Range { .. } | Self::Enum { .. } => (4, 1, UiGpuScalarRepresentation::U32), Self::F32 => (4, 1, UiGpuScalarRepresentation::F32), Self::Vec2 => (8, 2, UiGpuScalarRepresentation::Vec2F32), Self::Vec4 | Self::Color => (16, 4, UiGpuScalarRepresentation::Vec4F32), Self::TextHandle | Self::AssetHandle => (8, 2, UiGpuScalarRepresentation::HandleUvec2) } }
+    pub fn accepts(&self, value: &UiInputValue) -> bool { let finite = |values: &[f32]| values.iter().all(|value| value.is_finite()); match (self, value) { (Self::Bool, UiInputValue::Bool { .. }) | (Self::I32, UiInputValue::I32 { .. }) | (Self::U32, UiInputValue::U32 { .. }) | (Self::TextHandle, UiInputValue::TextHandle { .. }) | (Self::AssetHandle, UiInputValue::AssetHandle { .. }) => true, (Self::F32, UiInputValue::F32 { value }) => value.is_finite(), (Self::Vec2, UiInputValue::Vec2 { value }) => finite(value), (Self::Vec4, UiInputValue::Vec4 { value }) | (Self::Color, UiInputValue::Color { value }) => finite(value), (Self::Enum { variants }, UiInputValue::Enum { value }) => variants.iter().any(|variant| variant == value), (Self::I32Range { minimum, maximum }, UiInputValue::I32 { value }) => minimum <= maximum && (*minimum..=*maximum).contains(value), (Self::U32Range { minimum, maximum }, UiInputValue::U32 { value }) => minimum <= maximum && (*minimum..=*maximum).contains(value), _ => false } }
+}
+impl UiInputSchema {
+    pub fn validate(&self) -> Result<(), UiSchemaError> { if self.schema_id.trim().is_empty() || self.version == 0 || self.layout_hash.trim().is_empty() { return Err(UiSchemaError::InvalidInputSchema); } let mut keys = std::collections::HashSet::new(); let mut offsets = std::collections::HashSet::new(); for slot in &self.slots { if slot.key.trim().is_empty() || slot.semantic_label.trim().is_empty() { return Err(UiSchemaError::InvalidInputSlot); } if !keys.insert(slot.key.as_str()) { return Err(UiSchemaError::DuplicateInputKey); } if !slot.kind.accepts(&slot.default_value) { return Err(UiSchemaError::InvalidInputDefault); } let (alignment, lanes, representation) = slot.kind.packing(); if slot.packing.alignment != alignment || slot.packing.lanes != lanes || slot.packing.representation != representation || slot.packing.offset % alignment != 0 || !offsets.insert(slot.packing.offset) { return Err(UiSchemaError::InvalidInputPacking); } if let UiInputKind::Enum { variants } = &slot.kind { if variants.is_empty() || variants.iter().any(|variant| variant.trim().is_empty()) || variants.iter().collect::<std::collections::HashSet<_>>().len() != variants.len() { return Err(UiSchemaError::InvalidInputSlot); } } } Ok(()) }
+    pub fn validate_evolution_from(&self, previous: &Self) -> Result<(), UiSchemaError> { if self.schema_id != previous.schema_id || self.version <= previous.version { return Err(UiSchemaError::IncompatibleInputSchemaEvolution); } for old_slot in &previous.slots { let Some(new_slot) = self.slots.iter().find(|slot| slot.key == old_slot.key) else { return Err(UiSchemaError::IncompatibleInputSchemaEvolution); }; if new_slot.kind != old_slot.kind || new_slot.update_class != old_slot.update_class || new_slot.packing != old_slot.packing { return Err(UiSchemaError::IncompatibleInputSchemaEvolution); } } self.validate() }
+}
 
 /// Declares a versioned UI program capability and its authority.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -517,6 +554,7 @@ pub enum UiSchemaError {
     MissingRenderSurfaceRef,
     InvalidRenderSurfaceRef,
     InvalidText,
+    InvalidInputSchema, InvalidInputSlot, DuplicateInputKey, InvalidInputDefault, InvalidInputPacking, IncompatibleInputSchemaEvolution,
 }
 
 impl UiFragment {
@@ -995,5 +1033,13 @@ mod tests {
         for private_field in ["render_hit_id", "gpu_instance_index", "physical_pixels"] {
             assert!(encoded.get(private_field).is_none());
         }
+    }
+
+    #[test]
+    fn input_schema_round_trips_and_rejects_invalid_defaults() {
+        let kind = UiInputKind::Bool; let (alignment, lanes, representation) = kind.packing();
+        let schema = UiInputSchema { schema_id: "terrain-inputs".into(), version: 1, layout_hash: "layout-v1".into(), slots: vec![UiInputSlot { key: "can_commit".into(), kind, default_value: UiInputValue::Bool { value: false }, update_class: UiInputUpdateClass::ReliableExternal, semantic_label: "Can commit".into(), packing: UiInputPacking { alignment, lanes, offset: 0, representation } }] };
+        schema.validate().unwrap(); assert_eq!(serde_json::from_value::<UiInputSchema>(serde_json::to_value(&schema).unwrap()).unwrap(), schema);
+        let mut invalid = schema; invalid.slots[0].default_value = UiInputValue::F32 { value: f32::NAN }; assert_eq!(invalid.validate(), Err(UiSchemaError::InvalidInputDefault));
     }
 }

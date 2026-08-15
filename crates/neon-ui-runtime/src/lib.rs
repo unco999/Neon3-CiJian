@@ -1,6 +1,6 @@
 //! Headless UI declaration runtime. It must not create windows or GPU objects.
 
-use std::{collections::HashMap, net::SocketAddr};
+use std::{collections::{BTreeMap, HashMap, HashSet}, net::SocketAddr};
 
 use neon_ipc::{RpcClient, RpcServer, TransportError};
 use neon_observability::{
@@ -16,6 +16,8 @@ use neon_ui_schema::{
     UiDiagnosticsState, UiInspectorState, UiInspectorTab, UiSurfaceEvent, UiSurfaceEventKind, UiSurfaceEventRequest, UiSurfaceId, UiSurfaceSnapshot, UiSurfaceState, UI_SURFACE_SCHEMA_VERSION,
     UiSemanticEvent, UiTransition, UiTransitionState, ERROR_FRAGMENT_REVISION_STALE,
     ERROR_INPUT_SEQUENCE_STALE, ERROR_INTENT_NOT_BOUND, ERROR_RENDERER_EPOCH_MISMATCH,
+    UiInputChange, UiInputFrame, UiInputSchema, UiInputUpdateClass, UiInputValue, UiInputValueSource, UiProgramRevision, UiResolvedInputValue, UiResolvedInputs, UiSchemaError,
+    ERROR_UI_PROGRAM_DUPLICATE_INPUT_CHANGE, ERROR_UI_PROGRAM_INPUT_TYPE_MISMATCH, ERROR_UI_PROGRAM_INPUT_UPDATE_FORBIDDEN, ERROR_UI_PROGRAM_STALE_INPUT_REVISION, ERROR_UI_PROGRAM_UNKNOWN_INPUT_KEY,
 };
 use serde_json::{Value, json};
 
@@ -122,6 +124,32 @@ impl UiSurfaceMachine {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)] pub enum UiInputWriter { External, LocalPresentation }
+#[derive(Clone, Debug, PartialEq)] pub struct UiInputApplyResult { pub input_revision: Revision, pub changed_slots: Vec<String>, pub snapshot: UiResolvedInputs }
+#[derive(Clone, Debug, PartialEq, Eq)] pub struct UiInputStoreError { pub code: &'static str, pub message: &'static str }
+impl UiInputStoreError { fn schema(error: UiSchemaError) -> Self { match error { UiSchemaError::DuplicateInputKey => Self { code: "ui_program_duplicate_input_key", message: "input schema contains a duplicate slot key" }, UiSchemaError::InvalidInputDefault => Self { code: "ui_program_invalid_default", message: "input slot default does not match its declared kind" }, _ => Self { code: "ui_program_invalid_input_schema", message: "input schema is invalid" } } } }
+/// CPU-only transactional input state. Defaults are installed at activation;
+/// WGPU is deliberately absent from this supported headless API.
+#[derive(Clone, Debug)] pub struct UiInputStore { schema: UiInputSchema, resolved_inputs: UiResolvedInputs, dirty_slots: HashSet<String>, idempotent_results: HashMap<String, UiInputApplyResult> }
+impl UiInputStore {
+    pub fn activate(program_revision: UiProgramRevision, schema: UiInputSchema) -> Result<Self, UiInputStoreError> { program_revision.validate_baseline().map_err(UiInputStoreError::schema)?; schema.validate().map_err(UiInputStoreError::schema)?; let values = schema.slots.iter().map(|slot| (slot.key.clone(), UiResolvedInputValue { value: slot.default_value.clone(), source: UiInputValueSource::Default, last_update_revision: Revision(0) })).collect::<BTreeMap<_, _>>(); Ok(Self { schema, resolved_inputs: UiResolvedInputs { program_revision, input_revision: Revision(0), values, changed_slots: Vec::new() }, dirty_slots: HashSet::new(), idempotent_results: HashMap::new() }) }
+    pub fn schema(&self) -> &UiInputSchema { &self.schema }
+    pub fn snapshot(&self) -> UiResolvedInputs { self.resolved_inputs.clone() }
+    pub fn dirty_slots(&self) -> Vec<String> { let mut slots = self.dirty_slots.iter().cloned().collect::<Vec<_>>(); slots.sort(); slots }
+    pub fn take_dirty_slots(&mut self) -> Vec<String> { let slots = self.dirty_slots(); self.dirty_slots.clear(); slots }
+    pub fn apply(&mut self, writer: UiInputWriter, frame: UiInputFrame) -> Result<UiInputApplyResult, UiInputStoreError> {
+        if let Some(result) = self.idempotent_results.get(&frame.idempotency_key) { return Ok(result.clone()); }
+        if frame.idempotency_key.trim().is_empty() || frame.request_id.trim().is_empty() { return Err(UiInputStoreError { code: "invalid_request", message: "request_id and idempotency_key are required" }); }
+        if frame.program_revision != self.resolved_inputs.program_revision || frame.expected_input_revision != self.resolved_inputs.input_revision { return Err(UiInputStoreError { code: ERROR_UI_PROGRAM_STALE_INPUT_REVISION, message: "program or input revision is stale" }); }
+        let mut seen = HashSet::new();
+        for UiInputChange { key, value } in &frame.changes { if !seen.insert(key.as_str()) { return Err(UiInputStoreError { code: ERROR_UI_PROGRAM_DUPLICATE_INPUT_CHANGE, message: "input frame changes a slot more than once" }); } let Some(slot) = self.schema.slots.iter().find(|slot| slot.key == *key) else { return Err(UiInputStoreError { code: ERROR_UI_PROGRAM_UNKNOWN_INPUT_KEY, message: "input frame references an unknown slot" }); }; if !slot.kind.accepts(value) { return Err(UiInputStoreError { code: ERROR_UI_PROGRAM_INPUT_TYPE_MISMATCH, message: "input frame value does not match the declared slot kind" }); } if !Self::writer_is_allowed(writer, slot.update_class) { return Err(UiInputStoreError { code: ERROR_UI_PROGRAM_INPUT_UPDATE_FORBIDDEN, message: "writer is not authorized for this input slot" }); } }
+        let next_revision = Revision(self.resolved_inputs.input_revision.0 + 1); let mut changed_slots = Vec::new(); let mut values = self.resolved_inputs.values.clone();
+        for UiInputChange { key, value } in frame.changes { let slot = self.schema.slots.iter().find(|slot| slot.key == key).expect("validated slot exists"); let source = match slot.update_class { UiInputUpdateClass::ReliableExternal => UiInputValueSource::ReliableExternal, UiInputUpdateClass::LocalPresentation => UiInputValueSource::LocalPresentation, UiInputUpdateClass::TextRegistryReference => UiInputValueSource::TextRegistryReference, UiInputUpdateClass::StaticAtProgramActivation => unreachable!("static slots are not writable") }; if values.get(&key).is_none_or(|current| current.value != value) { changed_slots.push(key.clone()); self.dirty_slots.insert(key.clone()); } values.insert(key, UiResolvedInputValue { value, source, last_update_revision: next_revision }); }
+        let snapshot = UiResolvedInputs { program_revision: self.resolved_inputs.program_revision.clone(), input_revision: next_revision, values, changed_slots: changed_slots.clone() }; self.resolved_inputs = snapshot.clone(); let result = UiInputApplyResult { input_revision: next_revision, changed_slots, snapshot }; self.idempotent_results.insert(frame.idempotency_key, result.clone()); Ok(result)
+    }
+    fn writer_is_allowed(writer: UiInputWriter, update_class: UiInputUpdateClass) -> bool { matches!((writer, update_class), (UiInputWriter::External, UiInputUpdateClass::ReliableExternal | UiInputUpdateClass::TextRegistryReference) | (UiInputWriter::LocalPresentation, UiInputUpdateClass::LocalPresentation)) }
+}
+
 pub struct UiRuntime {
     epoch: u64,
     client: ClientIdentity,
@@ -178,6 +206,7 @@ impl UiRuntime {
                 "ui.surface.machine.v1".into(),
                 "ui.ai.terrain.panel.v1".into(),
                 "ui.text_input.commit.v1".into(),
+                "ui.program.input.v1".into(),
             ],
         }
     }
@@ -1202,5 +1231,15 @@ mod tests {
         assert_eq!(runtime.validate_semantic_event(&event(7, 3, "terrain.tool.invalid", 1)), Err(ERROR_INTENT_NOT_BOUND));
         runtime.validate_semantic_event(&event(7, 3, "terrain.tool.select", 2)).unwrap();
         assert_eq!(runtime.validate_semantic_event(&event(7, 3, "terrain.tool.select", 2)), Err(ERROR_INPUT_SEQUENCE_STALE));
+    }
+
+    #[test]
+    fn input_store_installs_defaults_and_rejects_external_local_writes() {
+        use neon_ui_schema::{UiGpuScalarRepresentation, UiInputKind, UiInputPacking, UiInputSlot, UiProgramCapability, UiProgramCapabilityOwner, UiProgramCapabilityStatus, UI_PROGRAM_CAPABILITY_NAME, UI_PROGRAM_SCHEMA_VERSION};
+        let program = UiProgramRevision { program_id: "surface.editor".into(), revision: Revision(3), schema_version: UI_PROGRAM_SCHEMA_VERSION, capabilities: vec![UiProgramCapability { name: UI_PROGRAM_CAPABILITY_NAME.into(), version: 1, owner: UiProgramCapabilityOwner::SharedContract, status: UiProgramCapabilityStatus::Experimental }] };
+        let schema = UiInputSchema { schema_id: "terrain-inputs".into(), version: 1, layout_hash: "layout-v1".into(), slots: vec![UiInputSlot { key: "hovered".into(), kind: UiInputKind::Bool, default_value: UiInputValue::Bool { value: false }, update_class: UiInputUpdateClass::LocalPresentation, semantic_label: "Hovered".into(), packing: UiInputPacking { alignment: 4, lanes: 1, offset: 0, representation: UiGpuScalarRepresentation::Bool32 } }] };
+        let mut store = UiInputStore::activate(program.clone(), schema).unwrap(); assert_eq!(store.snapshot().values["hovered"].source, UiInputValueSource::Default);
+        let frame = UiInputFrame { program_revision: program, expected_input_revision: Revision(0), request_id: "request-1".into(), idempotency_key: "key-1".into(), changes: vec![UiInputChange { key: "hovered".into(), value: UiInputValue::Bool { value: true } }] };
+        assert_eq!(store.apply(UiInputWriter::External, frame).unwrap_err().code, ERROR_UI_PROGRAM_INPUT_UPDATE_FORBIDDEN);
     }
 }
