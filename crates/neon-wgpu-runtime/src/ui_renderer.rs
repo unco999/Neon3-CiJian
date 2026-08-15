@@ -6,7 +6,7 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 use bytemuck::{Pod, Zeroable};
 use neon_protocol::{AssetBytes, AssetRef};
-use neon_ui_schema::{RenderSurfaceRef, TextRef, UiBounds, UiEasing, UiFragment, UiFragmentRevision, UiIntent, UiLayoutMode, UiNode, UiNodeKind, UiStyle, UiTransition};
+use neon_ui_schema::{RenderSurfaceRef, TextRef, UiAlignItems, UiBounds, UiEasing, UiFragment, UiFragmentRevision, UiIntent, UiJustifyContent, UiLayout, UiLayoutMode, UiNode, UiNodeKind, UiStyle, UiTransition};
 
 const SHADER: &str = r#"
 struct View { viewport: vec2<f32>, _pad: vec2<f32> }
@@ -167,7 +167,96 @@ struct UiHitInstance { rect: [f32; 4], params: [f32; 4], hit_id: u32, _pad: [u32
 #[derive(Clone, Debug)]
 pub(crate) struct UiHitBinding {
     pub fragment: UiFragmentRevision,
-    pub intent: UiIntent,
+    pub intent: Option<UiIntent>,
+    pub text_input: Option<UiTextInputBinding>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct UiTextInputBinding {
+    pub node_path: String,
+    pub max_length: u32,
+    pub bounds: UiBounds,
+}
+
+/// Process-local state for immediate IME composition. It never crosses the UI RPC boundary.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct UiTextEditingState {
+    pub node_path: Option<String>,
+    pub committed: String,
+    pub preedit: String,
+    pub max_length: u32,
+    pub cursor: usize,
+    pub selection_anchor: usize,
+    pub horizontal_scroll: f32,
+}
+
+impl UiTextEditingState {
+    fn rendered_text(&self) -> String {
+        let split = char_byte_index(&self.committed, self.cursor);
+        format!("{}{}{}", &self.committed[..split], self.preedit, &self.committed[split..])
+    }
+    pub fn focus(&mut self, binding: UiTextInputBinding, initial_value: String) {
+        self.node_path = Some(binding.node_path);
+        self.committed = initial_value;
+        self.preedit.clear();
+        self.max_length = binding.max_length;
+        self.cursor = self.committed.chars().count();
+        self.selection_anchor = self.cursor;
+        self.horizontal_scroll = 0.0;
+    }
+    pub fn clear(&mut self) { self.node_path = None; self.preedit.clear(); self.cursor = 0; self.selection_anchor = 0; self.horizontal_scroll = 0.0; }
+    pub fn set_preedit(&mut self, value: String) { self.preedit = value; }
+    pub fn commit(&mut self, value: &str) -> Option<String> {
+        self.delete_selection();
+        let available = self.max_length.saturating_sub(self.committed.chars().count() as u32) as usize;
+        let filtered: String = value.chars().filter(|ch| !ch.is_control() && *ch != '\n' && *ch != '\r').take(available).collect();
+        self.preedit.clear();
+        if filtered.is_empty() { return None; }
+        let split = char_byte_index(&self.committed, self.cursor);
+        self.committed.insert_str(split, &filtered);
+        self.cursor += filtered.chars().count();
+        self.selection_anchor = self.cursor;
+        Some(self.committed.clone())
+    }
+    pub fn backspace(&mut self) -> Option<String> {
+        self.preedit.clear();
+        if self.has_selection() { self.delete_selection(); return Some(self.committed.clone()); }
+        if self.cursor == 0 { return None; }
+        let start = char_byte_index(&self.committed, self.cursor - 1);
+        let end = char_byte_index(&self.committed, self.cursor);
+        self.committed.replace_range(start..end, "");
+        self.cursor -= 1;
+        self.selection_anchor = self.cursor;
+        Some(self.committed.clone())
+    }
+    pub fn delete(&mut self) -> Option<String> {
+        self.preedit.clear();
+        if self.has_selection() { self.delete_selection(); return Some(self.committed.clone()); }
+        if self.cursor >= self.committed.chars().count() { return None; }
+        let start = char_byte_index(&self.committed, self.cursor);
+        let end = char_byte_index(&self.committed, self.cursor + 1);
+        self.committed.replace_range(start..end, "");
+        Some(self.committed.clone())
+    }
+    pub fn move_cursor(&mut self, delta: isize, extend_selection: bool) {
+        self.preedit.clear();
+        self.cursor = (self.cursor as isize + delta).clamp(0, self.committed.chars().count() as isize) as usize;
+        if !extend_selection { self.selection_anchor = self.cursor; }
+    }
+    pub fn move_to_edge(&mut self, end: bool, extend_selection: bool) { self.preedit.clear(); self.cursor = if end { self.committed.chars().count() } else { 0 }; if !extend_selection { self.selection_anchor = self.cursor; } }
+    fn selection_range(&self) -> std::ops::Range<usize> { self.cursor.min(self.selection_anchor)..self.cursor.max(self.selection_anchor) }
+    fn has_selection(&self) -> bool { self.cursor != self.selection_anchor }
+    fn delete_selection(&mut self) {
+        let range = self.selection_range();
+        if range.is_empty() { return; }
+        self.committed.replace_range(char_byte_index(&self.committed, range.start)..char_byte_index(&self.committed, range.end), "");
+        self.cursor = range.start;
+        self.selection_anchor = range.start;
+    }
+}
+
+fn char_byte_index(value: &str, index: usize) -> usize {
+    value.char_indices().nth(index).map_or(value.len(), |(offset, _)| offset)
 }
 
 #[repr(C)]
@@ -204,6 +293,8 @@ struct AtlasGlyph { uv: [f32; 4], width: f32, height: f32, xmin: f32, plane_min_
 
 const FONT_ATLAS_SIZE: u32 = 2048;
 const FONT_RASTER_SIZE: f32 = 16.0;
+const TEXT_INPUT_INSET: f32 = 6.0;
+const CARET_WIDTH: f32 = 2.0;
 
 const HIT_READBACK_BYTES_PER_ROW: u32 = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
 
@@ -295,6 +386,7 @@ struct ActiveTransition {
 
 struct PlannedNode {
     id: String,
+    parent_id: Option<String>,
     target: UiVisual,
     transition: Option<UiTransition>,
     instance_index: Option<usize>,
@@ -335,6 +427,7 @@ pub struct UiWgpuRenderer {
     resident_font: Option<ResidentFont>,
     last_panel_instance_count: usize,
     pointer_visual_dirty: bool,
+    editing: UiTextEditingState,
 }
 
 impl UiWgpuRenderer {
@@ -519,6 +612,7 @@ impl UiWgpuRenderer {
             resident_font: None,
             last_panel_instance_count: 0,
             pointer_visual_dirty: false,
+            editing: UiTextEditingState::default(),
         }
     }
 
@@ -528,11 +622,14 @@ impl UiWgpuRenderer {
         let declarations = collect_hit_declarations(fragments);
         self.hit_bindings.clear();
         let mut instances = Vec::new();
-        for (node_path, visual, _) in flatten_fragments(fragments) {
-            if visual.kind != UiNodeKind::Button || !visual.enabled || visual.style.opacity <= 0.0 { continue; }
+        for (node_path, _, visual, _) in flatten_fragments(fragments, self.resident_font.as_ref()) {
+            if !matches!(visual.kind, UiNodeKind::Button | UiNodeKind::TextInput) || !visual.enabled || visual.style.opacity <= 0.0 { continue; }
             let hit_id = instances.len() as u32 + 1;
-            if let Some(binding) = declarations.get(&node_path) {
-                self.hit_bindings.insert(hit_id, binding.clone());
+            if let Some(mut binding) = declarations.get(&node_path).cloned() {
+                if visual.kind == UiNodeKind::TextInput {
+                    binding.text_input = Some(UiTextInputBinding { node_path: node_path.clone(), max_length: 256, bounds: visual.bounds });
+                }
+                self.hit_bindings.insert(hit_id, binding);
             }
             instances.push(UiHitInstance { rect: [visual.bounds.x, visual.bounds.y, visual.bounds.width, visual.bounds.height], params: [visual.style.border_width, visual.style.corner_radius, visual.style.opacity, 0.0], hit_id, _pad: [0; 3], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height] });
         }
@@ -555,15 +652,118 @@ impl UiWgpuRenderer {
 
     pub(crate) fn hit_binding(&self, hit_id: u32) -> Option<UiHitBinding> { self.hit_bindings.get(&hit_id).cloned() }
 
+    /// Text inputs must focus on the first pointer press, before asynchronous GPU hit readback.
+    pub(crate) fn text_input_at_pointer(&self) -> Option<UiTextInputBinding> {
+        let pointer = self.pointer_position?;
+        self.hit_bindings.values().filter_map(|binding| binding.text_input.as_ref()).find(|input| {
+            contains(input.bounds, pointer)
+        }).cloned()
+    }
+
     pub fn set_pointer_position(&mut self, position: [f32; 2]) {
         self.pointer_position = Some(position);
         self.pointer_visual_dirty = true;
     }
 
+    pub(crate) fn pointer_position(&self) -> Option<[f32; 2]> { self.pointer_position }
+
     pub fn press_hovered(&mut self, time_seconds: f32) {
         self.pressed_until_seconds = time_seconds + 0.14;
         self.pointer_visual_dirty = true;
     }
+
+    pub(crate) fn focus_text_input(&mut self, binding: UiTextInputBinding) {
+        let initial_value = self.plan.iter().find(|node| node.id == binding.node_path)
+            .and_then(|node| node.target.text.as_ref())
+            .and_then(text_ref_value)
+            .unwrap_or_default()
+            .to_owned();
+        self.editing.focus(binding, initial_value);
+        self.pointer_visual_dirty = true;
+    }
+
+    pub(crate) fn set_text_input_caret_from_pointer(&mut self, position: [f32; 2], extend_selection: bool) {
+        let Some(node_path) = self.editing.node_path.clone() else { return; };
+        let Some(bounds) = self.plan.iter().find(|node| node.id == node_path).map(|node| node.target.bounds) else { return; };
+        let Some(font) = self.resident_font.as_ref() else { return; };
+        let text_x = position[0] - bounds.x - TEXT_INPUT_INSET + self.editing.horizontal_scroll;
+        let cursor = caret_index_for_x(&font.font, &self.editing.committed, text_x);
+        self.editing.cursor = cursor;
+        if !extend_selection { self.editing.selection_anchor = cursor; }
+        self.ensure_text_input_caret_visible();
+        self.pointer_visual_dirty = true;
+    }
+
+    pub(crate) fn set_ime_preedit(&mut self, value: String) {
+        if self.editing.node_path.is_some() { self.editing.set_preedit(value); self.ensure_text_input_caret_visible(); self.pointer_visual_dirty = true; }
+    }
+
+    pub(crate) fn commit_ime_text(&mut self, value: &str) -> Option<(UiHitBinding, String)> {
+        let node_path = self.editing.node_path.clone()?;
+        let committed = self.editing.commit(value)?;
+        self.ensure_text_input_caret_visible();
+        self.pointer_visual_dirty = true;
+        let binding = self.text_input_binding(&node_path)?;
+        Some((binding, committed))
+    }
+
+    pub(crate) fn backspace_text_input(&mut self) -> Option<(UiHitBinding, String)> {
+        let node_path = self.editing.node_path.clone()?;
+        let committed = self.editing.backspace()?;
+        self.ensure_text_input_caret_visible();
+        self.pointer_visual_dirty = true;
+        Some((self.text_input_binding(&node_path)?, committed))
+    }
+
+    pub(crate) fn delete_text_input(&mut self) -> Option<(UiHitBinding, String)> {
+        let node_path = self.editing.node_path.clone()?;
+        let committed = self.editing.delete()?;
+        self.ensure_text_input_caret_visible();
+        self.pointer_visual_dirty = true;
+        Some((self.text_input_binding(&node_path)?, committed))
+    }
+
+    pub(crate) fn move_text_input_cursor(&mut self, delta: isize, extend_selection: bool) -> bool {
+        if self.editing.node_path.is_none() { return false; }
+        self.editing.move_cursor(delta, extend_selection);
+        self.ensure_text_input_caret_visible();
+        self.pointer_visual_dirty = true;
+        true
+    }
+
+    pub(crate) fn move_text_input_to_edge(&mut self, end: bool, extend_selection: bool) -> bool {
+        if self.editing.node_path.is_none() { return false; }
+        self.editing.move_to_edge(end, extend_selection);
+        self.ensure_text_input_caret_visible();
+        self.pointer_visual_dirty = true;
+        true
+    }
+
+    fn text_input_binding(&self, node_path: &str) -> Option<UiHitBinding> {
+        self.hit_bindings.values().find(|binding| {
+            binding.text_input.as_ref().is_some_and(|input| input.node_path == node_path)
+        }).cloned()
+    }
+
+    pub(crate) fn text_input_ime_rect(&self) -> Option<UiBounds> {
+        let node_path = self.editing.node_path.as_ref()?;
+        let bounds = self.plan.iter().find(|node| &node.id == node_path)?.target.bounds;
+        let font = self.resident_font.as_ref()?;
+        let x = bounds.x + TEXT_INPUT_INSET + text_advance(&font.font, &self.editing.committed, self.editing.cursor) + text_advance(&font.font, &self.editing.preedit, self.editing.preedit.chars().count()) - self.editing.horizontal_scroll;
+        Some(UiBounds { x, y: bounds.y + ((bounds.height - font.line_height).max(0.0) * 0.5), width: CARET_WIDTH, height: font.line_height.min(bounds.height) })
+    }
+
+    fn ensure_text_input_caret_visible(&mut self) {
+        let Some(rect) = self.text_input_ime_rect() else { return; };
+        let Some(node_path) = self.editing.node_path.as_ref() else { return; };
+        let Some(bounds) = self.plan.iter().find(|node| &node.id == node_path).map(|node| node.target.bounds) else { return; };
+        let left = bounds.x + TEXT_INPUT_INSET;
+        let right = bounds.x + bounds.width - TEXT_INPUT_INSET - CARET_WIDTH;
+        if rect.x < left { self.editing.horizontal_scroll = (self.editing.horizontal_scroll - (left - rect.x)).max(0.0); }
+        if rect.x > right { self.editing.horizontal_scroll += rect.x - right; }
+    }
+
+    pub(crate) fn clear_text_focus(&mut self) { self.editing.clear(); self.pointer_visual_dirty = true; }
 
     pub(crate) fn has_active_animation(&mut self, time_seconds: f32) -> bool {
         self.active.retain(|_, active| {
@@ -745,15 +945,16 @@ impl UiWgpuRenderer {
         viewport_size: [u32; 2],
         time_seconds: f32,
     ) {
+        self.ensure_builtin_font(device, queue);
         let plan_changed = self.refresh_plan(fragments);
+        self.instances.truncate(self.plan.iter().filter(|node| node.instance_index.is_some()).count());
         let pointer_active = self.pointer_visual_dirty || time_seconds < self.pressed_until_seconds;
         self.dirty_instances.clear();
         for index in 0..self.plan.len() {
             let node = &self.plan[index];
-            let should_sample = plan_changed || pointer_active || self.active.contains_key(&node.id);
-            if !should_sample {
-                continue;
-            }
+            // A parent transition is applied after this pass. Sampling every node avoids
+            // carrying the previous frame's inherited translation into the next frame.
+            let _should_sample = plan_changed || pointer_active || self.active.contains_key(&node.id);
             let sampled = Self::sample(
                 &mut self.current,
                 &mut self.active,
@@ -763,12 +964,47 @@ impl UiWgpuRenderer {
                 time_seconds,
             );
             self.sampled[index] = sampled;
-            if let Some(instance_index) = node.instance_index {
+        }
+        // Child bounds are flattened to final window coordinates. Reapply each parent's
+        // sampled translation and opacity so an entering panel carries its whole subtree.
+        let plan_index = self.plan.iter().enumerate().map(|(index, node)| (node.id.as_str(), index)).collect::<HashMap<_, _>>();
+        let mut subtree_translation = vec![[0.0_f32; 2]; self.plan.len()];
+        let mut subtree_opacity = vec![1.0_f32; self.plan.len()];
+        for index in 0..self.plan.len() {
+            let target = &self.plan[index].target;
+            let parent = self.plan[index].parent_id.as_deref().and_then(|parent| plan_index.get(parent).copied());
+            let inherited_translation = parent.map_or([0.0; 2], |parent| subtree_translation[parent]);
+            let inherited_opacity = parent.map_or(1.0, |parent| subtree_opacity[parent]);
+            let own_translation = [
+                self.sampled[index].bounds.x - target.bounds.x,
+                self.sampled[index].bounds.y - target.bounds.y,
+            ];
+            let own_opacity = if target.style.opacity > 0.0 {
+                self.sampled[index].style.opacity / target.style.opacity
+            } else {
+                1.0
+            };
+            self.sampled[index].bounds.x += inherited_translation[0];
+            self.sampled[index].bounds.y += inherited_translation[1];
+            self.sampled[index].clip.x += inherited_translation[0];
+            self.sampled[index].clip.y += inherited_translation[1];
+            if self.sampled[index].clip == target.bounds {
+                self.sampled[index].clip.x += own_translation[0];
+                self.sampled[index].clip.y += own_translation[1];
+            }
+            self.sampled[index].style.opacity *= inherited_opacity;
+            subtree_translation[index] = [
+                inherited_translation[0] + own_translation[0],
+                inherited_translation[1] + own_translation[1],
+            ];
+            subtree_opacity[index] = inherited_opacity * own_opacity;
+            if let Some(instance_index) = self.plan[index].instance_index {
                 self.instances[instance_index] = self.instance(&self.sampled[index], time_seconds);
                 self.dirty_instances.push(instance_index);
             }
         }
         self.pointer_visual_dirty = false;
+        self.append_text_input_overlays();
         self.last_panel_instance_count = self.instances.len();
         let mut instance_buffer_recreated = false;
         if self.instances.len() > self.instance_capacity {
@@ -776,7 +1012,7 @@ impl UiWgpuRenderer {
             self.instance_buffer = create_instance_buffer(device, self.instance_capacity);
             instance_buffer_recreated = true;
         }
-        if plan_changed || instance_buffer_recreated {
+        if plan_changed || instance_buffer_recreated || self.editing.node_path.is_some() {
             queue.write_buffer(&self.instance_buffer, 0, bytemuck::cast_slice(&self.instances));
         } else {
             for &index in &self.dirty_instances {
@@ -830,12 +1066,15 @@ impl UiWgpuRenderer {
                 pass.draw(0..6, 0..1);
             }
         }
-        self.ensure_builtin_font(device, queue);
         let texts = self.resident_font.as_mut().map(|font| {
-            self.sampled.iter().filter_map(|visual| {
-                let text = visual.text.as_ref().and_then(text_ref_value);
-                if !matches!(visual.kind, UiNodeKind::Label | UiNodeKind::Button) || text.is_none() { return None; }
-                layout_text(device, queue, font, visual, text.unwrap())
+            self.sampled.iter().enumerate().filter_map(|(index, visual)| {
+                let local_text = Some(&self.editing)
+                    .filter(|editing| editing.node_path.as_deref() == Some(self.plan[index].id.as_str()))
+                    .map(UiTextEditingState::rendered_text);
+                let text = local_text.as_deref().or_else(|| visual.text.as_ref().and_then(text_ref_value));
+                if !matches!(visual.kind, UiNodeKind::Label | UiNodeKind::Button | UiNodeKind::TextInput) || text.is_none() { return None; }
+                let horizontal_scroll = (visual.kind == UiNodeKind::TextInput && local_text.is_some()).then_some(self.editing.horizontal_scroll);
+                layout_text(device, queue, font, visual, text.unwrap(), horizontal_scroll)
             }).flatten().collect::<Vec<_>>()
         }).unwrap_or_default();
         if !texts.is_empty() {
@@ -855,25 +1094,45 @@ impl UiWgpuRenderer {
         if matches {
             return false;
         }
-        let nodes = flatten_fragments(fragments);
-        let live: HashSet<_> = nodes.iter().map(|(id, _, _)| id.clone()).collect();
+        let nodes = flatten_fragments(fragments, self.resident_font.as_ref());
+        let live: HashSet<_> = nodes.iter().map(|(id, _, _, _)| id.clone()).collect();
         self.current.retain(|id, _| live.contains(id));
         self.active.retain(|id, _| live.contains(id));
         self.plan.clear();
         self.sampled.clear();
         self.instances.clear();
-        for (id, target, transition) in nodes {
+        for (id, parent_id, target, transition) in nodes {
             let instance_index = (!matches!(target.kind, UiNodeKind::Image | UiNodeKind::RenderSurface)).then(|| self.instances.len());
             if let Some(instance_index) = instance_index {
                 self.instances.push(UiInstance::zeroed());
                 debug_assert_eq!(instance_index, self.instances.len() - 1);
             }
             self.sampled.push(target.clone());
-            self.plan.push(PlannedNode { id, target, transition, instance_index });
+            self.plan.push(PlannedNode { id, parent_id, target, transition, instance_index });
         }
         self.plan_revisions.clear();
         self.plan_revisions.extend(fragments.iter().map(|(id, fragment)| (id.clone(), fragment.revision)));
         true
+    }
+
+    fn append_text_input_overlays(&mut self) {
+        let Some(node_path) = self.editing.node_path.as_ref() else { return; };
+        let Some(index) = self.plan.iter().position(|node| &node.id == node_path) else { return; };
+        let visual = &self.sampled[index];
+        let Some(font) = self.resident_font.as_ref() else { return; };
+        let range = self.editing.selection_range();
+        if !range.is_empty() {
+            let start = text_advance(&font.font, &self.editing.committed, range.start) - self.editing.horizontal_scroll;
+            let end = text_advance(&font.font, &self.editing.committed, range.end) - self.editing.horizontal_scroll;
+            self.instances.push(overlay_instance(
+                UiBounds { x: visual.bounds.x + TEXT_INPUT_INSET + start, y: visual.bounds.y + 3.0, width: (end - start).max(1.0), height: (visual.bounds.height - 6.0).max(0.0) },
+                input_clip(visual),
+                [0.18, 0.62, 0.7, 0.62],
+            ));
+        }
+        if let Some(caret) = self.text_input_ime_rect() {
+            self.instances.push(overlay_instance(caret, input_clip(visual), [0.84, 0.98, 0.96, 1.0]));
+        }
     }
 
     fn sample(
@@ -1188,11 +1447,20 @@ fn ensure_glyph(_device: &wgpu::Device, queue: &wgpu::Queue, font: &mut Resident
 }
 
 fn text_clip(visual: &UiVisual) -> Option<[f32; 4]> {
+    let clip = if visual.kind == UiNodeKind::TextInput { input_clip(visual) } else { visual.clip };
+    let left = visual.bounds.x.max(clip.x);
+    let top = visual.bounds.y.max(clip.y);
+    let right = (visual.bounds.x + visual.bounds.width).min(clip.x + clip.width);
+    let bottom = (visual.bounds.y + visual.bounds.height).min(clip.y + clip.height);
+    (left < right && top < bottom).then_some([left, top, right, bottom])
+}
+
+fn input_clip(visual: &UiVisual) -> UiBounds {
     let left = visual.bounds.x.max(visual.clip.x);
     let top = visual.bounds.y.max(visual.clip.y);
     let right = (visual.bounds.x + visual.bounds.width).min(visual.clip.x + visual.clip.width);
     let bottom = (visual.bounds.y + visual.bounds.height).min(visual.clip.y + visual.clip.height);
-    (left < right && top < bottom).then_some([left, top, right, bottom])
+    UiBounds { x: left, y: top, width: (right - left).max(0.0), height: (bottom - top).max(0.0) }
 }
 
 fn layout_text(
@@ -1201,6 +1469,7 @@ fn layout_text(
     font: &mut ResidentFont,
     visual: &UiVisual,
     text: &str,
+    horizontal_scroll: Option<f32>,
 ) -> Option<Vec<UiTextInstance>> {
     let clip = text_clip(visual)?;
     let mut lines = Vec::<Vec<AtlasGlyph>>::new();
@@ -1232,7 +1501,7 @@ fn layout_text(
         let mut x = if visual.kind == UiNodeKind::Button {
             visual.bounds.x + ((visual.bounds.width - advance).max(0.0) * 0.5)
         } else {
-            visual.bounds.x
+            visual.bounds.x + if visual.kind == UiNodeKind::TextInput { TEXT_INPUT_INSET - horizontal_scroll.unwrap_or(0.0) } else { 0.0 }
         };
         let baseline = top + font.ascent + line_index as f32 * font.line_height;
         for glyph in glyphs {
@@ -1248,9 +1517,28 @@ fn layout_text(
     Some(result)
 }
 
+fn text_advance(font: &fontdue::Font, value: &str, char_count: usize) -> f32 {
+    value.chars().take(char_count).map(|ch| font.metrics(ch, FONT_RASTER_SIZE).advance_width).sum()
+}
+
+fn caret_index_for_x(font: &fontdue::Font, value: &str, x: f32) -> usize {
+    let mut advance = 0.0;
+    for (index, ch) in value.chars().enumerate() {
+        let next = advance + font.metrics(ch, FONT_RASTER_SIZE).advance_width;
+        if x < (advance + next) * 0.5 { return index; }
+        advance = next;
+    }
+    value.chars().count()
+}
+
+fn overlay_instance(bounds: UiBounds, clip: UiBounds, color: [f32; 4]) -> UiInstance {
+    UiInstance { rect: [bounds.x, bounds.y, bounds.width, bounds.height], fill: color, border: [0.0; 4], params: [0.0, 0.0, 1.0, 0.0], clip: [clip.x, clip.y, clip.x + clip.width, clip.y + clip.height] }
+}
+
 fn flatten_fragments(
     fragments: &HashMap<neon_ui_schema::UiFragmentId, UiFragment>,
-) -> Vec<(String, UiVisual, Option<UiTransition>)> {
+    font: Option<&ResidentFont>,
+) -> Vec<(String, Option<String>, UiVisual, Option<UiTransition>)> {
     let mut ordered = fragments.values().collect::<Vec<_>>();
     ordered.sort_by(|left, right| left.fragment_id.0.cmp(&right.fragment_id.0));
     let mut result = Vec::new();
@@ -1260,6 +1548,9 @@ fn flatten_fragments(
             &fragment.fragment_id.0,
             &fragment.root,
             [0.0, 0.0],
+            None,
+            None,
+            font,
             None,
         );
     }
@@ -1271,7 +1562,7 @@ fn collect_hit_declarations(fragments: &HashMap<neon_ui_schema::UiFragmentId, Ui
     for fragment in fragments.values() {
         for effect in &fragment.effects {
             if let neon_ui_schema::UiEffect::BoundSemanticIntent { node_id, intent } = effect {
-                declarations.insert(format!("{}/{}", fragment.fragment_id.0, node_id.0), UiHitBinding { fragment: UiFragmentRevision { id: fragment.fragment_id.clone(), revision: fragment.revision }, intent: intent.clone() });
+                declarations.insert(format!("{}/{}", fragment.fragment_id.0, node_id.0), UiHitBinding { fragment: UiFragmentRevision { id: fragment.fragment_id.clone(), revision: fragment.revision }, intent: Some(intent.clone()), text_input: None });
             }
         }
     }
@@ -1279,24 +1570,29 @@ fn collect_hit_declarations(fragments: &HashMap<neon_ui_schema::UiFragmentId, Ui
 }
 
 fn flatten_node(
-    out: &mut Vec<(String, UiVisual, Option<UiTransition>)>,
+    out: &mut Vec<(String, Option<String>, UiVisual, Option<UiTransition>)>,
     fragment_id: &str,
     node: &UiNode,
     parent_offset: [f32; 2],
     inherited_clip: Option<UiBounds>,
+    parent_id: Option<&str>,
+    font: Option<&ResidentFont>,
+    assigned_size: Option<[f32; 2]>,
 ) {
+    let node_layout = node.layout.unwrap_or_default();
     let bounds = UiBounds {
         x: parent_offset[0] + node.bounds.x,
         y: parent_offset[1] + node.bounds.y,
-        width: node.bounds.width,
-        height: node.bounds.height,
+        width: assigned_size.map_or_else(|| resolved_dimension(node.bounds.width, node, &node_layout, font, false), |size| size[0]),
+        height: assigned_size.map_or_else(|| resolved_dimension(node.bounds.height, node, &node_layout, font, true), |size| size[1]),
     };
-    let node_layout = node.layout.unwrap_or_default();
     let own_clip = if node_layout.clip { Some(bounds) } else { inherited_clip };
     let effective_clip = own_clip.unwrap_or(UiBounds { x: -1_000_000.0, y: -1_000_000.0, width: 2_000_000.0, height: 2_000_000.0 });
     if node.visible && node.style.opacity > 0.0 {
+        let node_path = format!("{fragment_id}/{}", node.node_id.0);
         out.push((
-            format!("{fragment_id}/{}", node.node_id.0),
+            node_path.clone(),
+            parent_id.map(str::to_owned),
             UiVisual {
                 bounds,
                 style: node.style,
@@ -1311,23 +1607,84 @@ fn flatten_node(
         ));
     }
     let inner = UiBounds { x: bounds.x + node_layout.padding[3], y: bounds.y + node_layout.padding[0], width: (bounds.width - node_layout.padding[1] - node_layout.padding[3]).max(0.0), height: (bounds.height - node_layout.padding[0] - node_layout.padding[2]).max(0.0) };
-    let mut cursor = [inner.x - node_layout.scroll_offset[0], inner.y - node_layout.scroll_offset[1]];
-    for child in &node.children {
-        let child_offset = [bounds.x - node_layout.scroll_offset[0], bounds.y - node_layout.scroll_offset[1]];
-        let child_layout = child.layout.unwrap_or_default();
-        let offset = match node_layout.mode {
-            UiLayoutMode::Row => {
-                let offset = [cursor[0] - child.bounds.x + child_layout.margin[3], cursor[1] - child.bounds.y + child_layout.margin[0]];
-                cursor[0] += child.bounds.width + child_layout.margin[1] + node_layout.gap; offset
-            }
-            UiLayoutMode::Column => {
-                let offset = [cursor[0] - child.bounds.x + child_layout.margin[3], cursor[1] - child.bounds.y + child_layout.margin[0]];
-                cursor[1] += child.bounds.height + child_layout.margin[2] + node_layout.gap; offset
-            }
-            UiLayoutMode::Absolute | UiLayoutMode::Overlay => child_offset,
-        };
-        flatten_node(out, fragment_id, child, offset, own_clip);
+    let child_bounds = resolve_children(node, bounds, node_layout, inner, font);
+    for (child, child_bounds) in node.children.iter().zip(child_bounds) {
+        let offset = [child_bounds.x - child.bounds.x, child_bounds.y - child.bounds.y];
+        let node_path = format!("{fragment_id}/{}", node.node_id.0);
+        flatten_node(out, fragment_id, child, offset, own_clip, Some(&node_path), font, Some([child_bounds.width, child_bounds.height]));
     }
+}
+
+fn resolved_dimension(declared: f32, node: &UiNode, layout: &UiLayout, font: Option<&ResidentFont>, height: bool) -> f32 {
+    let intrinsic = intrinsic_size(node, font);
+    let mut value = if declared > 0.0 { declared } else if height { intrinsic[1] } else { intrinsic[0] };
+    if let Some([width, height_value]) = layout.preferred_size { value = if height { height_value } else { width }; }
+    if let Some([width, height_value]) = layout.min_size { value = value.max(if height { height_value } else { width }); }
+    if let Some([width, height_value]) = layout.max_size { value = value.min(if height { height_value } else { width }); }
+    value
+}
+
+fn intrinsic_size(node: &UiNode, font: Option<&ResidentFont>) -> [f32; 2] {
+    let Some(text) = node.text.as_ref().and_then(text_ref_value) else { return [0.0, 0.0]; };
+    let line_height = font.map_or(FONT_RASTER_SIZE, |font| font.line_height);
+    let width = font.map_or_else(|| text.chars().count() as f32 * FONT_RASTER_SIZE * 0.5, |font| text.chars().map(|ch| font.font.metrics(ch, FONT_RASTER_SIZE).advance_width).sum());
+    [width + if node.kind == UiNodeKind::TextInput { TEXT_INPUT_INSET * 2.0 } else { 0.0 }, line_height]
+}
+
+fn resolve_children(node: &UiNode, bounds: UiBounds, parent_layout: UiLayout, inner: UiBounds, font: Option<&ResidentFont>) -> Vec<UiBounds> {
+    if !matches!(parent_layout.mode, UiLayoutMode::Row | UiLayoutMode::Column) {
+        return node.children.iter().map(|child| UiBounds {
+            x: bounds.x + child.bounds.x - parent_layout.scroll_offset[0],
+            y: bounds.y + child.bounds.y - parent_layout.scroll_offset[1],
+            width: resolved_dimension(child.bounds.width, child, &child.layout.unwrap_or_default(), font, false),
+            height: resolved_dimension(child.bounds.height, child, &child.layout.unwrap_or_default(), font, true),
+        }).collect();
+    }
+    let row = parent_layout.mode == UiLayoutMode::Row;
+    let available = if row { inner.width } else { inner.height };
+    let mut main_sizes = node.children.iter().map(|child| {
+        let layout = child.layout.unwrap_or_default();
+        layout.flex_basis.unwrap_or_else(|| resolved_dimension(if row { child.bounds.width } else { child.bounds.height }, child, &layout, font, !row))
+    }).collect::<Vec<_>>();
+    let outer = node.children.iter().map(|child| {
+        let margin = child.layout.unwrap_or_default().margin;
+        if row { margin[3] + margin[1] } else { margin[0] + margin[2] }
+    }).collect::<Vec<_>>();
+    let occupied = main_sizes.iter().sum::<f32>() + outer.iter().sum::<f32>() + parent_layout.gap * node.children.len().saturating_sub(1) as f32;
+    let free = available - occupied;
+    if free > 0.0 {
+        let total = node.children.iter().map(|child| child.layout.unwrap_or_default().flex_grow).sum::<f32>();
+        if total > 0.0 { for (size, child) in main_sizes.iter_mut().zip(&node.children) { *size += free * child.layout.unwrap_or_default().flex_grow / total; } }
+    } else if free < 0.0 {
+        let total = node.children.iter().zip(&main_sizes).map(|(child, size)| child.layout.unwrap_or_default().flex_shrink * *size).sum::<f32>();
+        if total > 0.0 { for (size, child) in main_sizes.iter_mut().zip(&node.children) { *size = (*size + free * child.layout.unwrap_or_default().flex_shrink * *size / total).max(0.0); } }
+    }
+    let used = main_sizes.iter().sum::<f32>() + outer.iter().sum::<f32>() + parent_layout.gap * node.children.len().saturating_sub(1) as f32;
+    let remaining = (available - used).max(0.0);
+    let count = node.children.len() as f32;
+    let (mut cursor, gap) = match parent_layout.justify_content {
+        UiJustifyContent::Start => (0.0, parent_layout.gap), UiJustifyContent::Center => (remaining * 0.5, parent_layout.gap), UiJustifyContent::End => (remaining, parent_layout.gap),
+        UiJustifyContent::SpaceBetween if count > 1.0 => (0.0, parent_layout.gap + remaining / (count - 1.0)),
+        UiJustifyContent::SpaceAround if count > 0.0 => (remaining / count * 0.5, parent_layout.gap + remaining / count),
+        UiJustifyContent::SpaceEvenly if count > 0.0 => (remaining / (count + 1.0), parent_layout.gap + remaining / (count + 1.0)),
+        _ => (0.0, parent_layout.gap),
+    };
+    node.children.iter().enumerate().map(|(index, child)| {
+        let layout = child.layout.unwrap_or_default(); let margin = layout.margin;
+        let cross_available = if row { inner.height } else { inner.width };
+        let declared_cross = if row { child.bounds.height } else { child.bounds.width };
+        let mut cross_size = resolved_dimension(declared_cross, child, &layout, font, row);
+        let align = layout.align_self.unwrap_or(parent_layout.align_items);
+        if align == UiAlignItems::Stretch && declared_cross == 0.0 { cross_size = (cross_available - if row { margin[0] + margin[2] } else { margin[3] + margin[1] }).max(0.0); }
+        let cross_margin_start = if row { margin[0] } else { margin[3] };
+        let cross_margin_end = if row { margin[2] } else { margin[1] };
+        let cross_offset = match align { UiAlignItems::Start | UiAlignItems::Stretch => cross_margin_start, UiAlignItems::Center => (cross_available - cross_size - cross_margin_start - cross_margin_end).max(0.0) * 0.5 + cross_margin_start, UiAlignItems::End => (cross_available - cross_size - cross_margin_end).max(0.0) };
+        let main_margin_start = if row { margin[3] } else { margin[0] }; let main_margin_end = if row { margin[1] } else { margin[2] };
+        cursor += main_margin_start;
+        let result = if row { UiBounds { x: inner.x + cursor - parent_layout.scroll_offset[0], y: inner.y + cross_offset - parent_layout.scroll_offset[1], width: main_sizes[index], height: cross_size } } else { UiBounds { x: inner.x + cross_offset - parent_layout.scroll_offset[0], y: inner.y + cursor - parent_layout.scroll_offset[1], width: cross_size, height: main_sizes[index] } };
+        cursor += main_sizes[index] + main_margin_end + gap;
+        result
+    }).collect()
 }
 
 fn transition_source(target: &UiVisual, transition: &UiTransition) -> UiVisual {
@@ -1440,7 +1797,7 @@ fn contains(bounds: UiBounds, position: [f32; 2]) -> bool {
 mod tests {
     use super::*;
     use neon_protocol::Revision;
-    use neon_ui_schema::{TextRef, UiEffect, UiFragmentId, UiIntent, UiNodeId, UiTransitionState};
+    use neon_ui_schema::{TextRef, UiAlignItems, UiEffect, UiFragmentId, UiIntent, UiJustifyContent, UiLayout, UiNodeId, UiTransitionState};
 
     fn fixture_font() -> AssetBytes {
         AssetBytes {
@@ -1450,6 +1807,91 @@ mod tests {
             height: None,
             bytes: include_bytes!("../../../assets/fonts/SarasaUiSC-Light.ttf").to_vec(),
         }
+    }
+
+    #[test]
+    fn text_edit_buffer_uses_character_boundaries_and_keeps_preedit_local() {
+        let mut editing = UiTextEditingState::default();
+        editing.focus(UiTextInputBinding { node_path: "surface/input".into(), max_length: 16, bounds: UiBounds { x: 0.0, y: 0.0, width: 1.0, height: 1.0 } }, "地形A".into());
+        editing.move_cursor(-1, false);
+        editing.set_preedit("测试".into());
+        assert_eq!(editing.commit("测试"), Some("地形测试A".into()));
+        assert_eq!(editing.backspace(), Some("地形测A".into()));
+        assert_eq!(editing.backspace(), Some("地形A".into()));
+        assert_eq!(editing.delete(), Some("地形".into()));
+        assert_eq!(editing.cursor, 2);
+    }
+
+    #[test]
+    fn text_edit_selection_replaces_character_safe_ranges() {
+        let mut editing = UiTextEditingState::default();
+        editing.focus(UiTextInputBinding { node_path: "surface/input".into(), max_length: 16, bounds: UiBounds { x: 0.0, y: 0.0, width: 1.0, height: 1.0 } }, "A地形B".into());
+        editing.move_cursor(-2, false);
+        editing.move_cursor(-2, true);
+        assert_eq!(editing.selection_range(), 0..2);
+        assert_eq!(editing.commit("测试"), Some("测试形B".into()));
+        assert_eq!(editing.committed, "测试形B");
+        assert_eq!(editing.selection_anchor, editing.cursor);
+    }
+
+    #[test]
+    fn text_input_pointer_hit_is_available_before_gpu_readback() {
+        let (device, _queue) = test_device("neon3-ui-text-input-pointer-hit");
+        let mut renderer = UiWgpuRenderer::new(&device, wgpu::TextureFormat::Rgba8Unorm);
+        renderer.hit_bindings.insert(1, UiHitBinding {
+            fragment: UiFragmentRevision { id: UiFragmentId("input".into()), revision: Revision(1) },
+            intent: None,
+            text_input: Some(UiTextInputBinding {
+                node_path: "input/field".into(),
+                max_length: 256,
+                bounds: UiBounds { x: 20.0, y: 30.0, width: 100.0, height: 32.0 },
+            }),
+        });
+        renderer.set_pointer_position([24.0, 40.0]);
+        assert_eq!(renderer.text_input_at_pointer().unwrap().node_path, "input/field");
+        renderer.set_pointer_position([124.0, 40.0]);
+        assert!(renderer.text_input_at_pointer().is_none());
+    }
+
+    #[test]
+    fn parent_transition_moves_child_panel_from_the_same_sampled_origin() {
+        let (device, queue) = test_device("neon3-ui-subtree-transition");
+        let mut root = node();
+        root.bounds = UiBounds { x: 20.0, y: 8.0, width: 28.0, height: 28.0 };
+        root.style = UiStyle { background_color: [0.0; 4], border_color: [0.0; 4], border_width: 0.0, corner_radius: 0.0, opacity: 1.0 };
+        root.enter_transition = Some(UiTransition {
+            delay_ms: 0,
+            duration_ms: 200,
+            easing: UiEasing::Linear,
+            from: UiTransitionState { bounds: Some(UiBounds { x: 0.0, y: 8.0, width: 28.0, height: 28.0 }), ..UiTransitionState::default() },
+        });
+        root.children.push(UiNode {
+            node_id: UiNodeId("child".into()),
+            kind: UiNodeKind::Panel,
+            bounds: UiBounds { x: 4.0, y: 4.0, width: 8.0, height: 8.0 },
+            layout: None,
+            visible: true,
+            enabled: true,
+            text_key: None,
+            text: None,
+            image: None,
+            surface: None,
+            style: UiStyle { background_color: [1.0, 0.0, 0.0, 1.0], border_color: [0.0; 4], border_width: 0.0, corner_radius: 0.0, opacity: 1.0 },
+            enter_transition: None,
+            children: Vec::new(),
+        });
+        let pixels = render_offscreen_for_test(
+            &device,
+            &queue,
+            wgpu::TextureFormat::Rgba8Unorm,
+            &HashMap::from([(UiFragmentId("subtree".into()), UiFragment { fragment_id: UiFragmentId("subtree".into()), revision: Revision(1), root, effects: Vec::new() })]),
+            [48, 48],
+            1.0,
+            &[],
+            Vec::new(),
+        );
+        assert!(pixels[4 * (14 * 48 + 6) + 3] > 0, "child must render at the parent's transition origin");
+        assert_eq!(pixels[4 * (14 * 48 + 26) + 3], 0, "child must not jump to the parent's final position");
     }
 
     fn test_device(label: &'static str) -> (wgpu::Device, wgpu::Queue) {
@@ -1529,10 +1971,10 @@ mod tests {
                 effects: Vec::new(),
             },
         )]);
-        let nodes = flatten_fragments(&fragments);
+        let nodes = flatten_fragments(&fragments, None);
         assert_eq!(nodes.len(), 2);
         assert_eq!(
-            nodes[1].1.bounds,
+            nodes[1].2.bounds,
             UiBounds {
                 x: 18.0,
                 y: 26.0,
@@ -1540,6 +1982,22 @@ mod tests {
                 height: 24.0
             }
         );
+    }
+
+    #[test]
+    fn wgpu_layout_resolves_flex_grow_shrink_alignment_and_intrinsic_text() {
+        let mut root = node();
+        root.bounds = UiBounds { x: 0.0, y: 0.0, width: 200.0, height: 40.0 };
+        root.layout = Some(UiLayout { mode: UiLayoutMode::Row, padding: [4.0; 4], gap: 4.0, align_items: UiAlignItems::Center, justify_content: UiJustifyContent::Start, ..UiLayout::default() });
+        for (id, grow, width, text) in [("fixed", 0.0, 20.0, None), ("grow", 1.0, 0.0, None), ("text", 0.0, 0.0, Some("abc"))] {
+            root.children.push(UiNode { node_id: UiNodeId(id.into()), kind: UiNodeKind::Label, bounds: UiBounds { x: 0.0, y: 0.0, width, height: 0.0 }, layout: Some(UiLayout { flex_grow: grow, ..UiLayout::default() }), visible: true, enabled: true, text_key: None, text: text.map(|value| TextRef::Literal { value: value.into() }), image: None, surface: None, style: UiStyle::default(), enter_transition: None, children: Vec::new() });
+        }
+        let fragments = HashMap::from([(UiFragmentId("flex".into()), UiFragment { fragment_id: UiFragmentId("flex".into()), revision: Revision(1), root, effects: Vec::new() })]);
+        let nodes = flatten_fragments(&fragments, None);
+        assert_eq!(nodes[1].2.bounds.x, 4.0);
+        assert!(nodes[2].2.bounds.width > 100.0, "grow consumes available main axis space");
+        assert!(nodes[3].2.bounds.width > 20.0, "auto text uses renderer intrinsic fallback before font residency");
+        assert_eq!(nodes[1].2.bounds.y, nodes[2].2.bounds.y, "center alignment uses common cross-axis placement");
     }
 
     #[test]
@@ -1707,7 +2165,7 @@ mod tests {
         let bindings = collect_hit_declarations(&HashMap::from([(UiFragmentId("surface.test".into()), fragment)]));
         let binding = bindings.get("surface.test/root").expect("bound node must resolve locally");
         assert_eq!(binding.fragment.revision, Revision(4));
-        assert_eq!(binding.intent, intent);
+        assert_eq!(binding.intent, Some(intent));
     }
 
     #[test]
@@ -1783,9 +2241,9 @@ mod tests {
             UiNode { node_id: UiNodeId("second".into()), kind: UiNodeKind::Button, bounds: UiBounds { x: 0.0, y: 0.0, width: 20.0, height: 10.0 }, layout: None, visible: true, enabled: true, text_key: None, text: None, image: None, surface: None, style: UiStyle::default(), enter_transition: None, children: Vec::new() },
         ];
         let fragments = HashMap::from([(UiFragmentId("layout".into()), UiFragment { fragment_id: UiFragmentId("layout".into()), revision: Revision(1), root, effects: Vec::new() })]);
-        let nodes = flatten_fragments(&fragments);
-        assert_eq!(nodes[1].1.bounds.y, 1.0);
-        assert_eq!(nodes[2].1.bounds.y, 13.0);
+        let nodes = flatten_fragments(&fragments, None);
+        assert_eq!(nodes[1].2.bounds.y, 1.0);
+        assert_eq!(nodes[2].2.bounds.y, 13.0);
     }
 
     #[test]

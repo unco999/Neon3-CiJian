@@ -79,6 +79,28 @@ test("RenderSurface compiles an opaque renderer target reference", () => {
   );
 });
 
+test("TextInput declares a bounded local editor and a commit intent", () => {
+  const input = createHost("neon-text-input", {
+    nodeKey: "title", bounds: { x: 4, y: 4, width: 180, height: 28 }, value: "Draft", maxLength: 256,
+    intent: { action: "ui.showcase.text.commit", params: {} },
+  });
+  const fragment = compileContainer(surface([input]));
+  assert.equal(fragment.root.children[0].kind, "text_input");
+  assert.deepEqual(fragment.root.children[0].text, { kind: "literal", value: "Draft" });
+  assert.equal(fragment.effects[0].intent.action, "ui.showcase.text.commit");
+  assert.throws(() => compileContainer(surface([createHost("neon-text-input", { nodeKey: "bad", bounds: { x: 0, y: 0, width: 1, height: 1 }, value: "x" })])), /intent is required/);
+  assert.throws(() => compileContainer(surface([createHost("neon-text-input", { nodeKey: "long", bounds: { x: 0, y: 0, width: 1, height: 1 }, value: "x", maxLength: 64, intent: { action: "ui.showcase.text.commit", params: {} } })])), /fixed at 256/);
+});
+
+test("Flex declarations preserve wire names and reject invalid factors", () => {
+  const child = panel("auto-label", [], { layout: { flex_basis: null, flex_grow: 1, flex_shrink: 0, align_self: "stretch" } });
+  const root = panel("row", [child], { layout: { mode: "row", justify_content: "space_between", align_items: "center", gap: 8 } });
+  const fragment = compileContainer(surface([root]));
+  assert.deepEqual(fragment.root.children[0].layout, { mode: "row", justify_content: "space_between", align_items: "center", gap: 8 });
+  assert.equal(fragment.root.children[0].children[0].layout.flex_grow, 1);
+  assert.throws(() => compileContainer(surface([panel("bad", [], { layout: { flex_grow: -1 } })])), /flex_grow is invalid/);
+});
+
 test("React reconciler produces a protocol fragment without DOM", async () => {
   const fragmentPromise = new Promise((resolve, reject) => {
     const root = createNeonRoot({

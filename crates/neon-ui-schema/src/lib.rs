@@ -143,7 +143,9 @@ pub enum UiNodeKind {
     Button,
     Image,
     RenderSurface,
+    TextInput,
 }
+
 
 /// Source-independent text declaration. Renderers receive resolved immutable content only.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -166,6 +168,32 @@ pub struct UiBounds {
 #[serde(rename_all = "snake_case")]
 pub enum UiLayoutMode { Absolute, Overlay, Row, Column }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UiJustifyContent {
+    #[default]
+    Start,
+    Center,
+    End,
+    SpaceBetween,
+    SpaceAround,
+    SpaceEvenly,
+}
+
+impl UiJustifyContent { fn is_start(value: &Self) -> bool { *value == Self::Start } }
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UiAlignItems {
+    #[default]
+    Start,
+    Center,
+    End,
+    Stretch,
+}
+
+impl UiAlignItems { fn is_start(value: &Self) -> bool { *value == Self::Start } }
+
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct UiLayout {
@@ -176,42 +204,30 @@ pub struct UiLayout {
     pub min_size: Option<[f32; 2]>,
     pub max_size: Option<[f32; 2]>,
     pub preferred_size: Option<[f32; 2]>,
+    /// Participates only when the parent uses row or column layout. A missing basis is auto:
+    /// the declared size is used when nonzero, otherwise WGPU derives intrinsic text size.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flex_basis: Option<f32>,
+    /// Defaults preserve v1's fixed-size row and column behavior.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub flex_grow: f32,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub flex_shrink: f32,
+    #[serde(default, skip_serializing_if = "UiJustifyContent::is_start")]
+    pub justify_content: UiJustifyContent,
+    #[serde(default, skip_serializing_if = "UiAlignItems::is_start")]
+    pub align_items: UiAlignItems,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub align_self: Option<UiAlignItems>,
     pub clip: bool,
     pub scroll_offset: [f32; 2],
 }
 
+fn is_zero(value: &f32) -> bool { *value == 0.0 }
+
 impl Default for UiLayout {
-    fn default() -> Self { Self { mode: UiLayoutMode::Absolute, padding: [0.0; 4], margin: [0.0; 4], gap: 0.0, min_size: None, max_size: None, preferred_size: None, clip: false, scroll_offset: [0.0; 2] } }
+    fn default() -> Self { Self { mode: UiLayoutMode::Absolute, padding: [0.0; 4], margin: [0.0; 4], gap: 0.0, min_size: None, max_size: None, preferred_size: None, flex_basis: None, flex_grow: 0.0, flex_shrink: 0.0, justify_content: UiJustifyContent::Start, align_items: UiAlignItems::Start, align_self: None, clip: false, scroll_offset: [0.0; 2] } }
 }
-
-pub fn resolve_layout(node: &UiNode, parent: UiBounds, scale_factor: f32) -> Result<Vec<UiBounds>, UiSchemaError> {
-    if !scale_factor.is_finite() || scale_factor <= 0.0 { return Err(UiSchemaError::InvalidLayout); }
-    let layout = node.layout.unwrap_or_default();
-    if !layout.is_valid() { return Err(UiSchemaError::InvalidLayout); }
-    let own = clamp_bounds(UiBounds { x: parent.x + node.bounds.x, y: parent.y + node.bounds.y, width: node.bounds.width, height: node.bounds.height }, layout);
-    let mut output = vec![physical_bounds(own, scale_factor)];
-    let inner = UiBounds { x: own.x + layout.padding[3], y: own.y + layout.padding[0], width: (own.width - layout.padding[1] - layout.padding[3]).max(0.0), height: (own.height - layout.padding[0] - layout.padding[2]).max(0.0) };
-    let mut cursor = [inner.x - layout.scroll_offset[0], inner.y - layout.scroll_offset[1]];
-    for child in &node.children {
-        let child_layout = child.layout.unwrap_or_default();
-        let mut child_bounds = UiBounds { x: inner.x + child.bounds.x, y: inner.y + child.bounds.y, width: child.bounds.width, height: child.bounds.height };
-        if matches!(layout.mode, UiLayoutMode::Row | UiLayoutMode::Column) {
-            child_bounds.x = cursor[0] + child_layout.margin[3]; child_bounds.y = cursor[1] + child_layout.margin[0];
-            if layout.mode == UiLayoutMode::Row { cursor[0] += child_bounds.width + child_layout.margin[1] + layout.gap; } else { cursor[1] += child_bounds.height + child_layout.margin[2] + layout.gap; }
-        }
-        output.extend(resolve_layout(child, child_bounds, scale_factor)?);
-    }
-    Ok(output)
-}
-
-fn clamp_bounds(mut bounds: UiBounds, layout: UiLayout) -> UiBounds {
-    if let Some([width, height]) = layout.preferred_size { bounds.width = width; bounds.height = height; }
-    if let Some([width, height]) = layout.min_size { bounds.width = bounds.width.max(width); bounds.height = bounds.height.max(height); }
-    if let Some([width, height]) = layout.max_size { bounds.width = bounds.width.min(width); bounds.height = bounds.height.min(height); }
-    bounds
-}
-
-fn physical_bounds(bounds: UiBounds, scale: f32) -> UiBounds { UiBounds { x: bounds.x * scale, y: bounds.y * scale, width: bounds.width * scale, height: bounds.height * scale } }
 
 /// Renderer-independent visual properties for a screen-space UI node.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -294,6 +310,7 @@ pub enum UiIntent {
 #[serde(rename_all = "snake_case")]
 pub enum UiSemanticEventType {
     PointerClick,
+    TextInputCommit,
     FocusChanged,
     InteractionCancelled,
 }
@@ -318,6 +335,13 @@ pub struct UiFocusMetadata {
     pub focused: bool,
 }
 
+/// A committed input value. IME preedit never enters the UI runtime contract.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiTextInputCommit {
+    pub value: String,
+}
+
 /// A renderer-resolved semantic event. It intentionally contains no render hit ID or node key.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -330,6 +354,8 @@ pub struct UiSemanticEvent {
     pub intent: UiIntent,
     pub pointer: Option<UiPointerMetadata>,
     pub focus: Option<UiFocusMetadata>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<UiTextInputCommit>,
 }
 
 pub const ERROR_RENDERER_EPOCH_MISMATCH: &str = "renderer_epoch_mismatch";
@@ -438,6 +464,9 @@ impl UiLayout {
     fn is_valid(self) -> bool {
         self.padding.iter().chain(self.margin.iter()).all(|value| value.is_finite() && *value >= 0.0)
             && self.gap.is_finite() && self.gap >= 0.0 && self.scroll_offset.iter().all(|value| value.is_finite())
+            && self.flex_basis.is_none_or(|value| value.is_finite() && value >= 0.0)
+            && self.flex_grow.is_finite() && self.flex_grow >= 0.0
+            && self.flex_shrink.is_finite() && self.flex_shrink >= 0.0
             && self.min_size.is_none_or(|size| size.iter().all(|value| value.is_finite() && *value >= 0.0))
             && self.max_size.is_none_or(|size| size.iter().all(|value| value.is_finite() && *value >= 0.0))
             && self.preferred_size.is_none_or(|size| size.iter().all(|value| value.is_finite() && *value >= 0.0))
@@ -666,6 +695,7 @@ mod tests {
                 sequence: 4,
             }),
             focus: None,
+            text: None,
         };
         let encoded = serde_json::to_value(event).unwrap();
         assert!(encoded.get("render_hit_id").is_none());
@@ -699,26 +729,13 @@ mod tests {
     }
 
     #[test]
-    fn row_column_dpi_and_scroll_layout_are_deterministic() {
-        let row = resolve_layout(&layout_node(UiLayoutMode::Row), UiBounds { x: 0.0, y: 0.0, width: 0.0, height: 0.0 }, 2.0).unwrap();
-        assert_eq!(row[1], UiBounds { x: 16.0, y: 10.0, width: 40.0, height: 20.0 });
-        assert_eq!(row[2].x, 58.0);
-        let column = resolve_layout(&layout_node(UiLayoutMode::Column), UiBounds { x: 0.0, y: 0.0, width: 0.0, height: 0.0 }, 1.0).unwrap();
-        assert_eq!(column[1].y, 5.0);
-        assert_eq!(column[2].y, 20.0);
-        let mut scrolled = layout_node(UiLayoutMode::Column);
-        scrolled.layout.as_mut().unwrap().scroll_offset = [0.0, 2.0];
-        assert_eq!(resolve_layout(&scrolled, UiBounds { x: 0.0, y: 0.0, width: 0.0, height: 0.0 }, 1.0).unwrap()[1].y, 3.0);
-    }
-
-    #[test]
-    fn layout_clamps_sizes_and_rejects_invalid_values() {
+    fn layout_contract_validates_flex_values_without_resolving_renderer_layout() {
         let mut node = layout_node(UiLayoutMode::Absolute);
-        node.layout.as_mut().unwrap().min_size = Some([120.0, 70.0]);
-        node.layout.as_mut().unwrap().max_size = Some([130.0, 80.0]);
-        assert_eq!(resolve_layout(&node, UiBounds { x: 0.0, y: 0.0, width: 0.0, height: 0.0 }, 1.0).unwrap()[0].width, 120.0);
-        node.layout.as_mut().unwrap().gap = -1.0;
-        assert_eq!(resolve_layout(&node, UiBounds { x: 0.0, y: 0.0, width: 0.0, height: 0.0 }, 1.0), Err(UiSchemaError::InvalidLayout));
+        node.layout.as_mut().unwrap().flex_grow = 1.0;
+        node.layout.as_mut().unwrap().flex_basis = Some(32.0);
+        node.validate().unwrap();
+        node.layout.as_mut().unwrap().flex_shrink = -1.0;
+        assert_eq!(node.validate(), Err(UiSchemaError::InvalidLayout));
     }
 
     #[test]

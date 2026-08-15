@@ -170,9 +170,17 @@ impl RpcServer {
     {
         loop {
             let (mut stream, _) = self.listener.accept().map_err(map_io_error)?;
-            let request = read_json_frame(&mut stream, self.max_frame_size)?;
+            let request = match read_json_frame(&mut stream, self.max_frame_size) {
+                Ok(request) => request,
+                Err(TransportError::ConnectionClosed) => continue,
+                Err(error) => return Err(error),
+            };
             let (response, keep_serving) = handler(request);
-            write_json_frame(&mut stream, &response, self.max_frame_size)?;
+            match write_json_frame(&mut stream, &response, self.max_frame_size) {
+                Ok(()) => {}
+                Err(TransportError::ConnectionClosed) => continue,
+                Err(error) => return Err(error),
+            }
             if !keep_serving {
                 return Ok(());
             }
@@ -360,6 +368,24 @@ mod tests {
             request.method = method.into();
             assert_eq!(client.call(&request).unwrap().status, RpcStatus::Accepted);
         }
+        thread.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn persistent_server_ignores_a_connection_closed_before_any_request() {
+        let server = RpcServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let endpoint = server.local_addr().unwrap();
+        let thread = thread::spawn(move || {
+            server.serve_until(|request| {
+                let shutdown = request.method == "service.shutdown";
+                (accepted(request), !shutdown)
+            })
+        });
+        drop(TcpStream::connect(endpoint).unwrap());
+        let mut client = RpcClient::connect(endpoint).unwrap();
+        let mut shutdown = request("shutdown-after-probe");
+        shutdown.method = "service.shutdown".into();
+        assert_eq!(client.call(&shutdown).unwrap().status, RpcStatus::Accepted);
         thread.join().unwrap().unwrap();
     }
 

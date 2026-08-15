@@ -11,6 +11,7 @@
     "demo:workbench": "npm run build && node dist/demo-workbench.js",
     "demo:animation": "npm run build && node dist/demo-animation.js",
     "demo:nested-animation": "npm run build && node dist/demo-nested-animation.js",
+    "demo:ui-platform": "npm run build && node dist/demo-ui-platform-showcase.js",
     "demo:workbench:interactive": "npm run build && node dist/demo-workbench-interactive.js"
   },
   "peerDependencies": {

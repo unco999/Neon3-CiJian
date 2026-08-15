@@ -1,7 +1,7 @@
 import type React from "react";
 import type { AssetRef, Bounds, JsonValue, NodeKey, RenderSurfaceRef, UiFragment, UiIntent, UiIntentSpec, UiLayout, UiNode, UiStyle, UiSurfaceEvent, UiTransition } from "./protocol.js";
 
-type HostType = "neon-surface" | "neon-panel" | "neon-label" | "neon-button" | "neon-image" | "neon-render-surface";
+type HostType = "neon-surface" | "neon-panel" | "neon-label" | "neon-button" | "neon-image" | "neon-render-surface" | "neon-text-input";
 type HostProps = Record<string, unknown>;
 type TextNode = { kind: "text"; value: string; hidden: boolean };
 export type HostNode = { kind: "host"; type: HostType; props: HostProps; children: Child[]; hidden: boolean };
@@ -67,6 +67,7 @@ function compileChildren(children: Child[], surfaceId: string, parentPath: strin
     if (intentSpec && surfaceEvent) throw new Error(`${path} cannot declare both intent and event`);
     if (surfaceEvent && kind !== "button") throw new Error(`${path}.event is only valid on Button`);
     const intent = surfaceEvent ? toSurfaceEventIntent(surfaceId, surfaceEvent) : intentSpec ? toWireIntent(intentSpec) : undefined;
+    if (kind === "text_input" && !intent) throw new Error(`${path}.intent is required for TextInput commits`);
     const id = nodeId(surfaceId, path);
     if (intent) {
       validateIntent(intent);
@@ -79,12 +80,15 @@ function compileChildren(children: Child[], surfaceId: string, parentPath: strin
       throw new Error(`RenderSurface ${key} requires surface.target_id`);
     }
     const text = textProp(child);
+    const inputValue = kind === "text_input" ? requiredString(child.props.value, `${path}.value`) : undefined;
+    if (kind === "text_input") textInputMaxLength(child.props.maxLength);
+    const layout = layoutProp(child.props.layout, `${path}.layout`);
     const textKey = typeof child.props.textKey === "string" ? child.props.textKey : null;
     nodes.push({
       node_id: id, kind, bounds: requiredBounds(child.props.bounds, `${path}.bounds`),
-      layout: (child.props.layout as UiLayout | undefined) ?? null,
+      layout,
       visible: boolProp(child.props.visible, true), enabled: boolProp(child.props.enabled, true),
-      text_key: textKey, text: textKey ? { kind: "key", key: textKey, arguments: (child.props.textArguments as JsonValue | undefined) ?? {} } : text,
+      text_key: textKey, text: textKey ? { kind: "key", key: textKey, arguments: (child.props.textArguments as JsonValue | undefined) ?? {} } : inputValue === undefined ? text : { kind: "literal", value: inputValue },
       image: asset ?? null, surface: surface ?? null, style: styleProp(child.props.style), enter_transition: transitionProp(child.props.enterTransition),
       children: compileChildren(child.children, surfaceId, path, effects),
     });
@@ -106,13 +110,24 @@ function sanitizeProps(props: HostProps): HostProps {
 }
 
 function hostKind(type: HostType): UiNode["kind"] {
-  switch (type) { case "neon-panel": return "panel"; case "neon-label": return "label"; case "neon-button": return "button"; case "neon-image": return "image"; case "neon-render-surface": return "render_surface"; default: throw new Error(`invalid node type: ${type}`); }
+  switch (type) { case "neon-panel": return "panel"; case "neon-label": return "label"; case "neon-button": return "button"; case "neon-image": return "image"; case "neon-render-surface": return "render_surface"; case "neon-text-input": return "text_input"; default: throw new Error(`invalid node type: ${type}`); }
 }
 
-function isHostType(type: string): type is HostType { return ["neon-surface", "neon-panel", "neon-label", "neon-button", "neon-image", "neon-render-surface"].includes(type); }
+function isHostType(type: string): type is HostType { return ["neon-surface", "neon-panel", "neon-label", "neon-button", "neon-image", "neon-render-surface", "neon-text-input"].includes(type); }
 function requiredString(value: unknown, name: string): string { if (typeof value !== "string" || !value.trim()) throw new Error(`${name} is required`); return value; }
 function requiredNodeKey(value: unknown): NodeKey { const key = requiredString(value, "nodeKey"); if (!/^[a-z][a-z0-9._-]*$/.test(key)) throw new Error(`nodeKey must be a semantic kebab-case token: ${key}`); return key; }
 function requiredRevision(value: unknown): number { if (!Number.isSafeInteger(value) || (value as number) < 0) throw new Error("Surface.revision must be a non-negative integer"); return value as number; }
+function textInputMaxLength(value: unknown): number { if (value === undefined || value === 256) return 256; throw new Error("TextInput.maxLength is fixed at 256 in v1"); }
+function layoutProp(value: unknown, name: string): UiLayout | null {
+  if (value === undefined) return null;
+  if (!value || typeof value !== "object") throw new Error(`${name} is invalid`);
+  const layout = value as UiLayout;
+  for (const key of ["flex_basis", "flex_grow", "flex_shrink", "gap"]) {
+    const part = layout[key as keyof UiLayout];
+    if (part !== undefined && part !== null && (typeof part !== "number" || !Number.isFinite(part) || part < 0)) throw new Error(`${name}.${key} is invalid`);
+  }
+  return layout;
+}
 function requiredBounds(value: unknown, name: string): Bounds { if (!value || typeof value !== "object") throw new Error(`${name} is required`); const bounds = value as Bounds; if (![bounds.x, bounds.y, bounds.width, bounds.height].every((part) => typeof part === "number" && Number.isFinite(part)) || bounds.width < 0 || bounds.height < 0) throw new Error(`${name} is invalid`); return bounds; }
 function boolProp(value: unknown, fallback: boolean): boolean { return value === undefined ? fallback : value === true; }
 function styleProp(style: unknown): UiStyle { return (style as UiStyle | undefined) ?? {}; }

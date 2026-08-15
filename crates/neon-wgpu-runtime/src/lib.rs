@@ -22,9 +22,10 @@ use neon_ui_schema::UiFragmentSubmission;
 use serde_json::{Value, json};
 use winit::{
     application::ApplicationHandler,
-    dpi::PhysicalSize,
-    event::WindowEvent,
+    dpi::{PhysicalPosition, PhysicalSize},
+    event::{ElementState, WindowEvent},
     event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy},
+    keyboard::{Key, NamedKey},
     window::{Window, WindowId},
 };
 
@@ -164,6 +165,9 @@ struct WindowGpu {
     pending_hit_slot: Option<(usize, u64)>,
     next_input_sequence: u64,
     next_semantic_sequence: u64,
+    ime_active: bool,
+    shift_down: bool,
+    text_selection_drag: bool,
     started_at: Instant,
     last_draw_instance_count: usize,
     hit_target_dirty: bool,
@@ -512,6 +516,9 @@ impl WindowGpu {
             pending_hit_slot: None,
             next_input_sequence: 0,
             next_semantic_sequence: 0,
+            ime_active: false,
+            shift_down: false,
+            text_selection_drag: false,
             started_at: Instant::now(),
             last_draw_instance_count: 0,
             hit_target_dirty: true,
@@ -592,6 +599,7 @@ fn forward_pointer_click(
     sequence: u64,
     binding: UiHitBinding,
 ) {
+    let Some(intent) = binding.intent else { return; };
     thread::spawn(move || {
         let request_id = RequestId(format!("wgpu-pointer-click-{sequence}"));
         let event = UiSemanticEvent {
@@ -600,9 +608,10 @@ fn forward_pointer_click(
             renderer_epoch,
             composition_revision,
             fragment: binding.fragment,
-            intent: binding.intent,
+            intent,
             pointer: Some(neon_ui_schema::UiPointerMetadata { id: 0, sequence }),
             focus: None,
+            text: None,
         };
         let request = RpcRequest {
             protocol: "neon3.rpc".into(), version: PROTOCOL_VERSION, request_id: request_id.clone(),
@@ -614,6 +623,36 @@ fn forward_pointer_click(
             Ok(response) if response.status == RpcStatus::Accepted => {}
             Ok(response) => eprintln!("ui pointer event rejected: {}", response.error.map_or("unknown".into(), |error| error.code)),
             Err(error) => eprintln!("ui pointer event delivery failed: {error}"),
+        }
+    });
+}
+
+fn forward_text_input_commit(
+    endpoint: SocketAddr,
+    renderer_epoch: u64,
+    composition_revision: Revision,
+    sequence: u64,
+    binding: UiHitBinding,
+    value: String,
+) {
+    let Some(intent) = binding.intent else { return; };
+    thread::spawn(move || {
+        let request_id = RequestId(format!("wgpu-text-input-{sequence}"));
+        let event = UiSemanticEvent {
+            event: neon_ui_schema::UiSemanticEventType::TextInputCommit,
+            event_id: request_id.0.clone(), renderer_epoch, composition_revision,
+            fragment: binding.fragment, intent, pointer: None,
+            focus: Some(neon_ui_schema::UiFocusMetadata { focused: true }),
+            text: Some(neon_ui_schema::UiTextInputCommit { value }),
+        };
+        let request = RpcRequest {
+            protocol: "neon3.rpc".into(), version: PROTOCOL_VERSION, request_id: request_id.clone(),
+            client: ClientIdentity { kind: ClientKind::WgpuRuntime, instance_id: format!("window-{renderer_epoch}"), pid: std::process::id(), origin: "neon-wgpu-runtime".into() },
+            target: ServiceName("ui-runtime".into()), method: "ui.input.event".into(), params: json!(&event),
+            expected_revision: Some(event.fragment.revision), idempotency_key: Some(format!("wgpu-text-input:{renderer_epoch}:{sequence}")),
+        };
+        if let Err(error) = RpcClient::connect(endpoint).and_then(|mut client| client.call(&request)) {
+            eprintln!("ui text commit delivery failed: {error}");
         }
     });
 }
@@ -642,8 +681,11 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
             WindowEvent::Resized(size) => self.resize(size),
             WindowEvent::CursorMoved { position, .. } => {
                 if let Some(gpu) = self.gpu.as_mut() {
-            gpu.ui
+                    gpu.ui
                         .set_pointer_position([position.x as f32, position.y as f32]);
+                    if gpu.text_selection_drag {
+                        gpu.ui.set_text_input_caret_from_pointer([position.x as f32, position.y as f32], true);
+                    }
                     let x = position.x.max(0.0).min(gpu.config.width.saturating_sub(1) as f64) as u32;
                     let y = position.y.max(0.0).min(gpu.config.height.saturating_sub(1) as f64) as u32;
                     gpu.pending_hit_pixel = Some([x, y]);
@@ -654,7 +696,21 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                 if state == winit::event::ElementState::Pressed
                 && button == winit::event::MouseButton::Left =>
             {
-                if let Some(gpu) = self.gpu.as_mut() {
+                let text_input = self.gpu.as_mut().and_then(|gpu| {
+                    let input = gpu.ui.text_input_at_pointer()?;
+                    gpu.ui.focus_text_input(input.clone());
+                    if let Some(pointer) = gpu.ui.pointer_position() {
+                        gpu.ui.set_text_input_caret_from_pointer(pointer, false);
+                    }
+                    gpu.text_selection_drag = true;
+                    self.redraw_pending = true;
+                    Some(input)
+                });
+                if let (Some(window), Some(input)) = (self.window.as_ref(), text_input) {
+                    window.set_ime_allowed(true);
+                    let rect = self.gpu.as_ref().and_then(|gpu| gpu.ui.text_input_ime_rect()).unwrap_or(input.bounds);
+                    window.set_ime_cursor_area(PhysicalPosition::new(rect.x.round() as i32, rect.y.round() as i32), PhysicalSize::new(rect.width.max(1.0).round() as u32, rect.height.max(1.0).round() as u32));
+                } else if let Some(gpu) = self.gpu.as_mut() {
                     if gpu.input.pointer_down().is_ok() {
                         gpu.ui.press_hovered(gpu.started_at.elapsed().as_secs_f32());
                         self.redraw_pending = true;
@@ -665,15 +721,90 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                 if state == winit::event::ElementState::Released
                 && button == winit::event::MouseButton::Left =>
             {
+                if let Some(gpu) = self.gpu.as_mut() { gpu.text_selection_drag = false; }
                 let binding = self.gpu.as_mut().and_then(|gpu| {
                     let hit_id = gpu.input.capture_id?;
                     gpu.input.pointer_up(true).ok()?;
                     gpu.next_semantic_sequence += 1;
-                    gpu.ui.hit_binding(hit_id).map(|binding| (gpu.next_semantic_sequence, binding))
+                    let binding = gpu.ui.hit_binding(hit_id)?;
+                    if let Some(input) = binding.text_input.clone() {
+                        gpu.ui.focus_text_input(input);
+                        self.redraw_pending = true;
+                        return Some((None, binding));
+                    }
+                    Some((Some(gpu.next_semantic_sequence), binding))
                 });
-                if let (Some(endpoint), Some((sequence, binding))) = (self.ui_endpoint, binding) {
+                if let Some((None, binding)) = &binding
+                    && let (Some(window), Some(input)) = (self.window.as_ref(), binding.text_input.as_ref())
+                {
+                    window.set_ime_allowed(true);
+                    let rect = self.gpu.as_ref().and_then(|gpu| gpu.ui.text_input_ime_rect()).unwrap_or(input.bounds);
+                    window.set_ime_cursor_area(PhysicalPosition::new(rect.x.round() as i32, rect.y.round() as i32), PhysicalSize::new(rect.width.max(1.0).round() as u32, rect.height.max(1.0).round() as u32));
+                }
+                if let (Some(endpoint), Some((Some(sequence), binding))) = (self.ui_endpoint, binding) {
+                    if let Some(window) = self.window.as_ref() { window.set_ime_allowed(false); }
                     forward_pointer_click(endpoint, self.epoch, self.applied_composition_revision, sequence, binding);
                 }
+            }
+            WindowEvent::Ime(winit::event::Ime::Enabled) => {
+                if let Some(gpu) = self.gpu.as_mut() { gpu.ime_active = true; }
+            }
+            WindowEvent::Ime(winit::event::Ime::Preedit(value, _)) => {
+                if let Some(gpu) = self.gpu.as_mut() {
+                    gpu.ime_active = true;
+                    gpu.ui.set_ime_preedit(value);
+                    self.redraw_pending = true;
+                }
+            }
+            WindowEvent::Ime(winit::event::Ime::Commit(value)) => {
+                let committed = self.gpu.as_mut().and_then(|gpu| {
+                    let result = gpu.ui.commit_ime_text(&value);
+                    if result.is_some() { gpu.next_semantic_sequence += 1; }
+                    result.map(|(binding, text)| (gpu.next_semantic_sequence, binding, text))
+                });
+                if let (Some(endpoint), Some((sequence, binding, value))) = (self.ui_endpoint, committed) {
+                    forward_text_input_commit(endpoint, self.epoch, self.applied_composition_revision, sequence, binding, value);
+                }
+                if let (Some(window), Some(rect)) = (self.window.as_ref(), self.gpu.as_ref().and_then(|gpu| gpu.ui.text_input_ime_rect())) {
+                    window.set_ime_cursor_area(PhysicalPosition::new(rect.x.round() as i32, rect.y.round() as i32), PhysicalSize::new(rect.width.max(1.0).round() as u32, rect.height.max(1.0).round() as u32));
+                }
+                self.redraw_pending = true;
+            }
+            WindowEvent::Ime(winit::event::Ime::Disabled) => {
+                if let Some(gpu) = self.gpu.as_mut() {
+                    gpu.ime_active = false;
+                    gpu.ui.set_ime_preedit(String::new());
+                    self.redraw_pending = true;
+                }
+            }
+            WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
+                let committed = self.gpu.as_mut().and_then(|gpu| {
+                    let result = match &event.logical_key {
+                        Key::Named(NamedKey::Backspace) => gpu.ui.backspace_text_input(),
+                        Key::Named(NamedKey::Delete) => gpu.ui.delete_text_input(),
+                        Key::Named(NamedKey::ArrowLeft) => { gpu.ui.move_text_input_cursor(-1, gpu.shift_down); None }
+                        Key::Named(NamedKey::ArrowRight) => { gpu.ui.move_text_input_cursor(1, gpu.shift_down); None }
+                        Key::Named(NamedKey::Home) => { gpu.ui.move_text_input_to_edge(false, gpu.shift_down); None }
+                        Key::Named(NamedKey::End) => { gpu.ui.move_text_input_to_edge(true, gpu.shift_down); None }
+                        Key::Character(value) if !gpu.ime_active && event.text.is_some() => gpu.ui.commit_ime_text(value),
+                        _ => None,
+                    };
+                    if result.is_some() { gpu.next_semantic_sequence += 1; }
+                    result.map(|(binding, text)| (gpu.next_semantic_sequence, binding, text))
+                });
+                if let (Some(endpoint), Some((sequence, binding, value))) = (self.ui_endpoint, committed) {
+                    forward_text_input_commit(endpoint, self.epoch, self.applied_composition_revision, sequence, binding, value);
+                }
+                if let (Some(window), Some(rect)) = (self.window.as_ref(), self.gpu.as_ref().and_then(|gpu| gpu.ui.text_input_ime_rect())) {
+                    window.set_ime_cursor_area(PhysicalPosition::new(rect.x.round() as i32, rect.y.round() as i32), PhysicalSize::new(rect.width.max(1.0).round() as u32, rect.height.max(1.0).round() as u32));
+                }
+                self.redraw_pending = true;
+            }
+            WindowEvent::ModifiersChanged(modifiers) => {
+                if let Some(gpu) = self.gpu.as_mut() { gpu.shift_down = modifiers.state().shift_key(); }
+            }
+            WindowEvent::Focused(false) => {
+                if let Some(gpu) = self.gpu.as_mut() { gpu.ui.clear_text_focus(); self.redraw_pending = true; }
             }
             WindowEvent::RedrawRequested => {
                 if let Err(error) = self.redraw() {
@@ -2445,6 +2576,7 @@ mod tests {
                 sequence: 1,
             }),
             focus: None,
+            text: None,
         };
         let response = runtime.handle(request(
             "inject",

@@ -13,6 +13,7 @@ Examples:
 scripts\start-ui-case.cmd workbench
 scripts\start-ui-case.cmd terrain
 scripts\start-ui-case.cmd terrain-generation --projectd
+scripts\start-ui-case.cmd ui-platform
 ```
 
 The default loopback ports are:

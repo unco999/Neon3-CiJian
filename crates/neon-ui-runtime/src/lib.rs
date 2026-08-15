@@ -132,6 +132,7 @@ pub struct UiRuntime {
     idempotent_responses: HashMap<String, RpcResponse>,
     surface: UiSurfaceMachine,
     ai_terrain: AiTerrainPanelState,
+    showcase_text: String,
 }
 
 impl UiRuntime {
@@ -151,6 +152,7 @@ impl UiRuntime {
             idempotent_responses: HashMap::new(),
             surface: UiSurfaceMachine::new(UiSurfaceId(WORKBENCH_SURFACE_ID.into())),
             ai_terrain: AiTerrainPanelState::default(),
+            showcase_text: String::new(),
         }
     }
 
@@ -175,6 +177,7 @@ impl UiRuntime {
                 "ui.intent_dispatch.v1".into(),
                 "ui.surface.machine.v1".into(),
                 "ui.ai.terrain.panel.v1".into(),
+                "ui.text_input.commit.v1".into(),
             ],
         }
     }
@@ -555,6 +558,14 @@ impl UiRuntime {
         match self.validate_semantic_event(&event) {
             Ok(()) => {
                 let neon_ui_schema::UiIntent::Invoke { action, params } = event.intent.clone();
+                if event.event == neon_ui_schema::UiSemanticEventType::TextInputCommit {
+                    let Some(text) = event.text else { return self.rejected(request.request_id, "invalid_text_commit", "a committed text value is required"); };
+                    if action != "ui.showcase.text.commit" || text.value.chars().count() > 256 {
+                        return self.rejected(request.request_id, "invalid_text_commit", "text commit is not accepted by this surface");
+                    }
+                    self.showcase_text = text.value;
+                    return self.accepted(request.request_id, json!({"surface_id": "surface.ui-platform-showcase", "value": self.showcase_text}));
+                }
                 if action == "ui.surface.event" {
                     request.method = "ui.surface.event".into();
                     request.params = params;
@@ -594,6 +605,7 @@ impl UiRuntime {
 
     fn validate_semantic_event(&mut self, event: &UiSemanticEvent) -> Result<(), &'static str> {
         if event.renderer_epoch != self.epoch { return Err(ERROR_RENDERER_EPOCH_MISMATCH); }
+        if event.event == neon_ui_schema::UiSemanticEventType::TextInputCommit && event.text.is_none() { return Err(ERROR_INTENT_NOT_BOUND); }
         let Some(fragment) = self.cached_fragment.as_ref() else { return Err(ERROR_INTENT_NOT_BOUND); };
         if fragment.fragment_id != event.fragment.id || fragment.revision != event.fragment.revision { return Err(ERROR_FRAGMENT_REVISION_STALE); }
         if !fragment.effects.iter().any(|effect| matches!(effect, UiEffect::SemanticIntent { intent } | UiEffect::BoundSemanticIntent { intent, .. } if intent == &event.intent)) {
@@ -880,6 +892,29 @@ mod tests {
     }
 
     #[test]
+    fn text_input_commit_is_typed_and_does_not_accept_preedit() {
+        use neon_ui_schema::{UiFragmentRevision, UiIntent, UiSemanticEventType, UiTextInputCommit};
+
+        let mut runtime = UiRuntime::new(1, "ui-text-input-test");
+        let mut fragment = runtime.static_fragment(Revision(1));
+        fragment.effects.push(UiEffect::SemanticIntent { intent: UiIntent::Invoke { action: "ui.showcase.text.commit".into(), params: json!({}) } });
+        runtime.cached_fragment = Some(fragment.clone());
+        let event = UiSemanticEvent {
+            event: UiSemanticEventType::TextInputCommit, event_id: "text-1".into(), renderer_epoch: 1, composition_revision: Revision(1),
+            fragment: UiFragmentRevision { id: fragment.fragment_id, revision: Revision(1) },
+            intent: UiIntent::Invoke { action: "ui.showcase.text.commit".into(), params: json!({}) },
+            pointer: None, focus: None, text: Some(UiTextInputCommit { value: "composed text".into() }),
+        };
+        let response = runtime.handle_service_request(RpcRequest {
+            protocol: "neon3.rpc".into(), version: PROTOCOL_VERSION, request_id: RequestId("text-1".into()),
+            client: ClientIdentity { kind: ClientKind::WgpuRuntime, instance_id: "renderer".into(), pid: 1, origin: "test".into() },
+            target: ServiceName(SERVICE_NAME.into()), method: "ui.input.event".into(), params: json!(event), expected_revision: Some(Revision(1)), idempotency_key: Some("text-1".into()),
+        });
+        assert_eq!(response.status, RpcStatus::Accepted);
+        assert_eq!(response.result.unwrap()["value"], "composed text");
+    }
+
+    #[test]
     fn forwarder_caches_only_the_renderer_accepted_revision() {
         let renderer = RpcServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
         let endpoint = renderer.local_addr().unwrap();
@@ -1014,7 +1049,7 @@ mod tests {
             event_id: "event-1".into(), renderer_epoch: 7, composition_revision: Revision(9),
             fragment: UiFragmentRevision { id: UiFragmentId("static-editor-shell".into()), revision: Revision(3) },
             intent: UiIntent::Invoke { action: "terrain.tool.select".into(), params: json!({"tool": "water_inject"}) },
-            pointer: Some(UiPointerMetadata { id: 0, sequence: 1 }), focus: None,
+            pointer: Some(UiPointerMetadata { id: 0, sequence: 1 }), focus: None, text: None,
         };
         let response = runtime.dispatch_semantic_event(endpoint, event, RequestId("terrain-request-1".into()), "terrain-key-1".into()).unwrap();
         assert_eq!(response.status, RpcStatus::Accepted);
@@ -1073,6 +1108,7 @@ mod tests {
             intent,
             pointer: Some(UiPointerMetadata { id: 0, sequence: 1 }),
             focus: None,
+            text: None,
         };
         let request = RpcRequest {
             protocol: "neon3.rpc".into(),
@@ -1125,6 +1161,7 @@ mod tests {
             intent,
             pointer: Some(UiPointerMetadata { id: 0, sequence: 1 }),
             focus: None,
+            text: None,
         };
         let response = runtime.handle_service_request(RpcRequest {
             protocol: "neon3.rpc".into(),
@@ -1158,7 +1195,7 @@ mod tests {
             event: UiSemanticEventType::PointerClick, event_id: "event-reject".into(), renderer_epoch: epoch, composition_revision: Revision(9),
             fragment: UiFragmentRevision { id: UiFragmentId("static-editor-shell".into()), revision: Revision(revision) },
             intent: UiIntent::Invoke { action: action.into(), params: json!({"tool": "water_inject"}) },
-            pointer: Some(UiPointerMetadata { id: 0, sequence }), focus: None,
+            pointer: Some(UiPointerMetadata { id: 0, sequence }), focus: None, text: None,
         };
         assert_eq!(runtime.validate_semantic_event(&event(8, 3, "terrain.tool.select", 1)), Err(ERROR_RENDERER_EPOCH_MISMATCH));
         assert_eq!(runtime.validate_semantic_event(&event(7, 2, "terrain.tool.select", 1)), Err(ERROR_FRAGMENT_REVISION_STALE));

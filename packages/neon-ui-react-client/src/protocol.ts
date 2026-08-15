@@ -34,6 +34,12 @@ export type UiLayout = {
   min_size?: [number, number] | null;
   max_size?: [number, number] | null;
   preferred_size?: [number, number] | null;
+  flex_basis?: number | null;
+  flex_grow?: number;
+  flex_shrink?: number;
+  justify_content?: "start" | "center" | "end" | "space_between" | "space_around" | "space_evenly";
+  align_items?: "start" | "center" | "end" | "stretch";
+  align_self?: "start" | "center" | "end" | "stretch" | null;
   clip?: boolean;
   scroll_offset?: [number, number];
 };
@@ -44,7 +50,7 @@ export type UiTransition = { durationMs: number; easing?: "linear" | "ease_in" |
 
 export type UiNode = {
   node_id: string;
-  kind: "panel" | "label" | "button" | "image" | "render_surface";
+  kind: "panel" | "label" | "button" | "image" | "render_surface" | "text_input";
   bounds: Bounds;
   layout: UiLayout | null;
   visible: boolean;
@@ -148,4 +154,10 @@ export type NodeProps = {
   event?: UiSurfaceEvent;
   enterTransition?: UiTransition;
   children?: React.ReactNode;
+};
+
+export type TextInputProps = Omit<NodeProps, "children"> & {
+  value: string;
+  maxLength?: number;
+  intent: UiIntentSpec;
 };

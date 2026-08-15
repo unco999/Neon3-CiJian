@@ -47,6 +47,7 @@ if /I "%~1"=="workbench" set "NPM_SCRIPT=demo:workbench"
 if /I "%~1"=="workbench-interactive" set "NPM_SCRIPT=demo:workbench:interactive"
 if /I "%~1"=="animation" set "NPM_SCRIPT=demo:animation"
 if /I "%~1"=="nested-animation" set "NPM_SCRIPT=demo:nested-animation"
+if /I "%~1"=="ui-platform" set "NPM_SCRIPT=demo:ui-platform"
 if not defined NPM_SCRIPT exit /B 1
 exit /B 0
 
@@ -63,5 +64,5 @@ exit /B 1
 
 :usage
 echo Usage: scripts\start-ui-case.cmd ^<case^> [--projectd]
-echo Cases: terrain, terrain-generation, workbench, workbench-interactive, animation, nested-animation
+echo Cases: terrain, terrain-generation, workbench, workbench-interactive, animation, nested-animation, ui-platform
 exit /B 2
