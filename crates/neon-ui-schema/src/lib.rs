@@ -8,6 +8,126 @@ use serde::{Deserialize, Serialize};
 /// This is deliberately separate from the RPC transport version.
 pub const UI_FRAGMENT_SCHEMA_VERSION: u16 = 1;
 pub const UI_SURFACE_SCHEMA_VERSION: u16 = 1;
+/// Baseline schema for the static, GPU-reactive UI program contract.
+///
+/// This is additive to `UiFragment`. Existing fragment clients stay on their
+/// current compatibility contract until they explicitly negotiate this capability.
+pub const UI_PROGRAM_SCHEMA_VERSION: u16 = 1;
+pub const UI_PROGRAM_CAPABILITY_NAME: &str = "ui.program.v1";
+
+pub const ERROR_UI_PROGRAM_UNSUPPORTED_SCHEMA: &str = "ui_program_unsupported_schema";
+pub const ERROR_UI_PROGRAM_UNSUPPORTED_CAPABILITY: &str = "ui_program_unsupported_capability";
+pub const ERROR_UI_PROGRAM_DUPLICATE_INPUT_KEY: &str = "ui_program_duplicate_input_key";
+pub const ERROR_UI_PROGRAM_INVALID_DEFAULT: &str = "ui_program_invalid_default";
+pub const ERROR_UI_PROGRAM_INPUT_TYPE_MISMATCH: &str = "ui_program_input_type_mismatch";
+pub const ERROR_UI_PROGRAM_STALE_INPUT_REVISION: &str = "ui_program_stale_input_revision";
+pub const ERROR_UI_PROGRAM_UNKNOWN_TEXT_HANDLE: &str = "ui_program_unknown_text_handle";
+pub const ERROR_UI_PROGRAM_TEXT_REGISTRY_GENERATION_MISMATCH: &str = "ui_program_text_registry_generation_mismatch";
+pub const ERROR_UI_PROGRAM_UNKNOWN_BINDING_TARGET: &str = "ui_program_unknown_binding_target";
+pub const ERROR_UI_PROGRAM_CAPACITY_OVERFLOW: &str = "ui_program_capacity_overflow";
+pub const ERROR_UI_PROGRAM_INVALID_BRANCH_TEMPLATE: &str = "ui_program_invalid_branch_template";
+pub const ERROR_UI_PROGRAM_FORBIDDEN_FLOW_FEATURE: &str = "ui_program_forbidden_flow_feature";
+
+/// Declares a versioned UI program capability and its authority.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiProgramCapability {
+    pub name: String,
+    pub version: u16,
+    pub owner: UiProgramCapabilityOwner,
+    pub status: UiProgramCapabilityStatus,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UiProgramCapabilityOwner {
+    UiRuntime,
+    WgpuRuntime,
+    SharedContract,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UiProgramCapabilityStatus {
+    Experimental,
+    Supported,
+    Deprecated,
+}
+
+/// Identity and compatibility information for one immutable UI program upload.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiProgramRevision {
+    pub program_id: String,
+    pub revision: Revision,
+    pub schema_version: u16,
+    pub capabilities: Vec<UiProgramCapability>,
+}
+
+impl UiProgramRevision {
+    pub fn validate_baseline(&self) -> Result<(), UiSchemaError> {
+        if self.program_id.trim().is_empty() {
+            return Err(UiSchemaError::EmptyProgramId);
+        }
+        if self.schema_version != UI_PROGRAM_SCHEMA_VERSION {
+            return Err(UiSchemaError::UnsupportedProgramSchemaVersion);
+        }
+        if !self.capabilities.iter().any(|capability| {
+            capability.name == UI_PROGRAM_CAPABILITY_NAME && capability.version == 1
+        }) {
+            return Err(UiSchemaError::UnsupportedProgramCapability);
+        }
+        let mut names = std::collections::HashSet::new();
+        for capability in &self.capabilities {
+            if capability.name.trim().is_empty() || capability.version == 0 {
+                return Err(UiSchemaError::InvalidProgramCapability);
+            }
+            if !names.insert((capability.name.as_str(), capability.version)) {
+                return Err(UiSchemaError::DuplicateProgramCapability);
+            }
+            if capability.name != UI_PROGRAM_CAPABILITY_NAME || capability.version != 1 {
+                return Err(UiSchemaError::UnsupportedProgramCapability);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A source location in NUI Flow or an equivalent authoring representation.
+/// It is semantic debug metadata, never a renderer-local identifier.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiSourceSpan {
+    pub source_id: String,
+    pub line: u32,
+    pub column: u32,
+    pub end_line: u32,
+    pub end_column: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UiDiagnosticSeverity {
+    Info,
+    Warning,
+    Error,
+}
+
+/// Machine-readable diagnostic for program validation, execution, or inspection.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiDiagnostic {
+    pub code: String,
+    pub severity: UiDiagnosticSeverity,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_span: Option<UiSourceSpan>,
+    pub revision: Revision,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -380,6 +500,11 @@ pub enum UiCommand {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UiSchemaError {
     UnsupportedSchemaVersion,
+    UnsupportedProgramSchemaVersion,
+    UnsupportedProgramCapability,
+    EmptyProgramId,
+    InvalidProgramCapability,
+    DuplicateProgramCapability,
     EmptyFragmentId,
     EmptyNodeId,
     EmptyAction,
@@ -790,5 +915,85 @@ mod tests {
         }
         node.text = Some(TextRef::Literal { value: String::new() });
         assert_eq!(node.validate(), Err(UiSchemaError::InvalidText));
+    }
+
+    fn baseline_program_revision() -> UiProgramRevision {
+        UiProgramRevision {
+            program_id: "surface.editor.terrain-workbench".into(),
+            revision: Revision(12),
+            schema_version: UI_PROGRAM_SCHEMA_VERSION,
+            capabilities: vec![UiProgramCapability {
+                name: UI_PROGRAM_CAPABILITY_NAME.into(),
+                version: 1,
+                owner: UiProgramCapabilityOwner::SharedContract,
+                status: UiProgramCapabilityStatus::Experimental,
+            }],
+        }
+    }
+
+    #[test]
+    fn program_revision_capability_round_trips_without_changing_fragment_v1() {
+        let revision = baseline_program_revision();
+        revision.validate_baseline().unwrap();
+        let encoded = serde_json::to_value(&revision).unwrap();
+        assert_eq!(encoded["schema_version"], UI_PROGRAM_SCHEMA_VERSION);
+        assert_eq!(encoded["capabilities"][0]["name"], UI_PROGRAM_CAPABILITY_NAME);
+        assert_eq!(serde_json::from_value::<UiProgramRevision>(encoded).unwrap(), revision);
+        assert_eq!(UI_FRAGMENT_SCHEMA_VERSION, 1);
+    }
+
+    #[test]
+    fn program_revision_rejects_unknown_schema_and_capability_versions() {
+        let mut revision = baseline_program_revision();
+        revision.schema_version += 1;
+        assert_eq!(revision.validate_baseline(), Err(UiSchemaError::UnsupportedProgramSchemaVersion));
+
+        let mut revision = baseline_program_revision();
+        revision.capabilities[0].version += 1;
+        assert_eq!(revision.validate_baseline(), Err(UiSchemaError::UnsupportedProgramCapability));
+
+        let mut revision = baseline_program_revision();
+        revision.capabilities.clear();
+        assert_eq!(revision.validate_baseline(), Err(UiSchemaError::UnsupportedProgramCapability));
+    }
+
+    #[test]
+    fn program_revision_rejects_duplicate_capabilities_and_unknown_fields() {
+        let mut revision = baseline_program_revision();
+        revision.capabilities.push(revision.capabilities[0].clone());
+        assert_eq!(revision.validate_baseline(), Err(UiSchemaError::DuplicateProgramCapability));
+
+        let invalid = serde_json::json!({
+            "program_id": "surface.editor",
+            "revision": 1,
+            "schema_version": 1,
+            "capabilities": [],
+            "gpu_handle": 42
+        });
+        assert!(serde_json::from_value::<UiProgramRevision>(invalid).is_err());
+    }
+
+    #[test]
+    fn diagnostic_round_trip_exposes_only_semantic_debug_identity() {
+        let diagnostic = UiDiagnostic {
+            code: ERROR_UI_PROGRAM_UNKNOWN_BINDING_TARGET.into(),
+            severity: UiDiagnosticSeverity::Error,
+            message: "binding target is not declared by this program".into(),
+            node_key: Some("terrain-inspector.apply".into()),
+            input_key: Some("can_commit".into()),
+            source_span: Some(UiSourceSpan {
+                source_id: "workbench.nui".into(),
+                line: 18,
+                column: 5,
+                end_line: 18,
+                end_column: 24,
+            }),
+            revision: Revision(12),
+        };
+        let encoded = serde_json::to_value(&diagnostic).unwrap();
+        assert_eq!(serde_json::from_value::<UiDiagnostic>(encoded.clone()).unwrap(), diagnostic);
+        for private_field in ["render_hit_id", "gpu_instance_index", "physical_pixels"] {
+            assert!(encoded.get(private_field).is_none());
+        }
     }
 }
