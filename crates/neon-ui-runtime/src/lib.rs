@@ -23,6 +23,7 @@ use neon_ui_schema::{
     UiInputValue, UiInputValueSource, UiInspectorState, UiInspectorTab, UiIrDocument, UiNode,
     UiNodeId, UiNodeKind, UiProgram, UiProgramEventDeclaration, UiProgramLayoutRecord,
     UiProgramLiteralText, UiProgramNode, UiProgramResourceKind, UiProgramRevision,
+    UiBranchPredicate, UiBranchRecord, UiTemplateRecord, UiRepeatFrame,
     UiResolvedInputValue, UiResolvedInputs, UiResourceBudget, UiSchemaError, UiSemanticEvent,
     UiStyle, UiSurfaceEvent, UiSurfaceEventKind, UiSurfaceEventRequest, UiSurfaceId,
     UiSurfaceSnapshot, UiSurfaceState, UiTextHandle, UiTextHandleDiagnostic, UiTextHandleStatus,
@@ -35,7 +36,8 @@ use neon_ui_schema::{
     ERROR_UI_PROGRAM_TEXT_REGISTRY_GENERATION_MISMATCH,
     ERROR_UI_PROGRAM_TEXT_REGISTRY_STALE_REVISION, ERROR_UI_PROGRAM_TEXT_TOO_LONG,
     ERROR_UI_PROGRAM_UNKNOWN_INPUT_KEY, ERROR_UI_PROGRAM_UNKNOWN_TEXT_HANDLE,
-    UI_SURFACE_SCHEMA_VERSION,
+    UI_SURFACE_SCHEMA_VERSION, ERROR_UI_PROGRAM_INVALID_BRANCH_TEMPLATE,
+    ERROR_UI_PROGRAM_CAPACITY_OVERFLOW,
 };
 use serde_json::{json, Value};
 
@@ -757,6 +759,64 @@ pub struct UiLocalPresentationState {
     pub revision: Revision,
 }
 
+/// UI-owned cache of bounded, domain-prepared repeat rows. It preserves row
+/// identity by stable key and never sorts, filters, or derives business data.
+#[derive(Clone, Debug, Default)]
+pub struct UiRepeatStore {
+    frames: BTreeMap<String, UiRepeatFrame>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct UiRepeatApplyResult {
+    pub accepted_rows: u32,
+    pub overflow_rows: u32,
+    pub diagnostics: Vec<UiDiagnostic>,
+}
+
+impl UiRepeatStore {
+    pub fn frame(&self, template_key: &str) -> Option<&UiRepeatFrame> { self.frames.get(template_key) }
+
+    pub fn apply(
+        &mut self,
+        program: &UiProgram,
+        frame: UiRepeatFrame,
+    ) -> Result<UiRepeatApplyResult, UiProgramCompileError> {
+        if frame.expected_program_revision != program.revision {
+            return Err(compile_error(ERROR_UI_PROGRAM_STALE_INPUT_REVISION, "repeat frame belongs to a different program revision"));
+        }
+        let template = program.template_records.iter().find(|record| record.template_key == frame.template_key)
+            .ok_or_else(|| compile_error(ERROR_UI_PROGRAM_INVALID_BRANCH_TEMPLATE, "repeat frame references an unknown template"))?;
+        if let Some(previous) = self.frames.get(&frame.template_key) {
+            if frame.list_revision.0 <= previous.list_revision.0 {
+                return Err(compile_error(ERROR_UI_PROGRAM_STALE_INPUT_REVISION, "repeat frame revision is stale"));
+            }
+        }
+        let mut keys = HashSet::new();
+        for row in &frame.rows {
+            if row.stable_row_key.trim().is_empty() || !keys.insert(&row.stable_row_key) {
+                return Err(compile_error(ERROR_UI_PROGRAM_INVALID_BRANCH_TEMPLATE, "repeat rows require unique nonempty stable row keys"));
+            }
+            if row.values.len() != template.row_schema.len() || template.row_schema.iter().any(|(key, kind)| !row.values.get(key).is_some_and(|value| kind.accepts(value))) {
+                return Err(compile_error(ERROR_UI_PROGRAM_INPUT_TYPE_MISMATCH, "repeat row values do not match the declared template row schema"));
+            }
+        }
+        let overflow_rows = frame.rows.len().saturating_sub(template.max_instances as usize) as u32;
+        if overflow_rows != 0 && !template.overflow_summary {
+            return Err(compile_error(ERROR_UI_PROGRAM_CAPACITY_OVERFLOW, "repeat rows exceed capacity and this template declares no overflow summary"));
+        }
+        let accepted_rows = frame.rows.len().min(template.max_instances as usize) as u32;
+        let mut accepted = frame;
+        accepted.rows.truncate(accepted_rows as usize);
+        self.frames.insert(accepted.template_key.clone(), accepted);
+        let diagnostics = if overflow_rows == 0 { Vec::new() } else { vec![cpu_diagnostic(
+            ERROR_UI_PROGRAM_CAPACITY_OVERFLOW,
+            "repeat rows exceed capacity; the declared overflow summary must be rendered",
+            Some(&template.template_key), None, program.revision.revision,
+        )] };
+        Ok(UiRepeatApplyResult { accepted_rows, overflow_rows, diagnostics })
+    }
+}
+
 /// Pure deterministic lowering from canonical IR plus a validated input schema.
 /// It performs no I/O, text-registry mutation, GPU allocation, or domain lookup.
 pub fn compile_ui_program(
@@ -817,6 +877,15 @@ pub fn compile_ui_program(
             "ui_program_capacity_overflow",
             "literal text or glyph count exceeds the declared program budget",
         ));
+    }
+    let branch_records = compile_branch_records(document, schema, &nodes)?;
+    let template_records = compile_template_records(document, &nodes)?;
+    let template_instances = template_records.iter().try_fold(0u32, |total, template| {
+        let count = template.node_range.len() as u32;
+        total.checked_add(count.saturating_mul(template.max_instances)).ok_or(())
+    }).map_err(|_| compile_error(ERROR_UI_PROGRAM_INVALID_BRANCH_TEMPLATE, "template instance count overflows the declared resource budget"))?;
+    if template_instances > document.resource_budget.max_instances {
+        return Err(compile_error(ERROR_UI_PROGRAM_CAPACITY_OVERFLOW, "preallocated template instances exceed the declared program budget"));
     }
     for node in &templates {
         if matches!(node.kind, UiNodeKind::Image | UiNodeKind::RenderSurface) {
@@ -914,7 +983,8 @@ pub fn compile_ui_program(
         literal_texts,
         layout_records: layouts,
         binding_records: bindings,
-        branch_records: Vec::new(),
+        branch_records,
+        template_records,
         event_records: document.events.clone(),
         resource_budget: document.resource_budget.clone(),
         dependency_index: dependencies,
@@ -992,6 +1062,16 @@ pub fn evaluate_ui_program(
             &binding.input_key,
         );
     }
+    // Branch topology is compiled once. Evaluation only gates its precompiled
+    // nodes, so a domain input cannot allocate or alter component kinds.
+    for branch in &program.branch_records {
+        let active = branch_predicate_matches(&branch.predicate, inputs);
+        if !active {
+            for node_key in &branch.node_range {
+                if let Some(state) = states.get_mut(node_key) { state.visible = false; }
+            }
+        }
+    }
     let mut clips = BTreeMap::new();
     let mut primitives = Vec::new();
     let mut semantic_targets = Vec::new();
@@ -1058,6 +1138,13 @@ pub fn evaluate_ui_program(
     }
 }
 
+fn branch_predicate_matches(predicate: &UiBranchPredicate, inputs: &UiResolvedInputs) -> bool {
+    match predicate {
+        UiBranchPredicate::Bool { input_key, expected } => matches!(inputs.values.get(input_key).map(|value| &value.value), Some(UiInputValue::Bool { value }) if value == expected),
+        UiBranchPredicate::EnumEquals { input_key, variant } => matches!(inputs.values.get(input_key).map(|value| &value.value), Some(UiInputValue::Enum { value }) if value == variant),
+    }
+}
+
 fn collect_program_nodes(
     node: &UiNode,
     parent: Option<String>,
@@ -1095,6 +1182,58 @@ fn collect_program_nodes(
         )?;
     }
     Ok(())
+}
+
+fn compile_branch_records(
+    document: &UiIrDocument,
+    schema: &UiInputSchema,
+    nodes: &[UiProgramNode],
+) -> Result<Vec<UiBranchRecord>, UiProgramCompileError> {
+    document.branches.iter().map(|branch| {
+        let slot = schema.slots.iter().find(|slot| slot.key == branch.predicate_input_key())
+            .ok_or_else(|| compile_error(ERROR_UI_PROGRAM_INVALID_BRANCH_TEMPLATE, "branch predicate references an undeclared input"))?;
+        let valid = match (&branch.predicate, &slot.kind) {
+            (UiBranchPredicate::Bool { .. }, neon_ui_schema::UiInputKind::Bool) => true,
+            (UiBranchPredicate::EnumEquals { variant, .. }, neon_ui_schema::UiInputKind::Enum { variants }) => variants.iter().any(|value| value == variant),
+            _ => false,
+        };
+        if !valid { return Err(compile_error(ERROR_UI_PROGRAM_INVALID_BRANCH_TEMPLATE, "branch predicate must be a direct bool or declared enum equality")); }
+        Ok(UiBranchRecord {
+            branch_key: branch.branch_key.clone(), predicate: branch.predicate.clone(),
+            node_range: subtree_keys(nodes, &branch.root_node_key),
+            layout_participation: branch.layout_participation.clone(),
+        })
+    }).collect()
+}
+
+fn compile_template_records(
+    document: &UiIrDocument,
+    nodes: &[UiProgramNode],
+) -> Result<Vec<UiTemplateRecord>, UiProgramCompileError> {
+    document.templates.iter().map(|template| {
+        if template.row_schema.values().any(|kind| matches!(kind, neon_ui_schema::UiInputKind::AssetHandle)) {
+            return Err(compile_error(ERROR_UI_PROGRAM_INVALID_BRANCH_TEMPLATE, "template row schema cannot contain renderer resource handles"));
+        }
+        let node_range = subtree_keys(nodes, &template.root_node_key);
+        if node_range.is_empty() { return Err(compile_error(ERROR_UI_PROGRAM_INVALID_BRANCH_TEMPLATE, "template root must identify a compiled subtree")); }
+        Ok(UiTemplateRecord { template_key: template.template_key.clone(), node_range, max_instances: template.max_instances, row_schema: template.row_schema.clone(), instance_key_field: template.instance_key_field.clone(), overflow_summary: template.overflow_summary })
+    }).collect()
+}
+
+trait BranchPredicateInputKey { fn predicate_input_key(&self) -> &str; }
+impl BranchPredicateInputKey for neon_ui_schema::UiBranchDeclaration {
+    fn predicate_input_key(&self) -> &str { match &self.predicate { UiBranchPredicate::Bool { input_key, .. } | UiBranchPredicate::EnumEquals { input_key, .. } => input_key } }
+}
+
+fn subtree_keys(nodes: &[UiProgramNode], root: &str) -> Vec<String> {
+    let mut result = vec![root.to_owned()];
+    let mut index = 0;
+    while index < result.len() {
+        let parent = result[index].clone();
+        result.extend(nodes.iter().filter(|node| node.parent_key.as_deref() == Some(parent.as_str())).map(|node| node.key.clone()));
+        index += 1;
+    }
+    result
 }
 fn compile_literal_texts(
     templates: &[UiNode],
@@ -3105,6 +3244,8 @@ mod tests {
                 allowed_payload_keys: Vec::new(),
             }],
             resources: Vec::new(),
+            branches: Vec::new(),
+            templates: Vec::new(),
             resource_budget: UiResourceBudget {
                 max_nodes: 2,
                 max_bindings: 1,

@@ -12,7 +12,8 @@ use neon_ui_schema::{
     UiInputUpdateClass, UiInputValue, UiIrBinding, UiIrDocument, UiIrPatch, UiIrPatchOperation,
     UiIrPatchOperationKind, UiJustifyContent, UiLayout, UiLayoutMode, UiNode, UiNodeId, UiNodeKind,
     RenderSurfaceRef, UiProgramEventDeclaration, UiResourceBudget, UiSourceSpan, UiStyle,
-    UiSurfaceId, UiProgram, UiProgramRevision,
+    UiSurfaceId, UiProgram, UiProgramRevision, UiBranchDeclaration, UiBranchPredicate,
+    UiBranchLayoutParticipation, UiTemplateDeclaration,
 };
 use serde_json::json;
 
@@ -32,6 +33,8 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
     let mut source_map = BTreeMap::new();
     let mut input_slots = Vec::new();
     let mut seen_inputs = HashSet::new();
+    let mut branches = Vec::new();
+    let mut templates = Vec::new();
 
     for (index, raw) in source.lines().enumerate() {
         let line = (index + 1) as u32;
@@ -127,6 +130,12 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
                 allowed_payload_keys: Vec::new(),
             });
         }
+        if let Some(predicate) = &node.branch_predicate {
+            branches.push(UiBranchDeclaration { branch_key: node.node.node_id.0.clone(), root_node_key: node.node.node_id.0.clone(), predicate: predicate.clone(), layout_participation: UiBranchLayoutParticipation::HiddenSubtree });
+        }
+        if let Some(template) = &node.template {
+            templates.push(UiTemplateDeclaration { template_key: node.node.node_id.0.clone(), root_node_key: node.node.node_id.0.clone(), max_instances: template.0, row_schema: template.1.clone(), instance_key_field: template.2.clone(), overflow_summary: template.3 });
+        }
         stack.push((indent, node));
     }
     while let Some((_, node)) = stack.pop() {
@@ -182,6 +191,14 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
             ));
         }
     }
+    for branch in &branches {
+        let input_key = match &branch.predicate { UiBranchPredicate::Bool { input_key, .. } | UiBranchPredicate::EnumEquals { input_key, .. } => input_key };
+        let slot = schema.slots.iter().find(|slot| &slot.key == input_key).ok_or_else(|| error("ui_program_invalid_branch_template", "branch predicate input is not declared", 1, 1))?;
+        match (&branch.predicate, &slot.kind) {
+            (UiBranchPredicate::Bool { .. }, UiInputKind::Bool) | (UiBranchPredicate::EnumEquals { .. }, UiInputKind::Enum { .. }) => {}
+            _ => return Err(error("ui_program_invalid_branch_template", "branch when requires a bool or enum input", 1, 1)),
+        }
+    }
     let ir = UiIrDocument {
         schema_version: 1,
         surface_id: UiSurfaceId(header.surface_id),
@@ -190,6 +207,8 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
         bindings,
         events,
         resources: Vec::new(),
+        branches,
+        templates,
         resource_budget: header.budget,
     };
     ir.validate().map_err(|_| {
@@ -475,6 +494,8 @@ struct NodeBuild {
     node: UiNode,
     bindings: Vec<(UiBoundProperty, String)>,
     intents: Vec<String>,
+    branch_predicate: Option<UiBranchPredicate>,
+    template: Option<(u32, BTreeMap<String, UiInputKind>, String, bool)>,
 }
 
 fn parse_header(text: &str, header: &mut Header, line: u32) -> FlowResult<bool> {
@@ -672,6 +693,8 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
     }
     let mut bindings = Vec::new();
     let mut intents = Vec::new();
+    let mut branch_predicate = None;
+    let mut template = None;
     let mut used = HashSet::new();
     let mut index = 2;
     while index < parts.len() {
@@ -702,6 +725,31 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
                 index += 1;
                 parse_attribute(&mut node, &mut bindings, &mut intents, token, value, line)?;
             }
+            "when" if parts[0] == "branch" => {
+                let value = *parts.get(index + 1).ok_or_else(|| error("nui_flow_missing_value", "when requires a direct input predicate", line, 1))?;
+                index += 1;
+                branch_predicate = Some(parse_branch_predicate(value, line)?);
+            }
+            "capacity" if matches!(parts[0], "repeat" | "template") => {
+                let value = *parts.get(index + 1).ok_or_else(|| error("nui_flow_missing_value", "capacity requires a positive bound", line, 1))?;
+                index += 1;
+                let capacity = parse_u64(value, line, "capacity")? as u32;
+                if capacity == 0 { return Err(error("ui_program_invalid_branch_template", "template capacity must be positive", line, 1)); }
+                template = Some((capacity, BTreeMap::from([("row_key".into(), UiInputKind::U32)]), "row_key".into(), false));
+            }
+            "key" if matches!(parts[0], "repeat" | "template") => {
+                let value = *parts.get(index + 1).ok_or_else(|| error("nui_flow_missing_value", "key requires a row key field", line, 1))?;
+                index += 1;
+                let current = template.get_or_insert((1, BTreeMap::from([("row_key".into(), UiInputKind::U32)]), String::new(), false));
+                let prior_key = current.2.clone();
+                current.1.remove(&prior_key);
+                current.1.insert(value.into(), UiInputKind::U32);
+                current.2 = value.into();
+            }
+            "overflow_summary" if matches!(parts[0], "repeat" | "template") => {
+                let current = template.get_or_insert((1, BTreeMap::from([("row_key".into(), UiInputKind::U32)]), "row_key".into(), false));
+                current.3 = true;
+            }
             _ => {
                 return Err(error(
                     "nui_flow_unknown_attribute",
@@ -713,11 +761,24 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
         }
         index += 1;
     }
-    Ok(NodeBuild {
-        node,
-        bindings,
-        intents,
-    })
+    if parts[0] == "branch" && branch_predicate.is_none() { return Err(error("ui_program_invalid_branch_template", "branch requires `when $bool`, `when !$bool`, or `when $enum=variant`", line, 1)); }
+    if matches!(parts[0], "repeat" | "template") {
+        let Some(spec) = &template else { return Err(error("ui_program_invalid_branch_template", "repeat/template requires a finite capacity", line, 1)); };
+        if spec.2.trim().is_empty() { return Err(error("ui_program_invalid_branch_template", "repeat/template requires a stable key field", line, 1)); }
+    }
+    Ok(NodeBuild { node, bindings, intents, branch_predicate, template })
+}
+
+fn parse_branch_predicate(value: &str, line: u32) -> FlowResult<UiBranchPredicate> {
+    let value = value.strip_prefix('$').ok_or_else(|| error("ui_program_invalid_branch_template", "branch predicate must reference one direct input", line, 1))?;
+    if let Some(input_key) = value.strip_prefix('!') {
+        return Ok(UiBranchPredicate::Bool { input_key: input_key.into(), expected: false });
+    }
+    if let Some((input_key, variant)) = value.split_once('=') {
+        if input_key.is_empty() || variant.is_empty() { return Err(error("ui_program_invalid_branch_template", "enum branch predicate requires input and variant", line, 1)); }
+        return Ok(UiBranchPredicate::EnumEquals { input_key: input_key.into(), variant: variant.into() });
+    }
+    Ok(UiBranchPredicate::Bool { input_key: value.into(), expected: true })
 }
 
 fn parse_attribute(
@@ -841,7 +902,7 @@ fn reject_forbidden(text: &str, line: u32) -> FlowResult<()> {
         || text.contains("function")
         || text.contains("http:")
         || text.contains("https:")
-        || text.contains("=") && !text.starts_with("budget") && !text.starts_with("@")
+        || text.contains("=") && !text.starts_with("budget") && !text.starts_with("@") && !text.contains("when $")
     {
         Err(error(
             "ui_program_forbidden_flow_feature",

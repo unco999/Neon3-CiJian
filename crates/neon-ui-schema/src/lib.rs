@@ -15,6 +15,7 @@ pub const UI_SURFACE_SCHEMA_VERSION: u16 = 1;
 pub const UI_PROGRAM_SCHEMA_VERSION: u16 = 1;
 pub const UI_PROGRAM_CAPABILITY_NAME: &str = "ui.program.v1";
 pub const UI_PROGRAM_TEXT_REGISTRY_CAPABILITY_NAME: &str = "ui.program.text_registry.v1";
+pub const UI_PROGRAM_BOUNDED_STRUCTURE_CAPABILITY_NAME: &str = "ui.program.bounded_structure.v1";
 
 pub const ERROR_UI_PROGRAM_UNSUPPORTED_SCHEMA: &str = "ui_program_unsupported_schema";
 pub const ERROR_UI_PROGRAM_UNSUPPORTED_CAPABILITY: &str = "ui_program_unsupported_capability";
@@ -181,7 +182,7 @@ impl UiProgramRevision {
             if !names.insert((capability.name.as_str(), capability.version)) {
                 return Err(UiSchemaError::DuplicateProgramCapability);
             }
-            if !matches!(capability.name.as_str(), UI_PROGRAM_CAPABILITY_NAME | UI_PROGRAM_TEXT_REGISTRY_CAPABILITY_NAME) || capability.version != 1 {
+            if !matches!(capability.name.as_str(), UI_PROGRAM_CAPABILITY_NAME | UI_PROGRAM_TEXT_REGISTRY_CAPABILITY_NAME | UI_PROGRAM_BOUNDED_STRUCTURE_CAPABILITY_NAME) || capability.version != 1 {
                 return Err(UiSchemaError::UnsupportedProgramCapability);
             }
         }
@@ -633,6 +634,14 @@ pub struct UiIrDocument {
     pub events: Vec<UiProgramEventDeclaration>,
     #[serde(default)]
     pub resources: Vec<UiProgramResource>,
+    /// Finite subtrees selected by one direct input predicate. The subtree is
+    /// already present in `root`; this table only supplies its runtime rule.
+    #[serde(default)]
+    pub branches: Vec<UiBranchDeclaration>,
+    /// Precompiled row subtrees. A repeat frame selects at most `max_instances`
+    /// copies; it can never create arbitrary topology.
+    #[serde(default)]
+    pub templates: Vec<UiTemplateDeclaration>,
     pub resource_budget: UiResourceBudget,
 }
 
@@ -678,6 +687,35 @@ pub enum UiBoundProperty {
 pub struct UiIrBinding { pub input_key: String, pub node_key: String, pub property: UiBoundProperty }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum UiBranchPredicate {
+    Bool { input_key: String, #[serde(default = "default_true")] expected: bool },
+    EnumEquals { input_key: String, variant: String },
+}
+
+fn default_true() -> bool { true }
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UiBranchLayoutParticipation { HiddenSubtree, RetainLayout }
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiBranchDeclaration { pub branch_key: String, pub root_node_key: String, pub predicate: UiBranchPredicate, pub layout_participation: UiBranchLayoutParticipation }
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiTemplateDeclaration { pub template_key: String, pub root_node_key: String, pub max_instances: u32, pub row_schema: std::collections::BTreeMap<String, UiInputKind>, pub instance_key_field: String, #[serde(default)] pub overflow_summary: bool }
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiRepeatRow { pub stable_row_key: String, pub values: std::collections::BTreeMap<String, UiInputValue>, #[serde(default)] pub semantic_payload: std::collections::BTreeMap<String, String> }
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiRepeatFrame { pub template_key: String, pub list_revision: Revision, pub rows: Vec<UiRepeatRow>, pub expected_program_revision: UiProgramRevision }
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UiProgramEventDeclaration { pub node_key: String, pub intent: String, #[serde(default)] pub allowed_payload_keys: Vec<String> }
 
@@ -715,7 +753,15 @@ pub struct UiDependencyIndex { pub input_to_bindings: std::collections::BTreeMap
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct UiProgram { pub revision: UiProgramRevision, pub nodes: Vec<UiProgramNode>, pub node_templates: Vec<UiNode>, pub literal_texts: Vec<UiProgramLiteralText>, pub layout_records: Vec<UiProgramLayoutRecord>, pub binding_records: Vec<UiBinding>, pub branch_records: Vec<String>, pub event_records: Vec<UiProgramEventDeclaration>, pub resource_budget: UiResourceBudget, pub dependency_index: UiDependencyIndex, pub layout_hash: String }
+pub struct UiBranchRecord { pub branch_key: String, pub predicate: UiBranchPredicate, pub node_range: Vec<String>, pub layout_participation: UiBranchLayoutParticipation }
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiTemplateRecord { pub template_key: String, pub node_range: Vec<String>, pub max_instances: u32, pub row_schema: std::collections::BTreeMap<String, UiInputKind>, pub instance_key_field: String, pub overflow_summary: bool }
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiProgram { pub revision: UiProgramRevision, pub nodes: Vec<UiProgramNode>, pub node_templates: Vec<UiNode>, pub literal_texts: Vec<UiProgramLiteralText>, pub layout_records: Vec<UiProgramLayoutRecord>, pub binding_records: Vec<UiBinding>, pub branch_records: Vec<UiBranchRecord>, pub template_records: Vec<UiTemplateRecord>, pub event_records: Vec<UiProgramEventDeclaration>, pub resource_budget: UiResourceBudget, pub dependency_index: UiDependencyIndex, pub layout_hash: String }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1268,6 +1314,32 @@ impl UiIrDocument {
         if self.schema_version != 1 || self.surface_id.0.trim().is_empty() { return Err(UiSchemaError::InvalidIrDocument); }
         self.root.validate()?;
         if self.resource_budget.max_nodes == 0 || self.resource_budget.max_instances == 0 { return Err(UiSchemaError::InvalidProgramBudget); }
+        let mut keys = std::collections::HashSet::new();
+        collect_ir_keys(&self.root, &mut keys);
+        let mut branch_keys = std::collections::HashSet::new();
+        for branch in &self.branches {
+            if branch.branch_key.trim().is_empty() || !branch_keys.insert(&branch.branch_key) || !keys.contains(&branch.root_node_key) {
+                return Err(UiSchemaError::InvalidIrDocument);
+            }
+            match &branch.predicate {
+                UiBranchPredicate::Bool { input_key, .. } if !input_key.trim().is_empty() => {}
+                UiBranchPredicate::EnumEquals { input_key, variant } if !input_key.trim().is_empty() && !variant.trim().is_empty() => {}
+                _ => return Err(UiSchemaError::InvalidIrDocument),
+            }
+        }
+        let mut template_keys = std::collections::HashSet::new();
+        for template in &self.templates {
+            if template.template_key.trim().is_empty() || !template_keys.insert(&template.template_key)
+                || !keys.contains(&template.root_node_key) || template.max_instances == 0
+                || template.instance_key_field.trim().is_empty() || template.row_schema.is_empty()
+                || !template.row_schema.contains_key(&template.instance_key_field)
+            { return Err(UiSchemaError::InvalidIrDocument); }
+        }
         Ok(())
     }
+}
+
+fn collect_ir_keys(node: &UiNode, keys: &mut std::collections::HashSet<String>) {
+    keys.insert(node.node_id.0.clone());
+    for child in &node.children { collect_ir_keys(child, keys); }
 }

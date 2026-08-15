@@ -10,7 +10,7 @@ use neon_protocol::Revision;
 use neon_ui_schema::{
     UiBoundProperty, UiBounds, UiDiagnostic, UiDiagnosticSeverity, UiGpuBackendAdapter,
     UiGpuFrameState, UiGpuLayoutNode, UiGpuLayoutReadback, UiGpuPassTiming, UiGpuUploadStatus,
-    UiInputValue, UiProgram, UiProgramRevision, UiResolvedInputs, UiResourceBudget,
+    UiInputValue, UiProgram, UiProgramRevision, UiResolvedInputs, UiResourceBudget, UiBranchPredicate,
 };
 
 #[derive(Debug)]
@@ -176,6 +176,15 @@ impl GpuUiProgramBackend {
                         visibility.insert(binding.node_key.clone(), *value);
                     }
                 }
+            }
+        }
+        for branch in &active.program.branch_records {
+            let active_branch = match &branch.predicate {
+                UiBranchPredicate::Bool { input_key, expected } => matches!(active.inputs.values.get(input_key).map(|value| &value.value), Some(UiInputValue::Bool { value }) if value == expected),
+                UiBranchPredicate::EnumEquals { input_key, variant } => matches!(active.inputs.values.get(input_key).map(|value| &value.value), Some(UiInputValue::Enum { value }) if value == variant),
+            };
+            if !active_branch {
+                for node_key in &branch.node_range { visibility.insert(node_key.clone(), false); }
             }
         }
         self.last_timing.binding_us = binding_started.elapsed().as_micros() as u64;
@@ -392,6 +401,7 @@ fn fits_budget(program: &UiProgram) -> bool {
         && program.binding_records.len() <= budget.max_bindings as usize
         && program.layout_records.len() <= budget.max_nodes as usize
         && program.literal_texts.len() <= budget.max_text_records as usize
+        && program.template_records.iter().try_fold(0u32, |total, record| total.checked_add((record.node_range.len() as u32).saturating_mul(record.max_instances))).is_some_and(|count| count <= budget.max_instances)
 }
 fn diagnostic(
     code: &str,
