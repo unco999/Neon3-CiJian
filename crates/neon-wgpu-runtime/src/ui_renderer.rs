@@ -1798,6 +1798,9 @@ mod tests {
     use super::*;
     use neon_protocol::Revision;
     use neon_ui_schema::{TextRef, UiAlignItems, UiEffect, UiFragmentId, UiIntent, UiJustifyContent, UiLayout, UiNodeId, UiTransitionState};
+    use std::sync::Mutex;
+
+    static GPU_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn fixture_font() -> AssetBytes {
         AssetBytes {
@@ -1836,6 +1839,7 @@ mod tests {
 
     #[test]
     fn text_input_pointer_hit_is_available_before_gpu_readback() {
+        let _gpu_test = GPU_TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let (device, _queue) = test_device("neon3-ui-text-input-pointer-hit");
         let mut renderer = UiWgpuRenderer::new(&device, wgpu::TextureFormat::Rgba8Unorm);
         renderer.hit_bindings.insert(1, UiHitBinding {
@@ -1855,6 +1859,7 @@ mod tests {
 
     #[test]
     fn parent_transition_moves_child_panel_from_the_same_sampled_origin() {
+        let _gpu_test = GPU_TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let (device, queue) = test_device("neon3-ui-subtree-transition");
         let mut root = node();
         root.bounds = UiBounds { x: 20.0, y: 8.0, width: 28.0, height: 28.0 };
@@ -2002,6 +2007,7 @@ mod tests {
 
     #[test]
     fn render_surface_samples_a_renderer_owned_gpu_texture() {
+        let _gpu_test = GPU_TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let (device, queue) = test_device("neon3-ui-render-surface");
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("neon3-ui-render-surface-source"),
@@ -2074,6 +2080,7 @@ mod tests {
 
     #[test]
     fn render_surface_refreshes_when_the_same_target_is_replaced_repeatedly() {
+        let _gpu_test = GPU_TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let (device, queue) = test_device("neon3-ui-render-surface-refresh");
         let root = UiNode {
             node_id: UiNodeId("preview".into()),
@@ -2170,6 +2177,7 @@ mod tests {
 
     #[test]
     fn owner_font_and_text_ref_produce_glyph_pixels_without_background_fill() {
+        let _gpu_test = GPU_TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let (device, queue) = test_device("neon3-ui-text-acceptance");
         let font = fixture_font();
         let text = UiNode {
@@ -2188,6 +2196,7 @@ mod tests {
 
     #[test]
     fn bundled_font_renders_cjk_text_without_an_owner_font_asset() {
+        let _gpu_test = GPU_TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let (device, queue) = test_device("neon3-ui-bundled-cjk-text");
         let text = UiNode {
             node_id: UiNodeId("text".into()), kind: UiNodeKind::Label,
@@ -2205,6 +2214,7 @@ mod tests {
 
     #[test]
     fn text_wraps_within_label_width_and_respects_parent_clip() {
+        let _gpu_test = GPU_TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let (device, queue) = test_device("neon3-ui-text-wrap-clip");
         let font = fixture_font();
         let label = UiNode {
@@ -2325,6 +2335,7 @@ mod tests {
 
     #[test]
     fn animation_activity_expires_after_transition_end() {
+        let _gpu_test = GPU_TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let (device, _queue) = test_device("neon3-ui-animation-activity");
         let mut renderer = UiWgpuRenderer::new(&device, wgpu::TextureFormat::Rgba8Unorm);
         let target = UiVisual { bounds: UiBounds { x: 0.0, y: 0.0, width: 10.0, height: 10.0 }, style: UiStyle::default(), kind: UiNodeKind::Panel, enabled: true, clip: UiBounds { x: 0.0, y: 0.0, width: 10.0, height: 10.0 }, image: None, surface: None, text: None };
@@ -2343,6 +2354,7 @@ mod tests {
 
     #[test]
     fn hit_readback_ring_copies_one_r32uint_texel_asynchronously() {
+        let _gpu_test = GPU_TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let (device, queue) = test_device("neon3-hit-readback-test");
         let target = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("neon3-hit-readback-source"), size: wgpu::Extent3d { width: 64, height: 1, depth_or_array_layers: 1 },
