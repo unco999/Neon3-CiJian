@@ -103,7 +103,7 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
             ));
         }
         if source_map
-            .insert(node.node.node_id.0.clone(), span(line, 1, content))
+            .insert(node.node.node_id.0.clone(), span(line, (indent + 1) as u32, content))
             .is_some()
         {
             return Err(error(
@@ -163,6 +163,25 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
             1,
         )
     })?;
+    for binding in &bindings {
+        let binding_span = source_map
+            .get(&binding.node_key)
+            .expect("Flow node keys populate the source map");
+        let slot = schema.slots.iter().find(|slot| slot.key == binding.input_key).ok_or_else(|| {
+            error_at(
+                "ui_program_unknown_binding_target",
+                "binding references an input that is not declared by this Flow document",
+                binding_span,
+            )
+        })?;
+        if !binding_accepts(&binding.property, &slot.kind) {
+            return Err(error_at(
+                "ui_program_input_type_mismatch",
+                "binding property is incompatible with its declared input kind",
+                binding_span,
+            ));
+        }
+    }
     let ir = UiIrDocument {
         schema_version: 1,
         surface_id: UiSurfaceId(header.surface_id),
@@ -328,6 +347,13 @@ pub fn apply_nui_ir_patch(document: &UiIrDocument, patch: &UiIrPatch) -> FlowRes
     let mut result = document.clone();
     for operation in &patch.operations {
         let path = StablePath::parse(&operation.target_path, &operation.source_span)?;
+        if path.segments().len() > 1 && !path_exists(&result.root, path.segments()) {
+            return Err(error_at(
+                "nui_flow_unknown_patch_target",
+                "patch semantic path does not exist",
+                &operation.source_span,
+            ));
+        }
         match operation.kind {
             UiIrPatchOperationKind::Set => set_node(
                 &mut result.root,
@@ -411,6 +437,22 @@ impl StablePath {
     fn last(&self) -> &str { self.0.last().expect("validated path") }
     fn segments(&self) -> &[String] { &self.0 }
     fn matches_root(&self, root: &str) -> bool { self.0.len() == 1 && self.0[0] == root }
+}
+
+fn path_exists(root: &UiNode, segments: &[String]) -> bool {
+    let segments = if segments.first().is_some_and(|segment| segment == &root.node_id.0) {
+        &segments[1..]
+    } else {
+        return false;
+    };
+    let mut node = root;
+    for segment in segments {
+        let Some(child) = node.children.iter().find(|child| child.node_id.0 == *segment) else {
+            return false;
+        };
+        node = child;
+    }
+    true
 }
 impl Default for Header {
     fn default() -> Self {
@@ -971,6 +1013,13 @@ fn valid_key(key: &str) -> bool {
 fn valid_intent(intent: &str) -> bool {
     intent.contains('.') && intent.split('.').all(valid_key)
 }
+fn binding_accepts(property: &UiBoundProperty, kind: &UiInputKind) -> bool {
+    match property {
+        UiBoundProperty::TextValue => matches!(kind, UiInputKind::TextHandle),
+        UiBoundProperty::Enabled | UiBoundProperty::Visible => matches!(kind, UiInputKind::Bool),
+        _ => false,
+    }
+}
 fn align_up(value: u32, alignment: u32) -> u32 { (value + alignment - 1) / alignment * alignment }
 fn tokenize(text: &str, line: u32) -> FlowResult<Vec<String>> {
     let mut tokens = Vec::new();
@@ -1019,7 +1068,7 @@ fn tokenize(text: &str, line: u32) -> FlowResult<Vec<String>> {
     Ok(tokens)
 }
 fn format_input(slot: &UiInputSlot) -> String {
-    let kind = match slot.kind {
+    let kind = match &slot.kind {
         UiInputKind::Bool => "bool",
         UiInputKind::I32 => "i32",
         UiInputKind::U32 => "u32",
@@ -1044,7 +1093,7 @@ fn format_node(
     events: &[UiProgramEventDeclaration],
     lines: &mut Vec<String>,
 ) {
-    let kind = match node.kind {
+    let kind = match &node.kind {
         UiNodeKind::Panel => "panel",
         UiNodeKind::Label => "text",
         UiNodeKind::Button => "button",
@@ -1071,7 +1120,7 @@ fn format_node(
         .iter()
         .filter(|binding| binding.node_key == node.node_id.0)
     {
-        let property = match binding.property {
+        let property = match &binding.property {
             UiBoundProperty::TextValue => "value",
             UiBoundProperty::Enabled => "enabled",
             UiBoundProperty::Visible => "visible",
@@ -1261,7 +1310,15 @@ fn move_node(
                 span,
             )
         })?;
-    let parent_key = StablePath::parse(parent_path, span)?.last().to_owned();
+    let parent_path = StablePath::parse(parent_path, span)?;
+    let parent_key = parent_path.last().to_owned();
+    if parent_path.segments().len() > 1 && !path_exists(root, parent_path.segments()) {
+        return Err(error_at(
+            "nui_flow_unknown_patch_target",
+            "move destination semantic path does not exist",
+            span,
+        ));
+    }
     if key == root.node_id.0 || key == parent_key {
         return Err(error_at(
             "nui_flow_invalid_patch",
@@ -1325,8 +1382,21 @@ panel workspace row gap 8
         let document = parse_nui_flow(WORKBENCH).expect("valid Flow workbench");
         assert_eq!(document.ir.surface_id.0, "surface.editor.terrain");
         assert_eq!(document.source_map["water"].line, 8);
+        assert_eq!(document.source_map["water"].column, 5);
         assert_eq!(document.ir.bindings.len(), 2);
         assert_eq!(document.input_schema.slots[1].packing.offset, 8);
+    }
+
+    #[test]
+    fn rejects_unknown_and_incompatible_binding_inputs_at_lowering_boundary() {
+        let unknown = parse_nui_flow("surface root\n  text title value $missing\n").unwrap_err();
+        assert_eq!(unknown.diagnostics[0].code, "ui_program_unknown_binding_target");
+
+        let incompatible = parse_nui_flow(
+            "input can_commit bool default false\nsurface root\n  text title value $can_commit\n",
+        )
+        .unwrap_err();
+        assert_eq!(incompatible.diagnostics[0].code, "ui_program_input_type_mismatch");
     }
 
     #[test]
@@ -1353,6 +1423,10 @@ panel workspace row gap 8
         let indexed = parse_nui_flow_patch("@ revision 12\n- /workspace/0\n").unwrap();
         let error = apply_nui_ir_patch(&document.ir, &indexed).unwrap_err();
         assert_eq!(error.diagnostics[0].code, "nui_flow_invalid_patch_path");
+
+        let incorrect_parent = parse_nui_flow_patch("@ revision 12\n- /workspace/inspector/water\n").unwrap();
+        let error = apply_nui_ir_patch(&document.ir, &incorrect_parent).unwrap_err();
+        assert_eq!(error.diagnostics[0].code, "nui_flow_unknown_patch_target");
     }
 
     #[test]
