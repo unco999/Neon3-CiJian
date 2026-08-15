@@ -733,6 +733,28 @@ pub struct UiCpuSemanticTarget { pub node_key: String, pub intents: Vec<String>,
 #[serde(deny_unknown_fields)]
 pub struct UiCpuFrameOutput { pub program_revision: UiProgramRevision, pub input_revision: Revision, pub nodes: Vec<UiCpuNodeState>, pub logical_layout: Vec<UiProgramLayoutRecord>, pub clips: std::collections::BTreeMap<String, UiBounds>, pub render_primitives: Vec<UiCpuRenderPrimitive>, pub semantic_targets: Vec<UiCpuSemanticTarget>, pub diagnostics: Vec<UiDiagnostic> }
 
+/// Renderer-owned GPU state exposed only as revisioned diagnostics. Buffer
+/// handles deliberately do not cross this contract boundary.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiGpuFrameState { pub renderer_epoch: u64, pub program_revision: UiProgramRevision, pub input_revision: Revision, pub dirty_slots: Vec<String>, pub frame_sequence: u64 }
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiGpuLayoutNode { pub node_key: String, pub bounds: UiBounds, pub clip: Option<UiBounds>, pub visible: bool }
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiGpuLayoutReadback { pub renderer_epoch: u64, pub program_revision: UiProgramRevision, pub input_revision: Revision, pub nodes: Vec<UiGpuLayoutNode>, pub diagnostics: Vec<UiDiagnostic>, pub sampled_frame: u64, pub asynchronous: bool }
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiGpuPassTiming { pub program_upload_us: u64, pub input_upload_us: u64, pub binding_us: u64, pub layout_us: u64, pub instance_us: u64, pub render_us: u64, pub readback_us: u64 }
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UiGpuUploadStatus { Empty, Staged, Active, RejectedCapacity }
+/// Public adapter summary. GPU objects remain private to the renderer process.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiGpuBackendAdapter { pub renderer_epoch: u64, pub program_revision: Option<UiProgramRevision>, pub input_revision: Option<Revision>, pub upload_status: UiGpuUploadStatus, pub capacity: UiResourceBudget, pub diagnostics: Vec<UiDiagnostic>, pub last_timing: UiGpuPassTiming }
+
 /// CPU evaluator input expressed exclusively in logical layout units.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

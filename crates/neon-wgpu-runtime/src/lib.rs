@@ -31,9 +31,11 @@ use winit::{
 
 mod ui_renderer;
 mod gpu_preview;
+mod ui_program_gpu;
 
 use ui_renderer::{UiHitBinding, UiWgpuRenderer};
 use gpu_preview::HeightmapPreviewConverter;
+pub use ui_program_gpu::GpuUiProgramBackend;
 
 pub const SERVICE_NAME: &str = "wgpu-runtime";
 pub const CAPABILITY_UI_FRAGMENT: &str = "wgpu.ui.fragment.v1";
