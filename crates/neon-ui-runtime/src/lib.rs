@@ -48,6 +48,7 @@ use serde_json::{json, Value};
 
 pub mod nui_flow;
 pub mod debug;
+pub mod terrain_workbench;
 pub use nui_flow::{
     apply_nui_ir_patch, compile_nui_flow_program, format_nui_flow, lower_nui_flow, parse_nui_flow,
     parse_nui_flow_patch, NuiFlowError,

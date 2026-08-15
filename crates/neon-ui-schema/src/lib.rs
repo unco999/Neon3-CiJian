@@ -906,6 +906,50 @@ pub enum UiGpuUploadStatus { Empty, Staged, Active, RejectedCapacity }
 #[serde(deny_unknown_fields)]
 pub struct UiGpuBackendAdapter { pub renderer_epoch: u64, pub program_revision: Option<UiProgramRevision>, pub input_revision: Option<Revision>, pub upload_status: UiGpuUploadStatus, pub capacity: UiResourceBudget, pub diagnostics: Vec<UiDiagnostic>, pub last_timing: UiGpuPassTiming }
 
+/// Domain-prepared values consumed by the terrain workbench. These groups are
+/// an inspection convenience only; the program still receives individual,
+/// typed input slots and bounded repeat frames.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TerrainWorkbenchUiInputs {
+    pub text_handles: std::collections::BTreeMap<String, UiTextHandle>,
+    pub tool_selection: String,
+    pub eligibility: std::collections::BTreeMap<String, bool>,
+    pub view_state: String,
+    pub controlled_values: std::collections::BTreeMap<String, UiInputValue>,
+    pub bounded_rows: std::collections::BTreeMap<String, u32>,
+    pub diagnostic_state: String,
+}
+
+/// Logical CPU/GPU comparison evidence for one named, headless scenario.
+/// `differences` contains diagnostics instead of renderer-private identities.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiDifferentialScenarioResult {
+    pub scenario: String,
+    pub program_revision: UiProgramRevision,
+    pub input_revision: Revision,
+    pub cpu_snapshot: UiCpuFrameOutput,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_snapshot: Option<UiGpuLayoutReadback>,
+    pub differences: Vec<UiDiagnostic>,
+    pub status: String,
+}
+
+/// Persistable acceptance metadata. It records automated evidence and leaves
+/// interactive acceptance explicitly user-owned.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiGpuReactiveAcceptanceRecord {
+    pub environment: std::collections::BTreeMap<String, String>,
+    pub program_hash: String,
+    pub capacities: UiResourceBudget,
+    pub timings: UiGpuPassTiming,
+    pub automated_results: Vec<UiDifferentialScenarioResult>,
+    pub manual_results: String,
+    pub residual_risks: Vec<String>,
+}
+
 /// CPU evaluator input expressed exclusively in logical layout units.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

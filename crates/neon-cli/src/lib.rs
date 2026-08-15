@@ -163,6 +163,7 @@ pub fn run_detail_toggle_scenario(endpoint: SocketAddr) -> Result<Value, Transpo
         intent,
         pointer: Some(UiPointerMetadata { id: 0, sequence: 1 }),
         focus: None,
+        text: None,
     };
     let validated = call(endpoint, "detail-event-1", "wgpu.ui.semantic_event.validate", json!(event), None)?;
     record_step(&mut steps, "wgpu.ui.semantic_event.validate", &validated);

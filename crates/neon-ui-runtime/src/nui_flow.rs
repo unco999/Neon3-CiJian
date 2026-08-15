@@ -563,10 +563,21 @@ fn parse_input(text: &str, line: u32) -> FlowResult<Option<UiInputSlot>> {
         "u32" => UiInputKind::U32,
         "f32" => UiInputKind::F32,
         "text" => UiInputKind::TextHandle,
+        enum_spec if enum_spec.starts_with("enum:") => {
+            let variants = enum_spec[5..]
+                .split('|')
+                .filter(|variant| !variant.is_empty())
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            if variants.is_empty() || variants.iter().any(|variant| !valid_key(variant)) {
+                return Err(error("nui_flow_invalid_input", "enum input variants use enum:one|two and stable variant keys", line, 1));
+            }
+            UiInputKind::Enum { variants }
+        }
         _ => {
             return Err(error(
                 "nui_flow_unknown_input_kind",
-                "Flow supports bool, i32, u32, f32, and text inputs",
+                "Flow supports bool, i32, u32, f32, text, and enum:one|two inputs",
                 line,
                 1,
             ))
@@ -605,6 +616,7 @@ fn parse_input(text: &str, line: u32) -> FlowResult<Option<UiInputSlot>> {
                 generation: 0,
             },
         },
+        (enum_spec, value) if enum_spec.starts_with("enum:") => UiInputValue::Enum { value: value.into() },
         _ => {
             return Err(error(
                 "nui_flow_invalid_literal",
@@ -1448,6 +1460,15 @@ panel workspace row gap 8
         assert_eq!(document.source_map["water"].column, 5);
         assert_eq!(document.ir.bindings.len(), 2);
         assert_eq!(document.input_schema.slots[1].packing.offset, 8);
+    }
+
+    #[test]
+    fn parses_closed_enum_input_domains_for_direct_branch_predicates() {
+        let document = parse_nui_flow(
+            "input state enum:loading|ready|error default loading\nsurface root\n  branch ready when $state=ready\n    text label value \"Ready\"\n",
+        ).unwrap();
+        assert_eq!(document.input_schema.slots[0].kind, UiInputKind::Enum { variants: vec!["loading".into(), "ready".into(), "error".into()] });
+        assert_eq!(document.ir.branches.len(), 1);
     }
 
     #[test]
