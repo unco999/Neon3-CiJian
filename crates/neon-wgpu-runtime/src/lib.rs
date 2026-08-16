@@ -725,7 +725,11 @@ fn forward_pointer_click(
     thread::spawn(move || {
         let request_id = RequestId(format!("wgpu-pointer-click-{sequence}"));
         let event = UiSemanticEvent {
-            event: neon_ui_schema::UiSemanticEventType::PointerClick,
+            event: if binding.data_grid_cell.is_some() && control_value.is_some() {
+                neon_ui_schema::UiSemanticEventType::SelectionChanged
+            } else {
+                neon_ui_schema::UiSemanticEventType::PointerClick
+            },
             event_id: request_id.0.clone(),
             renderer_epoch,
             composition_revision,
@@ -733,6 +737,7 @@ fn forward_pointer_click(
             intent,
             pointer: Some(neon_ui_schema::UiPointerMetadata { id: 0, sequence }),
             focus: None,
+            data_grid_cell: binding.data_grid_cell,
             text: None,
             control_value,
             drag_drop: None,
@@ -780,8 +785,9 @@ fn forward_text_input_commit(
             event_id: request_id.0.clone(), renderer_epoch, composition_revision,
             fragment: binding.fragment, intent, pointer: None,
             focus: Some(neon_ui_schema::UiFocusMetadata { focused: true }),
+            data_grid_cell: binding.data_grid_cell,
             text: Some(neon_ui_schema::UiTextInputCommit { value }),
-            control_value: None,
+            control_value: binding.control_value,
             drag_drop: None,
         };
         let request = RpcRequest {
@@ -810,7 +816,7 @@ fn forward_drag_drop(
             event_id: request_id.0.clone(), renderer_epoch, composition_revision, fragment: resolved.fragment.clone(),
             intent: resolved.intent,
             pointer: Some(neon_ui_schema::UiPointerMetadata { id: 0, sequence }),
-            focus: None, text: None, control_value: None,
+            focus: None, data_grid_cell: None, text: None, control_value: None,
             drag_drop: Some(neon_ui_schema::UiDragDropPayload { source_key: resolved.source_key, target_key: resolved.target_key, placement: resolved.placement, presentation_template_key: resolved.presentation_template_key }),
         };
         let request = RpcRequest {
@@ -967,6 +973,10 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                             .input
                             .capture_id
                             .and_then(|hit_id| gpu.ui.hit_binding(hit_id));
+                        gpu.pending_control_value = gpu
+                            .captured_binding
+                            .as_ref()
+                            .and_then(|binding| binding.control_value.clone());
                         if gpu.captured_binding.is_none() {
                             let _ = gpu.input.pointer_up(false);
                             gpu.last_pointer_outcome = "press_without_semantic_binding".into();
@@ -2986,6 +2996,7 @@ mod tests {
                 sequence: 1,
             }),
             focus: None,
+            data_grid_cell: None,
             text: None,
             control_value: None,
             drag_drop: None,

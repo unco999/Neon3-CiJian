@@ -79,6 +79,7 @@ fn main() {
     if case == "virtual-list" {
         attach_demo_virtual_list_frame(&document, &mut fragment);
     }
+    fragment.validate().expect("NUI Flow demo fragment must validate before submission");
     let request = RpcRequest {
         protocol: "neon3.rpc".into(),
         version: ProtocolVersion { major: 1, minor: 0 },

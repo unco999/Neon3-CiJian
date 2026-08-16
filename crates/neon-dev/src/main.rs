@@ -286,7 +286,7 @@ fn run_component_gallery_scenario_inner() -> io::Result<serde_json::Value> {
             event_id: format!("gallery-ui-event-{index}"), renderer_epoch: 1,
             composition_revision: Revision(1),
             fragment: UiFragmentRevision { id: fragment.fragment_id.clone(), revision: fragment.revision },
-            intent, pointer: None, focus: None, text: None, control_value: None, drag_drop: None,
+            intent, pointer: None, focus: None, data_grid_cell: None, text: None, control_value: None, drag_drop: None,
         };
         let ui_validation = call(ui_endpoint, &rpc_request(&format!("gallery-ui-validation-{index}"), "ui-runtime", "ui.input.event", json!(legacy_event), Some(fragment.revision), Some(&format!("gallery-ui-key-{index}"))) )?;
         assert_accepted(ui_validation.clone(), "UiRuntime Gallery event validation")?;
@@ -433,6 +433,7 @@ fn run_drag_card02_before_scenario() -> io::Result<()> {
         intent,
         pointer: None,
         focus: None,
+        data_grid_cell: None,
         text: None,
         control_value: None,
         drag_drop: Some(neon_ui_schema::UiDragDropPayload {

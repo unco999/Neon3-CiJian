@@ -665,6 +665,16 @@ pub struct UiTextInputCommit {
     pub value: String,
 }
 
+/// Stable identity for a cell in the current bounded DataGrid window. This is
+/// semantic identity only; row indices, renderer paths, and hit IDs stay local.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiDataGridCellTarget {
+    pub data_grid_key: String,
+    pub stable_row_key: String,
+    pub column_key: String,
+}
+
 /// The sole drag/drop data crossing the renderer boundary on release. The
 /// presentation template is target policy for an accepted domain patch, not a
 /// renderer instruction to mutate the canonical tree.
@@ -685,6 +695,8 @@ pub struct UiSemanticEvent {
     pub pointer: Option<UiPointerMetadata>,
     pub focus: Option<UiFocusMetadata>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_grid_cell: Option<UiDataGridCellTarget>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<UiTextInputCommit>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub control_value: Option<UiSemanticPayloadValue>,
@@ -698,6 +710,7 @@ pub const ERROR_INTENT_NOT_BOUND: &str = "intent_not_bound";
 pub const ERROR_INTERACTION_CANCELLED: &str = "interaction_cancelled";
 pub const ERROR_FOCUS_INVALID: &str = "focus_invalid";
 pub const ERROR_INPUT_SEQUENCE_STALE: &str = "input_sequence_stale";
+pub const ERROR_DATA_GRID_CELL_INVALID: &str = "data_grid_cell_invalid";
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -1640,6 +1653,11 @@ mod tests {
                 sequence: 4,
             }),
             focus: None,
+            data_grid_cell: Some(UiDataGridCellTarget {
+                data_grid_key: "assets".into(),
+                stable_row_key: "asset-42".into(),
+                column_key: "status".into(),
+            }),
             text: None,
             control_value: None,
             drag_drop: None,
@@ -1647,8 +1665,10 @@ mod tests {
         let encoded = serde_json::to_value(event).unwrap();
         assert!(encoded.get("render_hit_id").is_none());
         assert!(encoded.get("node_id").is_none());
+        assert!(encoded.get("node_path").is_none());
         assert!(encoded.get("pixel_position").is_none());
         assert!(encoded.get("logical_position").is_none());
+        assert_eq!(encoded["data_grid_cell"]["stable_row_key"], "asset-42");
     }
 
     #[test]

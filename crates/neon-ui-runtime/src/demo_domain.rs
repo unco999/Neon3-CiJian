@@ -684,6 +684,7 @@ mod tests {
             intent,
             pointer: None,
             focus: None,
+            data_grid_cell: None,
             text: None,
             control_value: None,
             drag_drop: Some(neon_ui_schema::UiDragDropPayload {

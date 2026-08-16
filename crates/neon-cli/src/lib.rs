@@ -163,6 +163,7 @@ pub fn run_detail_toggle_scenario(endpoint: SocketAddr) -> Result<Value, Transpo
         intent,
         pointer: Some(UiPointerMetadata { id: 0, sequence: 1 }),
         focus: None,
+        data_grid_cell: None,
         text: None,
         control_value: None,
         drag_drop: None,

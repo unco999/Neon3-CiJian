@@ -23,9 +23,9 @@ use neon_ui_schema::{
     UiInputValue, UiInputValueSource, UiInspectorState, UiInspectorTab, UiIrDocument, UiNode,
     UiNodeId, UiNodeKind, UiProgram, UiProgramEventDeclaration, UiProgramLayoutRecord,
     UiProgramLiteralText, UiProgramNode, UiProgramResourceKind, UiProgramRevision,
-    UiBranchPredicate, UiBranchRecord, UiTemplateRecord, UiRepeatFrame, UiDataGridDeclaration,
+    UiBranchPredicate, UiBranchRecord, UiTemplateRecord, UiRepeatFrame, UiDataGridCellTarget, UiDataGridDeclaration,
     UiDataGridFrame, UiDataGridRecord, UiDataGridWindowRequest,
-    UiResolvedInputValue, UiResolvedInputs, UiResourceBudget, UiSchemaError, UiSemanticEvent,
+    UiResolvedInputValue, UiResolvedInputs, UiResourceBudget, UiSchemaError, UiSemanticEvent, UiIntent,
     UiProgramSemanticEvent, UiProgramSemanticEventKind, UiProgramSemanticEventResult,
     UiProgramSemanticEventStatus, UiSemanticPayloadValue, UiEventTraceRecord,
     UiStyle, UiSurfaceEvent, UiSurfaceEventKind, UiSurfaceEventRequest, UiSurfaceId,
@@ -33,7 +33,7 @@ use neon_ui_schema::{
     UiSemanticInteractionMetadata,
     UiTextRecord, UiTextRegistryDebugSnapshot, UiTextRegistryEntryMetadata, UiTextRegistrySnapshot,
     UiTextSourceCategory, UiTransition, UiTransitionState, ERROR_FRAGMENT_REVISION_STALE,
-    ERROR_INPUT_SEQUENCE_STALE, ERROR_INTENT_NOT_BOUND, ERROR_RENDERER_EPOCH_MISMATCH,
+    ERROR_DATA_GRID_CELL_INVALID, ERROR_INPUT_SEQUENCE_STALE, ERROR_INTENT_NOT_BOUND, ERROR_RENDERER_EPOCH_MISMATCH,
     ERROR_UI_PROGRAM_DUPLICATE_INPUT_CHANGE, ERROR_UI_PROGRAM_INPUT_TYPE_MISMATCH,
     ERROR_UI_PROGRAM_INPUT_UPDATE_FORBIDDEN, ERROR_UI_PROGRAM_STALE_INPUT_REVISION,
     ERROR_UI_PROGRAM_TEXT_REGISTRY_CAPACITY_OVERFLOW,
@@ -1990,6 +1990,12 @@ impl UiRuntime {
                     .unwrap_or_else(|error| {
                         runtime.rejected(request_id, "service_unavailable", &error.to_string())
                     })
+            } else if request.method == "ui.input.event" && renderer_event_targets_data_grid(&request) {
+                runtime
+                    .forward_data_grid_cell_event(domain_endpoint, request)
+                    .unwrap_or_else(|error| {
+                        runtime.rejected(request_id, "service_unavailable", &error.to_string())
+                    })
             } else if request.method == "ui.input.event" && runtime.gallery.is_some() {
                 runtime
                     .forward_gallery_program_event(wgpu_endpoint, domain_endpoint, request)
@@ -2249,6 +2255,48 @@ impl UiRuntime {
             idempotency_key: Some(format!("domain-fragment:{}", event.event_id)),
         };
         let mut response = self.forward_fragment(wgpu_endpoint, submit)?;
+        response.request_id = response_request_id;
+        Ok(response)
+    }
+
+    /// Forwards only a UI-runtime validated cell intent. The target and value are
+    /// semantic schema values; renderer hit IDs, paths, and coordinates never leave WGPU.
+    fn forward_data_grid_cell_event(
+        &mut self,
+        domain_endpoint: SocketAddr,
+        request: RpcRequest,
+    ) -> Result<RpcResponse, TransportError> {
+        let response_request_id = request.request_id.clone();
+        let event: UiSemanticEvent = serde_json::from_value(request.params.clone())
+            .map_err(|_| TransportError::Io(std::io::Error::other("invalid UI semantic event")))?;
+        self.validate_semantic_event(&event)
+            .map_err(|code| TransportError::Io(std::io::Error::other(code)))?;
+        let target = event.data_grid_cell.clone().ok_or_else(|| {
+            TransportError::Io(std::io::Error::other(ERROR_DATA_GRID_CELL_INVALID))
+        })?;
+        let neon_ui_schema::UiIntent::Invoke { action, mut params } = event.intent.clone();
+        let Some(object) = params.as_object_mut() else {
+            return Ok(self.rejected(
+                response_request_id,
+                ERROR_DATA_GRID_CELL_INVALID,
+                "DataGrid intents require object parameters",
+            ));
+        };
+        object.insert("data_grid_cell".into(), json!(target));
+        if let Some(value) = event.control_value {
+            object.insert("control_value".into(), json!(value));
+        }
+        if let Some(text) = event.text {
+            object.insert("text".into(), json!(text));
+        }
+        let forwarded = RpcRequest {
+            protocol: "neon3.rpc".into(), version: PROTOCOL_VERSION,
+            request_id: RequestId(format!("{}-domain", response_request_id.0)),
+            client: self.client.clone(), target: ServiceName("demo-domain".into()), method: action,
+            params, expected_revision: Some(event.fragment.revision),
+            idempotency_key: request.idempotency_key,
+        };
+        let mut response = RpcClient::connect(domain_endpoint)?.call(&forwarded)?;
         response.request_id = response_request_id;
         Ok(response)
     }
@@ -2609,6 +2657,11 @@ impl UiRuntime {
         {
             return Err(ERROR_FRAGMENT_REVISION_STALE);
         }
+        let data_grid_cell = event
+            .data_grid_cell
+            .as_ref()
+            .map(|target| validate_data_grid_cell_event(fragment, event, target))
+            .transpose()?;
         let bound = fragment.effects.iter().any(|effect| matches!(effect, UiEffect::SemanticIntent { intent } | UiEffect::BoundSemanticIntent { intent, .. } if intent == &event.intent));
         let declared_drop = event.drag_drop.as_ref().is_some_and(|drop| fragment.effects.iter().any(|effect| {
             let UiEffect::DropBinding { binding } = effect else { return false; };
@@ -2617,7 +2670,7 @@ impl UiRuntime {
                 && binding.placement == drop.placement
                 && fragment.effects.iter().any(|effect| matches!(effect, UiEffect::DragBinding { binding: drag } if drag.key == binding.accepts_drag_key && drag.source_node_id.0 == drop.source_key))
         }));
-        if !(bound || declared_drop) {
+        if !(bound || declared_drop || data_grid_cell.is_some()) {
             return Err(ERROR_INTENT_NOT_BOUND);
         }
         if event.event == neon_ui_schema::UiSemanticEventType::DragDrop && event.drag_drop.is_none() {
@@ -2845,6 +2898,112 @@ fn renderer_event_targets_domain(request: &RpcRequest) -> bool {
         .is_some_and(|event| event.event == neon_ui_schema::UiSemanticEventType::DragDrop)
 }
 
+fn renderer_event_targets_data_grid(request: &RpcRequest) -> bool {
+    serde_json::from_value::<UiSemanticEvent>(request.params.clone())
+        .ok()
+        .is_some_and(|event| event.data_grid_cell.is_some())
+}
+
+fn validate_data_grid_cell_event(
+    fragment: &UiFragment,
+    event: &UiSemanticEvent,
+    target: &UiDataGridCellTarget,
+) -> Result<(), &'static str> {
+    if target.data_grid_key.trim().is_empty()
+        || target.stable_row_key.trim().is_empty()
+        || target.column_key.trim().is_empty()
+        || event.drag_drop.is_some()
+    {
+        return Err(ERROR_DATA_GRID_CELL_INVALID);
+    }
+    let Some((declaration, frame)) = fragment.effects.iter().find_map(|effect| match effect {
+        UiEffect::DataGridFrame { declaration, frame }
+            if declaration.node_key == target.data_grid_key && frame.data_grid_key == target.data_grid_key => {
+                Some((declaration, frame))
+            }
+        _ => None,
+    }) else {
+        return Err(ERROR_DATA_GRID_CELL_INVALID);
+    };
+    let Some(column) = declaration.columns.iter().find(|column| column.key == target.column_key) else {
+        return Err(ERROR_DATA_GRID_CELL_INVALID);
+    };
+    let Some(cell) = frame.window_rows.iter()
+        .find(|row| row.stable_row_key == target.stable_row_key)
+        .and_then(|row| row.cells.get(&target.column_key))
+    else {
+        return Err(ERROR_DATA_GRID_CELL_INVALID);
+    };
+    let (intent, effective) = match (&column.presentation, cell.presentation_override.as_ref()) {
+        (neon_ui_schema::UiDataGridPresentation::Text, _) => return Err(ERROR_DATA_GRID_CELL_INVALID),
+        (neon_ui_schema::UiDataGridPresentation::Select { intent }, None) => (intent, None),
+        (neon_ui_schema::UiDataGridPresentation::Dropdown { intent, .. }, None)
+        | (neon_ui_schema::UiDataGridPresentation::Edit { intent, .. }, None)
+        | (neon_ui_schema::UiDataGridPresentation::Select { intent }, Some(_))
+        | (neon_ui_schema::UiDataGridPresentation::Dropdown { intent, .. }, Some(_))
+        | (neon_ui_schema::UiDataGridPresentation::Edit { intent, .. }, Some(_)) => (intent, cell.presentation_override.as_ref()),
+    };
+    let UiIntent::Invoke { action, params } = &event.intent;
+    if action != intent || params.as_object().is_none_or(|params| !params.is_empty()) {
+        return Err(ERROR_DATA_GRID_CELL_INVALID);
+    }
+    match effective {
+        None => match &column.presentation {
+            neon_ui_schema::UiDataGridPresentation::Select { .. } => match (&cell.value, &event.control_value) {
+                (UiInputValue::Bool { value: current }, Some(UiSemanticPayloadValue::Bool { value }))
+                    if event.event == neon_ui_schema::UiSemanticEventType::SelectionChanged
+                        && *value == !*current
+                        && event.text.is_none() => Ok(()),
+                _ => Err(ERROR_DATA_GRID_CELL_INVALID),
+            },
+            neon_ui_schema::UiDataGridPresentation::Dropdown { options, .. } => {
+                validate_data_grid_dropdown_event(event, options)
+            }
+            neon_ui_schema::UiDataGridPresentation::Edit { max_chars, .. } => {
+                validate_data_grid_edit_event(event, &cell.value, *max_chars)
+            }
+            neon_ui_schema::UiDataGridPresentation::Text => Err(ERROR_DATA_GRID_CELL_INVALID),
+        },
+        Some(neon_ui_schema::UiDataGridCellPresentation::Text) => Err(ERROR_DATA_GRID_CELL_INVALID),
+        Some(neon_ui_schema::UiDataGridCellPresentation::Dropdown { options }) => {
+            validate_data_grid_dropdown_event(event, options)
+        }
+        Some(neon_ui_schema::UiDataGridCellPresentation::Edit { max_chars }) => {
+            validate_data_grid_edit_event(event, &cell.value, *max_chars)
+        }
+    }
+}
+
+fn validate_data_grid_dropdown_event(
+    event: &UiSemanticEvent,
+    options: &[String],
+) -> Result<(), &'static str> {
+    match &event.control_value {
+        Some(UiSemanticPayloadValue::Enum { value })
+            if event.event == neon_ui_schema::UiSemanticEventType::SelectionChanged
+                && options.iter().any(|option| option == value)
+                && event.text.is_none() => Ok(()),
+        _ => Err(ERROR_DATA_GRID_CELL_INVALID),
+    }
+}
+
+fn validate_data_grid_edit_event(
+    event: &UiSemanticEvent,
+    cell_value: &UiInputValue,
+    max_chars: u32,
+) -> Result<(), &'static str> {
+    match (cell_value, &event.control_value, &event.text) {
+        (
+            UiInputValue::TextHandle { value: expected },
+            Some(UiSemanticPayloadValue::TextHandle { value }),
+            Some(text),
+        ) if event.event == neon_ui_schema::UiSemanticEventType::TextInputCommit
+            && value == expected
+            && text.value.chars().count() <= max_chars as usize => Ok(()),
+        _ => Err(ERROR_DATA_GRID_CELL_INVALID),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3056,6 +3215,7 @@ mod tests {
             },
             pointer: None,
             focus: None,
+            data_grid_cell: None,
             text: Some(UiTextInputCommit {
                 value: "composed text".into(),
             }),
@@ -3292,6 +3452,7 @@ mod tests {
             },
             pointer: Some(UiPointerMetadata { id: 0, sequence: 1 }),
             focus: None,
+            data_grid_cell: None,
             text: None,
             control_value: None,
             drag_drop: None,
@@ -3381,6 +3542,7 @@ mod tests {
             intent,
             pointer: Some(UiPointerMetadata { id: 0, sequence: 1 }),
             focus: None,
+            data_grid_cell: None,
             text: None,
             control_value: None,
             drag_drop: None,
@@ -3447,7 +3609,7 @@ mod tests {
         let event = UiSemanticEvent {
             event: neon_ui_schema::UiSemanticEventType::DragDrop, event_id: "drag-forward-1".into(), renderer_epoch: 7,
             composition_revision: Revision(1), fragment: neon_ui_schema::UiFragmentRevision { id: fragment.fragment_id.clone(), revision: Revision(1) },
-            intent, pointer: Some(neon_ui_schema::UiPointerMetadata { id: 0, sequence: 1 }), focus: None, text: None, control_value: None,
+            intent, pointer: Some(neon_ui_schema::UiPointerMetadata { id: 0, sequence: 1 }), focus: None, data_grid_cell: None, text: None, control_value: None,
             drag_drop: Some(neon_ui_schema::UiDragDropPayload { source_key: "backlog-card-01".into(), target_key: "in-progress-panel".into(), placement: neon_ui_schema::UiDropPlacement::Into, presentation_template_key: Some("progress-template".into()) }),
         };
         let mut runtime = UiRuntime::new(7, "ui-drag-forward-test");
@@ -3544,6 +3706,7 @@ mod tests {
             intent,
             pointer: Some(UiPointerMetadata { id: 0, sequence: 1 }),
             focus: None,
+            data_grid_cell: None,
             text: None,
             control_value: None,
             drag_drop: None,
@@ -3593,6 +3756,7 @@ mod tests {
             },
             pointer: Some(UiPointerMetadata { id: 0, sequence }),
             focus: None,
+            data_grid_cell: None,
             text: None,
             control_value: None,
             drag_drop: None,
@@ -4130,6 +4294,95 @@ mod tests {
     }
 
     #[test]
+    fn data_grid_cell_events_require_current_targets_typed_values_and_edit_bounds() {
+        let root = UiNode {
+            node_id: UiNodeId("assets".into()), kind: UiNodeKind::DataGrid,
+            bounds: UiBounds { x: 0.0, y: 0.0, width: 320.0, height: 80.0 }, layout: None,
+            visible: true, enabled: true, text_key: None, text: None, image: None, surface: None,
+            style: UiStyle::default(), enter_transition: None, children: Vec::new(),
+        };
+        let declaration = UiDataGridDeclaration {
+            node_key: "assets".into(), max_window_rows: 1, row_height: 24, overscan: 0,
+            columns: vec![
+                neon_ui_schema::UiDataGridColumn { key: "selected".into(), label: "Selected".into(), width: 80, presentation: neon_ui_schema::UiDataGridPresentation::Select { intent: "asset.selected.set".into() } },
+                neon_ui_schema::UiDataGridColumn { key: "state".into(), label: "State".into(), width: 80, presentation: neon_ui_schema::UiDataGridPresentation::Dropdown { options: vec!["ready".into(), "review".into()], intent: "asset.state.set".into() } },
+                neon_ui_schema::UiDataGridColumn { key: "name".into(), label: "Name".into(), width: 160, presentation: neon_ui_schema::UiDataGridPresentation::Edit { max_chars: 5, intent: "asset.name.set".into() } },
+            ],
+        };
+        let text_handle = UiTextHandle { id: 3, generation: 1 };
+        let frame = UiDataGridFrame {
+            data_grid_key: "assets".into(), list_revision: Revision(1), total_rows: 1, first_row: 0,
+            window_rows: vec![neon_ui_schema::UiDataGridWindowRow {
+                stable_row_key: "asset-42".into(),
+                cells: BTreeMap::from([
+                    ("selected".into(), neon_ui_schema::UiDataGridCell { value: UiInputValue::Bool { value: false }, display: UiTextHandle { id: 1, generation: 1 }, presentation_override: None }),
+                    ("state".into(), neon_ui_schema::UiDataGridCell { value: UiInputValue::Enum { value: "ready".into() }, display: UiTextHandle { id: 2, generation: 1 }, presentation_override: None }),
+                    ("name".into(), neon_ui_schema::UiDataGridCell { value: UiInputValue::TextHandle { value: text_handle }, display: text_handle, presentation_override: None }),
+                ]),
+            }],
+            expected_program_revision: compiler_program_revision(),
+        };
+        let mut runtime = UiRuntime::new(7, "grid-event-test");
+        runtime.cached_fragment = Some(UiFragment {
+            fragment_id: UiFragmentId("grid".into()), revision: Revision(1), root,
+            effects: vec![UiEffect::DataGridFrame { declaration, frame }],
+        });
+        let event = |event, action: &str, column: &str, control_value, text| UiSemanticEvent {
+            event, event_id: format!("event-{column}"), renderer_epoch: 7, composition_revision: Revision(1),
+            fragment: neon_ui_schema::UiFragmentRevision { id: UiFragmentId("grid".into()), revision: Revision(1) },
+            intent: UiIntent::Invoke { action: action.into(), params: json!({}) }, pointer: None, focus: None,
+            data_grid_cell: Some(UiDataGridCellTarget { data_grid_key: "assets".into(), stable_row_key: "asset-42".into(), column_key: column.into() }),
+            text, control_value, drag_drop: None,
+        };
+        assert!(runtime.validate_semantic_event(&event(
+            neon_ui_schema::UiSemanticEventType::SelectionChanged, "asset.selected.set", "selected",
+            Some(UiSemanticPayloadValue::Bool { value: true }), None,
+        )).is_ok());
+        assert!(runtime.validate_semantic_event(&event(
+            neon_ui_schema::UiSemanticEventType::SelectionChanged, "asset.state.set", "state",
+            Some(UiSemanticPayloadValue::Enum { value: "review".into() }), None,
+        )).is_ok());
+        assert!(runtime.validate_semantic_event(&event(
+            neon_ui_schema::UiSemanticEventType::TextInputCommit, "asset.name.set", "name",
+            Some(UiSemanticPayloadValue::TextHandle { value: text_handle }),
+            Some(neon_ui_schema::UiTextInputCommit { value: "short".into() }),
+        )).is_ok());
+        let mut stale = event(
+            neon_ui_schema::UiSemanticEventType::SelectionChanged, "asset.selected.set", "selected",
+            Some(UiSemanticPayloadValue::Bool { value: true }), None,
+        );
+        stale.data_grid_cell.as_mut().unwrap().stable_row_key = "off-window".into();
+        assert_eq!(runtime.validate_semantic_event(&stale), Err(ERROR_DATA_GRID_CELL_INVALID));
+        assert_eq!(runtime.validate_semantic_event(&event(
+            neon_ui_schema::UiSemanticEventType::TextInputCommit, "asset.name.set", "name",
+            Some(UiSemanticPayloadValue::TextHandle { value: text_handle }),
+            Some(neon_ui_schema::UiTextInputCommit { value: "too-long".into() }),
+        )), Err(ERROR_DATA_GRID_CELL_INVALID));
+
+        let domain = RpcServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let endpoint = domain.local_addr().unwrap();
+        let domain_thread = thread::spawn(move || domain.serve_one(|request| {
+            assert_eq!(request.method, "asset.selected.set");
+            assert_eq!(request.params["data_grid_cell"]["stable_row_key"], "asset-42");
+            assert_eq!(request.params["control_value"], json!({"kind": "bool", "value": true}));
+            assert!(request.params.get("node_path").is_none());
+            accepted(request)
+        }));
+        let outbound = event(
+            neon_ui_schema::UiSemanticEventType::SelectionChanged, "asset.selected.set", "selected",
+            Some(UiSemanticPayloadValue::Bool { value: true }), None,
+        );
+        let response = runtime.forward_data_grid_cell_event(endpoint, RpcRequest {
+            protocol: "neon3.rpc".into(), version: PROTOCOL_VERSION, request_id: RequestId("grid-forward".into()),
+            client: runtime.client.clone(), target: ServiceName(SERVICE_NAME.into()), method: "ui.input.event".into(),
+            params: json!(outbound), expected_revision: Some(Revision(1)), idempotency_key: Some("grid-forward".into()),
+        }).unwrap();
+        assert_eq!(response.status, RpcStatus::Accepted);
+        assert_eq!(response.request_id, RequestId("grid-forward".into()));
+        domain_thread.join().unwrap().unwrap();
+    }
+
+    #[test]
     fn program_semantic_events_require_current_enabled_declarations_and_are_idempotent() {
         use neon_ui_schema::{UiProgramSemanticEvent, UiProgramSemanticEventKind, UiSemanticInteractionMetadata};
         let mut document = compiler_document();
@@ -4357,7 +4610,7 @@ mod tests {
                 fragment: neon_ui_schema::UiFragmentRevision { id: fragment_id.clone(), revision: event_revision },
                 intent: neon_ui_schema::UiIntent::Invoke { action: "gallery.checkbox.toggle".into(), params: json!({}) },
                 pointer: Some(neon_ui_schema::UiPointerMetadata { id: 0, sequence }),
-                focus: None, text: None, control_value: None, drag_drop: None,
+                focus: None, data_grid_cell: None, text: None, control_value: None, drag_drop: None,
             }),
             expected_revision: Some(event_revision),
             idempotency_key: Some(idempotency.into()),
