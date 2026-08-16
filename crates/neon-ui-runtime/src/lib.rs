@@ -1,7 +1,7 @@
 //! Headless UI declaration runtime. It must not create windows or GPU objects.
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     net::SocketAddr,
 };
 
@@ -11,7 +11,9 @@ use neon_observability::{
     TraceRecord, EVENT_COMMAND_ACCEPTED, EVENT_COMMAND_RECEIVED, EVENT_COMMAND_REJECTED,
 };
 use neon_protocol::{
-    AiTerrainCondition, ClientIdentity, ClientKind, HealthStatus, ProtocolVersion, RequestId,
+    AiTerrainCondition, ClientIdentity, ClientKind, HealthStatus, InteractionId,
+    InteractionSemanticTarget, InteractionTraceError,
+    InteractionTraceOutcome, InteractionTraceQuery, InteractionTraceRecord, InteractionTraceStage, ProtocolVersion, RequestId,
     Revision, RpcError, RpcRequest, RpcResponse, RpcStatus, ServiceDescription, ServiceHealth,
     ServiceName, PROTOCOL_VERSION,
 };
@@ -21,16 +23,16 @@ use neon_ui_schema::{
     UiDiagnosticSeverity, UiDiagnosticsState, UiEffect, UiFragment, UiFragmentId,
     UiFragmentSubmission, UiInputChange, UiInputFrame, UiInputSchema, UiInputUpdateClass,
     UiInputValue, UiInputValueSource, UiInspectorState, UiInspectorTab, UiIrDocument, UiNode,
-    UiNodeId, UiNodeKind, UiProgram, UiProgramEventDeclaration, UiProgramLayoutRecord,
+    UiNodeId, UiNodeKind, UiProgram, UiProgramLayoutRecord,
     UiProgramLiteralText, UiProgramNode, UiProgramResourceKind, UiProgramRevision,
     UiBranchPredicate, UiBranchRecord, UiTemplateRecord, UiRepeatFrame, UiDataGridCellTarget, UiDataGridDeclaration,
-    UiDataGridFrame, UiDataGridRecord, UiDataGridWindowRequest,
-    UiResolvedInputValue, UiResolvedInputs, UiResourceBudget, UiSchemaError, UiSemanticEvent, UiIntent,
+    UiDataGridFrame, UiDataGridInputFrame, UiDataGridRecord,
+    UiResolvedInputValue, UiResolvedInputs, UiSchemaError, UiSemanticEvent, UiIntent,
     UiProgramSemanticEvent, UiProgramSemanticEventKind, UiProgramSemanticEventResult,
     UiProgramSemanticEventStatus, UiSemanticPayloadValue, UiEventTraceRecord,
     UiStyle, UiSurfaceEvent, UiSurfaceEventKind, UiSurfaceEventRequest, UiSurfaceId,
     UiSurfaceSnapshot, UiSurfaceState, UiTextHandle, UiTextHandleDiagnostic, UiTextHandleStatus,
-    UiSemanticInteractionMetadata,
+    UiSemanticInteractionMetadata, UiHostInbound, UiHostPublication,
     UiTextRecord, UiTextRegistryDebugSnapshot, UiTextRegistryEntryMetadata, UiTextRegistrySnapshot,
     UiTextSourceCategory, UiTransition, UiTransitionState, ERROR_FRAGMENT_REVISION_STALE,
     ERROR_DATA_GRID_CELL_INVALID, ERROR_INPUT_SEQUENCE_STALE, ERROR_INTENT_NOT_BOUND, ERROR_RENDERER_EPOCH_MISMATCH,
@@ -53,6 +55,8 @@ pub mod nui_state_machine;
 pub mod debug;
 pub mod terrain_workbench;
 pub mod demo_domain;
+pub mod host_adapter;
+use host_adapter::{UiHostAdapter, UiHostAdapterConfig};
 pub use nui_flow::{
     apply_nui_ir_patch, compile_nui_flow_program, format_nui_flow, lower_nui_flow, lower_nui_flow_effects, parse_nui_flow,
     parse_nui_flow_patch, NuiFlowError,
@@ -62,6 +66,64 @@ pub use nui_state_machine::{NuiFlowDragController, NuiFlowDragUpdate, NuiFlowDro
 pub const SERVICE_NAME: &str = "ui-runtime";
 pub const WORKBENCH_SURFACE_ID: &str = "surface.ui-workbench";
 pub const AI_TERRAIN_SURFACE_ID: &str = "surface.ai.terrain-generator";
+pub const CAPABILITY_DEBUG_INTERACTION: &str = "debug.interaction.v1";
+const INTERACTION_TRACE_CAPACITY: usize = 256;
+
+#[derive(Default)]
+struct InteractionTraceStore {
+    next_sequence: u64,
+    records: VecDeque<InteractionTraceRecord>,
+}
+
+#[derive(Clone)]
+struct InteractionTraceContext {
+    interaction_id: InteractionId,
+    semantic_target: Option<InteractionSemanticTarget>,
+    fragment_revision: Option<Revision>,
+    composition_revision: Revision,
+}
+
+fn inbound_interaction_context(inbound: &UiHostInbound, fallback_composition_revision: Revision) -> Option<InteractionTraceContext> {
+    match inbound {
+        UiHostInbound::SemanticIntent { event } => Some(InteractionTraceContext {
+            interaction_id: InteractionId(event.interaction.interaction_id.clone()),
+            semantic_target: Some(InteractionSemanticTarget { node_path: event.source_node_key.clone() }),
+            fragment_revision: Some(event.program_revision.revision),
+            composition_revision: fallback_composition_revision,
+        }),
+        UiHostInbound::DataGridCell { event } => Some(InteractionTraceContext {
+            interaction_id: InteractionId(event.event_id.clone()),
+            semantic_target: event.data_grid_cell.as_ref().map(|target| InteractionSemanticTarget { node_path: target.source_key.clone() }),
+            fragment_revision: Some(event.fragment.revision),
+            composition_revision: event.composition_revision,
+        }),
+        UiHostInbound::WindowRequest { .. } => None,
+    }
+}
+
+impl InteractionTraceStore {
+    fn append(&mut self, interaction_id: InteractionId, stage: InteractionTraceStage, outcome: InteractionTraceOutcome, error: Option<InteractionTraceError>, semantic_target: Option<InteractionSemanticTarget>, fragment_revision: Option<Revision>, composition_revision: Revision, downstream_request_id: Option<RequestId>) {
+        if self.next_sequence == 0 { self.next_sequence = 1; }
+        if self.records.len() == INTERACTION_TRACE_CAPACITY { self.records.pop_front(); }
+        self.records.push_back(InteractionTraceRecord { sequence: self.next_sequence, interaction_id, stage, outcome, error, semantic_target, fragment_revision, composition_revision, downstream_request_id });
+        self.next_sequence += 1;
+    }
+
+    fn get(&self, interaction_id: &InteractionId) -> Vec<InteractionTraceRecord> {
+        self.records.iter().filter(|record| &record.interaction_id == interaction_id).cloned().collect()
+    }
+
+    fn query(&self, query: &InteractionTraceQuery) -> Vec<InteractionTraceRecord> {
+        let limit = query.limit.unwrap_or(100).min(INTERACTION_TRACE_CAPACITY);
+        self.records.iter().filter(|record| query.after.is_none_or(|after| record.sequence > after)).filter(|record| query.filters.as_ref().is_none_or(|filters| {
+            filters.interaction_id.as_ref().is_none_or(|id| id == &record.interaction_id)
+                && filters.stage.is_none_or(|stage| stage == record.stage)
+                && filters.outcome.is_none_or(|outcome| outcome == record.outcome)
+                && filters.semantic_node_path.as_ref().is_none_or(|path| record.semantic_target.as_ref().is_some_and(|target| &target.node_path == path))
+                && filters.downstream_request_id.as_ref().is_none_or(|id| record.downstream_request_id.as_ref() == Some(id))
+        })).take(limit).cloned().collect()
+    }
+}
 
 #[derive(Clone, Debug, PartialEq)]
 struct AiTerrainPanelState {
@@ -889,13 +951,100 @@ fn input_value_as_event_payload(value: &UiInputValue) -> Option<UiSemanticPayloa
     })
 }
 
-fn apply_program_visibility(
-    node: &mut UiNode,
-    visibility: &std::collections::BTreeMap<String, bool>,
+/// Converts legacy renderer transport events at the compiled-program boundary.
+/// Pointer clicks are transport details; the active control determines intent.
+fn program_semantic_event_kind(
+    node_kind: &UiNodeKind,
+    event_kind: &neon_ui_schema::UiSemanticEventType,
+) -> UiProgramSemanticEventKind {
+    use neon_ui_schema::UiSemanticEventType;
+    match event_kind {
+        UiSemanticEventType::ValuePreview => UiProgramSemanticEventKind::ValueTentative,
+        UiSemanticEventType::FocusChanged | UiSemanticEventType::InteractionCancelled => {
+            UiProgramSemanticEventKind::InteractionCancel
+        }
+        UiSemanticEventType::DragDrop => UiProgramSemanticEventKind::ValueCommit,
+        UiSemanticEventType::PointerClick
+        | UiSemanticEventType::ValueCommit
+        | UiSemanticEventType::SelectionChanged
+        | UiSemanticEventType::TextInputCommit => match node_kind {
+            UiNodeKind::Checkbox | UiNodeKind::RadioButton | UiNodeKind::Selectable
+            | UiNodeKind::Combo | UiNodeKind::Dropdown | UiNodeKind::ListBox => {
+                UiProgramSemanticEventKind::SelectionChanged
+            }
+            UiNodeKind::Slider | UiNodeKind::DragValue | UiNodeKind::Scrollbar => {
+                UiProgramSemanticEventKind::ValueCommit
+            }
+            UiNodeKind::TextInput => UiProgramSemanticEventKind::TextEditCommit,
+            UiNodeKind::Button => UiProgramSemanticEventKind::Activate,
+            _ => UiProgramSemanticEventKind::Activate,
+        },
+    }
+}
+
+/// Re-applies the compiled program to a submitted fragment after an external
+/// scalar publication. Grid effects are intentionally maintained separately.
+fn refresh_fragment_from_program(
+    fragment: &mut UiFragment,
+    program: &UiProgram,
+    inputs: &UiResolvedInputs,
+    schema: &UiInputSchema,
 ) {
-    node.visible = visibility.get(&node.node_id.0).copied().unwrap_or(false);
-    for child in &mut node.children {
-        apply_program_visibility(child, visibility);
+    let evaluated = evaluate_ui_program(
+        program,
+        inputs,
+        UiCpuViewport {
+            logical_bounds: UiBounds { x: 0.0, y: 0.0, width: f32::MAX, height: f32::MAX },
+            revision: Revision(0),
+        },
+        &UiLocalPresentationState::default(),
+    );
+    let states = evaluated.nodes.into_iter().map(|state| (state.node_key.clone(), state)).collect::<BTreeMap<_, _>>();
+    fn apply(node: &mut UiNode, states: &BTreeMap<String, UiCpuNodeState>) {
+        if let Some(state) = states.get(&node.node_id.0) {
+            node.visible = state.visible;
+            node.enabled = state.enabled;
+            node.style.opacity = state.opacity;
+        }
+        for child in &mut node.children { apply(child, states); }
+    }
+    apply(&mut fragment.root, &states);
+    fragment.effects.retain(|effect| !matches!(effect, UiEffect::ControlPresentation { .. }));
+    for node in &program.nodes {
+        let Some(state) = states.get(&node.key) else { continue; };
+        let presentation = match node.kind {
+            UiNodeKind::Checkbox | UiNodeKind::RadioButton | UiNodeKind::Selectable => {
+                Some(neon_ui_schema::UiControlPresentation::Toggle { selected: state.active || state.selected })
+            }
+            UiNodeKind::Slider | UiNodeKind::DragValue => state.numeric_value.map(|value| {
+                let bounds = program.binding_records.iter().find(|binding| {
+                    binding.node_key == node.key && binding.property == UiBoundProperty::NumericValue
+                }).and_then(|binding| schema.slots.iter().find(|slot| slot.key == binding.input_key))
+                    .map(|slot| match slot.kind {
+                        neon_ui_schema::UiInputKind::I32Range { minimum, maximum } => (minimum as f32, maximum as f32),
+                        neon_ui_schema::UiInputKind::U32Range { minimum, maximum } => (minimum as f32, maximum as f32),
+                        _ => (value.min(0.0), value.max(1.0)),
+                    }).unwrap_or((value.min(0.0), value.max(1.0)));
+                neon_ui_schema::UiControlPresentation::Numeric { value, min: bounds.0, max: bounds.1 }
+            }),
+            UiNodeKind::Scrollbar => state.numeric_value.map(|value| {
+                neon_ui_schema::UiControlPresentation::Scroll { position: value.clamp(0.0, 1.0) }
+            }),
+            UiNodeKind::Combo | UiNodeKind::Dropdown | UiNodeKind::ListBox => state.state_token.as_ref().map(|token| {
+                let options = program.binding_records.iter().find(|binding| {
+                    binding.node_key == node.key && binding.property == UiBoundProperty::StateToken
+                }).and_then(|binding| schema.slots.iter().find(|slot| slot.key == binding.input_key))
+                    .and_then(|slot| match &slot.kind {
+                        neon_ui_schema::UiInputKind::Enum { variants } => Some(variants.clone()),
+                        _ => None,
+                    }).unwrap_or_default();
+                neon_ui_schema::UiControlPresentation::Choice { token: token.clone(), options, selected: state.selected || state.active }
+            }),
+            _ => None,
+        };
+        if let Some(state) = presentation {
+            fragment.effects.push(UiEffect::ControlPresentation { node_id: UiNodeId(node.key.clone()), state });
+        }
     }
 }
 
@@ -928,20 +1077,20 @@ pub struct UiDataGridStore {
 pub struct UiDataGridApplyResult { pub accepted_rows: u32 }
 
 impl UiDataGridStore {
-    pub fn frame(&self, data_grid_key: &str) -> Option<&UiDataGridFrame> { self.frames.get(data_grid_key) }
+    pub fn frame(&self, source_key: &str) -> Option<&UiDataGridFrame> { self.frames.get(source_key) }
 
     /// Attaches the current bounded grid windows to a fragment produced from the
     /// same compiled program. Frames are presentation data, not fragment topology.
     pub fn attach_to_fragment(&self, program: &UiProgram, fragment: &mut UiFragment) -> Result<(), UiProgramCompileError> {
         let mut effects = fragment.effects.iter().filter(|effect| !matches!(effect, UiEffect::DataGridFrame { .. })).cloned().collect::<Vec<_>>();
         for grid in &program.data_grid_records {
-            let Some(frame) = self.frame(&grid.node_key) else { continue; };
+            let Some(frame) = self.frame(&grid.source_key) else { continue; };
             if frame.expected_program_revision != program.revision {
                 return Err(compile_error(ERROR_UI_PROGRAM_STALE_INPUT_REVISION, "DataGrid frame belongs to a different program revision"));
             }
             effects.push(UiEffect::DataGridFrame {
                 declaration: UiDataGridDeclaration {
-                    node_key: grid.node_key.clone(), max_window_rows: grid.max_window_rows,
+                    node_key: grid.node_key.clone(), source_key: grid.source_key.clone(), max_window_rows: grid.max_window_rows,
                     row_height: grid.row_height, overscan: grid.overscan, columns: grid.columns.clone(),
                 },
                 frame: frame.clone(),
@@ -954,13 +1103,14 @@ impl UiDataGridStore {
         Ok(())
     }
 
-    pub fn apply(&mut self, program: &UiProgram, frame: UiDataGridFrame) -> Result<UiDataGridApplyResult, UiProgramCompileError> {
+    pub fn apply(&mut self, program: &UiProgram, input: UiDataGridInputFrame) -> Result<UiDataGridApplyResult, UiProgramCompileError> {
+        let UiDataGridInputFrame { source_key, frame } = input;
         if frame.expected_program_revision != program.revision {
             return Err(compile_error(ERROR_UI_PROGRAM_STALE_INPUT_REVISION, "DataGrid frame belongs to a different program revision"));
         }
-        let grid = program.data_grid_records.iter().find(|record| record.node_key == frame.data_grid_key)
-            .ok_or_else(|| compile_error(ERROR_UI_PROGRAM_INVALID_BRANCH_TEMPLATE, "DataGrid frame references an unknown grid"))?;
-        if let Some(previous) = self.frames.get(&frame.data_grid_key)
+        let grid = program.data_grid_records.iter().find(|record| record.source_key == source_key)
+            .ok_or_else(|| compile_error(ERROR_UI_PROGRAM_INVALID_BRANCH_TEMPLATE, "DataGrid frame references an unknown grid source"))?;
+        if let Some(previous) = self.frames.get(&source_key)
             && frame.list_revision.0 < previous.list_revision.0 {
             return Err(compile_error(ERROR_UI_PROGRAM_STALE_INPUT_REVISION, "DataGrid frame revision is stale"));
         }
@@ -982,7 +1132,7 @@ impl UiDataGridStore {
             return Err(compile_error(ERROR_UI_PROGRAM_INVALID_BRANCH_TEMPLATE, "DataGrid rows must contain one valid typed/display cell for every declared column"));
         }
         let accepted_rows = frame.window_rows.len() as u32;
-        self.frames.insert(frame.data_grid_key.clone(), frame);
+        self.frames.insert(source_key, frame);
         Ok(UiDataGridApplyResult { accepted_rows })
     }
 }
@@ -1101,7 +1251,7 @@ pub fn compile_ui_program(
     }
     let branch_records = compile_branch_records(document, schema, &nodes)?;
     let template_records = compile_template_records(document, &nodes)?;
-    let data_grid_records = compile_data_grid_records(document, &nodes)?;
+    let data_grid_records = compile_data_grid_records(document, schema, &nodes)?;
     let template_instances = template_records.iter().try_fold(0u32, |total, template| {
             let count = template.node_range.len() as u32;
         total.checked_add(count.saturating_mul(template.max_instances)).ok_or(())
@@ -1238,16 +1388,17 @@ pub fn compile_ui_program(
     })
 }
 
-fn compile_data_grid_records(document: &UiIrDocument, nodes: &[neon_ui_schema::UiProgramNode]) -> Result<Vec<UiDataGridRecord>, UiProgramCompileError> {
+fn compile_data_grid_records(document: &UiIrDocument, schema: &UiInputSchema, nodes: &[neon_ui_schema::UiProgramNode]) -> Result<Vec<UiDataGridRecord>, UiProgramCompileError> {
     document.data_grids.iter().map(|grid| {
         if grid.max_window_rows == 0 || grid.row_height == 0 || grid.overscan > grid.max_window_rows || grid.columns.is_empty()
             || grid.columns.iter().any(|column| !column.validate())
             || grid.columns.iter().map(|column| &column.key).collect::<HashSet<_>>().len() != grid.columns.len()
-            || !nodes.iter().any(|node| node.key == grid.node_key && node.kind == UiNodeKind::DataGrid) {
+            || !nodes.iter().any(|node| node.key == grid.node_key && node.kind == UiNodeKind::DataGrid)
+            || !schema.grid_slots.iter().any(|slot| slot.key == grid.source_key) {
             Err(compile_error(ERROR_UI_PROGRAM_INVALID_BRANCH_TEMPLATE, "DataGrid declaration must target a DataGrid node with positive bounded metrics and columns"))
         } else {
             Ok(UiDataGridRecord {
-                node_key: grid.node_key.clone(), max_window_rows: grid.max_window_rows,
+                node_key: grid.node_key.clone(), source_key: grid.source_key.clone(), max_window_rows: grid.max_window_rows,
                 row_height: grid.row_height, overscan: grid.overscan, columns: grid.columns.clone(),
             })
         }
@@ -1650,21 +1801,12 @@ pub struct UiRuntime {
     journal: CommandJournal,
     receipts: HashMap<RequestId, CommandReceipt>,
     last_input_sequence: HashMap<u64, u64>,
-    last_data_grid_sequence: HashMap<String, u64>,
     idempotent_responses: HashMap<String, RpcResponse>,
     surface: UiSurfaceMachine,
     ai_terrain: AiTerrainPanelState,
     showcase_text: String,
-    gallery: Option<GalleryForwarder>,
-}
-
-/// Live program-domain state mirror for the component gallery. The domain
-/// controller process remains the authority; this mirror only tracks the
-/// resolved inputs so bound payloads and revisions stay consistent between
-/// renderer clicks and domain acceptance.
-struct GalleryForwarder {
-    program: UiProgram,
-    inputs: UiResolvedInputs,
+    host_adapter: Option<UiHostAdapter>,
+    interaction_traces: InteractionTraceStore,
 }
 
 impl UiRuntime {
@@ -1681,12 +1823,12 @@ impl UiRuntime {
             journal: CommandJournal::new(ServiceName(SERVICE_NAME.into()), epoch, 128),
             receipts: HashMap::new(),
             last_input_sequence: HashMap::new(),
-            last_data_grid_sequence: HashMap::new(),
             idempotent_responses: HashMap::new(),
             surface: UiSurfaceMachine::new(UiSurfaceId(WORKBENCH_SURFACE_ID.into())),
             ai_terrain: AiTerrainPanelState::default(),
             showcase_text: String::new(),
-            gallery: None,
+            host_adapter: None,
+            interaction_traces: InteractionTraceStore::default(),
         }
     }
 
@@ -1714,6 +1856,7 @@ impl UiRuntime {
                 "ui.text_input.commit.v1".into(),
                 "ui.program.input.v1".into(),
                 "ui.data_grid.window.v1".into(),
+                CAPABILITY_DEBUG_INTERACTION.into(),
             ],
         }
     }
@@ -1740,6 +1883,8 @@ impl UiRuntime {
             "debug.snapshot.get" => Some(json!(self.debug_snapshot())),
             "debug.command.get" => return self.handle_debug_command(request),
             "debug.trace.query" => return self.handle_debug_trace(request),
+            "debug.interaction.get" => return self.handle_interaction_get(request),
+            "debug.interaction.query" => return self.handle_interaction_query(request),
             "ui.fragment.submit" => return self.handle_fragment_submit(request),
             "ui.surface.snapshot.get" => Some(self.surface_value()),
             "ui.ai.terrain.snapshot.get" => Some(self.ai_terrain.snapshot()),
@@ -1938,31 +2083,16 @@ impl UiRuntime {
         Ok(Some(self.ai_terrain.snapshot()))
     }
 
-    /// Runs the UI declaration control plane. A React client can only submit to this
-    /// service; the service forwards a validated declaration to the sole renderer.
-    /// When `program_domain` is set, renderer pointer/selection/value events whose
-    /// intent is declared by the component gallery program are routed through the
-    /// program domain endpoint and their accepted snapshots republished to the
-    /// renderer as revisioned fragments.
+    /// Runs the UI declaration control plane. The configured host endpoint owns
+    /// program-specific behavior; this runtime validates only the generic host contract.
     pub fn serve_forwarder(
         endpoint: SocketAddr,
         wgpu_endpoint: SocketAddr,
         domain_endpoint: SocketAddr,
         epoch: u64,
-        program_domain: bool,
     ) -> Result<(), TransportError> {
         let server = RpcServer::bind(endpoint)?;
         let mut runtime = Self::new(epoch, "ui-runtime-forwarder");
-        runtime.gallery = if program_domain {
-            let (document, program) = demo_domain::component_gallery_program()
-                .map_err(|error| TransportError::Io(std::io::Error::other(error)))?;
-            let inputs = UiInputStore::activate(program.revision.clone(), document.input_schema)
-                .map_err(|error| TransportError::Io(std::io::Error::other(error.message)))?
-                .snapshot();
-            Some(GalleryForwarder { program, inputs })
-        } else {
-            None
-        };
         server.serve_until(|request| {
             let shutdown = request.method == "service.shutdown";
             let request_id = request.request_id.clone();
@@ -1972,36 +2102,20 @@ impl UiRuntime {
                     .unwrap_or_else(|error| {
                         runtime.rejected(request_id, "service_unavailable", &error.to_string())
                     })
-            } else if request.method == "ui.data_grid.window.request" {
+            } else if request.method == "ui.host.inbound" {
                 runtime
-                    .forward_data_grid_window_request(domain_endpoint, wgpu_endpoint, request)
-                    .unwrap_or_else(|error| {
-                        runtime.rejected(request_id, "service_unavailable", &error.to_string())
-                    })
+                    .forward_host_request(domain_endpoint, wgpu_endpoint, request)
+                    .unwrap_or_else(|error| runtime.rejected(request_id, "service_unavailable", &error.to_string()))
             } else if request.method == "ui.input.event" && renderer_event_targets_wgpu(&request) {
                 runtime
                     .forward_wgpu_event(wgpu_endpoint, request)
                     .unwrap_or_else(|error| {
                         runtime.rejected(request_id, "service_unavailable", &error.to_string())
                     })
-            } else if request.method == "ui.input.event" && renderer_event_targets_domain(&request) {
+            } else if request.method == "ui.input.event" {
                 runtime
-                    .forward_drag_drop_event(domain_endpoint, wgpu_endpoint, request)
-                    .unwrap_or_else(|error| {
-                        runtime.rejected(request_id, "service_unavailable", &error.to_string())
-                    })
-            } else if request.method == "ui.input.event" && renderer_event_targets_data_grid(&request) {
-                runtime
-                    .forward_data_grid_cell_event(domain_endpoint, request)
-                    .unwrap_or_else(|error| {
-                        runtime.rejected(request_id, "service_unavailable", &error.to_string())
-                    })
-            } else if request.method == "ui.input.event" && runtime.gallery.is_some() {
-                runtime
-                    .forward_gallery_program_event(wgpu_endpoint, domain_endpoint, request)
-                    .unwrap_or_else(|error| {
-                        runtime.rejected(request_id, "service_unavailable", &error.to_string())
-                    })
+                    .forward_host_request(domain_endpoint, wgpu_endpoint, request)
+                    .unwrap_or_else(|error| runtime.rejected(request_id, "service_unavailable", &error.to_string()))
             } else {
                 runtime.handle_service_request(request)
             };
@@ -2009,296 +2123,242 @@ impl UiRuntime {
         })
     }
 
-    /// Applies a domain-owned replacement frame to the cached presentation
-    /// fragment. The request contains only revisioned DataGrid identity, never
-    /// renderer-local pointer or hit-test data.
-    fn forward_data_grid_window_request(
-        &mut self,
-        domain_endpoint: SocketAddr,
-        wgpu_endpoint: SocketAddr,
-        request: RpcRequest,
-    ) -> Result<RpcResponse, TransportError> {
-        let response_request_id = request.request_id.clone();
-        let window_request: UiDataGridWindowRequest = serde_json::from_value(request.params.clone())
-            .map_err(|_| TransportError::Io(std::io::Error::other("invalid DataGrid window request")))?;
-        if window_request.renderer_epoch != self.epoch {
-            return Ok(self.rejected(response_request_id, ERROR_RENDERER_EPOCH_MISMATCH, "renderer epoch is stale"));
-        }
-        let fragment = self.cached_fragment.clone().ok_or_else(|| {
-            TransportError::Io(std::io::Error::other("no UI fragment has been submitted"))
-        })?;
-        if fragment.fragment_id != window_request.fragment.id || fragment.revision != window_request.fragment.revision {
-            return Ok(self.rejected(response_request_id, ERROR_FRAGMENT_REVISION_STALE, "DataGrid fragment revision is stale"));
-        }
-        let sequence_key = format!("{}/{}", window_request.fragment.id.0, window_request.data_grid_key);
-        if self.last_data_grid_sequence.get(&sequence_key).is_some_and(|last| window_request.sequence <= *last) {
-            return Ok(self.rejected(response_request_id, ERROR_INPUT_SEQUENCE_STALE, "DataGrid request sequence is stale"));
-        }
-        let current = fragment.effects.iter().find_map(|effect| match effect {
-            UiEffect::DataGridFrame { declaration, frame }
-                if declaration.node_key == window_request.data_grid_key => Some((declaration.clone(), frame.clone())),
-            _ => None,
-        }).ok_or_else(|| TransportError::Io(std::io::Error::other("DataGrid is not declared by the submitted fragment")))?;
-        if current.1.list_revision != window_request.expected_list_revision
-            || window_request.max_window_rows != current.0.max_window_rows {
-            return Ok(self.rejected(response_request_id, "revision_conflict", "DataGrid list revision or window capacity is stale"));
-        }
-        let forwarded = RpcRequest {
-            protocol: "neon3.rpc".into(), version: PROTOCOL_VERSION,
-            request_id: RequestId(format!("{}-domain", response_request_id.0)),
-            client: self.client.clone(), target: ServiceName("demo-domain".into()),
-            method: "ui.data_grid.window.request".into(), params: json!(window_request),
-            expected_revision: Some(current.1.list_revision),
-            idempotency_key: Some(format!("data-grid-window:{}:{}", sequence_key, window_request.sequence)),
+    fn handle_interaction_get(&mut self, request: RpcRequest) -> RpcResponse {
+        let Some(interaction_id) = request.params.get("interaction_id").and_then(Value::as_str) else {
+            return self.rejected(request.request_id, "invalid_request", "interaction_id is required");
         };
-        let domain_response = RpcClient::connect(domain_endpoint)?.call(&forwarded)?;
-        if domain_response.status != RpcStatus::Accepted {
-            return Ok(domain_response);
+        let interaction_id = InteractionId(interaction_id.into());
+        let records = self.interaction_traces.get(&interaction_id);
+        if records.is_empty() {
+            return self.rejected(request.request_id, "not_found", "interaction trace was not found");
         }
-        let frame: UiDataGridFrame = domain_response.result.clone()
-            .and_then(|value| serde_json::from_value(value).ok())
-            .ok_or_else(|| TransportError::Io(std::io::Error::other("DataGrid domain accepted without a frame")))?;
-        if frame.data_grid_key != current.0.node_key
-            || frame.expected_program_revision != current.1.expected_program_revision
-            || frame.window_rows.len() > current.0.max_window_rows as usize
-            || frame.first_row > frame.total_rows
-            || frame.window_rows.len() as u64 > frame.total_rows - frame.first_row {
-            return Ok(self.rejected(response_request_id, "invalid_data_grid_frame", "domain returned an invalid DataGrid frame"));
-        }
-        let mut updated = fragment.clone();
-        updated.revision = Revision(updated.revision.0 + 1);
-        for effect in &mut updated.effects {
-            if let UiEffect::DataGridFrame { declaration, frame: target } = effect
-                && declaration.node_key == window_request.data_grid_key {
-                *target = frame.clone();
-            }
-        }
-        if updated.validate().is_err() {
-            return Ok(self.rejected(response_request_id, "invalid_data_grid_frame", "domain returned an invalid DataGrid frame"));
-        }
-        let submit = RpcRequest {
-            protocol: "neon3.rpc".into(), version: PROTOCOL_VERSION,
-            request_id: RequestId(format!("{}-fragment", response_request_id.0)),
-            client: self.client.clone(), target: ServiceName(SERVICE_NAME.into()),
-            method: "ui.fragment.submit".into(),
-            params: json!(UiCommand::SubmitFragment { submission: UiFragmentSubmission::new(updated) }),
-            expected_revision: Some(fragment.revision),
-            idempotency_key: Some(format!("data-grid-frame:{}:{}", sequence_key, window_request.sequence)),
-        };
-        let mut response = self.forward_fragment(wgpu_endpoint, submit)?;
-        if response.status == RpcStatus::Accepted {
-            self.last_data_grid_sequence.insert(sequence_key, window_request.sequence);
-        }
-        response.request_id = response_request_id;
-        Ok(response)
+        self.accepted(request.request_id, json!({"interaction_id": interaction_id, "records": records}))
     }
 
-    /// Routes a renderer-resolved component gallery event through the program
-    /// domain and republishes the accepted input snapshot to the renderer.
-    fn forward_gallery_program_event(
+    fn handle_interaction_query(&mut self, request: RpcRequest) -> RpcResponse {
+        let query = match serde_json::from_value::<InteractionTraceQuery>(request.params) {
+            Ok(query) => query,
+            Err(_) => return self.rejected(request.request_id, "invalid_request", "invalid interaction trace query"),
+        };
+        self.accepted(request.request_id, json!({"records": self.interaction_traces.query(&query)}))
+    }
+
+    fn record_interaction(&mut self, context: &InteractionTraceContext, stage: InteractionTraceStage, outcome: InteractionTraceOutcome, error: Option<InteractionTraceError>, downstream_request_id: Option<RequestId>) {
+        self.interaction_traces.append(context.interaction_id.clone(), stage, outcome, error, context.semantic_target.clone(), context.fragment_revision, context.composition_revision, downstream_request_id);
+    }
+
+    fn forward_host_request(
         &mut self,
+        host_endpoint: SocketAddr,
         wgpu_endpoint: SocketAddr,
-        domain_endpoint: SocketAddr,
         request: RpcRequest,
     ) -> Result<RpcResponse, TransportError> {
         let request_id = request.request_id.clone();
-        let event: UiSemanticEvent = serde_json::from_value(request.params.clone())
-            .map_err(|_| TransportError::Io(std::io::Error::other("invalid UI semantic event")))?;
-        self.validate_semantic_event(&event)
-            .map_err(|code| TransportError::Io(std::io::Error::other(code)))?;
-        let (program_event, domain_key) = {
-            let gallery = self.gallery.as_mut().ok_or_else(|| {
-                TransportError::Io(std::io::Error::other("gallery program domain is unavailable"))
-            })?;
-            let neon_ui_schema::UiIntent::Invoke { action, .. } = event.intent.clone();
-            let Some(declaration) = gallery
-                .program
-                .event_records
-                .iter()
-                .find(|declaration| declaration.intent == action)
-            else {
-                return Err(TransportError::Io(std::io::Error::other(
-                    "event intent is not declared by the gallery program",
-                )));
-            };
-            let mut payload = declaration.literal_payload.clone();
-            for key in &declaration.bound_input_keys {
-                let Some(value) = gallery.inputs.values.get(key) else {
-                    return Err(TransportError::Io(std::io::Error::other(
-                        "event bound input is absent from the gallery domain snapshot",
-                    )));
-                };
-                let Some(payload_value) = input_value_as_event_payload(&value.value) else {
-                    return Err(TransportError::Io(std::io::Error::other(
-                        "bound input kind cannot cross the program event boundary",
-                    )));
-                };
-                payload.insert(key.clone(), payload_value);
-            }
-            let sequence = event
-                .pointer
-                .as_ref()
-                .map(|pointer| pointer.sequence)
-                .unwrap_or(1);
-            let domain_key = request
-                .idempotency_key
-                .clone()
-                .unwrap_or_else(|| format!("gallery-live:{}", event.event_id));
-            let program_event = UiProgramSemanticEvent {
-                event_id: format!("gallery-live:{}", event.event_id),
-                kind: demo_domain::gallery_event_kind(&declaration.node_key),
-                intent: action,
-                source_node_key: declaration.node_key.clone(),
-                payload,
-                program_revision: gallery.program.revision.clone(),
-                input_revision: gallery.inputs.input_revision,
-                request_id: event.event_id.clone(),
-                idempotency_key: domain_key.clone(),
-                requested_value: event.control_value.clone(),
-                interaction: UiSemanticInteractionMetadata {
-                    interaction_id: event.event_id.clone(),
-                    sequence,
-                    renderer_epoch: event.renderer_epoch,
-                },
-            };
-            (program_event, domain_key)
+        let Some(idempotency_key) = request.idempotency_key.clone() else {
+            return Ok(self.rejected(request_id, "invalid_request", "idempotency_key is required"));
         };
+        if let Some(response) = self.idempotent_responses.get(&idempotency_key) {
+            let mut response = response.clone();
+            response.request_id = request_id;
+            return Ok(response);
+        }
+        self.ensure_host_adapter(host_endpoint)?;
+        let inbound = match serde_json::from_value::<UiHostInbound>(request.params.clone()) {
+            Ok(inbound) => inbound,
+            Err(_) => self.renderer_event_to_host_inbound(request.params.clone())?,
+        };
+        let context = inbound_interaction_context(
+            &inbound,
+            self.cached_fragment.as_ref().map_or(Revision(0), |fragment| fragment.revision),
+        );
+        if let Some(context) = &context {
+            self.record_interaction(context, InteractionTraceStage::InboundReceived, InteractionTraceOutcome::Accepted, None, None);
+        }
+        let adapter = self.host_adapter.as_ref().expect("host adapter is activated");
+        if let Err(error) = adapter.validate_inbound(inbound.clone()) {
+            if let Some(context) = &context {
+                self.record_interaction(context, InteractionTraceStage::AdapterValidationRejected, InteractionTraceOutcome::Rejected, Some(InteractionTraceError { code: error.code.into(), message: error.message.into() }), None);
+            }
+            return Ok(self.rejected(request_id, error.code, error.message));
+        }
+        if let Some(context) = &context {
+            self.record_interaction(context, InteractionTraceStage::AdapterValidationAccepted, InteractionTraceOutcome::Accepted, None, None);
+        }
         let forwarded = RpcRequest {
             protocol: "neon3.rpc".into(), version: PROTOCOL_VERSION,
-            request_id: RequestId(format!("{}-domain", request_id.0)),
-            client: self.client.clone(), target: ServiceName("demo-domain".into()),
-            method: "ui.program.event".into(), params: json!(program_event),
-            expected_revision: Some(program_event.input_revision),
-            idempotency_key: Some(program_event.idempotency_key.clone()),
+            request_id: RequestId(format!("{}-host", request_id.0)), client: self.client.clone(),
+            target: ServiceName("ui-host".into()), method: "ui.host.inbound".into(),
+            params: json!(inbound), expected_revision: None, idempotency_key: Some(idempotency_key.clone()),
         };
-        let domain_response = RpcClient::connect(domain_endpoint)?.call(&forwarded)?;
-        if domain_response.status != RpcStatus::Accepted {
-            return Ok(domain_response);
+        if let Some(context) = &context {
+            self.record_interaction(context, InteractionTraceStage::HostForwarded, InteractionTraceOutcome::Pending, None, Some(forwarded.request_id.clone()));
         }
-        let snapshot: demo_domain::DemoInputDomainSnapshot = domain_response
-            .result
-            .as_ref()
-            .and_then(|result| result.get("snapshot"))
-            .cloned()
-            .and_then(|value| serde_json::from_value(value).ok())
-            .ok_or_else(|| {
-                TransportError::Io(std::io::Error::other(
-                    "gallery domain accepted without a snapshot",
-                ))
-            })?;
-        self.gallery
-            .as_mut()
-            .map(|gallery| gallery.inputs = snapshot.inputs.clone());
-        let Some(fragment) = self.cached_fragment.clone() else {
-            return Err(TransportError::Io(std::io::Error::other(
-                "no UI fragment has been submitted",
-            )));
+        let host_response = RpcClient::connect(host_endpoint)?.call(&forwarded)?;
+        if host_response.status != RpcStatus::Accepted {
+            if let Some(context) = &context {
+                let error = host_response.error.as_ref().map(|error| InteractionTraceError { code: error.code.clone(), message: error.message.clone() }).unwrap_or(InteractionTraceError { code: "ui_host_response_rejected".into(), message: "UI host rejected the inbound interaction".into() });
+                self.record_interaction(context, InteractionTraceStage::HostResponseRejected, InteractionTraceOutcome::Rejected, Some(error), Some(forwarded.request_id));
+            }
+            let mut response = host_response;
+            response.request_id = request_id;
+            return Ok(response);
+        }
+        if let Some(context) = &context {
+            self.record_interaction(context, InteractionTraceStage::HostResponseAccepted, InteractionTraceOutcome::Accepted, None, Some(forwarded.request_id.clone()));
+        }
+        let publication: UiHostPublication = match host_response.result.clone().and_then(|value| serde_json::from_value(value).ok()) {
+            Some(publication) => publication,
+            None => {
+                if let Some(context) = &context {
+                    self.record_interaction(context, InteractionTraceStage::PublicationRejected, InteractionTraceOutcome::Rejected, Some(InteractionTraceError { code: "ui_host_invalid_publication".into(), message: "host accepted without a valid UI publication".into() }), None);
+                }
+                return Ok(self.rejected(request_id, "ui_host_invalid_publication", "host accepted without a valid UI publication"));
+            }
+        };
+        let mut candidate = self.host_adapter.clone().expect("host adapter is activated");
+        let publication_result = match candidate.apply_publication(publication) {
+            Ok(result) => result,
+            Err(error) => {
+                if let Some(context) = &context {
+                    self.record_interaction(context, InteractionTraceStage::PublicationRejected, InteractionTraceOutcome::Rejected, Some(InteractionTraceError { code: error.code.into(), message: error.message.into() }), None);
+                }
+                return Ok(self.rejected(request_id, error.code, error.message));
+            }
+        };
+        let fragment = match self.cached_fragment.clone() {
+            Some(fragment) => fragment,
+            None => {
+                if let Some(context) = &context {
+                    self.record_interaction(context, InteractionTraceStage::PublicationRejected, InteractionTraceOutcome::Rejected, Some(InteractionTraceError { code: "ui_host_fragment_unavailable".into(), message: "no UI fragment has been submitted".into() }), None);
+                }
+                return Ok(self.rejected(request_id, "ui_host_fragment_unavailable", "no UI fragment has been submitted"));
+            }
         };
         let mut updated = fragment.clone();
         updated.revision = Revision(updated.revision.0 + 1);
-        if let Some(gallery) = self.gallery.as_ref() {
-            let frame = evaluate_ui_program(
-                &gallery.program,
-                &snapshot.inputs,
-                UiCpuViewport {
-                    logical_bounds: UiBounds { x: 0.0, y: 0.0, width: 1280.0, height: 800.0 },
-                    revision: updated.revision,
-                },
-                &UiLocalPresentationState::default(),
-            );
-            let visibility = frame.nodes.into_iter()
-                .map(|node| (node.node_key, node.visible))
-                .collect::<std::collections::BTreeMap<_, _>>();
-            apply_program_visibility(&mut updated.root, &visibility);
+        refresh_fragment_from_program(
+            &mut updated,
+            candidate.program(),
+            &publication_result.snapshot.scalar_inputs,
+            candidate.input_schema(),
+        );
+        for effect in &mut updated.effects {
+            if let UiEffect::DataGridFrame { declaration, frame } = effect
+                && let Some(input) = publication_result.snapshot.grid_inputs.iter().find(|input| input.source_key == declaration.source_key) {
+                *frame = input.frame.clone();
+            }
         }
-        demo_domain::apply_visible_status_to_fragment(&mut updated, &snapshot);
+        for input in &publication_result.snapshot.grid_inputs {
+            if updated.effects.iter().any(|effect| matches!(effect, UiEffect::DataGridFrame { declaration, .. } if declaration.source_key == input.source_key)) {
+                continue;
+            }
+            if let Some(record) = candidate.program().data_grid_records.iter().find(|record| record.source_key == input.source_key) {
+                updated.effects.push(UiEffect::DataGridFrame {
+                    declaration: UiDataGridDeclaration {
+                        node_key: record.node_key.clone(), source_key: record.source_key.clone(), max_window_rows: record.max_window_rows,
+                        row_height: record.row_height, overscan: record.overscan, columns: record.columns.clone(),
+                    },
+                    frame: input.frame.clone(),
+                });
+            }
+        }
+        if updated.validate().is_err() {
+            if let Some(context) = &context {
+                self.record_interaction(context, InteractionTraceStage::PublicationRejected, InteractionTraceOutcome::Rejected, Some(InteractionTraceError { code: "ui_host_invalid_fragment".into(), message: "host publication cannot be applied to the active fragment".into() }), None);
+            }
+            return Ok(self.rejected(request_id, "ui_host_invalid_fragment", "host publication cannot be applied to the active fragment"));
+        }
+        if let Some(context) = &context {
+            self.record_interaction(context, InteractionTraceStage::PublicationApplied, InteractionTraceOutcome::Accepted, None, None);
+        }
         let submit = RpcRequest {
             protocol: "neon3.rpc".into(), version: PROTOCOL_VERSION,
-            request_id: RequestId(format!("{}-fragment", request_id.0)),
-            client: self.client.clone(), target: ServiceName(SERVICE_NAME.into()),
-            method: "ui.fragment.submit".into(),
+            request_id: RequestId(format!("{}-fragment", request_id.0)), client: self.client.clone(),
+            target: ServiceName(SERVICE_NAME.into()), method: "ui.fragment.submit".into(),
             params: json!(UiCommand::SubmitFragment { submission: UiFragmentSubmission::new(updated) }),
-            expected_revision: Some(fragment.revision),
-            idempotency_key: Some(format!("gallery-live-fragment:{}", domain_key)),
+            expected_revision: Some(fragment.revision), idempotency_key: Some(format!("ui-host-fragment:{idempotency_key}")),
         };
         let mut response = self.forward_fragment(wgpu_endpoint, submit)?;
+        if let Some(context) = &context {
+            let stage = if response.status == RpcStatus::Accepted { InteractionTraceStage::WgpuFragmentSubmissionAccepted } else { InteractionTraceStage::WgpuFragmentSubmissionRejected };
+            let outcome = if response.status == RpcStatus::Accepted { InteractionTraceOutcome::Accepted } else { InteractionTraceOutcome::Rejected };
+            let error = (response.status != RpcStatus::Accepted).then(|| response.error.as_ref().map(|error| InteractionTraceError { code: error.code.clone(), message: error.message.clone() }).unwrap_or(InteractionTraceError { code: "wgpu_fragment_submission_rejected".into(), message: "WGPU rejected the UI fragment submission".into() }));
+            self.record_interaction(context, stage, outcome, error, Some(RequestId(format!("{}-fragment", request_id.0))));
+        }
+        if response.status == RpcStatus::Accepted {
+            self.host_adapter = Some(candidate);
+            self.idempotent_responses.insert(idempotency_key, response.clone());
+        }
         response.request_id = request_id;
         Ok(response)
     }
 
-    fn forward_drag_drop_event(
-        &mut self,
-        domain_endpoint: SocketAddr,
-        wgpu_endpoint: SocketAddr,
-        request: RpcRequest,
-    ) -> Result<RpcResponse, TransportError> {
-        let response_request_id = request.request_id.clone();
-        let event: UiSemanticEvent = serde_json::from_value(request.params.clone())
-            .map_err(|_| TransportError::Io(std::io::Error::other("invalid UI semantic event")))?;
-        self.validate_semantic_event(&event)
-            .map_err(|code| TransportError::Io(std::io::Error::other(code)))?;
-        let fragment = self.cached_fragment.clone().expect("validated semantic event has a fragment");
-        let forwarded = RpcRequest {
-            protocol: "neon3.rpc".into(), version: PROTOCOL_VERSION, request_id: request.request_id.clone(),
-            client: self.client.clone(), target: ServiceName("demo-domain".into()), method: "ui.drag_drop.apply".into(),
-            params: json!({"event": event, "fragment": fragment}), expected_revision: Some(event.fragment.revision), idempotency_key: request.idempotency_key.clone(),
+    fn ensure_host_adapter(&mut self, host_endpoint: SocketAddr) -> Result<(), TransportError> {
+        if self.host_adapter.is_some() { return Ok(()); }
+        let request = RpcRequest {
+            protocol: "neon3.rpc".into(), version: PROTOCOL_VERSION,
+            request_id: RequestId("ui-host-adapter-config".into()), client: self.client.clone(),
+            target: ServiceName("ui-host".into()), method: "ui.host.adapter.get".into(), params: json!({}),
+            expected_revision: None, idempotency_key: Some("ui-host-adapter-config".into()),
         };
-        let domain_response = RpcClient::connect(domain_endpoint)?.call(&forwarded)?;
-        if domain_response.status != RpcStatus::Accepted { return Ok(domain_response); }
-        let fragment: UiFragment = domain_response.result.as_ref().and_then(|result| result.get("fragment")).cloned()
+        let response = RpcClient::connect(host_endpoint)?.call(&request)?;
+        let config: UiHostAdapterConfig = response.result
             .and_then(|value| serde_json::from_value(value).ok())
-            .ok_or_else(|| TransportError::Io(std::io::Error::other("domain accepted without a UI fragment")))?;
-        let submit = RpcRequest {
-            protocol: "neon3.rpc".into(), version: PROTOCOL_VERSION, request_id: RequestId(format!("{}-fragment", request.request_id.0)),
-            client: self.client.clone(), target: ServiceName(SERVICE_NAME.into()), method: "ui.fragment.submit".into(),
-            params: json!(UiCommand::SubmitFragment { submission: UiFragmentSubmission::new(fragment) }), expected_revision: Some(event.fragment.revision),
-            idempotency_key: Some(format!("domain-fragment:{}", event.event_id)),
-        };
-        let mut response = self.forward_fragment(wgpu_endpoint, submit)?;
-        response.request_id = response_request_id;
-        Ok(response)
+            .ok_or_else(|| TransportError::Io(std::io::Error::other("host did not provide adapter configuration")))?;
+        let mut adapter = UiHostAdapter::activate(config.program, config.input_schema, self.epoch)
+            .map_err(|error| TransportError::Io(std::io::Error::other(error.message)))?;
+        let initial_grids = self.cached_fragment.as_ref().map(|fragment| {
+            fragment.effects.iter().filter_map(|effect| match effect {
+                UiEffect::DataGridFrame { declaration, frame } => Some(UiDataGridInputFrame {
+                    source_key: declaration.source_key.clone(), frame: frame.clone(),
+                }),
+                _ => None,
+            }).collect()
+        }).unwrap_or_default();
+        adapter.seed_grid_inputs(initial_grids)
+            .map_err(|error| TransportError::Io(std::io::Error::other(error.message)))?;
+        self.host_adapter = Some(adapter);
+        Ok(())
     }
 
-    /// Forwards only a UI-runtime validated cell intent. The target and value are
-    /// semantic schema values; renderer hit IDs, paths, and coordinates never leave WGPU.
-    fn forward_data_grid_cell_event(
-        &mut self,
-        domain_endpoint: SocketAddr,
-        request: RpcRequest,
-    ) -> Result<RpcResponse, TransportError> {
-        let response_request_id = request.request_id.clone();
-        let event: UiSemanticEvent = serde_json::from_value(request.params.clone())
-            .map_err(|_| TransportError::Io(std::io::Error::other("invalid UI semantic event")))?;
-        self.validate_semantic_event(&event)
-            .map_err(|code| TransportError::Io(std::io::Error::other(code)))?;
-        let target = event.data_grid_cell.clone().ok_or_else(|| {
-            TransportError::Io(std::io::Error::other(ERROR_DATA_GRID_CELL_INVALID))
-        })?;
-        let neon_ui_schema::UiIntent::Invoke { action, mut params } = event.intent.clone();
-        let Some(object) = params.as_object_mut() else {
-            return Ok(self.rejected(
-                response_request_id,
-                ERROR_DATA_GRID_CELL_INVALID,
-                "DataGrid intents require object parameters",
-            ));
-        };
-        object.insert("data_grid_cell".into(), json!(target));
-        if let Some(value) = event.control_value {
-            object.insert("control_value".into(), json!(value));
+    fn renderer_event_to_host_inbound(&mut self, params: Value) -> Result<UiHostInbound, TransportError> {
+        let event: UiSemanticEvent = serde_json::from_value(params)
+            .map_err(|_| TransportError::Io(std::io::Error::other("invalid UI host inbound")))?;
+        self.validate_semantic_event(&event).map_err(|code| TransportError::Io(std::io::Error::other(code)))?;
+        if event.data_grid_cell.is_some() {
+            return Ok(UiHostInbound::DataGridCell { event });
         }
-        if let Some(text) = event.text {
-            object.insert("text".into(), json!(text));
+        let neon_ui_schema::UiIntent::Invoke { action, .. } = &event.intent;
+        let adapter = self.host_adapter.as_ref().expect("host adapter is activated");
+        let declaration = adapter.program().event_records.iter().find(|declaration| declaration.intent == *action)
+            .ok_or_else(|| TransportError::Io(std::io::Error::other("renderer intent is not declared by the active host program")))?;
+        let mut payload = declaration.literal_payload.clone();
+        for key in &declaration.bound_input_keys {
+            let value = adapter.snapshot().scalar_inputs.values.get(key)
+                .and_then(|value| input_value_as_event_payload(&value.value))
+                .ok_or_else(|| TransportError::Io(std::io::Error::other("host bound input is unavailable")))?;
+            payload.insert(key.clone(), value);
         }
-        let forwarded = RpcRequest {
-            protocol: "neon3.rpc".into(), version: PROTOCOL_VERSION,
-            request_id: RequestId(format!("{}-domain", response_request_id.0)),
-            client: self.client.clone(), target: ServiceName("demo-domain".into()), method: action,
-            params, expected_revision: Some(event.fragment.revision),
-            idempotency_key: request.idempotency_key,
-        };
-        let mut response = RpcClient::connect(domain_endpoint)?.call(&forwarded)?;
-        response.request_id = response_request_id;
-        Ok(response)
+        let node = adapter.program().nodes.iter().find(|node| node.key == declaration.node_key)
+            .ok_or_else(|| TransportError::Io(std::io::Error::other("event declaration targets no active program node")))?;
+        let current_scalar = matches!(
+            node.kind,
+            UiNodeKind::Slider | UiNodeKind::DragValue | UiNodeKind::Scrollbar
+        )
+        .then(|| event.control_value.clone())
+        .flatten();
+        let kind = program_semantic_event_kind(&node.kind, &event.event);
+        if let Some(value) = current_scalar {
+            for key in &declaration.bound_input_keys {
+                payload.insert(key.clone(), value.clone());
+            }
+        }
+        Ok(UiHostInbound::SemanticIntent { event: UiProgramSemanticEvent {
+            event_id: event.event_id.clone(), kind, intent: action.clone(), source_node_key: declaration.node_key.clone(), payload,
+            program_revision: adapter.program().revision.clone(), input_revision: adapter.snapshot().scalar_inputs.input_revision,
+            request_id: event.event_id.clone(), idempotency_key: event.event_id.clone(), requested_value: event.control_value,
+            interaction: UiSemanticInteractionMetadata { interaction_id: event.event_id, sequence: event.pointer.map_or(1, |pointer| pointer.sequence), renderer_epoch: event.renderer_epoch },
+        }})
     }
 
     /// The cache is published only after the renderer accepted the exact declaration.
@@ -2892,24 +2952,12 @@ fn renderer_event_targets_wgpu(request: &RpcRequest) -> bool {
         })
 }
 
-fn renderer_event_targets_domain(request: &RpcRequest) -> bool {
-    serde_json::from_value::<UiSemanticEvent>(request.params.clone())
-        .ok()
-        .is_some_and(|event| event.event == neon_ui_schema::UiSemanticEventType::DragDrop)
-}
-
-fn renderer_event_targets_data_grid(request: &RpcRequest) -> bool {
-    serde_json::from_value::<UiSemanticEvent>(request.params.clone())
-        .ok()
-        .is_some_and(|event| event.data_grid_cell.is_some())
-}
-
 fn validate_data_grid_cell_event(
     fragment: &UiFragment,
     event: &UiSemanticEvent,
     target: &UiDataGridCellTarget,
 ) -> Result<(), &'static str> {
-    if target.data_grid_key.trim().is_empty()
+    if target.source_key.trim().is_empty()
         || target.stable_row_key.trim().is_empty()
         || target.column_key.trim().is_empty()
         || event.drag_drop.is_some()
@@ -2918,7 +2966,7 @@ fn validate_data_grid_cell_event(
     }
     let Some((declaration, frame)) = fragment.effects.iter().find_map(|effect| match effect {
         UiEffect::DataGridFrame { declaration, frame }
-            if declaration.node_key == target.data_grid_key && frame.data_grid_key == target.data_grid_key => {
+            if declaration.source_key == target.source_key => {
                 Some((declaration, frame))
             }
         _ => None,
@@ -3007,6 +3055,7 @@ fn validate_data_grid_edit_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use neon_ui_schema::{UiProgramEventDeclaration, UiResourceBudget};
     use neon_ipc::RpcServer;
     use neon_protocol::RpcError;
     use std::thread;
@@ -3240,6 +3289,190 @@ mod tests {
         });
         assert_eq!(response.status, RpcStatus::Accepted);
         assert_eq!(response.result.unwrap()["value"], "composed text");
+    }
+
+    #[test]
+    fn generic_host_route_validates_inbound_and_submits_publication_fragment() {
+        let (document, program) = crate::demo_domain::component_gallery_program().unwrap();
+        let declaration = program
+            .event_records
+            .iter()
+            .find(|declaration| declaration.intent == "gallery.drag_value.commit")
+            .unwrap()
+            .clone();
+        let rejected_declaration = declaration.clone();
+        let fragment = UiFragment {
+            fragment_id: UiFragmentId("host-route".into()), revision: Revision(1),
+            root: document.ir.root.clone(), effects: lower_nui_flow_effects(&document),
+        };
+        let host = RpcServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let host_endpoint = host.local_addr().unwrap();
+        let schema = document.input_schema.clone();
+        let host_thread = thread::spawn(move || {
+            let mut calls = 0;
+            host.serve_until(|request| {
+                calls += 1;
+                let response = match request.method.as_str() {
+                    "ui.host.adapter.get" => RpcResponse { request_id: request.request_id, status: RpcStatus::Accepted, revision: Some(Revision(0)), result: Some(json!(UiHostAdapterConfig { program: program.clone(), input_schema: schema.clone() })), snapshot: None, error: None },
+                    "ui.host.inbound" => {
+                        let UiHostInbound::SemanticIntent { event } = serde_json::from_value::<UiHostInbound>(request.params).unwrap() else { unreachable!() };
+                        assert_eq!(event.kind, UiProgramSemanticEventKind::ValueCommit);
+                        assert_eq!(event.source_node_key, declaration.node_key);
+                        assert_eq!(event.payload.get("drag_value"), Some(&UiSemanticPayloadValue::I32 { value: 15 }));
+                        assert_eq!(event.requested_value, Some(UiSemanticPayloadValue::I32 { value: 15 }));
+                        RpcResponse { request_id: request.request_id, status: RpcStatus::Accepted, revision: Some(Revision(1)), result: Some(json!(UiHostPublication { scalar_frame: UiInputFrame { program_revision: program.revision.clone(), expected_input_revision: Revision(0), request_id: "host-publication".into(), idempotency_key: "host-publication".into(), changes: vec![UiInputChange { key: "drag_value".into(), value: UiInputValue::I32 { value: 15 } }] }, grid_inputs: Vec::new() })), snapshot: None, error: None }
+                    }
+                    _ => unreachable!(),
+                };
+                (response, calls < 2)
+            })
+        });
+        let renderer = RpcServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let renderer_endpoint = renderer.local_addr().unwrap();
+        let renderer_thread = thread::spawn(move || renderer.serve_one(|request| {
+            let UiCommand::SubmitFragment { submission } = serde_json::from_value(request.params).unwrap() else { unreachable!() };
+            assert_eq!(submission.fragment.revision, Revision(2));
+            assert!(submission.fragment.effects.iter().any(|effect| matches!(
+                effect,
+                UiEffect::ControlPresentation { node_id, state: neon_ui_schema::UiControlPresentation::Numeric { value: 15.0, .. } }
+                    if node_id.0 == "count-drag"
+            )));
+            RpcResponse { request_id: request.request_id, status: RpcStatus::Accepted, revision: Some(Revision(2)), result: Some(json!({})), snapshot: None, error: None }
+        }));
+        let mut runtime = UiRuntime::new(7, "generic-host-route");
+        runtime.cached_fragment = Some(fragment.clone());
+        let event = UiSemanticEvent {
+            event: neon_ui_schema::UiSemanticEventType::PointerClick, event_id: "host-event".into(), renderer_epoch: 7,
+            composition_revision: Revision(1), fragment: neon_ui_schema::UiFragmentRevision { id: fragment.fragment_id, revision: Revision(1) },
+            intent: UiIntent::Invoke { action: declaration.intent.clone(), params: json!({}) }, pointer: Some(neon_ui_schema::UiPointerMetadata { id: 1, sequence: 1 }),
+            focus: None, data_grid_cell: None, text: None, control_value: Some(UiSemanticPayloadValue::I32 { value: 15 }), drag_drop: None,
+        };
+        let response = runtime.forward_host_request(host_endpoint, renderer_endpoint, RpcRequest {
+            protocol: "neon3.rpc".into(), version: PROTOCOL_VERSION, request_id: RequestId("host-event".into()), client: runtime.client.clone(),
+            target: ServiceName(SERVICE_NAME.into()), method: "ui.host.inbound".into(), params: json!(event), expected_revision: Some(Revision(1)), idempotency_key: Some("host-event".into()),
+        }).unwrap();
+        assert_eq!(response.status, RpcStatus::Accepted);
+        assert_eq!(runtime.cached_fragment().unwrap().revision, Revision(2));
+        let trace = runtime.handle_service_request(RpcRequest {
+            protocol: "neon3.rpc".into(), version: PROTOCOL_VERSION, request_id: RequestId("trace-get".into()), client: runtime.client.clone(),
+            target: ServiceName(SERVICE_NAME.into()), method: "debug.interaction.get".into(), params: json!({"interaction_id": "host-event"}), expected_revision: None, idempotency_key: None,
+        });
+        let records: Vec<InteractionTraceRecord> = serde_json::from_value(trace.result.unwrap()["records"].clone()).unwrap();
+        assert_eq!(records.first().unwrap().interaction_id, InteractionId("host-event".into()));
+        assert_eq!(records.last().unwrap().stage, InteractionTraceStage::WgpuFragmentSubmissionAccepted);
+        assert!(records.iter().any(|record| record.stage == InteractionTraceStage::HostForwarded));
+        let query = runtime.handle_service_request(RpcRequest {
+            protocol: "neon3.rpc".into(), version: PROTOCOL_VERSION, request_id: RequestId("trace-query".into()), client: runtime.client.clone(),
+            target: ServiceName(SERVICE_NAME.into()), method: "debug.interaction.query".into(), params: json!({"filters": {"interaction_id": "host-event"}}), expected_revision: None, idempotency_key: None,
+        });
+        assert_eq!(query.status, RpcStatus::Accepted);
+        host_thread.join().unwrap().unwrap();
+        renderer_thread.join().unwrap().unwrap();
+
+        let adapter = runtime.host_adapter.as_ref().unwrap();
+        let rejected_event = UiProgramSemanticEvent {
+            event_id: "rejected-event".into(), kind: UiProgramSemanticEventKind::Activate, intent: rejected_declaration.intent, source_node_key: rejected_declaration.node_key, payload: BTreeMap::new(),
+            program_revision: adapter.program().revision.clone(), input_revision: adapter.snapshot().scalar_inputs.input_revision,
+            request_id: "rejected-event".into(), idempotency_key: "rejected-event".into(), requested_value: None,
+            interaction: UiSemanticInteractionMetadata { interaction_id: "generic-host-interaction".into(), sequence: 1, renderer_epoch: 8 },
+        };
+        let rejected = runtime.forward_host_request("127.0.0.1:1".parse().unwrap(), renderer_endpoint, RpcRequest {
+            protocol: "neon3.rpc".into(), version: PROTOCOL_VERSION, request_id: RequestId("rejected-event".into()), client: runtime.client.clone(),
+            target: ServiceName(SERVICE_NAME.into()), method: "ui.host.inbound".into(), params: json!(UiHostInbound::SemanticIntent { event: rejected_event }), expected_revision: None, idempotency_key: Some("rejected-event".into()),
+        }).unwrap();
+        assert_eq!(rejected.error.unwrap().code, "ui_host_renderer_epoch_mismatch");
+        let rejected_records = runtime.interaction_traces.get(&InteractionId("generic-host-interaction".into()));
+        assert_eq!(rejected_records.last().unwrap().stage, InteractionTraceStage::AdapterValidationRejected);
+        assert_eq!(rejected_records.last().unwrap().error.as_ref().unwrap().code, "ui_host_renderer_epoch_mismatch");
+    }
+
+    #[test]
+    fn component_gallery_grid_window_and_cell_use_the_generic_host_route() {
+        fn frame(program: &UiProgram, first_row: u64, revision: u64) -> UiDataGridFrame {
+            let handle = |id| neon_ui_schema::UiTextHandle { id, generation: revision as u32 };
+            UiDataGridFrame {
+                list_revision: Revision(revision), total_rows: 10_000, first_row,
+                window_rows: (first_row..first_row + 24).map(|row| neon_ui_schema::UiDataGridWindowRow {
+                    stable_row_key: format!("virtual-row-{row}"),
+                    cells: std::collections::BTreeMap::from([
+                        ("name".into(), neon_ui_schema::UiDataGridCell { value: UiInputValue::TextHandle { value: handle(10_000 + row * 5 + 1) }, display: handle(10_000 + row * 5 + 1), presentation_override: None }),
+                        ("status".into(), neon_ui_schema::UiDataGridCell { value: UiInputValue::Enum { value: "ready".into() }, display: handle(10_000 + row * 5 + 2), presentation_override: None }),
+                        ("owner".into(), neon_ui_schema::UiDataGridCell { value: UiInputValue::Bool { value: true }, display: handle(10_000 + row * 5 + 3), presentation_override: None }),
+                        ("notes".into(), neon_ui_schema::UiDataGridCell { value: UiInputValue::TextHandle { value: handle(10_000 + row * 5 + 4) }, display: handle(10_000 + row * 5 + 4), presentation_override: None }),
+                    ]),
+                }).collect(),
+                expected_program_revision: program.revision.clone(),
+            }
+        }
+
+        let (document, program) = crate::demo_domain::component_gallery_program().unwrap();
+        let declaration = program.event_records.first().unwrap().clone();
+        let mut fragment = UiFragment { fragment_id: UiFragmentId("component-gallery-host".into()), revision: Revision(1), root: document.ir.root.clone(), effects: lower_nui_flow_effects(&document) };
+        let record = program.data_grid_records.iter().find(|record| record.source_key == "asset_window").unwrap();
+        fragment.effects.push(UiEffect::DataGridFrame {
+            declaration: UiDataGridDeclaration {
+                node_key: record.node_key.clone(), source_key: record.source_key.clone(), max_window_rows: record.max_window_rows,
+                row_height: record.row_height, overscan: record.overscan, columns: record.columns.clone(),
+            },
+            frame: frame(&program, 0, 1),
+        });
+        let host = RpcServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let host_endpoint = host.local_addr().unwrap();
+        let schema = document.input_schema.clone();
+        let host_program = program.clone();
+        let host_thread = thread::spawn(move || {
+            let mut calls = 0;
+            host.serve_until(|request| {
+                calls += 1;
+                let response = match request.method.as_str() {
+                    "ui.host.adapter.get" => RpcResponse { request_id: request.request_id, status: RpcStatus::Accepted, revision: Some(Revision(0)), result: Some(json!(UiHostAdapterConfig { program: host_program.clone(), input_schema: schema.clone() })), snapshot: None, error: None },
+                    "ui.host.inbound" => {
+                        let inbound: UiHostInbound = serde_json::from_value(request.params).unwrap();
+                        let (expected, key, grid) = match inbound {
+                            UiHostInbound::SemanticIntent { .. } => (0, "gallery-seed", frame(&host_program, 0, 1)),
+                            UiHostInbound::WindowRequest { request: neon_ui_schema::UiWindowRequest::DataGrid { request } } => {
+                                assert_eq!(request.source_key, "asset_window");
+                                (1, "gallery-window", frame(&host_program, 24, 1))
+                            }
+                            UiHostInbound::DataGridCell { event } => {
+                                assert_eq!(event.data_grid_cell.unwrap().stable_row_key, "virtual-row-24");
+                                (2, "gallery-cell", frame(&host_program, 24, 2))
+                            }
+                        };
+                        RpcResponse { request_id: request.request_id, status: RpcStatus::Accepted, revision: Some(Revision(grid.list_revision.0)), result: Some(json!(UiHostPublication {
+                            scalar_frame: UiInputFrame { program_revision: host_program.revision.clone(), expected_input_revision: Revision(expected), request_id: key.into(), idempotency_key: key.into(), changes: Vec::new() },
+                            grid_inputs: vec![UiDataGridInputFrame { source_key: "asset_window".into(), frame: grid }],
+                        })), snapshot: None, error: None }
+                    }
+                    _ => unreachable!(),
+                };
+                (response, calls < 4)
+            })
+        });
+        let renderer = RpcServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let renderer_endpoint = renderer.local_addr().unwrap();
+        let renderer_thread = thread::spawn(move || renderer.serve_until(|request| {
+            let UiCommand::SubmitFragment { submission } = serde_json::from_value(request.params).unwrap() else { unreachable!() };
+            assert!(submission.fragment.effects.iter().any(|effect| matches!(effect, UiEffect::DataGridFrame { declaration, frame } if declaration.source_key == "asset_window" && frame.window_rows.len() == 24)));
+            (RpcResponse { request_id: request.request_id, status: RpcStatus::Accepted, revision: Some(submission.fragment.revision), result: Some(json!({})), snapshot: None, error: None }, submission.fragment.revision.0 < 4)
+        }));
+        let mut runtime = UiRuntime::new(7, "component-gallery-host-route");
+        let initial = runtime.forward_fragment(renderer_endpoint, RpcRequest {
+            protocol: "neon3.rpc".into(), version: PROTOCOL_VERSION, request_id: RequestId("gallery-initial".into()), client: runtime.client.clone(),
+            target: ServiceName(SERVICE_NAME.into()), method: "ui.fragment.submit".into(),
+            params: json!(UiCommand::SubmitFragment { submission: UiFragmentSubmission::new(fragment.clone()) }), expected_revision: None,
+            idempotency_key: Some("gallery-initial".into()),
+        }).unwrap();
+        assert_eq!(initial.status, RpcStatus::Accepted);
+        let control = UiSemanticEvent { event: neon_ui_schema::UiSemanticEventType::PointerClick, event_id: "gallery-seed".into(), renderer_epoch: 7, composition_revision: Revision(1), fragment: neon_ui_schema::UiFragmentRevision { id: fragment.fragment_id.clone(), revision: Revision(1) }, intent: UiIntent::Invoke { action: declaration.intent, params: json!({}) }, pointer: Some(neon_ui_schema::UiPointerMetadata { id: 1, sequence: 1 }), focus: None, data_grid_cell: None, text: None, control_value: None, drag_drop: None };
+        let call = |runtime: &mut UiRuntime, request_id: &str, params: Value, key: &str| runtime.forward_host_request(host_endpoint, renderer_endpoint, RpcRequest { protocol: "neon3.rpc".into(), version: PROTOCOL_VERSION, request_id: RequestId(request_id.into()), client: runtime.client.clone(), target: ServiceName(SERVICE_NAME.into()), method: "ui.host.inbound".into(), params, expected_revision: None, idempotency_key: Some(key.into()) }).unwrap();
+        assert_eq!(call(&mut runtime, "gallery-seed", json!(control), "gallery-seed").status, RpcStatus::Accepted);
+        let window = neon_ui_schema::UiDataGridWindowRequest { renderer_epoch: 7, composition_revision: Revision(2), fragment: neon_ui_schema::UiFragmentRevision { id: fragment.fragment_id.clone(), revision: Revision(2) }, source_key: "asset_window".into(), expected_list_revision: Revision(1), requested_first_row: 24, max_window_rows: 24, sequence: 2 };
+        assert_eq!(call(&mut runtime, "gallery-window", json!(UiHostInbound::WindowRequest { request: neon_ui_schema::UiWindowRequest::DataGrid { request: window } }), "gallery-window").status, RpcStatus::Accepted);
+        let cell = UiSemanticEvent { event: neon_ui_schema::UiSemanticEventType::SelectionChanged, event_id: "gallery-cell".into(), renderer_epoch: 7, composition_revision: Revision(3), fragment: neon_ui_schema::UiFragmentRevision { id: fragment.fragment_id, revision: Revision(3) }, intent: UiIntent::Invoke { action: "virtual_list.status.set".into(), params: json!({}) }, pointer: Some(neon_ui_schema::UiPointerMetadata { id: 1, sequence: 3 }), focus: None, data_grid_cell: Some(UiDataGridCellTarget { source_key: "asset_window".into(), stable_row_key: "virtual-row-24".into(), column_key: "status".into() }), text: None, control_value: Some(UiSemanticPayloadValue::Enum { value: "archived".into() }), drag_drop: None };
+        assert_eq!(call(&mut runtime, "gallery-cell", json!(cell), "gallery-cell").status, RpcStatus::Accepted);
+        host_thread.join().unwrap().unwrap();
+        renderer_thread.join().unwrap().unwrap();
     }
 
     #[test]
@@ -3578,59 +3811,7 @@ mod tests {
     }
 
     #[test]
-    fn drag_drop_forwards_to_domain_and_submits_its_accepted_fragment() {
-        let document = parse_nui_flow(include_str!("../../../tests/fixtures/ui/kanban-reparent-workbench.nui")).unwrap();
-        let effects = lower_nui_flow_effects(&document);
-        let intent = effects.iter().find_map(|effect| match effect {
-            UiEffect::DropBinding { binding } if binding.key == "progress-drop" => Some(binding.intent.clone()),
-                _ => None,
-        }).unwrap();
-        let fragment = UiFragment {
-            fragment_id: UiFragmentId("forwarded-demo".into()), revision: Revision(1), root: document.ir.root, effects,
-        };
-        let domain = RpcServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
-        let domain_endpoint = domain.local_addr().unwrap();
-        let domain_thread = thread::spawn(move || {
-            let mut controller = crate::demo_domain::DemoDragDropDomain::new();
-            domain.serve_until(|request| {
-                let shutdown = request.method == "service.shutdown";
-                (controller.handle(request), !shutdown)
-            })
-        });
-        let renderer = RpcServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
-        let renderer_endpoint = renderer.local_addr().unwrap();
-        let renderer_thread = thread::spawn(move || renderer.serve_one(|request| {
-                let command: UiCommand = serde_json::from_value(request.params.clone()).unwrap();
-            let UiCommand::SubmitFragment { submission } = command else { unreachable!() };
-                assert_eq!(submission.fragment.revision, Revision(2));
-            assert!(submission.fragment.root.children.iter().all(|node| node.node_id.0 != "backlog-card-01"));
-                accepted(request)
-        }));
-        let event = UiSemanticEvent {
-            event: neon_ui_schema::UiSemanticEventType::DragDrop, event_id: "drag-forward-1".into(), renderer_epoch: 7,
-            composition_revision: Revision(1), fragment: neon_ui_schema::UiFragmentRevision { id: fragment.fragment_id.clone(), revision: Revision(1) },
-            intent, pointer: Some(neon_ui_schema::UiPointerMetadata { id: 0, sequence: 1 }), focus: None, data_grid_cell: None, text: None, control_value: None,
-            drag_drop: Some(neon_ui_schema::UiDragDropPayload { source_key: "backlog-card-01".into(), target_key: "in-progress-panel".into(), placement: neon_ui_schema::UiDropPlacement::Into, presentation_template_key: Some("progress-template".into()) }),
-        };
-        let mut runtime = UiRuntime::new(7, "ui-drag-forward-test");
-        runtime.cached_fragment = Some(fragment);
-        let response = runtime.forward_drag_drop_event(domain_endpoint, renderer_endpoint, RpcRequest {
-            protocol: "neon3.rpc".into(), version: PROTOCOL_VERSION, request_id: RequestId("drag-forward-1".into()),
-            client: ClientIdentity { kind: ClientKind::WgpuRuntime, instance_id: "renderer".into(), pid: 1, origin: "test".into() },
-            target: ServiceName(SERVICE_NAME.into()), method: "ui.input.event".into(), params: json!(event), expected_revision: Some(Revision(1)), idempotency_key: Some("drag-forward-1".into()),
-        }).unwrap();
-        assert_eq!(response.status, RpcStatus::Accepted);
-        assert_eq!(response.request_id, RequestId("drag-forward-1".into()));
-        assert_eq!(runtime.cached_fragment().unwrap().revision, Revision(2));
-        let mut client = RpcClient::connect(domain_endpoint).unwrap();
-        let shutdown = RpcRequest { protocol: "neon3.rpc".into(), version: PROTOCOL_VERSION, request_id: RequestId("domain-stop".into()), client: runtime.client.clone(), target: ServiceName("demo-domain".into()), method: "service.shutdown".into(), params: json!({}), expected_revision: None, idempotency_key: None };
-        assert_eq!(client.call(&shutdown).unwrap().status, RpcStatus::Accepted);
-        renderer_thread.join().unwrap().unwrap();
-        domain_thread.join().unwrap().unwrap();
-    }
-
-    #[test]
-    fn component_gallery_contract_covers_declarations_defaults_events_and_disabled_controls() {
+    fn compiled_program_control_semantics_route_and_refresh_generically() {
         let document = parse_nui_flow(include_str!("../../../tests/fixtures/ui/imgui-component-gallery.nui")).unwrap();
         let revision = compiler_program_revision();
         let program = compile_nui_flow_program(&document, revision.clone()).unwrap();
@@ -3655,11 +3836,53 @@ mod tests {
         assert_eq!(frame.nodes.iter().find(|node| node.node_key == "mode-combo").unwrap().state_token.as_deref(), Some("beta"));
         let mut router = UiProgramSemanticEventRouter::new(program.clone(), inputs.clone(), 7);
         for (index, (node_key, _, kind)) in controls.iter().enumerate() {
+            let node = program.nodes.iter().find(|node| node.key == *node_key).unwrap();
+            assert_eq!(
+                program_semantic_event_kind(&node.kind, &neon_ui_schema::UiSemanticEventType::PointerClick),
+                *kind,
+            );
             let declaration = program.event_records.iter().find(|event| event.node_key == *node_key).unwrap();
             let payload = declaration.bound_input_keys.iter().map(|key| (key.clone(), input_value_as_event_payload(&inputs.values[key].value).unwrap())).collect();
             let event = UiProgramSemanticEvent { event_id: format!("gallery-default-{index}"), kind: *kind, intent: declaration.intent.clone(), source_node_key: (*node_key).into(), payload, program_revision: revision.clone(), input_revision: inputs.input_revision, request_id: format!("gallery-request-{index}"), idempotency_key: format!("gallery-key-{index}"), requested_value: None, interaction: neon_ui_schema::UiSemanticInteractionMetadata { interaction_id: format!("gallery-interaction-{index}"), sequence: index as u64 + 1, renderer_epoch: 7 } };
             assert_eq!(router.validate(&event).status, UiProgramSemanticEventStatus::Accepted);
         }
+        assert_eq!(
+            program_semantic_event_kind(&UiNodeKind::TextInput, &neon_ui_schema::UiSemanticEventType::PointerClick),
+            UiProgramSemanticEventKind::TextEditCommit,
+        );
+        assert_eq!(
+            program_semantic_event_kind(&UiNodeKind::Button, &neon_ui_schema::UiSemanticEventType::PointerClick),
+            UiProgramSemanticEventKind::Activate,
+        );
+        let mut refreshed_inputs = UiInputStore::activate(revision.clone(), document.input_schema.clone()).unwrap();
+        refreshed_inputs.apply(UiInputWriter::External, UiInputFrame {
+            program_revision: revision.clone(), expected_input_revision: Revision(0), request_id: "generic-refresh".into(),
+            idempotency_key: "generic-refresh".into(), changes: vec![
+                UiInputChange { key: "feature_enabled".into(), value: UiInputValue::Bool { value: false } },
+                UiInputChange { key: "slider_value".into(), value: UiInputValue::F32 { value: 0.75 } },
+                UiInputChange { key: "combo_choice".into(), value: UiInputValue::Enum { value: "gamma".into() } },
+            ],
+        }).unwrap();
+        let mut refreshed_fragment = UiFragment {
+            fragment_id: UiFragmentId("generic-refresh".into()), revision: Revision(1), root: document.ir.root.clone(),
+            effects: lower_nui_flow_effects(&document),
+        };
+        refresh_fragment_from_program(&mut refreshed_fragment, &program, &refreshed_inputs.snapshot(), &document.input_schema);
+        assert!(refreshed_fragment.effects.iter().any(|effect| matches!(
+            effect,
+            UiEffect::ControlPresentation { node_id, state: neon_ui_schema::UiControlPresentation::Toggle { selected: false } }
+                if node_id.0 == "feature-toggle"
+        )));
+        assert!(refreshed_fragment.effects.iter().any(|effect| matches!(
+            effect,
+            UiEffect::ControlPresentation { node_id, state: neon_ui_schema::UiControlPresentation::Numeric { value, .. } }
+                if node_id.0 == "exposure-slider" && *value == 0.75
+        )));
+        assert!(refreshed_fragment.effects.iter().any(|effect| matches!(
+            effect,
+            UiEffect::ControlPresentation { node_id, state: neon_ui_schema::UiControlPresentation::Choice { token, .. } }
+                if node_id.0 == "mode-combo" && token == "gamma"
+        )));
         let mut disabled = inputs.clone();
         disabled.input_revision = Revision(inputs.input_revision.0 + 1);
         disabled.values.get_mut("controls_enabled").unwrap().value = UiInputValue::Bool { value: false };
@@ -3817,6 +4040,7 @@ mod tests {
                     representation: UiGpuScalarRepresentation::Bool32,
                 },
             }],
+            grid_slots: Vec::new(),
         };
         let mut store = UiInputStore::activate(program.clone(), schema).unwrap();
         assert_eq!(
@@ -3876,7 +4100,7 @@ mod tests {
     #[test]
     fn text_registry_rejects_overflow_and_input_frames_with_missing_handles() {
         use neon_ui_schema::{
-            UiGpuScalarRepresentation, UiInputKind, UiInputPacking, UiInputSlot,
+            UiInputKind, UiInputPacking, UiInputSlot,
             UiProgramCapability, UiProgramCapabilityOwner, UiProgramCapabilityStatus,
             UI_PROGRAM_CAPABILITY_NAME, UI_PROGRAM_SCHEMA_VERSION,
         };
@@ -3926,6 +4150,7 @@ mod tests {
                     representation,
                 },
             }],
+            grid_slots: Vec::new(),
         };
         let mut store = UiInputStore::activate(program.clone(), schema).unwrap();
         let missing = UiTextHandle {
@@ -3954,7 +4179,7 @@ mod tests {
     #[test]
     fn text_registry_validates_default_handles_and_literal_revision_before_activation() {
         use neon_ui_schema::{
-            UiGpuScalarRepresentation, UiInputKind, UiInputPacking, UiInputSlot,
+            UiInputKind, UiInputPacking, UiInputSlot,
             UiProgramCapability, UiProgramCapabilityOwner, UiProgramCapabilityStatus,
             UI_PROGRAM_CAPABILITY_NAME, UI_PROGRAM_SCHEMA_VERSION,
         };
@@ -4010,6 +4235,7 @@ mod tests {
                     representation,
                 },
             }],
+            grid_slots: Vec::new(),
         };
         assert_eq!(
             UiInputStore::activate_with_text_registry(program, schema, &registry)
@@ -4058,6 +4284,7 @@ mod tests {
                     representation: UiGpuScalarRepresentation::Bool32,
                 },
             }],
+            grid_slots: vec![neon_ui_schema::UiGridInputSlot { key: "assets_window".into() }],
         }
     }
 
@@ -4180,7 +4407,7 @@ mod tests {
 
     #[test]
     fn data_grid_store_accepts_only_fresh_bounded_windows() {
-        use neon_ui_schema::{UiDataGridDeclaration, UiDataGridFrame, UiDataGridWindowRow};
+        use neon_ui_schema::{UiDataGridDeclaration, UiDataGridFrame, UiDataGridInputFrame, UiDataGridWindowRow};
 
         let mut document = compiler_document();
         document.root.children.push(UiNode {
@@ -4190,7 +4417,7 @@ mod tests {
             style: UiStyle::default(), enter_transition: None, children: Vec::new(),
         });
         document.data_grids.push(UiDataGridDeclaration {
-            node_key: "assets".into(), max_window_rows: 2, row_height: 24, overscan: 1,
+            node_key: "assets".into(), source_key: "assets_window".into(), max_window_rows: 2, row_height: 24, overscan: 1,
             columns: vec![neon_ui_schema::UiDataGridColumn { key: "name".into(), label: "Name".into(), width: 120, presentation: neon_ui_schema::UiDataGridPresentation::Edit { max_chars: 120, intent: "asset.name.edit".into() } }],
         });
         document.resource_budget.max_nodes = 3;
@@ -4199,7 +4426,7 @@ mod tests {
         let program = compile_ui_program(&document, revision.clone(), &compiler_schema(true)).unwrap();
         assert_eq!(program.data_grid_records[0].columns[0].presentation, neon_ui_schema::UiDataGridPresentation::Edit { max_chars: 120, intent: "asset.name.edit".into() });
         let frame = UiDataGridFrame {
-            data_grid_key: "assets".into(), list_revision: Revision(1), total_rows: 10, first_row: 4,
+            list_revision: Revision(1), total_rows: 10, first_row: 4,
             window_rows: vec![
                 UiDataGridWindowRow { stable_row_key: "asset-5".into(), cells: BTreeMap::from([("name".into(), neon_ui_schema::UiDataGridCell { value: UiInputValue::TextHandle { value: UiTextHandle { id: 5, generation: 1 } }, display: UiTextHandle { id: 105, generation: 1 }, presentation_override: None })]) },
                 UiDataGridWindowRow { stable_row_key: "asset-6".into(), cells: BTreeMap::from([("name".into(), neon_ui_schema::UiDataGridCell { value: UiInputValue::TextHandle { value: UiTextHandle { id: 6, generation: 1 } }, display: UiTextHandle { id: 106, generation: 1 }, presentation_override: None })]) },
@@ -4207,50 +4434,51 @@ mod tests {
             expected_program_revision: revision,
         };
         let mut store = UiDataGridStore::default();
-        assert_eq!(store.apply(&program, frame.clone()).unwrap().accepted_rows, 2);
-        assert_eq!(store.frame("assets").unwrap().first_row, 4);
+        let input = |frame| UiDataGridInputFrame { source_key: "assets_window".into(), frame };
+        assert_eq!(store.apply(&program, input(frame.clone())).unwrap().accepted_rows, 2);
+        assert_eq!(store.frame("assets_window").unwrap().first_row, 4);
         let mut same_list_next_window = frame.clone();
         same_list_next_window.first_row = 6;
-        assert_eq!(store.apply(&program, same_list_next_window).unwrap().accepted_rows, 2);
+        assert_eq!(store.apply(&program, input(same_list_next_window)).unwrap().accepted_rows, 2);
 
         let mut stale_list = frame.clone();
         stale_list.list_revision = Revision(0);
-        assert_eq!(store.apply(&program, stale_list).unwrap_err().code, ERROR_UI_PROGRAM_STALE_INPUT_REVISION);
+        assert_eq!(store.apply(&program, input(stale_list)).unwrap_err().code, ERROR_UI_PROGRAM_STALE_INPUT_REVISION);
 
         let mut wrong_program = frame.clone();
         wrong_program.list_revision = Revision(2);
         wrong_program.expected_program_revision.revision = Revision(2);
-        assert_eq!(store.apply(&program, wrong_program).unwrap_err().code, ERROR_UI_PROGRAM_STALE_INPUT_REVISION);
+        assert_eq!(store.apply(&program, input(wrong_program)).unwrap_err().code, ERROR_UI_PROGRAM_STALE_INPUT_REVISION);
 
         let mut out_of_bounds = frame.clone();
         out_of_bounds.list_revision = Revision(2);
         out_of_bounds.first_row = 9;
-        assert_eq!(store.apply(&program, out_of_bounds).unwrap_err().code, ERROR_UI_PROGRAM_CAPACITY_OVERFLOW);
+        assert_eq!(store.apply(&program, input(out_of_bounds)).unwrap_err().code, ERROR_UI_PROGRAM_CAPACITY_OVERFLOW);
 
         let mut duplicate_key = frame;
         duplicate_key.list_revision = Revision(2);
         duplicate_key.window_rows[1].stable_row_key = "asset-5".into();
-        assert_eq!(store.apply(&program, duplicate_key).unwrap_err().code, ERROR_UI_PROGRAM_INVALID_BRANCH_TEMPLATE);
+        assert_eq!(store.apply(&program, input(duplicate_key)).unwrap_err().code, ERROR_UI_PROGRAM_INVALID_BRANCH_TEMPLATE);
 
-        let mut missing_cell = store.frame("assets").unwrap().clone();
+        let mut missing_cell = store.frame("assets_window").unwrap().clone();
         missing_cell.list_revision = Revision(2);
         missing_cell.window_rows[0].cells.clear();
-        assert_eq!(store.apply(&program, missing_cell).unwrap_err().code, ERROR_UI_PROGRAM_INVALID_BRANCH_TEMPLATE);
+        assert_eq!(store.apply(&program, input(missing_cell)).unwrap_err().code, ERROR_UI_PROGRAM_INVALID_BRANCH_TEMPLATE);
 
-        let mut invalid_value = store.frame("assets").unwrap().clone();
+        let mut invalid_value = store.frame("assets_window").unwrap().clone();
         invalid_value.list_revision = Revision(2);
         invalid_value.window_rows[0].cells.get_mut("name").unwrap().value = UiInputValue::F32 { value: f32::NAN };
-        assert_eq!(store.apply(&program, invalid_value).unwrap_err().code, ERROR_UI_PROGRAM_INVALID_BRANCH_TEMPLATE);
+        assert_eq!(store.apply(&program, input(invalid_value)).unwrap_err().code, ERROR_UI_PROGRAM_INVALID_BRANCH_TEMPLATE);
 
-        let mut invalid_override = store.frame("assets").unwrap().clone();
+        let mut invalid_override = store.frame("assets_window").unwrap().clone();
         invalid_override.list_revision = Revision(2);
         invalid_override.window_rows[0].cells.get_mut("name").unwrap().presentation_override = Some(neon_ui_schema::UiDataGridCellPresentation::Dropdown { options: Vec::new() });
-        assert_eq!(store.apply(&program, invalid_override).unwrap_err().code, ERROR_UI_PROGRAM_INVALID_BRANCH_TEMPLATE);
+        assert_eq!(store.apply(&program, input(invalid_override)).unwrap_err().code, ERROR_UI_PROGRAM_INVALID_BRANCH_TEMPLATE);
     }
 
     #[test]
     fn data_grid_store_attaches_current_frame_to_fragment() {
-        use neon_ui_schema::{UiDataGridCell, UiDataGridDeclaration, UiDataGridFrame, UiDataGridWindowRow};
+        use neon_ui_schema::{UiDataGridCell, UiDataGridDeclaration, UiDataGridFrame, UiDataGridInputFrame, UiDataGridWindowRow};
 
         let mut document = compiler_document();
         document.root.children.push(UiNode {
@@ -4260,7 +4488,7 @@ mod tests {
             style: UiStyle::default(), enter_transition: None, children: Vec::new(),
         });
         document.data_grids.push(UiDataGridDeclaration {
-            node_key: "assets".into(), max_window_rows: 2, row_height: 24, overscan: 1,
+            node_key: "assets".into(), source_key: "assets_window".into(), max_window_rows: 2, row_height: 24, overscan: 1,
             columns: vec![neon_ui_schema::UiDataGridColumn { key: "name".into(), label: "Name".into(), width: 120, presentation: neon_ui_schema::UiDataGridPresentation::Text }],
         });
         document.resource_budget.max_nodes = 3;
@@ -4268,7 +4496,7 @@ mod tests {
         let revision = compiler_program_revision();
         let program = compile_ui_program(&document, revision.clone(), &compiler_schema(true)).unwrap();
         let frame = UiDataGridFrame {
-            data_grid_key: "assets".into(), list_revision: Revision(1), total_rows: 1, first_row: 0,
+            list_revision: Revision(1), total_rows: 1, first_row: 0,
             window_rows: vec![UiDataGridWindowRow {
                 stable_row_key: "asset-1".into(),
                 cells: BTreeMap::from([("name".into(), UiDataGridCell {
@@ -4280,7 +4508,7 @@ mod tests {
             expected_program_revision: revision,
         };
         let mut store = UiDataGridStore::default();
-        store.apply(&program, frame).unwrap();
+        store.apply(&program, UiDataGridInputFrame { source_key: "assets_window".into(), frame }).unwrap();
         let mut fragment = UiFragment {
             fragment_id: UiFragmentId("grid-fragment".into()), revision: Revision(1),
             root: document.root, effects: vec![UiEffect::SemanticAction { action: "grid.ready".into() }],
@@ -4291,95 +4519,6 @@ mod tests {
         assert!(matches!(fragment.effects.last(), Some(UiEffect::DataGridFrame { declaration, frame })
             if declaration.node_key == "assets" && frame.window_rows[0].cells["name"].display.id == 101));
         fragment.validate().unwrap();
-    }
-
-    #[test]
-    fn data_grid_cell_events_require_current_targets_typed_values_and_edit_bounds() {
-        let root = UiNode {
-            node_id: UiNodeId("assets".into()), kind: UiNodeKind::DataGrid,
-            bounds: UiBounds { x: 0.0, y: 0.0, width: 320.0, height: 80.0 }, layout: None,
-            visible: true, enabled: true, text_key: None, text: None, image: None, surface: None,
-            style: UiStyle::default(), enter_transition: None, children: Vec::new(),
-        };
-        let declaration = UiDataGridDeclaration {
-            node_key: "assets".into(), max_window_rows: 1, row_height: 24, overscan: 0,
-            columns: vec![
-                neon_ui_schema::UiDataGridColumn { key: "selected".into(), label: "Selected".into(), width: 80, presentation: neon_ui_schema::UiDataGridPresentation::Select { intent: "asset.selected.set".into() } },
-                neon_ui_schema::UiDataGridColumn { key: "state".into(), label: "State".into(), width: 80, presentation: neon_ui_schema::UiDataGridPresentation::Dropdown { options: vec!["ready".into(), "review".into()], intent: "asset.state.set".into() } },
-                neon_ui_schema::UiDataGridColumn { key: "name".into(), label: "Name".into(), width: 160, presentation: neon_ui_schema::UiDataGridPresentation::Edit { max_chars: 5, intent: "asset.name.set".into() } },
-            ],
-        };
-        let text_handle = UiTextHandle { id: 3, generation: 1 };
-        let frame = UiDataGridFrame {
-            data_grid_key: "assets".into(), list_revision: Revision(1), total_rows: 1, first_row: 0,
-            window_rows: vec![neon_ui_schema::UiDataGridWindowRow {
-                stable_row_key: "asset-42".into(),
-                cells: BTreeMap::from([
-                    ("selected".into(), neon_ui_schema::UiDataGridCell { value: UiInputValue::Bool { value: false }, display: UiTextHandle { id: 1, generation: 1 }, presentation_override: None }),
-                    ("state".into(), neon_ui_schema::UiDataGridCell { value: UiInputValue::Enum { value: "ready".into() }, display: UiTextHandle { id: 2, generation: 1 }, presentation_override: None }),
-                    ("name".into(), neon_ui_schema::UiDataGridCell { value: UiInputValue::TextHandle { value: text_handle }, display: text_handle, presentation_override: None }),
-                ]),
-            }],
-            expected_program_revision: compiler_program_revision(),
-        };
-        let mut runtime = UiRuntime::new(7, "grid-event-test");
-        runtime.cached_fragment = Some(UiFragment {
-            fragment_id: UiFragmentId("grid".into()), revision: Revision(1), root,
-            effects: vec![UiEffect::DataGridFrame { declaration, frame }],
-        });
-        let event = |event, action: &str, column: &str, control_value, text| UiSemanticEvent {
-            event, event_id: format!("event-{column}"), renderer_epoch: 7, composition_revision: Revision(1),
-            fragment: neon_ui_schema::UiFragmentRevision { id: UiFragmentId("grid".into()), revision: Revision(1) },
-            intent: UiIntent::Invoke { action: action.into(), params: json!({}) }, pointer: None, focus: None,
-            data_grid_cell: Some(UiDataGridCellTarget { data_grid_key: "assets".into(), stable_row_key: "asset-42".into(), column_key: column.into() }),
-            text, control_value, drag_drop: None,
-        };
-        assert!(runtime.validate_semantic_event(&event(
-            neon_ui_schema::UiSemanticEventType::SelectionChanged, "asset.selected.set", "selected",
-            Some(UiSemanticPayloadValue::Bool { value: true }), None,
-        )).is_ok());
-        assert!(runtime.validate_semantic_event(&event(
-            neon_ui_schema::UiSemanticEventType::SelectionChanged, "asset.state.set", "state",
-            Some(UiSemanticPayloadValue::Enum { value: "review".into() }), None,
-        )).is_ok());
-        assert!(runtime.validate_semantic_event(&event(
-            neon_ui_schema::UiSemanticEventType::TextInputCommit, "asset.name.set", "name",
-            Some(UiSemanticPayloadValue::TextHandle { value: text_handle }),
-            Some(neon_ui_schema::UiTextInputCommit { value: "short".into() }),
-        )).is_ok());
-        let mut stale = event(
-            neon_ui_schema::UiSemanticEventType::SelectionChanged, "asset.selected.set", "selected",
-            Some(UiSemanticPayloadValue::Bool { value: true }), None,
-        );
-        stale.data_grid_cell.as_mut().unwrap().stable_row_key = "off-window".into();
-        assert_eq!(runtime.validate_semantic_event(&stale), Err(ERROR_DATA_GRID_CELL_INVALID));
-        assert_eq!(runtime.validate_semantic_event(&event(
-            neon_ui_schema::UiSemanticEventType::TextInputCommit, "asset.name.set", "name",
-            Some(UiSemanticPayloadValue::TextHandle { value: text_handle }),
-            Some(neon_ui_schema::UiTextInputCommit { value: "too-long".into() }),
-        )), Err(ERROR_DATA_GRID_CELL_INVALID));
-
-        let domain = RpcServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
-        let endpoint = domain.local_addr().unwrap();
-        let domain_thread = thread::spawn(move || domain.serve_one(|request| {
-            assert_eq!(request.method, "asset.selected.set");
-            assert_eq!(request.params["data_grid_cell"]["stable_row_key"], "asset-42");
-            assert_eq!(request.params["control_value"], json!({"kind": "bool", "value": true}));
-            assert!(request.params.get("node_path").is_none());
-            accepted(request)
-        }));
-        let outbound = event(
-            neon_ui_schema::UiSemanticEventType::SelectionChanged, "asset.selected.set", "selected",
-            Some(UiSemanticPayloadValue::Bool { value: true }), None,
-        );
-        let response = runtime.forward_data_grid_cell_event(endpoint, RpcRequest {
-            protocol: "neon3.rpc".into(), version: PROTOCOL_VERSION, request_id: RequestId("grid-forward".into()),
-            client: runtime.client.clone(), target: ServiceName(SERVICE_NAME.into()), method: "ui.input.event".into(),
-            params: json!(outbound), expected_revision: Some(Revision(1)), idempotency_key: Some("grid-forward".into()),
-        }).unwrap();
-        assert_eq!(response.status, RpcStatus::Accepted);
-        assert_eq!(response.request_id, RequestId("grid-forward".into()));
-        domain_thread.join().unwrap().unwrap();
     }
 
     #[test]
@@ -4509,130 +4648,5 @@ mod tests {
             .code,
             "ui_program_invalid_schema"
         );
-    }
-    #[test]
-    fn forwarder_routes_gallery_pointer_clicks_through_program_domain() {
-        use std::time::Duration;
-
-        fn gallery_client() -> ClientIdentity {
-            ClientIdentity { kind: ClientKind::UiReactClient, instance_id: "gallery-live-test".into(), pid: 0, origin: "neon-ui-runtime-test".into() }
-        }
-
-        fn literal_text(root: &UiNode, node_id: &str) -> Option<String> {
-            fn visit(node: &UiNode, node_id: &str) -> Option<String> {
-                if node.node_id.0 == node_id {
-                    if let Some(TextRef::Literal { value }) = &node.text { return Some(value.clone()); }
-                }
-                node.children.iter().find_map(|child| visit(child, node_id))
-            }
-            visit(root, node_id)
-        }
-
-        fn shutdown_request(endpoint: SocketAddr) -> RpcRequest {
-            RpcRequest {
-                protocol: "neon3.rpc".into(), version: PROTOCOL_VERSION, request_id: RequestId(format!("shutdown-{}", endpoint.port())),
-                client: gallery_client(), target: ServiceName("ui-runtime".into()), method: "service.shutdown".into(),
-                params: json!({}), expected_revision: None, idempotency_key: None,
-            }
-        }
-
-        let domain_server = RpcServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
-        let domain_addr = domain_server.local_addr().unwrap();
-        drop(domain_server);
-        let domain_thread = thread::spawn(move || {
-            let _ = demo_domain::DemoInputDomain::serve_component_gallery(domain_addr);
-        });
-
-        let wgpu_server = RpcServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
-        let wgpu_addr = wgpu_server.local_addr().unwrap();
-        let (fragments_tx, fragments_rx) = std::sync::mpsc::channel::<UiFragment>();
-        let wgpu_thread = thread::spawn(move || {
-            let _ = wgpu_server.serve_until(|request| {
-                let shutdown = request.method == "service.shutdown";
-                let response = if shutdown {
-                    RpcResponse { request_id: request.request_id, status: RpcStatus::Accepted, revision: None, result: Some(json!({"state": "accepted"})), snapshot: None, error: None }
-                } else if request.method == "wgpu.ui.submit_fragment" {
-                    match serde_json::from_value::<UiCommand>(request.params.clone()) {
-                        Ok(UiCommand::SubmitFragment { submission }) => {
-                            let _ = fragments_tx.send(submission.fragment.clone());
-                            RpcResponse { request_id: request.request_id, status: RpcStatus::Accepted, revision: Some(submission.fragment.revision), result: Some(json!({"fragment_revision": submission.fragment.revision.0})), snapshot: None, error: None }
-                            }
-                        _ => RpcResponse { request_id: request.request_id, status: RpcStatus::Rejected, revision: None, result: None, snapshot: None, error: Some(RpcError { code: "invalid_request".into(), message: "expected submit fragment command".into(), current_revision: None, object_id: None }) },
-                    }
-                } else {
-                    RpcResponse { request_id: request.request_id, status: RpcStatus::Rejected, revision: None, result: None, snapshot: None, error: Some(RpcError { code: "unsupported_method".into(), message: "method is not supported".into(), current_revision: None, object_id: None }) }
-                };
-                (response, !shutdown)
-            });
-        });
-
-        let ui_server = RpcServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
-        let ui_addr = ui_server.local_addr().unwrap();
-        drop(ui_server);
-        let forwarder_thread = thread::spawn(move || {
-            let _ = UiRuntime::serve_forwarder(ui_addr, wgpu_addr, domain_addr, 1, true);
-        });
-
-        let call = |endpoint: SocketAddr, request: RpcRequest| {
-            let mut last_error = None;
-            for _ in 0..40 {
-                match RpcClient::connect(endpoint).and_then(|mut client| client.call(&request)) {
-                    Ok(response) => return response,
-                    Err(error) => {
-                        last_error = Some(error);
-                        thread::sleep(Duration::from_millis(50));
-                    }
-                }
-            }
-            panic!("RPC call failed after retries: {last_error:?}");
-        };
-
-        let (document, _program) = demo_domain::component_gallery_program().unwrap();
-        let fragment_id = UiFragmentId("component-gallery-live".into());
-        let fragment = UiFragment { fragment_id: fragment_id.clone(), revision: Revision(1), root: document.ir.root.clone(), effects: lower_nui_flow_effects(&document) };
-        let submit = RpcRequest {
-            protocol: "neon3.rpc".into(), version: PROTOCOL_VERSION, request_id: RequestId("gallery-live-submit-1".into()),
-            client: gallery_client(), target: ServiceName("ui-runtime".into()), method: "ui.fragment.submit".into(),
-            params: json!(UiCommand::SubmitFragment { submission: UiFragmentSubmission::new(fragment.clone()) }),
-            expected_revision: None, idempotency_key: Some("gallery-live-submit-1".into()),
-        };
-        assert_eq!(call(ui_addr, submit).status, RpcStatus::Accepted);
-        assert_eq!(fragments_rx.recv_timeout(Duration::from_secs(5)).unwrap().revision, Revision(1));
-
-        let click = |sequence: u64, event_revision: Revision, idempotency: &str| RpcRequest {
-            protocol: "neon3.rpc".into(), version: PROTOCOL_VERSION, request_id: RequestId(format!("wgpu-click-{sequence}")),
-            client: gallery_client(), target: ServiceName("ui-runtime".into()), method: "ui.input.event".into(),
-            params: json!(UiSemanticEvent {
-                event: neon_ui_schema::UiSemanticEventType::PointerClick,
-                event_id: format!("wgpu-pointer-click-{sequence}"),
-                renderer_epoch: 1,
-                composition_revision: event_revision,
-                fragment: neon_ui_schema::UiFragmentRevision { id: fragment_id.clone(), revision: event_revision },
-                intent: neon_ui_schema::UiIntent::Invoke { action: "gallery.checkbox.toggle".into(), params: json!({}) },
-                pointer: Some(neon_ui_schema::UiPointerMetadata { id: 0, sequence }),
-                focus: None, data_grid_cell: None, text: None, control_value: None, drag_drop: None,
-            }),
-            expected_revision: Some(event_revision),
-            idempotency_key: Some(idempotency.into()),
-        };
-
-        let first = call(ui_addr, click(1, Revision(1), "wgpu-pointer-click:1:1"));
-        assert_eq!(first.status, RpcStatus::Accepted, "first gallery click must be accepted: {first:?}");
-        let fragment_two = fragments_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        assert_eq!(fragment_two.revision, Revision(2));
-        assert_eq!(literal_text(&fragment_two.root, "status-feature_enabled").as_deref(), Some("feature_enabled: false"));
-
-        let second = call(ui_addr, click(2, Revision(2), "wgpu-pointer-click:1:2"));
-        assert_eq!(second.status, RpcStatus::Accepted, "second gallery click must be accepted: {second:?}");
-        let fragment_three = fragments_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        assert_eq!(fragment_three.revision, Revision(3));
-        assert_eq!(literal_text(&fragment_three.root, "status-feature_enabled").as_deref(), Some("feature_enabled: true"));
-
-        for endpoint in [ui_addr, domain_addr, wgpu_addr] {
-            let _ = call(endpoint, shutdown_request(endpoint));
-        }
-        forwarder_thread.join().unwrap();
-        domain_thread.join().unwrap();
-        wgpu_thread.join().unwrap();
     }
 }

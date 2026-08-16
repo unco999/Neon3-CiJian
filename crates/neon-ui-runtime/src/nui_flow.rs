@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, HashSet};
 use neon_protocol::Revision;
 use neon_ui_schema::{
     NuiFlowDocument, NuiFlowParseDiagnostic, NuiSourceSpan, TextRef, UiAlignItems, UiBoundProperty,
-    UiBounds, UiDiagnosticSeverity, UiInputKind, UiInputPacking, UiInputSchema, UiInputSlot,
+    UiBounds, UiDiagnosticSeverity, UiGridInputSlot, UiInputKind, UiInputPacking, UiInputSchema, UiInputSlot,
     UiInputUpdateClass, UiInputValue, UiIrBinding, UiIrDocument, UiIrPatch, UiIrPatchOperation,
     UiIrPatchOperationKind, UiJustifyContent, UiLayout, UiLayoutMode, UiNode, UiNodeId, UiNodeKind,
     RenderSurfaceRef, UiProgramEventDeclaration, UiResourceBudget, UiSourceSpan, UiStyle,
@@ -36,6 +36,7 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
     let mut events = Vec::new();
     let mut source_map = BTreeMap::new();
     let mut input_slots = Vec::new();
+    let mut grid_slots = Vec::new();
     let mut seen_inputs = HashSet::new();
     let mut branches = Vec::new();
     let mut templates = Vec::new();
@@ -91,8 +92,9 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
             if parse_state_machine_declaration(content, &mut state_machines, line)? {
                 continue;
             }
-            if let Some(slot) = parse_input(content, line)? {
-                if !seen_inputs.insert(slot.key.clone()) {
+            if let Some(input) = parse_input(content, line)? {
+                let key = match &input { ParsedInput::Scalar(slot) => &slot.key, ParsedInput::Grid(slot) => &slot.key };
+                if !seen_inputs.insert(key.clone()) {
                     return Err(error(
                         "ui_program_duplicate_input_key",
                         "input keys must be unique",
@@ -100,7 +102,7 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
                         1,
                     ));
                 }
-                input_slots.push(slot);
+                match input { ParsedInput::Scalar(slot) => input_slots.push(slot), ParsedInput::Grid(slot) => grid_slots.push(slot) }
                 continue;
             }
             if parse_header(content, &mut header, line)? {
@@ -157,7 +159,7 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
                 // A control event carries its declared controlled input through
                 // the generic semantic boundary, never a renderer-local value.
                 bound_input_keys: node.bindings.iter().filter_map(|(property, key)| {
-                    matches!(property, UiBoundProperty::Active | UiBoundProperty::Selected | UiBoundProperty::NumericValue | UiBoundProperty::StateToken)
+                    matches!(property, UiBoundProperty::TextValue | UiBoundProperty::Active | UiBoundProperty::Selected | UiBoundProperty::NumericValue | UiBoundProperty::StateToken)
                         .then_some(key.clone())
                 }).collect(),
             });
@@ -176,7 +178,7 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
     while let Some((_, node)) = stack.pop() {
         attach(node, &mut stack, &mut root, 0)?;
     }
-    let root = root.ok_or_else(|| {
+    let mut root = root.ok_or_else(|| {
         error(
             "nui_flow_missing_root",
             "Flow requires exactly one root surface",
@@ -198,6 +200,7 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
         version: 1,
         layout_hash: "nui-flow-v1".into(),
         slots: input_slots,
+        grid_slots,
     };
     schema.validate().map_err(|_| {
         error(
@@ -241,6 +244,12 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
                     _ => return Err(error("ui_program_invalid_branch_template", "branch when requires a bool or enum input", 1, 1)),
                 }
             }
+        }
+    }
+    apply_boolean_binding_defaults(&mut root.node, &bindings, &schema);
+    for grid in &data_grids {
+        if !schema.grid_slots.iter().any(|slot| slot.key == grid.source_key) {
+            return Err(error("ui_program_unknown_input_key", "DataGrid source must reference a declared grid input", 1, 1));
         }
     }
     validate_state_machines(&state_machines, &schema)?;
@@ -366,6 +375,9 @@ pub fn format_nui_flow(source: &str) -> FlowResult<String> {
             parsed.ir.surface_id.0, parsed.ir.revision.0
         ),
     ];
+    for slot in &parsed.input_schema.grid_slots {
+        lines.push(format!("input {} grid default grid:empty", slot.key));
+    }
     for slot in &parsed.input_schema.slots {
         lines.push(format_input(slot));
     }
@@ -790,7 +802,9 @@ fn validate_state_machines(machines: &[NuiFlowStateMachine], schema: &UiInputSch
     Ok(())
 }
 
-fn parse_input(text: &str, line: u32) -> FlowResult<Option<UiInputSlot>> {
+enum ParsedInput { Scalar(UiInputSlot), Grid(UiGridInputSlot) }
+
+fn parse_input(text: &str, line: u32) -> FlowResult<Option<ParsedInput>> {
     let parts = text.split_whitespace().collect::<Vec<_>>();
     if parts.first() != Some(&"input") {
         return Ok(None);
@@ -802,6 +816,12 @@ fn parse_input(text: &str, line: u32) -> FlowResult<Option<UiInputSlot>> {
             line,
             1,
         ));
+    }
+    if parts[2] == "grid" {
+        if parts[4] != "grid:empty" {
+            return Err(error("nui_flow_invalid_literal", "grid inputs require default grid:empty", line, 1));
+        }
+        return Ok(Some(ParsedInput::Grid(UiGridInputSlot { key: parts[1].into() })));
     }
     let kind = match parts[2] {
         "bool" => UiInputKind::Bool,
@@ -873,7 +893,7 @@ fn parse_input(text: &str, line: u32) -> FlowResult<Option<UiInputSlot>> {
         }
     };
     let (alignment, lanes, representation) = kind.packing();
-    Ok(Some(UiInputSlot {
+    Ok(Some(ParsedInput::Scalar(UiInputSlot {
         key: parts[1].into(),
         kind,
         default_value: value,
@@ -885,7 +905,7 @@ fn parse_input(text: &str, line: u32) -> FlowResult<Option<UiInputSlot>> {
             offset: 0,
             representation,
         },
-    }))
+    })))
 }
 
 fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
@@ -976,6 +996,7 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
     let mut data_grid_row_height = None;
     let mut data_grid_overscan = None;
     let mut data_grid_columns = None;
+    let mut data_grid_source = None;
     let mut used = HashSet::new();
     let mut index = 2;
     while index < parts.len() {
@@ -1050,6 +1071,13 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
                 index += 1;
                 data_grid_columns = Some(parse_data_grid_columns(&quoted(value, line)?, line)?);
             }
+            "source" if parts[0] == "data_grid" => {
+                let value = *parts.get(index + 1).ok_or_else(|| error("nui_flow_missing_value", "source requires a grid input binding", line, 1))?;
+                index += 1;
+                let Some(key) = value.strip_prefix('$') else { return Err(error("nui_flow_invalid_data_grid", "DataGrid source must use $grid_input", line, 1)); };
+                if !valid_key(key) { return Err(error("nui_flow_invalid_data_grid", "DataGrid source must name a valid grid input", line, 1)); }
+                data_grid_source = Some(key.into());
+            }
             "key" if matches!(parts[0], "repeat" | "template") => {
                 let value = *parts.get(index + 1).ok_or_else(|| error("nui_flow_missing_value", "key requires a row key field", line, 1))?;
                 index += 1;
@@ -1085,6 +1113,7 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
         if overscan > capacity { return Err(error("nui_flow_invalid_data_grid", "DataGrid overscan cannot exceed capacity", line, 1)); }
         Some(UiDataGridDeclaration {
             node_key: String::new(),
+            source_key: data_grid_source.ok_or_else(|| error("nui_flow_invalid_data_grid", "DataGrid requires source $grid_input", line, 1))?,
             max_window_rows: capacity,
             row_height: data_grid_row_height.unwrap_or(24),
             overscan,
@@ -1092,6 +1121,38 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
         })
     } else { None };
     Ok(NodeBuild { node, bindings, intents, branch_predicate, template, data_grid })
+}
+
+/// A lowered fragment may be submitted before an input frame is evaluated. Apply
+/// boolean defaults that affect participation so hidden dialogs cannot become
+/// active modal layers merely because their binding has not changed yet.
+fn apply_boolean_binding_defaults(
+    root: &mut UiNode,
+    bindings: &[UiIrBinding],
+    schema: &UiInputSchema,
+) {
+    fn visit(node: &mut UiNode, bindings: &[UiIrBinding], schema: &UiInputSchema) {
+        for binding in bindings.iter().filter(|binding| binding.node_key == node.node_id.0) {
+            let Some(UiInputValue::Bool { value }) = schema
+                .slots
+                .iter()
+                .find(|slot| slot.key == binding.input_key)
+                .map(|slot| &slot.default_value)
+            else {
+                continue;
+            };
+            match binding.property {
+                UiBoundProperty::Visible => node.visible = *value,
+                UiBoundProperty::Enabled => node.enabled = *value,
+                _ => {}
+            }
+        }
+        for child in &mut node.children {
+            visit(child, bindings, schema);
+        }
+    }
+
+    visit(root, bindings, schema);
 }
 
 fn parse_data_grid_columns(value: &str, line: u32) -> FlowResult<Vec<UiDataGridColumn>> {
@@ -1594,8 +1655,8 @@ fn format_node(
     if node.bounds.y != 0.0 { line.push_str(&format!(" y {}", node.bounds.y)); }
     if node.kind == UiNodeKind::DataGrid {
         if let Some(grid) = data_grids.iter().find(|grid| grid.node_key == node.node_id.0) {
-            line.push_str(&format!(" capacity {} row_height {} overscan {} columns \"{}\"",
-                grid.max_window_rows, grid.row_height, grid.overscan,
+            line.push_str(&format!(" source ${} capacity {} row_height {} overscan {} columns \"{}\"",
+                grid.source_key, grid.max_window_rows, grid.row_height, grid.overscan,
                 grid.columns.iter().map(format_data_grid_column).collect::<Vec<_>>().join(",")));
         }
     }
@@ -1948,7 +2009,7 @@ panel workspace row gap 8
 
     #[test]
     fn data_grid_full_declaration_round_trips_typed_columns() {
-        let source = "surface root\n  data_grid assets capacity 64 row_height 28 overscan 3 columns \"Name:240,Status:120\"\n";
+        let source = "input asset_window grid default grid:empty\nsurface root\n  data_grid assets source $asset_window capacity 64 row_height 28 overscan 3 columns \"Name:240,Status:120\"\n";
         let document = parse_nui_flow(source).unwrap();
         let grid = &document.ir.data_grids[0];
         assert_eq!(grid.row_height, 28);
@@ -1956,20 +2017,32 @@ panel workspace row gap 8
         assert_eq!(grid.columns[0], UiDataGridColumn { key: "Name".into(), label: "Name".into(), width: 240, presentation: UiDataGridPresentation::Text });
         assert_eq!(grid.columns[1].key, "Status");
         let formatted = format_nui_flow(source).unwrap();
-        assert!(formatted.contains("row_height 28 overscan 3 columns \"Name:240,Status:120\""));
+        assert_eq!(grid.source_key, "asset_window");
+        assert!(formatted.contains("source $asset_window capacity 64 row_height 28 overscan 3 columns \"Name:240,Status:120\""));
+    }
+
+    #[test]
+    fn data_grid_sources_require_declared_control_plane_grid_inputs() {
+        let document = parse_nui_flow("input enabled bool default true\ninput asset_window grid default grid:empty\nsurface root\n  data_grid assets source $asset_window capacity 2\n").unwrap();
+        assert_eq!(document.input_schema.slots.len(), 1);
+        assert_eq!(document.input_schema.grid_slots[0].key, "asset_window");
+        assert_eq!(document.input_schema.slots[0].packing.offset, 0);
+
+        let error = parse_nui_flow("surface root\n  data_grid assets source $asset_window capacity 2\n").unwrap_err();
+        assert_eq!(error.diagnostics[0].code, "ui_program_unknown_input_key");
     }
 
     #[test]
     fn data_grid_columns_are_strict() {
         for columns in ["Name", "Name:0", "Name:20,Name:30", "Name:-1", "Name:20:select", "Name:20:dropdown::set", "Name:20:dropdown: |a:set", "Name:20:dropdown:a|a:set", "Name:20:edit:0:set", "Name:20:unknown"] {
-            let error = parse_nui_flow(&format!("surface root\n  data_grid assets capacity 2 columns \"{columns}\"\n")).unwrap_err();
+            let error = parse_nui_flow(&format!("input asset_window grid default grid:empty\nsurface root\n  data_grid assets source $asset_window capacity 2 columns \"{columns}\"\n")).unwrap_err();
             assert_eq!(error.diagnostics[0].code, "nui_flow_invalid_data_grid");
         }
     }
 
     #[test]
     fn data_grid_columns_parse_presentations_and_format_deterministically() {
-        let source = "surface root\n  data_grid assets capacity 2 columns \"Name:240:text,State:120:select:asset.state.select,Owner:160:dropdown:me|team:asset.owner.select,Notes:280:edit:128:asset.notes.edit\"\n";
+        let source = "input asset_window grid default grid:empty\nsurface root\n  data_grid assets source $asset_window capacity 2 columns \"Name:240:text,State:120:select:asset.state.select,Owner:160:dropdown:me|team:asset.owner.select,Notes:280:edit:128:asset.notes.edit\"\n";
         let document = parse_nui_flow(source).unwrap();
         assert_eq!(document.ir.data_grids[0].columns[1].presentation, UiDataGridPresentation::Select { intent: "asset.state.select".into() });
         assert_eq!(document.ir.data_grids[0].columns[2].presentation, UiDataGridPresentation::Dropdown { options: vec!["me".into(), "team".into()], intent: "asset.owner.select".into() });
@@ -2022,12 +2095,12 @@ panel workspace row gap 8
 
     #[test]
     fn data_grid_declaration_lowers_with_a_finite_window_capacity() {
-        let source = "surface root\n  data_grid assets capacity 64 h 400\n";
+        let source = "input asset_window grid default grid:empty\nsurface root\n  data_grid assets source $asset_window capacity 64 h 400\n";
         let document = parse_nui_flow(source).unwrap();
         assert_eq!(document.ir.root.children[0].kind, UiNodeKind::DataGrid);
         assert_eq!(document.ir.data_grids[0].node_key, "assets");
         assert_eq!(document.ir.data_grids[0].max_window_rows, 64);
-        assert!(format_nui_flow(source).unwrap().contains("data_grid assets capacity 64"));
+        assert!(format_nui_flow(source).unwrap().contains("data_grid assets source $asset_window capacity 64"));
 
         let error = parse_nui_flow("surface root\n  data_grid assets\n").unwrap_err();
         assert_eq!(error.diagnostics[0].code, "nui_flow_invalid_data_grid");

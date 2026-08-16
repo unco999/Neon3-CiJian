@@ -1,9 +1,10 @@
 //! Command handling and window/GPU bootstrap for Neon3's sole renderer owner.
 //! No other Neon3 crate may initialize window or GPU objects.
 
-use std::time::{Duration, Instant};
-use std::{collections::HashMap, net::SocketAddr, thread};
 use std::sync::{Arc, Mutex};
+
+use std::time::{Duration, Instant};
+use std::{collections::{HashMap, VecDeque}, net::SocketAddr, thread};
 
 use neon_ipc::RpcClient;
 use neon_observability::{
@@ -11,15 +12,15 @@ use neon_observability::{
     EVENT_COMMAND_RECEIVED, EVENT_COMMAND_REJECTED, JournalFilter, TraceLevel, TraceRecord,
 };
 use neon_protocol::{
-    AiTerrainGenerateCommand, AiTerrainGenerationResult, AssetBytes, AssetRef, ClientIdentity, ClientKind, HealthStatus, PROTOCOL_VERSION, RequestId, Revision, RpcError, RpcRequest, RpcResponse,
+    AiTerrainGenerateCommand, AiTerrainGenerationResult, AssetBytes, AssetRef, ClientIdentity, ClientKind, HealthStatus, InteractionId, InteractionSemanticTarget, InteractionTraceError, InteractionTraceFilters, InteractionTraceOutcome, InteractionTraceQuery, InteractionTraceRecord, InteractionTraceStage, PROTOCOL_VERSION, RequestId, Revision, RpcError, RpcRequest, RpcResponse,
     RpcStatus, ServiceDescription, ServiceHealth, ServiceName,
-};
-use neon_ui_schema::{
-    UiBounds, UiCommand, UiFragment, UiFragmentId, UiNode, UiNodeKind, UiStyle, UiTransition,
-    UiDataGridWindowRequest, UiTransitionState, UiSemanticEvent,
 };
 #[cfg(test)]
 use neon_ui_schema::UiFragmentSubmission;
+use neon_ui_schema::{
+    UiBounds, UiCommand, UiDataGridWindowRequest, UiFragment, UiFragmentId, UiHostInbound, UiNode, UiNodeKind,
+    UiSemanticEvent, UiStyle, UiTransition, UiTransitionState, UiWindowRequest,
+};
 use serde_json::{Value, json};
 use winit::{
     application::ApplicationHandler,
@@ -30,13 +31,12 @@ use winit::{
     window::{Window, WindowId},
 };
 
-mod ui_renderer;
 mod gpu_preview;
 mod ui_program_gpu;
-
-use ui_renderer::{UiHitBinding, UiWgpuRenderer};
+mod ui_renderer;
 use gpu_preview::HeightmapPreviewConverter;
 pub use ui_program_gpu::GpuUiProgramBackend;
+use ui_renderer::{UiHitBinding, UiWgpuRenderer};
 
 pub const SERVICE_NAME: &str = "wgpu-runtime";
 pub const CAPABILITY_UI_FRAGMENT: &str = "wgpu.ui.fragment.v1";
@@ -45,10 +45,135 @@ pub const CAPABILITY_UI_SEMANTIC_EVENT: &str = "wgpu.ui.semantic_event.v1";
 pub const CAPABILITY_UI_PROGRAM_SEMANTIC_EVENT: &str = "wgpu.ui.program.semantic_event.v1";
 pub const CAPABILITY_UI_RENDER_SURFACE: &str = "wgpu.ui.render_surface.v1";
 pub const CAPABILITY_AI_TERRAIN_GENERATION: &str = "wgpu.ai.terrain_generation.v1";
+pub const CAPABILITY_DEBUG_INTERACTION: &str = "debug.interaction.v1";
 pub const UI_HIT_TARGET: &str = "ui.hit_id.v1";
 pub const UI_COLOR_TARGET: &str = "ui.color.v1";
 pub const RENDER_HIT_NONE: u32 = u32::MAX;
 const DATA_GRID_WINDOW_DEBOUNCE: Duration = Duration::from_millis(24);
+const INTERACTION_TRACE_CAPACITY: usize = 256;
+
+/// Bounded process-local retention for interaction diagnostics. The public
+/// records intentionally carry no renderer-local hit-test or position data.
+struct InteractionTraceStore {
+    next_sequence: u64,
+    records: VecDeque<InteractionTraceRecord>,
+    accepted_waiting_for_composition: VecDeque<InteractionId>,
+}
+
+impl InteractionTraceStore {
+    fn new() -> Self {
+        Self {
+            next_sequence: 1,
+            records: VecDeque::with_capacity(INTERACTION_TRACE_CAPACITY),
+            accepted_waiting_for_composition: VecDeque::new(),
+        }
+    }
+
+    fn append(
+        &mut self,
+        interaction_id: InteractionId,
+        stage: InteractionTraceStage,
+        outcome: InteractionTraceOutcome,
+        error: Option<InteractionTraceError>,
+        semantic_target: Option<InteractionSemanticTarget>,
+        fragment_revision: Option<Revision>,
+        composition_revision: Revision,
+        downstream_request_id: Option<RequestId>,
+    ) {
+        let record = InteractionTraceRecord {
+            sequence: self.next_sequence,
+            interaction_id,
+            stage,
+            outcome,
+            error,
+            semantic_target,
+            fragment_revision,
+            composition_revision,
+            downstream_request_id,
+        };
+        self.next_sequence += 1;
+        if self.records.len() == INTERACTION_TRACE_CAPACITY {
+            self.records.pop_front();
+        }
+        self.records.push_back(record);
+    }
+
+    fn delivery_accepted(&mut self, interaction_id: InteractionId) {
+        self.accepted_waiting_for_composition.push_back(interaction_id);
+    }
+
+    fn composition_applied(&mut self, composition_revision: Revision) {
+        let Some(interaction_id) = self.accepted_waiting_for_composition.pop_front() else {
+            return;
+        };
+        let previous = self.records.iter().rev().find(|record| record.interaction_id == interaction_id);
+        self.append(
+            interaction_id,
+            InteractionTraceStage::CompositionRevisionApplied,
+            InteractionTraceOutcome::Accepted,
+            None,
+            previous.and_then(|record| record.semantic_target.clone()),
+            previous.and_then(|record| record.fragment_revision),
+            composition_revision,
+            previous.and_then(|record| record.downstream_request_id.clone()),
+        );
+    }
+
+    fn get(&self, interaction_id: &InteractionId) -> Vec<InteractionTraceRecord> {
+        self.records
+            .iter()
+            .filter(|record| &record.interaction_id == interaction_id)
+            .cloned()
+            .collect()
+    }
+
+    fn query(&self, query: &InteractionTraceQuery) -> Vec<InteractionTraceRecord> {
+        let filters = query.filters.as_ref();
+        let limit = query.limit.unwrap_or(100).min(INTERACTION_TRACE_CAPACITY);
+        self.records
+            .iter()
+            .filter(|record| query.after.is_none_or(|after| record.sequence > after))
+            .filter(|record| filters.is_none_or(|filters| interaction_matches(record, filters)))
+            .take(limit)
+            .cloned()
+            .collect()
+    }
+}
+
+fn interaction_matches(record: &InteractionTraceRecord, filters: &InteractionTraceFilters) -> bool {
+    filters.interaction_id.as_ref().is_none_or(|id| &record.interaction_id == id)
+        && filters.stage.is_none_or(|stage| record.stage == stage)
+        && filters.outcome.is_none_or(|outcome| record.outcome == outcome)
+        && filters.semantic_node_path.as_ref().is_none_or(|path| {
+            record.semantic_target.as_ref().is_some_and(|target| &target.node_path == path)
+        })
+        && filters.downstream_request_id.as_ref().is_none_or(|id| {
+            record.downstream_request_id.as_ref() == Some(id)
+        })
+}
+
+fn append_interaction_record(
+    traces: &Arc<Mutex<InteractionTraceStore>>,
+    interaction_id: InteractionId,
+    stage: InteractionTraceStage,
+    outcome: InteractionTraceOutcome,
+    error: Option<InteractionTraceError>,
+    binding: Option<&UiHitBinding>,
+    composition_revision: Revision,
+) {
+    if let Ok(mut traces) = traces.lock() {
+        traces.append(
+            interaction_id,
+            stage,
+            outcome,
+            error,
+            binding.map(semantic_target),
+            binding.map(|binding| binding.fragment.revision),
+            composition_revision,
+            None,
+        );
+    }
+}
 
 /// Retains only the newest local viewport demand for each virtual grid. The
 /// renderer dispatches these after a short debounce, never per wheel event.
@@ -59,13 +184,14 @@ struct LatestDataGridWindowRequests {
 
 impl LatestDataGridWindowRequests {
     fn schedule(&mut self, request: UiDataGridWindowRequest, now: Instant) {
-        let key = format!("{}/{}", request.fragment.id.0, request.data_grid_key);
+        let key = format!("{}/{}", request.fragment.id.0, request.source_key);
         self.pending.insert(key, (now, request));
     }
 
     fn take_ready(&mut self, now: Instant) -> Vec<UiDataGridWindowRequest> {
         let ready = self.pending.iter()
-            .filter(|(_, (scheduled, _))| now.duration_since(*scheduled) >= DATA_GRID_WINDOW_DEBOUNCE)
+            .filter(|(_, (scheduled, _))| { now.duration_since(*scheduled) >= DATA_GRID_WINDOW_DEBOUNCE
+            })
             .map(|(key, _)| key.clone())
             .collect::<Vec<_>>();
         ready.into_iter().filter_map(|key| self.pending.remove(&key).map(|(_, request)| request)).collect()
@@ -181,6 +307,8 @@ pub struct WindowedRuntime {
     pending_composition_ack: Option<std::sync::mpsc::Sender<()>>,
     ui_endpoint: Option<SocketAddr>,
     pointer_delivery: Arc<Mutex<Value>>,
+    interaction_traces: Arc<Mutex<InteractionTraceStore>>,
+    next_interaction_id: u64,
     data_grid_window_requests: LatestDataGridWindowRequests,
     next_data_grid_window_sequence: u64,
 }
@@ -202,6 +330,15 @@ enum WindowCommand {
     },
     InputDebugSnapshot {
         completed: std::sync::mpsc::Sender<Value>,
+    },
+    InputDebugProbe {
+        logical_position: Option<[f64; 2]>,
+        physical_position: Option<[f64; 2]>,
+        completed: std::sync::mpsc::Sender<Value>,
+    },
+    InputDebugActivate {
+        logical_position: [f64; 2],
+        completed: std::sync::mpsc::Sender<Result<Value, &'static str>>,
     },
     Shutdown,
 }
@@ -236,9 +373,39 @@ struct WindowGpu {
     longest_frame_gap_ms: f32,
     last_pointer_outcome: String,
     last_pointer_node_path: Option<String>,
+    active_interaction_id: Option<InteractionId>,
 }
 
 impl WindowedRuntime {
+    fn begin_os_pointer_interaction(&mut self) -> InteractionId {
+        self.next_interaction_id += 1;
+        let interaction_id = InteractionId(format!("wgpu-window-{}-{}", self.epoch, self.next_interaction_id));
+        if let Ok(mut traces) = self.interaction_traces.lock() {
+            traces.append(
+                interaction_id.clone(),
+                InteractionTraceStage::Prepared,
+                InteractionTraceOutcome::Pending,
+                None,
+                None,
+                None,
+                self.applied_composition_revision,
+                None,
+            );
+        }
+        interaction_id
+    }
+
+    fn prepare_pointer_interaction(&mut self) {
+        let fragments = &self.fragments;
+        if let Some(gpu) = self.gpu.as_mut() {
+            gpu.ui.prepare_interaction(
+                fragments,
+                [gpu.config.width, gpu.config.height],
+                gpu.started_at.elapsed().as_secs_f32(),
+            );
+        }
+    }
+
     pub fn new(epoch: u64) -> Self {
         Self {
             epoch,
@@ -252,6 +419,8 @@ impl WindowedRuntime {
             pending_composition_ack: None,
             ui_endpoint: None,
             pointer_delivery: Arc::new(Mutex::new(json!({"state": "none"}))),
+            interaction_traces: Arc::new(Mutex::new(InteractionTraceStore::new())),
+            next_interaction_id: 0,
             data_grid_window_requests: LatestDataGridWindowRequests::default(),
             next_data_grid_window_sequence: 0,
         }
@@ -286,7 +455,8 @@ impl WindowedRuntime {
             runtime.applied_composition_revision = Revision(1);
         }
         if let Some(endpoint) = endpoint {
-            spawn_window_server(epoch, endpoint, proxy);
+            let interaction_traces = runtime.interaction_traces.clone();
+            spawn_window_server(epoch, endpoint, proxy, interaction_traces);
         }
         event_loop
             .run_app(&mut runtime)
@@ -467,6 +637,9 @@ impl WindowedRuntime {
         self.applied_composition_revision = composition_revision;
         self.fragments = fragments;
         self.redraw_pending = true;
+        if let Ok(mut traces) = self.interaction_traces.lock() {
+            traces.composition_applied(composition_revision);
+        }
         if let Some(gpu) = self.gpu.as_mut() {
             gpu.hit_target_dirty = true;
         }
@@ -474,12 +647,13 @@ impl WindowedRuntime {
     }
 
     fn schedule_data_grid_window_requests(&mut self) {
-        let requests = self.gpu.as_ref().map(|gpu| gpu.ui.data_grid_window_requests(
+        let requests = self.gpu.as_ref().map(|gpu| { gpu.ui.data_grid_window_requests(
             &self.fragments,
             self.epoch,
             self.applied_composition_revision,
             &mut self.next_data_grid_window_sequence,
-        )).unwrap_or_default();
+        )
+            }).unwrap_or_default();
         let now = Instant::now();
         for request in requests {
             self.data_grid_window_requests.schedule(request, now);
@@ -504,7 +678,9 @@ impl WindowedRuntime {
             return json!({"state": "uninitialized"});
         };
         let node_path = |hit_id: Option<u32>| {
-            hit_id.and_then(|hit_id| gpu.ui.hit_binding(hit_id).map(|binding| binding.node_path))
+            hit_id
+                .and_then(|hit_id| gpu.ui.hit_binding(hit_id))
+                .and_then(|binding| diagnostic_node_path(&binding))
         };
         json!({
             "state": gpu.input.state_name(),
@@ -520,6 +696,100 @@ impl WindowedRuntime {
             "pointer_delivery": self.pointer_delivery.lock().ok().map(|state| state.clone()),
         })
     }
+
+    fn input_debug_probe(&mut self, logical_position: Option<[f64; 2]>, physical_position: Option<[f64; 2]>) -> Value {
+        let Some(gpu) = self.gpu.as_mut() else {
+            return json!({"state": "uninitialized"});
+        };
+        let scale_factor = self.window.as_ref().map(Window::scale_factor).unwrap_or(1.0);
+        let physical_position = physical_position
+            .or_else(|| logical_position.map(|position| [position[0] * scale_factor, position[1] * scale_factor]))
+            .expect("probe position is validated before dispatch");
+        let logical_position = logical_position.unwrap_or([physical_position[0] / scale_factor, physical_position[1] / scale_factor]);
+        let physical_position = [physical_position[0] as f32, physical_position[1] as f32];
+        gpu.ui.set_pointer_position(physical_position);
+        gpu.ui.prepare_interaction(
+            &self.fragments,
+            [gpu.config.width, gpu.config.height],
+            gpu.started_at.elapsed().as_secs_f32(),
+        );
+        let mut probe = gpu.ui.pointer_probe_snapshot();
+        probe["pointer"] = json!({
+            "logical": {"x": logical_position[0], "y": logical_position[1]},
+            "physical": {"x": physical_position[0], "y": physical_position[1]},
+        });
+        let x = physical_position[0].max(0.0).min(gpu.config.width.saturating_sub(1) as f32) as u32;
+        let y = physical_position[1].max(0.0).min(gpu.config.height.saturating_sub(1) as f32) as u32;
+        gpu.pending_hit_pixel = Some([x, y]);
+        probe["gpu_hit_readback"] = json!({
+            "status": "queued",
+            "available": true,
+            "pending": gpu.pending_hit_slot.is_some() || gpu.pending_hit_pixel.is_some(),
+        });
+        probe["last_pointer_delivery"] = self.pointer_delivery.lock().ok().map(|state| state.clone()).unwrap_or_else(|| json!({"state": "unavailable"}));
+        probe["last_pointer"] = json!({
+            "outcome": gpu.last_pointer_outcome,
+            "semantic_node_path": gpu.last_pointer_node_path,
+        });
+        self.redraw_pending = true;
+        probe
+    }
+
+    /// Debug-only automation entry point. The point is resolved through the
+    /// same prepared CPU binding and capture state used by pointer release;
+    /// renderer hit identifiers never leave this process.
+    fn input_debug_activate(&mut self, logical_position: [f64; 2]) -> Result<Value, &'static str> {
+        let Some(gpu) = self.gpu.as_mut() else { return Err("window_gpu_unavailable"); };
+        let scale_factor = self.window.as_ref().map(Window::scale_factor).unwrap_or(1.0);
+        let physical = [
+            (logical_position[0] * scale_factor) as f32,
+            (logical_position[1] * scale_factor) as f32,
+        ];
+        gpu.ui.set_pointer_position(physical);
+        gpu.ui.prepare_interaction(&self.fragments, [gpu.config.width, gpu.config.height], gpu.started_at.elapsed().as_secs_f32());
+        let Some(hit_id) = gpu.ui.hit_id_at_pointer() else { return Err("press_without_semantic_hit"); };
+        gpu.input.set_hover_id(Some(hit_id));
+        gpu.input.pointer_down().map_err(|_| "pointer_down_rejected")?;
+        gpu.captured_binding = gpu.input.capture_id.and_then(|id| gpu.ui.hit_binding(id));
+        gpu.pending_control_value = gpu.captured_binding.as_ref().and_then(|binding| binding.control_value.clone());
+        let Some(binding) = gpu.captured_binding.as_ref() else { return Err("press_without_semantic_binding"); };
+        if binding.text_input.is_some() || (gpu.ui.requires_value_gesture(binding) && !gpu.ui.begin_value_gesture(binding)) {
+            gpu.captured_binding = None;
+            gpu.input.cancel();
+            return Err("debug_activation_not_supported_for_control");
+        }
+        let (binding, control_value, sequence) = release_captured_binding(gpu).ok_or("interaction_cancelled")?;
+        let node_path = diagnostic_node_path(&binding);
+        gpu.last_pointer_node_path = node_path.clone();
+        gpu.last_pointer_outcome = if binding.intent.is_some() { "semantic_event_forwarded".into() } else { "release_without_semantic_binding".into() };
+        let endpoint = self.ui_endpoint.ok_or("ui_host_unavailable")?;
+        forward_pointer_click(endpoint, self.epoch, self.applied_composition_revision, sequence, None, binding, control_value, self.pointer_delivery.clone(), self.interaction_traces.clone());
+        Ok(json!({"state": "forwarded", "sequence": sequence, "node_path": node_path}))
+    }
+}
+
+/// Finalizes a captured pointer using the normal release semantics. Both OS
+/// release and debug activation use this so tests cannot bypass control state.
+fn release_captured_binding(gpu: &mut WindowGpu) -> Option<(UiHitBinding, Option<neon_ui_schema::UiSemanticPayloadValue>, u64)> {
+    let initial_value = gpu.pending_control_value.take();
+    let control_value = gpu.ui.finish_value_gesture().or(initial_value);
+    let binding = gpu.captured_binding.take();
+    gpu.input.pointer_up(binding.is_some()).ok()?;
+    let binding = binding?;
+    if binding.text_input.is_some() { return None; }
+    gpu.next_semantic_sequence += 1;
+    Some((binding, control_value, gpu.next_semantic_sequence))
+}
+
+fn diagnostic_node_path(binding: &UiHitBinding) -> Option<String> {
+    binding
+        .data_grid_cell
+        .is_none()
+        .then(|| binding.node_path.clone())
+}
+
+fn semantic_target(binding: &UiHitBinding) -> InteractionSemanticTarget {
+    InteractionSemanticTarget { node_path: binding.node_path.clone() }
 }
 
 impl WindowGpu {
@@ -599,7 +869,8 @@ impl WindowGpu {
         if let Some(path) = configured_pack {
             match std::fs::read(&path)
                 .map_err(|error| error.to_string())
-                .and_then(|bytes| ai.load_model(&bytes).map(|_| ()).map_err(|error| error.to_string()))
+                .and_then(|bytes| { ai.load_model(&bytes).map(|_| ()).map_err(|error| error.to_string())
+                })
             {
                 Ok(()) => eprintln!("neon-wgpu AI model loaded from {}", path.display()),
                 Err(error) => eprintln!("neon-wgpu AI model unavailable: {error}"),
@@ -636,6 +907,7 @@ impl WindowGpu {
             longest_frame_gap_ms: 0.0,
             last_pointer_outcome: "none".into(),
             last_pointer_node_path: None,
+            active_interaction_id: None,
         })
     }
 
@@ -708,22 +980,38 @@ fn forward_pointer_click(
     renderer_epoch: u64,
     composition_revision: Revision,
     sequence: u64,
+    interaction_id: Option<InteractionId>,
     binding: UiHitBinding,
     control_value: Option<neon_ui_schema::UiSemanticPayloadValue>,
     delivery: Arc<Mutex<Value>>,
+    traces: Arc<Mutex<InteractionTraceStore>>,
 ) {
-    let Some(intent) = binding.intent else {
+    let node_path = diagnostic_node_path(&binding);
+    let Some(intent) = binding.intent.clone() else {
         if let Ok(mut state) = delivery.lock() {
             *state = json!({"state": "not_sent", "reason": "semantic_binding_missing"});
         }
         return;
     };
-    let node_path = binding.node_path.clone();
     if let Ok(mut state) = delivery.lock() {
         *state = json!({"state": "pending", "sequence": sequence, "node_path": node_path.clone()});
     }
+    let semantic_target = semantic_target(&binding);
+    let fragment_revision = binding.fragment.revision;
+    let request_id = RequestId(format!("wgpu-pointer-click-{sequence}"));
+    if let (Some(interaction_id), Ok(mut traces)) = (interaction_id.clone(), traces.lock()) {
+        traces.append(
+            interaction_id,
+            InteractionTraceStage::SemanticEventForwarded,
+            InteractionTraceOutcome::Pending,
+            None,
+            Some(semantic_target.clone()),
+            Some(fragment_revision),
+            composition_revision,
+            Some(request_id.clone()),
+        );
+    }
     thread::spawn(move || {
-        let request_id = RequestId(format!("wgpu-pointer-click-{sequence}"));
         let event = UiSemanticEvent {
             event: if binding.data_grid_cell.is_some() && control_value.is_some() {
                 neon_ui_schema::UiSemanticEventType::SelectionChanged
@@ -733,11 +1021,11 @@ fn forward_pointer_click(
             event_id: request_id.0.clone(),
             renderer_epoch,
             composition_revision,
-            fragment: binding.fragment,
+            fragment: binding.fragment.clone(),
             intent,
             pointer: Some(neon_ui_schema::UiPointerMetadata { id: 0, sequence }),
             focus: None,
-            data_grid_cell: binding.data_grid_cell,
+            data_grid_cell: binding.data_grid_cell.clone(),
             text: None,
             control_value,
             drag_drop: None,
@@ -745,7 +1033,7 @@ fn forward_pointer_click(
         let request = RpcRequest {
             protocol: "neon3.rpc".into(), version: PROTOCOL_VERSION, request_id: request_id.clone(),
             client: ClientIdentity { kind: ClientKind::WgpuRuntime, instance_id: format!("window-{renderer_epoch}"), pid: std::process::id(), origin: "neon-wgpu-runtime".into() },
-            target: ServiceName("ui-runtime".into()), method: "ui.input.event".into(), params: json!(&event),
+            target: ServiceName("ui-runtime".into()), method: "ui.host.inbound".into(), params: json!(&event),
             expected_revision: Some(event.fragment.revision), idempotency_key: Some(format!("wgpu-pointer-click:{renderer_epoch}:{sequence}")),
         };
         match RpcClient::connect(endpoint).and_then(|mut client| client.call(&request)) {
@@ -753,16 +1041,35 @@ fn forward_pointer_click(
                 if let Ok(mut state) = delivery.lock() {
                     *state = json!({"state": "accepted", "sequence": sequence, "node_path": node_path, "revision": response.revision});
                 }
+                if let (Some(interaction_id), Ok(mut traces)) = (interaction_id.clone(), traces.lock()) {
+                    traces.append(interaction_id.clone(), InteractionTraceStage::DeliveryAccepted, InteractionTraceOutcome::Accepted, None, Some(semantic_target.clone()), Some(fragment_revision), composition_revision, Some(request_id));
+                    traces.delivery_accepted(interaction_id);
+                }
             }
             Ok(response) => {
                 let error = response.error;
                 if let Ok(mut state) = delivery.lock() {
                     *state = json!({"state": "rejected", "sequence": sequence, "node_path": node_path, "error": error});
                 }
+                if let (Some(interaction_id), Ok(mut traces)) = (interaction_id, traces.lock()) {
+                    let error = error
+                        .map(|error| InteractionTraceError {
+                            code: error.code,
+                            message: error.message,
+                        })
+                        .unwrap_or(InteractionTraceError {
+                            code: "delivery_rejected".into(),
+                            message: "UI host rejected semantic delivery".into(),
+                        });
+                    traces.append(interaction_id, InteractionTraceStage::DeliveryRejected, InteractionTraceOutcome::Rejected, Some(error), Some(semantic_target.clone()), Some(fragment_revision), composition_revision, Some(request_id));
+                }
             }
             Err(error) => {
                 if let Ok(mut state) = delivery.lock() {
                     *state = json!({"state": "transport_failed", "sequence": sequence, "node_path": node_path, "error": error.to_string()});
+                }
+                if let (Some(interaction_id), Ok(mut traces)) = (interaction_id, traces.lock()) {
+                    traces.append(interaction_id, InteractionTraceStage::TransportFailed, InteractionTraceOutcome::Failed, Some(InteractionTraceError { code: "transport_failed".into(), message: error.to_string() }), Some(semantic_target), Some(fragment_revision), composition_revision, Some(request_id));
                 }
             }
         }
@@ -777,29 +1084,54 @@ fn forward_text_input_commit(
     binding: UiHitBinding,
     value: String,
 ) {
-    let Some(intent) = binding.intent else { return; };
+    let Some(event) = text_input_commit_event(
+        renderer_epoch,
+        composition_revision,
+        sequence, binding,
+        value,
+    ) else { return; };
     thread::spawn(move || {
-        let request_id = RequestId(format!("wgpu-text-input-{sequence}"));
-        let event = UiSemanticEvent {
-            event: neon_ui_schema::UiSemanticEventType::TextInputCommit,
-            event_id: request_id.0.clone(), renderer_epoch, composition_revision,
-            fragment: binding.fragment, intent, pointer: None,
-            focus: Some(neon_ui_schema::UiFocusMetadata { focused: true }),
-            data_grid_cell: binding.data_grid_cell,
-            text: Some(neon_ui_schema::UiTextInputCommit { value }),
-            control_value: binding.control_value,
-            drag_drop: None,
-        };
+        let request_id = RequestId( event.
+            event_id.clone());
         let request = RpcRequest {
             protocol: "neon3.rpc".into(), version: PROTOCOL_VERSION, request_id: request_id.clone(),
             client: ClientIdentity { kind: ClientKind::WgpuRuntime, instance_id: format!("window-{renderer_epoch}"), pid: std::process::id(), origin: "neon-wgpu-runtime".into() },
-            target: ServiceName("ui-runtime".into()), method: "ui.input.event".into(), params: json!(&event),
+            target: ServiceName("ui-runtime".into()), method: "ui.host.inbound".into(), params: json!(&event),
             expected_revision: Some(event.fragment.revision), idempotency_key: Some(format!("wgpu-text-input:{renderer_epoch}:{sequence}")),
         };
         if let Err(error) = RpcClient::connect(endpoint).and_then(|mut client| client.call(&request)) {
             eprintln!("ui text commit delivery failed: {error}");
         }
     });
+}
+
+fn text_input_commit_event(
+    renderer_epoch: u64,
+    composition_revision: Revision,
+    sequence: u64,
+    binding: UiHitBinding,
+    value: String,
+) -> Option<UiSemanticEvent> {
+    Some(UiSemanticEvent {
+        event: neon_ui_schema::UiSemanticEventType::TextInputCommit,
+        event_id: format!("wgpu-text-input-{sequence}"),
+        renderer_epoch,
+        composition_revision,
+        fragment: binding.fragment,
+        intent: binding.intent?,
+        pointer: None,
+        focus: Some(neon_ui_schema::UiFocusMetadata { focused: true }),
+        data_grid_cell: binding.data_grid_cell,
+        text: Some(neon_ui_schema::UiTextInputCommit { value }),
+        control_value: binding.control_value,
+        drag_drop: None,
+    })
+}
+
+fn take_data_grid_text_commit(gpu: &mut WindowGpu) -> Option<(u64, UiHitBinding, String)> {
+    let (binding, value) = gpu.ui.finish_data_grid_text_input()?;
+    gpu.next_semantic_sequence += 1;
+    Some((gpu.next_semantic_sequence, binding, value))
 }
 
 fn forward_drag_drop(
@@ -822,7 +1154,7 @@ fn forward_drag_drop(
         let request = RpcRequest {
             protocol: "neon3.rpc".into(), version: PROTOCOL_VERSION, request_id: request_id.clone(),
             client: ClientIdentity { kind: ClientKind::WgpuRuntime, instance_id: format!("window-{renderer_epoch}"), pid: std::process::id(), origin: "neon-wgpu-runtime".into() },
-            target: ServiceName("ui-runtime".into()), method: "ui.input.event".into(), params: json!(&event),
+            target: ServiceName("ui-runtime".into()), method: "ui.host.inbound".into(), params: json!(&event),
             expected_revision: Some(event.fragment.revision), idempotency_key: Some(format!("wgpu-drag-drop:{renderer_epoch}:{sequence}")),
         };
         if let Err(error) = RpcClient::connect(endpoint).and_then(|mut client| client.call(&request)) { eprintln!("ui drag/drop delivery failed: {error}"); }
@@ -841,13 +1173,13 @@ fn forward_data_grid_window_request(endpoint: SocketAddr, window_request: UiData
                 origin: "neon-wgpu-runtime".into(),
             },
             target: ServiceName("ui-runtime".into()),
-            method: "ui.data_grid.window.request".into(),
+            method: "ui.host.inbound".into(),
             expected_revision: Some(window_request.fragment.revision),
             idempotency_key: Some(format!(
                 "wgpu-data-grid-window:{}:{}:{}",
-                window_request.fragment.id.0, window_request.data_grid_key, window_request.sequence,
+                window_request.fragment.id.0, window_request.source_key, window_request.sequence,
             )),
-            params: json!(window_request),
+            params: json!(UiHostInbound::WindowRequest { request: UiWindowRequest::DataGrid { request: window_request } }),
         };
         let _ = RpcClient::connect(endpoint).and_then(|mut client| client.call(&request));
     });
@@ -898,6 +1230,7 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                 if state == winit::event::ElementState::Pressed
                     && button == winit::event::MouseButton::Middle =>
             {
+                self.prepare_pointer_interaction();
                 if self.gpu.as_mut().is_some_and(|gpu| gpu.ui.begin_scroll_pan_at_pointer()) {
                     self.redraw_pending = true;
                 }
@@ -906,6 +1239,10 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                 if state == winit::event::ElementState::Pressed
                     && button == winit::event::MouseButton::Left =>
             {
+                let interaction_id = self.begin_os_pointer_interaction();
+                let interaction_traces = self.interaction_traces.clone();
+                let composition_revision = self.applied_composition_revision;
+                self.prepare_pointer_interaction();
                 let modal_consumed = self.gpu.as_mut().is_some_and(|gpu| {
                     if !gpu.ui.dismiss_modal_at_pointer() {
                         return false;
@@ -916,10 +1253,41 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                     true
                 });
                 if modal_consumed {
+                    append_interaction_record(&interaction_traces, interaction_id, InteractionTraceStage::HitCaptureResolved, InteractionTraceOutcome::Rejected, Some(InteractionTraceError { code: "modal_outside_press".into(), message: "pointer press was consumed by the active modal".into() }), None, composition_revision);
                     self.redraw_pending = true;
                     return;
                 }
+                let blur_commit = self.gpu.as_mut().and_then(|gpu| {
+                    let next_input = gpu.ui.text_input_at_pointer();
+                    let active_path = gpu.ui.active_text_input_path();
+                    if gpu.ui.data_grid_text_input_active()
+                        && next_input
+                            .as_ref()
+                            .is_none_or(|input| Some(input.node_path.as_str()) != active_path)
+                    {
+                        take_data_grid_text_commit(gpu)
+                    } else {
+                        None
+                    }
+                });
+                if let (Some(endpoint), Some((sequence, binding, value))) =
+                    (self.ui_endpoint, blur_commit)
+                {
+                    if let Some(window) = self.window.as_ref() {
+                        window.set_ime_allowed(false);
+                    }
+                    forward_text_input_commit(
+                        endpoint,
+                        self.epoch,
+                        self.applied_composition_revision,
+                        sequence,
+                        binding,
+                        value,
+                    );
+                    self.redraw_pending = true;
+                }
                 if self.gpu.as_mut().is_some_and(|gpu| gpu.ui.begin_scroll_drag_at_pointer()) {
+                    append_interaction_record(&interaction_traces, interaction_id, InteractionTraceStage::HitCaptureResolved, InteractionTraceOutcome::Accepted, None, None, composition_revision);
                     self.redraw_pending = true;
                     return;
                 }
@@ -940,12 +1308,16 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                     window.set_ime_allowed(true);
                     let rect = self.gpu.as_ref().and_then(|gpu| gpu.ui.text_input_ime_rect()).unwrap_or(input.bounds);
                     window.set_ime_cursor_area(PhysicalPosition::new(rect.x.round() as i32, rect.y.round() as i32), PhysicalSize::new(rect.width.max(1.0).round() as u32, rect.height.max(1.0).round() as u32));
+                    append_interaction_record(&interaction_traces, interaction_id, InteractionTraceStage::HitCaptureResolved, InteractionTraceOutcome::Accepted, None, None, composition_revision);
                 } else if let Some(gpu) = self.gpu.as_mut() {
                     if let Some((binding, value)) = gpu.ui.dropdown_option_at_pointer().or_else(|| gpu.ui.list_option_at_pointer()) {
                         gpu.input.set_hover_id(Some(0));
                         let _ = gpu.input.pointer_down();
                         gpu.captured_binding = Some(binding);
+                        gpu.active_interaction_id = Some(interaction_id.clone());
                         gpu.pending_control_value = Some(value);
+                        let binding = gpu.captured_binding.clone().expect("binding was just assigned");
+                        append_interaction_record(&interaction_traces, interaction_id, InteractionTraceStage::HitCaptureResolved, InteractionTraceOutcome::Accepted, None, Some(&binding), composition_revision);
                         gpu.ui.close_dropdown();
                         self.redraw_pending = true;
                     } else if gpu.ui.dismiss_dropdown_at_pointer() {
@@ -967,6 +1339,7 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                         if gpu.input.pointer_down().is_err() {
                             gpu.last_pointer_outcome = "press_without_semantic_hit".into();
                             gpu.last_pointer_node_path = None;
+                            append_interaction_record(&interaction_traces, interaction_id, InteractionTraceStage::HitCaptureResolved, InteractionTraceOutcome::Rejected, Some(InteractionTraceError { code: "press_without_semantic_hit".into(), message: "pointer press did not resolve a semantic target".into() }), None, composition_revision);
                             return;
                         }
                         gpu.captured_binding = gpu
@@ -981,13 +1354,17 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                             let _ = gpu.input.pointer_up(false);
                             gpu.last_pointer_outcome = "press_without_semantic_binding".into();
                             gpu.last_pointer_node_path = None;
+                            append_interaction_record(&interaction_traces, interaction_id, InteractionTraceStage::HitCaptureResolved, InteractionTraceOutcome::Rejected, Some(InteractionTraceError { code: "press_without_semantic_binding".into(), message: "captured hit did not resolve a semantic binding".into() }), None, composition_revision);
                             return;
                         }
+                        let binding = gpu.captured_binding.clone().expect("binding checked above");
+                        gpu.active_interaction_id = Some(interaction_id.clone());
+                        append_interaction_record(&interaction_traces, interaction_id, InteractionTraceStage::HitCaptureResolved, InteractionTraceOutcome::Accepted, None, Some(&binding), composition_revision);
                         gpu.last_pointer_node_path = gpu
                             .input
                             .capture_id
                             .and_then(|hit_id| gpu.ui.hit_binding(hit_id))
-                            .map(|binding| binding.node_path);
+                            .and_then(|binding| diagnostic_node_path(&binding));
                         gpu.last_pointer_outcome = "pointer_captured".into();
                         if let Some(binding) = gpu.captured_binding.clone() {
                             let started = gpu.ui.begin_value_gesture(&binding);
@@ -995,7 +1372,7 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                                 gpu.captured_binding = None;
                                 gpu.input.cancel();
                                 gpu.last_pointer_outcome = "press_outside_value_control".into();
-                                gpu.last_pointer_node_path = Some(binding.node_path);
+                                gpu.last_pointer_node_path = diagnostic_node_path(&binding);
                                 return;
                             }
                         }
@@ -1040,20 +1417,15 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                     return;
                 }
                 if drag.is_some() { self.redraw_pending = true; return; }
-                let control_value = self.gpu.as_mut().and_then(|gpu| {
-                    gpu.pending_control_value.take().or_else(|| gpu.ui.finish_value_gesture())
-                });
                 let binding = self.gpu.as_mut().and_then(|gpu| {
-                    let binding = gpu.captured_binding.take();
-                    gpu.input.pointer_up(binding.is_some()).ok()?;
-                    let binding = binding?;
-                    gpu.next_semantic_sequence += 1;
-                    if let Some(input) = binding.text_input.clone() {
-                        gpu.ui.focus_text_input(input);
-                        self.redraw_pending = true;
+                    let text_binding = gpu.captured_binding.as_ref().is_some_and(|binding| binding.text_input.is_some());
+                    if text_binding {
+                        let binding = gpu.captured_binding.take()?;
+                        gpu.input.pointer_up(true).ok()?;
                         return Some((None, binding, None));
                     }
-                    Some((Some(gpu.next_semantic_sequence), binding, control_value.clone()))
+                    let (binding, control_value, sequence) = release_captured_binding(gpu)?;
+                    Some((Some(sequence), binding, control_value))
                 });
                 if let Some((None, binding, _)) = &binding
                     && let (Some(window), Some(input)) = (self.window.as_ref(), binding.text_input.as_ref())
@@ -1065,28 +1437,32 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                 if let (Some(endpoint), Some((Some(sequence), binding, control_value))) = (self.ui_endpoint, binding) {
                     if let Some(window) = self.window.as_ref() { window.set_ime_allowed(false); }
                     if let Some(gpu) = self.gpu.as_mut() {
-                        gpu.last_pointer_node_path = Some(binding.node_path.clone());
+                        gpu.last_pointer_node_path = diagnostic_node_path(&binding);
                         gpu.last_pointer_outcome = if binding.intent.is_some() {
                             "semantic_event_forwarded".into()
                         } else {
                             "release_without_semantic_binding".into()
                         };
                     }
+                    let interaction_id = self.gpu.as_mut().and_then(|gpu| gpu.active_interaction_id.take());
                     forward_pointer_click(
                         endpoint,
                         self.epoch,
                         self.applied_composition_revision,
                         sequence,
+                        interaction_id,
                         binding,
                         control_value,
                         self.pointer_delivery.clone(),
+                        self.interaction_traces.clone(),
                     );
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 let delta = match delta {
                     MouseScrollDelta::LineDelta(x, y) => [x * 24.0, y * 24.0],
-                    MouseScrollDelta::PixelDelta(position) => [position.x as f32, position.y as f32],
+                    MouseScrollDelta::PixelDelta(position) => { [position.x as f32, position.y as f32]
+                    }
                 };
                 let scrolled = self.gpu.as_mut().is_some_and(|gpu| {
                     let delta = if gpu.shift_down {
@@ -1133,7 +1509,21 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                 }
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
+                let ending_data_grid_edit = matches!(
+                    &event.logical_key,
+                    Key::Named(NamedKey::Enter | NamedKey::Escape)
+                ) && self
+                    .gpu
+                    .as_ref()
+                    .is_some_and(|gpu| gpu.ui.data_grid_text_input_active());
                 let committed = self.gpu.as_mut().and_then(|gpu| {
+                    if matches!(&event.logical_key, Key::Named(NamedKey::Enter)) {
+                        return take_data_grid_text_commit(gpu);
+                    }
+                    if matches!(&event.logical_key, Key::Named(NamedKey::Escape)) {
+                        gpu.ui.cancel_data_grid_text_input();
+                        return None;
+                    }
                     let result = match &event.logical_key {
                         Key::Named(NamedKey::Backspace) => gpu.ui.backspace_text_input(),
                         Key::Named(NamedKey::Delete) => gpu.ui.delete_text_input(),
@@ -1141,14 +1531,19 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                         Key::Named(NamedKey::ArrowRight) => { gpu.ui.move_text_input_cursor(1, gpu.shift_down); None }
                         Key::Named(NamedKey::Home) => { gpu.ui.move_text_input_to_edge(false, gpu.shift_down); None }
                         Key::Named(NamedKey::End) => { gpu.ui.move_text_input_to_edge(true, gpu.shift_down); None }
-                        Key::Character(value) if !gpu.ime_active && event.text.is_some() => gpu.ui.commit_ime_text(value),
+                        Key::Character(value) if !gpu.ime_active && event.text.is_some() => { gpu.ui.commit_ime_text(value)
+                        }
                         _ => None,
                     };
                     if result.is_some() { gpu.next_semantic_sequence += 1; }
                     result.map(|(binding, text)| (gpu.next_semantic_sequence, binding, text))
                 });
                 if let (Some(endpoint), Some((sequence, binding, value))) = (self.ui_endpoint, committed) {
-                    forward_text_input_commit(endpoint, self.epoch, self.applied_composition_revision, sequence, binding, value);
+                    forward_text_input_commit(endpoint, self.epoch, self.applied_composition_revision, sequence, binding, value
+                    );
+                }
+                if ending_data_grid_edit && let Some(window) = self.window.as_ref() {
+                    window.set_ime_allowed(false);
                 }
                 if let (Some(window), Some(rect)) = (self.window.as_ref(), self.gpu.as_ref().and_then(|gpu| gpu.ui.text_input_ime_rect())) {
                     window.set_ime_cursor_area(PhysicalPosition::new(rect.x.round() as i32, rect.y.round() as i32), PhysicalSize::new(rect.width.max(1.0).round() as u32, rect.height.max(1.0).round() as u32));
@@ -1159,6 +1554,22 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                 if let Some(gpu) = self.gpu.as_mut() { gpu.shift_down = modifiers.state().shift_key(); }
             }
             WindowEvent::Focused(false) => {
+                let commit = self.gpu.as_mut().and_then(take_data_grid_text_commit);
+                if let (Some(endpoint), Some((sequence, binding, value))) =
+                    (self.ui_endpoint, commit)
+                {
+                    forward_text_input_commit(
+                        endpoint,
+                        self.epoch,
+                        self.applied_composition_revision,
+                        sequence,
+                        binding,
+                        value,
+                    );
+            }
+                if let Some(window) = self.window.as_ref() {
+                    window.set_ime_allowed(false);
+                }
                 if let Some(gpu) = self.gpu.as_mut() { gpu.ui.clear_text_focus(); gpu.ui.cancel_drag(); gpu.ui.cancel_value_gesture(); gpu.ui.end_scroll_pan(); gpu.captured_binding = None; gpu.pending_control_value = None; gpu.input.cancel(); self.redraw_pending = true; }
             }
             WindowEvent::RedrawRequested => {
@@ -1201,6 +1612,12 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
             }
             WindowCommand::InputDebugSnapshot { completed } => {
                 let _ = completed.send(self.input_debug_snapshot());
+            }
+            WindowCommand::InputDebugProbe { logical_position, physical_position, completed } => {
+                let _ = completed.send(self.input_debug_probe(logical_position, physical_position));
+            }
+            WindowCommand::InputDebugActivate { logical_position, completed } => {
+                let _ = completed.send(self.input_debug_activate(logical_position));
             }
             WindowCommand::Shutdown => event_loop.exit(),
         }
@@ -1389,10 +1806,75 @@ fn handle_window_input_debug_snapshot(
     }
 }
 
+fn probe_position(params: &Value) -> Result<(Option<[f64; 2]>, Option<[f64; 2]>), &'static str> {
+    let point = |name: &str| -> Result<Option<[f64; 2]>, &'static str> {
+        let Some(value) = params.get(name) else { return Ok(None); };
+        let x = value.get("x").and_then(Value::as_f64).ok_or("position x must be a number")?;
+        let y = value.get("y").and_then(Value::as_f64).ok_or("position y must be a number")?;
+        if !x.is_finite() || !y.is_finite() { return Err("position coordinates must be finite"); }
+        Ok(Some([x, y]))
+    };
+    let logical = point("logical_position")?;
+    let physical = point("physical_position")?;
+    if logical.is_none() && physical.is_none() { return Err("logical_position or physical_position is required"); }
+    Ok((logical, physical))
+}
+
+fn handle_window_input_debug_probe(
+    runtime: &mut WgpuRuntime,
+    proxy: &EventLoopProxy<WindowCommand>,
+    request_id: RequestId,
+    params: Value,
+) -> RpcResponse {
+    if !cfg!(debug_assertions) {
+        return runtime.reject(request_id, "debug_endpoint_unavailable", "window input probing is only available in debug builds", None);
+    }
+    let (logical_position, physical_position) = match probe_position(&params) {
+        Ok(position) => position,
+        Err(message) => return runtime.reject(request_id, "invalid_request", message, None),
+    };
+    let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+    if proxy.send_event(WindowCommand::InputDebugProbe {
+        logical_position, physical_position, completed: completed_tx,
+    }).is_err() {
+        return runtime.reject(request_id, "window_compositor_unavailable", "window compositor is unavailable", None);
+    }
+    match completed_rx.recv_timeout(Duration::from_secs(5)) {
+        Ok(probe) => runtime.accept(request_id, probe),
+        Err(_) => runtime.reject(request_id, "window_compositor_timeout", "window compositor did not report input probe", None),
+    }
+}
+
+fn handle_window_input_debug_activate(
+    runtime: &mut WgpuRuntime,
+    proxy: &EventLoopProxy<WindowCommand>,
+    request_id: RequestId,
+    params: Value,
+) -> RpcResponse {
+    if !cfg!(debug_assertions) {
+        return runtime.reject(request_id, "debug_endpoint_unavailable", "window input activation is only available in debug builds", None);
+    }
+    let logical_position = match probe_position(&params) {
+        Ok((Some(position), None)) => position,
+        Ok(_) => return runtime.reject(request_id, "invalid_request", "logical_position is required for debug activation", None),
+        Err(message) => return runtime.reject(request_id, "invalid_request", message, None),
+    };
+    let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+    if proxy.send_event(WindowCommand::InputDebugActivate { logical_position, completed: completed_tx }).is_err() {
+        return runtime.reject(request_id, "window_compositor_unavailable", "window compositor is unavailable", None);
+    }
+    match completed_rx.recv_timeout(Duration::from_secs(5)) {
+        Ok(Ok(result)) => runtime.accept(request_id, result),
+        Ok(Err(code)) => runtime.reject(request_id, code, "debug activation did not resolve an eligible semantic control", None),
+        Err(_) => runtime.reject(request_id, "window_compositor_timeout", "window compositor did not activate the prepared binding", None),
+    }
+}
+
 fn spawn_window_server(
     epoch: u64,
     endpoint: SocketAddr,
     proxy: EventLoopProxy<WindowCommand>,
+    interaction_traces: Arc<Mutex<InteractionTraceStore>>,
 ) {
     thread::spawn(move || {
         let server = match neon_ipc::RpcServer::bind(endpoint) {
@@ -1403,7 +1885,7 @@ fn spawn_window_server(
                 return;
             }
         };
-        let mut runtime = WgpuRuntime::window_control(epoch);
+        let mut runtime = WgpuRuntime::window_control(epoch, interaction_traces);
         if let Err(error) = server.serve_until(|request| {
             let shutdown = request.method == "service.shutdown";
             let mutates_composition = matches!(request.method.as_str(), "wgpu.ui.submit_fragment" | "wgpu.ui.remove_fragment");
@@ -1413,6 +1895,10 @@ fn spawn_window_server(
                 handle_window_ai_model_status(&mut runtime, &proxy, request.request_id)
             } else if request.method == "debug.window.input.snapshot" {
                 handle_window_input_debug_snapshot(&mut runtime, &proxy, request.request_id)
+            } else if request.method == "debug.window.input.probe" {
+                handle_window_input_debug_probe(&mut runtime, &proxy, request.request_id, request.params)
+            } else if request.method == "debug.window.input.activate" {
+                handle_window_input_debug_activate(&mut runtime, &proxy, request.request_id, request.params)
             } else {
                 runtime.handle(request)
             };
@@ -1426,9 +1912,10 @@ fn spawn_window_server(
                 if send.is_err() {
                     return (runtime.reject(response.request_id, "window_compositor_unavailable", "window compositor is unavailable", None), !shutdown);
                 }
-                match applied_rx.recv_timeout(std::time::Duration::from_secs(2)) {
+                match applied_rx.recv_timeout(std::time::Duration::from_secs(5)) {
                     Ok(()) => {}
-                    Err(_) => return (runtime.reject(response.request_id, "window_compositor_timeout", "window compositor did not apply the fragment", Some(runtime.diagnostics().graph_revision)), !shutdown),
+                    Err(_) => { return (runtime.reject(response.request_id, "window_compositor_timeout", "window compositor did not apply the fragment", Some(runtime.diagnostics().graph_revision)), !shutdown);
+                    }
                 }
             }
             (response, !shutdown)
@@ -1579,6 +2066,7 @@ pub struct WgpuRuntime {
     receipts: HashMap<RequestId, CommandReceipt>,
     idempotent_responses: HashMap<String, RpcResponse>,
     resources: HashMap<u64, UiResourceRecord>,
+    interaction_traces: Arc<Mutex<InteractionTraceStore>>,
 }
 
 impl WgpuRuntime {
@@ -1594,12 +2082,14 @@ impl WgpuRuntime {
             receipts: HashMap::new(),
             idempotent_responses: HashMap::new(),
             resources: HashMap::new(),
+            interaction_traces: Arc::new(Mutex::new(InteractionTraceStore::new())),
         }
     }
 
-    fn window_control(epoch: u64) -> Self {
+    fn window_control(epoch: u64, interaction_traces: Arc<Mutex<InteractionTraceStore>>) -> Self {
         let mut runtime = Self::headless(epoch);
         runtime.window_gpu_available = true;
+        runtime.interaction_traces = interaction_traces;
         runtime
     }
 
@@ -1622,6 +2112,7 @@ impl WgpuRuntime {
         ];
         if self.window_gpu_available {
             capabilities.push(CAPABILITY_AI_TERRAIN_GENERATION.into());
+            capabilities.push(CAPABILITY_DEBUG_INTERACTION.into());
         }
         ServiceDescription {
             service: ServiceName(SERVICE_NAME.into()),
@@ -1675,7 +2166,8 @@ impl WgpuRuntime {
         let request_id = request.request_id.clone();
         let asset: AssetRef = match serde_json::from_value(request.params) {
             Ok(asset) => asset,
-            Err(_) => return self.reject(request_id, "invalid_request", "a stable AssetRef is required", None),
+            Err(_) => { return self.reject(request_id, "invalid_request", "a stable AssetRef is required", None);
+            }
         };
         let job_id = format!("ui-resource-{}-{}", asset.asset_id, asset.revision.0);
         self.resources.insert(asset.asset_id, UiResourceRecord { asset: asset.clone(), job_id: job_id.clone(), state: UiResourceState::Loading });
@@ -1757,9 +2249,12 @@ impl WgpuRuntime {
             "debug.snapshot.get" => self.accept(request_id, json!(self.debug_snapshot())),
             "debug.command.get" => self.command_get(request_id, request.params),
             "debug.trace.query" => self.trace_query(request_id, request.params),
+            "debug.interaction.get" => self.interaction_get(request_id, request.params),
+            "debug.interaction.query" => self.interaction_query(request_id, request.params),
             "wgpu.ui.submit_fragment" => self.submit_fragment(request_id, request.params),
             "wgpu.ui.remove_fragment" => self.remove_fragment(request_id, request.params),
-            "wgpu.ui.semantic_event.validate" | "test.ui.semantic_event.inject" => self.inject_semantic_event(request_id, request.params),
+            "wgpu.ui.semantic_event.validate" | "test.ui.semantic_event.inject" => { self.inject_semantic_event(request_id, request.params)
+            }
             "test.ui.hit_sample.request" => self.hit_sample_request(request_id, request.params),
             "test.ui.hit_sample.complete" => self.hit_sample_complete(request_id, request.params),
             "test.ui.pointer.down" => self.pointer_down(request_id),
@@ -1817,6 +2312,27 @@ impl WgpuRuntime {
             ..JournalFilter::default()
         };
         self.accept(request_id, json!(self.traces(&filter)))
+    }
+
+    fn interaction_get(&mut self, request_id: RequestId, params: Value) -> RpcResponse {
+        let Some(interaction_id) = params.get("interaction_id").and_then(Value::as_str) else {
+            return self.reject(request_id, "invalid_request", "interaction_id is required", None);
+        };
+        let interaction_id = InteractionId(interaction_id.into());
+        let records = self.interaction_traces.lock().ok().map(|traces| traces.get(&interaction_id)).unwrap_or_default();
+        if records.is_empty() {
+            return self.reject(request_id, "not_found", "interaction trace was not found", None);
+        }
+        self.accept(request_id, json!({"interaction_id": interaction_id, "records": records}))
+    }
+
+    fn interaction_query(&mut self, request_id: RequestId, params: Value) -> RpcResponse {
+        let query: InteractionTraceQuery = match serde_json::from_value(params) {
+            Ok(query) => query,
+            Err(_) => return self.reject(request_id, "invalid_request", "invalid interaction trace query", None),
+        };
+        let records = self.interaction_traces.lock().ok().map(|traces| traces.query(&query)).unwrap_or_default();
+        self.accept(request_id, json!({"records": records}))
     }
 
     fn submit_fragment(&mut self, request_id: RequestId, params: Value) -> RpcResponse {
@@ -1917,7 +2433,8 @@ impl WgpuRuntime {
     fn inject_semantic_event(&mut self, request_id: RequestId, params: Value) -> RpcResponse {
         let event: UiSemanticEvent = match serde_json::from_value(params) {
             Ok(event) => event,
-            Err(_) => return self.reject(request_id, "invalid_request", "invalid UI semantic event", None),
+            Err(_) => { return self.reject(request_id, "invalid_request", "invalid UI semantic event", None);
+            }
         };
         let Some(fragment) = self.fragments.get(&event.fragment.id) else {
             return self.reject(request_id, "fragment_revision_stale", "fragment is not present", None);
@@ -1946,7 +2463,7 @@ impl WgpuRuntime {
             Ok(()) => {
                 self.journal.append(TraceLevel::Info, "ui.hit_sample.completed", Some(request_id.clone()), None, None, None, Some(self.graph_revision), Some(self.graph_revision), json!({"pointer_id": pointer_id, "composition_revision": self.graph_revision.0, "fragment_revision": self.graph_revision.0}));
                 self.accept(request_id, json!({"state": self.input.state_name(), "hovered": self.input.hover_id.is_some()}))
-            },
+            }
             Err(code) => self.reject(request_id, code, "hit sample was rejected", None),
         }
     }
@@ -1984,7 +2501,8 @@ impl WgpuRuntime {
     fn resource_preload(&mut self, request_id: RequestId, params: Value) -> RpcResponse {
         let asset: AssetRef = match serde_json::from_value(params) {
             Ok(asset) => asset,
-            Err(_) => return self.reject(request_id, "invalid_request", "a stable AssetRef is required", None),
+            Err(_) => { return self.reject(request_id, "invalid_request", "a stable AssetRef is required", None);
+            }
         };
         if !matches!(asset.kind.as_str(), "font" | "image") {
             return self.reject(request_id, "unsupported_resource_kind", "only font and image resources are supported", None);
@@ -2134,13 +2652,29 @@ mod tests {
     }
 
     #[test]
+    fn pointer_probe_accepts_logical_or_physical_coordinates_and_rejects_invalid_input() {
+        assert_eq!(
+            probe_position(&json!({"logical_position": {"x": 40.0, "y": 60.0}})),
+            Ok((Some([40.0, 60.0]), None))
+        );
+        assert_eq!(
+            probe_position(&json!({"physical_position": {"x": 850.0, "y": 70.0}})),
+            Ok((None, Some([850.0, 70.0])))
+        );
+        assert_eq!(
+            probe_position(&json!({"logical_position": {"x": "bad", "y": 1.0}})),
+            Err("position x must be a number")
+        );
+    }
+
+    #[test]
     fn data_grid_window_scheduler_coalesces_to_the_latest_request() {
         let now = Instant::now();
         let base = UiDataGridWindowRequest {
             renderer_epoch: 1,
             composition_revision: Revision(4),
             fragment: neon_ui_schema::UiFragmentRevision { id: UiFragmentId("virtual-list".into()), revision: Revision(2) },
-            data_grid_key: "virtual-list".into(), expected_list_revision: Revision(1),
+            source_key: "asset_window".into(), expected_list_revision: Revision(1),
             requested_first_row: 8, max_window_rows: 12, sequence: 1,
         };
         let mut latest = LatestDataGridWindowRequests::default();
@@ -2156,10 +2690,64 @@ mod tests {
         assert_eq!(ready[0].sequence, 2);
     }
 
+    #[test]
+    fn data_grid_text_commit_event_keeps_declared_target_and_typed_handle() {
+        let text_handle = neon_ui_schema::UiTextHandle {
+            id: 7,
+            generation: 2,
+        };
+        let binding = UiHitBinding {
+            node_path: "grid/assets/data-grid-row-asset-42/cell-name".into(),
+            fragment: neon_ui_schema::UiFragmentRevision {
+                id: UiFragmentId("grid".into()),
+                revision: Revision(4),
+            },
+            intent: Some(neon_ui_schema::UiIntent::Invoke {
+                action: "asset.name.edit".into(),
+                params: json!({}),
+            }),
+            text_input: Some(ui_renderer::UiTextInputBinding {
+                node_path: "grid/assets/data-grid-row-asset-42/cell-name".into(),
+                max_length: 8,
+                bounds: UiBounds {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 80.0,
+                    height: 24.0,
+                },
+            }),
+            data_grid_cell: Some(neon_ui_schema::UiDataGridCellTarget {
+                source_key: "assets_window".into(),
+                stable_row_key: "asset-42".into(),
+                column_key: "name".into(),
+            }),
+            control_value: Some(neon_ui_schema::UiSemanticPayloadValue::TextHandle {
+                value: text_handle,
+            }),
+            max_text_length: Some(8),
+        };
+        assert!(diagnostic_node_path(&binding).is_none());
+        let event = text_input_commit_event(9, Revision(12), 3, binding, "renamed".into())
+            .expect("a declared edit intent must produce an event");
+        assert_eq!(
+            event.event,
+            neon_ui_schema::UiSemanticEventType::TextInputCommit
+        );
+        assert_eq!(event.renderer_epoch, 9);
+        assert_eq!(event.composition_revision, Revision(12));
+        assert_eq!(event.data_grid_cell.unwrap().stable_row_key, "asset-42");
+        assert_eq!(event.text.unwrap().value, "renamed");
+        assert_eq!(
+            event.control_value,
+            Some(neon_ui_schema::UiSemanticPayloadValue::TextHandle { value: text_handle })
+        );
+    }
+
     fn test_device(label: &'static str) -> (wgpu::Device, wgpu::Queue) {
         let instance = wgpu::Instance::default();
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::LowPower, compatible_surface: None, force_fallback_adapter: true, apply_limit_buckets: false }))
-            .or_else(|_| pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::LowPower, compatible_surface: None, force_fallback_adapter: false, apply_limit_buckets: false })))
+            .or_else(|_| { pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::LowPower, compatible_surface: None, force_fallback_adapter: false, apply_limit_buckets: false }))
+        })
         .expect("a headless WGPU adapter is required");
         pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor { label: Some(label), required_features: wgpu::Features::empty(), required_limits: wgpu::Limits::downlevel_defaults(), experimental_features: wgpu::ExperimentalFeatures::default(), memory_hints: wgpu::MemoryHints::MemoryUsage, trace: wgpu::Trace::Off })).expect("the selected adapter must create a device and queue")
     }
@@ -2259,9 +2847,10 @@ mod tests {
     #[test]
     fn window_control_advertises_gpu_generation_capability_only_there() {
         let headless = WgpuRuntime::headless(1);
-        let window = WgpuRuntime::window_control(1);
+        let window = WgpuRuntime::window_control(1, Arc::new(Mutex::new(InteractionTraceStore::new())));
         assert!(!headless.service_description().capabilities.iter().any(|capability| capability == CAPABILITY_AI_TERRAIN_GENERATION));
         assert!(window.service_description().capabilities.iter().any(|capability| capability == CAPABILITY_AI_TERRAIN_GENERATION));
+        assert!(window.service_description().capabilities.iter().any(|capability| capability == CAPABILITY_DEBUG_INTERACTION));
     }
 
     #[test]
@@ -2834,6 +3423,52 @@ mod tests {
         let records = response.result.unwrap().as_array().unwrap().clone();
         assert!(records.iter().any(|record| record["event"] == "ui.hit_sample.requested"));
         assert!(records.iter().all(|record| record["data"].get("render_hit_id").is_none()));
+    }
+
+    #[test]
+    fn interaction_trace_get_reports_the_accepted_real_window_lifecycle() {
+        let mut runtime = WgpuRuntime::headless(1);
+        let interaction_id = InteractionId("wgpu-window-1-7".into());
+        let target = Some(InteractionSemanticTarget {
+            node_path: "tools/water/apply".into(),
+        });
+        let downstream = RequestId("wgpu-pointer-click-7".into());
+        let mut traces = runtime.interaction_traces.lock().unwrap();
+        traces.append(interaction_id.clone(), InteractionTraceStage::Prepared, InteractionTraceOutcome::Pending, None, None, None, Revision(4), None);
+        traces.append(interaction_id.clone(), InteractionTraceStage::HitCaptureResolved, InteractionTraceOutcome::Accepted, None, target.clone(), Some(Revision(9)), Revision(4), None);
+        traces.append(interaction_id.clone(), InteractionTraceStage::SemanticEventForwarded, InteractionTraceOutcome::Pending, None, target.clone(), Some(Revision(9)), Revision(4), Some(downstream.clone()));
+        traces.append(interaction_id.clone(), InteractionTraceStage::DeliveryAccepted, InteractionTraceOutcome::Accepted, None, target, Some(Revision(9)), Revision(4), Some(downstream));
+        traces.delivery_accepted(interaction_id.clone());
+        traces.composition_applied(Revision(5));
+        drop(traces);
+
+        let response = runtime.handle(request("interaction-get", "debug.interaction.get", json!({"interaction_id": interaction_id.0})));
+        assert_eq!(response.status, RpcStatus::Accepted);
+        let records = response.result.unwrap()["records"].as_array().unwrap().clone();
+        assert_eq!(records.len(), 5);
+        assert_eq!(records[4]["stage"], "composition_revision_applied");
+        assert_eq!(records[4]["composition_revision"], 5);
+        assert_eq!(records[2]["downstream_request_id"], "wgpu-pointer-click-7");
+        assert_eq!(records[1]["semantic_target"]["node_path"], "tools/water/apply");
+        assert!(records.iter().all(|record| record.get("coordinates").is_none() && record.get("hit_id").is_none()));
+    }
+
+    #[test]
+    fn interaction_trace_query_filters_rejected_delivery() {
+        let mut runtime = WgpuRuntime::headless(1);
+        let interaction_id = InteractionId("wgpu-window-1-8".into());
+        let downstream = RequestId("wgpu-pointer-click-8".into());
+        let mut traces = runtime.interaction_traces.lock().unwrap();
+        traces.append(interaction_id.clone(), InteractionTraceStage::Prepared, InteractionTraceOutcome::Pending, None, None, None, Revision(6), None);
+        traces.append(interaction_id.clone(), InteractionTraceStage::DeliveryRejected, InteractionTraceOutcome::Rejected, Some(InteractionTraceError { code: "intent_not_bound".into(), message: "semantic intent is not bound".into() }), Some(InteractionSemanticTarget { node_path: "assets/remove".into() }), Some(Revision(2)), Revision(6), Some(downstream));
+        drop(traces);
+
+        let response = runtime.handle(request("interaction-query", "debug.interaction.query", json!({"after": 1, "limit": 1, "filters": {"outcome": "rejected", "semantic_node_path": "assets/remove"}})));
+        assert_eq!(response.status, RpcStatus::Accepted);
+        let records = response.result.unwrap()["records"].as_array().unwrap().clone();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["stage"], "delivery_rejected");
+        assert_eq!(records[0]["error"]["code"], "intent_not_bound");
     }
 
     #[test]

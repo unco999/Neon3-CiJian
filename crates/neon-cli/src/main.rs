@@ -7,11 +7,49 @@ use std::time::{Duration, Instant};
 fn main() -> ExitCode {
     let args: Vec<_> = std::env::args().skip(1).collect();
     if args.as_slice() == ["--help"] {
-        println!("neon-cli scenario <ui.static-fragment.submit.v1|ui.detail-toggle.v1> --headless");
+        println!(
+            "neon-cli scenario <ui.static-fragment.submit.v1|ui.detail-toggle.v1> --headless\n{}",
+            neon_cli::debug_usage()
+        );
         return ExitCode::SUCCESS;
     }
+    if args.first().is_some_and(|command| command == "debug") {
+        let command = match neon_cli::DebugCommand::parse(&args) {
+            Ok(command) => command,
+            Err(error) => {
+                eprintln!("{error}");
+                return ExitCode::from(2);
+            }
+        };
+        return match neon_cli::execute_debug(command) {
+            Ok(output) => {
+                println!("{output}");
+                if output["response"]["status"] == "accepted" {
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::from(1)
+                }
+            }
+            Err(error) => {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({"status": "failed", "error": {"code": "transport_failed", "message": error.to_string()}})
+                );
+                ExitCode::from(1)
+            }
+        };
+    }
     let scenario = match args.as_slice() {
-        [command, scenario, mode] if command == "scenario" && mode == "--headless" && matches!(scenario.as_str(), "ui.static-fragment.submit.v1" | "ui.detail-toggle.v1") => scenario.as_str(),
+        [command, scenario, mode]
+            if command == "scenario"
+                && mode == "--headless"
+                && matches!(
+                    scenario.as_str(),
+                    "ui.static-fragment.submit.v1" | "ui.detail-toggle.v1"
+                ) =>
+        {
+            scenario.as_str()
+        }
         _ => {
             eprintln!("unsupported command");
             return ExitCode::from(2);
@@ -24,7 +62,11 @@ fn main() -> ExitCode {
         .expect("reserved endpoint must have address");
     drop(reservation);
     let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let request_count = if scenario == neon_cli::DETAIL_TOGGLE_SCENARIO_ID { "5" } else { "10" };
+    let request_count = if scenario == neon_cli::DETAIL_TOGGLE_SCENARIO_ID {
+        "5"
+    } else {
+        "10"
+    };
     let mut server = Command::new("cargo")
         .args([
             "run",
@@ -42,7 +84,11 @@ fn main() -> ExitCode {
 
     let deadline = Instant::now() + Duration::from_secs(10);
     let outcome = loop {
-        match if scenario == neon_cli::DETAIL_TOGGLE_SCENARIO_ID { neon_cli::run_detail_toggle_scenario(endpoint) } else { neon_cli::run_headless_scenario(endpoint) } {
+        match if scenario == neon_cli::DETAIL_TOGGLE_SCENARIO_ID {
+            neon_cli::run_detail_toggle_scenario(endpoint)
+        } else {
+            neon_cli::run_headless_scenario(endpoint)
+        } {
             Ok(outcome) => break outcome,
             Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
             Err(error) => {

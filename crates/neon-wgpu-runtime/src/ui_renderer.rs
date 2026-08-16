@@ -6,11 +6,11 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 use bytemuck::{Pod, Zeroable};
 use neon_protocol::{AssetBytes, AssetRef};
-use serde_json::{json, Value};
 use neon_ui_schema::{
-    RenderSurfaceRef, TextRef, UiAlignItems, UiBounds, UiClipPolicy, UiDragAxis, UiDragBinding,
-    UiControlPresentation, UiDataGridCellTarget, UiDragBoundary, UiDropPlacement, UiEasing, UiFragment, UiFragmentRevision, UiIntent,
-    UiDataGridWindowRequest, UiJustifyContent, UiLayout, UiLayoutMode, UiNode, UiNodeKind, UiSemanticPayloadValue, UiStyle, UiTransition,
+    RenderSurfaceRef, TextRef, UiAlignItems, UiBounds, UiClipPolicy, UiControlPresentation,
+    UiDataGridCellTarget, UiDataGridWindowRequest, UiDragAxis, UiDragBinding, UiDragBoundary, UiDropPlacement, UiEasing, UiFragment, UiFragmentRevision, UiIntent, UiJustifyContent, UiLayout, UiLayoutMode, UiNode, UiNodeKind, UiSemanticPayloadValue, UiStyle, UiTransition,
+};
+use serde_json::{Value, json
 };
 
 const SHADER: &str = r#"
@@ -608,6 +608,20 @@ struct ScrollPan {
     offset_start: [f32; 2],
 }
 
+/// Renderer-local identity for a virtual cell. It deliberately excludes
+/// renderer topology, GPU hit IDs, and the row's current frame position.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct DataGridCellIdentity {
+    source_key: String,
+    stable_row_key: String,
+    column_key: String,
+}
+
+#[derive(Clone, Debug)]
+struct CachedDataGridTextDisplay {
+    text: String,
+}
+
 pub struct UiWgpuRenderer {
     pipeline: wgpu::RenderPipeline,
     view_buffer: wgpu::Buffer,
@@ -658,6 +672,7 @@ pub struct UiWgpuRenderer {
     scroll_metrics: HashMap<String, ScrollMetrics>,
     scroll_drag: Option<ScrollDrag>,
     scroll_pan: Option<ScrollPan>,
+    data_grid_text_display_cache: HashMap<DataGridCellIdentity, CachedDataGridTextDisplay>,
 }
 
 impl UiWgpuRenderer {
@@ -1043,6 +1058,7 @@ impl UiWgpuRenderer {
             scroll_metrics: HashMap::new(),
             scroll_drag: None,
             scroll_pan: None,
+            data_grid_text_display_cache: HashMap::new(),
         }
     }
 
@@ -1057,54 +1073,11 @@ impl UiWgpuRenderer {
     ) {
         pass.set_pipeline(&self.hit_clear_pipeline);
         pass.draw(0..3, 0..1);
-        let declarations = collect_hit_declarations(fragments);
-        self.hit_bindings.clear();
+        self.refresh_plan(fragments);
+        let hit_nodes = self.refresh_hit_bindings(fragments);
         let mut instances = Vec::new();
-        for (node_path, _, visual, _) in flatten_fragments(fragments, self.resident_font.as_ref()) {
-            let has_drag_binding = fragments.iter().any(|(fragment_id, fragment)| {
-                let source_path = format!("{}/", fragment_id.0);
-                node_path.strip_prefix(&source_path).is_some_and(|node_id| {
-                    fragment.effects.iter().any(|effect| {
-                        matches!(effect, neon_ui_schema::UiEffect::DragBinding { binding } if binding.source_node_id.0 == node_id)
-                    })
-                })
-            });
-            if (!is_interactive_control(&visual.kind)
-                && !has_drag_binding)
-                || !visual.enabled
-                || visual.style.opacity <= 0.0
-            {
-                continue;
-            }
-            if is_data_grid_cell_path(&node_path) && !declarations.contains_key(&node_path) {
-                continue;
-            }
-            let hit_id = instances.len() as u32 + 1;
-            let mut binding = declarations
-                .get(&node_path)
-                .cloned()
-                .unwrap_or(UiHitBinding {
-                    node_path: node_path.clone(),
-                    fragment: UiFragmentRevision {
-                        id: neon_ui_schema::UiFragmentId(
-                            node_path.split('/').next().unwrap_or_default().into(),
-                        ),
-                        revision: neon_protocol::Revision(0),
-                    },
-                    intent: None,
-                    text_input: None,
-                    data_grid_cell: None,
-                    control_value: None,
-                    max_text_length: None,
-                });
-            if visual.kind == UiNodeKind::TextInput {
-                binding.text_input = Some(UiTextInputBinding {
-                    node_path: node_path.clone(),
-                    max_length: binding.max_text_length.unwrap_or(256),
-                    bounds: visual.bounds,
-                });
-            }
-            self.hit_bindings.insert(hit_id, binding);
+        for (hit_id, index) in hit_nodes {
+            let visual = self.visual_at(index);
             instances.push(UiHitInstance {
                 rect: [
                     visual.bounds.x,
@@ -1177,13 +1150,39 @@ impl UiWgpuRenderer {
         self.hit_bindings.get(&hit_id).cloned()
     }
 
+    /// Makes CPU-side pointer handling independent of a prior redraw or GPU hit readback.
+    /// Rendering still performs the full composed visual pass; this prepares the current
+    /// declaration sample and its renderer-local semantic bindings for an incoming press.
+    pub(crate) fn prepare_interaction(
+        &mut self,
+        fragments: &HashMap<neon_ui_schema::UiFragmentId, UiFragment>,
+        viewport_size: [u32; 2],
+        time_seconds: f32,
+    ) {
+        self.viewport_size = [viewport_size[0].max(1), viewport_size[1].max(1)];
+        self.refresh_plan(fragments);
+        self.update_scroll_metrics();
+        for index in 0..self.plan.len() {
+            let node = &self.plan[index];
+            self.sampled[index] = Self::sample(
+                &mut self.current,
+                &mut self.active,
+                &node.id,
+                &node.target,
+                node.transition.as_ref(),
+                time_seconds,
+            );
+        }
+        self.refresh_hit_bindings(fragments);
+    }
+
     /// Semantic declaration paths only. Numeric renderer hit IDs remain private
     /// to this process and are never included in a diagnostic response.
     pub(crate) fn semantic_hit_nodes(&self) -> Vec<String> {
         let mut paths = self
             .hit_bindings
             .values()
-            .filter(|binding| binding.intent.is_some())
+            .filter(|binding| binding.intent.is_some() && binding.data_grid_cell.is_none())
             .map(|binding| binding.node_path.clone())
             .collect::<Vec<_>>();
         paths.sort();
@@ -1197,10 +1196,12 @@ impl UiWgpuRenderer {
     pub(crate) fn hit_id_at_pointer(&self) -> Option<u32> {
         let pointer = self.pointer_position?;
         let modal = self.active_modal_index();
-        self.plan.iter().rev().find_map(|node| {
-            if !node.target.enabled
-                || !contains(node.target.bounds, pointer)
-                || !contains(node.target.clip, pointer)
+        self.plan.iter().enumerate()
+            .rev().find_map(|(index,node)| {
+                let visual = self.visual_at(index);
+            if !visual.enabled
+                || !contains(visual.bounds, pointer)
+                || !contains(visual.clip, pointer)
             {
                 return None;
             }
@@ -1215,12 +1216,49 @@ impl UiWgpuRenderer {
         })
     }
 
+    /// Debug-only semantic diagnostics for a prepared pointer sample. Renderer
+    /// hit IDs remain process-local, including on this diagnostic path.
+    pub(crate) fn pointer_probe_snapshot(&self) -> Value {
+        let fallback = self.hit_id_at_pointer().and_then(|hit_id| self.hit_binding(hit_id));
+        let modal = self.active_modal_index().map(|index| {
+            let visual = self.visual_at(index);
+            json!({
+                "active": true,
+                "semantic_node_path": self.plan[index].id,
+                "blocks_pointer": self.modal_blocks_pointer(),
+                "bounds": {"x": visual.bounds.x, "y": visual.bounds.y, "width": visual.bounds.width, "height": visual.bounds.height},
+            })
+        }).unwrap_or_else(|| json!({"active": false, "blocks_pointer": false}));
+        let scroll_container = self.pointer_position.and_then(|pointer| {
+            self.plan.iter().rev().find_map(|node| {
+                let metrics = self.scroll_metrics.get(&node.id)?;
+                (node.target.scroll && contains(metrics.viewport, pointer)).then(|| {
+                    let offset = self.scroll_offsets.get(&node.id).copied().unwrap_or(node.target.declared_scroll_offset);
+                    json!({
+                        "semantic_node_path": node.id,
+                        "offset": {"x": offset[0], "y": offset[1]},
+                        "max_offset": {"x": metrics.max_offset[0], "y": metrics.max_offset[1]},
+                    })
+                })
+            })
+        });
+        json!({
+            "fallback_hit": match fallback {
+                Some(binding) => json!({"status": "hit", "semantic_node_path": binding.node_path}),
+                None => json!({"status": "miss", "semantic_node_path": Value::Null}),
+            },
+            "modal": modal,
+            "scroll_container": scroll_container,
+        })
+    }
+
     pub(crate) fn scroll_wheel_at_pointer(&mut self, delta: [f32; 2]) -> bool {
         let Some(pointer) = self.pointer_position else { return false; };
         let Some(node) = self.plan.iter().enumerate().rev().find(|(_, node)| {
             node.target.scroll
                 && contains(node.target.bounds, pointer)
-                && self.scroll_metrics.get(&node.id).is_some_and(|metrics| metrics.max_offset[0] > 0.0 || metrics.max_offset[1] > 0.0)
+                && self.scroll_metrics.get(&node.id).is_some_and(|metrics| { metrics.max_offset[0] > 0.0 || metrics.max_offset[1] > 0.0
+                })
         }) else { return false; };
         let metrics = self.scroll_metrics[&node.1.id];
         let offset = self.scroll_offsets.entry(node.1.id.clone()).or_insert(node.1.target.declared_scroll_offset);
@@ -1264,8 +1302,13 @@ impl UiWgpuRenderer {
                     offset_y,
                     grid.target.bounds.height,
                 ) else { continue; };
-                let requested_end = requested_first_row.saturating_add(required_rows);
-                let frame_end = frame.first_row.saturating_add(frame.window_rows.len() as u64);
+                let requested_end = requested_first_row
+                    .saturating_add(required_rows)
+                    .min(frame.total_rows);
+                let frame_end = frame
+                    .first_row
+                    .saturating_add(frame.window_rows.len() as u64)
+                    .min(frame.total_rows);
                 if requested_first_row >= frame.first_row && requested_end <= frame_end {
                     continue;
                 }
@@ -1277,7 +1320,7 @@ impl UiWgpuRenderer {
                         id: fragment.fragment_id.clone(),
                         revision: fragment.revision,
                     },
-                    data_grid_key: declaration.node_key.clone(),
+                    source_key: declaration.source_key.clone(),
                     expected_list_revision: frame.list_revision,
                     requested_first_row,
                     max_window_rows: declaration.max_window_rows,
@@ -1446,9 +1489,12 @@ impl UiWgpuRenderer {
             return false;
         }
         let Some(pointer) = self.pointer_position else { return false; };
-        let Some(node) = self.plan.iter().find(|node| {
-            node.target.kind == UiNodeKind::Dropdown && contains(node.target.bounds, pointer)
-        }) else { return false; };
+        let Some(node) = self.plan.iter().enumerate()
+            .find(|(index,node)| {
+            node.target.kind == UiNodeKind::Dropdown && contains(self.visual_at(*index).bounds, pointer)
+                    && contains(self.visual_at(*index).clip, pointer)
+        })
+            .map(|(_, node)| node) else { return false; };
         if self.open_dropdown.as_deref() == Some(node.id.as_str()) {
             self.open_dropdown = None;
         } else {
@@ -1478,11 +1524,12 @@ impl UiWgpuRenderer {
             return None;
         }
         let pointer = self.pointer_position?;
-        let node = self.plan.iter().find(|node| {
-            node.target.kind == UiNodeKind::ListBox && contains(node.target.bounds, pointer)
+        let (index, node) = self.plan.iter().enumerate().find(|(index,node)| {
+            node.target.kind == UiNodeKind::ListBox && contains(self.visual_at(*index).bounds, pointer)
+                && contains(self.visual_at(*index).clip, pointer)
         })?;
         let UiControlPresentation::Choice { options, .. } = node.target.presentation.as_ref()? else { return None; };
-        let index = list_box_rows(node.target.bounds, options.len())
+        let index = list_box_rows(self.visual_at(index).bounds, options.len())
             .iter()
             .position(|row| contains(*row, pointer))?;
         let value = options.get(index)?.clone();
@@ -1496,15 +1543,22 @@ impl UiWgpuRenderer {
     }
 
     pub(crate) fn dropdown_debug_snapshot(&self) -> Value {
+        let diagnostic_node_path = |node_path: &str| {
+            self.hit_bindings
+                .values()
+                .find(|binding| binding.node_path == node_path && binding.data_grid_cell.is_none())
+                .map(|binding| binding.node_path.as_str())
+        };
         let popup = self.dropdown_popup_layout().map(|(plan_index, rows)| {
-            let anchor = self.plan[plan_index].target.bounds;
+            let anchor = self.visual_at(plan_index).bounds;
             json!({
-                "node_path": self.plan[plan_index].id,
+                "node_path": diagnostic_node_path(& self.plan[plan_index].id),
                 "anchor": {"x": anchor.x, "y": anchor.y, "width": anchor.width, "height": anchor.height},
                 "rows": rows.iter().map(|row| json!({"x": row.x, "y": row.y, "width": row.width, "height": row.height})).collect::<Vec<_>>(),
             })
         });
-        json!({"viewport": self.viewport_size, "open_dropdown": self.open_dropdown, "popup": popup})
+        let open_dropdown = self.open_dropdown.as_deref().and_then(diagnostic_node_path);
+        json!({"viewport": self.viewport_size, "open_dropdown":open_dropdown, "popup": popup})
     }
 
     /// A top-level popup consumes an outside press before underlying controls
@@ -1512,7 +1566,7 @@ impl UiWgpuRenderer {
     pub(crate) fn dismiss_dropdown_at_pointer(&mut self) -> bool {
         let Some(pointer) = self.pointer_position else { return false; };
         let Some((plan_index, rows)) = self.dropdown_popup_layout() else { return false; };
-        let source = self.plan[plan_index].target.bounds;
+        let source = self.visual_at(plan_index).bounds;
         if contains(source, pointer) || rows.iter().any(|row| contains(*row, pointer)) {
             return false;
         }
@@ -1574,8 +1628,23 @@ impl UiWgpuRenderer {
         self.hit_bindings
             .values()
             .filter_map(|binding| binding.text_input.as_ref())
-            .find(|input| self.active_modal_allows_node(&input.node_path) && contains(input.bounds, pointer))
-            .cloned()
+            .find_map(|input| {
+                let (bounds, clip) = self
+                    .plan
+                    .iter()
+                    .position(|node| node.id == input.node_path)
+                    .map(|index| {
+                        let visual = self.visual_at(index);
+                        (visual.bounds, visual.clip)
+                    })
+                    .unwrap_or((input.bounds, input.bounds));
+                (self.active_modal_allows_node(&input.node_path) && contains(bounds, pointer)
+                    && contains(clip, pointer))
+                .then(|| UiTextInputBinding {
+                    bounds,
+                    ..input.clone()
+                })
+            })
     }
 
     /// Focus is renderer-local presentation state. Semantic events still carry
@@ -1586,8 +1655,11 @@ impl UiWgpuRenderer {
         }
         let Some(pointer) = self.pointer_position else { return false; };
         let Some(path) = self.hit_bindings.values().find_map(|binding| {
-            self.plan.iter().find(|node| node.id == binding.node_path)
-                .filter(|node| self.active_modal_allows_node(&node.id) && node.target.enabled && contains(node.target.bounds, pointer))
+            self.plan.iter().enumerate()
+                .find(|(_,node)| node.id == binding.node_path)
+                .filter(|(index,node)| { self.active_modal_allows_node(&node.id) && self.visual_at(*index).enabled && contains(self.visual_at(*index).bounds, pointer)
+                        && contains(self.visual_at(*index).clip, pointer)
+                })
                 .map(|_| binding.node_path.clone())
         }) else { return false; };
         self.focused_control = Some(path);
@@ -1602,6 +1674,10 @@ impl UiWgpuRenderer {
 
     pub(crate) fn pointer_position(&self) -> Option<[f32; 2]> {
         self.pointer_position
+    }
+
+    fn visual_at(&self, index: usize) -> &UiVisual {
+        self.sampled.get(index).unwrap_or(&self.plan[index].target)
     }
 
     pub(crate) fn begin_drag_at_pointer(
@@ -1786,6 +1862,9 @@ impl UiWgpuRenderer {
     }
 
     pub(crate) fn focus_text_input(&mut self, binding: UiTextInputBinding) {
+        if self.editing.node_path.as_deref() == Some(binding.node_path.as_str()) {
+            return;
+        }
         let initial_value = self
             .plan
             .iter()
@@ -1809,8 +1888,8 @@ impl UiWgpuRenderer {
         let Some(bounds) = self
             .plan
             .iter()
-            .find(|node| node.id == node_path)
-            .map(|node| node.target.bounds)
+            .position(|node| node.id == node_path)
+            .map(|index| self.visual_at(index).bounds)
         else {
             return;
         };
@@ -1840,6 +1919,12 @@ impl UiWgpuRenderer {
         let committed = self.editing.commit(value)?;
         self.ensure_text_input_caret_visible();
         self.pointer_visual_dirty = true;
+        if self
+            .text_input_binding(&node_path)
+            .is_some_and(|binding| binding.data_grid_cell.is_some())
+        {
+            return None;
+        }
         let binding = self.text_input_binding(&node_path)?;
         Some((binding, committed))
     }
@@ -1849,6 +1934,12 @@ impl UiWgpuRenderer {
         let committed = self.editing.backspace()?;
         self.ensure_text_input_caret_visible();
         self.pointer_visual_dirty = true;
+        if self
+            .text_input_binding(&node_path)
+            .is_some_and(|binding| binding.data_grid_cell.is_some())
+        {
+            return None;
+        }
         Some((self.text_input_binding(&node_path)?, committed))
     }
 
@@ -1857,7 +1948,54 @@ impl UiWgpuRenderer {
         let committed = self.editing.delete()?;
         self.ensure_text_input_caret_visible();
         self.pointer_visual_dirty = true;
+        if self
+            .text_input_binding(&node_path)
+            .is_some_and(|binding| binding.data_grid_cell.is_some())
+        {
+            return None;
+        }
         Some((self.text_input_binding(&node_path)?, committed))
+    }
+
+    pub(crate) fn data_grid_text_input_active(&self) -> bool {
+        self.editing
+            .node_path
+            .as_deref()
+            .and_then(|path| self.text_input_binding(path))
+            .is_some_and(|binding| binding.data_grid_cell.is_some())
+    }
+
+    pub(crate) fn active_text_input_path(&self) -> Option<&str> {
+        self.editing.node_path.as_deref()
+    }
+
+    pub(crate) fn finish_data_grid_text_input(&mut self) -> Option<(UiHitBinding, String)> {
+        let node_path = self.editing.node_path.clone()?;
+        let binding = self.text_input_binding(&node_path)?;
+        if binding.data_grid_cell.is_none() {
+            return None;
+        }
+        let value = self.editing.committed.clone();
+        if let Some(identity) = data_grid_cell_identity(&binding) {
+            self.data_grid_text_display_cache.insert(
+                identity,
+                CachedDataGridTextDisplay {
+                    text: value.clone(),
+                },
+            );
+        }
+        self.editing.clear();
+        self.pointer_visual_dirty = true;
+        Some((binding, value))
+    }
+
+    pub(crate) fn cancel_data_grid_text_input(&mut self) -> bool {
+        if !self.data_grid_text_input_active() {
+            return false;
+        }
+        self.editing.clear();
+        self.pointer_visual_dirty = true;
+        true
     }
 
     pub(crate) fn move_text_input_cursor(&mut self, delta: isize, extend_selection: bool) -> bool {
@@ -1897,9 +2035,9 @@ impl UiWgpuRenderer {
         let bounds = self
             .plan
             .iter()
-            .find(|node| &node.id == node_path)?
-            .target
-            .bounds;
+            .position(|node| &node.id == node_path)
+            .map(|index| self.visual_at(index)
+            .bounds)?;
         let font = self.resident_font.as_ref()?;
         let x = bounds.x
             + TEXT_INPUT_INSET
@@ -1928,8 +2066,8 @@ impl UiWgpuRenderer {
         let Some(bounds) = self
             .plan
             .iter()
-            .find(|node| &node.id == node_path)
-            .map(|node| node.target.bounds)
+            .position(|node| &node.id == node_path)
+            .map(|index| self.visual_at(index).bounds)
         else {
             return;
         };
@@ -2301,14 +2439,14 @@ impl UiWgpuRenderer {
             self.sampled[index].bounds.y -= inherited_scroll[1];
             self.sampled[index].clip.x += inherited_translation[0];
             self.sampled[index].clip.y += inherited_translation[1];
-            self.sampled[index].clip.x -= inherited_scroll[0];
-            self.sampled[index].clip.y -= inherited_scroll[1];
-            if let Some(scroll_clip) = inherited_scroll_clip {
-                self.sampled[index].clip = intersect_clip(Some(scroll_clip), self.sampled[index].clip);
-            }
             if self.sampled[index].clip == target.bounds {
                 self.sampled[index].clip.x += own_translation[0];
                 self.sampled[index].clip.y += own_translation[1];
+            }
+            // Clips are window-space viewports. Scroll moves content through them;
+            // moving the inherited clip would erase the trailing viewport area.
+            if let Some(scroll_clip) = inherited_scroll_clip {
+                self.sampled[index].clip = intersect_clip(Some(scroll_clip), self.sampled[index].clip);
             }
             self.sampled[index].style.opacity *= inherited_opacity;
             if top_layer[index].is_some() {
@@ -2349,7 +2487,10 @@ impl UiWgpuRenderer {
                 inherited_scroll[1] + own_scroll[1],
             ];
             subtree_scroll_clip[index] = if target.scroll {
-                Some(target.bounds)
+                // Capture the viewport after composing all ancestor transforms and
+                // scroll offsets. Descendants move through this fixed screen-space
+                // rectangle, rather than translating their own content clips.
+                Some(intersect_clip(inherited_scroll_clip, self.sampled[index].bounds))
             } else {
                 inherited_scroll_clip
             };
@@ -2375,6 +2516,9 @@ impl UiWgpuRenderer {
                 self.dirty_instances.extend(first_instance..self.instances.len());
             }
         }
+        // CPU first-press handling must be ready as soon as the visible frame is
+        // drawn; asynchronous GPU hit readback is only supplemental.
+        self.refresh_hit_bindings(fragments);
         // Reuse the dropdown popup resource path for declarative top-level layers.
         // Modal backdrops are inserted immediately before their own subtree.
         let mut popup_instances = self.dropdown_popup_instances();
@@ -2523,9 +2667,10 @@ impl UiWgpuRenderer {
         let dropdown_texts = self.dropdown_option_texts();
         let list_box_texts = self.list_box_option_texts();
         let drag_value_texts = self.drag_value_texts();
-        let visible_top_layer = top_layer.iter().map(|root| root.is_none_or(|root| {
+        let visible_top_layer = top_layer.iter().map(|root| { root.is_none_or(|root| {
             self.plan[root].target.kind != UiNodeKind::Tooltip || self.tooltip_hovered(root)
-        })).collect::<Vec<_>>();
+        })
+            }).collect::<Vec<_>>();
         let (texts, popup_texts) = self
             .resident_font
             .as_mut()
@@ -2654,7 +2799,12 @@ impl UiWgpuRenderer {
         if matches {
             return false;
         }
-        let nodes = flatten_fragments(fragments, self.resident_font.as_ref());
+        self.reconcile_data_grid_text_display_cache(fragments);
+        let nodes = flatten_fragments_with_data_grid_display_cache(
+            fragments,
+            self.resident_font.as_ref(),
+            &self.data_grid_text_display_cache,
+        );
         let live: HashSet<_> = nodes.iter().map(|(id, _, _, _)| id.clone()).collect();
         self.current.retain(|id, _| live.contains(id));
         self.active.retain(|id, _| live.contains(id));
@@ -2678,7 +2828,8 @@ impl UiWgpuRenderer {
                 instance_index,
             });
         }
-        self.scroll_offsets.retain(|id, _| self.plan.iter().any(|node| node.id == *id && node.target.scroll));
+        self.scroll_offsets.retain(|id, _| { self.plan.iter().any(|node| node.id == *id && node.target.scroll)
+        });
         for node in &self.plan {
             if node.target.scroll {
                 self.scroll_offsets.entry(node.id.clone()).or_insert(node.target.declared_scroll_offset);
@@ -2691,6 +2842,100 @@ impl UiWgpuRenderer {
                 .map(|(id, fragment)| (id.clone(), fragment.revision)),
         );
         true
+    }
+
+    fn reconcile_data_grid_text_display_cache(
+        &mut self,
+        fragments: &HashMap<neon_ui_schema::UiFragmentId, UiFragment>,
+    ) {
+        let mut frame_cells = HashMap::new();
+        let mut sources = HashSet::new();
+
+        for fragment in fragments.values() {
+            for effect in &fragment.effects {
+                let neon_ui_schema::UiEffect::DataGridFrame { declaration, frame } = effect else {
+                    continue;
+                };
+                sources.insert(declaration.source_key.clone());
+                for row in frame.window_rows.iter().take(declaration.max_window_rows as usize) {
+                    for (column_key, cell) in &row.cells {
+                        let identity = DataGridCellIdentity {
+                            source_key: declaration.source_key.clone(),
+                            stable_row_key: row.stable_row_key.clone(),
+                            column_key: column_key.clone(),
+                        };
+                        frame_cells.insert(identity, cell);
+                    }
+                }
+            }
+        }
+
+        self.data_grid_text_display_cache.retain(|identity, _| {
+            sources.contains(&identity.source_key)
+                && frame_cells.get(identity).is_some_and(|cell| {
+                    matches!(cell.value, neon_ui_schema::UiInputValue::TextHandle { .. })
+                })
+        });
+    }
+
+    fn refresh_hit_bindings(
+        &mut self,
+        fragments: &HashMap<neon_ui_schema::UiFragmentId, UiFragment>,
+    ) -> Vec<(u32, usize)> {
+        let declarations = collect_hit_declarations(fragments);
+        self.hit_bindings.clear();
+        let mut hit_nodes = Vec::new();
+        for index in 0..self.plan.len() {
+            let node_path = self.plan[index].id.clone();
+            let visual = self.visual_at(index);
+            let kind = visual.kind.clone();
+            let enabled = visual.enabled;
+            let opacity = visual.style.opacity;
+            let bounds = visual.bounds;
+            let has_drag_binding = fragments.iter().any(|(fragment_id, fragment)| {
+                let source_path = format!("{}/", fragment_id.0);
+                node_path.strip_prefix(&source_path).is_some_and(|node_id| {
+                    fragment.effects.iter().any(|effect| {
+                        matches!(effect, neon_ui_schema::UiEffect::DragBinding { binding } if binding.source_node_id.0 == node_id)
+                    })
+                })
+            });
+            if (!is_interactive_control(&kind) && !has_drag_binding)
+                || !enabled
+                || opacity <= 0.0
+                || (is_data_grid_cell_path(&node_path) && !declarations.contains_key(&node_path))
+            {
+                continue;
+            }
+            let hit_id = hit_nodes.len() as u32 + 1;
+            let mut binding = declarations
+                .get(&node_path)
+                .cloned()
+                .unwrap_or(UiHitBinding {
+                    node_path: node_path.clone(),
+                    fragment: UiFragmentRevision {
+                        id: neon_ui_schema::UiFragmentId(
+                            node_path.split('/').next().unwrap_or_default().into(),
+                        ),
+                        revision: neon_protocol::Revision(0),
+                    },
+                    intent: None,
+                    text_input: None,
+                    data_grid_cell: None,
+                    control_value: None,
+                    max_text_length: None,
+                });
+            if kind == UiNodeKind::TextInput {
+                binding.text_input = Some(UiTextInputBinding {
+                    node_path,
+                    max_length: binding.max_text_length.unwrap_or(256),
+                    bounds,
+                });
+            }
+            self.hit_bindings.insert(hit_id, binding);
+            hit_nodes.push((hit_id, index));
+        }
+        hit_nodes
     }
 
     fn update_scroll_metrics(&mut self) {
@@ -2891,15 +3136,12 @@ impl UiWgpuRenderer {
         let mut preview = visual.clone();
         if let Some(value) = self.value_previews.get(node_path) {
             preview.presentation = match (&preview.presentation, value) {
-                (Some(UiControlPresentation::Numeric { min, max, .. }), UiSemanticPayloadValue::F32 { value }) => {
-                    Some(UiControlPresentation::Numeric { value: *value, min: *min, max: *max })
-                }
-                (Some(UiControlPresentation::Numeric { min, max, .. }), UiSemanticPayloadValue::I32 { value }) => {
-                    Some(UiControlPresentation::Numeric { value: *value as f32, min: *min, max: *max })
-                }
-                (Some(UiControlPresentation::Scroll { .. }), UiSemanticPayloadValue::F32 { value }) => {
-                    Some(UiControlPresentation::Scroll { position: *value })
-                }
+                (Some(UiControlPresentation::Numeric { min, max, .. }), UiSemanticPayloadValue::F32 { value }) =>
+                    Some(UiControlPresentation::Numeric { value: *value, min: *min, max: *max }),
+                (Some(UiControlPresentation::Numeric { min, max, .. }), UiSemanticPayloadValue::I32 { value }) =>
+                    Some(UiControlPresentation::Numeric { value: *value as f32, min: *min, max: *max }),
+                (Some(UiControlPresentation::Scroll { .. }), UiSemanticPayloadValue::F32 { value }) =>
+                    Some(UiControlPresentation::Scroll { position: *value }),
                 _ => preview.presentation,
             };
         }
@@ -2911,20 +3153,21 @@ impl UiWgpuRenderer {
         let node_path = self.open_dropdown.as_ref()?;
         let plan_index = self.plan.iter().position(|node| &node.id == node_path)?;
         let node = &self.plan[plan_index];
+        let anchor = self.visual_at(plan_index).bounds;
         let UiControlPresentation::Choice { options, .. } = node.target.presentation.as_ref()? else { return None; };
         let row_height = 24.0;
         let margin = 4.0;
         let popup_height = options.len() as f32 * row_height;
         let viewport_height = self.viewport_size[1].max(1) as f32;
-        let y = if node.target.bounds.y + node.target.bounds.height + margin + popup_height <= viewport_height - margin {
-            node.target.bounds.y + node.target.bounds.height + margin
+        let y = if anchor.y + anchor.height + margin + popup_height <= viewport_height - margin {
+            anchor.y + anchor.height + margin
         } else {
-            (node.target.bounds.y - margin - popup_height).max(margin)
+            (anchor.y - margin - popup_height).max(margin)
         };
         Some((plan_index, (0..options.len()).map(|index| UiBounds {
-                    x: node.target.bounds.x,
+                    x: anchor.x,
                     y: y + index as f32 * row_height,
-                    width: node.target.bounds.width,
+                    width: anchor.width,
                     height: row_height,
         }).collect()))
     }
@@ -3026,13 +3269,21 @@ fn data_grid_requested_range(
     if row_height <= 0.0 || frame.total_rows == 0 || !offset_y.is_finite() || !viewport_height.is_finite() {
         return None;
     }
-    let first_visible = (offset_y.max(0.0) / row_height).floor() as u64;
+    // Row zero begins below the grid header, so convert from scroll content space
+    // to a data-row index only after accounting for that leading header row.
+    let first_visible = ((offset_y - row_height).max(0.0) / row_height).floor() as u64;
     let requested_first_row = first_visible.saturating_sub(u64::from(declaration.overscan));
     let viewport_rows = (viewport_height.max(0.0) / row_height).ceil().max(1.0) as u64;
     let required_rows = (viewport_rows + u64::from(declaration.overscan) * 2)
         .min(u64::from(declaration.max_window_rows));
+    let final_window_first_row = frame.total_rows.saturating_sub(required_rows);
+    let requested_first_row = if first_visible.saturating_add(viewport_rows) >= frame.total_rows {
+        final_window_first_row
+    } else {
+        requested_first_row.min(final_window_first_row)
+    };
     Some((
-        requested_first_row.min(frame.total_rows.saturating_sub(required_rows)),
+        requested_first_row,
         required_rows,
     ))
 }
@@ -3139,8 +3390,10 @@ fn component_chrome_instances(visual: &UiVisual) -> Vec<UiInstance> {
         _ => 0.5,
     };
     let choice_tint = match &visual.presentation {
-        Some(UiControlPresentation::Choice { token, .. }) if token == "alpha" => [0.86, 0.59, 0.33, 0.95],
-        Some(UiControlPresentation::Choice { token, .. }) if token == "gamma" => [0.48, 0.66, 0.95, 0.95],
+        Some(UiControlPresentation::Choice { token, .. }) if token == "alpha" => { [0.86, 0.59, 0.33, 0.95]
+        }
+        Some(UiControlPresentation::Choice { token, .. }) if token == "gamma" => { [0.48, 0.66, 0.95, 0.95]
+        }
         _ => mint,
     };
     match visual.kind {
@@ -3196,10 +3449,11 @@ fn component_chrome_instances(visual: &UiVisual) -> Vec<UiInstance> {
             3.0,
         )],
         UiNodeKind::ListBox => match &visual.presentation {
-            Some(UiControlPresentation::Choice { token, options, .. }) => list_box_rows(bounds, options.len()).into_iter().zip(options).map(|(row, option)| {
+            Some(UiControlPresentation::Choice { token, options, .. }) => { list_box_rows(bounds, options.len()).into_iter().zip(options).map(|(row, option)| {
                 let active = option == token;
                 chrome(row, if active { [0.16, 0.35, 0.28, 1.0] } else { [0.075, 0.12, 0.11, 1.0] }, if active { choice_tint } else { muted }, 3.0)
-            }).collect(),
+            }).collect()
+            }
             _ => Vec::new(),
         },
         UiNodeKind::Scrollbar => {
@@ -3354,6 +3608,17 @@ pub(crate) fn render_hit_ids_for_test(
     size: [u32; 2],
 ) -> Vec<u32> {
     let mut renderer = UiWgpuRenderer::new(device, wgpu::TextureFormat::Rgba8Unorm);
+    render_hit_ids_with_renderer_for_test(&mut renderer, device, queue, fragments, size)
+}
+
+#[cfg(test)]
+fn render_hit_ids_with_renderer_for_test(
+    renderer: &mut UiWgpuRenderer,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    fragments: &HashMap<neon_ui_schema::UiFragmentId, UiFragment>,
+    size: [u32; 2],
+) -> Vec<u32> {
     let target = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("neon3-ui-hit-id-test-target"),
         size: wgpu::Extent3d {
@@ -3731,6 +3996,14 @@ fn flatten_fragments(
     fragments: &HashMap<neon_ui_schema::UiFragmentId, UiFragment>,
     font: Option<&ResidentFont>,
 ) -> Vec<(String, Option<String>, UiVisual, Option<UiTransition>)> {
+    flatten_fragments_with_data_grid_display_cache(fragments, font, &HashMap::new())
+}
+
+fn flatten_fragments_with_data_grid_display_cache(
+    fragments: &HashMap<neon_ui_schema::UiFragmentId, UiFragment>,
+    font: Option<&ResidentFont>,
+    data_grid_text_display_cache: &HashMap<DataGridCellIdentity, CachedDataGridTextDisplay>,
+) -> Vec<(String, Option<String>, UiVisual, Option<UiTransition>)> {
     let presentations = collect_control_presentations(fragments);
     let mut ordered = fragments.values().collect::<Vec<_>>();
     ordered.sort_by(|left, right| left.fragment_id.0.cmp(&right.fragment_id.0));
@@ -3749,7 +4022,7 @@ fn flatten_fragments(
             false,
         );
     }
-    append_data_grid_frames(&mut result, fragments);
+    append_data_grid_frames(&mut result, fragments, data_grid_text_display_cache);
     for (node_path, _, visual, _) in &mut result {
         visual.presentation = presentations.get(node_path).cloned();
         if let Some(UiControlPresentation::Numeric { value, .. }) = &visual.presentation
@@ -3790,6 +4063,7 @@ fn flatten_fragments(
 fn append_data_grid_frames(
     out: &mut Vec<(String, Option<String>, UiVisual, Option<UiTransition>)>,
     fragments: &HashMap<neon_ui_schema::UiFragmentId, UiFragment>,
+    data_grid_text_display_cache: &HashMap<DataGridCellIdentity, CachedDataGridTextDisplay>,
 ) {
     for fragment in fragments.values() {
         for effect in &fragment.effects {
@@ -3800,7 +4074,7 @@ fn append_data_grid_frames(
             let Some((_, _, grid, _)) = out.iter().find(|(path, _, _, _)| path == &grid_path).cloned() else {
                 continue;
             };
-            if grid.kind != UiNodeKind::DataGrid || frame.data_grid_key != declaration.node_key {
+            if grid.kind != UiNodeKind::DataGrid {
                 continue;
             }
             // A virtual grid is itself a scroll viewport. Its bounded window remains
@@ -3827,10 +4101,14 @@ fn append_data_grid_frames(
                 height: row_height * (frame.total_rows as f32 + 1.0),
             };
             extent.image = None;
+            // The parent scroll viewport supplies the fixed screen-space clip.
+            // Generated content needs its larger logical clip so scrolling does
+            // not translate the viewport clip out of its own intersection.
+            let content_clip = extent.bounds;
             out.push((format!("{grid_path}/data-grid-content-extent"), Some(grid_path.clone()), extent, None));
             let clip = intersect_clip(Some(grid.clip), grid.bounds);
             let header = UiVisual {
-                bounds: UiBounds { x: grid.bounds.x, y: grid.bounds.y, width: grid.bounds.width, height: row_height },
+                bounds: UiBounds { x: grid.bounds.x, y: grid.bounds.y, width: content_width, height: row_height },
                 style: UiStyle {
                     background_color: [0.10, 0.16, 0.19, 1.0],
                     border_color: [0.30, 0.48, 0.52, 1.0],
@@ -3873,7 +4151,7 @@ fn append_data_grid_frames(
                 let logical_row = frame.first_row.saturating_add(row_index as u64);
                 let y = grid.bounds.y + row_height * (logical_row as f32 + 1.0);
                 let row_visual = UiVisual {
-                    bounds: UiBounds { x: grid.bounds.x, y, width: grid.bounds.width, height: row_height },
+                    bounds: UiBounds { x: grid.bounds.x, y, width: content_width, height: row_height },
                     style: UiStyle {
                         background_color: if row_index % 2 == 0 { [0.055, 0.085, 0.10, 1.0] } else { [0.070, 0.105, 0.12, 1.0] },
                         border_color: [0.18, 0.29, 0.32, 1.0],
@@ -3883,7 +4161,7 @@ fn append_data_grid_frames(
                     },
                     kind: UiNodeKind::Panel,
                     enabled: false,
-                    clip,
+                    clip: content_clip,
                     clip_radius: 0.0,
                     image: None,
                     surface: None,
@@ -3905,14 +4183,43 @@ fn append_data_grid_frames(
                         let presentation = cell.presentation_override.as_ref()
                             .map(data_grid_cell_presentation)
                             .unwrap_or_else(|| data_grid_column_presentation(&column.presentation));
+                        if matches!(column.presentation, neon_ui_schema::UiDataGridPresentation::Select { .. })
+                            && cell.presentation_override.is_none()
+                            && let neon_ui_schema::UiInputValue::Bool { value } = cell.value
+                        {
+                            label.style = if value {
+                                UiStyle {
+                                    background_color: [0.10, 0.25, 0.20, 1.0],
+                                    border_color: [0.34, 0.80, 0.64, 0.95],
+                                    border_width: 1.0,
+                                    corner_radius: 4.0,
+                                    opacity: 1.0,
+                                }
+                            } else {
+                                UiStyle {
+                                    background_color: [0.30, 0.10, 0.12, 1.0],
+                                    border_color: [0.92, 0.34, 0.38, 0.96],
+                                    border_width: 1.0,
+                                    corner_radius: 4.0,
+                                    opacity: 1.0,
+                                }
+                            };
+                        }
                         label.enabled = presentation.0 != UiNodeKind::Label;
                         label.kind = presentation.0;
-                        label.clip = clip;
+                        label.clip = content_clip;
                         label.clip_radius = 0.0;
                         label.image = None;
                         label.surface = None;
                         label.text = Some(TextRef::Literal {
-                            value: format!("text#{}:{}", cell.display.id, cell.display.generation),
+                            value: data_grid_cell_display_text(
+                                cell,
+                                data_grid_text_display_cache.get(&DataGridCellIdentity {
+                                    source_key: declaration.source_key.clone(),
+                                    stable_row_key: row.stable_row_key.clone(),
+                                    column_key: column.key.clone(),
+                                }),
+                            ),
                         });
                         label.presentation = presentation.1;
                         // Stable renderer-local target metadata; it is never serialized.
@@ -3923,6 +4230,39 @@ fn append_data_grid_frames(
             }
         }
     }
+}
+
+fn data_grid_cell_display_text(
+    cell: &neon_ui_schema::UiDataGridCell,
+    cached: Option<&CachedDataGridTextDisplay>,
+) -> String {
+    match &cell.value {
+        neon_ui_schema::UiInputValue::Bool { value } => value.to_string(),
+        neon_ui_schema::UiInputValue::I32 { value } => value.to_string(),
+        neon_ui_schema::UiInputValue::U32 { value } => value.to_string(),
+        neon_ui_schema::UiInputValue::F32 { value } => format!("{value:.3}"),
+        neon_ui_schema::UiInputValue::Enum { value } => value.clone(),
+        neon_ui_schema::UiInputValue::TextHandle { .. } => cached
+            .map(|cached| cached.text.clone())
+            .unwrap_or_else(|| format!("text#{}:{}", cell.display.id, cell.display.generation)),
+        neon_ui_schema::UiInputValue::Vec2 { value } => format!("{}, {}", value[0], value[1]),
+        neon_ui_schema::UiInputValue::Vec4 { value }
+        | neon_ui_schema::UiInputValue::Color { value } => {
+            format!("{}, {}, {}, {}", value[0], value[1], value[2], value[3])
+        }
+        neon_ui_schema::UiInputValue::AssetHandle { id, generation } => {
+            format!("asset#{id}:{generation}")
+        }
+    }
+}
+
+fn data_grid_cell_identity(binding: &UiHitBinding) -> Option<DataGridCellIdentity> {
+    let cell = binding.data_grid_cell.as_ref()?;
+    Some(DataGridCellIdentity {
+        source_key: cell.source_key.clone(),
+        stable_row_key: cell.stable_row_key.clone(),
+        column_key: cell.column_key.clone(),
+    })
 }
 
 fn data_grid_column_presentation(
@@ -4066,7 +4406,7 @@ fn collect_hit_declarations(
                             }),
                             text_input: None,
                             data_grid_cell: Some(UiDataGridCellTarget {
-                                data_grid_key: declaration.node_key.clone(),
+                                source_key: declaration.source_key.clone(),
                                 stable_row_key: row.stable_row_key.clone(),
                                 column_key: column.key.clone(),
                             }),
@@ -4636,7 +4976,7 @@ fn intersect_clip(inherited: Option<UiBounds>, bounds: UiBounds) -> UiBounds {
 mod tests {
     use super::*;
     use neon_protocol::{ClientIdentity, ClientKind, ProtocolVersion, RequestId, Revision, RpcRequest, RpcStatus, ServiceName};
-    use neon_ui_runtime::{lower_nui_flow_effects, parse_nui_flow, UiRuntime};
+    use neon_ui_runtime::{UiRuntime,lower_nui_flow_effects, parse_nui_flow};
     use neon_ui_schema::{
         TextRef, UiAlignItems, UiCommand, UiEffect, UiFragmentId, UiFragmentSubmission,
         UiIntent, UiJustifyContent, UiLayout, UiNodeId, UiSemanticEvent, UiSemanticEventType,
@@ -4938,6 +5278,416 @@ mod tests {
     }
 
     #[test]
+    fn data_grid_pointer_hit_uses_scrolled_sampled_cell_bounds() {
+        let _gpu_test = GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let (device, _queue) = test_device("neon3-ui-data-grid-scrolled-hit");
+        let logical = UiBounds {
+            x: 120.0,
+            y: 30.0,
+            width: 80.0,
+            height: 24.0,
+        };
+        let visible = UiBounds {
+            x: 20.0,
+            y: 30.0,
+            width: 80.0,
+            height: 24.0,
+        };
+        let mut visual = UiVisual {
+            bounds: logical,
+            style: UiStyle::default(),
+            kind: UiNodeKind::TextInput,
+            enabled: true,
+            clip: UiBounds {
+                x: 0.0,
+                y: 0.0,
+                width: 100.0,
+                height: 100.0,
+            },
+            clip_radius: 0.0,
+            image: None,
+            surface: None,
+            text: Some(TextRef::Literal {
+                value: "display".into(),
+            }),
+            presentation: None,
+            scroll: false,
+            declared_scroll_offset: [0.0; 2],
+        };
+        let node_path = "grid/assets/data-grid-row-asset-42/cell-name".to_owned();
+        let mut renderer = UiWgpuRenderer::new(&device, wgpu::TextureFormat::Rgba8Unorm);
+        renderer.plan.push(PlannedNode {
+            id: node_path.clone(),
+            parent_id: None,
+            target: visual.clone(),
+            transition: None,
+            instance_index: None,
+        });
+        visual.bounds = visible;
+        renderer.sampled.push(visual);
+        renderer.hit_bindings.insert(
+            1,
+            UiHitBinding {
+                node_path: node_path.clone(),
+                fragment: UiFragmentRevision {
+                    id: UiFragmentId("grid".into()),
+                    revision: Revision(1),
+                },
+                intent: Some(UiIntent::Invoke {
+                    action: "asset.name.edit".into(),
+                    params: json!({}),
+                }),
+                text_input: Some(UiTextInputBinding {
+                    node_path,
+                    max_length: 16,
+                    bounds: logical,
+                }),
+                data_grid_cell: Some(UiDataGridCellTarget {
+                    source_key: "assets_window".into(),
+                    stable_row_key: "asset-42".into(),
+                    column_key: "name".into(),
+                }),
+                control_value: Some(UiSemanticPayloadValue::TextHandle {
+                    value: neon_ui_schema::UiTextHandle {
+                        id: 7,
+                        generation: 2,
+                    },
+                }),
+                max_text_length: Some(16),
+            },
+        );
+        renderer.set_pointer_position([30.0, 40.0]);
+        assert_eq!(renderer.hit_id_at_pointer(), Some(1));
+        assert_eq!(renderer.text_input_at_pointer().unwrap().bounds, visible);
+    }
+
+    #[test]
+    fn data_grid_text_edit_buffers_until_finish_and_escape_cancels() {
+        let _gpu_test = GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let (device, _queue) = test_device("neon3-ui-data-grid-text-edit");
+        let bounds = UiBounds {
+            x: 20.0,
+            y: 30.0,
+            width: 120.0,
+            height: 28.0,
+        };
+        let input = UiTextInputBinding {
+            node_path: "grid/assets/data-grid-row-asset-42/cell-name".into(),
+            max_length: 8,
+            bounds,
+        };
+        let mut renderer = UiWgpuRenderer::new(&device, wgpu::TextureFormat::Rgba8Unorm);
+        renderer.plan.push(PlannedNode {
+            id: input.node_path.clone(),
+            parent_id: None,
+            target: UiVisual {
+                bounds,
+                style: UiStyle::default(),
+                kind: UiNodeKind::TextInput,
+                enabled: true,
+                clip: bounds,
+                clip_radius: 0.0,
+                image: None,
+                surface: None,
+                text: Some(TextRef::Literal {
+                    value: "display".into(),
+                }),
+                presentation: None,
+                scroll: false,
+                declared_scroll_offset: [0.0; 2],
+            },
+            transition: None,
+            instance_index: None,
+        });
+        renderer.hit_bindings.insert(
+            1,
+            UiHitBinding {
+                node_path: input.node_path.clone(),
+                fragment: UiFragmentRevision {
+                    id: UiFragmentId("grid".into()),
+                    revision: Revision(1),
+                },
+                intent: Some(UiIntent::Invoke {
+                    action: "asset.name.edit".into(),
+                    params: json!({}),
+                }),
+                text_input: Some(input.clone()),
+                data_grid_cell: Some(UiDataGridCellTarget {
+                    source_key: "assets_window".into(),
+                    stable_row_key: "asset-42".into(),
+                    column_key: "name".into(),
+                }),
+                control_value: Some(UiSemanticPayloadValue::TextHandle {
+                    value: neon_ui_schema::UiTextHandle {
+                        id: 7,
+                        generation: 2,
+                    },
+                }),
+                max_text_length: Some(8),
+            },
+        );
+        renderer.focus_text_input(input.clone());
+        assert!(renderer.data_grid_text_input_active());
+        assert!(renderer.commit_ime_text("X").is_none());
+        assert_eq!(renderer.editing.committed, "displayX");
+        renderer.focus_text_input(input.clone());
+        assert_eq!(renderer.editing.committed, "displayX");
+        let (binding, value) = renderer.finish_data_grid_text_input().unwrap();
+        assert_eq!(value, "displayX");
+        assert_eq!(binding.data_grid_cell.unwrap().column_key, "name");
+        assert!(!renderer.data_grid_text_input_active());
+
+        renderer.focus_text_input(input);
+        assert!(renderer.commit_ime_text("Y").is_none());
+        assert!(renderer.cancel_data_grid_text_input());
+        assert!(!renderer.data_grid_text_input_active());
+    }
+
+    #[test]
+    fn data_grid_committed_text_survives_a_replacement_text_handle_frame() {
+        let _gpu_test = GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let (device, _queue) = test_device("neon3-ui-data-grid-text-display-cache");
+        let input = UiTextInputBinding {
+            node_path: "grid/assets/data-grid-row-asset-42/cell-name".into(),
+            max_length: 32,
+            bounds: UiBounds {
+                x: 0.0,
+                y: 0.0,
+                width: 120.0,
+                height: 24.0,
+            },
+        };
+        let mut renderer = UiWgpuRenderer::new(&device, wgpu::TextureFormat::Rgba8Unorm);
+        renderer.plan.push(PlannedNode {
+            id: input.node_path.clone(),
+            parent_id: None,
+            target: UiVisual {
+                bounds: input.bounds,
+                style: UiStyle::default(),
+                kind: UiNodeKind::TextInput,
+                enabled: true,
+                clip: input.bounds,
+                clip_radius: 0.0,
+                image: None,
+                surface: None,
+                text: Some(TextRef::Literal {
+                    value: "before".into(),
+                }),
+                presentation: None,
+                scroll: false,
+                declared_scroll_offset: [0.0; 2],
+            },
+            transition: None,
+            instance_index: None,
+        });
+        renderer.hit_bindings.insert(
+            1,
+            UiHitBinding {
+                node_path: input.node_path.clone(),
+                fragment: UiFragmentRevision {
+                    id: UiFragmentId("grid".into()),
+                    revision: Revision(1),
+                },
+                intent: None,
+                text_input: Some(input.clone()),
+                data_grid_cell: Some(UiDataGridCellTarget {
+                    source_key: "assets_window".into(),
+                    stable_row_key: "asset-42".into(),
+                    column_key: "name".into(),
+                }),
+                control_value: None,
+                max_text_length: Some(32),
+            },
+        );
+        renderer.focus_text_input(input);
+        assert!(renderer.commit_ime_text(" after").is_none());
+        assert_eq!(renderer.finish_data_grid_text_input().unwrap().1, "before after");
+
+        let mut root = node();
+        root.node_id = UiNodeId("assets".into());
+        root.kind = UiNodeKind::DataGrid;
+        root.bounds.width = 120.0;
+        root.bounds.height = 48.0;
+        let declaration = neon_ui_schema::UiDataGridDeclaration {
+            node_key: "assets".into(),
+            source_key: "assets_window".into(),
+            max_window_rows: 1,
+            row_height: 24,
+            overscan: 0,
+            columns: vec![neon_ui_schema::UiDataGridColumn {
+                key: "name".into(),
+                label: "Name".into(),
+                width: 120,
+                presentation: neon_ui_schema::UiDataGridPresentation::Edit {
+                    max_chars: 32,
+                    intent: "asset.name.set".into(),
+                },
+            }],
+        };
+        let replacement = HashMap::from([(
+            UiFragmentId("replacement-grid".into()),
+            UiFragment {
+                fragment_id: UiFragmentId("replacement-grid".into()),
+                revision: Revision(2),
+                root,
+                effects: vec![UiEffect::DataGridFrame {
+                    declaration,
+                    frame: neon_ui_schema::UiDataGridFrame {
+                        list_revision: Revision(2),
+                        total_rows: 1,
+                        first_row: 0,
+                        window_rows: vec![neon_ui_schema::UiDataGridWindowRow {
+                            stable_row_key: "asset-42".into(),
+                            cells: std::collections::BTreeMap::from([(
+                                "name".into(),
+                                neon_ui_schema::UiDataGridCell {
+                                    value: neon_ui_schema::UiInputValue::TextHandle {
+                                        value: neon_ui_schema::UiTextHandle {
+                                            id: 70,
+                                            generation: 4,
+                                        },
+                                    },
+                                    display: neon_ui_schema::UiTextHandle {
+                                        id: 71,
+                                        generation: 5,
+                                    },
+                                    presentation_override: None,
+                                },
+                            )]),
+                        }],
+                        expected_program_revision: neon_ui_schema::UiProgramRevision {
+                            program_id: "grid-test".into(),
+                            revision: Revision(2),
+                            schema_version: 1,
+                            capabilities: Vec::new(),
+                        },
+                    },
+                }],
+            },
+        )]);
+
+        renderer.reconcile_data_grid_text_display_cache(&replacement);
+        let flattened = flatten_fragments_with_data_grid_display_cache(
+            &replacement,
+            None,
+            &renderer.data_grid_text_display_cache,
+        );
+        let label = &flattened
+            .iter()
+            .find(|(path, _, _, _)| path.ends_with("data-grid-row-asset-42/cell-name"))
+            .unwrap()
+            .2;
+        assert_eq!(
+            text_ref_value(label.text.as_ref().expect("DataGrid cell has text")),
+            Some("before after")
+        );
+    }
+
+    #[test]
+    fn data_grid_cell_keeps_display_text_separate_from_typed_handle() {
+        let cell = neon_ui_schema::UiDataGridCell {
+            value: neon_ui_schema::UiInputValue::TextHandle {
+                value: neon_ui_schema::UiTextHandle {
+                    id: 7,
+                    generation: 2,
+                },
+            },
+            display: neon_ui_schema::UiTextHandle {
+                id: 70,
+                generation: 4,
+            },
+            presentation_override: None,
+        };
+        assert_eq!(data_grid_cell_display_text(&cell, None), "text#70:4");
+    }
+
+    #[test]
+    fn data_grid_dropdown_click_resolves_declared_typed_option() {
+        let _gpu_test = GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let (device, _queue) = test_device("neon3-ui-data-grid-dropdown");
+        let node_path = "grid/assets/data-grid-row-asset-42/cell-state".to_owned();
+        let bounds = UiBounds {
+            x: 20.0,
+            y: 30.0,
+            width: 100.0,
+            height: 24.0,
+        };
+        let mut renderer = UiWgpuRenderer::new(&device, wgpu::TextureFormat::Rgba8Unorm);
+        renderer.viewport_size = [200, 160];
+        renderer.plan.push(PlannedNode {
+            id: node_path.clone(),
+            parent_id: None,
+            target: UiVisual {
+                bounds,
+                style: UiStyle::default(),
+                kind: UiNodeKind::Dropdown,
+                enabled: true,
+                clip: UiBounds {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 200.0,
+                    height: 160.0,
+                },
+                clip_radius: 0.0,
+                image: None,
+                surface: None,
+                text: Some(TextRef::Literal {
+                    value: "ready".into(),
+                }),
+                presentation: Some(UiControlPresentation::Choice {
+                    token: "ready".into(),
+                    options: vec!["ready".into(), "review".into()],
+                    selected: false,
+                }),
+                scroll: false,
+                declared_scroll_offset: [0.0; 2],
+            },
+            transition: None,
+            instance_index: None,
+        });
+        renderer.hit_bindings.insert(
+            1,
+            UiHitBinding {
+                node_path,
+                fragment: UiFragmentRevision {
+                    id: UiFragmentId("grid".into()),
+                    revision: Revision(1),
+                },
+                intent: Some(UiIntent::Invoke {
+                    action: "asset.state.select".into(),
+                    params: json!({}),
+                }),
+                text_input: None,
+                data_grid_cell: Some(UiDataGridCellTarget {
+                    source_key: "assets_window".into(),
+                    stable_row_key: "asset-42".into(),
+                    column_key: "state".into(),
+                }),
+                control_value: None,
+                max_text_length: None,
+            },
+        );
+        renderer.set_pointer_position([30.0, 40.0]);
+        assert!(renderer.toggle_dropdown_at_pointer());
+        renderer.set_pointer_position([30.0, 90.0]);
+        let (binding, value) = renderer.dropdown_option_at_pointer().unwrap();
+        assert_eq!(binding.data_grid_cell.unwrap().column_key, "state");
+        assert_eq!(
+            value,
+            UiSemanticPayloadValue::Enum {
+                value: "review".into()
+            });
+    }
+
+    #[test]
     fn generic_control_focus_is_local_and_skips_disabled_controls() {
         let _gpu_test = GPU_TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let (device, _queue) = test_device("neon3-ui-component-focus");
@@ -5149,16 +5899,16 @@ mod tests {
     #[test]
     fn data_grid_window_request_uses_scroll_viewport_and_overscan() {
         let declaration = neon_ui_schema::UiDataGridDeclaration {
-            node_key: "assets".into(), max_window_rows: 12, row_height: 24, overscan: 2,
+            node_key: "assets".into(), source_key: "assets_window".into(), max_window_rows: 12, row_height: 24, overscan: 2,
             columns: vec![neon_ui_schema::UiDataGridColumn { key: "name".into(), label: "Name".into(), width: 96, presentation: neon_ui_schema::UiDataGridPresentation::Text }],
         };
         let frame = neon_ui_schema::UiDataGridFrame {
-            data_grid_key: "assets".into(), list_revision: Revision(1), total_rows: 10_000,
+            list_revision: Revision(1), total_rows: 10_000,
             first_row: 0, window_rows: Vec::new(), expected_program_revision: neon_ui_schema::UiProgramRevision {
                 program_id: "grid-test".into(), revision: Revision(1), schema_version: 1, capabilities: Vec::new(),
             },
         };
-        assert_eq!(data_grid_requested_range(&frame, &declaration, 240.0, 252.0), Some((8, 12)));
+        assert_eq!(data_grid_requested_range(&frame, &declaration, 240.0, 252.0), Some((7, 12)));
         assert_eq!(data_grid_requested_range(&frame, &declaration, 999_999.0, 252.0), Some((9_988, 12)));
     }
 
@@ -5194,13 +5944,13 @@ mod tests {
         };
         let declaration = neon_ui_schema::UiDataGridDeclaration {
             node_key: "assets".into(),
+            source_key: "assets_window".into(),
             max_window_rows: 2,
             row_height: 12,
             overscan: 0,
             columns: vec![neon_ui_schema::UiDataGridColumn { key: "name".into(), label: "Name".into(), width: 96, presentation: neon_ui_schema::UiDataGridPresentation::Text }],
         };
         let frame = neon_ui_schema::UiDataGridFrame {
-            data_grid_key: "assets".into(),
             list_revision: Revision(1),
             total_rows: 99,
             first_row: 40,
@@ -5217,13 +5967,14 @@ mod tests {
             UiFragment {
                 fragment_id: UiFragmentId("grid".into()),
                 revision: Revision(1),
-                root,
-                effects: vec![UiEffect::DataGridFrame { declaration, frame }],
+                root: root.clone(),
+                effects: vec![UiEffect::DataGridFrame { declaration: declaration.clone(), frame: frame.clone(), }],
             },
         )]);
 
         let flattened = flatten_fragments(&fragments, None);
-        let row_y = |row| flattened.iter().find(|(path, _, _, _)| path == row).unwrap().2.bounds.y;
+        let row_y = |row| { flattened.iter().find(|(path, _, _, _)| path == row).unwrap().2.bounds.y
+        };
         assert_eq!(row_y("grid/assets/data-grid-row-asset-41"), 500.0);
         assert_eq!(row_y("grid/assets/data-grid-row-asset-42"), 512.0);
         assert_eq!(flattened.iter().filter(|(path, _, _, _)| {
@@ -5243,6 +5994,65 @@ mod tests {
         let alpha = |x: usize, y: usize| pixels[(y * 128 + x) * 4 + 3];
         assert!(alpha(12, 12) > 0, "header must render");
         assert_eq!(alpha(12, 24), 0, "unscrolled off-window rows must not render");
+
+        let mut initial_frame = frame.clone();
+        initial_frame.first_row = 0;
+        initial_frame.total_rows = 200;
+        initial_frame.window_rows = vec![row("asset-1", 4), row("asset-2", 5)];
+        let initial_fragments = HashMap::from([(
+            UiFragmentId("grid".into()),
+            UiFragment {
+                fragment_id: UiFragmentId("grid".into()),
+                revision: Revision(1),
+                root: root.clone(),
+                effects: vec![UiEffect::DataGridFrame {
+                    declaration: declaration.clone(),
+                    frame: initial_frame,
+                }],
+            },
+        )]);
+        let mut replacement_frame = frame;
+        replacement_frame.first_row = 98;
+        replacement_frame.total_rows = 200;
+        replacement_frame.window_rows = vec![row("asset-99", 6), row("asset-100", 7)];
+        let replacement_fragments = HashMap::from([(
+            UiFragmentId("grid".into()),
+            UiFragment {
+                fragment_id: UiFragmentId("grid".into()),
+                revision: Revision(2),
+                root,
+                effects: vec![UiEffect::DataGridFrame {
+                    declaration,
+                    frame: replacement_frame,
+                }],
+            },
+        )]);
+        let mut renderer = UiWgpuRenderer::new(&device, wgpu::TextureFormat::Rgba8Unorm);
+        let _ = render_renderer_offscreen_for_test(
+            &mut renderer,
+            &device,
+            &queue,
+            wgpu::TextureFormat::Rgba8Unorm,
+            &initial_fragments,
+            [128, 80],
+            0.0,
+        );
+        renderer
+            .scroll_offsets
+            .insert("grid/assets".into(), [0.0, 1_200.0]);
+        let pixels = render_renderer_offscreen_for_test(
+            &mut renderer,
+            &device,
+            &queue,
+            wgpu::TextureFormat::Rgba8Unorm,
+            &replacement_fragments,
+            [128, 80],
+            0.0,
+        );
+        let alpha = |x: usize, y: usize| pixels[(y * 128 + x) * 4 + 3];
+        assert!(
+            alpha(12, 12) > 0,
+            "replacement rows must remain visible at row 100");
     }
 
     #[test]
@@ -5259,7 +6069,7 @@ mod tests {
             presentation_override,
         };
         let declaration = neon_ui_schema::UiDataGridDeclaration {
-            node_key: "assets".into(), max_window_rows: 1, row_height: 24, overscan: 0,
+            node_key: "assets".into(), source_key: "assets_window".into(), max_window_rows: 1, row_height: 24, overscan: 0,
             columns: vec![
                 neon_ui_schema::UiDataGridColumn { key: "state".into(), label: "State".into(), width: 100, presentation: neon_ui_schema::UiDataGridPresentation::Select { intent: "asset.state.select".into() } },
                 neon_ui_schema::UiDataGridColumn { key: "owner".into(), label: "Owner".into(), width: 100, presentation: neon_ui_schema::UiDataGridPresentation::Dropdown { options: vec!["me".into(), "team".into()], intent: "asset.owner.select".into() } },
@@ -5268,7 +6078,7 @@ mod tests {
             ],
         };
         let frame = neon_ui_schema::UiDataGridFrame {
-            data_grid_key: "assets".into(), list_revision: Revision(1), total_rows: 1, first_row: 0,
+            list_revision: Revision(1), total_rows: 1, first_row: 0,
             window_rows: vec![neon_ui_schema::UiDataGridWindowRow {
                 stable_row_key: "asset-42".into(),
                 cells: std::collections::BTreeMap::from([
@@ -5285,12 +6095,14 @@ mod tests {
             UiFragment { fragment_id: UiFragmentId("grid".into()), revision: Revision(1), root, effects: vec![UiEffect::DataGridFrame { declaration, frame }] },
         )]);
         let flattened = flatten_fragments(&fragments, None);
-        let kind = |path| flattened.iter().find(|(candidate, _, _, _)| candidate == path).unwrap().2.kind.clone();
+        let kind = |path| { flattened.iter().find(|(candidate, _, _, _)| candidate == path).unwrap().2.kind.clone()
+        };
         assert_eq!(kind("grid/assets/data-grid-row-asset-42/cell-state"), UiNodeKind::Combo);
         assert_eq!(kind("grid/assets/data-grid-row-asset-42/cell-owner"), UiNodeKind::TextInput);
         assert_eq!(kind("grid/assets/data-grid-row-asset-42/cell-notes"), UiNodeKind::Dropdown);
         assert_eq!(kind("grid/assets/data-grid-row-asset-42/cell-title"), UiNodeKind::Label);
-        let visual = |path| &flattened.iter().find(|(candidate, _, _, _)| candidate == path).unwrap().2;
+        let visual = |path| { &flattened.iter().find(|(candidate, _, _, _)| candidate == path).unwrap().2
+        };
         assert!(!component_chrome_instances(visual("grid/assets/data-grid-row-asset-42/cell-state")).is_empty());
         assert!(!component_chrome_instances(visual("grid/assets/data-grid-row-asset-42/cell-owner")).is_empty());
         assert!(!component_chrome_instances(visual("grid/assets/data-grid-row-asset-42/cell-notes")).is_empty());
@@ -5305,7 +6117,7 @@ mod tests {
             style: UiStyle::default(), enter_transition: None, children: Vec::new(),
         };
         let declaration = neon_ui_schema::UiDataGridDeclaration {
-            node_key: "assets".into(), max_window_rows: 1, row_height: 24, overscan: 0,
+            node_key: "assets".into(), source_key: "assets_window".into(), max_window_rows: 1, row_height: 24, overscan: 0,
             columns: vec![
                 neon_ui_schema::UiDataGridColumn { key: "selected".into(), label: "Selected".into(), width: 80, presentation: neon_ui_schema::UiDataGridPresentation::Select { intent: "asset.selected.set".into() } },
                 neon_ui_schema::UiDataGridColumn { key: "state".into(), label: "State".into(), width: 80, presentation: neon_ui_schema::UiDataGridPresentation::Dropdown { options: vec!["ready".into(), "review".into()], intent: "asset.state.set".into() } },
@@ -5313,7 +6125,7 @@ mod tests {
             ],
         };
         let frame = neon_ui_schema::UiDataGridFrame {
-            data_grid_key: "assets".into(), list_revision: Revision(1), total_rows: 1, first_row: 0,
+            list_revision: Revision(1), total_rows: 1, first_row: 0,
             window_rows: vec![neon_ui_schema::UiDataGridWindowRow {
                 stable_row_key: "asset-42".into(),
                 cells: std::collections::BTreeMap::from([
@@ -5337,7 +6149,371 @@ mod tests {
         assert!(dropdown.control_value.is_none());
         let edit = &bindings["grid/assets/data-grid-row-asset-42/cell-name"];
         assert_eq!(edit.max_text_length, Some(5));
-        assert_eq!(edit.control_value, Some(UiSemanticPayloadValue::TextHandle { value: neon_ui_schema::UiTextHandle { id: 3, generation: 1 } }));
+        assert_eq!(edit.control_value, Some(UiSemanticPayloadValue::TextHandle { value: neon_ui_schema::UiTextHandle { id: 3, generation: 1 } })
+        );
+    }
+
+    #[test]
+    fn data_grid_interactive_cells_hit_gpu_id_map_with_scroll_offsets() {
+        let _gpu_test = GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let (device, queue) = test_device("neon3-ui-data-grid-hit-id-map");
+        let root = UiNode {
+            node_id: UiNodeId("assets".into()),
+            kind: UiNodeKind::DataGrid,
+            bounds: UiBounds {
+                x: 8.0,
+                y: 8.0,
+                width: 320.0,
+                height: 80.0,
+            },
+            layout: None,
+            visible: true,
+            enabled: true,
+            text_key: None,
+            text: None,
+            image: None,
+            surface: None,
+            style: UiStyle::default(),
+            enter_transition: None,
+            children: Vec::new(),
+        };
+        let declaration = neon_ui_schema::UiDataGridDeclaration {
+            node_key: "assets".into(),
+            source_key: "assets_window".into(),
+            max_window_rows: 1,
+            row_height: 24,
+            overscan: 0,
+            columns: vec![
+                neon_ui_schema::UiDataGridColumn {
+                    key: "selected".into(),
+                    label: "Selected".into(),
+                    width: 96,
+                    presentation: neon_ui_schema::UiDataGridPresentation::Select {
+                        intent: "asset.selected.set".into(),
+                    },
+                },
+                neon_ui_schema::UiDataGridColumn {
+                    key: "state".into(),
+                    label: "State".into(),
+                    width: 96,
+                    presentation: neon_ui_schema::UiDataGridPresentation::Dropdown {
+                        options: vec!["ready".into(), "review".into()],
+                        intent: "asset.state.set".into(),
+                    },
+                },
+                neon_ui_schema::UiDataGridColumn {
+                    key: "name".into(),
+                    label: "Name".into(),
+                    width: 96,
+                    presentation: neon_ui_schema::UiDataGridPresentation::Edit {
+                        max_chars: 12,
+                        intent: "asset.name.set".into(),
+                    },
+                },
+            ],
+        };
+        let frame = neon_ui_schema::UiDataGridFrame {
+            list_revision: Revision(1),
+            total_rows: 4,
+            first_row: 0,
+            window_rows: vec![neon_ui_schema::UiDataGridWindowRow {
+                stable_row_key: "asset-42".into(),
+                cells: std::collections::BTreeMap::from([
+                    ("selected".into(), neon_ui_schema::UiDataGridCell {
+                        value: neon_ui_schema::UiInputValue::Bool { value: false },
+                        display: neon_ui_schema::UiTextHandle { id: 1, generation: 1 },
+                        presentation_override: None,
+                    }),
+                    ("state".into(), neon_ui_schema::UiDataGridCell {
+                        value: neon_ui_schema::UiInputValue::Enum { value: "ready".into() },
+                        display: neon_ui_schema::UiTextHandle { id: 2, generation: 1 },
+                        presentation_override: None,
+                    }),
+                    ("name".into(), neon_ui_schema::UiDataGridCell {
+                        value: neon_ui_schema::UiInputValue::TextHandle {
+                            value: neon_ui_schema::UiTextHandle { id: 3, generation: 1 },
+                        },
+                        display: neon_ui_schema::UiTextHandle { id: 3, generation: 1 },
+                        presentation_override: None,
+                    }),
+                ]),
+            }],
+            expected_program_revision: neon_ui_schema::UiProgramRevision {
+                program_id: "grid-test".into(),
+                revision: Revision(1),
+                schema_version: 1,
+                capabilities: Vec::new(),
+            },
+        };
+        let fragments = HashMap::from([(UiFragmentId("grid".into()), UiFragment {
+            fragment_id: UiFragmentId("grid".into()),
+            revision: Revision(1),
+            root,
+            effects: vec![UiEffect::DataGridFrame { declaration, frame }],
+        })]);
+        let mut renderer = UiWgpuRenderer::new(&device, wgpu::TextureFormat::Rgba8Unorm);
+        let size = [384, 128];
+
+        // Normal drawing resolves the same scrolled visuals consumed by the hit pass.
+        let _ = render_renderer_offscreen_for_test(
+            &mut renderer,
+            &device,
+            &queue,
+            wgpu::TextureFormat::Rgba8Unorm,
+            &fragments,
+            size,
+            0.0,
+        );
+        renderer
+            .scroll_offsets
+            .insert("grid/assets".into(), [0.0, 24.0]);
+        let _ = render_renderer_offscreen_for_test(
+            &mut renderer,
+            &device,
+            &queue,
+            wgpu::TextureFormat::Rgba8Unorm,
+            &fragments,
+            size,
+            1.0,
+        );
+        let normal_draw_bindings = renderer.hit_bindings.clone();
+        let pixels = render_hit_ids_with_renderer_for_test(
+            &mut renderer,
+            &device,
+            &queue,
+            &fragments,
+            size,
+        );
+        assert_eq!(renderer.hit_bindings.len(), normal_draw_bindings.len());
+        for (hit_id, binding) in normal_draw_bindings {
+            assert_eq!(
+                renderer.hit_binding(hit_id).unwrap().node_path,
+                binding.node_path
+            );
+        }
+
+        for (column_key, kind, intent, control_value, max_text_length) in [
+            ("selected", UiNodeKind::Combo, "asset.selected.set", Some(UiSemanticPayloadValue::Bool { value: true }), None),
+            ("state", UiNodeKind::Dropdown, "asset.state.set", None, None),
+            ("name", UiNodeKind::TextInput, "asset.name.set", Some(UiSemanticPayloadValue::TextHandle { value: neon_ui_schema::UiTextHandle { id: 3, generation: 1 } }), Some(12)),
+        ] {
+            let binding = renderer.hit_bindings.iter().find_map(|(hit_id, binding)| {
+                (binding.data_grid_cell.as_ref().is_some_and(|cell| cell.column_key == column_key))
+                    .then_some((*hit_id, binding))
+            }).unwrap();
+            let index = renderer.plan.iter().position(|node| node.id == binding.1.node_path).unwrap();
+            let visual = renderer.visual_at(index);
+            let pixel = [
+                (visual.bounds.x + visual.bounds.width * 0.5) as usize,
+                (visual.bounds.y + visual.bounds.height * 0.5) as usize,
+            ];
+            let hit_id = pixels[pixel[1] * size[0] as usize + pixel[0]];
+            assert_eq!(hit_id, binding.0, "GPU hit ID must match {column_key}");
+            let binding = renderer.hit_binding(hit_id).unwrap();
+            assert_eq!(renderer.visual_at(index).kind, kind);
+            assert_eq!(binding.intent, Some(UiIntent::Invoke {
+                action: intent.into(), params: Value::Object(Default::default()),
+            }));
+            assert_eq!(binding.control_value, control_value);
+            assert_eq!(binding.max_text_length, max_text_length);
+            assert_eq!(binding.data_grid_cell, Some(UiDataGridCellTarget {
+                source_key: "assets_window".into(),
+                stable_row_key: "asset-42".into(),
+                column_key: column_key.into(),
+            }));
+        }
+    }
+
+    #[test]
+    fn data_grid_controls_handle_first_press_after_normal_draw_only() {
+        let _gpu_test = GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let (device, queue) = test_device("neon3-ui-data-grid-first-press");
+        let root = UiNode {
+            node_id: UiNodeId("assets".into()),
+            kind: UiNodeKind::DataGrid,
+            bounds: UiBounds {
+                x: 8.0,
+                y: 8.0,
+                width: 320.0,
+                height: 80.0,
+            },
+            layout: None,
+            visible: true,
+            enabled: true,
+            text_key: None,
+            text: None,
+            image: None,
+            surface: None,
+            style: UiStyle::default(),
+            enter_transition: None,
+            children: Vec::new(),
+        };
+        let declaration = neon_ui_schema::UiDataGridDeclaration {
+            node_key: "assets".into(),
+            source_key: "assets_window".into(),
+            max_window_rows: 1,
+            row_height: 24,
+            overscan: 0,
+            columns: vec![
+                neon_ui_schema::UiDataGridColumn {
+                    key: "selected".into(),
+                    label: "Selected".into(),
+                    width: 80,
+                    presentation: neon_ui_schema::UiDataGridPresentation::Select {
+                        intent: "asset.selected.set".into(),
+                    },
+                },
+                neon_ui_schema::UiDataGridColumn {
+                    key: "state".into(),
+                    label: "State".into(),
+                    width: 80,
+                    presentation: neon_ui_schema::UiDataGridPresentation::Dropdown {
+                        options: vec!["ready".into(), "review".into()],
+                        intent: "asset.state.set".into(),
+                    },
+                },
+                neon_ui_schema::UiDataGridColumn {
+                    key: "name".into(),
+                    label: "Name".into(),
+                    width: 160,
+                    presentation: neon_ui_schema::UiDataGridPresentation::Edit {
+                        max_chars: 12,
+                        intent: "asset.name.set".into(),
+                    },
+                },
+            ],
+        };
+        let frame = neon_ui_schema::UiDataGridFrame {
+            list_revision: Revision(1),
+            total_rows: 1,
+            first_row: 0,
+            window_rows: vec![neon_ui_schema::UiDataGridWindowRow {
+                stable_row_key: "asset-42".into(),
+                cells: std::collections::BTreeMap::from([
+                    (
+                        "selected".into(),
+                        neon_ui_schema::UiDataGridCell {
+                            value: neon_ui_schema::UiInputValue::Bool { value: false },
+                            display: neon_ui_schema::UiTextHandle {
+                                id: 1,
+                                generation: 1,
+                            },
+                            presentation_override: None,
+                        },
+                    ),
+                    (
+                        "state".into(),
+                        neon_ui_schema::UiDataGridCell {
+                            value: neon_ui_schema::UiInputValue::Enum {
+                                value: "ready".into(),
+                            },
+                            display: neon_ui_schema::UiTextHandle {
+                                id: 2,
+                                generation: 1,
+                            },
+                            presentation_override: None,
+                        },
+                    ),
+                    (
+                        "name".into(),
+                        neon_ui_schema::UiDataGridCell {
+                            value: neon_ui_schema::UiInputValue::TextHandle {
+                                value: neon_ui_schema::UiTextHandle {
+                                    id: 3,
+                                    generation: 1,
+                                },
+                            },
+                            display: neon_ui_schema::UiTextHandle {
+                                id: 30,
+                                generation: 1,
+                            },
+                            presentation_override: None,
+                        },
+                    ),
+                ]),
+            }],
+            expected_program_revision: neon_ui_schema::UiProgramRevision {
+                program_id: "grid-test".into(),
+                revision: Revision(1),
+                schema_version: 1,
+                capabilities: Vec::new(),
+            },
+        };
+        let fragments = HashMap::from([(
+            UiFragmentId("grid".into()),
+            UiFragment {
+                fragment_id: UiFragmentId("grid".into()),
+                revision: Revision(1),
+                root,
+                effects: vec![UiEffect::DataGridFrame { declaration, frame }],
+            },
+        )]);
+        let mut renderer = UiWgpuRenderer::new(&device, wgpu::TextureFormat::Rgba8Unorm);
+
+        // This invokes only `draw`; no hit pass or readback has populated state.
+        let _ = render_renderer_offscreen_for_test(
+            &mut renderer,
+            &device,
+            &queue,
+            wgpu::TextureFormat::Rgba8Unorm,
+            &fragments,
+            [352, 104],
+            0.0,
+        );
+        let cell_pointer = |renderer: &UiWgpuRenderer, column_key: &str| {
+            let binding = renderer
+                .hit_bindings
+                .values()
+                .find(|binding| {
+                    binding
+                        .data_grid_cell
+                        .as_ref()
+                        .is_some_and(|cell| cell.column_key == column_key)
+                })
+                .expect("normal draw must populate the generated cell binding");
+            let index = renderer
+                .plan
+                .iter()
+                .position(|node| node.id == binding.node_path)
+                .unwrap();
+            let bounds = renderer.visual_at(index).bounds;
+            [
+                bounds.x + bounds.width * 0.5,
+                bounds.y + bounds.height * 0.5,
+            ]
+        };
+
+        renderer.set_pointer_position(cell_pointer(&renderer, "name"));
+        let input = renderer
+            .text_input_at_pointer()
+            .expect("edit must focus on first press");
+        renderer.focus_text_input(input);
+        assert!(renderer.data_grid_text_input_active());
+        renderer.clear_text_focus();
+
+        renderer.set_pointer_position(cell_pointer(&renderer, "state"));
+        assert!(renderer.toggle_dropdown_at_pointer());
+        assert!(renderer.open_dropdown.is_some());
+        assert!(renderer.dropdown_debug_snapshot()["open_dropdown"].is_null());
+        renderer.close_dropdown();
+
+        renderer.set_pointer_position(cell_pointer(&renderer, "selected"));
+        let hit_id = renderer
+            .hit_id_at_pointer()
+            .expect("select must hit on first press");
+        let binding = renderer.hit_binding(hit_id).unwrap();
+        assert_eq!(
+            binding.control_value,
+            Some(UiSemanticPayloadValue::Bool { value: true })
+        );
+        assert!(renderer.focus_control_at_pointer());
+        assert!(
+            renderer.semantic_hit_nodes().is_empty(),
+            "generated paths must remain renderer-local");
     }
 
     fn test_device(label: &'static str) -> (wgpu::Device, wgpu::Queue) {
@@ -5403,6 +6579,71 @@ mod tests {
             }),
             children: Vec::new(),
         }
+    }
+
+    #[test]
+    fn prepare_interaction_binds_the_first_press_after_fragment_application() {
+        let _gpu_test = GPU_TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let (device, _queue) = test_device("neon3-ui-first-press-preparation");
+        let mut root = node();
+        root.kind = UiNodeKind::Button;
+        root.enter_transition = None;
+        let intent = UiIntent::Invoke {
+            action: "gallery.first_press".into(),
+            params: json!({}),
+        };
+        let fragments = HashMap::from([(
+            UiFragmentId("first-press".into()),
+            UiFragment {
+                fragment_id: UiFragmentId("first-press".into()),
+                revision: Revision(1),
+                root,
+                effects: vec![UiEffect::BoundSemanticIntent {
+                    node_id: UiNodeId("root".into()),
+                    intent: intent.clone(),
+                }],
+            },
+        )]);
+        let mut renderer = UiWgpuRenderer::new(&device, wgpu::TextureFormat::Rgba8Unorm);
+        renderer.set_pointer_position([20.0, 30.0]);
+
+        renderer.prepare_interaction(&fragments, [160, 120], 0.0);
+
+        let hit_id = renderer.hit_id_at_pointer().expect("first press must resolve a hit");
+        assert_eq!(renderer.hit_binding(hit_id).unwrap().intent, Some(intent));
+    }
+
+    #[test]
+    fn value_gesture_uses_the_current_pointer_value_after_interaction_preparation() {
+        let _gpu_test = GPU_TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let (device, _queue) = test_device("neon3-ui-value-gesture-preparation");
+        let mut root = node();
+        root.kind = UiNodeKind::DragValue;
+        root.bounds = UiBounds { x: 0.0, y: 0.0, width: 300.0, height: 40.0 };
+        root.enter_transition = None;
+        let fragments = HashMap::from([(
+            UiFragmentId("item-count".into()),
+            UiFragment {
+                fragment_id: UiFragmentId("item-count".into()),
+                revision: Revision(1),
+                root,
+                effects: vec![UiEffect::ControlPresentation {
+                    node_id: UiNodeId("root".into()),
+                    state: UiControlPresentation::Numeric { value: 12.0, min: 0.0, max: 20.0 },
+                }],
+            },
+        )]);
+        let mut renderer = UiWgpuRenderer::new(&device, wgpu::TextureFormat::Rgba8Unorm);
+        renderer.set_pointer_position([260.0, 20.0]);
+
+        renderer.prepare_interaction(&fragments, [320, 80], 0.0);
+        let hit_id = renderer.hit_id_at_pointer().expect("drag control must be bound");
+        let binding = renderer.hit_binding(hit_id).unwrap();
+        assert!(renderer.begin_value_gesture(&binding));
+        assert_eq!(
+            renderer.finish_value_gesture(),
+            Some(UiSemanticPayloadValue::I32 { value: 15 })
+        );
     }
 
     #[test]
@@ -5875,6 +7116,181 @@ mod tests {
                 idempotency_key: Some(format!("gallery-key-{key}")),
             });
             assert_eq!(response.status, RpcStatus::Accepted, "{key}: {:?}", response.error);
+        }
+    }
+
+    #[test]
+    fn component_gallery_fixture_keeps_scrollports_and_interactive_hits_separate() {
+        let _gpu_test = GPU_TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let (device, queue) = test_device("neon3-ui-component-gallery-scroll-hit-map");
+        let document = parse_nui_flow(include_str!(
+            "../../../tests/fixtures/ui/imgui-component-gallery.nui"
+        ))
+        .expect("component gallery must parse");
+        let declaration = document.ir.data_grids[0].clone();
+        let handle = |id| neon_ui_schema::UiTextHandle { id, generation: 1 };
+        let cells = std::collections::BTreeMap::from([
+            ("name".into(), neon_ui_schema::UiDataGridCell {
+                value: neon_ui_schema::UiInputValue::TextHandle { value: handle(1) },
+                display: handle(101), presentation_override: None,
+            }),
+            ("status".into(), neon_ui_schema::UiDataGridCell {
+                value: neon_ui_schema::UiInputValue::Enum { value: "ready".into() },
+                display: handle(102), presentation_override: None,
+            }),
+            ("owner".into(), neon_ui_schema::UiDataGridCell {
+                value: neon_ui_schema::UiInputValue::Bool { value: true },
+                display: handle(103), presentation_override: None,
+            }),
+            ("notes".into(), neon_ui_schema::UiDataGridCell {
+                value: neon_ui_schema::UiInputValue::TextHandle { value: handle(4) },
+                display: handle(104), presentation_override: None,
+            }),
+        ]);
+        let mut fragment = UiFragment {
+            fragment_id: UiFragmentId("component-gallery".into()),
+            revision: Revision(1),
+            root: document.ir.root.clone(),
+            effects: lower_nui_flow_effects(&document),
+        };
+        fragment.effects.push(UiEffect::DataGridFrame {
+            declaration,
+            frame: neon_ui_schema::UiDataGridFrame {
+                list_revision: Revision(1), total_rows: 10_000, first_row: 0,
+                window_rows: vec![neon_ui_schema::UiDataGridWindowRow {
+                    stable_row_key: "asset-1".into(), cells,
+                }],
+                expected_program_revision: neon_ui_schema::UiProgramRevision {
+                    program_id: "component-gallery-test".into(), revision: Revision(1),
+                    schema_version: 1, capabilities: Vec::new(),
+                },
+            },
+        });
+        let fragments = HashMap::from([(fragment.fragment_id.clone(), fragment)]);
+        let flattened = flatten_fragments(&fragments, None);
+        let visual = |path: &str| &flattened.iter().find(|(id, _, _, _)| id == path).unwrap().2;
+        let controls = visual("component-gallery/gallery-controls");
+        let grid = visual("component-gallery/asset-grid");
+        assert_eq!(controls.bounds, UiBounds { x: 14.0, y: 14.0, width: 390.0, height: 652.0 });
+        assert_eq!(grid.bounds, UiBounds { x: 414.0, y: 14.0, width: 840.0, height: 652.0 });
+        assert_eq!(controls.clip, controls.bounds);
+        assert_eq!(grid.clip, grid.bounds);
+        assert_eq!(visual("component-gallery/feature-toggle").bounds.y, 58.0);
+        assert_eq!(visual("component-gallery/asset-grid/data-grid-row-asset-1/cell-status").bounds,
+            UiBounds { x: 639.0, y: 38.0, width: 170.0, height: 24.0 });
+
+        let mut renderer = UiWgpuRenderer::new(&device, wgpu::TextureFormat::Rgba8Unorm);
+        let _ = render_renderer_offscreen_for_test(
+            &mut renderer, &device, &queue, wgpu::TextureFormat::Rgba8Unorm,
+            &fragments, [1280, 680], 1.0,
+        );
+        renderer.set_pointer_position([30.0, 70.0]);
+        assert!(renderer.hit_id_at_pointer().is_some(), "the default-hidden dialog must not block gallery controls");
+        let probe = renderer.pointer_probe_snapshot();
+        assert_eq!(probe["fallback_hit"]["status"], "hit");
+        assert_eq!(
+            probe["fallback_hit"]["semantic_node_path"],
+            "component-gallery/feature-toggle"
+        );
+        assert!(probe["fallback_hit"].get("render_id").is_none());
+        let pixels = render_hit_ids_with_renderer_for_test(
+            &mut renderer, &device, &queue, &fragments, [1280, 680],
+        );
+        let at = |x: usize, y: usize| pixels[y * 1280 + x];
+        let binding = |x, y| renderer.hit_binding(at(x, y)).unwrap();
+        assert_eq!(binding(30, 70).node_path, "component-gallery/feature-toggle");
+        assert_eq!(binding(700, 50).data_grid_cell.as_ref().unwrap().column_key, "status");
+        assert_eq!(binding(880, 50).data_grid_cell.as_ref().unwrap().column_key, "owner");
+
+        renderer.scroll_offsets.insert("component-gallery/asset-grid".into(), [0.0, 24.0]);
+        let _ = render_renderer_offscreen_for_test(
+            &mut renderer, &device, &queue, wgpu::TextureFormat::Rgba8Unorm,
+            &fragments, [1280, 680], 2.0,
+        );
+        let pixels = render_hit_ids_with_renderer_for_test(
+            &mut renderer, &device, &queue, &fragments, [1280, 680],
+        );
+        let at = |x: usize, y: usize| pixels[y * 1280 + x];
+        let binding = |x, y| renderer.hit_binding(at(x, y)).unwrap();
+        assert_eq!(renderer.scroll_metrics["component-gallery/gallery-controls"].max_offset, [0.0, 16.0]);
+        assert_eq!(binding(30, 70).node_path, "component-gallery/feature-toggle");
+        assert_eq!(binding(700, 26).data_grid_cell.as_ref().unwrap().column_key, "status");
+        assert_eq!(binding(880, 26).data_grid_cell.as_ref().unwrap().column_key, "owner");
+
+        let controls_offset = renderer.scroll_metrics["component-gallery/gallery-controls"].max_offset;
+        renderer.scroll_offsets.insert("component-gallery/gallery-controls".into(), controls_offset);
+        let pixels = render_renderer_offscreen_for_test(
+            &mut renderer, &device, &queue, wgpu::TextureFormat::Rgba8Unorm,
+            &fragments, [1280, 680], 3.0,
+        );
+        let dialog_toggle = renderer
+            .plan
+            .iter()
+            .position(|node| node.id == "component-gallery/dialog-toggle")
+            .map(|index| renderer.visual_at(index).bounds)
+            .unwrap();
+        let x = (dialog_toggle.x + dialog_toggle.width * 0.5) as usize;
+        let y = (dialog_toggle.y + dialog_toggle.height * 0.5) as usize;
+        assert!(pixels[(y * 1280 + x) * 4 + 3] > 0, "bottom control must remain visible at maximum scroll offset");
+        for path in [
+            "component-gallery/feature-toggle",
+            "component-gallery/mode-combo",
+            "component-gallery/item-list",
+            "component-gallery/dialog-toggle",
+        ] {
+            let bounds = renderer
+                .plan
+                .iter()
+                .position(|node| node.id == path)
+                .map(|index| renderer.visual_at(index).bounds)
+                .unwrap();
+            let x = (bounds.x + 12.0) as usize;
+            let y = (bounds.y + bounds.height * 0.5) as usize;
+            let pixel = &pixels[(y * 1280 + x) * 4..][..4];
+            assert_ne!(pixel, &[29, 42, 40, 255], "{path} must paint inside the fixed scroll viewport");
+        }
+
+        let grid_offset = renderer.scroll_metrics["component-gallery/asset-grid"].max_offset;
+        renderer.scroll_offsets.insert("component-gallery/asset-grid".into(), grid_offset);
+        let mut sequence = 0;
+        let requests = renderer.data_grid_window_requests(&fragments, 1, Revision(1), &mut sequence);
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].requested_first_row, 9_976);
+        assert_eq!(requests[0].max_window_rows, 24);
+
+        let mut end_fragment = fragments[&UiFragmentId("component-gallery".into())].clone();
+        let UiEffect::DataGridFrame { frame, .. } = end_fragment.effects.iter_mut().find(|effect| matches!(effect, UiEffect::DataGridFrame { .. })).unwrap() else { unreachable!() };
+        frame.first_row = 9_976;
+        frame.window_rows = (9_976..10_000).map(|row| neon_ui_schema::UiDataGridWindowRow {
+            stable_row_key: format!("asset-{row}"),
+            cells: std::collections::BTreeMap::new(),
+        }).collect();
+        end_fragment.revision = Revision(2);
+        let end_fragments = HashMap::from([(end_fragment.fragment_id.clone(), end_fragment)]);
+        let pixels = render_renderer_offscreen_for_test(
+            &mut renderer, &device, &queue, wgpu::TextureFormat::Rgba8Unorm,
+            &end_fragments, [1280, 680], 4.0,
+        );
+        for row in [9_976_u64, 9_988, 9_999] {
+            let path = format!("component-gallery/asset-grid/data-grid-row-asset-{row}");
+            let bounds = renderer
+                .plan
+                .iter()
+                .position(|node| node.id == path)
+                .map(|index| renderer.visual_at(index).bounds)
+                .unwrap();
+            let x = 430_usize;
+            let y = (bounds.y + bounds.height * 0.5) as usize;
+            let pixel = &pixels[(y * 1280 + x) * 4..][..4];
+            let expected = if (row - 9_976) % 2 == 0 {
+                [1, 2, 3, 255]
+            } else {
+                [1, 3, 4, 255]
+            };
+            assert!(
+                pixel.iter().zip(expected).all(|(actual, expected)| actual.abs_diff(expected) <= 1),
+                "tail row {row} must render at its translated viewport position, got {pixel:?}",
+            );
         }
     }
 

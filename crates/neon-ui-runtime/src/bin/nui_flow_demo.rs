@@ -12,7 +12,7 @@ use neon_ui_runtime::{
     UiDataGridStore, UiInputStore, UiLocalPresentationState,
 };
 use neon_ui_schema::{
-    NuiFlowDocument, UiBounds, UiCommand, UiCpuViewport, UiDataGridCell, UiDataGridFrame,
+    NuiFlowDocument, UiBounds, UiCommand, UiCpuViewport, UiDataGridCell, UiDataGridFrame, UiDataGridInputFrame,
     UiDataGridWindowRow, UiFragment, UiFragmentId, UiFragmentSubmission, UiInputValue, UiNode,
     UiNodeKind, UiProgramCapability, UiProgramCapabilityOwner, UiProgramCapabilityStatus,
     UiProgramResource, UiProgramResourceKind, UiProgramRevision, UiTextHandle,
@@ -61,17 +61,7 @@ fn main() {
         effects,
     };
     if case == "component-gallery" {
-        let (_, program) = neon_ui_runtime::demo_domain::component_gallery_program()
-            .expect("component gallery program must compile");
-        let domain = neon_ui_runtime::demo_domain::DemoInputDomain::new(
-            program,
-            document.input_schema.clone(),
-        )
-        .expect("component gallery defaults must activate");
-        neon_ui_runtime::demo_domain::apply_visible_status_to_fragment(
-            &mut fragment,
-            &domain.snapshot(),
-        );
+        attach_demo_virtual_list_frame(&document, &mut fragment);
     }
     if case == "data-grid" {
         attach_demo_data_grid_frame(&document, &mut fragment);
@@ -120,7 +110,7 @@ fn attach_demo_data_grid_frame(document: &NuiFlowDocument, fragment: &mut UiFrag
     let program = compile_nui_flow_program(document, demo_program_revision(&document.ir.surface_id.0))
         .expect("DataGrid demo fixture must compile");
     let frame = UiDataGridFrame {
-        data_grid_key: "asset-grid".into(), list_revision: Revision(1), total_rows: 3, first_row: 0,
+        list_revision: Revision(1), total_rows: 3, first_row: 0,
         window_rows: [
             ("asset-wood", 1, 101, 2, 102),
             ("asset-stone", 3, 103, 4, 104),
@@ -143,33 +133,41 @@ fn attach_demo_data_grid_frame(document: &NuiFlowDocument, fragment: &mut UiFrag
         expected_program_revision: program.revision.clone(),
     };
     let mut store = UiDataGridStore::default();
-    store.apply(&program, frame).expect("DataGrid demo frame must be valid");
+    store.apply(&program, UiDataGridInputFrame { source_key: "asset_window".into(), frame }).expect("DataGrid demo frame must be valid");
     store.attach_to_fragment(&program, fragment).expect("DataGrid demo frame must attach");
 }
 
 fn attach_demo_virtual_list_frame(document: &NuiFlowDocument, fragment: &mut UiFragment) {
     let program = compile_nui_flow_program(document, demo_program_revision(&document.ir.surface_id.0))
         .expect("Virtual list demo fixture must compile");
+    let column_keys = program.data_grid_records[0]
+        .columns
+        .iter()
+        .map(|column| column.key.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
     let first_row = 0_u64;
-    let window_rows = (0_u64..12).map(|row_index| {
+    let window_rows = (0_u64..24).map(|row_index| {
         let handle = |id: u64| UiTextHandle { id, generation: 1 };
-        let base = 10_000 + row_index * 4;
+        let base = 10_000 + row_index * 5;
+        let mut cells: std::collections::BTreeMap<String, UiDataGridCell> = std::collections::BTreeMap::from([
+            ("id".into(), UiDataGridCell { value: UiInputValue::I32 { value: row_index as i32 }, display: handle(base), presentation_override: None }),
+            ("name".into(), UiDataGridCell { value: UiInputValue::TextHandle { value: handle(base + 1) }, display: handle(base + 1), presentation_override: None }),
+            ("status".into(), UiDataGridCell { value: UiInputValue::Enum { value: "ready".into() }, display: handle(base + 2), presentation_override: None }),
+            ("owner".into(), UiDataGridCell { value: UiInputValue::Bool { value: row_index % 2 == 0 }, display: handle(base + 3), presentation_override: None }),
+            ("notes".into(), UiDataGridCell { value: UiInputValue::TextHandle { value: handle(base + 4) }, display: handle(base + 4), presentation_override: None }),
+        ]);
+        cells.retain(|key, _| column_keys.contains(key.as_str()));
         UiDataGridWindowRow {
             stable_row_key: format!("virtual-row-{row_index}"),
-            cells: std::collections::BTreeMap::from([
-                ("id".into(), UiDataGridCell { value: UiInputValue::I32 { value: row_index as i32 }, display: handle(base), presentation_override: None }),
-                ("name".into(), UiDataGridCell { value: UiInputValue::TextHandle { value: handle(base + 1) }, display: handle(base + 1), presentation_override: None }),
-                ("status".into(), UiDataGridCell { value: UiInputValue::TextHandle { value: handle(base + 2) }, display: handle(base + 2), presentation_override: None }),
-                ("owner".into(), UiDataGridCell { value: UiInputValue::TextHandle { value: handle(base + 3) }, display: handle(base + 3), presentation_override: None }),
-            ]),
+            cells,
         }
     }).collect();
     let frame = UiDataGridFrame {
-        data_grid_key: "virtual-list".into(), list_revision: Revision(1), total_rows: 10_000,
+        list_revision: Revision(1), total_rows: 10_000,
         first_row, window_rows, expected_program_revision: program.revision.clone(),
     };
     let mut store = UiDataGridStore::default();
-    store.apply(&program, frame).expect("Virtual list demo frame must be valid");
+    store.apply(&program, UiDataGridInputFrame { source_key: "asset_window".into(), frame }).expect("Virtual list demo frame must be valid");
     store.attach_to_fragment(&program, fragment).expect("Virtual list demo frame must attach");
 }
 
@@ -294,6 +292,42 @@ mod tests {
         assert!(fragment.effects.iter().any(|effect| matches!(effect,
             neon_ui_schema::UiEffect::DataGridFrame { declaration, frame }
                 if declaration.node_key == "asset-grid" && frame.window_rows.len() == 3
+        )));
+    }
+
+    #[test]
+    fn virtual_list_case_attaches_the_asset_window_frame() {
+        let document = parse_nui_flow(VIRTUAL_LIST_SOURCE).unwrap();
+        let mut fragment = UiFragment {
+            fragment_id: UiFragmentId("virtual-list-demo-test".into()), revision: Revision(1),
+            root: initial_visible_root(&document), effects: lower_nui_flow_effects(&document),
+        };
+
+        attach_demo_virtual_list_frame(&document, &mut fragment);
+
+        assert!(fragment.effects.iter().any(|effect| matches!(effect,
+            neon_ui_schema::UiEffect::DataGridFrame { declaration, frame }
+                if declaration.node_key == "virtual-list"
+                    && declaration.source_key == "asset_window"
+                    && frame.window_rows.len() == 24
+        )));
+    }
+
+    #[test]
+    fn component_gallery_initializes_the_asset_window_through_its_grid_input() {
+        let document = parse_nui_flow(COMPONENT_GALLERY_SOURCE).unwrap();
+        let mut fragment = UiFragment {
+            fragment_id: UiFragmentId("component-gallery-demo-test".into()), revision: Revision(1),
+            root: initial_visible_root(&document), effects: lower_nui_flow_effects(&document),
+        };
+
+        attach_demo_virtual_list_frame(&document, &mut fragment);
+
+        assert!(fragment.effects.iter().any(|effect| matches!(effect,
+            neon_ui_schema::UiEffect::DataGridFrame { declaration, frame }
+                if declaration.node_key == "asset-grid"
+                    && declaration.source_key == "asset_window"
+                    && frame.window_rows.len() == 24
         )));
     }
 }

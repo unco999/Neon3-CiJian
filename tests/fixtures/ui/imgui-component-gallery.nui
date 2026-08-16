@@ -2,7 +2,7 @@
 # and a semantic intent; no renderer identity or domain-specific rule is present.
 version 1
 surface surface.component-gallery revision 1
-budget nodes=64 bindings=64 instances=64 text=64 glyphs=4096 events=32 clips=32
+budget nodes=96 bindings=96 instances=64 text=96 glyphs=8192 events=48 clips=48
 input controls_enabled bool default true
 input feature_enabled bool default true
 input radio_selected bool default false
@@ -14,30 +14,33 @@ input list_choice enum:alpha|beta|gamma default beta
 input item_selected bool default true
 input scroll_position f32 default 0.35
 input dialog_visible bool default false
-surface component-gallery overlay w 420 h 680 fill #17201E
-  panel gallery-content x 0 y 0 column w 420 h 680 gap 6 pad 14 align stretch fill #17201E
-    text gallery-title h 28 value "Component Gallery"
-    checkbox feature-toggle h 30 checked $feature_enabled enabled $controls_enabled value "Enable feature" event gallery.checkbox.toggle
-    text status-feature_enabled h 18 value "feature_enabled: true"
-    radio_button mode-radio h 30 selected $radio_selected enabled $controls_enabled value "Select mode" event gallery.radio.select
-    text status-radio_selected h 18 value "radio_selected: false"
-    slider exposure-slider h 30 numeric $slider_value enabled $controls_enabled value "Exposure" event gallery.slider.commit
-    text status-slider_value h 18 value "slider_value: 0.5"
-    drag_value count-drag h 30 numeric $drag_value enabled $controls_enabled value "Item count" event gallery.drag_value.commit
-    text status-drag_value h 18 value "Current count: 12"
-    combo mode-combo h 32 state $combo_choice enabled $controls_enabled value "Mode selector" event gallery.combo.select
-    text status-combo_choice h 18 value "combo_choice: beta"
-    dropdown mode-dropdown h 32 state $dropdown_choice enabled $controls_enabled value "Mode menu" event gallery.dropdown.select
-    text status-dropdown_choice h 18 value "dropdown_choice: beta"
-    selectable item-selectable h 30 selected $item_selected enabled $controls_enabled value "Selectable item" event gallery.selectable.select
-    text status-item_selected h 18 value "item_selected: true"
-    list_box item-list h 90 state $list_choice enabled $controls_enabled value "Available modes" event gallery.list_box.select
-    text status-list_choice h 18 value "Selected mode: beta"
-    scrollbar gallery-scroll h 20 scroll $scroll_position enabled $controls_enabled value "Scrollbar" event gallery.scrollbar.commit
-      tooltip gallery-scroll-tooltip x 0 y 26 w 184 h 34 fill #25363B value "Tooltip: local overlay"
-    text status-scroll_position h 18 value "scroll_position: 0.35"
-    checkbox dialog-toggle h 30 checked $dialog_visible enabled $controls_enabled value "Open dialog" event gallery.dialog.toggle
-  dialog gallery-dialog x 62 y 190 column w 296 h 184 pad 14 gap 10 align stretch visible $dialog_visible fill #263334 line #66B7A0
+input asset_window grid default grid:empty
+surface component-gallery overlay w 1280 h 680 fill #17201E
+  panel gallery-layout x 0 y 0 row w 1280 h 680 gap 10 pad 14 align stretch fill #17201E
+    scroll gallery-controls column w 390 h 652 gap 6 pad 10 align stretch fill #1D2A28
+      text gallery-title h 28 value "Component Gallery"
+      checkbox feature-toggle h 30 checked $feature_enabled enabled $controls_enabled value "Enable feature" event gallery.checkbox.toggle
+      text status-feature_enabled h 18 value "feature_enabled: true"
+      radio_button mode-radio h 30 selected $radio_selected enabled $controls_enabled value "Select mode" event gallery.radio.select
+      text status-radio_selected h 18 value "radio_selected: false"
+      slider exposure-slider h 30 numeric $slider_value enabled $controls_enabled value "Exposure" event gallery.slider.commit
+      text status-slider_value h 18 value "slider_value: 0.5"
+      drag_value count-drag h 30 numeric $drag_value enabled $controls_enabled value "Item count" event gallery.drag_value.commit
+      text status-drag_value h 18 value "Current count: 12"
+      combo mode-combo h 32 state $combo_choice enabled $controls_enabled value "Mode selector" event gallery.combo.select
+      text status-combo_choice h 18 value "combo_choice: beta"
+      dropdown mode-dropdown h 32 state $dropdown_choice enabled $controls_enabled value "Mode menu" event gallery.dropdown.select
+      text status-dropdown_choice h 18 value "dropdown_choice: beta"
+      selectable item-selectable h 30 selected $item_selected enabled $controls_enabled value "Selectable item" event gallery.selectable.select
+      text status-item_selected h 18 value "item_selected: true"
+      list_box item-list h 90 state $list_choice enabled $controls_enabled value "Available modes" event gallery.list_box.select
+      text status-list_choice h 18 value "Selected mode: beta"
+      scrollbar gallery-scroll h 20 scroll $scroll_position enabled $controls_enabled value "Scrollbar" event gallery.scrollbar.commit
+        tooltip gallery-scroll-tooltip x 0 y 26 w 184 h 34 fill #25363B value "Tooltip: local overlay"
+      text status-scroll_position h 18 value "scroll_position: 0.35"
+      checkbox dialog-toggle h 30 checked $dialog_visible enabled $controls_enabled value "Open dialog" event gallery.dialog.toggle
+    data_grid asset-grid w 840 h 652 source $asset_window capacity 24 row_height 24 overscan 6 columns "name:220:edit:64:virtual_list.name.commit,status:180:dropdown:draft|ready|archived:virtual_list.status.set,owner:160:select:virtual_list.owner.toggle,notes:260:edit:128:virtual_list.notes.commit"
+  dialog gallery-dialog x 492 y 190 column w 296 h 184 pad 14 gap 10 align stretch visible $dialog_visible fill #263334 line #66B7A0
     text dialog-title h 26 value "Dialog example"
     text dialog-body h 48 value "This dialog blocks the gallery behind it."
     checkbox dialog-close h 32 checked $dialog_visible value "Close dialog" event gallery.dialog.toggle

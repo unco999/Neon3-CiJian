@@ -48,6 +48,90 @@ pub struct ServiceName(pub String);
 #[serde(transparent)]
 pub struct Revision(pub u64);
 
+/// Stable identifier assigned by the window owner to one real OS interaction.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct InteractionId(pub String);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InteractionTraceStage {
+    Prepared,
+    HitCaptureResolved,
+    SemanticEventForwarded,
+    InboundReceived,
+    AdapterValidationAccepted,
+    AdapterValidationRejected,
+    HostForwarded,
+    HostResponseAccepted,
+    HostResponseRejected,
+    PublicationApplied,
+    PublicationRejected,
+    WgpuFragmentSubmissionAccepted,
+    WgpuFragmentSubmissionRejected,
+    DeliveryAccepted,
+    DeliveryRejected,
+    TransportFailed,
+    CompositionRevisionApplied,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InteractionTraceOutcome {
+    Pending,
+    Accepted,
+    Rejected,
+    Failed,
+}
+
+/// Renderer-independent target identity. `node_path` is the declared semantic
+/// path; renderer hit IDs, coordinates, and private renderer paths are excluded.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InteractionSemanticTarget {
+    pub node_path: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InteractionTraceError {
+    pub code: String,
+    pub message: String,
+}
+
+/// One durable lifecycle observation for a real window interaction.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InteractionTraceRecord {
+    pub sequence: u64,
+    pub interaction_id: InteractionId,
+    pub stage: InteractionTraceStage,
+    pub outcome: InteractionTraceOutcome,
+    pub error: Option<InteractionTraceError>,
+    pub semantic_target: Option<InteractionSemanticTarget>,
+    pub fragment_revision: Option<Revision>,
+    pub composition_revision: Revision,
+    pub downstream_request_id: Option<RequestId>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct InteractionTraceFilters {
+    pub interaction_id: Option<InteractionId>,
+    pub stage: Option<InteractionTraceStage>,
+    pub outcome: Option<InteractionTraceOutcome>,
+    pub semantic_node_path: Option<String>,
+    pub downstream_request_id: Option<RequestId>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct InteractionTraceQuery {
+    pub after: Option<u64>,
+    pub limit: Option<usize>,
+    pub filters: Option<InteractionTraceFilters>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AssetRef {

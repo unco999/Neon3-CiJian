@@ -9,8 +9,8 @@ use neon_ipc::{RpcServer, TransportError};
 use neon_protocol::{Revision, RpcError, RpcRequest, RpcResponse, RpcStatus};
 use neon_ui_schema::{
     TextRef, UiControlPresentation, UiDropPlacement, UiEffect, UiFragment, UiInputChange, UiInputFrame, UiInputKind,
-    UiDataGridCell, UiDataGridFrame, UiDataGridWindowRequest, UiDataGridWindowRow,
-    UiInputSchema, UiInputValue, UiNode, UiNodeId, UiProgram, UiProgramSemanticEvent,
+    UiDataGridCell, UiDataGridFrame, UiDataGridInputFrame, UiDataGridWindowRequest, UiDataGridWindowRow,
+    UiHostInbound, UiHostPublication, UiInputSchema, UiInputValue, UiNode, UiNodeId, UiProgram, UiProgramSemanticEvent,
     UiProgramSemanticEventKind, UiSemanticEvent, UiSemanticEventType, UiResolvedInputs, UiProgramRevision,
     UiProgramCapability, UiProgramCapabilityOwner, UiProgramCapabilityStatus,
     UiProgramSemanticEventStatus, UiSemanticPayloadValue, UI_PROGRAM_BOUNDED_STRUCTURE_CAPABILITY_NAME,
@@ -19,7 +19,7 @@ use neon_ui_schema::{
 };
 use serde_json::{json, Value};
 
-use crate::{compile_nui_flow_program, parse_nui_flow, UiInputStore, UiInputStoreError,
+use crate::{compile_nui_flow_program, host_adapter::UiHostAdapterConfig, parse_nui_flow, UiInputStore, UiInputStoreError,
     UiInputWriter, UiProgramSemanticEventRouter};
 
 /// Generic controlled-input demo domain. It resolves the slot from the program
@@ -84,20 +84,94 @@ impl DemoInputDomain {
         Ok(self.snapshot())
     }
 
-    /// Runs the controlled component-gallery domain over the public RPC boundary.
-    /// The semantic gate remains the UI runtime's router; this endpoint owns only
-    /// the controlled input state and visible status values.
+    /// Runs the component-gallery program through the generic UI host boundary.
+    /// It owns only typed inputs and bounded DataGrid frames.
     pub fn serve_component_gallery(endpoint: SocketAddr) -> Result<(), TransportError> {
         let (document, program) = component_gallery_program()
             .map_err(|error| TransportError::Io(std::io::Error::other(error)))?;
-        let mut domain = Self::new(program.clone(), document.input_schema)
+        let input_schema = document.input_schema;
+        let mut domain = Self::new(program.clone(), input_schema.clone())
             .map_err(|error| TransportError::Io(std::io::Error::other(error.message)))?;
-        let mut router = UiProgramSemanticEventRouter::new(program, domain.snapshot().inputs, 1);
+        let mut router = UiProgramSemanticEventRouter::new(program.clone(), domain.snapshot().inputs, 1);
+        let mut grid = DemoDragDropDomain::new();
+        let mut active_grid = None;
         let server = RpcServer::bind(endpoint)?;
         server.serve_until(|request| {
             let shutdown = request.method == "service.shutdown";
             let response = if shutdown {
                 accepted(request, Some(domain.snapshot().inputs.input_revision), json!({"state": "accepted"}))
+            } else if request.method == "ui.host.adapter.get" {
+                accepted(request, Some(domain.snapshot().inputs.input_revision), json!(UiHostAdapterConfig {
+                    program: program.clone(), input_schema: input_schema.clone(),
+                }))
+            } else if request.method == "ui.host.inbound" {
+                let inbound = serde_json::from_value::<UiHostInbound>(request.params.clone());
+                match inbound {
+                    Ok(UiHostInbound::SemanticIntent { event }) => {
+                        let validation = router.validate(&event);
+                        if validation.status != UiProgramSemanticEventStatus::Accepted {
+                            rejected(request, Some(domain.snapshot().inputs.input_revision), validation.code.as_deref().unwrap_or("semantic_event_rejected"), &validation.message)
+                        } else {
+                            let before = domain.snapshot().inputs.input_revision;
+                            match domain.apply(&event) {
+                                Ok(snapshot) => {
+                                    router.replace_resolved_inputs(snapshot.inputs.clone());
+                                    let changes = snapshot.inputs.changed_slots.iter().filter_map(|key| snapshot.inputs.values.get(key).map(|value| UiInputChange { key: key.clone(), value: value.value.clone() })).collect();
+                                    let frame = grid.virtual_list_window_frame(0, 24, program.revision.clone(), &["name", "status", "owner", "notes"]);
+                                    active_grid = Some(frame.clone());
+                                    accepted(request, Some(snapshot.inputs.input_revision), json!(UiHostPublication {
+                                        scalar_frame: UiInputFrame { program_revision: program.revision.clone(), expected_input_revision: before, request_id: event.request_id, idempotency_key: event.idempotency_key, changes },
+                                        grid_inputs: vec![UiDataGridInputFrame { source_key: "asset_window".into(), frame }],
+                                    }))
+                                }
+                                Err(message) => rejected(request, Some(domain.snapshot().inputs.input_revision), "domain_input_rejected", message),
+                            }
+                        }
+                    }
+                    Ok(UiHostInbound::WindowRequest { request: neon_ui_schema::UiWindowRequest::DataGrid { request: window } }) => {
+                        let before = domain.snapshot().inputs.input_revision;
+                        let frame_response = grid.handle_data_grid_window_request(RpcRequest { params: json!(window), ..request.clone() });
+                        match frame_response.result.and_then(|value| serde_json::from_value::<UiDataGridFrame>(value).ok()) {
+                            Some(mut frame) => {
+                                frame.expected_program_revision = program.revision.clone();
+                                let scalar_frame = UiInputFrame { program_revision: program.revision.clone(), expected_input_revision: before, request_id: request.request_id.0.clone(), idempotency_key: request.idempotency_key.clone().unwrap_or_default(), changes: Vec::new() };
+                                if domain.inputs.apply(UiInputWriter::External, scalar_frame.clone()).is_err() {
+                                    rejected(request, Some(before), "domain_input_rejected", "host input frame was rejected")
+                                } else {
+                                    router.replace_resolved_inputs(domain.snapshot().inputs);
+                                    active_grid = Some(frame.clone());
+                                    accepted(request, Some(frame.list_revision), json!(UiHostPublication { scalar_frame, grid_inputs: vec![UiDataGridInputFrame { source_key: "asset_window".into(), frame }] }))
+                                }
+                            }
+                            None => rejected(request, Some(grid.virtual_list_revision), "data_grid_window_rejected", "DataGrid window request was rejected"),
+                        }
+                    }
+                    Ok(UiHostInbound::DataGridCell { event }) => {
+                        let before = domain.snapshot().inputs.input_revision;
+                        let Some(current_frame) = active_grid.clone() else {
+                            return (rejected(request, Some(grid.virtual_list_revision), "ui_host_grid_unavailable", "DataGrid cell mutation has no active grid frame"), !shutdown);
+                        };
+                        let frame_response = grid.handle_virtual_list_cell_event(RpcRequest {
+                            params: json!({ "data_grid_cell": event.data_grid_cell, "data_grid_frame": current_frame, "control_value": event.control_value, "text": event.text }),
+                            method: match event.intent { neon_ui_schema::UiIntent::Invoke { action, .. } => action },
+                            ..request.clone()
+                        });
+                        match frame_response.result.and_then(|value| serde_json::from_value::<UiDataGridFrame>(value).ok()) {
+                            Some(frame) => {
+                                let scalar_frame = UiInputFrame { program_revision: program.revision.clone(), expected_input_revision: before, request_id: request.request_id.0.clone(), idempotency_key: request.idempotency_key.clone().unwrap_or_default(), changes: Vec::new() };
+                                if domain.inputs.apply(UiInputWriter::External, scalar_frame.clone()).is_err() {
+                                    rejected(request, Some(before), "domain_input_rejected", "host input frame was rejected")
+                                } else {
+                                    router.replace_resolved_inputs(domain.snapshot().inputs);
+                                    active_grid = Some(frame.clone());
+                                    accepted(request, Some(frame.list_revision), json!(UiHostPublication { scalar_frame, grid_inputs: vec![UiDataGridInputFrame { source_key: "asset_window".into(), frame }] }))
+                                }
+                            }
+                            None => rejected(request, Some(grid.virtual_list_revision), "data_grid_cell_rejected", "DataGrid cell mutation was rejected"),
+                        }
+                    }
+                    Err(_) => rejected(request, Some(domain.snapshot().inputs.input_revision), "invalid_request", "a typed UI host inbound request is required"),
+                }
             } else if request.method != "ui.program.event" {
                 rejected(request, Some(domain.snapshot().inputs.input_revision), "unsupported_method", "method is not supported")
             } else {
@@ -129,7 +203,7 @@ pub fn component_gallery_program() -> Result<(neon_ui_schema::NuiFlowDocument, n
     let document = parse_nui_flow(include_str!("../../../tests/fixtures/ui/imgui-component-gallery.nui"))
     .map_err(|error| format!("component gallery fixture is invalid: {error:?}"))?;
     let revision = UiProgramRevision {
-        program_id: "component-gallery.scenario".into(),
+        program_id: "surface.component-gallery.demo".into(),
         revision: Revision(1),
         schema_version: UI_PROGRAM_SCHEMA_VERSION,
         capabilities: [
@@ -250,11 +324,25 @@ fn display_value(value: &UiInputValue) -> String {
 
 pub struct DemoDragDropDomain {
     revision: Option<Revision>,
+    virtual_list_revision: Revision,
+    virtual_list_rows: std::collections::BTreeMap<String, VirtualListRowState>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct VirtualListRowState {
+    name: Option<String>,
+    status: Option<String>,
+    owner: Option<bool>,
+    notes: Option<String>,
 }
 
 impl DemoDragDropDomain {
     pub fn new() -> Self {
-        Self { revision: None }
+        Self {
+            revision: None,
+            virtual_list_revision: Revision(1),
+            virtual_list_rows: std::collections::BTreeMap::new(),
+        }
     }
 
     pub fn serve(endpoint: SocketAddr) -> Result<(), TransportError> {
@@ -272,6 +360,15 @@ impl DemoDragDropDomain {
         }
         if request.method == "ui.data_grid.window.request" {
             return self.handle_data_grid_window_request(request);
+        }
+        if matches!(
+            request.method.as_str(),
+            "virtual_list.name.commit"
+                | "virtual_list.status.set"
+                | "virtual_list.owner.toggle"
+                | "virtual_list.notes.commit"
+        ) {
+            return self.handle_virtual_list_cell_event(request);
         }
         if request.method != "ui.drag_drop.apply" {
             return rejected(
@@ -468,40 +565,171 @@ impl DemoDragDropDomain {
             Ok(window_request) => window_request,
             Err(_) => return rejected(request, self.revision, "invalid_request", "a typed DataGrid window request is required"),
         };
-        if window_request.data_grid_key != "virtual-list" || window_request.max_window_rows == 0 {
+        if window_request.source_key != "asset_window" || window_request.max_window_rows == 0 {
             return rejected(request, self.revision, "data_grid_not_found", "the requested DataGrid is not available");
         }
-        if window_request.expected_list_revision != Revision(1) {
-            return rejected(request, Some(Revision(1)), "revision_conflict", "the requested DataGrid list revision is stale");
+        if window_request.expected_list_revision != self.virtual_list_revision {
+            return rejected(request, Some(self.virtual_list_revision), "revision_conflict", "the requested DataGrid list revision is stale");
         }
+        let frame = self.virtual_list_window_frame(
+            window_request.requested_first_row,
+            window_request.max_window_rows,
+            virtual_list_program_revision(),
+            &["id", "name", "status", "owner", "notes"],
+        );
+        accepted(request, Some(frame.list_revision), json!(frame))
+    }
+
+    fn virtual_list_window_frame(
+        &self,
+        requested_first_row: u64,
+        max_window_rows: u32,
+        expected_program_revision: UiProgramRevision,
+        declared_columns: &[&str],
+    ) -> UiDataGridFrame {
         const TOTAL_ROWS: u64 = 10_000;
-        let first_row = window_request.requested_first_row.min(TOTAL_ROWS);
-        let row_count = u64::from(window_request.max_window_rows.min(12)).min(TOTAL_ROWS - first_row);
-        let window_rows = (first_row..first_row + row_count).map(virtual_list_row).collect();
-        let frame = UiDataGridFrame {
-            data_grid_key: window_request.data_grid_key,
-            list_revision: Revision(1),
+        let row_count = u64::from(max_window_rows.min(24)).min(TOTAL_ROWS);
+        let first_row = requested_first_row.min(TOTAL_ROWS - row_count);
+        UiDataGridFrame {
+            list_revision: self.virtual_list_revision,
             total_rows: TOTAL_ROWS,
             first_row,
-            window_rows,
-            expected_program_revision: virtual_list_program_revision(),
+            window_rows: (first_row..first_row + row_count).map(|row_index| {
+                let mut row = self.virtual_list_row(row_index);
+                row.cells.retain(|key, _| declared_columns.contains(&key.as_str()));
+                row
+            }).collect(),
+            expected_program_revision,
+        }
+    }
+
+    fn handle_virtual_list_cell_event(&mut self, request: RpcRequest) -> RpcResponse {
+        let target = match request.params.get("data_grid_cell").cloned()
+            .and_then(|value| serde_json::from_value::<neon_ui_schema::UiDataGridCellTarget>(value).ok()) {
+            Some(target) if target.source_key == "asset_window" => target,
+            _ => return rejected(request, Some(self.virtual_list_revision), "invalid_data_grid_cell", "a virtual-list cell target is required"),
         };
-        accepted(request, Some(frame.list_revision), json!(frame))
+        let frame = match request.params.get("data_grid_frame").cloned()
+            .and_then(|value| serde_json::from_value::<UiDataGridFrame>(value).ok()) {
+            Some(frame) if frame.list_revision == self.virtual_list_revision
+                && frame.window_rows.iter().any(|row| row.stable_row_key == target.stable_row_key) => frame,
+            _ => return rejected(request, Some(self.virtual_list_revision), "revision_conflict", "the virtual-list window is stale"),
+        };
+        if virtual_list_row_index(&target.stable_row_key).is_none() {
+            return rejected(request, Some(self.virtual_list_revision), "invalid_data_grid_cell", "the virtual-list row key is invalid");
+        }
+        let row = self.virtual_list_rows.entry(target.stable_row_key.clone()).or_default();
+        let valid = match request.method.as_str() {
+            "virtual_list.name.commit" if target.column_key == "name" => {
+                request.params.get("text").cloned()
+                    .and_then(|value| serde_json::from_value::<neon_ui_schema::UiTextInputCommit>(value).ok())
+                    .filter(|text| !text.value.trim().is_empty())
+                    .map(|text| row.name = Some(text.value))
+                    .is_some()
+            }
+            "virtual_list.notes.commit" if target.column_key == "notes" => {
+                request.params.get("text").cloned()
+                    .and_then(|value| serde_json::from_value::<neon_ui_schema::UiTextInputCommit>(value).ok())
+                    .filter(|text| !text.value.trim().is_empty())
+                    .map(|text| row.notes = Some(text.value))
+                    .is_some()
+            }
+            "virtual_list.status.set" if target.column_key == "status" => {
+                match request.params.get("control_value").cloned()
+                    .and_then(|value| serde_json::from_value::<UiSemanticPayloadValue>(value).ok()) {
+                    Some(UiSemanticPayloadValue::Enum { value })
+                        if matches!(value.as_str(), "draft" | "ready" | "archived") => {
+                            row.status = Some(value);
+                            true
+                        }
+                    _ => false,
+                }
+            }
+            "virtual_list.owner.toggle" if target.column_key == "owner" => {
+                match request.params.get("control_value").cloned()
+                    .and_then(|value| serde_json::from_value::<UiSemanticPayloadValue>(value).ok()) {
+                    Some(UiSemanticPayloadValue::Bool { value }) => {
+                        row.owner = Some(value);
+                        true
+                    }
+                    _ => false,
+                }
+            }
+            _ => false,
+        };
+        if !valid {
+            return rejected(request, Some(self.virtual_list_revision), "invalid_data_grid_cell", "the virtual-list target or value is invalid");
+        }
+        self.virtual_list_revision = Revision(self.virtual_list_revision.0 + 1);
+        let row_count = frame.window_rows.len() as u64;
+        let first_row = frame.first_row.min(10_000);
+        let declared_columns = frame.window_rows.first()
+            .map(|row| row.cells.keys().cloned().collect::<std::collections::BTreeSet<_>>())
+            .unwrap_or_default();
+        let window_rows = (first_row..first_row + row_count)
+            .map(|index| {
+                let mut row = self.virtual_list_row(index);
+                row.cells.retain(|key, _| declared_columns.contains(key));
+                row
+            })
+            .collect();
+        let replacement = UiDataGridFrame {
+            list_revision: self.virtual_list_revision,
+            total_rows: 10_000,
+            first_row,
+            window_rows,
+            expected_program_revision: frame.expected_program_revision,
+        };
+        accepted(request, Some(replacement.list_revision), json!(replacement))
+    }
+
+    fn virtual_list_row(&self, row_index: u64) -> UiDataGridWindowRow {
+        virtual_list_row(row_index, self.virtual_list_revision, self.virtual_list_rows.get(&format!("virtual-row-{row_index}")))
     }
 }
 
-fn virtual_list_row(row_index: u64) -> UiDataGridWindowRow {
-    let handle = |id| neon_ui_schema::UiTextHandle { id, generation: 1 };
-    let base = 10_000 + row_index * 4;
+fn virtual_list_row_index(stable_row_key: &str) -> Option<u64> {
+    stable_row_key.strip_prefix("virtual-row-")?.parse::<u64>().ok().filter(|index| *index < 10_000)
+}
+
+fn virtual_list_row(
+    row_index: u64,
+    list_revision: Revision,
+    state: Option<&VirtualListRowState>,
+) -> UiDataGridWindowRow {
+    let handle = |id| neon_ui_schema::UiTextHandle { id, generation: list_revision.0 as u32 };
+    let base = 10_000 + row_index * 5;
+    let state = state.cloned().unwrap_or_default();
+    let name_handle = state.name.as_ref().map_or_else(
+        || handle(base + 1),
+        |name| neon_ui_schema::UiTextHandle {
+            id: 1_000_000 + row_index * 1_000 + virtual_list_text_hash(name) % 1_000,
+            generation: list_revision.0 as u32,
+        },
+    );
+    let notes_handle = state.notes.as_ref().map_or_else(
+        || handle(base + 4),
+        |notes| neon_ui_schema::UiTextHandle {
+            id: 2_000_000 + row_index * 1_000 + virtual_list_text_hash(notes) % 1_000,
+            generation: list_revision.0 as u32,
+        },
+    );
     UiDataGridWindowRow {
         stable_row_key: format!("virtual-row-{row_index}"),
         cells: std::collections::BTreeMap::from([
             ("id".into(), UiDataGridCell { value: UiInputValue::I32 { value: row_index as i32 }, display: handle(base), presentation_override: None }),
-            ("name".into(), UiDataGridCell { value: UiInputValue::TextHandle { value: handle(base + 1) }, display: handle(base + 1), presentation_override: None }),
-            ("status".into(), UiDataGridCell { value: UiInputValue::TextHandle { value: handle(base + 2) }, display: handle(base + 2), presentation_override: None }),
-            ("owner".into(), UiDataGridCell { value: UiInputValue::TextHandle { value: handle(base + 3) }, display: handle(base + 3), presentation_override: None }),
+            ("name".into(), UiDataGridCell { value: UiInputValue::TextHandle { value: name_handle }, display: name_handle, presentation_override: None }),
+            ("status".into(), UiDataGridCell { value: UiInputValue::Enum { value: state.status.unwrap_or_else(|| "ready".into()) }, display: handle(base + 2), presentation_override: None }),
+            ("owner".into(), UiDataGridCell { value: UiInputValue::Bool { value: state.owner.unwrap_or(row_index % 2 == 0) }, display: handle(base + 3), presentation_override: None }),
+            ("notes".into(), UiDataGridCell { value: UiInputValue::TextHandle { value: notes_handle }, display: notes_handle, presentation_override: None }),
         ]),
     }
+}
+
+fn virtual_list_text_hash(value: &str) -> u64 {
+    value.bytes().fold(0xcbf29ce484222325_u64, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+    })
 }
 
 fn virtual_list_program_revision() -> UiProgramRevision {
@@ -713,7 +941,7 @@ mod tests {
     }
     #[test]
     fn accepted_drop_returns_a_revisioned_target_template_representation() {
-        let mut domain = DemoDragDropDomain { revision: None };
+        let mut domain = DemoDragDropDomain::new();
         let response = domain.handle(request(
             fragment(),
             "progress-drop",
@@ -788,7 +1016,7 @@ mod tests {
             renderer_epoch: 1,
             composition_revision: Revision(7),
             fragment: neon_ui_schema::UiFragmentRevision { id: UiFragmentId("virtual-list-demo".into()), revision: Revision(3) },
-            data_grid_key: "virtual-list".into(),
+            source_key: "asset_window".into(),
             expected_list_revision: Revision(1),
             requested_first_row: 9_996,
             max_window_rows: 99,
@@ -804,9 +1032,58 @@ mod tests {
         assert_eq!(response.status, RpcStatus::Accepted, "{:?}", response.error);
         let frame: UiDataGridFrame = serde_json::from_value(response.result.unwrap()).unwrap();
         assert_eq!(frame.total_rows, 10_000);
-        assert_eq!(frame.first_row, 9_996);
-        assert_eq!(frame.window_rows.len(), 4);
-        assert_eq!(frame.window_rows[0].stable_row_key, "virtual-row-9996");
+        assert_eq!(frame.first_row, 9_976);
+        assert_eq!(frame.window_rows.len(), 24);
+        assert_eq!(frame.window_rows[0].stable_row_key, "virtual-row-9976");
+    }
+
+    #[test]
+    fn virtual_list_cell_handlers_persist_values_and_replace_the_current_window() {
+        let mut domain = DemoDragDropDomain::new();
+        let mut frame = UiDataGridFrame {
+            list_revision: Revision(1), total_rows: 10_000,
+            first_row: 0, window_rows: vec![domain.virtual_list_row(0)],
+            expected_program_revision: virtual_list_program_revision(),
+        };
+        let request = |method: &str, column_key: &str, frame: &UiDataGridFrame, params: Value| RpcRequest {
+            protocol: "neon3.rpc".into(), version: ProtocolVersion { major: 1, minor: 0 },
+            request_id: RequestId(format!("virtual-list-{method}")),
+            client: ClientIdentity { kind: ClientKind::UiRuntime, instance_id: "test".into(), pid: 1, origin: "test".into() },
+            target: ServiceName("demo-domain".into()), method: method.into(),
+            params: json!({
+                "data_grid_cell": { "source_key": "asset_window", "stable_row_key": "virtual-row-0", "column_key": column_key },
+                "data_grid_frame": frame,
+                "control_value": params.get("control_value"),
+                "text": params.get("text"),
+            }),
+            expected_revision: Some(frame.list_revision), idempotency_key: Some(format!("virtual-list-{method}")),
+        };
+        let response = domain.handle(request(
+            "virtual_list.name.commit", "name", &frame,
+            json!({"text": {"value": "first"}}),
+        ));
+        assert_eq!(response.status, RpcStatus::Accepted, "{:?}", response.error);
+        frame = serde_json::from_value(response.result.unwrap()).unwrap();
+        assert_eq!(frame.list_revision, Revision(2));
+        assert_ne!(frame.window_rows[0].cells["name"].display.id, 10_001);
+
+        let response = domain.handle(request(
+            "virtual_list.status.set", "status", &frame,
+            json!({"control_value": {"kind": "enum", "value": "archived"}}),
+        ));
+        assert_eq!(response.status, RpcStatus::Accepted, "{:?}", response.error);
+        frame = serde_json::from_value(response.result.unwrap()).unwrap();
+        assert_eq!(frame.list_revision, Revision(3));
+        assert_eq!(frame.window_rows[0].cells["status"].value, UiInputValue::Enum { value: "archived".into() });
+
+        let response = domain.handle(request(
+            "virtual_list.owner.toggle", "owner", &frame,
+            json!({"control_value": {"kind": "bool", "value": false}}),
+        ));
+        assert_eq!(response.status, RpcStatus::Accepted, "{:?}", response.error);
+        frame = serde_json::from_value(response.result.unwrap()).unwrap();
+        assert_eq!(frame.list_revision, Revision(4));
+        assert_eq!(frame.window_rows[0].cells["owner"].value, UiInputValue::Bool { value: false });
     }
 
     #[test]

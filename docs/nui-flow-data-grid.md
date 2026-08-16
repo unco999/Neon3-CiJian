@@ -6,14 +6,19 @@ NUI Flow V1.
 ## Basic Declaration
 
 ```text
+input asset_window grid default grid:empty
 surface asset-list column w 640 h 360 gap 8 pad 12 align stretch fill #17201E
   text title h 24 value "Assets"
-  data_grid assets h 300 capacity 32 row_height 28 overscan 4 columns "name:240,status:140,owner:180"
+  data_grid assets h 300 source $asset_window capacity 32 row_height 28 overscan 4 columns "name:240,status:140,owner:180"
 ```
 
 `capacity` is the maximum number of rows in one domain frame. It is not the
 total number of rows. `overscan` keeps extra rows around the visible range so
 small scroll movements do not immediately request another window.
+
+`source` binds the visual grid node to a declared control-plane `grid` variable.
+The visual node key (`assets`) is not domain data identity. The source key
+(`asset_window`) remains stable when a UI author renames or moves the node.
 
 The old `key:width` column form remains valid and creates a text column.
 
@@ -82,16 +87,17 @@ Scrolling is split into two paths:
 1. WGPU handles wheel, thumb drag, horizontal movement, and middle-button pan
    locally at frame rate.
 2. When the visible logical range leaves the current bounded frame, WGPU sends
-   a latest-value `ui.data_grid.window.request`.
+   a latest-value `UiHostInbound::WindowRequest` through the UI host adapter.
 
 Requests contain revisioned semantic identity, the requested first row, the
 maximum window size, and a sequence. They do not contain pointer coordinates,
 hit IDs, GPU handles, or renderer paths.
 
 Requests are coalesced and debounced. A fast wheel gesture does not create one
-domain request per raw wheel event. Newer requests replace queued older ones.
-The domain returns a replacement `UiDataGridFrame`, normally with the same
-program and list revision and a new bounded row range.
+host request per raw wheel event. Newer requests replace queued older ones.
+The application host returns an accepted `UiHostPublication` containing a
+replacement grid value, normally with the same program and list revision and a
+new bounded row range.
 
 ## Scrolling
 
@@ -124,22 +130,38 @@ Cell interactions produce declared semantic intents:
 - edit enters on the declared edit interaction and commits a bounded text
   handle.
 
-The event target uses the grid key, stable row key, and column key. Generated
+The event target uses the declared input source key, stable row key, and column key. Generated
 renderer paths and pointer coordinates are not public identity. The UI runtime
 rejects events for rows outside the currently attached bounded frame or for
 cells whose declared presentation does not allow that event.
 
-The domain remains responsible for accepting or rejecting the mutation. A UI
-event is a request, not a direct project write.
+The application host remains responsible for accepting or rejecting the
+mutation. A UI event is a request, not a direct project write.
+
+## Host Adapter
+
+NUI never names a domain service or executes a handler. The embedding
+application configures a `UiHostAdapter` and receives two generic inbound
+messages:
+
+- `UiHostInbound::WindowRequest` for a bounded grid source window.
+- `UiHostInbound::SemanticIntent` for a declared control or cell intent.
+
+The host returns `UiHostPublication`, a revisioned scalar-plus-grid input
+snapshot. The UI runtime validates and atomically applies that publication,
+then submits the resulting declaration to WGPU. This keeps application routing
+and business logic outside NUI while allowing a script to create the complete
+UI topology.
 
 ## Ownership Rules
 
 - NUI declares topology, dimensions, columns, presentations, and intents.
-- The domain owns row count, row identity, typed cell values, options, and
+- The application host/domain owns row count, row identity, typed cell values, options, and
   revisioned window data.
 - WGPU owns pixels, local scrolling, clipping, hit testing, focus, and pointer
   capture.
-- The UI runtime validates frames and forwards typed semantic events.
+- The UI runtime validates snapshots and exchanges generic inbound/publication
+  messages with its configured host adapter.
 - NUI cannot execute code, query data, format domain values, or create GPU
   resources.
 

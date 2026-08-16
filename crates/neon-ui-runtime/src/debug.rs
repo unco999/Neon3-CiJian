@@ -10,7 +10,7 @@ use neon_ui_schema::{
     UiInputFrame, UiInputSchema, UiIrDocument, UiIrOutlineEntry, UiIrOutlinePage, UiIrPatch,
     UiLayoutDiagnosticSnapshot, UiNodeInspection, UiPatchDryRun, UiProgram, UiProgramDescription,
     UiProgramRevision, UiResolvedInputs, UiTextHandle, UiTextHandleDiagnostic,
-    UiTextHandleStatus, UiTextRegistryDebugSnapshot, UiProgramSemanticEvent,
+    UiProgramSemanticEvent,
 };
 
 use crate::{apply_nui_ir_patch, compile_ui_program, evaluate_ui_program, UiInputStore, UiInputWriter,

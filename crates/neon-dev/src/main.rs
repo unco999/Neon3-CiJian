@@ -45,10 +45,23 @@ fn run() -> io::Result<()> {
     if matches!(args.as_slice(), [command, scenario] if command == "scenario" && scenario == "component-gallery-interactions") {
         return run_component_gallery_scenario();
     }
+    if matches!(args.as_slice(), [command, scenario] if command == "scenario" && scenario == "component-gallery-window-input") {
+        return run_component_gallery_window_input_scenario();
+    }
     if let [command, endpoint] = args.as_slice()
         && command == "inspect-window"
     {
         return inspect_window_input(endpoint);
+    }
+    if let [command, endpoint, x, y] = args.as_slice()
+        && command == "probe-window"
+    {
+        return probe_window_input(endpoint, x, y);
+    }
+    if let [command, endpoint, interaction_id] = args.as_slice()
+        && command == "debug-interaction"
+    {
+        return debug_interaction(endpoint, interaction_id);
     }
     let case = match args.as_slice() {
         [command, case]
@@ -64,13 +77,13 @@ fn run() -> io::Result<()> {
             case
         }
         [flag] if flag == "--help" => {
-            println!("neon-dev case <kanban-reparent|asset-review|component-gallery|data-grid|scroll-view|virtual-list> [--show-logs]\nneon-dev scenario <drag-card02-before|component-gallery-interactions>\nneon-dev inspect-window <wgpu-loopback-endpoint>");
+            println!("neon-dev case <kanban-reparent|asset-review|component-gallery|data-grid|scroll-view|virtual-list> [--show-logs]\nneon-dev scenario <drag-card02-before|component-gallery-interactions|component-gallery-window-input>\nneon-dev debug-interaction <wgpu-loopback-endpoint> <interaction-id>\nneon-dev inspect-window <wgpu-loopback-endpoint>\nneon-dev probe-window <wgpu-loopback-endpoint> <x> <y>");
             return Ok(());
         }
         _ => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "usage: neon-dev case <kanban-reparent|asset-review|component-gallery|data-grid|scroll-view|virtual-list> [--show-logs] | neon-dev scenario <drag-card02-before|component-gallery-interactions> | neon-dev inspect-window <wgpu-loopback-endpoint>",
+                "usage: neon-dev case <kanban-reparent|asset-review|component-gallery|data-grid|scroll-view|virtual-list> [--show-logs] | neon-dev scenario <drag-card02-before|component-gallery-interactions|component-gallery-window-input> | neon-dev debug-interaction <wgpu-loopback-endpoint> <interaction-id> | neon-dev inspect-window <wgpu-loopback-endpoint> | neon-dev probe-window <wgpu-loopback-endpoint> <x> <y>",
             ));
         }
     };
@@ -95,17 +108,15 @@ fn run() -> io::Result<()> {
     children.push(wgpu);
     wait_for_endpoint(wgpu_endpoint)?;
 
-    let domain_program = case == "component-gallery";
+    let domain_endpoint_text = domain_endpoint.to_string();
+    let domain_args = if case == "component-gallery" {
+        vec![domain_endpoint_text.as_str(), "--component-gallery"]
+    } else {
+        vec![domain_endpoint_text.as_str()]
+    };
     let domain = spawn_service(
-        executable(
-            &workspace,
-            if domain_program {
-                "component_gallery_domain_controller"
-            } else {
-                "demo_domain_controller"
-            },
-        ),
-        &[&domain_endpoint.to_string()],
+        executable(&workspace, "demo_domain_controller"),
+        &domain_args,
         show_logs,
     )?;
     job.assign(&domain)?;
@@ -116,30 +127,16 @@ fn run() -> io::Result<()> {
         let ui_endpoint_text = ui_endpoint.to_string();
         let wgpu_endpoint_text = wgpu_endpoint.to_string();
         let domain_endpoint_text = domain_endpoint.to_string();
-        if domain_program {
-            spawn_service(
-                executable(&workspace, "neon-ui-runtime"),
-                &[
-                    "--forward-server",
-                    &ui_endpoint_text,
-                    &wgpu_endpoint_text,
-                    &domain_endpoint_text,
-                    "--program-domain",
-                ],
-                show_logs,
-            )?
-        } else {
-            spawn_service(
-                executable(&workspace, "neon-ui-runtime"),
-                &[
-                    "--forward-server",
-                    &ui_endpoint_text,
-                    &wgpu_endpoint_text,
-                    &domain_endpoint_text,
-                ],
-                show_logs,
-            )?
-        }
+        spawn_service(
+            executable(&workspace, "neon-ui-runtime"),
+            &[
+                "--forward-server",
+                &ui_endpoint_text,
+                &wgpu_endpoint_text,
+                &domain_endpoint_text,
+            ],
+            show_logs,
+        )?
     };
     job.assign(&ui)?;
     children.push(ui);
@@ -160,9 +157,7 @@ fn run() -> io::Result<()> {
         )));
     }
 
-    println!(
-        "Neon3 case '{case}' is running at WGPU endpoint {wgpu_endpoint}. Close the WGPU window or press Ctrl+C to stop the session."
-    );
+    println!("{}", session_manifest(case, wgpu_endpoint, ui_endpoint, domain_endpoint));
     wait_for_session_end(&mut children);
     Ok(())
 }
@@ -178,6 +173,99 @@ fn run_component_gallery_scenario() -> io::Result<()> {
             println!("{}", json!({"scenario": "component-gallery-interactions", "status": "failed", "steps": [], "error": {"code": "scenario_failed", "message": error.to_string()}}));
             Err(error)
         }
+    }
+}
+
+fn run_component_gallery_window_input_scenario() -> io::Result<()> {
+    let result = run_component_gallery_window_input_scenario_inner();
+    match result {
+        Ok(value) => { println!("{value}"); Ok(()) }
+        Err(error) => {
+            println!("{}", json!({"scenario": "component-gallery-window-input", "status": "failed", "steps": [], "error": {"code": "scenario_failed", "message": error.to_string()}}));
+            Err(error)
+        }
+    }
+}
+
+fn run_component_gallery_window_input_scenario_inner() -> io::Result<serde_json::Value> {
+    const SCENARIO: &str = "component-gallery-window-input";
+    const FRAGMENT_ID: &str = "component-gallery-window-input";
+    // These are stable logical points in the declared 1280x680 gallery surface.
+    const LEFT_CHECKBOX: (f64, f64) = (48.0, 70.0);
+    const RIGHT_OWNER_CELL: (f64, f64) = (900.0, 54.0);
+    let workspace = workspace_root()?;
+    let wgpu_endpoint = reserve_loopback_endpoint()?;
+    let ui_endpoint = reserve_loopback_endpoint()?;
+    let domain_endpoint = reserve_loopback_endpoint()?;
+    let job = ProcessJob::new()?;
+    let mut children = ChildSession::default();
+    let wgpu = spawn_service(executable(&workspace, "neon-wgpu-runtime"), &["--window-server", &wgpu_endpoint.to_string(), &ui_endpoint.to_string()], false)?;
+    job.assign(&wgpu)?; children.push(wgpu); wait_for_endpoint(wgpu_endpoint)?;
+    wait_for_window_gpu(wgpu_endpoint)?;
+    let domain = spawn_service(executable(&workspace, "component_gallery_domain_controller"), &[&domain_endpoint.to_string()], false)?;
+    job.assign(&domain)?; children.push(domain); wait_for_endpoint(domain_endpoint)?;
+    let ui = spawn_service(executable(&workspace, "neon-ui-runtime"), &["--forward-server", &ui_endpoint.to_string(), &wgpu_endpoint.to_string(), &domain_endpoint.to_string()], false)?;
+    job.assign(&ui)?; children.push(ui); wait_for_endpoint(ui_endpoint)?;
+
+    let (document, _) = neon_ui_runtime::demo_domain::component_gallery_program().map_err(io::Error::other)?;
+    let effects = lower_nui_flow_effects(&document);
+    let fragment = UiFragment { fragment_id: UiFragmentId(FRAGMENT_ID.into()), revision: Revision(1), root: document.ir.root, effects };
+    assert_accepted(call(ui_endpoint, &rpc_request("window-input-submit", "ui-runtime", "ui.fragment.submit", json!(UiCommand::SubmitFragment { submission: UiFragmentSubmission::new(fragment) }), None, Some("window-input-submit")))?, "window Gallery fragment submission")?;
+
+    let mut steps = Vec::new();
+    for (index, (control, point, expected_path)) in [
+        ("left-checkbox", LEFT_CHECKBOX, "feature-toggle"),
+        ("right-owner-cell", RIGHT_OWNER_CELL, "asset-grid/data-grid-row-virtual-row-0/cell-owner"),
+    ].into_iter().enumerate() {
+        let before = window_graph_revision(wgpu_endpoint)?;
+        let probe = call(wgpu_endpoint, &rpc_request(&format!("window-input-probe-{index}"), "wgpu-runtime", "debug.window.input.probe", json!({"logical_position": {"x": point.0, "y": point.1}}), None, None))?;
+        assert_accepted(probe.clone(), "logical input probe")?;
+        let path = probe.result.as_ref().and_then(|value| value.pointer("/fallback_hit/semantic_node_path")).and_then(serde_json::Value::as_str).unwrap_or_default();
+        if !path.ends_with(expected_path) { return Err(io::Error::other(format!("{control} probe resolved '{path}', expected declared path ending '{expected_path}'"))); }
+        let activation = call(wgpu_endpoint, &rpc_request(&format!("window-input-activate-{index}"), "wgpu-runtime", "debug.window.input.activate", json!({"logical_position": {"x": point.0, "y": point.1}}), None, None))?;
+        assert_accepted(activation.clone(), "debug semantic activation")?;
+        let delivery = wait_for_pointer_delivery(wgpu_endpoint, Duration::from_secs(5))?;
+        if delivery.get("state").and_then(serde_json::Value::as_str) != Some("accepted") { return Err(io::Error::other(format!("{control} pointer delivery did not receive UI host acceptance: {delivery}"))); }
+        let after = window_graph_revision(wgpu_endpoint)?;
+        if after <= before { return Err(io::Error::other(format!("{control} did not advance the WGPU composition revision ({before} -> {after})"))); }
+        steps.push(json!({"control": control, "logical_point": {"x": point.0, "y": point.1}, "probe_path": path, "pointer_delivery": delivery, "composition_revision": {"before": before, "after": after}}));
+    }
+    Ok(json!({"scenario": SCENARIO, "status": "passed", "acceptance_level": "composition-ready", "steps": steps}))
+}
+
+fn window_graph_revision(endpoint: SocketAddr) -> io::Result<u64> {
+    let response = call(endpoint, &rpc_request("window-input-diagnostics", "wgpu-runtime", "wgpu.render.diagnostics", json!({}), None, None))?;
+    assert_accepted(response.clone(), "WGPU diagnostics")?;
+    response.result.and_then(|value| value.get("graph_revision").and_then(serde_json::Value::as_u64)).ok_or_else(|| io::Error::other("WGPU diagnostics omitted graph_revision"))
+}
+
+fn wait_for_pointer_delivery(endpoint: SocketAddr, timeout: Duration) -> io::Result<serde_json::Value> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let response = call(endpoint, &rpc_request("window-input-snapshot", "wgpu-runtime", "debug.window.input.snapshot", json!({}), None, None))?;
+        assert_accepted(response.clone(), "window input snapshot")?;
+        let delivery = response.result.and_then(|value| value.get("pointer_delivery").cloned()).unwrap_or_else(|| json!({"state": "missing"}));
+        match delivery.get("state").and_then(serde_json::Value::as_str) {
+            Some("accepted") | Some("rejected") | Some("transport_failed") | Some("not_sent") => return Ok(delivery),
+            _ if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+            _ => return Err(io::Error::new(io::ErrorKind::TimedOut, "UI host did not respond to pointer delivery")),
+        }
+    }
+}
+
+fn wait_for_window_gpu(endpoint: SocketAddr) -> io::Result<()> {
+    let deadline = Instant::now() + STARTUP_TIMEOUT;
+    loop {
+        let response = call(endpoint, &rpc_request("window-input-ready", "wgpu-runtime", "debug.window.input.snapshot", json!({}), None, None));
+        if let Ok(response) = response
+            && response.status == RpcStatus::Accepted
+            && response.result.as_ref().and_then(|value| value.get("state")).and_then(serde_json::Value::as_str) != Some("uninitialized") {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "window compositor did not initialize"));
+        }
+        std::thread::sleep(Duration::from_millis(25));
     }
 }
 
@@ -212,6 +300,68 @@ fn inspect_window_input(endpoint: &str) -> io::Result<()> {
     } else {
         Err(io::Error::other("window input inspection was rejected"))
     }
+}
+
+fn debug_interaction(endpoint: &str, interaction_id: &str) -> io::Result<()> {
+    let endpoint = endpoint.parse::<SocketAddr>().map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid WGPU loopback endpoint: {error}"),
+        )
+    })?;
+    let response = call(
+        endpoint,
+        &rpc_request(
+            "neon-dev-debug-interaction",
+            "wgpu-runtime",
+            "debug.interaction.get",
+            json!({"interaction_id": interaction_id}),
+            None,
+            None,
+        ),
+    )?;
+    println!(
+        "{}",
+        json!({
+            "endpoint": endpoint.to_string(),
+            "method": "debug.interaction.get",
+            "interaction_id": interaction_id,
+            "response": response,
+        })
+    );
+    if response.status == RpcStatus::Accepted {
+        Ok(())
+    } else {
+        Err(io::Error::other("interaction trace query was rejected"))
+    }
+}
+
+fn session_manifest(case: &str, wgpu_endpoint: SocketAddr, ui_endpoint: SocketAddr, domain_endpoint: SocketAddr) -> serde_json::Value {
+    json!({
+        "kind": "neon3.session",
+        "version": 1,
+        "case": case,
+        "services": [
+            {"name": "wgpu-runtime", "endpoint": wgpu_endpoint.to_string()},
+            {"name": "ui-runtime", "endpoint": ui_endpoint.to_string()},
+            {"name": "demo-domain", "endpoint": domain_endpoint.to_string()},
+        ],
+        "debug": {
+            "snapshot": {"endpoint": wgpu_endpoint.to_string(), "method": "debug.snapshot.get"},
+            "interaction_get": {"endpoint": wgpu_endpoint.to_string(), "method": "debug.interaction.get", "params": {"interaction_id": "<interaction-id>"}},
+            "interaction_query": {"endpoint": wgpu_endpoint.to_string(), "method": "debug.interaction.query", "params": {"filters": {}, "limit": 100}},
+        },
+    })
+}
+
+fn probe_window_input(endpoint: &str, x: &str, y: &str) -> io::Result<()> {
+    let endpoint = endpoint.parse::<SocketAddr>().map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, format!("invalid WGPU loopback endpoint: {error}")))?;
+    let x = x.parse::<f64>().map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, format!("invalid x coordinate: {error}")))?;
+    let y = y.parse::<f64>().map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, format!("invalid y coordinate: {error}")))?;
+    if !x.is_finite() || !y.is_finite() { return Err(io::Error::new(io::ErrorKind::InvalidInput, "coordinates must be finite")); }
+    let response = call(endpoint, &rpc_request("window-input-probe", "wgpu-runtime", "debug.window.input.probe", json!({"logical_position": {"x": x, "y": y}}), None, None))?;
+    println!("{}", json!({"status": if response.status == RpcStatus::Accepted { "passed" } else { "rejected" }, "probe": response.result, "error": response.error}));
+    if response.status == RpcStatus::Accepted { Ok(()) } else { Err(io::Error::other("window input probe was rejected")) }
 }
 
 fn run_component_gallery_scenario_inner() -> io::Result<serde_json::Value> {
@@ -701,5 +851,24 @@ impl Drop for ChildSession {
             let _ = child.kill();
             let _ = child.wait();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_manifest_exposes_only_live_service_and_read_only_debug_endpoints() {
+        let manifest = session_manifest(
+            "component-gallery",
+            "127.0.0.1:4101".parse().unwrap(),
+            "127.0.0.1:4102".parse().unwrap(),
+            "127.0.0.1:4103".parse().unwrap(),
+        );
+        assert_eq!(manifest["kind"], "neon3.session");
+        assert_eq!(manifest["services"].as_array().unwrap().len(), 3);
+        assert_eq!(manifest["debug"]["interaction_get"]["method"], "debug.interaction.get");
+        assert!(manifest.to_string().contains("127.0.0.1:4101"));
     }
 }

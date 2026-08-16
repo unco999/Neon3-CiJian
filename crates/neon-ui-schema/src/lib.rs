@@ -59,8 +59,12 @@ pub enum UiInputUpdateClass { StaticAtProgramActivation, ReliableExternal, Local
 pub enum UiInputValue { Bool { value: bool }, I32 { value: i32 }, U32 { value: u32 }, F32 { value: f32 }, Vec2 { value: [f32; 2] }, Vec4 { value: [f32; 4] }, Color { value: [f32; 4] }, Enum { value: String }, TextHandle { value: UiTextHandle }, AssetHandle { id: u64, generation: u32 } }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)] #[serde(deny_unknown_fields)]
 pub struct UiInputSlot { pub key: String, pub kind: UiInputKind, pub default_value: UiInputValue, pub update_class: UiInputUpdateClass, pub semantic_label: String, pub packing: UiInputPacking }
+/// A control-plane input which supplies a bounded DataGrid window. Grid inputs
+/// deliberately have no scalar value or GPU packing.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)] #[serde(deny_unknown_fields)]
+pub struct UiGridInputSlot { pub key: String }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)] #[serde(deny_unknown_fields)]
-pub struct UiInputSchema { pub schema_id: String, pub version: u16, pub slots: Vec<UiInputSlot>, pub layout_hash: String }
+pub struct UiInputSchema { pub schema_id: String, pub version: u16, pub slots: Vec<UiInputSlot>, #[serde(default)] pub grid_slots: Vec<UiGridInputSlot>, pub layout_hash: String }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)] #[serde(deny_unknown_fields)]
 pub struct UiInputChange { pub key: String, pub value: UiInputValue }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)] #[serde(deny_unknown_fields)]
@@ -71,6 +75,16 @@ pub enum UiInputValueSource { Default, ReliableExternal, LocalPresentation, Text
 pub struct UiResolvedInputValue { pub value: UiInputValue, pub source: UiInputValueSource, pub last_update_revision: Revision }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)] #[serde(deny_unknown_fields)]
 pub struct UiResolvedInputs { pub program_revision: UiProgramRevision, pub input_revision: Revision, pub values: std::collections::BTreeMap<String, UiResolvedInputValue>, pub changed_slots: Vec<String> }
+
+/// Complete host-visible input state for one active UI program. Scalar inputs
+/// and bounded grid windows are kept separate because grids have no GPU scalar
+/// packing and are replaced as whole windows.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiProgramInputSnapshot {
+    pub scalar_inputs: UiResolvedInputs,
+    pub grid_inputs: Vec<UiDataGridInputFrame>,
+}
 
 impl UiInputKind {
     pub fn packing(&self) -> (u32, u8, UiGpuScalarRepresentation) { match self { Self::Bool => (4, 1, UiGpuScalarRepresentation::Bool32), Self::I32 | Self::I32Range { .. } => (4, 1, UiGpuScalarRepresentation::I32), Self::U32 | Self::U32Range { .. } | Self::Enum { .. } => (4, 1, UiGpuScalarRepresentation::U32), Self::F32 => (4, 1, UiGpuScalarRepresentation::F32), Self::Vec2 => (8, 2, UiGpuScalarRepresentation::Vec2F32), Self::Vec4 | Self::Color => (16, 4, UiGpuScalarRepresentation::Vec4F32), Self::TextHandle | Self::AssetHandle => (8, 2, UiGpuScalarRepresentation::HandleUvec2) } }
@@ -128,8 +142,8 @@ pub enum UiTextHandleStatus { Ready, Missing, GenerationMismatch, Released, Capa
 #[serde(deny_unknown_fields)]
 pub struct UiTextHandleDiagnostic { pub handle: UiTextHandle, pub status: UiTextHandleStatus, pub reference_count: u32, pub resident: bool, pub message: String }
 impl UiInputSchema {
-    pub fn validate(&self) -> Result<(), UiSchemaError> { if self.schema_id.trim().is_empty() || self.version == 0 || self.layout_hash.trim().is_empty() { return Err(UiSchemaError::InvalidInputSchema); } let mut keys = std::collections::HashSet::new(); let mut offsets = std::collections::HashSet::new(); for slot in &self.slots { if slot.key.trim().is_empty() || slot.semantic_label.trim().is_empty() { return Err(UiSchemaError::InvalidInputSlot); } if !keys.insert(slot.key.as_str()) { return Err(UiSchemaError::DuplicateInputKey); } if !slot.kind.accepts(&slot.default_value) { return Err(UiSchemaError::InvalidInputDefault); } let (alignment, lanes, representation) = slot.kind.packing(); if slot.packing.alignment != alignment || slot.packing.lanes != lanes || slot.packing.representation != representation || slot.packing.offset % alignment != 0 || !offsets.insert(slot.packing.offset) { return Err(UiSchemaError::InvalidInputPacking); } if let UiInputKind::Enum { variants } = &slot.kind { if variants.is_empty() || variants.iter().any(|variant| variant.trim().is_empty()) || variants.iter().collect::<std::collections::HashSet<_>>().len() != variants.len() { return Err(UiSchemaError::InvalidInputSlot); } } } Ok(()) }
-    pub fn validate_evolution_from(&self, previous: &Self) -> Result<(), UiSchemaError> { if self.schema_id != previous.schema_id || self.version <= previous.version { return Err(UiSchemaError::IncompatibleInputSchemaEvolution); } for old_slot in &previous.slots { let Some(new_slot) = self.slots.iter().find(|slot| slot.key == old_slot.key) else { return Err(UiSchemaError::IncompatibleInputSchemaEvolution); }; if new_slot.kind != old_slot.kind || new_slot.update_class != old_slot.update_class || new_slot.packing != old_slot.packing { return Err(UiSchemaError::IncompatibleInputSchemaEvolution); } } self.validate() }
+    pub fn validate(&self) -> Result<(), UiSchemaError> { if self.schema_id.trim().is_empty() || self.version == 0 || self.layout_hash.trim().is_empty() { return Err(UiSchemaError::InvalidInputSchema); } let mut keys = std::collections::HashSet::new(); let mut offsets = std::collections::HashSet::new(); for slot in &self.slots { if slot.key.trim().is_empty() || slot.semantic_label.trim().is_empty() { return Err(UiSchemaError::InvalidInputSlot); } if !keys.insert(slot.key.as_str()) { return Err(UiSchemaError::DuplicateInputKey); } if !slot.kind.accepts(&slot.default_value) { return Err(UiSchemaError::InvalidInputDefault); } let (alignment, lanes, representation) = slot.kind.packing(); if slot.packing.alignment != alignment || slot.packing.lanes != lanes || slot.packing.representation != representation || slot.packing.offset % alignment != 0 || !offsets.insert(slot.packing.offset) { return Err(UiSchemaError::InvalidInputPacking); } if let UiInputKind::Enum { variants } = &slot.kind { if variants.is_empty() || variants.iter().any(|variant| variant.trim().is_empty()) || variants.iter().collect::<std::collections::HashSet<_>>().len() != variants.len() { return Err(UiSchemaError::InvalidInputSlot); } } } for slot in &self.grid_slots { if slot.key.trim().is_empty() || !keys.insert(slot.key.as_str()) { return Err(UiSchemaError::DuplicateInputKey); } } Ok(()) }
+    pub fn validate_evolution_from(&self, previous: &Self) -> Result<(), UiSchemaError> { if self.schema_id != previous.schema_id || self.version <= previous.version { return Err(UiSchemaError::IncompatibleInputSchemaEvolution); } for old_slot in &previous.slots { let Some(new_slot) = self.slots.iter().find(|slot| slot.key == old_slot.key) else { return Err(UiSchemaError::IncompatibleInputSchemaEvolution); }; if new_slot.kind != old_slot.kind || new_slot.update_class != old_slot.update_class || new_slot.packing != old_slot.packing { return Err(UiSchemaError::IncompatibleInputSchemaEvolution); } } if previous.grid_slots.iter().any(|old_slot| !self.grid_slots.iter().any(|new_slot| new_slot.key == old_slot.key)) { return Err(UiSchemaError::IncompatibleInputSchemaEvolution); } self.validate() }
 }
 
 /// Declares a versioned UI program capability and its authority.
@@ -670,7 +684,7 @@ pub struct UiTextInputCommit {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UiDataGridCellTarget {
-    pub data_grid_key: String,
+    pub source_key: String,
     pub stable_row_key: String,
     pub column_key: String,
 }
@@ -952,6 +966,7 @@ pub struct UiDataGridColumn {
 #[serde(deny_unknown_fields)]
 pub struct UiDataGridDeclaration {
     pub node_key: String,
+    pub source_key: String,
     pub max_window_rows: u32,
     pub row_height: u32,
     pub overscan: u32,
@@ -961,6 +976,7 @@ pub struct UiDataGridDeclaration {
 impl UiDataGridDeclaration {
     pub fn validate(&self) -> bool {
         self.node_key.trim() != ""
+            && self.source_key.trim() != ""
             && self.max_window_rows > 0
             && self.row_height > 0
             && self.overscan <= self.max_window_rows
@@ -1011,7 +1027,12 @@ fn data_grid_value_is_valid(value: &UiInputValue) -> bool {
 /// the zero-based logical row offset and `total_rows` is the full domain count.
  #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
  #[serde(deny_unknown_fields)]
-pub struct UiDataGridFrame { pub data_grid_key: String, pub list_revision: Revision, pub total_rows: u64, pub first_row: u64, pub window_rows: Vec<UiDataGridWindowRow>, pub expected_program_revision: UiProgramRevision }
+pub struct UiDataGridFrame { pub list_revision: Revision, pub total_rows: u64, pub first_row: u64, pub window_rows: Vec<UiDataGridWindowRow>, pub expected_program_revision: UiProgramRevision }
+
+/// One typed update for a declared control-plane grid input.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiDataGridInputFrame { pub source_key: String, pub frame: UiDataGridFrame }
 
 /// Renderer-to-UI-runtime demand for a bounded replacement window. This carries
 /// only revisioned semantic identity; pointer coordinates and renderer hit IDs
@@ -1022,11 +1043,41 @@ pub struct UiDataGridWindowRequest {
     pub renderer_epoch: u64,
     pub composition_revision: Revision,
     pub fragment: UiFragmentRevision,
-    pub data_grid_key: String,
+    pub source_key: String,
     pub expected_list_revision: Revision,
     pub requested_first_row: u64,
     pub max_window_rows: u32,
     pub sequence: u64,
+}
+
+/// A renderer request for a bounded window. The tagged wrapper leaves room for
+/// additional windowed input kinds without changing the host inbound envelope.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum UiWindowRequest {
+    DataGrid { request: UiDataGridWindowRequest },
+}
+
+/// Generic data entering a UI host. Semantic events remain semantic data: a
+/// host validates them but does not choose a domain destination.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum UiHostInbound {
+    WindowRequest { request: UiWindowRequest },
+    SemanticIntent { event: UiProgramSemanticEvent },
+    /// A renderer-validated mutation for a currently published DataGrid cell.
+    /// This preserves the cell target and typed payload for a generic host.
+    DataGridCell { event: UiSemanticEvent },
+}
+
+/// An externally accepted input publication. The host applies its scalar and
+/// grid portions together or leaves the active input state unchanged.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiHostPublication {
+    pub scalar_frame: UiInputFrame,
+    #[serde(default)]
+    pub grid_inputs: Vec<UiDataGridInputFrame>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1153,6 +1204,7 @@ pub struct UiTemplateRecord { pub template_key: String, pub node_range: Vec<Stri
 #[serde(deny_unknown_fields)]
  pub struct UiDataGridRecord {
      pub node_key: String,
+     pub source_key: String,
      pub max_window_rows: u32,
      pub row_height: u32,
      pub overscan: u32,
@@ -1295,7 +1347,7 @@ impl UiFragment {
                 UiEffect::DragBinding { binding } if !nodes.contains(&binding.source_node_id.0) => return Err(UiSchemaError::InvalidProgramEvent),
                 UiEffect::DropBinding { binding } if !nodes.contains(&binding.target_node_id.0) || !drags.iter().any(|drag| drag.key == binding.accepts_drag_key) => return Err(UiSchemaError::InvalidProgramEvent),
                 UiEffect::ControlPresentation { node_id, .. } if !nodes.contains(&node_id.0) => return Err(UiSchemaError::InvalidProgramEvent),
-                UiEffect::DataGridFrame { declaration, frame } if !nodes.contains(&declaration.node_key) || declaration.node_key != frame.data_grid_key => return Err(UiSchemaError::InvalidProgramEvent),
+                UiEffect::DataGridFrame { declaration, .. } if !nodes.contains(&declaration.node_key) => return Err(UiSchemaError::InvalidProgramEvent),
                 _ => {}
             }
         }
@@ -1436,7 +1488,6 @@ impl UiEffect {
             }
             Self::DataGridFrame { declaration, frame } => {
                 if !declaration.validate()
-                    || frame.data_grid_key != declaration.node_key
                     || frame.window_rows.len() > declaration.max_window_rows as usize
                     || frame.first_row.saturating_add(frame.window_rows.len() as u64) > frame.total_rows
                     || frame.window_rows.iter().any(|row| row.cells.values().any(|cell| !cell.validate()))
@@ -1654,7 +1705,7 @@ mod tests {
             }),
             focus: None,
             data_grid_cell: Some(UiDataGridCellTarget {
-                data_grid_key: "assets".into(),
+                source_key: "assets_window".into(),
                 stable_row_key: "asset-42".into(),
                 column_key: "status".into(),
             }),
@@ -1668,7 +1719,29 @@ mod tests {
         assert!(encoded.get("node_path").is_none());
         assert!(encoded.get("pixel_position").is_none());
         assert!(encoded.get("logical_position").is_none());
+        assert_eq!(encoded["data_grid_cell"]["source_key"], "assets_window");
+        assert!(encoded["data_grid_cell"].get("data_grid_key").is_none());
         assert_eq!(encoded["data_grid_cell"]["stable_row_key"], "asset-42");
+    }
+
+    #[test]
+    fn data_grid_window_request_uses_source_identity_without_renderer_paths() {
+        let request = UiDataGridWindowRequest {
+            renderer_epoch: 7,
+            composition_revision: Revision(3),
+            fragment: UiFragmentRevision { id: UiFragmentId("asset-list".into()), revision: Revision(2) },
+            source_key: "asset_window".into(),
+            expected_list_revision: Revision(5),
+            requested_first_row: 96,
+            max_window_rows: 24,
+            sequence: 4,
+        };
+        let encoded = serde_json::to_value(request).unwrap();
+        assert_eq!(encoded["source_key"], "asset_window");
+        assert!(encoded.get("data_grid_key").is_none());
+        assert!(encoded.get("node_key").is_none());
+        assert!(encoded.get("node_path").is_none());
+        assert!(encoded.get("pointer").is_none());
     }
 
     #[test]
@@ -1842,7 +1915,7 @@ mod tests {
     #[test]
     fn input_schema_round_trips_and_rejects_invalid_defaults() {
         let kind = UiInputKind::Bool; let (alignment, lanes, representation) = kind.packing();
-        let schema = UiInputSchema { schema_id: "terrain-inputs".into(), version: 1, layout_hash: "layout-v1".into(), slots: vec![UiInputSlot { key: "can_commit".into(), kind, default_value: UiInputValue::Bool { value: false }, update_class: UiInputUpdateClass::ReliableExternal, semantic_label: "Can commit".into(), packing: UiInputPacking { alignment, lanes, offset: 0, representation } }] };
+        let schema = UiInputSchema { schema_id: "terrain-inputs".into(), version: 1, layout_hash: "layout-v1".into(), slots: vec![UiInputSlot { key: "can_commit".into(), kind, default_value: UiInputValue::Bool { value: false }, update_class: UiInputUpdateClass::ReliableExternal, semantic_label: "Can commit".into(), packing: UiInputPacking { alignment, lanes, offset: 0, representation } }], grid_slots: Vec::new() };
         schema.validate().unwrap(); assert_eq!(serde_json::from_value::<UiInputSchema>(serde_json::to_value(&schema).unwrap()).unwrap(), schema);
         let mut invalid = schema; invalid.slots[0].default_value = UiInputValue::F32 { value: f32::NAN }; assert_eq!(invalid.validate(), Err(UiSchemaError::InvalidInputDefault));
     }
@@ -1891,13 +1964,16 @@ impl UiIrDocument {
                 || !template.row_schema.contains_key(&template.instance_key_field)
             { return Err(UiSchemaError::InvalidIrDocument); }
         }
-        let mut data_grid_keys = std::collections::HashSet::new();
+        let mut data_grid_node_keys = std::collections::HashSet::new();
+        let mut data_grid_sources = std::collections::HashSet::new();
         for data_grid in &self.data_grids {
-            if data_grid.node_key.trim().is_empty() || data_grid.max_window_rows == 0
+            if data_grid.node_key.trim().is_empty() || data_grid.source_key.trim().is_empty()
+                || data_grid.max_window_rows == 0
                 || data_grid.row_height == 0
                 || data_grid.overscan > data_grid.max_window_rows
                 || data_grid.columns.is_empty()
-                || !data_grid_keys.insert(data_grid.node_key.clone())
+                || !data_grid_node_keys.insert(data_grid.node_key.clone())
+                || !data_grid_sources.insert(data_grid.source_key.clone())
                 || !matches!(find_ir_node(&self.root, &data_grid.node_key), Some(node) if node.kind == UiNodeKind::DataGrid)
             { return Err(UiSchemaError::InvalidIrDocument); }
             let mut column_keys = std::collections::HashSet::new();
@@ -1906,8 +1982,8 @@ impl UiIrDocument {
             { return Err(UiSchemaError::InvalidIrDocument); }
         }
         let mut declared_grid_nodes = std::collections::HashSet::new();
-        collect_data_grid_keys(&self.root, &mut declared_grid_nodes);
-        if declared_grid_nodes != data_grid_keys { return Err(UiSchemaError::InvalidIrDocument); }
+        collect_data_grid_node_keys(&self.root, &mut declared_grid_nodes);
+        if declared_grid_nodes != data_grid_node_keys { return Err(UiSchemaError::InvalidIrDocument); }
         Ok(())
     }
 }
@@ -1922,7 +1998,7 @@ fn find_ir_node<'a>(node: &'a UiNode, key: &str) -> Option<&'a UiNode> {
     node.children.iter().find_map(|child| find_ir_node(child, key))
 }
 
-fn collect_data_grid_keys(node: &UiNode, keys: &mut std::collections::HashSet<String>) {
+fn collect_data_grid_node_keys(node: &UiNode, keys: &mut std::collections::HashSet<String>) {
     if node.kind == UiNodeKind::DataGrid { keys.insert(node.node_id.0.clone()); }
-    for child in &node.children { collect_data_grid_keys(child, keys); }
+    for child in &node.children { collect_data_grid_node_keys(child, keys); }
 }
