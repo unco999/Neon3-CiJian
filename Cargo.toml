@@ -9,6 +9,7 @@ members = [
     "crates/neon-wgpu-ai",
     "crates/neon-ui-runtime",
     "crates/neon-cli",
+    "crates/neon-dev",
 ]
 resolver = "2"
 
@@ -25,3 +26,4 @@ pollster = "0.4"
 wgpu = "30.0"
 winit = "0.30"
 fontdue = "0.9"
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }

@@ -19,3 +19,4 @@ fontdue.workspace = true
 
 [dev-dependencies]
 neon-projectd = { path = "../neon-projectd" }
+neon-ui-runtime = { path = "../neon-ui-runtime" }

@@ -110,7 +110,7 @@ impl UiDebugSession {
     pub fn apply_input(&mut self, frame: UiInputFrame) -> Result<(), String> { self.inputs.apply_with_text_registry(UiInputWriter::External, frame.clone(), &self.text).map_err(|error| error.message.to_owned())?; self.input_timeline.push(frame); self.events.replace_resolved_inputs(self.inputs.snapshot()); Ok(()) }
     pub fn apply_repeat(&mut self, frame: neon_ui_schema::UiRepeatFrame) -> Result<(), String> { self.repeats.apply(&self.program, frame.clone()).map_err(|error| error.message)?; self.repeat_timeline.push(frame); Ok(()) }
     pub fn validate_event(&mut self, event: UiProgramSemanticEvent) { self.events.validate(&event); self.event_timeline.push(event); }
-    fn frame(&self) -> UiCpuFrameOutput { evaluate_ui_program(&self.program, &self.inputs.snapshot(), self.viewport, &UiLocalPresentationState { revision: Revision(0) }) }
+    fn frame(&self) -> UiCpuFrameOutput { evaluate_ui_program(&self.program, &self.inputs.snapshot(), self.viewport, &UiLocalPresentationState::default()) }
     fn program_resource_refs(&self, key: &str) -> Vec<neon_ui_schema::UiProgramResource> {
         let Some(node) = self.program.node_templates.iter().find(|node| node.node_id.0 == key) else { return Vec::new(); };
         let mut resources = Vec::new();
@@ -122,8 +122,8 @@ impl UiDebugSession {
 
 pub fn replay_debug_bundle(bundle: &UiDebugBundle) -> Result<UiReplayResult, String> {
     let mut store = UiInputStore::activate(bundle.program.revision.clone(), bundle.schema.clone()).map_err(|error| error.message.to_owned())?;
-    let mut frames = vec![evaluate_ui_program(&bundle.program, &store.snapshot(), bundle.viewport, &UiLocalPresentationState { revision: Revision(0) })];
-    for input in &bundle.input_timeline { store.apply(UiInputWriter::External, input.clone()).map_err(|error| error.message.to_owned())?; frames.push(evaluate_ui_program(&bundle.program, &store.snapshot(), bundle.viewport, &UiLocalPresentationState { revision: Revision(0) })); }
+    let mut frames = vec![evaluate_ui_program(&bundle.program, &store.snapshot(), bundle.viewport, &UiLocalPresentationState::default())];
+    for input in &bundle.input_timeline { store.apply(UiInputWriter::External, input.clone()).map_err(|error| error.message.to_owned())?; frames.push(evaluate_ui_program(&bundle.program, &store.snapshot(), bundle.viewport, &UiLocalPresentationState::default())); }
     let matched_expected_frames = bundle.expected_frames.last().is_none_or(|expected| frames.last() == Some(expected));
     let diagnostics = if matched_expected_frames { Vec::new() } else { vec![diagnostic("ui_debug_replay_mismatch", "replayed logical frame differs from the captured expected frame", None, bundle.program.revision.revision)] };
     Ok(UiReplayResult { frames, diagnostics, matched_expected_frames })

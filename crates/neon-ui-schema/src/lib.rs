@@ -368,6 +368,16 @@ pub enum UiNodeKind {
     Image,
     RenderSurface,
     TextInput,
+    Checkbox,
+    RadioButton,
+    Slider,
+    DragValue,
+    Combo,
+    Dropdown,
+    Selectable,
+    ListBox,
+    Scrollbar,
+    ProgressBar,
 }
 
 
@@ -391,6 +401,19 @@ pub struct UiBounds {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UiLayoutMode { Absolute, Overlay, Row, Column }
+
+/// Child-overflow policy for a layout container. `Rounded` uses the node's
+/// declared corner radius; `Scroll` clips identically to bounds while applying
+/// the layout scroll offset.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UiClipPolicy {
+    None,
+    #[default]
+    Bounds,
+    Rounded,
+    Scroll,
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -443,14 +466,14 @@ pub struct UiLayout {
     pub align_items: UiAlignItems,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub align_self: Option<UiAlignItems>,
-    pub clip: bool,
+    pub clip: UiClipPolicy,
     pub scroll_offset: [f32; 2],
 }
 
 fn is_zero(value: &f32) -> bool { *value == 0.0 }
 
 impl Default for UiLayout {
-    fn default() -> Self { Self { mode: UiLayoutMode::Absolute, padding: [0.0; 4], margin: [0.0; 4], gap: 0.0, min_size: None, max_size: None, preferred_size: None, flex_basis: None, flex_grow: 0.0, flex_shrink: 0.0, justify_content: UiJustifyContent::Start, align_items: UiAlignItems::Start, align_self: None, clip: false, scroll_offset: [0.0; 2] } }
+    fn default() -> Self { Self { mode: UiLayoutMode::Absolute, padding: [0.0; 4], margin: [0.0; 4], gap: 0.0, min_size: None, max_size: None, preferred_size: None, flex_basis: None, flex_grow: 0.0, flex_shrink: 0.0, justify_content: UiJustifyContent::Start, align_items: UiAlignItems::Start, align_self: None, clip: UiClipPolicy::Bounds, scroll_offset: [0.0; 2] } }
 }
 
 /// Renderer-independent visual properties for a screen-space UI node.
@@ -522,6 +545,68 @@ pub enum UiEffect {
     SemanticAction { action: String },
     SemanticIntent { intent: UiIntent },
     BoundSemanticIntent { node_id: UiNodeId, intent: UiIntent },
+    ControlPresentation { node_id: UiNodeId, state: UiControlPresentation },
+    DragBinding { binding: UiDragBinding },
+    DropBinding { binding: UiDropBinding },
+}
+
+/// Domain-prepared visual value for a declared control. It contains only
+/// renderer presentation data and cannot encode actions or business rules.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum UiControlPresentation {
+    Toggle { selected: bool },
+    Numeric { value: f32, min: f32, max: f32 },
+    Choice { token: String, options: Vec<String>, selected: bool },
+    Scroll { position: f32 },
+}
+
+/// Renderer-local pointer interaction policy. The keys name declared UI
+/// semantics; renderer hit IDs and pointer coordinates never leave WGPU.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UiDragAxis { Horizontal, Vertical, Both }
+
+/// Bounds used by the renderer-local drag preview. This is presentation policy,
+/// not a domain placement rule.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UiDragBoundary { Parent, Surface, Free }
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiDragBinding {
+    pub key: String,
+    pub source_node_id: UiNodeId,
+    pub axis: UiDragAxis,
+    pub snap: f32,
+    pub threshold: f32,
+    pub boundary: UiDragBoundary,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiDropBinding {
+    pub key: String,
+    pub target_node_id: UiNodeId,
+    pub accepts_drag_key: String,
+    #[serde(default)]
+    pub placement: UiDropPlacement,
+    /// A bounded template owned by the `into` target. The domain uses it when
+    /// constructing an accepted revision; the renderer never applies it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presentation_template_key: Option<String>,
+    pub intent: UiIntent,
+}
+
+/// Semantic placement relative to a declared drop target.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UiDropPlacement {
+    #[default]
+    Into,
+    Before,
+    After,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -534,7 +619,11 @@ pub enum UiIntent {
 #[serde(rename_all = "snake_case")]
 pub enum UiSemanticEventType {
     PointerClick,
+    ValuePreview,
+    ValueCommit,
+    SelectionChanged,
     TextInputCommit,
+    DragDrop,
     FocusChanged,
     InteractionCancelled,
 }
@@ -566,6 +655,13 @@ pub struct UiTextInputCommit {
     pub value: String,
 }
 
+/// The sole drag/drop data crossing the renderer boundary on release. The
+/// presentation template is target policy for an accepted domain patch, not a
+/// renderer instruction to mutate the canonical tree.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiDragDropPayload { pub source_key: String, pub target_key: String, #[serde(default)] pub placement: UiDropPlacement, #[serde(default, skip_serializing_if = "Option::is_none")] pub presentation_template_key: Option<String> }
+
 /// A renderer-resolved semantic event. It intentionally contains no render hit ID or node key.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -580,6 +676,10 @@ pub struct UiSemanticEvent {
     pub focus: Option<UiFocusMetadata>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<UiTextInputCommit>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_value: Option<UiSemanticPayloadValue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drag_drop: Option<UiDragDropPayload>,
 }
 
 pub const ERROR_RENDERER_EPOCH_MISMATCH: &str = "renderer_epoch_mismatch";
@@ -666,7 +766,36 @@ pub struct NuiFlowParseDiagnostic { pub code: String, pub severity: UiDiagnostic
 /// the canonical persisted representation; Flow is an authoring notation.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct NuiFlowDocument { pub version: u16, pub source: String, pub source_map: std::collections::BTreeMap<String, NuiSourceSpan>, pub ir: UiIrDocument, pub input_schema: UiInputSchema }
+pub struct NuiFlowDocument { pub version: u16, pub source: String, pub source_map: std::collections::BTreeMap<String, NuiSourceSpan>, pub ir: UiIrDocument, pub input_schema: UiInputSchema, #[serde(default)] pub state_machines: Vec<NuiFlowStateMachine>, #[serde(default)] pub drags: Vec<NuiFlowDragDeclaration>, #[serde(default)] pub drops: Vec<NuiFlowDropDeclaration> }
+
+/// Finite UI-local statechart declared by NUI Flow. It may only control
+/// presentation; domain mutations leave through declared semantic intents.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NuiFlowStateMachine { pub key: String, pub initial_state: String, pub states: Vec<String>, #[serde(default)] pub transitions: Vec<NuiFlowStateTransition> }
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NuiFlowStateTrigger { Sync, Intent { name: String } }
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NuiFlowStateTransition { pub from_state: String, pub trigger: NuiFlowStateTrigger, #[serde(default, skip_serializing_if = "Option::is_none")] pub predicate: Option<UiBranchPredicate>, pub target_state: String, #[serde(default, skip_serializing_if = "Option::is_none")] pub emit_intent: Option<String> }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NuiFlowDragAxis { Horizontal, Vertical, Both }
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NuiFlowDragDeclaration { pub key: String, pub source_node_key: String, pub axis: NuiFlowDragAxis, pub snap: f32, pub threshold: f32, pub boundary: UiDragBoundary }
+
+/// Declarative drop target. It proposes a revisioned semantic reparent command;
+/// it never moves a running program node directly. An optional presentation
+/// template is owned by an `into` target and guides domain patch construction.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NuiFlowDropDeclaration { pub key: String, pub target_node_key: String, pub accepts_drag_key: String, #[serde(default)] pub placement: UiDropPlacement, #[serde(default, skip_serializing_if = "Option::is_none")] pub presentation_template_key: Option<String>, pub emit_intent: String }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -698,6 +827,7 @@ pub struct UiIrBinding { pub input_key: String, pub node_key: String, pub proper
 pub enum UiBranchPredicate {
     Bool { input_key: String, #[serde(default = "default_true")] expected: bool },
     EnumEquals { input_key: String, variant: String },
+    MachineState { machine_key: String, state: String },
 }
 
 fn default_true() -> bool { true }
@@ -746,7 +876,7 @@ pub enum UiSemanticPayloadValue {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum UiProgramSemanticEventKind { Activate, ValueTentative, TextEditCommit, InteractionCancel }
+pub enum UiProgramSemanticEventKind { Activate, ValueTentative, ValueCommit, SelectionChanged, TextEditCommit, InteractionCancel }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -766,6 +896,8 @@ pub struct UiProgramSemanticEvent {
     pub input_revision: Revision,
     pub request_id: String,
     pub idempotency_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_value: Option<UiSemanticPayloadValue>,
     pub interaction: UiSemanticInteractionMetadata,
 }
 
@@ -846,7 +978,7 @@ pub struct UiProgram { pub revision: UiProgramRevision, pub nodes: Vec<UiProgram
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct UiCpuNodeState { pub node_key: String, pub visible: bool, pub enabled: bool, pub selected: bool, pub active: bool, pub text: Option<UiTextHandle>, pub image: Option<UiInputValue>, pub opacity: f32, pub scroll_offset: [f32; 2] }
+pub struct UiCpuNodeState { pub node_key: String, pub visible: bool, pub enabled: bool, pub selected: bool, pub active: bool, #[serde(default, skip_serializing_if = "Option::is_none")] pub numeric_value: Option<f32>, #[serde(default, skip_serializing_if = "Option::is_none")] pub state_token: Option<String>, pub text: Option<UiTextHandle>, pub image: Option<UiInputValue>, pub opacity: f32, pub scroll_offset: [f32; 2] }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -963,6 +1095,21 @@ impl UiFragment {
         self.root.validate()?;
         for effect in &self.effects {
             effect.validate()?;
+        }
+        let mut nodes = std::collections::HashSet::new();
+        fn collect(node: &UiNode, nodes: &mut std::collections::HashSet<String>) {
+            nodes.insert(node.node_id.0.clone());
+            for child in &node.children { collect(child, nodes); }
+        }
+        collect(&self.root, &mut nodes);
+        let drags = self.effects.iter().filter_map(|effect| match effect { UiEffect::DragBinding { binding } => Some(binding), _ => None }).collect::<Vec<_>>();
+        for effect in &self.effects {
+            match effect {
+                UiEffect::DragBinding { binding } if !nodes.contains(&binding.source_node_id.0) => return Err(UiSchemaError::InvalidProgramEvent),
+                UiEffect::DropBinding { binding } if !nodes.contains(&binding.target_node_id.0) || !drags.iter().any(|drag| drag.key == binding.accepts_drag_key) => return Err(UiSchemaError::InvalidProgramEvent),
+                UiEffect::ControlPresentation { node_id, .. } if !nodes.contains(&node_id.0) => return Err(UiSchemaError::InvalidProgramEvent),
+                _ => {}
+            }
         }
         Ok(())
     }
@@ -1087,6 +1234,29 @@ impl UiEffect {
             Self::SemanticAction { .. } => Ok(()),
             Self::SemanticIntent { intent } => intent.validate(),
             Self::BoundSemanticIntent { intent, .. } => intent.validate(),
+            Self::ControlPresentation { node_id, state } => {
+                if node_id.0.trim().is_empty() { return Err(UiSchemaError::InvalidProgramEvent); }
+                match state {
+                    UiControlPresentation::Toggle { .. } | UiControlPresentation::Choice { .. } => Ok(()),
+                    UiControlPresentation::Numeric { value, min, max } => {
+                        if value.is_finite() && min.is_finite() && max.is_finite() && min < max { Ok(()) } else { Err(UiSchemaError::InvalidProgramEvent) }
+                    }
+                    UiControlPresentation::Scroll { position } => {
+                        if position.is_finite() && (0.0..=1.0).contains(position) { Ok(()) } else { Err(UiSchemaError::InvalidProgramEvent) }
+                    }
+                }
+            }
+            Self::DragBinding { binding } => {
+                if binding.key.trim().is_empty() || binding.source_node_id.0.trim().is_empty()
+                    || !binding.snap.is_finite() || !binding.threshold.is_finite()
+                    || binding.snap < 0.0 || binding.threshold < 0.0
+                { Err(UiSchemaError::InvalidProgramEvent) } else { Ok(()) }
+            }
+            Self::DropBinding { binding } => {
+                if binding.key.trim().is_empty() || binding.target_node_id.0.trim().is_empty()
+                    || binding.accepts_drag_key.trim().is_empty()
+                { Err(UiSchemaError::InvalidProgramEvent) } else { binding.intent.validate() }
+            }
         }
     }
 }
@@ -1124,6 +1294,22 @@ mod tests {
             serde_json::to_value(fragment).unwrap(),
             serde_json::from_str::<Value>(STATIC_FRAGMENT).unwrap()
         );
+    }
+
+    #[test]
+    fn drag_drop_payload_carries_only_target_presentation_policy() {
+        let payload = UiDragDropPayload {
+            source_key: "backlog-card-01".into(),
+            target_key: "done-panel".into(),
+            placement: UiDropPlacement::Into,
+            presentation_template_key: Some("accepted-template".into()),
+        };
+        assert_eq!(serde_json::to_value(payload).unwrap(), serde_json::json!({
+            "source_key": "backlog-card-01",
+            "target_key": "done-panel",
+            "placement": "into",
+            "presentation_template_key": "accepted-template"
+        }));
     }
 
     #[test]
@@ -1257,6 +1443,8 @@ mod tests {
             }),
             focus: None,
             text: None,
+            control_value: None,
+            drag_drop: None,
         };
         let encoded = serde_json::to_value(event).unwrap();
         assert!(encoded.get("render_hit_id").is_none());
@@ -1473,6 +1661,7 @@ impl UiIrDocument {
             match &branch.predicate {
                 UiBranchPredicate::Bool { input_key, .. } if !input_key.trim().is_empty() => {}
                 UiBranchPredicate::EnumEquals { input_key, variant } if !input_key.trim().is_empty() && !variant.trim().is_empty() => {}
+                UiBranchPredicate::MachineState { machine_key, state } if !machine_key.trim().is_empty() && !state.trim().is_empty() => {}
                 _ => return Err(UiSchemaError::InvalidIrDocument),
             }
         }

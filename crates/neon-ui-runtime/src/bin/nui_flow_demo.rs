@@ -1,0 +1,209 @@
+//! Submits an open NUI Flow fixture through the headless UI runtime.
+
+use std::net::SocketAddr;
+use std::time::Duration;
+
+use neon_ipc::RpcClient;
+use neon_protocol::{
+    ClientIdentity, ClientKind, ProtocolVersion, RequestId, Revision, RpcRequest, ServiceName,
+};
+use neon_ui_runtime::{
+    compile_nui_flow_program, evaluate_ui_program, lower_nui_flow_effects, parse_nui_flow,
+    UiInputStore, UiLocalPresentationState,
+};
+use neon_ui_schema::{
+    NuiFlowDocument, UiBounds, UiCommand, UiCpuViewport, UiFragment, UiFragmentId,
+    UiFragmentSubmission, UiNode, UiNodeKind, UiProgramCapability, UiProgramCapabilityOwner,
+    UiProgramCapabilityStatus, UiProgramResource, UiProgramResourceKind, UiProgramRevision,
+    UI_PROGRAM_BOUNDED_STRUCTURE_CAPABILITY_NAME, UI_PROGRAM_CAPABILITY_NAME,
+    UI_PROGRAM_SCHEMA_VERSION, UI_PROGRAM_SEMANTIC_EVENT_CAPABILITY_NAME,
+    UI_PROGRAM_TEXT_REGISTRY_CAPABILITY_NAME,
+};
+use serde_json::json;
+
+const ASSET_REVIEW_SOURCE: &str =
+    include_str!("../../../../tests/fixtures/ui/asset-review-workbench.nui");
+const KANBAN_REPARENT_SOURCE: &str =
+    include_str!("../../../../tests/fixtures/ui/kanban-reparent-workbench.nui");
+const COMPONENT_GALLERY_SOURCE: &str =
+    include_str!("../../../../tests/fixtures/ui/imgui-component-gallery.nui");
+
+fn main() {
+    let mut args = std::env::args().skip(1);
+    let case = args.next().expect("case name is required");
+    let endpoint = args
+        .next()
+        .unwrap_or_else(|| "127.0.0.1:40102".into())
+        .parse::<SocketAddr>()
+        .expect("UI runtime endpoint must be a socket address");
+    let source = match case.as_str() {
+        "asset-review" => ASSET_REVIEW_SOURCE,
+        "kanban-reparent" => KANBAN_REPARENT_SOURCE,
+        "component-gallery" => COMPONENT_GALLERY_SOURCE,
+        _ => panic!("unsupported NUI Flow case: {case}"),
+    };
+    let document = parse_nui_flow(source).expect("NUI Flow fixture must parse");
+    let effects = lower_nui_flow_effects(&document);
+    let mut fragment = UiFragment {
+        fragment_id: UiFragmentId(format!("nui-flow-case-{case}")),
+        revision: neon_protocol::Revision(1),
+        root: initial_visible_root(&document),
+        effects,
+    };
+    if case == "component-gallery" {
+        let (_, program) = neon_ui_runtime::demo_domain::component_gallery_program()
+            .expect("component gallery program must compile");
+        let domain = neon_ui_runtime::demo_domain::DemoInputDomain::new(
+            program,
+            document.input_schema.clone(),
+        )
+        .expect("component gallery defaults must activate");
+        neon_ui_runtime::demo_domain::apply_visible_status_to_fragment(
+            &mut fragment,
+            &domain.snapshot(),
+        );
+    }
+    let request = RpcRequest {
+        protocol: "neon3.rpc".into(),
+        version: ProtocolVersion { major: 1, minor: 0 },
+        request_id: RequestId(format!("nui-flow-case-{case}-submit")),
+        client: ClientIdentity {
+            kind: ClientKind::Cli,
+            instance_id: "nui-flow-demo".into(),
+            pid: std::process::id(),
+            origin: "nui-flow-demo".into(),
+        },
+        target: ServiceName("ui-runtime".into()),
+        method: "ui.fragment.submit".into(),
+        params: json!(UiCommand::SubmitFragment {
+            submission: UiFragmentSubmission::new(fragment)
+        }),
+        expected_revision: None,
+        idempotency_key: Some(format!("nui-flow-case-{case}-submit-v1")),
+    };
+    for attempt in 1..=10 {
+        match RpcClient::connect(endpoint).and_then(|mut client| client.call(&request)) {
+            Ok(response) if matches!(response.status, neon_protocol::RpcStatus::Accepted) => return,
+            Ok(response)
+                if response.error.as_ref().is_some_and(|error| {
+                    error.code == "window_compositor_stale"
+                        && error.current_revision == Some(neon_protocol::Revision(1))
+                }) =>
+            {
+                return;
+            }
+            Ok(response) if attempt == 10 => panic!("NUI Flow case rejected: {:?}", response.error),
+            Err(error) if attempt == 10 => panic!("submit NUI Flow case: {error}"),
+            _ => std::thread::sleep(Duration::from_millis(100)),
+        }
+    }
+}
+
+fn initial_visible_root(document: &NuiFlowDocument) -> UiNode {
+    let mut compile_document = document.clone();
+    declare_preview_fallbacks(
+        &compile_document.ir.root,
+        &mut compile_document.ir.resources,
+    );
+    let revision = demo_program_revision(&document.ir.surface_id.0);
+    let program = compile_nui_flow_program(&compile_document, revision.clone())
+        .expect("NUI Flow fixture must compile for initial visibility evaluation");
+    let inputs = UiInputStore::activate(revision, document.input_schema.clone())
+        .expect("NUI Flow defaults must activate");
+    let frame = evaluate_ui_program(
+        &program,
+        &inputs.snapshot(),
+        UiCpuViewport {
+            logical_bounds: UiBounds {
+                x: 0.0,
+                y: 0.0,
+                width: 1280.0,
+                height: 800.0,
+            },
+            revision: Revision(1),
+        },
+        &UiLocalPresentationState::default(),
+    );
+    let visibility = frame
+        .nodes
+        .into_iter()
+        .map(|node| (node.node_key, node.visible))
+        .collect();
+    let mut root = document.ir.root.clone();
+    apply_evaluated_visibility(&mut root, &visibility);
+    root
+}
+
+fn declare_preview_fallbacks(node: &UiNode, resources: &mut Vec<UiProgramResource>) {
+    let kind = match node.kind {
+        UiNodeKind::Image => Some(UiProgramResourceKind::Image),
+        UiNodeKind::RenderSurface => Some(UiProgramResourceKind::RenderSurface),
+        _ => None,
+    };
+    if let Some(kind) = kind {
+        if !resources.iter().any(|resource| resource.key == node.node_id.0) {
+            resources.push(UiProgramResource {
+                key: node.node_id.0.clone(),
+                kind,
+                has_fallback: true,
+            });
+        }
+    }
+    for child in &node.children {
+        declare_preview_fallbacks(child, resources);
+    }
+}
+
+fn apply_evaluated_visibility(
+    node: &mut UiNode,
+    visibility: &std::collections::BTreeMap<String, bool>,
+) {
+    node.visible &= visibility.get(&node.node_id.0).copied().unwrap_or(false);
+    for child in &mut node.children {
+        apply_evaluated_visibility(child, visibility);
+    }
+}
+
+fn demo_program_revision(surface_id: &str) -> UiProgramRevision {
+    UiProgramRevision {
+        program_id: format!("{surface_id}.demo"),
+        revision: Revision(1),
+        schema_version: UI_PROGRAM_SCHEMA_VERSION,
+        capabilities: [
+            UI_PROGRAM_CAPABILITY_NAME,
+            UI_PROGRAM_TEXT_REGISTRY_CAPABILITY_NAME,
+            UI_PROGRAM_BOUNDED_STRUCTURE_CAPABILITY_NAME,
+            UI_PROGRAM_SEMANTIC_EVENT_CAPABILITY_NAME,
+        ]
+        .into_iter()
+        .map(|name| UiProgramCapability {
+            name: name.into(),
+            version: 1,
+            owner: UiProgramCapabilityOwner::SharedContract,
+            status: UiProgramCapabilityStatus::Supported,
+        })
+        .collect(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn initial_visibility_hides_inactive_kanban_status_branches() {
+        let document = parse_nui_flow(KANBAN_REPARENT_SOURCE).unwrap();
+        let root = initial_visible_root(&document);
+        let mut visible = std::collections::BTreeMap::new();
+        fn collect(node: &UiNode, visible: &mut std::collections::BTreeMap<String, bool>) {
+            visible.insert(node.node_id.0.clone(), node.visible);
+            for child in &node.children {
+                collect(child, visible);
+            }
+        }
+        collect(&root, &mut visible);
+        assert_eq!(visible["reparent-pending"], false);
+        assert_eq!(visible["reparent-accepted"], false);
+        assert_eq!(visible["reparent-rejected"], false);
+    }
+}

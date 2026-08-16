@@ -876,6 +876,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "neon-dev"
+version = "0.1.0"
+dependencies = [
+ "neon-ipc",
+ "neon-protocol",
+ "neon-ui-runtime",
+ "neon-ui-schema",
+ "serde_json",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
 name = "neon-ipc"
 version = "0.1.0"
 dependencies = [
@@ -919,6 +931,7 @@ dependencies = [
  "neon-observability",
  "neon-protocol",
  "neon-ui-schema",
+ "serde",
  "serde_json",
 ]
 
@@ -952,6 +965,7 @@ dependencies = [
  "neon-observability",
  "neon-projectd",
  "neon-protocol",
+ "neon-ui-runtime",
  "neon-ui-schema",
  "neon-wgpu-ai",
  "pollster",

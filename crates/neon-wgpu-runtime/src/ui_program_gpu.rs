@@ -8,9 +8,10 @@ use std::time::Instant;
 
 use neon_protocol::Revision;
 use neon_ui_schema::{
-    UiBoundProperty, UiBounds, UiDiagnostic, UiDiagnosticSeverity, UiGpuBackendAdapter,
-    UiGpuFrameState, UiGpuLayoutNode, UiGpuLayoutReadback, UiGpuPassTiming, UiGpuUploadStatus,
-    UiInputValue, UiProgram, UiProgramRevision, UiResolvedInputs, UiResourceBudget, UiBranchPredicate,
+    UiBoundProperty, UiBounds, UiBranchPredicate, UiDiagnostic, UiDiagnosticSeverity,
+    UiGpuBackendAdapter, UiGpuFrameState, UiGpuLayoutNode, UiGpuLayoutReadback, UiGpuPassTiming,
+    UiGpuUploadStatus, UiInputValue, UiProgram, UiProgramRevision, UiResolvedInputs,
+    UiResourceBudget,
 };
 
 #[derive(Debug)]
@@ -180,11 +181,23 @@ impl GpuUiProgramBackend {
         }
         for branch in &active.program.branch_records {
             let active_branch = match &branch.predicate {
-                UiBranchPredicate::Bool { input_key, expected } => matches!(active.inputs.values.get(input_key).map(|value| &value.value), Some(UiInputValue::Bool { value }) if value == expected),
-                UiBranchPredicate::EnumEquals { input_key, variant } => matches!(active.inputs.values.get(input_key).map(|value| &value.value), Some(UiInputValue::Enum { value }) if value == variant),
+                UiBranchPredicate::Bool {
+                    input_key,
+                    expected,
+                } => {
+                    matches!(active.inputs.values.get(input_key).map(|value| &value.value), Some(UiInputValue::Bool { value }) if value == expected)
+                }
+                UiBranchPredicate::EnumEquals { input_key, variant } => {
+                    matches!(active.inputs.values.get(input_key).map(|value| &value.value), Some(UiInputValue::Enum { value }) if value == variant)
+                }
+                // Local NUI statechart state is resolved in the UI runtime before
+                // a program reaches the renderer; GPU inputs cannot own it.
+                UiBranchPredicate::MachineState { .. } => false,
             };
             if !active_branch {
-                for node_key in &branch.node_range { visibility.insert(node_key.clone(), false); }
+                for node_key in &branch.node_range {
+                    visibility.insert(node_key.clone(), false);
+                }
             }
         }
         self.last_timing.binding_us = binding_started.elapsed().as_micros() as u64;
@@ -201,7 +214,7 @@ impl GpuUiProgramBackend {
                     bounds.width = bounds.width.min(active.viewport.width);
                     bounds.height = bounds.height.min(active.viewport.height);
                 }
-                let clip = record.layout.filter(|layout| layout.clip).map(|_| bounds);
+                let clip = record.layout.filter(|layout| layout.clip != neon_ui_schema::UiClipPolicy::None).map(|_| bounds);
                 if let Some(clip) = clip {
                     clips.insert(record.node_key.clone(), clip);
                 }
@@ -401,7 +414,15 @@ fn fits_budget(program: &UiProgram) -> bool {
         && program.binding_records.len() <= budget.max_bindings as usize
         && program.layout_records.len() <= budget.max_nodes as usize
         && program.literal_texts.len() <= budget.max_text_records as usize
-        && program.template_records.iter().try_fold(0u32, |total, record| total.checked_add((record.node_range.len() as u32).saturating_mul(record.max_instances))).is_some_and(|count| count <= budget.max_instances)
+        && program
+            .template_records
+            .iter()
+            .try_fold(0u32, |total, record| {
+                total.checked_add(
+                    (record.node_range.len() as u32).saturating_mul(record.max_instances),
+                )
+            })
+            .is_some_and(|count| count <= budget.max_instances)
 }
 fn diagnostic(
     code: &str,

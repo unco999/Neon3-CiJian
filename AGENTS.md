@@ -3,6 +3,10 @@
 本目录是 Neon3 的全新重构工作区。本文件定义不可随意绕过的进程边界、权威所有权、
 渲染边界与公开通信协议。开始实现前必须先阅读本文件。
 
+AI 创建或修改 NUI Flow 前，还必须阅读 [AI NUI Flow Authoring](docs/nui-flow-ai-authoring.md)
+与 `plan/neon3-nui-flow.md`。NUI Flow 只允许声明式 UI 和受限的本地 presentation
+statechart，不能承载领域规则、项目写入、代码执行或 GPU 资源操作。
+
 ## 1. 已确认的核心模型
 
 Neon3 使用多个独立、可单独启动和重启的无窗口业务进程，但所有 wgpu 渲染集中在唯一的

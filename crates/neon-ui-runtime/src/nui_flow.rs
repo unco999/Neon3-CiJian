@@ -14,6 +14,9 @@ use neon_ui_schema::{
     RenderSurfaceRef, UiProgramEventDeclaration, UiResourceBudget, UiSourceSpan, UiStyle,
     UiSurfaceId, UiProgram, UiProgramRevision, UiBranchDeclaration, UiBranchPredicate,
     UiBranchLayoutParticipation, UiTemplateDeclaration,
+    NuiFlowStateMachine, NuiFlowStateTransition, NuiFlowStateTrigger,
+    NuiFlowDragAxis, NuiFlowDragDeclaration, UiDragAxis, UiDragBinding, UiDragBoundary, UiDropBinding, UiEffect, UiIntent,
+    NuiFlowDropDeclaration, UiClipPolicy, UiDropPlacement,
 };
 use serde_json::json;
 
@@ -35,6 +38,9 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
     let mut seen_inputs = HashSet::new();
     let mut branches = Vec::new();
     let mut templates = Vec::new();
+    let mut state_machines = Vec::new();
+    let mut drags = Vec::new();
+    let mut drops = Vec::new();
 
     for (index, raw) in source.lines().enumerate() {
         let line = (index + 1) as u32;
@@ -66,6 +72,23 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
         let content = without_comment.trim();
         reject_forbidden(content, line)?;
         if indent == 0 {
+            if let Some(drop) = parse_drop_declaration(content, line)? {
+                if drops.iter().any(|existing: &NuiFlowDropDeclaration| existing.key == drop.key) {
+                    return Err(error("nui_flow_invalid_drop", "drop keys must be unique", line, 1));
+                }
+                drops.push(drop);
+                continue;
+            }
+            if let Some(drag) = parse_drag_declaration(content, line)? {
+                if drags.iter().any(|existing: &NuiFlowDragDeclaration| existing.key == drag.key) {
+                    return Err(error("nui_flow_invalid_drag", "drag keys must be unique", line, 1));
+                }
+                drags.push(drag);
+                continue;
+            }
+            if parse_state_machine_declaration(content, &mut state_machines, line)? {
+                continue;
+            }
             if let Some(slot) = parse_input(content, line)? {
                 if !seen_inputs.insert(slot.key.clone()) {
                     return Err(error(
@@ -129,7 +152,12 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
                 intent: intent.clone(),
                 allowed_payload_keys: Vec::new(),
                 literal_payload: std::collections::BTreeMap::new(),
-                bound_input_keys: Vec::new(),
+                // A control event carries its declared controlled input through
+                // the generic semantic boundary, never a renderer-local value.
+                bound_input_keys: node.bindings.iter().filter_map(|(property, key)| {
+                    matches!(property, UiBoundProperty::Active | UiBoundProperty::Selected | UiBoundProperty::NumericValue | UiBoundProperty::StateToken)
+                        .then_some(key.clone())
+                }).collect(),
             });
         }
         if let Some(predicate) = &node.branch_predicate {
@@ -194,11 +222,43 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
         }
     }
     for branch in &branches {
-        let input_key = match &branch.predicate { UiBranchPredicate::Bool { input_key, .. } | UiBranchPredicate::EnumEquals { input_key, .. } => input_key };
-        let slot = schema.slots.iter().find(|slot| &slot.key == input_key).ok_or_else(|| error("ui_program_invalid_branch_template", "branch predicate input is not declared", 1, 1))?;
-        match (&branch.predicate, &slot.kind) {
-            (UiBranchPredicate::Bool { .. }, UiInputKind::Bool) | (UiBranchPredicate::EnumEquals { .. }, UiInputKind::Enum { .. }) => {}
-            _ => return Err(error("ui_program_invalid_branch_template", "branch when requires a bool or enum input", 1, 1)),
+        match &branch.predicate {
+            UiBranchPredicate::MachineState { machine_key, state } => {
+                let machine = state_machines.iter().find(|machine| &machine.key == machine_key).ok_or_else(|| error("nui_flow_invalid_state_machine", "branch references an undeclared machine", 1, 1))?;
+                if !machine.states.iter().any(|candidate| candidate == state) {
+                    return Err(error("nui_flow_invalid_state_machine", "branch references an undeclared machine state", 1, 1));
+                }
+            }
+            UiBranchPredicate::Bool { input_key, .. } | UiBranchPredicate::EnumEquals { input_key, .. } => {
+                let slot = schema.slots.iter().find(|slot| &slot.key == input_key).ok_or_else(|| error("ui_program_invalid_branch_template", "branch predicate input is not declared", 1, 1))?;
+                match (&branch.predicate, &slot.kind) {
+                    (UiBranchPredicate::Bool { .. }, UiInputKind::Bool) | (UiBranchPredicate::EnumEquals { .. }, UiInputKind::Enum { .. }) => {}
+                    _ => return Err(error("ui_program_invalid_branch_template", "branch when requires a bool or enum input", 1, 1)),
+                }
+            }
+        }
+    }
+    validate_state_machines(&state_machines, &schema)?;
+    for drag in &drags {
+        if !source_map.contains_key(&drag.source_node_key) {
+            return Err(error("nui_flow_invalid_drag", "drag source node is not declared", 1, 1));
+        }
+    }
+    for drop in &drops {
+        if !source_map.contains_key(&drop.target_node_key) {
+            return Err(error("nui_flow_invalid_drop", "drop target node is not declared", 1, 1));
+        }
+        if !drags.iter().any(|drag| drag.key == drop.accepts_drag_key) {
+            return Err(error("nui_flow_invalid_drop", "drop accepts an undeclared drag key", 1, 1));
+        }
+        if let Some(template_key) = &drop.presentation_template_key {
+            let template = templates.iter().find(|template| &template.template_key == template_key)
+                .ok_or_else(|| error("nui_flow_invalid_drop", "drop present references an undeclared bounded template", 1, 1))?;
+            let target = find_node(&root.node, &drop.target_node_key)
+                .expect("declared drop target exists in the Flow tree");
+            if !target.children.iter().any(|child| child.node_id.0 == template.root_node_key) {
+                return Err(error("nui_flow_invalid_drop", "drop present template must be directly owned by its target", 1, 1));
+            }
         }
     }
     let ir = UiIrDocument {
@@ -227,11 +287,40 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
         source_map,
         ir,
         input_schema: schema,
+        state_machines,
+        drags,
+        drops,
     })
 }
 
 pub fn lower_nui_flow(document: &NuiFlowDocument) -> UiIrDocument {
     document.ir.clone()
+}
+
+/// Lowers Flow's declarative interaction vocabulary into the renderer-neutral
+/// fragment effect contract. Pointer capture and preview remain WGPU-local.
+pub fn lower_nui_flow_effects(document: &NuiFlowDocument) -> Vec<UiEffect> {
+    let mut effects = document.ir.events.iter().map(|event| UiEffect::BoundSemanticIntent {
+        node_id: UiNodeId(event.node_key.clone()),
+        intent: UiIntent::Invoke { action: event.intent.clone(), params: json!({}) },
+    }).collect::<Vec<_>>();
+    effects.extend(document.drags.iter().map(|drag| UiEffect::DragBinding {
+        binding: UiDragBinding {
+            key: drag.key.clone(), source_node_id: UiNodeId(drag.source_node_key.clone()),
+            axis: match drag.axis { NuiFlowDragAxis::Horizontal => UiDragAxis::Horizontal, NuiFlowDragAxis::Vertical => UiDragAxis::Vertical, NuiFlowDragAxis::Both => UiDragAxis::Both },
+            snap: drag.snap, threshold: drag.threshold, boundary: drag.boundary,
+        },
+    }));
+    effects.extend(document.drops.iter().map(|drop| UiEffect::DropBinding {
+        binding: UiDropBinding {
+            key: drop.key.clone(), target_node_id: UiNodeId(drop.target_node_key.clone()),
+            accepts_drag_key: drop.accepts_drag_key.clone(),
+            placement: drop.placement,
+            presentation_template_key: drop.presentation_template_key.clone(),
+            intent: UiIntent::Invoke { action: drop.emit_intent.clone(), params: json!({}) },
+        },
+    }));
+    effects
 }
 
 /// Compiles Flow through the same portable IR compiler and restores the exact
@@ -544,6 +633,156 @@ fn parse_header(text: &str, header: &mut Header, line: u32) -> FlowResult<bool> 
     }
 }
 
+fn parse_state_machine_declaration(
+    text: &str,
+    machines: &mut Vec<NuiFlowStateMachine>,
+    line: u32,
+) -> FlowResult<bool> {
+    let parts = tokenize(text, line)?;
+    let words = parts.iter().map(String::as_str).collect::<Vec<_>>();
+    let invalid = |message| error("nui_flow_invalid_state_machine", message, line, 1);
+    match words.first().copied() {
+        Some("machine") => {
+            if words.len() != 4 || words[2] != "initial" || !valid_key(words[1]) || !valid_key(words[3]) {
+                return Err(invalid("machine syntax is: machine <key> initial <state>"));
+            }
+            if machines.iter().any(|machine| machine.key == words[1]) {
+                return Err(invalid("machine keys must be unique"));
+            }
+            machines.push(NuiFlowStateMachine { key: words[1].into(), initial_state: words[3].into(), states: vec![words[3].into()], transitions: Vec::new() });
+            Ok(true)
+        }
+        Some("state") => {
+            if words.len() != 3 || !valid_key(words[1]) || !valid_key(words[2]) {
+                return Err(invalid("state syntax is: state <machine> <state>"));
+            }
+            let machine = machines.iter_mut().find(|machine| machine.key == words[1]).ok_or_else(|| invalid("state references an undeclared machine"))?;
+            if machine.states.iter().any(|state| state == words[2]) {
+                return Err(invalid("state keys must be unique within a machine"));
+            }
+            machine.states.push(words[2].into());
+            Ok(true)
+        }
+        Some("sync") => {
+            if words.len() != 6 || words[2] != "when" || words[4] != "->" {
+                return Err(invalid("sync syntax is: sync <machine> when <predicate> -> <state>"));
+            }
+            let predicate = parse_branch_predicate(words[3], line)?;
+            let machine = machines.iter_mut().find(|machine| machine.key == words[1]).ok_or_else(|| invalid("sync references an undeclared machine"))?;
+            machine.transitions.push(NuiFlowStateTransition { from_state: "*".into(), trigger: NuiFlowStateTrigger::Sync, predicate: Some(predicate), target_state: words[5].into(), emit_intent: None });
+            Ok(true)
+        }
+        Some("on") => {
+            let when_index = words.iter().position(|word| *word == "when");
+            let arrow_index = words.iter().position(|word| *word == "->").ok_or_else(|| invalid("event transition requires -> <state>"))?;
+            if words.len() < 5 || arrow_index + 1 >= words.len() || !valid_intent(words[2]) {
+                return Err(invalid("on syntax is: on <machine> <intent> [when <predicate>] -> <state> [emit <intent>]"));
+            }
+            if let Some(index) = when_index {
+                if index != 3 || arrow_index != 5 { return Err(invalid("event transition has an invalid when clause")); }
+            } else if arrow_index != 3 { return Err(invalid("event transition has an invalid target")); }
+            let trailing = &words[arrow_index + 2..];
+            let emit_intent = match trailing {
+                [] => None,
+                ["emit", intent] if valid_intent(intent) => Some((*intent).into()),
+                _ => return Err(invalid("emit accepts one dotted semantic intent")),
+            };
+            let predicate = when_index.map(|_| parse_branch_predicate(words[4], line)).transpose()?;
+            let machine = machines.iter_mut().find(|machine| machine.key == words[1]).ok_or_else(|| invalid("event transition references an undeclared machine"))?;
+            machine.transitions.push(NuiFlowStateTransition { from_state: "*".into(), trigger: NuiFlowStateTrigger::Intent { name: words[2].into() }, predicate, target_state: words[arrow_index + 1].into(), emit_intent });
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+fn parse_drag_declaration(text: &str, line: u32) -> FlowResult<Option<NuiFlowDragDeclaration>> {
+    let parts = tokenize(text, line)?;
+    let words = parts.iter().map(String::as_str).collect::<Vec<_>>();
+    if words.first().copied() != Some("drag") { return Ok(None); }
+    if words.len() != 12 || words[2] != "source" || words[4] != "axis" || words[6] != "snap" || words[8] != "threshold" || words[10] != "within" || !valid_key(words[1]) || !valid_key(words[3]) {
+        return Err(error("nui_flow_invalid_drag", "drag syntax is: drag <key> source <node> axis <horizontal|vertical|both> snap <px> threshold <px> within <parent|surface|free>", line, 1));
+    }
+    let axis = match words[5] {
+        "horizontal" => NuiFlowDragAxis::Horizontal,
+        "vertical" => NuiFlowDragAxis::Vertical,
+        "both" => NuiFlowDragAxis::Both,
+        _ => return Err(error("nui_flow_invalid_drag", "drag axis must be horizontal, vertical, or both", line, 1)),
+    };
+    let snap = number(words[7], line)?;
+    let threshold = number(words[9], line)?;
+    if snap < 0.0 || threshold < 0.0 { return Err(error("nui_flow_invalid_drag", "drag snap and threshold must be nonnegative", line, 1)); }
+    let boundary = match words[11] {
+        "parent" => UiDragBoundary::Parent,
+        "surface" => UiDragBoundary::Surface,
+        "free" => UiDragBoundary::Free,
+        _ => return Err(error("nui_flow_invalid_drag", "drag within must be parent, surface, or free", line, 1)),
+    };
+    Ok(Some(NuiFlowDragDeclaration { key: words[1].into(), source_node_key: words[3].into(), axis, snap, threshold, boundary }))
+}
+
+fn parse_drop_declaration(text: &str, line: u32) -> FlowResult<Option<NuiFlowDropDeclaration>> {
+    let parts = tokenize(text, line)?;
+    let words = parts.iter().map(String::as_str).collect::<Vec<_>>();
+    if words.first().copied() != Some("drop") { return Ok(None); }
+    if words.len() < 8 || words[..6] != ["drop", words[1], "target", words[3], "accepts", words[5]] {
+        return Err(error("nui_flow_invalid_drop", "drop syntax is: drop <key> target <node> accepts <drag> [placement <into|before|after>] [present <template-key>] emit <intent>", line, 1));
+    }
+    let mut cursor = 6;
+    let mut placement = UiDropPlacement::Into;
+    if words.get(cursor) == Some(&"placement") {
+        placement = match words.get(cursor + 1).copied() {
+            Some("into") => UiDropPlacement::Into,
+            Some("before") => UiDropPlacement::Before,
+            Some("after") => UiDropPlacement::After,
+            _ => return Err(error("nui_flow_invalid_drop", "drop placement must be into, before, or after", line, 1)),
+        };
+        cursor += 2;
+    }
+    let presentation_template_key = if words.get(cursor) == Some(&"present") {
+        let template_key = words.get(cursor + 1).ok_or_else(|| error("nui_flow_invalid_drop", "drop present requires a template key", line, 1))?;
+        cursor += 2;
+        Some((*template_key).to_string())
+    } else {
+        None
+    };
+    if words.get(cursor) != Some(&"emit") || cursor + 2 != words.len() {
+        return Err(error("nui_flow_invalid_drop", "drop syntax is: drop <key> target <node> accepts <drag> [placement <into|before|after>] [present <template-key>] emit <intent>", line, 1));
+    }
+    if !valid_key(words[1]) || !valid_key(words[3]) || !valid_key(words[5]) || !presentation_template_key.as_ref().is_none_or(|key| valid_key(key)) || !valid_intent(words[cursor + 1]) {
+        return Err(error("nui_flow_invalid_drop", "drop keys and intent are invalid", line, 1));
+    }
+    Ok(Some(NuiFlowDropDeclaration { key: words[1].into(), target_node_key: words[3].into(), accepts_drag_key: words[5].into(), placement, presentation_template_key, emit_intent: words[cursor + 1].into() }))
+}
+
+fn find_node<'a>(node: &'a UiNode, key: &str) -> Option<&'a UiNode> {
+    if node.node_id.0 == key {
+        return Some(node);
+    }
+    node.children.iter().find_map(|child| find_node(child, key))
+}
+
+fn validate_state_machines(machines: &[NuiFlowStateMachine], schema: &UiInputSchema) -> FlowResult<()> {
+    for machine in machines {
+        if !machine.states.iter().any(|state| state == &machine.initial_state) {
+            return Err(error("nui_flow_invalid_state_machine", "initial state must be declared", 1, 1));
+        }
+        for transition in &machine.transitions {
+            if !machine.states.iter().any(|state| state == &transition.target_state) {
+                return Err(error("nui_flow_invalid_state_machine", "transition target state is not declared", 1, 1));
+            }
+            if let Some(predicate) = &transition.predicate {
+                let input_key = match predicate { UiBranchPredicate::Bool { input_key, .. } | UiBranchPredicate::EnumEquals { input_key, .. } => input_key, UiBranchPredicate::MachineState { .. } => return Err(error("nui_flow_invalid_state_machine", "state transitions cannot predicate on another machine", 1, 1)) };
+                let slot = schema.slots.iter().find(|slot| slot.key == *input_key).ok_or_else(|| error("nui_flow_invalid_state_machine", "transition predicate input is not declared", 1, 1))?;
+                if !matches!((predicate, &slot.kind), (UiBranchPredicate::Bool { .. }, UiInputKind::Bool) | (UiBranchPredicate::EnumEquals { .. }, UiInputKind::Enum { .. })) {
+                    return Err(error("nui_flow_invalid_state_machine", "transition predicate type is incompatible", 1, 1));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn parse_input(text: &str, line: u32) -> FlowResult<Option<UiInputSlot>> {
     let parts = text.split_whitespace().collect::<Vec<_>>();
     if parts.first() != Some(&"input") {
@@ -660,6 +899,16 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
         "text" => UiNodeKind::Label,
         "button" => UiNodeKind::Button,
         "input" => UiNodeKind::TextInput,
+        "checkbox" => UiNodeKind::Checkbox,
+        "radio_button" => UiNodeKind::RadioButton,
+        "slider" => UiNodeKind::Slider,
+        "drag_value" => UiNodeKind::DragValue,
+        "combo" => UiNodeKind::Combo,
+        "dropdown" => UiNodeKind::Dropdown,
+        "selectable" => UiNodeKind::Selectable,
+        "list_box" => UiNodeKind::ListBox,
+        "scrollbar" => UiNodeKind::Scrollbar,
+        "progress_bar" => UiNodeKind::ProgressBar,
         "image" => UiNodeKind::Image,
         "render" => UiNodeKind::RenderSurface,
         _ => {
@@ -705,6 +954,9 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
             target_id: format!("render.{}", node.node_id.0),
         });
     }
+    if parts[0] == "scroll" {
+        node.layout.as_mut().expect("Flow nodes have layout").clip = UiClipPolicy::Scroll;
+    }
     let mut bindings = Vec::new();
     let mut intents = Vec::new();
     let mut branch_predicate = None;
@@ -726,7 +978,7 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
             "column" => node.layout.as_mut().unwrap().mode = UiLayoutMode::Column,
             "overlay" => node.layout.as_mut().unwrap().mode = UiLayoutMode::Overlay,
             "w" | "h" | "minw" | "maxw" | "grow" | "shrink" | "basis" | "gap" | "pad" | "fill"
-            | "line" | "ink" | "value" | "enabled" | "visible" | "event" | "token" | "align"
+             | "line" | "ink" | "value" | "checked" | "selected" | "state" | "numeric" | "scroll" | "enabled" | "visible" | "event" | "token" | "align" | "clip"
             | "justify" => {
                 let value = *parts.get(index + 1).ok_or_else(|| {
                     error(
@@ -743,6 +995,11 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
                 let value = *parts.get(index + 1).ok_or_else(|| error("nui_flow_missing_value", "when requires a direct input predicate", line, 1))?;
                 index += 1;
                 branch_predicate = Some(parse_branch_predicate(value, line)?);
+            }
+            "in" if parts[0] == "branch" => {
+                let value = *parts.get(index + 1).ok_or_else(|| error("nui_flow_missing_value", "in requires machine.state", line, 1))?;
+                index += 1;
+                branch_predicate = Some(parse_machine_state_predicate(value, line)?);
             }
             "capacity" if matches!(parts[0], "repeat" | "template") => {
                 let value = *parts.get(index + 1).ok_or_else(|| error("nui_flow_missing_value", "capacity requires a positive bound", line, 1))?;
@@ -775,7 +1032,7 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
         }
         index += 1;
     }
-    if parts[0] == "branch" && branch_predicate.is_none() { return Err(error("ui_program_invalid_branch_template", "branch requires `when $bool`, `when !$bool`, or `when $enum=variant`", line, 1)); }
+    if parts[0] == "branch" && branch_predicate.is_none() { return Err(error("ui_program_invalid_branch_template", "branch requires `when` or `in machine.state`", line, 1)); }
     if matches!(parts[0], "repeat" | "template") {
         let Some(spec) = &template else { return Err(error("ui_program_invalid_branch_template", "repeat/template requires a finite capacity", line, 1)); };
         if spec.2.trim().is_empty() { return Err(error("ui_program_invalid_branch_template", "repeat/template requires a stable key field", line, 1)); }
@@ -793,6 +1050,16 @@ fn parse_branch_predicate(value: &str, line: u32) -> FlowResult<UiBranchPredicat
         return Ok(UiBranchPredicate::EnumEquals { input_key: input_key.into(), variant: variant.into() });
     }
     Ok(UiBranchPredicate::Bool { input_key: value.into(), expected: true })
+}
+
+fn parse_machine_state_predicate(value: &str, line: u32) -> FlowResult<UiBranchPredicate> {
+    let Some((machine_key, state)) = value.rsplit_once('.') else {
+        return Err(error("nui_flow_invalid_state_machine", "branch in requires machine.state", line, 1));
+    };
+    if !valid_key(machine_key) || !valid_key(state) {
+        return Err(error("nui_flow_invalid_state_machine", "machine and state keys are invalid", line, 1));
+    }
+    Ok(UiBranchPredicate::MachineState { machine_key: machine_key.into(), state: state.into() })
 }
 
 fn parse_attribute(
@@ -853,6 +1120,13 @@ fn parse_attribute(
             }
         }
         "align" => layout.align_items = alignment(value, line)?,
+        "clip" => layout.clip = match value {
+            "none" => UiClipPolicy::None,
+            "bounds" => UiClipPolicy::Bounds,
+            "rounded" => UiClipPolicy::Rounded,
+            "scroll" => UiClipPolicy::Scroll,
+            _ => return Err(error("nui_flow_invalid_layout", "clip must be none, bounds, rounded, or scroll", line, 1)),
+        },
         "justify" => layout.justify_content = justify(value, line)?,
         "value" => {
             if let Some(input) = direct_binding(UiBoundProperty::TextValue) {
@@ -862,6 +1136,18 @@ fn parse_attribute(
                     value: quoted(value, line)?,
                 });
             }
+        }
+        "checked" => {
+            if direct_binding(UiBoundProperty::Active).is_none() { return Err(error("nui_flow_invalid_control_binding", "checked requires a bool input binding", line, 1)); }
+        }
+        "selected" => {
+            if direct_binding(UiBoundProperty::Selected).is_none() { return Err(error("nui_flow_invalid_control_binding", "selected requires a bool input binding", line, 1)); }
+        }
+        "state" => {
+            if direct_binding(UiBoundProperty::StateToken).is_none() { return Err(error("nui_flow_invalid_control_binding", "state requires an enum input binding", line, 1)); }
+        }
+        "numeric" | "scroll" => {
+            if direct_binding(UiBoundProperty::NumericValue).is_none() { return Err(error("nui_flow_invalid_control_binding", "numeric and scroll require a numeric input binding", line, 1)); }
         }
         "enabled" => {
             if direct_binding(UiBoundProperty::Enabled).is_none() {
@@ -1091,7 +1377,9 @@ fn valid_intent(intent: &str) -> bool {
 fn binding_accepts(property: &UiBoundProperty, kind: &UiInputKind) -> bool {
     match property {
         UiBoundProperty::TextValue => matches!(kind, UiInputKind::TextHandle),
-        UiBoundProperty::Enabled | UiBoundProperty::Visible => matches!(kind, UiInputKind::Bool),
+        UiBoundProperty::Enabled | UiBoundProperty::Visible | UiBoundProperty::Selected | UiBoundProperty::Active => matches!(kind, UiInputKind::Bool),
+        UiBoundProperty::StateToken => matches!(kind, UiInputKind::Enum { .. }),
+        UiBoundProperty::NumericValue => matches!(kind, UiInputKind::I32 | UiInputKind::U32 | UiInputKind::F32 | UiInputKind::I32Range { .. } | UiInputKind::U32Range { .. }),
         _ => false,
     }
 }
@@ -1173,6 +1461,16 @@ fn format_node(
         UiNodeKind::Label => "text",
         UiNodeKind::Button => "button",
         UiNodeKind::TextInput => "input",
+        UiNodeKind::Checkbox => "checkbox",
+        UiNodeKind::RadioButton => "radio_button",
+        UiNodeKind::Slider => "slider",
+        UiNodeKind::DragValue => "drag_value",
+        UiNodeKind::Combo => "combo",
+        UiNodeKind::Dropdown => "dropdown",
+        UiNodeKind::Selectable => "selectable",
+        UiNodeKind::ListBox => "list_box",
+        UiNodeKind::Scrollbar => "scrollbar",
+        UiNodeKind::ProgressBar => "progress_bar",
         UiNodeKind::Image => "image",
         UiNodeKind::RenderSurface => "render",
     };
@@ -1187,6 +1485,15 @@ fn format_node(
         if layout.gap != 0.0 {
             line.push_str(&format!(" gap {}", layout.gap));
         }
+        if layout.clip != UiClipPolicy::Bounds {
+            let policy = match layout.clip {
+                UiClipPolicy::None => "none",
+                UiClipPolicy::Bounds => "bounds",
+                UiClipPolicy::Rounded => "rounded",
+                UiClipPolicy::Scroll => "scroll",
+            };
+            line.push_str(&format!(" clip {policy}"));
+        }
     }
     if let Some(TextRef::Literal { value }) = &node.text {
         line.push_str(&format!(" value \"{}\"", value.replace('"', "\\\"")));
@@ -1199,6 +1506,10 @@ fn format_node(
             UiBoundProperty::TextValue => "value",
             UiBoundProperty::Enabled => "enabled",
             UiBoundProperty::Visible => "visible",
+            UiBoundProperty::Active => "checked",
+            UiBoundProperty::Selected => "selected",
+            UiBoundProperty::StateToken => "state",
+            UiBoundProperty::NumericValue => "numeric",
             _ => continue,
         };
         line.push_str(&format!(" {} ${}", property, binding.input_key));
@@ -1330,6 +1641,16 @@ fn insert_node(
         "text" => UiNodeKind::Label,
         "button" => UiNodeKind::Button,
         "input" => UiNodeKind::TextInput,
+        "checkbox" => UiNodeKind::Checkbox,
+        "radio_button" => UiNodeKind::RadioButton,
+        "slider" => UiNodeKind::Slider,
+        "drag_value" => UiNodeKind::DragValue,
+        "combo" => UiNodeKind::Combo,
+        "dropdown" => UiNodeKind::Dropdown,
+        "selectable" => UiNodeKind::Selectable,
+        "list_box" => UiNodeKind::ListBox,
+        "scrollbar" => UiNodeKind::Scrollbar,
+        "progress_bar" => UiNodeKind::ProgressBar,
         "image" => UiNodeKind::Image,
         "render" => UiNodeKind::RenderSurface,
         _ => {
@@ -1528,5 +1849,79 @@ panel workspace row gap 8
             document.ir.root.children[0].surface.as_ref().unwrap().target_id,
             "render.terrain_view"
         );
+    }
+
+    #[test]
+    fn complex_asset_review_fixture_uses_bounded_declarative_ui_features() {
+        let source = include_str!("../../../tests/fixtures/ui/asset-review-workbench.nui");
+        let document = parse_nui_flow(source).unwrap();
+
+        assert_eq!(document.input_schema.slots.len(), 12);
+        assert_eq!(document.state_machines.len(), 2);
+        assert_eq!(document.drags.len(), 1);
+        assert!(document.ir.events.iter().any(|event| event.intent == "asset.review.publish"));
+        assert!(document.ir.root.children.iter().any(|node| node.node_id.0 == "command-bar"));
+    }
+
+    #[test]
+    fn flow_drag_and_drop_lower_to_generic_effect_bindings() {
+        let document = parse_nui_flow(include_str!("../../../tests/fixtures/ui/kanban-reparent-workbench.nui")).unwrap();
+        let effects = lower_nui_flow_effects(&document);
+        assert!(effects.iter().any(|effect| matches!(effect, UiEffect::DragBinding { binding } if binding.key == "backlog-card-drag" && binding.source_node_id.0 == "backlog-card-01" && binding.boundary == UiDragBoundary::Surface)));
+        assert!(effects.iter().any(|effect| matches!(effect, UiEffect::DropBinding { binding } if binding.target_node_id.0 == "in-progress-panel" && binding.accepts_drag_key == "backlog-card-drag" && binding.presentation_template_key.as_deref() == Some("progress-template"))));
+        assert!(effects.iter().any(|effect| matches!(effect, UiEffect::DropBinding { binding } if binding.target_node_id.0 == "done-panel" && binding.accepts_drag_key == "backlog-card-drag" && binding.presentation_template_key.as_deref() == Some("accepted-template"))));
+    }
+
+    #[test]
+    fn drop_placement_defaults_to_into_and_accepts_relative_targets() {
+        let source = "drag item-drag source item axis both snap 0 threshold 0 within free\ndrop default target target accepts item-drag emit workspace.item.move\ndrop before target target accepts item-drag placement before emit workspace.item.move\ndrop after target target accepts item-drag placement after emit workspace.item.move\nsurface root\n  panel item\n  panel target\n";
+        let document = parse_nui_flow(source).unwrap();
+        assert_eq!(document.drops.iter().map(|drop| drop.placement).collect::<Vec<_>>(), vec![UiDropPlacement::Into, UiDropPlacement::Before, UiDropPlacement::After]);
+        assert!(lower_nui_flow_effects(&document).iter().any(|effect| matches!(effect, UiEffect::DropBinding { binding } if binding.key == "after" && binding.placement == UiDropPlacement::After)));
+    }
+
+    #[test]
+    fn drop_present_lowers_a_target_owned_template_key() {
+        let source = "drag item-drag source item axis both snap 0 threshold 0 within free\ndrop target-drop target target accepts item-drag present target-row emit workspace.item.move\nsurface root\n  panel item\n  panel target\n    template target-row h 32 capacity 4 key row_key overflow_summary\n      text row value \"Target row\"\n";
+        let document = parse_nui_flow(source).unwrap();
+        assert_eq!(document.drops[0].presentation_template_key.as_deref(), Some("target-row"));
+        assert!(lower_nui_flow_effects(&document).iter().any(|effect| matches!(effect, UiEffect::DropBinding { binding } if binding.key == "target-drop" && binding.presentation_template_key.as_deref() == Some("target-row"))));
+    }
+
+    #[test]
+    fn drop_present_requires_a_target_owned_template_for_every_placement() {
+        let undeclared = parse_nui_flow("drag item-drag source item axis both snap 0 threshold 0 within free\ndrop target-drop target target accepts item-drag present missing-row emit workspace.item.move\nsurface root\n  panel item\n  panel target\n").unwrap_err();
+        assert_eq!(undeclared.diagnostics[0].code, "nui_flow_invalid_drop");
+
+        let relative = parse_nui_flow("drag item-drag source item axis both snap 0 threshold 0 within free\ndrop target-drop target target accepts item-drag placement before present target-row emit workspace.item.move\nsurface root\n  panel item\n  panel target\n    template target-row h 32 capacity 4 key row_key overflow_summary\n      text row value \"Target row\"\n").unwrap();
+        assert_eq!(relative.drops[0].placement, UiDropPlacement::Before);
+        assert_eq!(relative.drops[0].presentation_template_key.as_deref(), Some("target-row"));
+
+        let unowned = parse_nui_flow("drag item-drag source item axis both snap 0 threshold 0 within free\ndrop target-drop target target accepts item-drag present other-row emit workspace.item.move\nsurface root\n  panel item\n  panel target\n  template other-row h 32 capacity 4 key row_key overflow_summary\n    text row value \"Other row\"\n").unwrap_err();
+        assert_eq!(unowned.diagnostics[0].code, "nui_flow_invalid_drop");
+    }
+
+    #[test]
+    fn panel_clip_defaults_to_bounds_and_flow_accepts_explicit_policies() {
+        let document = parse_nui_flow("surface root clip none\n  panel bounds\n  panel rounded clip rounded\n  scroll scroller\n").unwrap();
+        assert_eq!(document.ir.root.layout.unwrap().clip, UiClipPolicy::None);
+        assert_eq!(document.ir.root.children[0].layout.unwrap().clip, UiClipPolicy::Bounds);
+        assert_eq!(document.ir.root.children[1].layout.unwrap().clip, UiClipPolicy::Rounded);
+        assert_eq!(document.ir.root.children[2].layout.unwrap().clip, UiClipPolicy::Scroll);
+        assert!(format_nui_flow("surface root clip none\n  panel rounded clip rounded\n").unwrap().contains("clip rounded"));
+    }
+
+    #[test]
+    fn drag_boundary_policy_accepts_all_declared_values() {
+        for (within, boundary) in [
+            ("parent", UiDragBoundary::Parent),
+            ("surface", UiDragBoundary::Surface),
+            ("free", UiDragBoundary::Free),
+        ] {
+            let source = format!("drag demo source panel axis both snap 0 threshold 0 within {within}\nsurface root\n  panel panel\n");
+            assert_eq!(parse_nui_flow(&source).unwrap().drags[0].boundary, boundary);
+        }
+        let error = parse_nui_flow("drag demo source panel axis both snap 0 threshold 0 within column\nsurface root\n  panel panel\n").unwrap_err();
+        assert_eq!(error.diagnostics[0].code, "nui_flow_invalid_drag");
     }
 }

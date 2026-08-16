@@ -1,0 +1,35 @@
+# Unified declarative component gallery. Every control uses a typed input binding
+# and a semantic intent; no renderer identity or domain-specific rule is present.
+version 1
+surface surface.component-gallery revision 1
+budget nodes=64 bindings=64 instances=64 text=64 glyphs=4096 events=32 clips=32
+input controls_enabled bool default true
+input feature_enabled bool default true
+input radio_selected bool default false
+input slider_value f32 default 0.5
+input drag_value i32 default 12
+input combo_choice enum:alpha|beta|gamma default beta
+input dropdown_choice enum:alpha|beta|gamma default beta
+input list_choice enum:alpha|beta|gamma default beta
+input item_selected bool default true
+input scroll_position f32 default 0.35
+surface component-gallery column w 420 h 590 gap 6 pad 14 align stretch fill #17201E
+  text gallery-title h 28 value "Component Gallery"
+  checkbox feature-toggle h 30 checked $feature_enabled enabled $controls_enabled value "Enable feature" event gallery.checkbox.toggle
+  text status-feature_enabled h 18 value "feature_enabled: true"
+  radio_button mode-radio h 30 selected $radio_selected enabled $controls_enabled value "Select mode" event gallery.radio.select
+  text status-radio_selected h 18 value "radio_selected: false"
+  slider exposure-slider h 30 numeric $slider_value enabled $controls_enabled value "Exposure" event gallery.slider.commit
+  text status-slider_value h 18 value "slider_value: 0.5"
+  drag_value count-drag h 30 numeric $drag_value enabled $controls_enabled value "Item count" event gallery.drag_value.commit
+  text status-drag_value h 18 value "drag_value: 12"
+  combo mode-combo h 32 state $combo_choice enabled $controls_enabled value "Mode selector" event gallery.combo.select
+  text status-combo_choice h 18 value "combo_choice: beta"
+  dropdown mode-dropdown h 32 state $dropdown_choice enabled $controls_enabled value "Mode menu" event gallery.dropdown.select
+  text status-dropdown_choice h 18 value "dropdown_choice: beta"
+  selectable item-selectable h 30 selected $item_selected enabled $controls_enabled value "Selectable item" event gallery.selectable.select
+  text status-item_selected h 18 value "item_selected: true"
+  list_box item-list h 72 state $list_choice enabled $controls_enabled value "Available modes" event gallery.list_box.select
+  text status-list_choice h 18 value "list_choice: beta"
+  scrollbar gallery-scroll h 20 scroll $scroll_position enabled $controls_enabled value "Scrollbar" event gallery.scrollbar.commit
+  text status-scroll_position h 18 value "scroll_position: 0.35"

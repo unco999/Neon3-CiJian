@@ -1,13 +1,13 @@
 [package]
-name = "neon-ui-runtime"
+name = "neon-dev"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-neon-protocol = { path = "../neon-protocol" }
+windows-sys.workspace = true
 neon-ipc = { path = "../neon-ipc" }
-neon-observability = { path = "../neon-observability" }
+neon-protocol = { path = "../neon-protocol" }
+neon-ui-runtime = { path = "../neon-ui-runtime" }
 neon-ui-schema = { path = "../neon-ui-schema" }
 serde_json.workspace = true
-serde.workspace = true

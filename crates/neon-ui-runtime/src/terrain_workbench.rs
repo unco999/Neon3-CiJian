@@ -86,7 +86,7 @@ mod tests {
         let document = terrain_workbench_document();
         let program = terrain_workbench_program();
         let mut store = UiInputStore::activate(terrain_workbench_program_revision(), document.input_schema.clone()).unwrap();
-        let defaults = evaluate_ui_program(&program, &store.snapshot(), terrain_workbench_viewport(1440.0, 900.0, 1), &UiLocalPresentationState { revision: Revision(0) });
+        let defaults = evaluate_ui_program(&program, &store.snapshot(), terrain_workbench_viewport(1440.0, 900.0, 1), &UiLocalPresentationState::default());
         assert!(defaults.nodes.iter().any(|node| node.node_key == "terrain-render-surface"));
         assert!(defaults.nodes.iter().any(|node| node.node_key == "loading-state" && node.visible));
 
@@ -95,7 +95,7 @@ mod tests {
             UiInputChange { key: "can_commit".into(), value: UiInputValue::Bool { value: true } },
         ]);
         store.apply(UiInputWriter::External, update).unwrap();
-        let ready = evaluate_ui_program(&program, &store.snapshot(), terrain_workbench_viewport(720.0, 900.0, 2), &UiLocalPresentationState { revision: Revision(0) });
+        let ready = evaluate_ui_program(&program, &store.snapshot(), terrain_workbench_viewport(720.0, 900.0, 2), &UiLocalPresentationState::default());
         assert!(ready.nodes.iter().any(|node| node.node_key == "ready-state" && node.visible));
         assert!(ready.nodes.iter().any(|node| node.node_key == "loading-state" && !node.visible));
 
@@ -104,7 +104,7 @@ mod tests {
             event_id: "tool-select".into(), kind: UiProgramSemanticEventKind::Activate,
             intent: "terrain.tool.select".into(), source_node_key: "tool-select".into(),
             payload: BTreeMap::new(), program_revision: terrain_workbench_program_revision(),
-            input_revision: Revision(1), request_id: "tool-request".into(), idempotency_key: "tool-select-1".into(),
+            input_revision: Revision(1), request_id: "tool-request".into(), idempotency_key: "tool-select-1".into(), requested_value: None,
             interaction: UiSemanticInteractionMetadata { interaction_id: "pointer-capture-1".into(), sequence: 1, renderer_epoch: 7 },
         };
         assert_eq!(events.validate(&activate).status, UiProgramSemanticEventStatus::Accepted);

@@ -1,7 +1,7 @@
 # Canonical NUI Flow terrain workbench. Domain snapshots supply all values.
 version 1
 surface surface.editor.terrain-workbench revision 1
-budget nodes=64 bindings=32 instances=32 text=32 glyphs=2048 events=16 clips=16
+budget nodes=64 bindings=32 instances=32 text=32 glyphs=2048 events=16 clips=64
 input project_title text default text:empty
 input inspector_title text default text:empty
 input diagnostic_text text default text:empty

@@ -38,15 +38,92 @@ Input declarations have the form `input <key> <kind> default <literal>`. V1 supp
 
 ## Components and attributes
 
-The closed V1 vocabulary is `surface`, `panel`, `text`, `button`, `input`, `image`, `render`, `scroll`, `overlay`, `branch`, `repeat`, and `template`. No other component name is valid. `surface`, `panel`, `scroll`, `overlay`, `branch`, `repeat`, and `template` lower through the current compatible panel topology; bounded branch and template records are completed by their dedicated runtime capability.
+The closed V1 vocabulary is `surface`, `panel`, `text`, `button`, `input`, `checkbox`, `radio_button`, `slider`, `drag_value`, `combo`, `dropdown`, `selectable`, `list_box`, `scrollbar`, `progress_bar`, `image`, `render`, `scroll`, `overlay`, `branch`, `repeat`, and `template`. No other component name is valid. `surface`, `panel`, `scroll`, `overlay`, `branch`, `repeat`, and `template` lower through the current compatible panel topology; bounded branch and template records are completed by their dedicated runtime capability.
 
-Supported layout tokens are `row`, `column`, `overlay`, `w`, `h`, `minw`, `maxw`, `grow`, `shrink`, `basis`, `pad`, `gap`, `align`, and `justify`. Values are finite logical numbers. Alignment accepts `start`, `center`, `end`, and `stretch`; justification additionally accepts `between`, `around`, and `evenly`.
+Supported layout tokens are `row`, `column`, `overlay`, `w`, `h`, `minw`, `maxw`, `grow`, `shrink`, `basis`, `pad`, `gap`, `align`, `justify`, and `clip`. Values are finite logical numbers. Alignment accepts `start`, `center`, `end`, and `stretch`; justification additionally accepts `between`, `around`, and `evenly`. Panels default to `clip bounds`; `clip none`, `clip bounds`, `clip rounded`, and `clip scroll` are explicit policies. Rounded clipping uses the panel corner radius for both pixels and hit tests; `scroll` also uses the existing layout scroll offset.
 
 `token`, `fill`, `line`, and `ink` are visual declarations. `token` and `ink` require `token:<name>` references. `fill` and `line` accept an explicit `#RRGGBB` or `#RRGGBBAA` compatibility color until theme-token lowering carries those fields in canonical IR. There is no shader source or arbitrary visual expression.
 
-Direct bindings use `$input_key` only. `value $name`, `enabled $can_commit`, and `visible $show_details` lower to canonical binding records. Literal `value` text is quoted. V1 conditional syntax is reserved for bounded branch lowering: `when $flag`, `when !$flag`, and `when $mode=ready`; complex predicates require a domain-provided boolean or enum input and are rejected rather than evaluated.
+Direct bindings use `$input_key` only. `value $name`, `enabled $can_commit`, and `visible $show_details` lower to canonical binding records. Literal `value` text is quoted. Component state uses typed forms: `checked $bool` for checkboxes, `selected $bool` for radio buttons and selectables, `numeric $i32_or_f32` for sliders, drag values, scrollbars, and progress bars, and `state $enum` for combos, dropdowns, and list boxes. V1 conditional syntax is reserved for bounded branch lowering: `when $flag`, `when !$flag`, and `when $mode=ready`; complex predicates require a domain-provided boolean or enum input and are rejected rather than evaluated.
 
 `event <dotted.intent>` declares a typed semantic intent. V1 event declarations contain no handlers and no computed payload expressions. Payload fields must be declared through the canonical event schema; Flow cannot inject pointer positions, render hit IDs, GPU handles or domain mutations.
+
+The program event boundary distinguishes activation, value preview, value commit, selection change, text commit, and cancellation. The renderer may retain hover, pointer capture, and focus locally for enabled interactive controls, but it emits only the declared semantic intent. `progress_bar` is display-only in the renderer; a preview event, when declared, remains a typed program event rather than a pointer-derived domain mutation.
+
+## Local Statecharts
+
+Flow may declare a finite presentation-only statechart. It is executed by
+`NuiFlowStateMachineRuntime` in `neon-ui-runtime`; it is not a general script
+engine and cannot mutate domain state, access I/O, call functions, or evaluate
+arbitrary expressions.
+
+```text
+machine asset_review initial loading
+state asset_review ready
+state asset_review publishing
+state asset_review error
+sync asset_review when $workspace_state=ready -> ready
+sync asset_review when $workspace_state=error -> error
+on asset_review asset.review.publish when $can_publish -> publishing emit asset.review.publish
+on asset_review asset.review.retry -> loading emit asset.review.retry
+```
+
+`machine` declares a unique local chart and its initial state. `state` adds a
+finite legal target. `sync` consumes only a direct bool or enum input predicate.
+`on` consumes only a declared dotted semantic intent. `emit` is optional and
+publishes one typed semantic intent for the owning domain service. Domain
+completion always returns through a fresh typed input snapshot; it does not
+write the statechart directly.
+
+A branch may directly select a local state with
+`branch <key> in <machine>.<state>`. This only gates a precompiled subtree;
+it cannot create nodes or bypass the semantic event gate.
+
+## Drag Interactions
+
+Flow can declare a finite presentation drag without introducing pointer scripts:
+
+```text
+drag inspector-drag source inspector axis both snap 8 threshold 3 within parent
+```
+
+The declaration names a stable drag key and source node. Axis is
+`horizontal`, `vertical`, or `both`; snap and threshold are nonnegative logical
+units. `within parent` clamps to the source parent, `within surface` clamps to
+the renderer viewport, and `within free` leaves the preview unconstrained. Flow
+lowers the declaration to a generic `UiEffect::DragBinding`; WGPU owns capture,
+dead-zone filtering, snap rounding, boundary clamping, and the immediate
+preview. It resolves matching `UiEffect::DropBinding` declarations locally on
+release. Raw pointer coordinates and local offsets do not leave WGPU; the UI
+runtime receives only the declared intent and stable source/target keys.
+
+If a layout change needs persistence, the drag-end transition emits a domain
+intent. The domain responds with an explicit enum/bool/text-handle input state;
+the UI must not infer acceptance from elapsed time or drag position.
+
+## Drop And Reparent
+
+```text
+drop progress-drop target in-progress-panel accepts backlog-card-drag placement into present progress-template emit workspace.card.reparent
+```
+
+`drop` has a stable key, a declared target node, exactly one accepted drag key,
+an optional `placement <into|before|after>` clause (default `into`), an optional
+`present <template-key>` for a bounded template directly owned by the target,
+and one dotted semantic intent. `present` is valid with `into`, `before`, and
+`after`; accepted drops require this target-owned template so the domain can
+render source data in the target's representation. `into` inserts the new
+representation as a target child; `before` and `after` insert it as the target's
+immediate sibling. The presentation key is forwarded to the domain; the
+renderer never applies the patch. Resolving a drop selects the deepest/topmost valid
+target under the pointer, excluding the active dragged subtree, and produces a
+proposal containing stable source and target keys plus placement. It cannot edit
+the active `UiIrDocument` or alter a node's running parent.
+
+Actual parent changes use the revisioned authoring path: domain validation,
+`UiIrPatch` remove/insert by stable path, a new compiled `UiProgram`, and a new
+accepted/rejected domain snapshot. This is the only supported A-to-B reparent
+workflow in V1.
 
 ## Patches
 
