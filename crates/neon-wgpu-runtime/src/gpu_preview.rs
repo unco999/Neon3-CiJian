@@ -239,8 +239,8 @@ mod tests {
         queue.submit(Some(encoder.finish()));
         let (sender, receiver) = std::sync::mpsc::channel();
         readback.slice(..).map_async(wgpu::MapMode::Read, move |result| {
-            sender.send(result).unwrap();
-        });
+                sender.send(result).unwrap();
+            });
         device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
         receiver.recv().unwrap().unwrap();
         let pixels = readback.slice(..).get_mapped_range().unwrap();

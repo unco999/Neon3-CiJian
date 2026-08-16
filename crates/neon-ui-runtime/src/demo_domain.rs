@@ -43,20 +43,25 @@ impl DemoInputDomain {
     pub fn snapshot(&self) -> DemoInputDomainSnapshot {
         let inputs = self.inputs.snapshot();
         let visible_status = inputs.values.iter().map(|(key, value)| {
-            (format!("status-{key}"), format!("{key}: {}", display_value(&value.value)))
+            let label = match key.as_str() {
+                "list_choice" => "Selected mode",
+                "drag_value" => "Current count",
+                _ => key,
+            };
+            (format!("status-{key}"), format!("{label}: {}", display_value(&value.value)))
         }).collect();
         DemoInputDomainSnapshot { inputs, visible_status }
     }
 
     pub fn apply(&mut self, event: &UiProgramSemanticEvent) -> Result<DemoInputDomainSnapshot, &'static str> {
         let declaration = self.program.event_records.iter().find(|declaration| {
-            declaration.node_key == event.source_node_key && declaration.intent == event.intent
+                declaration.node_key == event.source_node_key && declaration.intent == event.intent
         }).ok_or("semantic event is not declared by the source node")?;
         let key = declaration.bound_input_keys.iter().find(|key| {
-            self.program.binding_records.iter().any(|binding| {
+                self.program.binding_records.iter().any(|binding| {
                 binding.node_key == event.source_node_key && binding.input_key == **key
                     && matches!(binding.property, neon_ui_schema::UiBoundProperty::Active | neon_ui_schema::UiBoundProperty::Selected | neon_ui_schema::UiBoundProperty::NumericValue | neon_ui_schema::UiBoundProperty::StateToken)
-            })
+                })
         }).ok_or("semantic event has no controlled input binding")?;
         let slot = self.inputs.schema().slots.iter().find(|slot| slot.key == *key)
             .ok_or("controlled input slot is missing")?;
@@ -69,10 +74,10 @@ impl DemoInputDomain {
                 .ok_or("controlled input kind is not supported")?,
         };
         self.inputs.apply(UiInputWriter::External, UiInputFrame {
-            program_revision: self.program.revision.clone(),
-            expected_input_revision: current_inputs.input_revision,
-            request_id: event.request_id.clone(),
-            idempotency_key: event.idempotency_key.clone(),
+                    program_revision: self.program.revision.clone(),
+                    expected_input_revision: current_inputs.input_revision,
+                    request_id: event.request_id.clone(),
+                    idempotency_key: event.idempotency_key.clone(),
             changes: vec![UiInputChange { key: key.clone(), value }],
         }).map_err(|_| "controlled input frame was rejected")?;
         Ok(self.snapshot())
@@ -121,7 +126,7 @@ impl DemoInputDomain {
 
 pub fn component_gallery_program() -> Result<(neon_ui_schema::NuiFlowDocument, neon_ui_schema::UiProgram), String> {
     let document = parse_nui_flow(include_str!("../../../tests/fixtures/ui/imgui-component-gallery.nui"))
-        .map_err(|error| format!("component gallery fixture is invalid: {error:?}"))?;
+    .map_err(|error| format!("component gallery fixture is invalid: {error:?}"))?;
     let revision = UiProgramRevision {
         program_id: "component-gallery.scenario".into(),
         revision: Revision(1),
@@ -182,9 +187,9 @@ pub fn apply_visible_status_to_fragment(
         if let Some(UiInputValue::Enum { value }) = values.get(input_key).map(|value| &value.value) {
             let selected = matches!(node_id, "mode-radio" | "item-selectable") && value == "alpha";
             fragment.effects.push(presentation(node_id, UiControlPresentation::Choice {
-                token: value.clone(),
-                options: vec!["alpha".into(), "beta".into(), "gamma".into()],
-                selected,
+                    token: value.clone(),
+                    options: vec!["alpha".into(), "beta".into(), "gamma".into()],
+                    selected,
             }));
         }
     }
@@ -660,9 +665,9 @@ mod tests {
         assert_eq!(updated.revision, Revision(2));
         assert!(find_node(&updated.root, "backlog-card-01").is_none());
         assert!(find_node(
-            &updated.root,
-            "progress-template-backlog-card-01-r2-progress-template"
-        )
+                &updated.root,
+                "progress-template-backlog-card-01-r2-progress-template"
+            )
         .is_some());
     }
 
@@ -735,7 +740,7 @@ mod tests {
                     UiInputValue::I32 { value } => neon_ui_schema::UiSemanticPayloadValue::I32 { value: *value },
                     UiInputValue::F32 { value } => neon_ui_schema::UiSemanticPayloadValue::F32 { value: *value },
                     UiInputValue::Enum { value } => neon_ui_schema::UiSemanticPayloadValue::Enum { value: value.clone() },
-                    _ => unreachable!(),
+                            _ => unreachable!(),
                 })
             }).collect();
             let event = UiProgramSemanticEvent {
@@ -764,7 +769,7 @@ mod tests {
             revision: Revision(2), root: document.ir.root.clone(), effects: Vec::new(),
         };
         apply_visible_status_to_fragment(&mut fragment, &snapshot);
-        assert_eq!(first_literal(find_node(&fragment.root, "status-list_choice").unwrap()).as_deref(), Some("list_choice: gamma"));
+        assert_eq!(first_literal(find_node(&fragment.root, "status-list_choice").unwrap()).as_deref(), Some("Selected mode: gamma"));
         assert!(fragment.effects.iter().any(|effect| matches!(
             effect,
             UiEffect::ControlPresentation {

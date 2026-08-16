@@ -13,7 +13,7 @@ use neon_ui_schema::{
     UiIrPatchOperationKind, UiJustifyContent, UiLayout, UiLayoutMode, UiNode, UiNodeId, UiNodeKind,
     RenderSurfaceRef, UiProgramEventDeclaration, UiResourceBudget, UiSourceSpan, UiStyle,
     UiSurfaceId, UiProgram, UiProgramRevision, UiBranchDeclaration, UiBranchPredicate,
-    UiBranchLayoutParticipation, UiTemplateDeclaration,
+    UiBranchLayoutParticipation, UiTemplateDeclaration, UiDataGridDeclaration,
     NuiFlowStateMachine, NuiFlowStateTransition, NuiFlowStateTrigger,
     NuiFlowDragAxis, NuiFlowDragDeclaration, UiDragAxis, UiDragBinding, UiDragBoundary, UiDropBinding, UiEffect, UiIntent,
     NuiFlowDropDeclaration, UiClipPolicy, UiDropPlacement,
@@ -38,6 +38,7 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
     let mut seen_inputs = HashSet::new();
     let mut branches = Vec::new();
     let mut templates = Vec::new();
+    let mut data_grids = Vec::new();
     let mut state_machines = Vec::new();
     let mut drags = Vec::new();
     let mut drops = Vec::new();
@@ -166,6 +167,9 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
         if let Some(template) = &node.template {
             templates.push(UiTemplateDeclaration { template_key: node.node.node_id.0.clone(), root_node_key: node.node.node_id.0.clone(), max_instances: template.0, row_schema: template.1.clone(), instance_key_field: template.2.clone(), overflow_summary: template.3 });
         }
+        if let Some(max_window_rows) = node.data_grid_capacity {
+            data_grids.push(UiDataGridDeclaration { node_key: node.node.node_id.0.clone(), max_window_rows });
+        }
         stack.push((indent, node));
     }
     while let Some((_, node)) = stack.pop() {
@@ -207,12 +211,12 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
             .get(&binding.node_key)
             .expect("Flow node keys populate the source map");
         let slot = schema.slots.iter().find(|slot| slot.key == binding.input_key).ok_or_else(|| {
-            error_at(
-                "ui_program_unknown_binding_target",
-                "binding references an input that is not declared by this Flow document",
-                binding_span,
-            )
-        })?;
+                error_at(
+                    "ui_program_unknown_binding_target",
+                    "binding references an input that is not declared by this Flow document",
+                    binding_span,
+                )
+            })?;
         if !binding_accepts(&binding.property, &slot.kind) {
             return Err(error_at(
                 "ui_program_input_type_mismatch",
@@ -271,6 +275,7 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
         resources: Vec::new(),
         branches,
         templates,
+        data_grids,
         resource_budget: header.budget,
     };
     ir.validate().map_err(|_| {
@@ -301,7 +306,7 @@ pub fn lower_nui_flow(document: &NuiFlowDocument) -> UiIrDocument {
 /// fragment effect contract. Pointer capture and preview remain WGPU-local.
 pub fn lower_nui_flow_effects(document: &NuiFlowDocument) -> Vec<UiEffect> {
     let mut effects = document.ir.events.iter().map(|event| UiEffect::BoundSemanticIntent {
-        node_id: UiNodeId(event.node_key.clone()),
+            node_id: UiNodeId(event.node_key.clone()),
         intent: UiIntent::Invoke { action: event.intent.clone(), params: json!({}) },
     }).collect::<Vec<_>>();
     effects.extend(document.drags.iter().map(|drag| UiEffect::DragBinding {
@@ -367,7 +372,7 @@ pub fn format_nui_flow(source: &str) -> FlowResult<String> {
         &parsed.ir.root,
         0,
         &parsed.ir.bindings,
-        &parsed.ir.events,
+        &parsed.ir.events, &parsed.ir.data_grids,
         &mut lines,
     );
     Ok(lines.join("\n") + "\n")
@@ -587,6 +592,7 @@ struct NodeBuild {
     intents: Vec<String>,
     branch_predicate: Option<UiBranchPredicate>,
     template: Option<(u32, BTreeMap<String, UiInputKind>, String, bool)>,
+    data_grid_capacity: Option<u32>,
 }
 
 fn parse_header(text: &str, header: &mut Header, line: u32) -> FlowResult<bool> {
@@ -896,6 +902,10 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
         "surface" | "panel" | "scroll" | "overlay" | "branch" | "repeat" | "template" => {
             UiNodeKind::Panel
         }
+        "data_grid" => UiNodeKind::DataGrid,
+        "tooltip" => UiNodeKind::Tooltip,
+        "modal" => UiNodeKind::Modal,
+        "dialog" => UiNodeKind::Dialog,
         "text" => UiNodeKind::Label,
         "button" => UiNodeKind::Button,
         "input" => UiNodeKind::TextInput,
@@ -961,6 +971,7 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
     let mut intents = Vec::new();
     let mut branch_predicate = None;
     let mut template = None;
+    let mut data_grid_capacity = None;
     let mut used = HashSet::new();
     let mut index = 2;
     while index < parts.len() {
@@ -1008,6 +1019,14 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
                 if capacity == 0 { return Err(error("ui_program_invalid_branch_template", "template capacity must be positive", line, 1)); }
                 template = Some((capacity, BTreeMap::from([("row_key".into(), UiInputKind::U32)]), "row_key".into(), false));
             }
+            "capacity" if parts[0] == "data_grid" => {
+                let value = *parts.get(index + 1).ok_or_else(|| error("nui_flow_missing_value", "capacity requires a positive bound", line, 1))?;
+                index += 1;
+                let capacity = u32::try_from(parse_u64(value, line, "capacity")?)
+                    .map_err(|_| error("nui_flow_invalid_data_grid", "DataGrid capacity exceeds u32", line, 1))?;
+                if capacity == 0 { return Err(error("nui_flow_invalid_data_grid", "DataGrid capacity must be positive", line, 1)); }
+                data_grid_capacity = Some(capacity);
+            }
             "key" if matches!(parts[0], "repeat" | "template") => {
                 let value = *parts.get(index + 1).ok_or_else(|| error("nui_flow_missing_value", "key requires a row key field", line, 1))?;
                 index += 1;
@@ -1037,7 +1056,8 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
         let Some(spec) = &template else { return Err(error("ui_program_invalid_branch_template", "repeat/template requires a finite capacity", line, 1)); };
         if spec.2.trim().is_empty() { return Err(error("ui_program_invalid_branch_template", "repeat/template requires a stable key field", line, 1)); }
     }
-    Ok(NodeBuild { node, bindings, intents, branch_predicate, template })
+    if parts[0] == "data_grid" && data_grid_capacity.is_none() { return Err(error("nui_flow_invalid_data_grid", "DataGrid requires a finite capacity", line, 1)); }
+    Ok(NodeBuild { node, bindings, intents, branch_predicate, template, data_grid_capacity })
 }
 
 fn parse_branch_predicate(value: &str, line: u32) -> FlowResult<UiBranchPredicate> {
@@ -1048,7 +1068,7 @@ fn parse_branch_predicate(value: &str, line: u32) -> FlowResult<UiBranchPredicat
     if let Some((input_key, variant)) = value.split_once('=') {
         if input_key.is_empty() || variant.is_empty() { return Err(error("ui_program_invalid_branch_template", "enum branch predicate requires input and variant", line, 1)); }
         return Ok(UiBranchPredicate::EnumEquals { input_key: input_key.into(), variant: variant.into() });
-    }
+        }
     Ok(UiBranchPredicate::Bool { input_key: value.into(), expected: true })
 }
 
@@ -1121,10 +1141,10 @@ fn parse_attribute(
         }
         "align" => layout.align_items = alignment(value, line)?,
         "clip" => layout.clip = match value {
-            "none" => UiClipPolicy::None,
-            "bounds" => UiClipPolicy::Bounds,
-            "rounded" => UiClipPolicy::Rounded,
-            "scroll" => UiClipPolicy::Scroll,
+                "none" => UiClipPolicy::None,
+                "bounds" => UiClipPolicy::Bounds,
+                "rounded" => UiClipPolicy::Rounded,
+                "scroll" => UiClipPolicy::Scroll,
             _ => return Err(error("nui_flow_invalid_layout", "clip must be none, bounds, rounded, or scroll", line, 1)),
         },
         "justify" => layout.justify_content = justify(value, line)?,
@@ -1454,6 +1474,7 @@ fn format_node(
     indent: usize,
     bindings: &[UiIrBinding],
     events: &[UiProgramEventDeclaration],
+    data_grids: &[UiDataGridDeclaration],
     lines: &mut Vec<String>,
 ) {
     let kind = match &node.kind {
@@ -1467,14 +1488,23 @@ fn format_node(
         UiNodeKind::DragValue => "drag_value",
         UiNodeKind::Combo => "combo",
         UiNodeKind::Dropdown => "dropdown",
+        UiNodeKind::Tooltip => "tooltip",
+        UiNodeKind::Modal => "modal",
+        UiNodeKind::Dialog => "dialog",
         UiNodeKind::Selectable => "selectable",
         UiNodeKind::ListBox => "list_box",
         UiNodeKind::Scrollbar => "scrollbar",
         UiNodeKind::ProgressBar => "progress_bar",
+        UiNodeKind::DataGrid => "data_grid",
         UiNodeKind::Image => "image",
         UiNodeKind::RenderSurface => "render",
     };
     let mut line = format!("{}{} {}", " ".repeat(indent), kind, node.node_id.0);
+    if node.kind == UiNodeKind::DataGrid {
+        if let Some(grid) = data_grids.iter().find(|grid| grid.node_key == node.node_id.0) {
+            line.push_str(&format!(" capacity {}", grid.max_window_rows));
+        }
+    }
     if let Some(layout) = node.layout {
         match layout.mode {
             UiLayoutMode::Row => line.push_str(" row"),
@@ -1522,7 +1552,7 @@ fn format_node(
     }
     lines.push(line);
     for child in &node.children {
-        format_node(child, indent + 2, bindings, events, lines);
+        format_node(child, indent + 2, bindings, events, data_grids, lines);
     }
 }
 
@@ -1638,6 +1668,9 @@ fn insert_node(
     }
     let kind = match kind {
         "panel" | "surface" | "scroll" | "overlay" => UiNodeKind::Panel,
+        "tooltip" => UiNodeKind::Tooltip,
+        "modal" => UiNodeKind::Modal,
+        "dialog" => UiNodeKind::Dialog,
         "text" => UiNodeKind::Label,
         "button" => UiNodeKind::Button,
         "input" => UiNodeKind::TextInput,
@@ -1840,6 +1873,29 @@ panel workspace row gap 8
         assert_eq!(format_nui_flow(&formatted).unwrap(), formatted);
         let error = parse_nui_flow("text title value terrain name").unwrap_err();
         assert_eq!(error.diagnostics[0].code, "nui_flow_unquoted_text");
+    }
+
+    #[test]
+    fn tooltip_and_modal_components_round_trip_as_declarative_node_kinds() {
+        let source = "surface root\n  tooltip hint value \"More detail\"\n  modal confirm\n    dialog prompt\n      text body value \"Continue?\"\n";
+        let document = parse_nui_flow(source).unwrap();
+        assert_eq!(document.ir.root.children[0].kind, UiNodeKind::Tooltip);
+        assert_eq!(document.ir.root.children[1].kind, UiNodeKind::Modal);
+        assert_eq!(document.ir.root.children[1].children[0].kind, UiNodeKind::Dialog);
+        assert!(format_nui_flow(source).unwrap().contains("tooltip hint"));
+    }
+
+    #[test]
+    fn data_grid_declaration_lowers_with_a_finite_window_capacity() {
+        let source = "surface root\n  data_grid assets capacity 64 h 400\n";
+        let document = parse_nui_flow(source).unwrap();
+        assert_eq!(document.ir.root.children[0].kind, UiNodeKind::DataGrid);
+        assert_eq!(document.ir.data_grids[0].node_key, "assets");
+        assert_eq!(document.ir.data_grids[0].max_window_rows, 64);
+        assert!(format_nui_flow(source).unwrap().contains("data_grid assets capacity 64"));
+
+        let error = parse_nui_flow("surface root\n  data_grid assets\n").unwrap_err();
+        assert_eq!(error.diagnostics[0].code, "nui_flow_invalid_data_grid");
     }
 
     #[test]

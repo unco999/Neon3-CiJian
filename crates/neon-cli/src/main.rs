@@ -13,8 +13,8 @@ fn main() -> ExitCode {
     let scenario = match args.as_slice() {
         [command, scenario, mode] if command == "scenario" && mode == "--headless" && matches!(scenario.as_str(), "ui.static-fragment.submit.v1" | "ui.detail-toggle.v1") => scenario.as_str(),
         _ => {
-        eprintln!("unsupported command");
-        return ExitCode::from(2);
+            eprintln!("unsupported command");
+            return ExitCode::from(2);
         }
     };
 

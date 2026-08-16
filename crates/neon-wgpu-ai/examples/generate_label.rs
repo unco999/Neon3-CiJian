@@ -83,12 +83,12 @@ fn main() {
     println!("adapter: {} ({:?}, {:?})", info.name, info.backend, info.device_type);
     let (device, queue) = pollster::block_on(adapter.request_device(
         &wgpu::DeviceDescriptor {
-            label: Some("neon-wgpu-ai generate_label"),
-            required_features: wgpu::Features::empty(),
-            required_limits: wgpu::Limits::default(),
-            experimental_features: wgpu::ExperimentalFeatures::default(),
-            memory_hints: wgpu::MemoryHints::default(),
-            trace: wgpu::Trace::Off,
+        label: Some("neon-wgpu-ai generate_label"),
+        required_features: wgpu::Features::empty(),
+        required_limits: wgpu::Limits::default(),
+        experimental_features: wgpu::ExperimentalFeatures::default(),
+        memory_hints: wgpu::MemoryHints::default(),
+        trace: wgpu::Trace::Off,
         },
     ))
     .expect("device request failed");

@@ -15,8 +15,8 @@ fn main() {
             neon_ipc::RpcServer::bind(endpoint).expect("headless server must bind loopback");
         let mut runtime = neon_wgpu_runtime::WgpuRuntime::headless(1);
         server.serve_until(|request| {
-            let shutdown = request.method == "service.shutdown";
-            (runtime.handle(request), !shutdown)
+                let shutdown = request.method == "service.shutdown";
+                (runtime.handle(request), !shutdown)
         }).expect("headless server request must complete");
         return;
     }

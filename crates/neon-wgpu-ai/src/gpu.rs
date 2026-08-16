@@ -166,17 +166,17 @@ impl GpuCtx {
                     .collect();
                 let layout = self
                     .device
-                    .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                        label: None,
-                        entries: &entries,
-                    });
+                        .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                            label: None,
+                            entries: &entries,
+                        });
                 let pipeline_layout = self
                     .device
-                    .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                        label: None,
-                        bind_group_layouts: &[Some(&layout)],
-                        immediate_size: 0,
-                    });
+                        .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                            label: None,
+                            bind_group_layouts: &[Some(&layout)],
+                            immediate_size: 0,
+                        });
                 let module = self
                     .device
                     .create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -185,14 +185,14 @@ impl GpuCtx {
                     });
                 let pipeline = self
                     .device
-                    .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                        label: Some($key),
-                        layout: Some(&pipeline_layout),
-                        module: &module,
-                        entry_point: Some($entry),
-                        compilation_options: Default::default(),
-                        cache: None,
-                    });
+                        .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                            label: Some($key),
+                            layout: Some(&pipeline_layout),
+                            module: &module,
+                            entry_point: Some($entry),
+                            compilation_options: Default::default(),
+                            cache: None,
+                        });
                 self.pipelines.insert(
                     $key,
                     Pipeline {

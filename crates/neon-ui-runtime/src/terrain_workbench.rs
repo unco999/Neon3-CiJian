@@ -46,7 +46,7 @@ pub fn terrain_workbench_document() -> neon_ui_schema::NuiFlowDocument {
 
 pub fn terrain_workbench_program() -> neon_ui_schema::UiProgram {
     compile_nui_flow_program(&terrain_workbench_document(), terrain_workbench_program_revision())
-        .expect("checked-in terrain workbench Flow must compile")
+    .expect("checked-in terrain workbench Flow must compile")
 }
 
 pub fn terrain_workbench_viewport(width: f32, height: f32, revision: u64) -> UiCpuViewport {
@@ -68,7 +68,7 @@ pub fn terrain_workbench_material_rows(revision: u64, count: u32) -> UiRepeatFra
         template_key: "material-rows".into(), list_revision: Revision(revision),
         expected_program_revision: terrain_workbench_program_revision(),
         rows: (0..count).map(|index| UiRepeatRow {
-            stable_row_key: format!("material-{}", index + 1),
+                stable_row_key: format!("material-{}", index + 1),
             values: BTreeMap::from([("row_key".into(), UiInputValue::U32 { value: index + 1 })]),
             semantic_payload: BTreeMap::from([("material_ref".into(), format!("material:{}", index + 1))]),
         }).collect(),

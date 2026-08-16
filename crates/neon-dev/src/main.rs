@@ -261,8 +261,8 @@ fn run_component_gallery_scenario_inner() -> io::Result<serde_json::Value> {
         };
         let payload = declaration.bound_input_keys.iter().map(|key| {
             domain_inputs.values.get(key)
-                .ok_or_else(|| io::Error::other(format!("missing input {key}")))
-                .map(|value| (key.clone(), input_payload(value)))
+                    .ok_or_else(|| io::Error::other(format!("missing input {key}")))
+                    .map(|value| (key.clone(), input_payload(value)))
         }).collect::<io::Result<std::collections::BTreeMap<_, _>>>()?;
         let kind = if matches!(node_key, "feature-toggle" | "mode-radio" | "mode-combo" | "mode-dropdown" | "item-selectable" | "item-list") { UiProgramSemanticEventKind::SelectionChanged }
             else { UiProgramSemanticEventKind::ValueCommit };

@@ -1149,10 +1149,16 @@ impl UiWgpuRenderer {
     /// GPU hit pass for hover/readback diagnostics.
     pub(crate) fn hit_id_at_pointer(&self) -> Option<u32> {
         let pointer = self.pointer_position?;
+        let modal = self.active_modal_index();
         self.plan.iter().rev().find_map(|node| {
             if !node.target.enabled
                 || !contains(node.target.bounds, pointer)
                 || !contains(node.target.clip, pointer)
+            {
+                return None;
+            }
+            if let Some(modal) = modal
+                && !self.node_is_in_subtree(node.id.as_str(), modal)
             {
                 return None;
             }
@@ -1186,8 +1192,12 @@ impl UiWgpuRenderer {
                 width: (node.target.bounds.width - 20.0).max(1.0),
                 height: node.target.bounds.height,
             },
+            UiNodeKind::DragValue => drag_value_bounds(node.target.bounds),
             _ => node.target.bounds,
         };
+        if !self.pointer_position.is_some_and(|pointer| contains(bounds, pointer)) {
+            return false;
+        }
         self.value_gesture = Some(UiValueGesture {
             node_path: binding.node_path.clone(),
             kind: node.target.kind.clone(),
@@ -1196,6 +1206,12 @@ impl UiWgpuRenderer {
             max,
         });
         self.update_value_gesture()
+    }
+
+    pub(crate) fn requires_value_gesture(&self, binding: &UiHitBinding) -> bool {
+        self.plan.iter().find(|node| node.id == binding.node_path).is_some_and(|node| {
+            matches!(node.target.kind, UiNodeKind::Slider | UiNodeKind::DragValue | UiNodeKind::Scrollbar)
+        })
     }
 
     pub(crate) fn update_value_gesture(&mut self) -> bool {
@@ -1229,6 +1245,9 @@ impl UiWgpuRenderer {
     }
 
     pub(crate) fn toggle_dropdown_at_pointer(&mut self) -> bool {
+        if self.modal_active() {
+            return false;
+        }
         let Some(pointer) = self.pointer_position else { return false; };
         let Some(node) = self.plan.iter().find(|node| {
             node.target.kind == UiNodeKind::Dropdown && contains(node.target.bounds, pointer)
@@ -1243,6 +1262,9 @@ impl UiWgpuRenderer {
     }
 
     pub(crate) fn dropdown_option_at_pointer(&self) -> Option<(UiHitBinding, UiSemanticPayloadValue)> {
+        if self.modal_active() {
+            return None;
+        }
         let node_path = self.open_dropdown.as_ref()?;
         let pointer = self.pointer_position?;
         let (plan_index, rows) = self.dropdown_popup_layout()?;
@@ -1255,12 +1277,17 @@ impl UiWgpuRenderer {
     }
 
     pub(crate) fn list_option_at_pointer(&self) -> Option<(UiHitBinding, UiSemanticPayloadValue)> {
+        if self.modal_active() {
+            return None;
+        }
         let pointer = self.pointer_position?;
         let node = self.plan.iter().find(|node| {
             node.target.kind == UiNodeKind::ListBox && contains(node.target.bounds, pointer)
         })?;
         let UiControlPresentation::Choice { options, .. } = node.target.presentation.as_ref()? else { return None; };
-        let index = ((pointer[1] - node.target.bounds.y - 6.0) / 22.0).floor() as usize;
+        let index = list_box_rows(node.target.bounds, options.len())
+            .iter()
+            .position(|row| contains(*row, pointer))?;
         let value = options.get(index)?.clone();
         let binding = self.hit_bindings.values().find(|binding| binding.node_path == node.id)?.clone();
         Some((binding, UiSemanticPayloadValue::Enum { value }))
@@ -1296,23 +1323,74 @@ impl UiWgpuRenderer {
         true
     }
 
+    /// Modal dismissal is intentionally renderer-local: it only consumes an
+    /// outside press and clears local text focus. Closing remains declarative.
+    pub(crate) fn dismiss_modal_at_pointer(&mut self) -> bool {
+        let Some(pointer) = self.pointer_position else { return false; };
+        let Some(index) = self.active_modal_index() else { return false; };
+        if contains(self.plan[index].target.bounds, pointer) {
+            return false;
+        }
+        self.clear_text_focus();
+        self.pointer_visual_dirty = true;
+        true
+    }
+
+    fn active_modal_index(&self) -> Option<usize> {
+        self.plan.iter().rposition(|node| matches!(node.target.kind, UiNodeKind::Modal | UiNodeKind::Dialog))
+    }
+
+    fn modal_active(&self) -> bool {
+        self.active_modal_index().is_some()
+    }
+
+    fn modal_blocks_pointer(&self) -> bool {
+        let Some(pointer) = self.pointer_position else { return false; };
+        self.active_modal_index().is_some_and(|index| !contains(self.plan[index].target.bounds, pointer))
+    }
+
+    fn active_modal_allows_node(&self, node_id: &str) -> bool {
+        self.active_modal_index()
+            .is_none_or(|modal| self.node_is_in_subtree(node_id, modal))
+    }
+
+    fn node_is_in_subtree(&self, node_id: &str, root: usize) -> bool {
+        let mut current = self.plan.iter().position(|node| node.id == node_id);
+        while let Some(index) = current {
+            if index == root {
+                return true;
+            }
+            current = self.plan[index]
+                .parent_id
+                .as_deref()
+                .and_then(|parent| self.plan.iter().position(|node| node.id == parent));
+        }
+        false
+    }
+
     /// Text inputs must focus on the first pointer press, before asynchronous GPU hit readback.
     pub(crate) fn text_input_at_pointer(&self) -> Option<UiTextInputBinding> {
+        if self.modal_blocks_pointer() {
+            return None;
+        }
         let pointer = self.pointer_position?;
         self.hit_bindings
             .values()
             .filter_map(|binding| binding.text_input.as_ref())
-            .find(|input| contains(input.bounds, pointer))
+            .find(|input| self.active_modal_allows_node(&input.node_path) && contains(input.bounds, pointer))
             .cloned()
     }
 
     /// Focus is renderer-local presentation state. Semantic events still carry
     /// only their declared intent and never this path or a hit identifier.
     pub(crate) fn focus_control_at_pointer(&mut self) -> bool {
+        if self.modal_blocks_pointer() {
+            return false;
+        }
         let Some(pointer) = self.pointer_position else { return false; };
         let Some(path) = self.hit_bindings.values().find_map(|binding| {
             self.plan.iter().find(|node| node.id == binding.node_path)
-                .filter(|node| node.target.enabled && contains(node.target.bounds, pointer))
+                .filter(|node| self.active_modal_allows_node(&node.id) && node.target.enabled && contains(node.target.bounds, pointer))
                 .map(|_| binding.node_path.clone())
         }) else { return false; };
         self.focused_control = Some(path);
@@ -1994,6 +2072,7 @@ impl UiWgpuRenderer {
             .enumerate()
             .map(|(index, node)| (node.id.as_str(), index))
             .collect::<HashMap<_, _>>();
+        let top_layer = top_layer_roots(&self.plan, &plan_index);
         let mut subtree_translation = vec![[0.0_f32; 2]; self.plan.len()];
         let mut subtree_opacity = vec![1.0_f32; self.plan.len()];
         for index in 0..self.plan.len() {
@@ -2023,6 +2102,17 @@ impl UiWgpuRenderer {
                 self.sampled[index].clip.y += own_translation[1];
             }
             self.sampled[index].style.opacity *= inherited_opacity;
+            if top_layer[index].is_some() {
+                // Like dropdown popups and captured drags, declared overlays escape
+                // document clipping while remaining in logical window coordinates.
+                self.sampled[index].clip = UiBounds {
+                    x: 0.0,
+                    y: 0.0,
+                    width: viewport_size[0] as f32,
+                    height: viewport_size[1] as f32,
+                };
+                self.sampled[index].clip_radius = 0.0;
+            }
             if let Some(offset) = self.drag_offset_for_node(index, &plan_index) {
                 self.sampled[index].bounds.x += offset[0];
                 self.sampled[index].bounds.y += offset[1];
@@ -2048,6 +2138,7 @@ impl UiWgpuRenderer {
         for dragged_layer in [false, true] {
             for index in 0..self.plan.len() {
                 if self.plan[index].instance_index.is_none()
+                    || top_layer[index].is_some()
                     || self.drag_offset_for_node(index, &plan_index).is_some() != dragged_layer
                 {
                     continue;
@@ -2061,7 +2152,23 @@ impl UiWgpuRenderer {
                 self.dirty_instances.extend(first_instance..self.instances.len());
             }
         }
-        let popup_instances = self.dropdown_popup_instances();
+        // Reuse the dropdown popup resource path for declarative top-level layers.
+        // Modal backdrops are inserted immediately before their own subtree.
+        let mut popup_instances = self.dropdown_popup_instances();
+        for index in 0..self.plan.len() {
+            let Some(root) = top_layer[index] else { continue; };
+            if root == index && matches!(self.plan[index].target.kind, UiNodeKind::Modal | UiNodeKind::Dialog) {
+                popup_instances.push(overlay_instance(
+                    UiBounds { x: 0.0, y: 0.0, width: viewport_size[0] as f32, height: viewport_size[1] as f32 },
+                    UiBounds { x: 0.0, y: 0.0, width: viewport_size[0] as f32, height: viewport_size[1] as f32 },
+                    [0.0, 0.0, 0.0, 0.45],
+                ));
+            }
+            if self.plan[index].instance_index.is_some() {
+                popup_instances.push(self.instance(&self.sampled[index], &self.plan[index].id, time_seconds));
+                popup_instances.extend(self.component_chrome_instances(&self.sampled[index], &self.plan[index].id));
+            }
+        }
         self.pointer_visual_dirty = false;
         self.append_text_input_overlays();
         self.last_panel_instance_count = self.instances.len();
@@ -2183,6 +2290,8 @@ impl UiWgpuRenderer {
             }
         }
         let dropdown_texts = self.dropdown_option_texts();
+        let list_box_texts = self.list_box_option_texts();
+        let drag_value_texts = self.drag_value_texts();
         let (texts, popup_texts) = self
             .resident_font
             .as_mut()
@@ -2191,6 +2300,9 @@ impl UiWgpuRenderer {
                     .iter()
                     .enumerate()
                     .filter_map(|(index, visual)| {
+                        if top_layer[index].is_some() {
+                            return None;
+                        }
                         let local_text = Some(&self.editing)
                             .filter(|editing| {
                                 editing.node_path.as_deref() == Some(self.plan[index].id.as_str())
@@ -2204,7 +2316,7 @@ impl UiWgpuRenderer {
                             UiNodeKind::Label | UiNodeKind::Button | UiNodeKind::TextInput
                                 | UiNodeKind::Checkbox | UiNodeKind::RadioButton | UiNodeKind::Slider
                                 | UiNodeKind::DragValue | UiNodeKind::Combo | UiNodeKind::Dropdown
-                                | UiNodeKind::Selectable | UiNodeKind::ListBox | UiNodeKind::Scrollbar
+                                | UiNodeKind::Selectable | UiNodeKind::Scrollbar
                                 | UiNodeKind::ProgressBar
                         ) || text.is_none()
                         {
@@ -2224,9 +2336,36 @@ impl UiWgpuRenderer {
                     })
                     .flatten()
                     .collect::<Vec<_>>();
-                let popup_texts = dropdown_texts.iter().flat_map(|(visual, text)| {
-                    layout_text(device, queue, font, visual, text, None).unwrap_or_default()
+                let mut texts = texts;
+                for (visual, text) in &list_box_texts {
+                    if let Some(instances) = layout_text(device, queue, font, visual, text, None) {
+                        texts.extend(instances);
+                    }
+                }
+                for (visual, text) in &drag_value_texts {
+                    if let Some(instances) = layout_text(device, queue, font, visual, text, None) {
+                        texts.extend(instances);
+                    }
+                }
+                let mut popup_texts = dropdown_texts.iter().flat_map(|(visual, text)| {
+                        layout_text(device, queue, font, visual, text, None).unwrap_or_default()
                 }).collect::<Vec<_>>();
+                for (index, visual) in self.sampled.iter().enumerate() {
+                    if top_layer[index].is_none() {
+                        continue;
+                    }
+                    if let Some(text) = visual.text.as_ref().and_then(text_ref_value)
+                        && matches!(visual.kind,
+                            UiNodeKind::Label | UiNodeKind::Button | UiNodeKind::TextInput
+                            | UiNodeKind::Checkbox | UiNodeKind::RadioButton | UiNodeKind::Slider
+                            | UiNodeKind::DragValue | UiNodeKind::Combo | UiNodeKind::Dropdown
+                            | UiNodeKind::Selectable | UiNodeKind::Scrollbar | UiNodeKind::ProgressBar
+                        )
+                        && let Some(instances) = layout_text(device, queue, font, visual, text, None)
+                    {
+                        popup_texts.extend(instances);
+                    }
+                }
                 (texts, popup_texts)
             })
             .unwrap_or_default();
@@ -2384,11 +2523,32 @@ impl UiWgpuRenderer {
     }
 
     fn instance(&self, visual: &UiVisual, node_path: &str, time_seconds: f32) -> UiInstance {
-        let style = if visual.style == UiStyle::default() {
+        let mut style = if visual.style == UiStyle::default() {
             default_component_style(&visual.kind)
         } else {
             visual.style
         };
+        if matches!(visual.kind, UiNodeKind::Checkbox | UiNodeKind::RadioButton)
+            && let Some(UiControlPresentation::Toggle { selected }) = &visual.presentation
+        {
+            style = if *selected {
+                UiStyle {
+                    background_color: [0.10, 0.25, 0.20, 1.0],
+                    border_color: [0.34, 0.80, 0.64, 0.95],
+                    border_width: 1.0,
+                    corner_radius: 5.0,
+                    opacity: style.opacity,
+                }
+            } else {
+                UiStyle {
+                    background_color: [0.17, 0.18, 0.20, 1.0],
+                    border_color: [0.39, 0.41, 0.45, 0.96],
+                    border_width: 1.0,
+                    corner_radius: 5.0,
+                    opacity: style.opacity,
+                }
+            };
+        }
         let mut fill = style.background_color;
         let bounds = visual.bounds;
         if is_interactive_control(&visual.kind)
@@ -2464,10 +2624,10 @@ impl UiWgpuRenderer {
             (node.target.bounds.y - margin - popup_height).max(margin)
         };
         Some((plan_index, (0..options.len()).map(|index| UiBounds {
-            x: node.target.bounds.x,
-            y: y + index as f32 * row_height,
-            width: node.target.bounds.width,
-            height: row_height,
+                    x: node.target.bounds.x,
+                    y: y + index as f32 * row_height,
+                    width: node.target.bounds.width,
+                    height: row_height,
         }).collect()))
     }
 
@@ -2501,14 +2661,76 @@ impl UiWgpuRenderer {
         let Some((plan_index, rows)) = self.dropdown_popup_layout() else { return Vec::new(); };
         let Some(UiControlPresentation::Choice { options, .. }) = self.sampled[plan_index].presentation.as_ref() else { return Vec::new(); };
         options.iter().zip(rows).map(|(option, row)| {
+                let mut visual = self.sampled[plan_index].clone();
+                visual.kind = UiNodeKind::Label;
+                visual.text = None;
+                visual.bounds = row;
+            visual.clip = UiBounds { x: 0.0, y: 0.0, width: self.viewport_size[0].max(1) as f32, height: self.viewport_size[1].max(1) as f32 };
+                visual.clip_radius = 0.0;
+                (visual, option.clone())
+        }).collect()
+    }
+
+    fn list_box_option_texts(&self) -> Vec<(UiVisual, String)> {
+        self.plan.iter().enumerate().flat_map(|(plan_index, node)| {
+            if node.target.kind != UiNodeKind::ListBox {
+                return Vec::new();
+            }
+            let Some(UiControlPresentation::Choice { options, .. }) = self.sampled[plan_index].presentation.as_ref() else {
+                return Vec::new();
+            };
+            list_box_rows(self.sampled[plan_index].bounds, options.len()).into_iter().zip(options).map(|(row, option)| {
+                let mut visual = self.sampled[plan_index].clone();
+                visual.kind = UiNodeKind::Label;
+                visual.text = None;
+                visual.bounds = row;
+                (visual, option.clone())
+            }).collect::<Vec<_>>()
+        }).collect()
+    }
+
+    fn drag_value_texts(&self) -> Vec<(UiVisual, String)> {
+        self.plan.iter().enumerate().filter_map(|(plan_index, node)| {
+            if node.target.kind != UiNodeKind::DragValue {
+                return None;
+            }
+            let Some(UiControlPresentation::Numeric { value, min: _, max }) = self.sampled[plan_index].presentation.as_ref() else {
+                return None;
+            };
+            let value = match self.value_previews.get(&node.id) {
+                Some(UiSemanticPayloadValue::I32 { value }) => *value as f32,
+                _ => *value,
+            };
             let mut visual = self.sampled[plan_index].clone();
             visual.kind = UiNodeKind::Label;
             visual.text = None;
-            visual.bounds = row;
-            visual.clip = UiBounds { x: 0.0, y: 0.0, width: self.viewport_size[0].max(1) as f32, height: self.viewport_size[1].max(1) as f32 };
-            visual.clip_radius = 0.0;
-            (visual, option.clone())
+            visual.bounds = drag_value_bounds(visual.bounds);
+            Some((visual, format!("{} / {}", value.round() as i32, max.round() as i32)))
         }).collect()
+    }
+}
+
+fn list_box_rows(bounds: UiBounds, option_count: usize) -> Vec<UiBounds> {
+    if option_count == 0 {
+        return Vec::new();
+    }
+    let inset = 6.0;
+    let row_height = ((bounds.height - inset * 2.0) / option_count as f32).max(18.0);
+    (0..option_count).map(|index| UiBounds {
+        x: bounds.x + inset,
+        y: bounds.y + inset + index as f32 * row_height,
+        width: (bounds.width - inset * 2.0).max(0.0),
+        height: row_height,
+    }).collect()
+}
+
+fn drag_value_bounds(bounds: UiBounds) -> UiBounds {
+    let width = (bounds.width * 0.42).clamp(112.0, 180.0);
+    UiBounds {
+        x: bounds.x + bounds.width - width - 8.0,
+        y: bounds.y + 5.0,
+        width,
+        height: (bounds.height - 10.0).max(0.0),
     }
 }
 
@@ -2558,6 +2780,7 @@ fn component_chrome_instances(visual: &UiVisual) -> Vec<UiInstance> {
     let center_y = bounds.y + bounds.height * 0.5;
     let mint = [0.34, 0.80, 0.64, 0.95];
     let muted = [0.18, 0.29, 0.26, 1.0];
+    let inactive = [0.34, 0.36, 0.40, 1.0];
     let clip = [
         visual.clip.x,
         visual.clip.y,
@@ -2596,14 +2819,14 @@ fn component_chrome_instances(visual: &UiVisual) -> Vec<UiInstance> {
     match visual.kind {
         UiNodeKind::Checkbox => vec![chrome(
             UiBounds { x: bounds.x + 8.0, y: center_y - 7.0, width: 14.0, height: 14.0 },
-            if selected { mint } else { muted },
-            mint,
+            if selected { mint } else { inactive },
+            if selected { mint } else { [0.53, 0.55, 0.60, 1.0] },
             3.0,
         )],
         UiNodeKind::RadioButton => vec![chrome(
             UiBounds { x: bounds.x + 8.0, y: center_y - 7.0, width: 14.0, height: 14.0 },
-            if selected { mint } else { muted },
-            mint,
+            if selected { mint } else { inactive },
+            if selected { mint } else { [0.53, 0.55, 0.60, 1.0] },
             7.0,
         )],
         UiNodeKind::Selectable => vec![chrome(
@@ -2619,26 +2842,33 @@ fn component_chrome_instances(visual: &UiVisual) -> Vec<UiInstance> {
                 chrome(UiBounds { x: track.x + track.width * normalized - 5.0, y: center_y - 6.0, width: 12.0, height: 12.0 }, mint, mint, 6.0),
             ]
         }
-        UiNodeKind::DragValue => vec![chrome(
-            UiBounds { x: bounds.x + bounds.width - 62.0, y: bounds.y + 5.0, width: 54.0, height: (bounds.height - 10.0).max(0.0) },
-            muted,
-            choice_tint,
-            4.0,
-        )],
+        UiNodeKind::DragValue => {
+            let well = drag_value_bounds(bounds);
+            let progress = UiBounds { x: well.x + 1.0, y: well.y + 1.0, width: ((well.width - 2.0) * normalized).max(0.0), height: (well.height - 2.0).max(0.0) };
+            vec![
+                chrome(well, muted, choice_tint, 4.0),
+                UiInstance {
+                    rect: [progress.x, progress.y, progress.width, progress.height],
+                    fill: [0.18, 0.52, 0.90, 0.92],
+                    border: [0.18, 0.52, 0.90, 0.92],
+                    params: [0.0, 3.0, visual.style.opacity, visual.clip_radius],
+                    clip,
+                },
+            ]
+        }
         UiNodeKind::Combo | UiNodeKind::Dropdown => vec![chrome(
             UiBounds { x: bounds.x + bounds.width - 27.0, y: center_y - 5.0, width: 16.0, height: 10.0 },
             muted,
             choice_tint,
             3.0,
         )],
-        UiNodeKind::ListBox => {
-            let width = (bounds.width - 20.0).max(0.0);
-            vec![
-                chrome(UiBounds { x: bounds.x + 10.0, y: bounds.y + 10.0 + normalized * 34.0, width, height: 14.0 }, [0.16, 0.29, 0.24, 1.0], choice_tint, 3.0),
-                chrome(UiBounds { x: bounds.x + 10.0, y: bounds.y + 32.0, width, height: 2.0 }, muted, muted, 1.0),
-                chrome(UiBounds { x: bounds.x + 10.0, y: bounds.y + 50.0, width, height: 2.0 }, muted, muted, 1.0),
-            ]
-        }
+        UiNodeKind::ListBox => match &visual.presentation {
+            Some(UiControlPresentation::Choice { token, options, .. }) => list_box_rows(bounds, options.len()).into_iter().zip(options).map(|(row, option)| {
+                let active = option == token;
+                chrome(row, if active { [0.16, 0.35, 0.28, 1.0] } else { [0.075, 0.12, 0.11, 1.0] }, if active { choice_tint } else { muted }, 3.0)
+            }).collect(),
+            _ => Vec::new(),
+        },
         UiNodeKind::Scrollbar => {
             let track = UiBounds { x: bounds.x + 10.0, y: center_y - 3.0, width: (bounds.width - 20.0).max(0.0), height: 6.0 };
             vec![
@@ -3152,6 +3382,18 @@ fn overlay_instance(bounds: UiBounds, clip: UiBounds, color: [f32; 4]) -> UiInst
     }
 }
 
+fn top_layer_roots(plan: &[PlannedNode], indices: &HashMap<&str, usize>) -> Vec<Option<usize>> {
+    let mut roots = vec![None; plan.len()];
+    for (index, node) in plan.iter().enumerate() {
+        roots[index] = if matches!(node.target.kind, UiNodeKind::Tooltip | UiNodeKind::Modal | UiNodeKind::Dialog) {
+            Some(index)
+        } else {
+            node.parent_id.as_deref().and_then(|parent| indices.get(parent).copied()).and_then(|parent| roots[parent])
+        };
+    }
+    roots
+}
+
 fn flatten_fragments(
     fragments: &HashMap<neon_ui_schema::UiFragmentId, UiFragment>,
     font: Option<&ResidentFont>,
@@ -3171,6 +3413,7 @@ fn flatten_fragments(
             None,
             font,
             None,
+            false,
         );
     }
     for (node_path, _, visual, _) in &mut result {
@@ -3181,7 +3424,7 @@ fn flatten_fragments(
         {
             visual.text = Some(TextRef::Literal {
                 value: if visual.kind == UiNodeKind::DragValue {
-                    format!("{label}: {}", value.round() as i32)
+                    label.clone()
                 } else {
                     format!("{label}: {value:.2}")
                 },
@@ -3281,6 +3524,7 @@ fn flatten_node(
     parent_id: Option<&str>,
     font: Option<&ResidentFont>,
     assigned_size: Option<[f32; 2]>,
+    inherited_top_layer: bool,
 ) {
     let node_layout = node.layout.unwrap_or_default();
     let bounds = UiBounds {
@@ -3295,17 +3539,20 @@ fn flatten_node(
             |size| size[1],
         ),
     };
-    let own_clip = match node_layout.clip {
-        UiClipPolicy::None => inherited_clip,
-        UiClipPolicy::Bounds | UiClipPolicy::Rounded | UiClipPolicy::Scroll => {
-            Some(intersect_clip(inherited_clip, bounds))
-        }
-    };
-    let own_clip_radius = match node_layout.clip {
-        UiClipPolicy::Rounded => Some(node.style.corner_radius),
-        UiClipPolicy::None => inherited_clip_radius,
-        UiClipPolicy::Bounds | UiClipPolicy::Scroll => None,
-    };
+    let top_layer = inherited_top_layer || matches!(node.kind, UiNodeKind::Tooltip | UiNodeKind::Modal | UiNodeKind::Dialog);
+    let own_clip = if top_layer {
+        None
+    } else { match node_layout.clip {
+            UiClipPolicy::None => inherited_clip,
+            UiClipPolicy::Bounds | UiClipPolicy::Rounded | UiClipPolicy::Scroll => {
+                Some(intersect_clip(inherited_clip, bounds))
+            }
+    }};
+    let own_clip_radius = if top_layer { None } else { match node_layout.clip {
+            UiClipPolicy::Rounded => Some(node.style.corner_radius),
+            UiClipPolicy::None => inherited_clip_radius,
+            UiClipPolicy::Bounds | UiClipPolicy::Scroll => None,
+    }};
     let effective_clip = own_clip.unwrap_or(UiBounds {
         x: -1_000_000.0,
         y: -1_000_000.0,
@@ -3355,6 +3602,7 @@ fn flatten_node(
             Some(&node_path),
             font,
             Some([child_bounds.width, child_bounds.height]),
+            top_layer,
         );
     }
 }
@@ -4222,6 +4470,25 @@ mod tests {
             }),
             children: Vec::new(),
         }
+    }
+
+    #[test]
+    fn declared_modal_subtree_escapes_parent_clip() {
+        let mut root = node();
+        root.layout = Some(UiLayout { clip: UiClipPolicy::Bounds, ..UiLayout::default() });
+        root.bounds = UiBounds { x: 0.0, y: 0.0, width: 20.0, height: 20.0 };
+        let mut modal = node();
+        modal.node_id = UiNodeId("modal".into());
+        modal.kind = UiNodeKind::Modal;
+        modal.bounds = UiBounds { x: 30.0, y: 30.0, width: 40.0, height: 30.0 };
+        root.children.push(modal);
+        let fragment_id = neon_ui_schema::UiFragmentId("fixture".into());
+        let flattened = flatten_fragments(&HashMap::from([(
+            fragment_id.clone(),
+            UiFragment { fragment_id, revision: Revision(1), root, effects: Vec::new() },
+        )]), None);
+        let modal = flattened.iter().find(|(id, _, _, _)| id == "fixture/modal").unwrap();
+        assert!(modal.2.clip.width > 1_000_000.0);
     }
 
     #[test]

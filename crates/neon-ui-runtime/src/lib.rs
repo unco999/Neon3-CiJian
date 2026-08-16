@@ -23,7 +23,8 @@ use neon_ui_schema::{
     UiInputValue, UiInputValueSource, UiInspectorState, UiInspectorTab, UiIrDocument, UiNode,
     UiNodeId, UiNodeKind, UiProgram, UiProgramEventDeclaration, UiProgramLayoutRecord,
     UiProgramLiteralText, UiProgramNode, UiProgramResourceKind, UiProgramRevision,
-    UiBranchPredicate, UiBranchRecord, UiTemplateRecord, UiRepeatFrame,
+    UiBranchPredicate, UiBranchRecord, UiTemplateRecord, UiRepeatFrame, UiDataGridFrame,
+    UiDataGridRecord,
     UiResolvedInputValue, UiResolvedInputs, UiResourceBudget, UiSchemaError, UiSemanticEvent,
     UiProgramSemanticEvent, UiProgramSemanticEventKind, UiProgramSemanticEventResult,
     UiProgramSemanticEventStatus, UiSemanticPayloadValue, UiEventTraceRecord,
@@ -906,6 +907,44 @@ pub struct UiRepeatStore {
     frames: BTreeMap<String, UiRepeatFrame>,
 }
 
+/// UI-owned cache of bounded, domain-prepared virtual DataGrid windows.
+/// It retains no off-window rows and never derives sorting or filtering.
+#[derive(Clone, Debug, Default)]
+pub struct UiDataGridStore {
+    frames: BTreeMap<String, UiDataGridFrame>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UiDataGridApplyResult { pub accepted_rows: u32 }
+
+impl UiDataGridStore {
+    pub fn frame(&self, data_grid_key: &str) -> Option<&UiDataGridFrame> { self.frames.get(data_grid_key) }
+
+    pub fn apply(&mut self, program: &UiProgram, frame: UiDataGridFrame) -> Result<UiDataGridApplyResult, UiProgramCompileError> {
+        if frame.expected_program_revision != program.revision {
+            return Err(compile_error(ERROR_UI_PROGRAM_STALE_INPUT_REVISION, "DataGrid frame belongs to a different program revision"));
+        }
+        let grid = program.data_grid_records.iter().find(|record| record.node_key == frame.data_grid_key)
+            .ok_or_else(|| compile_error(ERROR_UI_PROGRAM_INVALID_BRANCH_TEMPLATE, "DataGrid frame references an unknown grid"))?;
+        if let Some(previous) = self.frames.get(&frame.data_grid_key)
+            && frame.list_revision.0 <= previous.list_revision.0 {
+            return Err(compile_error(ERROR_UI_PROGRAM_STALE_INPUT_REVISION, "DataGrid frame revision is stale"));
+        }
+        let row_count = u64::try_from(frame.window_rows.len()).map_err(|_| compile_error(ERROR_UI_PROGRAM_CAPACITY_OVERFLOW, "DataGrid window row count overflows u64"))?;
+        if row_count > u64::from(grid.max_window_rows) || frame.first_row > frame.total_rows
+            || row_count > frame.total_rows - frame.first_row {
+            return Err(compile_error(ERROR_UI_PROGRAM_CAPACITY_OVERFLOW, "DataGrid window exceeds its declared bounds"));
+        }
+        let mut keys = HashSet::new();
+        if frame.window_rows.iter().any(|row| row.stable_row_key.trim().is_empty() || !keys.insert(&row.stable_row_key)) {
+            return Err(compile_error(ERROR_UI_PROGRAM_INVALID_BRANCH_TEMPLATE, "DataGrid window rows require unique nonempty stable row keys"));
+        }
+        let accepted_rows = frame.window_rows.len() as u32;
+        self.frames.insert(frame.data_grid_key.clone(), frame);
+        Ok(UiDataGridApplyResult { accepted_rows })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct UiRepeatApplyResult {
     pub accepted_rows: u32,
@@ -949,8 +988,8 @@ impl UiRepeatStore {
         accepted.rows.truncate(accepted_rows as usize);
         self.frames.insert(accepted.template_key.clone(), accepted);
         let diagnostics = if overflow_rows == 0 { Vec::new() } else { vec![cpu_diagnostic(
-            ERROR_UI_PROGRAM_CAPACITY_OVERFLOW,
-            "repeat rows exceed capacity; the declared overflow summary must be rendered",
+                ERROR_UI_PROGRAM_CAPACITY_OVERFLOW,
+                "repeat rows exceed capacity; the declared overflow summary must be rendered",
             Some(&template.template_key), None, program.revision.revision,
         )] };
         Ok(UiRepeatApplyResult { accepted_rows, overflow_rows, diagnostics })
@@ -1020,8 +1059,9 @@ pub fn compile_ui_program(
     }
     let branch_records = compile_branch_records(document, schema, &nodes)?;
     let template_records = compile_template_records(document, &nodes)?;
+    let data_grid_records = compile_data_grid_records(document, &nodes)?;
     let template_instances = template_records.iter().try_fold(0u32, |total, template| {
-        let count = template.node_range.len() as u32;
+            let count = template.node_range.len() as u32;
         total.checked_add(count.saturating_mul(template.max_instances)).ok_or(())
     }).map_err(|_| compile_error(ERROR_UI_PROGRAM_INVALID_BRANCH_TEMPLATE, "template instance count overflows the declared resource budget"))?;
     if template_instances > document.resource_budget.max_instances {
@@ -1148,11 +1188,22 @@ pub fn compile_ui_program(
         binding_records: bindings,
         branch_records,
         template_records,
+        data_grid_records,
         event_records: document.events.clone(),
         resource_budget: document.resource_budget.clone(),
         dependency_index: dependencies,
         layout_hash,
     })
+}
+
+fn compile_data_grid_records(document: &UiIrDocument, nodes: &[neon_ui_schema::UiProgramNode]) -> Result<Vec<UiDataGridRecord>, UiProgramCompileError> {
+    document.data_grids.iter().map(|grid| {
+        if grid.max_window_rows == 0 || !nodes.iter().any(|node| node.key == grid.node_key && node.kind == UiNodeKind::DataGrid) {
+            Err(compile_error(ERROR_UI_PROGRAM_INVALID_BRANCH_TEMPLATE, "DataGrid declaration must target a DataGrid node with a positive window capacity"))
+        } else {
+            Ok(UiDataGridRecord { node_key: grid.node_key.clone(), max_window_rows: grid.max_window_rows })
+        }
+    }).collect()
 }
 
 /// Supported CPU execution backend. It consumes the same program and resolved
@@ -1393,8 +1444,8 @@ fn compile_template_records(
     document.templates.iter().map(|template| {
         if template.row_schema.values().any(|kind| matches!(kind, neon_ui_schema::UiInputKind::AssetHandle)) {
             return Err(compile_error(ERROR_UI_PROGRAM_INVALID_BRANCH_TEMPLATE, "template row schema cannot contain renderer resource handles"));
-        }
-        let node_range = subtree_keys(nodes, &template.root_node_key);
+            }
+            let node_range = subtree_keys(nodes, &template.root_node_key);
         if node_range.is_empty() { return Err(compile_error(ERROR_UI_PROGRAM_INVALID_BRANCH_TEMPLATE, "template root must identify a compiled subtree")); }
         Ok(UiTemplateRecord { template_key: template.template_key.clone(), node_range, max_instances: template.max_instances, row_schema: template.row_schema.clone(), instance_key_field: template.instance_key_field.clone(), overflow_summary: template.overflow_summary })
     }).collect()
@@ -1908,7 +1959,7 @@ impl UiRuntime {
             .map_err(|_| TransportError::Io(std::io::Error::other("invalid UI semantic event")))?;
         self.validate_semantic_event(&event)
             .map_err(|code| TransportError::Io(std::io::Error::other(code)))?;
-let (program_event, domain_key) = {
+        let (program_event, domain_key) = {
             let gallery = self.gallery.as_mut().ok_or_else(|| {
                 TransportError::Io(std::io::Error::other("gallery program domain is unavailable"))
             })?;
@@ -1946,7 +1997,7 @@ let (program_event, domain_key) = {
                 .idempotency_key
                 .clone()
                 .unwrap_or_else(|| format!("gallery-live:{}", event.event_id));
-let program_event = UiProgramSemanticEvent {
+            let program_event = UiProgramSemanticEvent {
                 event_id: format!("gallery-live:{}", event.event_id),
                 kind: demo_domain::gallery_event_kind(&declaration.node_key),
                 intent: action,
@@ -3214,7 +3265,7 @@ mod tests {
         let effects = lower_nui_flow_effects(&document);
         let intent = effects.iter().find_map(|effect| match effect {
             UiEffect::DropBinding { binding } if binding.key == "progress-drop" => Some(binding.intent.clone()),
-            _ => None,
+                _ => None,
         }).unwrap();
         let fragment = UiFragment {
             fragment_id: UiFragmentId("forwarded-demo".into()), revision: Revision(1), root: document.ir.root, effects,
@@ -3231,11 +3282,11 @@ mod tests {
         let renderer = RpcServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
         let renderer_endpoint = renderer.local_addr().unwrap();
         let renderer_thread = thread::spawn(move || renderer.serve_one(|request| {
-            let command: UiCommand = serde_json::from_value(request.params.clone()).unwrap();
+                let command: UiCommand = serde_json::from_value(request.params.clone()).unwrap();
             let UiCommand::SubmitFragment { submission } = command else { unreachable!() };
-            assert_eq!(submission.fragment.revision, Revision(2));
+                assert_eq!(submission.fragment.revision, Revision(2));
             assert!(submission.fragment.root.children.iter().all(|node| node.node_id.0 != "backlog-card-01"));
-            accepted(request)
+                accepted(request)
         }));
         let event = UiSemanticEvent {
             event: neon_ui_schema::UiSemanticEventType::DragDrop, event_id: "drag-forward-1".into(), renderer_epoch: 7,
@@ -3296,7 +3347,7 @@ mod tests {
         disabled.values.get_mut("controls_enabled").unwrap().value = UiInputValue::Bool { value: false };
         let disabled_frame = evaluate_ui_program(&program, &disabled, UiCpuViewport { logical_bounds: UiBounds { x: 0.0, y: 0.0, width: 760.0, height: 680.0 }, revision: Revision(1) }, &UiLocalPresentationState::default());
         assert!(disabled_frame.nodes.iter().filter(|node| matches!(
-            node.node_key.as_str(),
+                    node.node_key.as_str(),
             "feature-toggle" | "mode-radio" | "exposure-slider" | "count-drag" | "mode-combo"
                 | "mode-dropdown" | "item-selectable" | "item-list" | "gallery-scroll"
         )).all(|node| !node.enabled));
@@ -3751,6 +3802,7 @@ mod tests {
             resources: Vec::new(),
             branches: Vec::new(),
             templates: Vec::new(),
+            data_grids: Vec::new(),
             resource_budget: UiResourceBudget {
                 max_nodes: 2,
                 max_bindings: 1,
@@ -3804,6 +3856,51 @@ mod tests {
                 .visible
         );
         assert_eq!(output.semantic_targets[0].node_key, "commit");
+    }
+
+    #[test]
+    fn data_grid_store_accepts_only_fresh_bounded_windows() {
+        use neon_ui_schema::{UiDataGridDeclaration, UiDataGridFrame, UiDataGridWindowRow};
+
+        let mut document = compiler_document();
+        document.root.children.push(UiNode {
+            node_id: UiNodeId("assets".into()), kind: UiNodeKind::DataGrid,
+            bounds: UiBounds { x: 0.0, y: 0.0, width: 100.0, height: 40.0 }, layout: None,
+            visible: true, enabled: true, text_key: None, text: None, image: None, surface: None,
+            style: UiStyle::default(), enter_transition: None, children: Vec::new(),
+        });
+        document.data_grids.push(UiDataGridDeclaration { node_key: "assets".into(), max_window_rows: 2 });
+        document.resource_budget.max_nodes = 3;
+        document.resource_budget.max_instances = 3;
+        let revision = compiler_program_revision();
+        let program = compile_ui_program(&document, revision.clone(), &compiler_schema(true)).unwrap();
+        let frame = UiDataGridFrame {
+            data_grid_key: "assets".into(), list_revision: Revision(1), total_rows: 10, first_row: 4,
+            window_rows: vec![
+                UiDataGridWindowRow { stable_row_key: "asset-5".into() },
+                UiDataGridWindowRow { stable_row_key: "asset-6".into() },
+            ],
+            expected_program_revision: revision,
+        };
+        let mut store = UiDataGridStore::default();
+        assert_eq!(store.apply(&program, frame.clone()).unwrap().accepted_rows, 2);
+        assert_eq!(store.frame("assets").unwrap().first_row, 4);
+        assert_eq!(store.apply(&program, frame.clone()).unwrap_err().code, ERROR_UI_PROGRAM_STALE_INPUT_REVISION);
+
+        let mut wrong_program = frame.clone();
+        wrong_program.list_revision = Revision(2);
+        wrong_program.expected_program_revision.revision = Revision(2);
+        assert_eq!(store.apply(&program, wrong_program).unwrap_err().code, ERROR_UI_PROGRAM_STALE_INPUT_REVISION);
+
+        let mut out_of_bounds = frame.clone();
+        out_of_bounds.list_revision = Revision(2);
+        out_of_bounds.first_row = 9;
+        assert_eq!(store.apply(&program, out_of_bounds).unwrap_err().code, ERROR_UI_PROGRAM_CAPACITY_OVERFLOW);
+
+        let mut duplicate_key = frame;
+        duplicate_key.list_revision = Revision(2);
+        duplicate_key.window_rows[1].stable_row_key = "asset-5".into();
+        assert_eq!(store.apply(&program, duplicate_key).unwrap_err().code, ERROR_UI_PROGRAM_INVALID_BRANCH_TEMPLATE);
     }
 
     #[test]
@@ -3932,7 +4029,7 @@ mod tests {
             .unwrap_err()
             .code,
             "ui_program_invalid_schema"
-);
+        );
     }
     #[test]
     fn forwarder_routes_gallery_pointer_clicks_through_program_domain() {
@@ -3980,7 +4077,7 @@ mod tests {
                         Ok(UiCommand::SubmitFragment { submission }) => {
                             let _ = fragments_tx.send(submission.fragment.clone());
                             RpcResponse { request_id: request.request_id, status: RpcStatus::Accepted, revision: Some(submission.fragment.revision), result: Some(json!({"fragment_revision": submission.fragment.revision.0})), snapshot: None, error: None }
-                        }
+                            }
                         _ => RpcResponse { request_id: request.request_id, status: RpcStatus::Rejected, revision: None, result: None, snapshot: None, error: Some(RpcError { code: "invalid_request".into(), message: "expected submit fragment command".into(), current_revision: None, object_id: None }) },
                     }
                 } else {

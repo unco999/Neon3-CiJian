@@ -492,12 +492,12 @@ impl WindowGpu {
         .map_err(|error| format!("request adapter: {error}"))?;
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
-                label: Some("neon3-wgpu-runtime-device"),
-                required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::default(),
-                experimental_features: wgpu::ExperimentalFeatures::default(),
-                memory_hints: wgpu::MemoryHints::Performance,
-                trace: wgpu::Trace::Off,
+            label: Some("neon3-wgpu-runtime-device"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::default(),
+            experimental_features: wgpu::ExperimentalFeatures::default(),
+            memory_hints: wgpu::MemoryHints::Performance,
+            trace: wgpu::Trace::Off,
             },
         ))
         .map_err(|error| format!("request device: {error}"))?;
@@ -811,8 +811,21 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
             }
             WindowEvent::MouseInput { state, button, .. }
                 if state == winit::event::ElementState::Pressed
-                && button == winit::event::MouseButton::Left =>
+                    && button == winit::event::MouseButton::Left =>
             {
+                let modal_consumed = self.gpu.as_mut().is_some_and(|gpu| {
+                    if !gpu.ui.dismiss_modal_at_pointer() {
+                        return false;
+                    }
+                    gpu.captured_binding = None;
+                    gpu.pending_control_value = None;
+                    gpu.input.cancel();
+                    true
+                });
+                if modal_consumed {
+                    self.redraw_pending = true;
+                    return;
+                }
                 let text_input = self.gpu.as_mut().and_then(|gpu| {
                     let input = gpu.ui.text_input_at_pointer()?;
                     gpu.ui.focus_text_input(input.clone());
@@ -876,7 +889,14 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                             .map(|binding| binding.node_path);
                         gpu.last_pointer_outcome = "pointer_captured".into();
                         if let Some(binding) = gpu.captured_binding.clone() {
-                            gpu.ui.begin_value_gesture(&binding);
+                            let started = gpu.ui.begin_value_gesture(&binding);
+                            if gpu.ui.requires_value_gesture(&binding) && !started {
+                                gpu.captured_binding = None;
+                                gpu.input.cancel();
+                                gpu.last_pointer_outcome = "press_outside_value_control".into();
+                                gpu.last_pointer_node_path = Some(binding.node_path);
+                                return;
+                            }
                         }
                         gpu.ui.focus_control_at_pointer();
                         gpu.ui.press_hovered(gpu.started_at.elapsed().as_secs_f32());
@@ -886,7 +906,7 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
             }
             WindowEvent::MouseInput { state, button, .. }
                 if state == winit::event::ElementState::Released
-                && button == winit::event::MouseButton::Left =>
+                    && button == winit::event::MouseButton::Left =>
             {
                 if let Some(gpu) = self.gpu.as_mut() { gpu.text_selection_drag = false; }
                 let drag = self.gpu.as_mut().and_then(|gpu| {
@@ -922,7 +942,7 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                     window.set_ime_allowed(true);
                     let rect = self.gpu.as_ref().and_then(|gpu| gpu.ui.text_input_ime_rect()).unwrap_or(input.bounds);
                     window.set_ime_cursor_area(PhysicalPosition::new(rect.x.round() as i32, rect.y.round() as i32), PhysicalSize::new(rect.width.max(1.0).round() as u32, rect.height.max(1.0).round() as u32));
-                }
+                    }
                 if let (Some(endpoint), Some((Some(sequence), binding, control_value))) = (self.ui_endpoint, binding) {
                     if let Some(window) = self.window.as_ref() { window.set_ime_allowed(false); }
                     if let Some(gpu) = self.gpu.as_mut() {
@@ -1745,10 +1765,10 @@ impl WgpuRuntime {
             return self.reject(request_id, "not_found", "fragment is not present", None);
         };
         self.accept(request_id, json!({
-            "epoch": self.epoch,
-            "sequence": self.graph_revision,
-            "fragment_revision": fragment.revision,
-            "fragment": fragment,
+                "epoch": self.epoch,
+                "sequence": self.graph_revision,
+                "fragment_revision": fragment.revision,
+                "fragment": fragment,
         }))
     }
 
@@ -1976,7 +1996,7 @@ mod tests {
         let instance = wgpu::Instance::default();
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::LowPower, compatible_surface: None, force_fallback_adapter: true, apply_limit_buckets: false }))
             .or_else(|_| pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::LowPower, compatible_surface: None, force_fallback_adapter: false, apply_limit_buckets: false })))
-            .expect("a headless WGPU adapter is required");
+        .expect("a headless WGPU adapter is required");
         pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor { label: Some(label), required_features: wgpu::Features::empty(), required_limits: wgpu::Limits::downlevel_defaults(), experimental_features: wgpu::ExperimentalFeatures::default(), memory_hints: wgpu::MemoryHints::MemoryUsage, trace: wgpu::Trace::Off })).expect("the selected adapter must create a device and queue")
     }
 
@@ -2782,11 +2802,11 @@ mod tests {
         let mut runtime = WgpuRuntime::headless(7);
         let mut semantic_fragment = fragment(1);
         semantic_fragment.effects.push(neon_ui_schema::UiEffect::SemanticIntent {
-            intent: UiIntent::Invoke {
-                action: "terrain.tool.select".into(),
-                params: json!({"tool": "water_inject"}),
-            },
-        });
+                intent: UiIntent::Invoke {
+                    action: "terrain.tool.select".into(),
+                    params: json!({"tool": "water_inject"}),
+                },
+            });
         let mut submit_request = request(
             "submit",
             "wgpu.ui.submit_fragment",

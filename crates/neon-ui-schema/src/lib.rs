@@ -374,10 +374,19 @@ pub enum UiNodeKind {
     DragValue,
     Combo,
     Dropdown,
+    /// A non-modal top-level presentation layer, normally anchored by its bounds.
+    Tooltip,
+    /// A modal top-level presentation layer with a renderer-owned backdrop.
+    Modal,
+    /// Alias of modal presentation for document-like dialog content.
+    Dialog,
     Selectable,
     ListBox,
     Scrollbar,
     ProgressBar,
+    /// A declarative, virtualized tabular viewport. Row data is supplied by
+    /// bounded `UiDataGridFrame` windows rather than by runtime topology.
+    DataGrid,
 }
 
 
@@ -749,6 +758,9 @@ pub struct UiIrDocument {
     /// copies; it can never create arbitrary topology.
     #[serde(default)]
     pub templates: Vec<UiTemplateDeclaration>,
+    /// Bounded virtual-grid declarations attached to `DataGrid` nodes.
+    #[serde(default)]
+    pub data_grids: Vec<UiDataGridDeclaration>,
     pub resource_budget: UiResourceBudget,
 }
 
@@ -851,6 +863,24 @@ pub struct UiRepeatRow { pub stable_row_key: String, pub values: std::collection
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UiRepeatFrame { pub template_key: String, pub list_revision: Revision, pub rows: Vec<UiRepeatRow>, pub expected_program_revision: UiProgramRevision }
+
+/// Declarative bound for one virtualized grid viewport. The grid node owns its
+/// stable key; a frame can replace only the currently visible row window.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiDataGridDeclaration { pub node_key: String, pub max_window_rows: u32 }
+
+/// One domain-prepared row in a virtual grid window. Its key is stable across
+/// window changes; row position is deliberately not an identity.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiDataGridWindowRow { pub stable_row_key: String }
+
+/// Revisioned bounded window for a declared virtual DataGrid. `first_row` is
+/// the zero-based logical row offset and `total_rows` is the full domain count.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiDataGridFrame { pub data_grid_key: String, pub list_revision: Revision, pub total_rows: u64, pub first_row: u64, pub window_rows: Vec<UiDataGridWindowRow>, pub expected_program_revision: UiProgramRevision }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -972,9 +1002,13 @@ pub struct UiBranchRecord { pub branch_key: String, pub predicate: UiBranchPredi
 #[serde(deny_unknown_fields)]
 pub struct UiTemplateRecord { pub template_key: String, pub node_range: Vec<String>, pub max_instances: u32, pub row_schema: std::collections::BTreeMap<String, UiInputKind>, pub instance_key_field: String, pub overflow_summary: bool }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiDataGridRecord { pub node_key: String, pub max_window_rows: u32 }
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct UiProgram { pub revision: UiProgramRevision, pub nodes: Vec<UiProgramNode>, pub node_templates: Vec<UiNode>, pub literal_texts: Vec<UiProgramLiteralText>, pub layout_records: Vec<UiProgramLayoutRecord>, pub binding_records: Vec<UiBinding>, pub branch_records: Vec<UiBranchRecord>, pub template_records: Vec<UiTemplateRecord>, pub event_records: Vec<UiProgramEventDeclaration>, pub resource_budget: UiResourceBudget, pub dependency_index: UiDependencyIndex, pub layout_hash: String }
+pub struct UiProgram { pub revision: UiProgramRevision, pub nodes: Vec<UiProgramNode>, pub node_templates: Vec<UiNode>, pub literal_texts: Vec<UiProgramLiteralText>, pub layout_records: Vec<UiProgramLayoutRecord>, pub binding_records: Vec<UiBinding>, pub branch_records: Vec<UiBranchRecord>, pub template_records: Vec<UiTemplateRecord>, pub data_grid_records: Vec<UiDataGridRecord>, pub event_records: Vec<UiProgramEventDeclaration>, pub resource_budget: UiResourceBudget, pub dependency_index: UiDependencyIndex, pub layout_hash: String }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1305,10 +1339,10 @@ mod tests {
             presentation_template_key: Some("accepted-template".into()),
         };
         assert_eq!(serde_json::to_value(payload).unwrap(), serde_json::json!({
-            "source_key": "backlog-card-01",
-            "target_key": "done-panel",
-            "placement": "into",
-            "presentation_template_key": "accepted-template"
+                "source_key": "backlog-card-01",
+                "target_key": "done-panel",
+                "placement": "into",
+                "presentation_template_key": "accepted-template"
         }));
     }
 
@@ -1331,11 +1365,11 @@ mod tests {
             available_events: vec![UiSurfaceEventKind::DiagnosticsToggle, UiSurfaceEventKind::InspectorTabSelect],
         };
         assert_eq!(serde_json::to_value(snapshot).unwrap(), serde_json::json!({
-            "schema_version": 1,
-            "surface_id": "surface.ui-workbench",
-            "revision": 7,
-            "value": { "diagnostics": "expanded", "inspector": { "tab": "materials" } },
-            "available_events": ["DIAGNOSTICS_TOGGLE", "INSPECTOR_TAB_SELECT"]
+                "schema_version": 1,
+                "surface_id": "surface.ui-workbench",
+                "revision": 7,
+                "value": { "diagnostics": "expanded", "inspector": { "tab": "materials" } },
+                "available_events": ["DIAGNOSTICS_TOGGLE", "INSPECTOR_TAB_SELECT"]
         }));
     }
 
@@ -1673,6 +1707,16 @@ impl UiIrDocument {
                 || !template.row_schema.contains_key(&template.instance_key_field)
             { return Err(UiSchemaError::InvalidIrDocument); }
         }
+        let mut data_grid_keys = std::collections::HashSet::new();
+        for data_grid in &self.data_grids {
+            if data_grid.node_key.trim().is_empty() || data_grid.max_window_rows == 0
+                || !data_grid_keys.insert(data_grid.node_key.clone())
+                || !matches!(find_ir_node(&self.root, &data_grid.node_key), Some(node) if node.kind == UiNodeKind::DataGrid)
+            { return Err(UiSchemaError::InvalidIrDocument); }
+        }
+        let mut declared_grid_nodes = std::collections::HashSet::new();
+        collect_data_grid_keys(&self.root, &mut declared_grid_nodes);
+        if declared_grid_nodes != data_grid_keys { return Err(UiSchemaError::InvalidIrDocument); }
         Ok(())
     }
 }
@@ -1680,4 +1724,14 @@ impl UiIrDocument {
 fn collect_ir_keys(node: &UiNode, keys: &mut std::collections::HashSet<String>) {
     keys.insert(node.node_id.0.clone());
     for child in &node.children { collect_ir_keys(child, keys); }
+}
+
+fn find_ir_node<'a>(node: &'a UiNode, key: &str) -> Option<&'a UiNode> {
+    if node.node_id.0 == key { return Some(node); }
+    node.children.iter().find_map(|child| find_ir_node(child, key))
+}
+
+fn collect_data_grid_keys(node: &UiNode, keys: &mut std::collections::HashSet<String>) {
+    if node.kind == UiNodeKind::DataGrid { keys.insert(node.node_id.0.clone()); }
+    for child in &node.children { collect_data_grid_keys(child, keys); }
 }

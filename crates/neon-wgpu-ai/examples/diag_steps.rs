@@ -62,12 +62,12 @@ fn main() {
     .expect("no wgpu adapter available");
     let (device, queue) = pollster::block_on(adapter.request_device(
         &wgpu::DeviceDescriptor {
-            label: Some("neon-wgpu-ai diag_steps"),
-            required_features: wgpu::Features::empty(),
-            required_limits: wgpu::Limits::default(),
-            experimental_features: wgpu::ExperimentalFeatures::default(),
-            memory_hints: wgpu::MemoryHints::default(),
-            trace: wgpu::Trace::Off,
+        label: Some("neon-wgpu-ai diag_steps"),
+        required_features: wgpu::Features::empty(),
+        required_limits: wgpu::Limits::default(),
+        experimental_features: wgpu::ExperimentalFeatures::default(),
+        memory_hints: wgpu::MemoryHints::default(),
+        trace: wgpu::Trace::Off,
         },
     ))
     .expect("device request failed");
@@ -141,7 +141,7 @@ fn main() {
     let gn_bias = ctx.upload(bytemuck::cast_slice(&[0.0f32; 8]), "gn_bias");
     let gn_x = ctx.upload(bytemuck::cast_slice(&gn_input), "gn_input");
     let gn = ops::group_norm(ctx, &gn_x, &gn_weight, &gn_bias, 8, 8, 1, 2, 1e-5, "gn_regression")
-        .expect("group norm");
+    .expect("group norm");
     let gn_gpu = ctx.readback_f32(&gn.buffer, gn_input.len()).expect("group norm out");
     for (i, actual) in gn_gpu.iter().enumerate() {
         let expected = if i % 2 == 0 { -0.999995 } else { 0.999995 };
