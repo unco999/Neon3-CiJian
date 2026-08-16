@@ -9,6 +9,7 @@ use neon_ipc::{RpcServer, TransportError};
 use neon_protocol::{Revision, RpcError, RpcRequest, RpcResponse, RpcStatus};
 use neon_ui_schema::{
     TextRef, UiControlPresentation, UiDropPlacement, UiEffect, UiFragment, UiInputChange, UiInputFrame, UiInputKind,
+    UiDataGridCell, UiDataGridFrame, UiDataGridWindowRequest, UiDataGridWindowRow,
     UiInputSchema, UiInputValue, UiNode, UiNodeId, UiProgram, UiProgramSemanticEvent,
     UiProgramSemanticEventKind, UiSemanticEvent, UiSemanticEventType, UiResolvedInputs, UiProgramRevision,
     UiProgramCapability, UiProgramCapabilityOwner, UiProgramCapabilityStatus,
@@ -269,6 +270,9 @@ impl DemoDragDropDomain {
         if request.method == "service.shutdown" {
             return accepted(request, self.revision, json!({"state": "accepted"}));
         }
+        if request.method == "ui.data_grid.window.request" {
+            return self.handle_data_grid_window_request(request);
+        }
         if request.method != "ui.drag_drop.apply" {
             return rejected(
                 request,
@@ -457,6 +461,64 @@ impl DemoDragDropDomain {
             self.revision,
             json!({"fragment": fragment, "state": "accepted"}),
         )
+    }
+
+    fn handle_data_grid_window_request(&self, request: RpcRequest) -> RpcResponse {
+        let window_request: UiDataGridWindowRequest = match serde_json::from_value(request.params.clone()) {
+            Ok(window_request) => window_request,
+            Err(_) => return rejected(request, self.revision, "invalid_request", "a typed DataGrid window request is required"),
+        };
+        if window_request.data_grid_key != "virtual-list" || window_request.max_window_rows == 0 {
+            return rejected(request, self.revision, "data_grid_not_found", "the requested DataGrid is not available");
+        }
+        if window_request.expected_list_revision != Revision(1) {
+            return rejected(request, Some(Revision(1)), "revision_conflict", "the requested DataGrid list revision is stale");
+        }
+        const TOTAL_ROWS: u64 = 10_000;
+        let first_row = window_request.requested_first_row.min(TOTAL_ROWS);
+        let row_count = u64::from(window_request.max_window_rows.min(12)).min(TOTAL_ROWS - first_row);
+        let window_rows = (first_row..first_row + row_count).map(virtual_list_row).collect();
+        let frame = UiDataGridFrame {
+            data_grid_key: window_request.data_grid_key,
+            list_revision: Revision(1),
+            total_rows: TOTAL_ROWS,
+            first_row,
+            window_rows,
+            expected_program_revision: virtual_list_program_revision(),
+        };
+        accepted(request, Some(frame.list_revision), json!(frame))
+    }
+}
+
+fn virtual_list_row(row_index: u64) -> UiDataGridWindowRow {
+    let handle = |id| neon_ui_schema::UiTextHandle { id, generation: 1 };
+    let base = 10_000 + row_index * 4;
+    UiDataGridWindowRow {
+        stable_row_key: format!("virtual-row-{row_index}"),
+        cells: std::collections::BTreeMap::from([
+            ("id".into(), UiDataGridCell { value: UiInputValue::I32 { value: row_index as i32 }, display: handle(base), presentation_override: None }),
+            ("name".into(), UiDataGridCell { value: UiInputValue::TextHandle { value: handle(base + 1) }, display: handle(base + 1), presentation_override: None }),
+            ("status".into(), UiDataGridCell { value: UiInputValue::TextHandle { value: handle(base + 2) }, display: handle(base + 2), presentation_override: None }),
+            ("owner".into(), UiDataGridCell { value: UiInputValue::TextHandle { value: handle(base + 3) }, display: handle(base + 3), presentation_override: None }),
+        ]),
+    }
+}
+
+fn virtual_list_program_revision() -> UiProgramRevision {
+    UiProgramRevision {
+        program_id: "virtual-list-demo.demo".into(),
+        revision: Revision(1),
+        schema_version: UI_PROGRAM_SCHEMA_VERSION,
+        capabilities: [
+            UI_PROGRAM_CAPABILITY_NAME,
+            UI_PROGRAM_TEXT_REGISTRY_CAPABILITY_NAME,
+            UI_PROGRAM_BOUNDED_STRUCTURE_CAPABILITY_NAME,
+            UI_PROGRAM_SEMANTIC_EVENT_CAPABILITY_NAME,
+        ].into_iter().map(|name| UiProgramCapability {
+            name: name.into(), version: 1,
+            owner: UiProgramCapabilityOwner::SharedContract,
+            status: UiProgramCapabilityStatus::Supported,
+        }).collect(),
     }
 }
 
@@ -717,6 +779,33 @@ mod tests {
             board_columns.children[done_index + 1].node_id.0,
             "accepted-template-backlog-card-03-r2-accepted-template"
         );
+    }
+
+    #[test]
+    fn virtual_list_window_request_returns_a_bounded_generated_frame() {
+        let request = UiDataGridWindowRequest {
+            renderer_epoch: 1,
+            composition_revision: Revision(7),
+            fragment: neon_ui_schema::UiFragmentRevision { id: UiFragmentId("virtual-list-demo".into()), revision: Revision(3) },
+            data_grid_key: "virtual-list".into(),
+            expected_list_revision: Revision(1),
+            requested_first_row: 9_996,
+            max_window_rows: 99,
+            sequence: 4,
+        };
+        let response = DemoDragDropDomain::new().handle(RpcRequest {
+            protocol: "neon3.rpc".into(), version: ProtocolVersion { major: 1, minor: 0 },
+            request_id: RequestId("virtual-list-window".into()),
+            client: ClientIdentity { kind: ClientKind::UiRuntime, instance_id: "test".into(), pid: 1, origin: "test".into() },
+            target: ServiceName("demo-domain".into()), method: "ui.data_grid.window.request".into(),
+            params: json!(request), expected_revision: Some(Revision(1)), idempotency_key: Some("virtual-list-window".into()),
+        });
+        assert_eq!(response.status, RpcStatus::Accepted, "{:?}", response.error);
+        let frame: UiDataGridFrame = serde_json::from_value(response.result.unwrap()).unwrap();
+        assert_eq!(frame.total_rows, 10_000);
+        assert_eq!(frame.first_row, 9_996);
+        assert_eq!(frame.window_rows.len(), 4);
+        assert_eq!(frame.window_rows[0].stable_row_key, "virtual-row-9996");
     }
 
     #[test]

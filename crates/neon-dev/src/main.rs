@@ -52,25 +52,25 @@ fn run() -> io::Result<()> {
     }
     let case = match args.as_slice() {
         [command, case]
-            if command == "case" && matches!(case.as_str(), "kanban-reparent" | "asset-review" | "component-gallery") =>
+            if command == "case" && matches!(case.as_str(), "kanban-reparent" | "asset-review" | "component-gallery" | "data-grid" | "scroll-view" | "virtual-list") =>
         {
             case
         }
         [command, case, flag]
             if command == "case"
                 && flag == "--show-logs"
-                && matches!(case.as_str(), "kanban-reparent" | "asset-review" | "component-gallery") =>
+                && matches!(case.as_str(), "kanban-reparent" | "asset-review" | "component-gallery" | "data-grid" | "scroll-view" | "virtual-list") =>
         {
             case
         }
         [flag] if flag == "--help" => {
-            println!("neon-dev case <kanban-reparent|asset-review|component-gallery> [--show-logs]\nneon-dev scenario <drag-card02-before|component-gallery-interactions>\nneon-dev inspect-window <wgpu-loopback-endpoint>");
+            println!("neon-dev case <kanban-reparent|asset-review|component-gallery|data-grid|scroll-view|virtual-list> [--show-logs]\nneon-dev scenario <drag-card02-before|component-gallery-interactions>\nneon-dev inspect-window <wgpu-loopback-endpoint>");
             return Ok(());
         }
         _ => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "usage: neon-dev case <kanban-reparent|asset-review|component-gallery> [--show-logs] | neon-dev scenario <drag-card02-before|component-gallery-interactions> | neon-dev inspect-window <wgpu-loopback-endpoint>",
+                "usage: neon-dev case <kanban-reparent|asset-review|component-gallery|data-grid|scroll-view|virtual-list> [--show-logs] | neon-dev scenario <drag-card02-before|component-gallery-interactions> | neon-dev inspect-window <wgpu-loopback-endpoint>",
             ));
         }
     };

@@ -23,8 +23,8 @@ use neon_ui_schema::{
     UiInputValue, UiInputValueSource, UiInspectorState, UiInspectorTab, UiIrDocument, UiNode,
     UiNodeId, UiNodeKind, UiProgram, UiProgramEventDeclaration, UiProgramLayoutRecord,
     UiProgramLiteralText, UiProgramNode, UiProgramResourceKind, UiProgramRevision,
-    UiBranchPredicate, UiBranchRecord, UiTemplateRecord, UiRepeatFrame, UiDataGridFrame,
-    UiDataGridRecord,
+    UiBranchPredicate, UiBranchRecord, UiTemplateRecord, UiRepeatFrame, UiDataGridDeclaration,
+    UiDataGridFrame, UiDataGridRecord, UiDataGridWindowRequest,
     UiResolvedInputValue, UiResolvedInputs, UiResourceBudget, UiSchemaError, UiSemanticEvent,
     UiProgramSemanticEvent, UiProgramSemanticEventKind, UiProgramSemanticEventResult,
     UiProgramSemanticEventStatus, UiSemanticPayloadValue, UiEventTraceRecord,
@@ -889,6 +889,16 @@ fn input_value_as_event_payload(value: &UiInputValue) -> Option<UiSemanticPayloa
     })
 }
 
+fn apply_program_visibility(
+    node: &mut UiNode,
+    visibility: &std::collections::BTreeMap<String, bool>,
+) {
+    node.visible = visibility.get(&node.node_id.0).copied().unwrap_or(false);
+    for child in &mut node.children {
+        apply_program_visibility(child, visibility);
+    }
+}
+
 fn same_payload_kind(left: &UiSemanticPayloadValue, right: &UiSemanticPayloadValue) -> bool {
     matches!(
         (left, right),
@@ -920,6 +930,30 @@ pub struct UiDataGridApplyResult { pub accepted_rows: u32 }
 impl UiDataGridStore {
     pub fn frame(&self, data_grid_key: &str) -> Option<&UiDataGridFrame> { self.frames.get(data_grid_key) }
 
+    /// Attaches the current bounded grid windows to a fragment produced from the
+    /// same compiled program. Frames are presentation data, not fragment topology.
+    pub fn attach_to_fragment(&self, program: &UiProgram, fragment: &mut UiFragment) -> Result<(), UiProgramCompileError> {
+        let mut effects = fragment.effects.iter().filter(|effect| !matches!(effect, UiEffect::DataGridFrame { .. })).cloned().collect::<Vec<_>>();
+        for grid in &program.data_grid_records {
+            let Some(frame) = self.frame(&grid.node_key) else { continue; };
+            if frame.expected_program_revision != program.revision {
+                return Err(compile_error(ERROR_UI_PROGRAM_STALE_INPUT_REVISION, "DataGrid frame belongs to a different program revision"));
+            }
+            effects.push(UiEffect::DataGridFrame {
+                declaration: UiDataGridDeclaration {
+                    node_key: grid.node_key.clone(), max_window_rows: grid.max_window_rows,
+                    row_height: grid.row_height, overscan: grid.overscan, columns: grid.columns.clone(),
+                },
+                frame: frame.clone(),
+            });
+        }
+        let mut candidate = fragment.clone();
+        candidate.effects = effects;
+        candidate.validate().map_err(schema_compile_error)?;
+        fragment.effects = candidate.effects;
+        Ok(())
+    }
+
     pub fn apply(&mut self, program: &UiProgram, frame: UiDataGridFrame) -> Result<UiDataGridApplyResult, UiProgramCompileError> {
         if frame.expected_program_revision != program.revision {
             return Err(compile_error(ERROR_UI_PROGRAM_STALE_INPUT_REVISION, "DataGrid frame belongs to a different program revision"));
@@ -927,7 +961,7 @@ impl UiDataGridStore {
         let grid = program.data_grid_records.iter().find(|record| record.node_key == frame.data_grid_key)
             .ok_or_else(|| compile_error(ERROR_UI_PROGRAM_INVALID_BRANCH_TEMPLATE, "DataGrid frame references an unknown grid"))?;
         if let Some(previous) = self.frames.get(&frame.data_grid_key)
-            && frame.list_revision.0 <= previous.list_revision.0 {
+            && frame.list_revision.0 < previous.list_revision.0 {
             return Err(compile_error(ERROR_UI_PROGRAM_STALE_INPUT_REVISION, "DataGrid frame revision is stale"));
         }
         let row_count = u64::try_from(frame.window_rows.len()).map_err(|_| compile_error(ERROR_UI_PROGRAM_CAPACITY_OVERFLOW, "DataGrid window row count overflows u64"))?;
@@ -938,6 +972,14 @@ impl UiDataGridStore {
         let mut keys = HashSet::new();
         if frame.window_rows.iter().any(|row| row.stable_row_key.trim().is_empty() || !keys.insert(&row.stable_row_key)) {
             return Err(compile_error(ERROR_UI_PROGRAM_INVALID_BRANCH_TEMPLATE, "DataGrid window rows require unique nonempty stable row keys"));
+        }
+        let column_keys = grid.columns.iter().map(|column| column.key.as_str()).collect::<HashSet<_>>();
+        if frame.window_rows.iter().any(|row| {
+            row.cells.len() != column_keys.len()
+                || row.cells.keys().any(|key| !column_keys.contains(key.as_str()))
+                || row.cells.values().any(|cell| !cell.validate())
+        }) {
+            return Err(compile_error(ERROR_UI_PROGRAM_INVALID_BRANCH_TEMPLATE, "DataGrid rows must contain one valid typed/display cell for every declared column"));
         }
         let accepted_rows = frame.window_rows.len() as u32;
         self.frames.insert(frame.data_grid_key.clone(), frame);
@@ -1198,10 +1240,16 @@ pub fn compile_ui_program(
 
 fn compile_data_grid_records(document: &UiIrDocument, nodes: &[neon_ui_schema::UiProgramNode]) -> Result<Vec<UiDataGridRecord>, UiProgramCompileError> {
     document.data_grids.iter().map(|grid| {
-        if grid.max_window_rows == 0 || !nodes.iter().any(|node| node.key == grid.node_key && node.kind == UiNodeKind::DataGrid) {
-            Err(compile_error(ERROR_UI_PROGRAM_INVALID_BRANCH_TEMPLATE, "DataGrid declaration must target a DataGrid node with a positive window capacity"))
+        if grid.max_window_rows == 0 || grid.row_height == 0 || grid.overscan > grid.max_window_rows || grid.columns.is_empty()
+            || grid.columns.iter().any(|column| !column.validate())
+            || grid.columns.iter().map(|column| &column.key).collect::<HashSet<_>>().len() != grid.columns.len()
+            || !nodes.iter().any(|node| node.key == grid.node_key && node.kind == UiNodeKind::DataGrid) {
+            Err(compile_error(ERROR_UI_PROGRAM_INVALID_BRANCH_TEMPLATE, "DataGrid declaration must target a DataGrid node with positive bounded metrics and columns"))
         } else {
-            Ok(UiDataGridRecord { node_key: grid.node_key.clone(), max_window_rows: grid.max_window_rows })
+            Ok(UiDataGridRecord {
+                node_key: grid.node_key.clone(), max_window_rows: grid.max_window_rows,
+                row_height: grid.row_height, overscan: grid.overscan, columns: grid.columns.clone(),
+            })
         }
     }).collect()
 }
@@ -1602,6 +1650,7 @@ pub struct UiRuntime {
     journal: CommandJournal,
     receipts: HashMap<RequestId, CommandReceipt>,
     last_input_sequence: HashMap<u64, u64>,
+    last_data_grid_sequence: HashMap<String, u64>,
     idempotent_responses: HashMap<String, RpcResponse>,
     surface: UiSurfaceMachine,
     ai_terrain: AiTerrainPanelState,
@@ -1632,6 +1681,7 @@ impl UiRuntime {
             journal: CommandJournal::new(ServiceName(SERVICE_NAME.into()), epoch, 128),
             receipts: HashMap::new(),
             last_input_sequence: HashMap::new(),
+            last_data_grid_sequence: HashMap::new(),
             idempotent_responses: HashMap::new(),
             surface: UiSurfaceMachine::new(UiSurfaceId(WORKBENCH_SURFACE_ID.into())),
             ai_terrain: AiTerrainPanelState::default(),
@@ -1663,6 +1713,7 @@ impl UiRuntime {
                 "ui.ai.terrain.panel.v1".into(),
                 "ui.text_input.commit.v1".into(),
                 "ui.program.input.v1".into(),
+                "ui.data_grid.window.v1".into(),
             ],
         }
     }
@@ -1921,6 +1972,12 @@ impl UiRuntime {
                     .unwrap_or_else(|error| {
                         runtime.rejected(request_id, "service_unavailable", &error.to_string())
                     })
+            } else if request.method == "ui.data_grid.window.request" {
+                runtime
+                    .forward_data_grid_window_request(domain_endpoint, wgpu_endpoint, request)
+                    .unwrap_or_else(|error| {
+                        runtime.rejected(request_id, "service_unavailable", &error.to_string())
+                    })
             } else if request.method == "ui.input.event" && renderer_event_targets_wgpu(&request) {
                 runtime
                     .forward_wgpu_event(wgpu_endpoint, request)
@@ -1944,6 +2001,90 @@ impl UiRuntime {
             };
             (response, !shutdown)
         })
+    }
+
+    /// Applies a domain-owned replacement frame to the cached presentation
+    /// fragment. The request contains only revisioned DataGrid identity, never
+    /// renderer-local pointer or hit-test data.
+    fn forward_data_grid_window_request(
+        &mut self,
+        domain_endpoint: SocketAddr,
+        wgpu_endpoint: SocketAddr,
+        request: RpcRequest,
+    ) -> Result<RpcResponse, TransportError> {
+        let response_request_id = request.request_id.clone();
+        let window_request: UiDataGridWindowRequest = serde_json::from_value(request.params.clone())
+            .map_err(|_| TransportError::Io(std::io::Error::other("invalid DataGrid window request")))?;
+        if window_request.renderer_epoch != self.epoch {
+            return Ok(self.rejected(response_request_id, ERROR_RENDERER_EPOCH_MISMATCH, "renderer epoch is stale"));
+        }
+        let fragment = self.cached_fragment.clone().ok_or_else(|| {
+            TransportError::Io(std::io::Error::other("no UI fragment has been submitted"))
+        })?;
+        if fragment.fragment_id != window_request.fragment.id || fragment.revision != window_request.fragment.revision {
+            return Ok(self.rejected(response_request_id, ERROR_FRAGMENT_REVISION_STALE, "DataGrid fragment revision is stale"));
+        }
+        let sequence_key = format!("{}/{}", window_request.fragment.id.0, window_request.data_grid_key);
+        if self.last_data_grid_sequence.get(&sequence_key).is_some_and(|last| window_request.sequence <= *last) {
+            return Ok(self.rejected(response_request_id, ERROR_INPUT_SEQUENCE_STALE, "DataGrid request sequence is stale"));
+        }
+        let current = fragment.effects.iter().find_map(|effect| match effect {
+            UiEffect::DataGridFrame { declaration, frame }
+                if declaration.node_key == window_request.data_grid_key => Some((declaration.clone(), frame.clone())),
+            _ => None,
+        }).ok_or_else(|| TransportError::Io(std::io::Error::other("DataGrid is not declared by the submitted fragment")))?;
+        if current.1.list_revision != window_request.expected_list_revision
+            || window_request.max_window_rows != current.0.max_window_rows {
+            return Ok(self.rejected(response_request_id, "revision_conflict", "DataGrid list revision or window capacity is stale"));
+        }
+        let forwarded = RpcRequest {
+            protocol: "neon3.rpc".into(), version: PROTOCOL_VERSION,
+            request_id: RequestId(format!("{}-domain", response_request_id.0)),
+            client: self.client.clone(), target: ServiceName("demo-domain".into()),
+            method: "ui.data_grid.window.request".into(), params: json!(window_request),
+            expected_revision: Some(current.1.list_revision),
+            idempotency_key: Some(format!("data-grid-window:{}:{}", sequence_key, window_request.sequence)),
+        };
+        let domain_response = RpcClient::connect(domain_endpoint)?.call(&forwarded)?;
+        if domain_response.status != RpcStatus::Accepted {
+            return Ok(domain_response);
+        }
+        let frame: UiDataGridFrame = domain_response.result.clone()
+            .and_then(|value| serde_json::from_value(value).ok())
+            .ok_or_else(|| TransportError::Io(std::io::Error::other("DataGrid domain accepted without a frame")))?;
+        if frame.data_grid_key != current.0.node_key
+            || frame.expected_program_revision != current.1.expected_program_revision
+            || frame.window_rows.len() > current.0.max_window_rows as usize
+            || frame.first_row > frame.total_rows
+            || frame.window_rows.len() as u64 > frame.total_rows - frame.first_row {
+            return Ok(self.rejected(response_request_id, "invalid_data_grid_frame", "domain returned an invalid DataGrid frame"));
+        }
+        let mut updated = fragment.clone();
+        updated.revision = Revision(updated.revision.0 + 1);
+        for effect in &mut updated.effects {
+            if let UiEffect::DataGridFrame { declaration, frame: target } = effect
+                && declaration.node_key == window_request.data_grid_key {
+                *target = frame.clone();
+            }
+        }
+        if updated.validate().is_err() {
+            return Ok(self.rejected(response_request_id, "invalid_data_grid_frame", "domain returned an invalid DataGrid frame"));
+        }
+        let submit = RpcRequest {
+            protocol: "neon3.rpc".into(), version: PROTOCOL_VERSION,
+            request_id: RequestId(format!("{}-fragment", response_request_id.0)),
+            client: self.client.clone(), target: ServiceName(SERVICE_NAME.into()),
+            method: "ui.fragment.submit".into(),
+            params: json!(UiCommand::SubmitFragment { submission: UiFragmentSubmission::new(updated) }),
+            expected_revision: Some(fragment.revision),
+            idempotency_key: Some(format!("data-grid-frame:{}:{}", sequence_key, window_request.sequence)),
+        };
+        let mut response = self.forward_fragment(wgpu_endpoint, submit)?;
+        if response.status == RpcStatus::Accepted {
+            self.last_data_grid_sequence.insert(sequence_key, window_request.sequence);
+        }
+        response.request_id = response_request_id;
+        Ok(response)
     }
 
     /// Routes a renderer-resolved component gallery event through the program
@@ -2049,6 +2190,21 @@ impl UiRuntime {
         };
         let mut updated = fragment.clone();
         updated.revision = Revision(updated.revision.0 + 1);
+        if let Some(gallery) = self.gallery.as_ref() {
+            let frame = evaluate_ui_program(
+                &gallery.program,
+                &snapshot.inputs,
+                UiCpuViewport {
+                    logical_bounds: UiBounds { x: 0.0, y: 0.0, width: 1280.0, height: 800.0 },
+                    revision: updated.revision,
+                },
+                &UiLocalPresentationState::default(),
+            );
+            let visibility = frame.nodes.into_iter()
+                .map(|node| (node.node_key, node.visible))
+                .collect::<std::collections::BTreeMap<_, _>>();
+            apply_program_visibility(&mut updated.root, &visibility);
+        }
         demo_domain::apply_visible_status_to_fragment(&mut updated, &snapshot);
         let submit = RpcRequest {
             protocol: "neon3.rpc".into(), version: PROTOCOL_VERSION,
@@ -3869,23 +4025,33 @@ mod tests {
             visible: true, enabled: true, text_key: None, text: None, image: None, surface: None,
             style: UiStyle::default(), enter_transition: None, children: Vec::new(),
         });
-        document.data_grids.push(UiDataGridDeclaration { node_key: "assets".into(), max_window_rows: 2 });
+        document.data_grids.push(UiDataGridDeclaration {
+            node_key: "assets".into(), max_window_rows: 2, row_height: 24, overscan: 1,
+            columns: vec![neon_ui_schema::UiDataGridColumn { key: "name".into(), label: "Name".into(), width: 120, presentation: neon_ui_schema::UiDataGridPresentation::Edit { max_chars: 120, intent: "asset.name.edit".into() } }],
+        });
         document.resource_budget.max_nodes = 3;
         document.resource_budget.max_instances = 3;
         let revision = compiler_program_revision();
         let program = compile_ui_program(&document, revision.clone(), &compiler_schema(true)).unwrap();
+        assert_eq!(program.data_grid_records[0].columns[0].presentation, neon_ui_schema::UiDataGridPresentation::Edit { max_chars: 120, intent: "asset.name.edit".into() });
         let frame = UiDataGridFrame {
             data_grid_key: "assets".into(), list_revision: Revision(1), total_rows: 10, first_row: 4,
             window_rows: vec![
-                UiDataGridWindowRow { stable_row_key: "asset-5".into() },
-                UiDataGridWindowRow { stable_row_key: "asset-6".into() },
+                UiDataGridWindowRow { stable_row_key: "asset-5".into(), cells: BTreeMap::from([("name".into(), neon_ui_schema::UiDataGridCell { value: UiInputValue::TextHandle { value: UiTextHandle { id: 5, generation: 1 } }, display: UiTextHandle { id: 105, generation: 1 }, presentation_override: None })]) },
+                UiDataGridWindowRow { stable_row_key: "asset-6".into(), cells: BTreeMap::from([("name".into(), neon_ui_schema::UiDataGridCell { value: UiInputValue::TextHandle { value: UiTextHandle { id: 6, generation: 1 } }, display: UiTextHandle { id: 106, generation: 1 }, presentation_override: None })]) },
             ],
             expected_program_revision: revision,
         };
         let mut store = UiDataGridStore::default();
         assert_eq!(store.apply(&program, frame.clone()).unwrap().accepted_rows, 2);
         assert_eq!(store.frame("assets").unwrap().first_row, 4);
-        assert_eq!(store.apply(&program, frame.clone()).unwrap_err().code, ERROR_UI_PROGRAM_STALE_INPUT_REVISION);
+        let mut same_list_next_window = frame.clone();
+        same_list_next_window.first_row = 6;
+        assert_eq!(store.apply(&program, same_list_next_window).unwrap().accepted_rows, 2);
+
+        let mut stale_list = frame.clone();
+        stale_list.list_revision = Revision(0);
+        assert_eq!(store.apply(&program, stale_list).unwrap_err().code, ERROR_UI_PROGRAM_STALE_INPUT_REVISION);
 
         let mut wrong_program = frame.clone();
         wrong_program.list_revision = Revision(2);
@@ -3901,6 +4067,66 @@ mod tests {
         duplicate_key.list_revision = Revision(2);
         duplicate_key.window_rows[1].stable_row_key = "asset-5".into();
         assert_eq!(store.apply(&program, duplicate_key).unwrap_err().code, ERROR_UI_PROGRAM_INVALID_BRANCH_TEMPLATE);
+
+        let mut missing_cell = store.frame("assets").unwrap().clone();
+        missing_cell.list_revision = Revision(2);
+        missing_cell.window_rows[0].cells.clear();
+        assert_eq!(store.apply(&program, missing_cell).unwrap_err().code, ERROR_UI_PROGRAM_INVALID_BRANCH_TEMPLATE);
+
+        let mut invalid_value = store.frame("assets").unwrap().clone();
+        invalid_value.list_revision = Revision(2);
+        invalid_value.window_rows[0].cells.get_mut("name").unwrap().value = UiInputValue::F32 { value: f32::NAN };
+        assert_eq!(store.apply(&program, invalid_value).unwrap_err().code, ERROR_UI_PROGRAM_INVALID_BRANCH_TEMPLATE);
+
+        let mut invalid_override = store.frame("assets").unwrap().clone();
+        invalid_override.list_revision = Revision(2);
+        invalid_override.window_rows[0].cells.get_mut("name").unwrap().presentation_override = Some(neon_ui_schema::UiDataGridCellPresentation::Dropdown { options: Vec::new() });
+        assert_eq!(store.apply(&program, invalid_override).unwrap_err().code, ERROR_UI_PROGRAM_INVALID_BRANCH_TEMPLATE);
+    }
+
+    #[test]
+    fn data_grid_store_attaches_current_frame_to_fragment() {
+        use neon_ui_schema::{UiDataGridCell, UiDataGridDeclaration, UiDataGridFrame, UiDataGridWindowRow};
+
+        let mut document = compiler_document();
+        document.root.children.push(UiNode {
+            node_id: UiNodeId("assets".into()), kind: UiNodeKind::DataGrid,
+            bounds: UiBounds { x: 0.0, y: 0.0, width: 100.0, height: 40.0 }, layout: None,
+            visible: true, enabled: true, text_key: None, text: None, image: None, surface: None,
+            style: UiStyle::default(), enter_transition: None, children: Vec::new(),
+        });
+        document.data_grids.push(UiDataGridDeclaration {
+            node_key: "assets".into(), max_window_rows: 2, row_height: 24, overscan: 1,
+            columns: vec![neon_ui_schema::UiDataGridColumn { key: "name".into(), label: "Name".into(), width: 120, presentation: neon_ui_schema::UiDataGridPresentation::Text }],
+        });
+        document.resource_budget.max_nodes = 3;
+        document.resource_budget.max_instances = 3;
+        let revision = compiler_program_revision();
+        let program = compile_ui_program(&document, revision.clone(), &compiler_schema(true)).unwrap();
+        let frame = UiDataGridFrame {
+            data_grid_key: "assets".into(), list_revision: Revision(1), total_rows: 1, first_row: 0,
+            window_rows: vec![UiDataGridWindowRow {
+                stable_row_key: "asset-1".into(),
+                cells: BTreeMap::from([("name".into(), UiDataGridCell {
+                    value: UiInputValue::TextHandle { value: UiTextHandle { id: 1, generation: 1 } },
+                    display: UiTextHandle { id: 101, generation: 1 },
+                    presentation_override: None,
+                })]),
+            }],
+            expected_program_revision: revision,
+        };
+        let mut store = UiDataGridStore::default();
+        store.apply(&program, frame).unwrap();
+        let mut fragment = UiFragment {
+            fragment_id: UiFragmentId("grid-fragment".into()), revision: Revision(1),
+            root: document.root, effects: vec![UiEffect::SemanticAction { action: "grid.ready".into() }],
+        };
+
+        store.attach_to_fragment(&program, &mut fragment).unwrap();
+
+        assert!(matches!(fragment.effects.last(), Some(UiEffect::DataGridFrame { declaration, frame })
+            if declaration.node_key == "assets" && frame.window_rows[0].cells["name"].display.id == 101));
+        fragment.validate().unwrap();
     }
 
     #[test]

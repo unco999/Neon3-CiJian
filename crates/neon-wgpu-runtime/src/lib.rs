@@ -1,7 +1,7 @@
 //! Command handling and window/GPU bootstrap for Neon3's sole renderer owner.
 //! No other Neon3 crate may initialize window or GPU objects.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use std::{collections::HashMap, net::SocketAddr, thread};
 use std::sync::{Arc, Mutex};
 
@@ -16,7 +16,7 @@ use neon_protocol::{
 };
 use neon_ui_schema::{
     UiBounds, UiCommand, UiFragment, UiFragmentId, UiNode, UiNodeKind, UiStyle, UiTransition,
-    UiTransitionState, UiSemanticEvent,
+    UiDataGridWindowRequest, UiTransitionState, UiSemanticEvent,
 };
 #[cfg(test)]
 use neon_ui_schema::UiFragmentSubmission;
@@ -24,8 +24,8 @@ use serde_json::{Value, json};
 use winit::{
     application::ApplicationHandler,
     dpi::{PhysicalPosition, PhysicalSize},
-    event::{ElementState, WindowEvent},
-    event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy},
+    event::{ElementState, MouseScrollDelta, WindowEvent},
+    event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy},
     keyboard::{Key, NamedKey},
     window::{Window, WindowId},
 };
@@ -48,6 +48,33 @@ pub const CAPABILITY_AI_TERRAIN_GENERATION: &str = "wgpu.ai.terrain_generation.v
 pub const UI_HIT_TARGET: &str = "ui.hit_id.v1";
 pub const UI_COLOR_TARGET: &str = "ui.color.v1";
 pub const RENDER_HIT_NONE: u32 = u32::MAX;
+const DATA_GRID_WINDOW_DEBOUNCE: Duration = Duration::from_millis(24);
+
+/// Retains only the newest local viewport demand for each virtual grid. The
+/// renderer dispatches these after a short debounce, never per wheel event.
+#[derive(Default)]
+struct LatestDataGridWindowRequests {
+    pending: HashMap<String, (Instant, UiDataGridWindowRequest)>,
+}
+
+impl LatestDataGridWindowRequests {
+    fn schedule(&mut self, request: UiDataGridWindowRequest, now: Instant) {
+        let key = format!("{}/{}", request.fragment.id.0, request.data_grid_key);
+        self.pending.insert(key, (now, request));
+    }
+
+    fn take_ready(&mut self, now: Instant) -> Vec<UiDataGridWindowRequest> {
+        let ready = self.pending.iter()
+            .filter(|(_, (scheduled, _))| now.duration_since(*scheduled) >= DATA_GRID_WINDOW_DEBOUNCE)
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        ready.into_iter().filter_map(|key| self.pending.remove(&key).map(|(_, request)| request)).collect()
+    }
+
+    fn next_deadline(&self) -> Option<Instant> {
+        self.pending.values().map(|(scheduled, _)| *scheduled + DATA_GRID_WINDOW_DEBOUNCE).min()
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum UiResourceState { Loading, Ready, Failed }
@@ -154,6 +181,8 @@ pub struct WindowedRuntime {
     pending_composition_ack: Option<std::sync::mpsc::Sender<()>>,
     ui_endpoint: Option<SocketAddr>,
     pointer_delivery: Arc<Mutex<Value>>,
+    data_grid_window_requests: LatestDataGridWindowRequests,
+    next_data_grid_window_sequence: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -223,6 +252,8 @@ impl WindowedRuntime {
             pending_composition_ack: None,
             ui_endpoint: None,
             pointer_delivery: Arc::new(Mutex::new(json!({"state": "none"}))),
+            data_grid_window_requests: LatestDataGridWindowRequests::default(),
+            next_data_grid_window_sequence: 0,
         }
     }
 
@@ -440,6 +471,26 @@ impl WindowedRuntime {
             gpu.hit_target_dirty = true;
         }
         true
+    }
+
+    fn schedule_data_grid_window_requests(&mut self) {
+        let requests = self.gpu.as_ref().map(|gpu| gpu.ui.data_grid_window_requests(
+            &self.fragments,
+            self.epoch,
+            self.applied_composition_revision,
+            &mut self.next_data_grid_window_sequence,
+        )).unwrap_or_default();
+        let now = Instant::now();
+        for request in requests {
+            self.data_grid_window_requests.schedule(request, now);
+        }
+    }
+
+    fn dispatch_ready_data_grid_window_requests(&mut self) {
+        let Some(endpoint) = self.ui_endpoint else { return; };
+        for request in self.data_grid_window_requests.take_ready(Instant::now()) {
+            forward_data_grid_window_request(endpoint, request);
+        }
     }
 
     fn needs_redraw(&self) -> bool {
@@ -772,6 +823,30 @@ fn forward_drag_drop(
     });
 }
 
+fn forward_data_grid_window_request(endpoint: SocketAddr, window_request: UiDataGridWindowRequest) {
+    thread::spawn(move || {
+        let request = RpcRequest {
+            protocol: "neon3.rpc".into(), version: PROTOCOL_VERSION,
+            request_id: RequestId(format!("wgpu-data-grid-window-{}", window_request.sequence)),
+            client: ClientIdentity {
+                kind: ClientKind::WgpuRuntime,
+                instance_id: format!("window-{}", window_request.renderer_epoch),
+                pid: std::process::id(),
+                origin: "neon-wgpu-runtime".into(),
+            },
+            target: ServiceName("ui-runtime".into()),
+            method: "ui.data_grid.window.request".into(),
+            expected_revision: Some(window_request.fragment.revision),
+            idempotency_key: Some(format!(
+                "wgpu-data-grid-window:{}:{}:{}",
+                window_request.fragment.id.0, window_request.data_grid_key, window_request.sequence,
+            )),
+            params: json!(window_request),
+        };
+        let _ = RpcClient::connect(endpoint).and_then(|mut client| client.call(&request));
+    });
+}
+
 impl ApplicationHandler<WindowCommand> for WindowedRuntime {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_none()
@@ -795,6 +870,7 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => self.resize(size),
             WindowEvent::CursorMoved { position, .. } => {
+                let mut scroll_changed = false;
                 if let Some(gpu) = self.gpu.as_mut() {
                     gpu.ui
                         .set_pointer_position([position.x as f32, position.y as f32]);
@@ -802,10 +878,21 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                         gpu.ui.set_text_input_caret_from_pointer([position.x as f32, position.y as f32], true);
                     }
                     if gpu.ui.drag_active() { gpu.ui.update_drag_preview(); }
+                    scroll_changed = gpu.ui.update_scroll_drag() || gpu.ui.update_scroll_pan();
+                    if scroll_changed { self.redraw_pending = true; }
                     gpu.ui.update_value_gesture();
                     let x = position.x.max(0.0).min(gpu.config.width.saturating_sub(1) as f64) as u32;
                     let y = position.y.max(0.0).min(gpu.config.height.saturating_sub(1) as f64) as u32;
                     gpu.pending_hit_pixel = Some([x, y]);
+                    self.redraw_pending = true;
+                }
+                if scroll_changed { self.schedule_data_grid_window_requests(); }
+            }
+            WindowEvent::MouseInput { state, button, .. }
+                if state == winit::event::ElementState::Pressed
+                    && button == winit::event::MouseButton::Middle =>
+            {
+                if self.gpu.as_mut().is_some_and(|gpu| gpu.ui.begin_scroll_pan_at_pointer()) {
                     self.redraw_pending = true;
                 }
             }
@@ -823,6 +910,10 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                     true
                 });
                 if modal_consumed {
+                    self.redraw_pending = true;
+                    return;
+                }
+                if self.gpu.as_mut().is_some_and(|gpu| gpu.ui.begin_scroll_drag_at_pointer()) {
                     self.redraw_pending = true;
                     return;
                 }
@@ -906,8 +997,26 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
             }
             WindowEvent::MouseInput { state, button, .. }
                 if state == winit::event::ElementState::Released
+                    && button == winit::event::MouseButton::Middle =>
+            {
+                if let Some(gpu) = self.gpu.as_mut() {
+                    if gpu.ui.scroll_pan_active() {
+                        gpu.ui.end_scroll_pan();
+                        self.redraw_pending = true;
+                    }
+                }
+            }
+            WindowEvent::MouseInput { state, button, .. }
+                if state == winit::event::ElementState::Released
                     && button == winit::event::MouseButton::Left =>
             {
+                if let Some(gpu) = self.gpu.as_mut()
+                    && gpu.ui.scroll_drag_active()
+                {
+                    gpu.ui.end_scroll_drag();
+                    self.redraw_pending = true;
+                    return;
+                }
                 if let Some(gpu) = self.gpu.as_mut() { gpu.text_selection_drag = false; }
                 let drag = self.gpu.as_mut().and_then(|gpu| {
                     if !gpu.ui.drag_active() { return None; }
@@ -962,6 +1071,24 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                         control_value,
                         self.pointer_delivery.clone(),
                     );
+                }
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                let delta = match delta {
+                    MouseScrollDelta::LineDelta(x, y) => [x * 24.0, y * 24.0],
+                    MouseScrollDelta::PixelDelta(position) => [position.x as f32, position.y as f32],
+                };
+                let scrolled = self.gpu.as_mut().is_some_and(|gpu| {
+                    let delta = if gpu.shift_down {
+                        [delta[0] + delta[1], 0.0]
+                    } else {
+                        delta
+                    };
+                    gpu.ui.scroll_wheel_at_pointer(delta)
+                });
+                if scrolled {
+                    self.redraw_pending = true;
+                    self.schedule_data_grid_window_requests();
                 }
             }
             WindowEvent::Ime(winit::event::Ime::Enabled) => {
@@ -1022,7 +1149,7 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                 if let Some(gpu) = self.gpu.as_mut() { gpu.shift_down = modifiers.state().shift_key(); }
             }
             WindowEvent::Focused(false) => {
-                if let Some(gpu) = self.gpu.as_mut() { gpu.ui.clear_text_focus(); gpu.ui.cancel_drag(); gpu.ui.cancel_value_gesture(); gpu.captured_binding = None; gpu.pending_control_value = None; gpu.input.cancel(); self.redraw_pending = true; }
+                if let Some(gpu) = self.gpu.as_mut() { gpu.ui.clear_text_focus(); gpu.ui.cancel_drag(); gpu.ui.cancel_value_gesture(); gpu.ui.end_scroll_pan(); gpu.captured_binding = None; gpu.pending_control_value = None; gpu.input.cancel(); self.redraw_pending = true; }
             }
             WindowEvent::RedrawRequested => {
                 if let Err(error) = self.redraw() {
@@ -1069,7 +1196,11 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        self.dispatch_ready_data_grid_window_requests();
+        if let Some(deadline) = self.data_grid_window_requests.next_deadline() {
+            event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
+        }
         if let Some(window) = self.window.as_ref()
             && self.needs_redraw()
         {
@@ -1990,6 +2121,29 @@ mod tests {
             expected_revision: None,
             idempotency_key: None,
         }
+    }
+
+    #[test]
+    fn data_grid_window_scheduler_coalesces_to_the_latest_request() {
+        let now = Instant::now();
+        let base = UiDataGridWindowRequest {
+            renderer_epoch: 1,
+            composition_revision: Revision(4),
+            fragment: neon_ui_schema::UiFragmentRevision { id: UiFragmentId("virtual-list".into()), revision: Revision(2) },
+            data_grid_key: "virtual-list".into(), expected_list_revision: Revision(1),
+            requested_first_row: 8, max_window_rows: 12, sequence: 1,
+        };
+        let mut latest = LatestDataGridWindowRequests::default();
+        latest.schedule(base.clone(), now);
+        let mut replacement = base;
+        replacement.requested_first_row = 80;
+        replacement.sequence = 2;
+        latest.schedule(replacement, now + Duration::from_millis(5));
+        assert!(latest.take_ready(now + Duration::from_millis(24)).is_empty());
+        let ready = latest.take_ready(now + Duration::from_millis(29));
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].requested_first_row, 80);
+        assert_eq!(ready[0].sequence, 2);
     }
 
     fn test_device(label: &'static str) -> (wgpu::Device, wgpu::Queue) {

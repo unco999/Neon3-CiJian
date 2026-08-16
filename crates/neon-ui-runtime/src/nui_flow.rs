@@ -13,7 +13,8 @@ use neon_ui_schema::{
     UiIrPatchOperationKind, UiJustifyContent, UiLayout, UiLayoutMode, UiNode, UiNodeId, UiNodeKind,
     RenderSurfaceRef, UiProgramEventDeclaration, UiResourceBudget, UiSourceSpan, UiStyle,
     UiSurfaceId, UiProgram, UiProgramRevision, UiBranchDeclaration, UiBranchPredicate,
-    UiBranchLayoutParticipation, UiTemplateDeclaration, UiDataGridDeclaration,
+    UiBranchLayoutParticipation, UiTemplateDeclaration, UiDataGridDeclaration, UiDataGridColumn,
+    UiDataGridPresentation,
     NuiFlowStateMachine, NuiFlowStateTransition, NuiFlowStateTrigger,
     NuiFlowDragAxis, NuiFlowDragDeclaration, UiDragAxis, UiDragBinding, UiDragBoundary, UiDropBinding, UiEffect, UiIntent,
     NuiFlowDropDeclaration, UiClipPolicy, UiDropPlacement,
@@ -167,8 +168,8 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
         if let Some(template) = &node.template {
             templates.push(UiTemplateDeclaration { template_key: node.node.node_id.0.clone(), root_node_key: node.node.node_id.0.clone(), max_instances: template.0, row_schema: template.1.clone(), instance_key_field: template.2.clone(), overflow_summary: template.3 });
         }
-        if let Some(max_window_rows) = node.data_grid_capacity {
-            data_grids.push(UiDataGridDeclaration { node_key: node.node.node_id.0.clone(), max_window_rows });
+        if let Some(ref grid) = node.data_grid {
+            data_grids.push(UiDataGridDeclaration { node_key: node.node.node_id.0.clone(), ..grid.clone() });
         }
         stack.push((indent, node));
     }
@@ -592,7 +593,7 @@ struct NodeBuild {
     intents: Vec<String>,
     branch_predicate: Option<UiBranchPredicate>,
     template: Option<(u32, BTreeMap<String, UiInputKind>, String, bool)>,
-    data_grid_capacity: Option<u32>,
+    data_grid: Option<UiDataGridDeclaration>,
 }
 
 fn parse_header(text: &str, header: &mut Header, line: u32) -> FlowResult<bool> {
@@ -972,6 +973,9 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
     let mut branch_predicate = None;
     let mut template = None;
     let mut data_grid_capacity = None;
+    let mut data_grid_row_height = None;
+    let mut data_grid_overscan = None;
+    let mut data_grid_columns = None;
     let mut used = HashSet::new();
     let mut index = 2;
     while index < parts.len() {
@@ -988,7 +992,7 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
             "row" => node.layout.as_mut().unwrap().mode = UiLayoutMode::Row,
             "column" => node.layout.as_mut().unwrap().mode = UiLayoutMode::Column,
             "overlay" => node.layout.as_mut().unwrap().mode = UiLayoutMode::Overlay,
-            "w" | "h" | "minw" | "maxw" | "grow" | "shrink" | "basis" | "gap" | "pad" | "fill"
+            "x" | "y" | "w" | "h" | "minw" | "maxw" | "grow" | "shrink" | "basis" | "gap" | "pad" | "fill"
              | "line" | "ink" | "value" | "checked" | "selected" | "state" | "numeric" | "scroll" | "enabled" | "visible" | "event" | "token" | "align" | "clip"
             | "justify" => {
                 let value = *parts.get(index + 1).ok_or_else(|| {
@@ -1027,6 +1031,25 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
                 if capacity == 0 { return Err(error("nui_flow_invalid_data_grid", "DataGrid capacity must be positive", line, 1)); }
                 data_grid_capacity = Some(capacity);
             }
+            "row_height" if parts[0] == "data_grid" => {
+                let value = *parts.get(index + 1).ok_or_else(|| error("nui_flow_missing_value", "row_height requires a positive pixel value", line, 1))?;
+                index += 1;
+                let height = u32::try_from(parse_u64(value, line, "row_height")?)
+                    .map_err(|_| error("nui_flow_invalid_data_grid", "DataGrid row_height exceeds u32", line, 1))?;
+                if height == 0 { return Err(error("nui_flow_invalid_data_grid", "DataGrid row_height must be positive", line, 1)); }
+                data_grid_row_height = Some(height);
+            }
+            "overscan" if parts[0] == "data_grid" => {
+                let value = *parts.get(index + 1).ok_or_else(|| error("nui_flow_missing_value", "overscan requires a nonnegative bound", line, 1))?;
+                index += 1;
+                data_grid_overscan = Some(u32::try_from(parse_u64(value, line, "overscan")?)
+                    .map_err(|_| error("nui_flow_invalid_data_grid", "DataGrid overscan exceeds u32", line, 1))?);
+            }
+            "columns" if parts[0] == "data_grid" => {
+                let value = *parts.get(index + 1).ok_or_else(|| error("nui_flow_missing_value", "columns requires a quoted key:width list", line, 1))?;
+                index += 1;
+                data_grid_columns = Some(parse_data_grid_columns(&quoted(value, line)?, line)?);
+            }
             "key" if matches!(parts[0], "repeat" | "template") => {
                 let value = *parts.get(index + 1).ok_or_else(|| error("nui_flow_missing_value", "key requires a row key field", line, 1))?;
                 index += 1;
@@ -1056,8 +1079,73 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
         let Some(spec) = &template else { return Err(error("ui_program_invalid_branch_template", "repeat/template requires a finite capacity", line, 1)); };
         if spec.2.trim().is_empty() { return Err(error("ui_program_invalid_branch_template", "repeat/template requires a stable key field", line, 1)); }
     }
-    if parts[0] == "data_grid" && data_grid_capacity.is_none() { return Err(error("nui_flow_invalid_data_grid", "DataGrid requires a finite capacity", line, 1)); }
-    Ok(NodeBuild { node, bindings, intents, branch_predicate, template, data_grid_capacity })
+    let data_grid = if parts[0] == "data_grid" {
+        let capacity = data_grid_capacity.ok_or_else(|| error("nui_flow_invalid_data_grid", "DataGrid requires a finite capacity", line, 1))?;
+        let overscan = data_grid_overscan.unwrap_or(0);
+        if overscan > capacity { return Err(error("nui_flow_invalid_data_grid", "DataGrid overscan cannot exceed capacity", line, 1)); }
+        Some(UiDataGridDeclaration {
+            node_key: String::new(),
+            max_window_rows: capacity,
+            row_height: data_grid_row_height.unwrap_or(24),
+            overscan,
+            columns: data_grid_columns.unwrap_or_else(|| vec![UiDataGridColumn { key: "value".into(), label: "Value".into(), width: 1, presentation: UiDataGridPresentation::Text }]),
+        })
+    } else { None };
+    Ok(NodeBuild { node, bindings, intents, branch_predicate, template, data_grid })
+}
+
+fn parse_data_grid_columns(value: &str, line: u32) -> FlowResult<Vec<UiDataGridColumn>> {
+    if value.is_empty() { return Err(error("nui_flow_invalid_data_grid", "DataGrid columns cannot be empty", line, 1)); }
+    let mut columns = Vec::new();
+    let mut keys = HashSet::new();
+    for entry in value.split(',') {
+        let parts = entry.split(':').collect::<Vec<_>>();
+        if parts.len() < 2 {
+            return Err(error("nui_flow_invalid_data_grid", "DataGrid columns use key:width[:presentation]", line, 1));
+        }
+        let key = parts[0];
+        let width = parts[1];
+        if !valid_key(key) || !keys.insert(key) { return Err(error("nui_flow_invalid_data_grid", "DataGrid column keys must be valid and unique", line, 1)); }
+        let width = u32::try_from(width.parse::<u64>().map_err(|_| error("nui_flow_invalid_data_grid", "DataGrid column width must be a positive integer", line, 1))?)
+            .map_err(|_| error("nui_flow_invalid_data_grid", "DataGrid column width exceeds u32", line, 1))?;
+        if width == 0 { return Err(error("nui_flow_invalid_data_grid", "DataGrid column width must be positive", line, 1)); }
+        let presentation = match parts.get(2).copied() {
+            None | Some("text") if parts.len() <= 3 => UiDataGridPresentation::Text,
+            Some("select") if parts.len() == 4 => UiDataGridPresentation::Select { intent: parse_data_grid_token(parts[3], line, "select intent")? },
+            Some("dropdown") if parts.len() == 5 => UiDataGridPresentation::Dropdown {
+                options: parse_data_grid_options(parts[3], line)?,
+                intent: parse_data_grid_token(parts[4], line, "dropdown intent")?,
+            },
+            Some("edit") if parts.len() == 5 => UiDataGridPresentation::Edit {
+                max_chars: parse_data_grid_max_chars(parts[3], line)?,
+                intent: parse_data_grid_token(parts[4], line, "edit intent")?,
+            },
+            _ => return Err(error("nui_flow_invalid_data_grid", "invalid DataGrid column presentation grammar", line, 1)),
+        };
+        columns.push(UiDataGridColumn { key: key.into(), label: key.replace('_', " "), width, presentation });
+    }
+    Ok(columns)
+}
+
+fn parse_data_grid_token(value: &str, line: u32, name: &str) -> FlowResult<String> {
+    if value.is_empty() || value.contains('|') || !valid_key(value) {
+        return Err(error("nui_flow_invalid_data_grid", &format!("DataGrid {name} must be a valid token"), line, 1));
+    }
+    Ok(value.into())
+}
+
+fn parse_data_grid_options(value: &str, line: u32) -> FlowResult<Vec<String>> {
+    let options = value.split('|').map(str::to_owned).collect::<Vec<_>>();
+    if options.is_empty() || options.iter().any(|option| option.trim().is_empty()) || options.iter().collect::<HashSet<_>>().len() != options.len() {
+        return Err(error("nui_flow_invalid_data_grid", "DataGrid dropdown options must be nonempty and unique", line, 1));
+    }
+    Ok(options)
+}
+
+fn parse_data_grid_max_chars(value: &str, line: u32) -> FlowResult<u32> {
+    let max_chars = value.parse::<u64>().ok().and_then(|value| u32::try_from(value).ok()).unwrap_or(0);
+    if max_chars == 0 { return Err(error("nui_flow_invalid_data_grid", "DataGrid edit max_chars must be positive", line, 1)); }
+    Ok(max_chars)
 }
 
 fn parse_branch_predicate(value: &str, line: u32) -> FlowResult<UiBranchPredicate> {
@@ -1097,6 +1185,8 @@ fn parse_attribute(
             .map(|input| bindings.push((property, input.into())))
     };
     match key {
+        "x" => node.bounds.x = number(value, line)?,
+        "y" => node.bounds.y = number(value, line)?,
         "w" => node.bounds.width = number(value, line)?,
         "h" => node.bounds.height = number(value, line)?,
         "minw" => {
@@ -1500,9 +1590,13 @@ fn format_node(
         UiNodeKind::RenderSurface => "render",
     };
     let mut line = format!("{}{} {}", " ".repeat(indent), kind, node.node_id.0);
+    if node.bounds.x != 0.0 { line.push_str(&format!(" x {}", node.bounds.x)); }
+    if node.bounds.y != 0.0 { line.push_str(&format!(" y {}", node.bounds.y)); }
     if node.kind == UiNodeKind::DataGrid {
         if let Some(grid) = data_grids.iter().find(|grid| grid.node_key == node.node_id.0) {
-            line.push_str(&format!(" capacity {}", grid.max_window_rows));
+            line.push_str(&format!(" capacity {} row_height {} overscan {} columns \"{}\"",
+                grid.max_window_rows, grid.row_height, grid.overscan,
+                grid.columns.iter().map(format_data_grid_column).collect::<Vec<_>>().join(",")));
         }
     }
     if let Some(layout) = node.layout {
@@ -1553,6 +1647,15 @@ fn format_node(
     lines.push(line);
     for child in &node.children {
         format_node(child, indent + 2, bindings, events, data_grids, lines);
+    }
+}
+
+fn format_data_grid_column(column: &UiDataGridColumn) -> String {
+    match &column.presentation {
+        UiDataGridPresentation::Text => format!("{}:{}", column.key, column.width),
+        UiDataGridPresentation::Select { intent } => format!("{}:{}:select:{}", column.key, column.width, intent),
+        UiDataGridPresentation::Dropdown { options, intent } => format!("{}:{}:dropdown:{}:{}", column.key, column.width, options.join("|"), intent),
+        UiDataGridPresentation::Edit { max_chars, intent } => format!("{}:{}:edit:{}:{}", column.key, column.width, max_chars, intent),
     }
 }
 
@@ -1841,6 +1944,38 @@ panel workspace row gap 8
     fn rejects_forbidden_script_syntax() {
         let error = parse_nui_flow("panel root { eval() }").unwrap_err();
         assert_eq!(error.diagnostics[0].code, "ui_program_forbidden_flow_feature");
+    }
+
+    #[test]
+    fn data_grid_full_declaration_round_trips_typed_columns() {
+        let source = "surface root\n  data_grid assets capacity 64 row_height 28 overscan 3 columns \"Name:240,Status:120\"\n";
+        let document = parse_nui_flow(source).unwrap();
+        let grid = &document.ir.data_grids[0];
+        assert_eq!(grid.row_height, 28);
+        assert_eq!(grid.overscan, 3);
+        assert_eq!(grid.columns[0], UiDataGridColumn { key: "Name".into(), label: "Name".into(), width: 240, presentation: UiDataGridPresentation::Text });
+        assert_eq!(grid.columns[1].key, "Status");
+        let formatted = format_nui_flow(source).unwrap();
+        assert!(formatted.contains("row_height 28 overscan 3 columns \"Name:240,Status:120\""));
+    }
+
+    #[test]
+    fn data_grid_columns_are_strict() {
+        for columns in ["Name", "Name:0", "Name:20,Name:30", "Name:-1", "Name:20:select", "Name:20:dropdown::set", "Name:20:dropdown: |a:set", "Name:20:dropdown:a|a:set", "Name:20:edit:0:set", "Name:20:unknown"] {
+            let error = parse_nui_flow(&format!("surface root\n  data_grid assets capacity 2 columns \"{columns}\"\n")).unwrap_err();
+            assert_eq!(error.diagnostics[0].code, "nui_flow_invalid_data_grid");
+        }
+    }
+
+    #[test]
+    fn data_grid_columns_parse_presentations_and_format_deterministically() {
+        let source = "surface root\n  data_grid assets capacity 2 columns \"Name:240:text,State:120:select:asset.state.select,Owner:160:dropdown:me|team:asset.owner.select,Notes:280:edit:128:asset.notes.edit\"\n";
+        let document = parse_nui_flow(source).unwrap();
+        assert_eq!(document.ir.data_grids[0].columns[1].presentation, UiDataGridPresentation::Select { intent: "asset.state.select".into() });
+        assert_eq!(document.ir.data_grids[0].columns[2].presentation, UiDataGridPresentation::Dropdown { options: vec!["me".into(), "team".into()], intent: "asset.owner.select".into() });
+        assert_eq!(document.ir.data_grids[0].columns[3].presentation, UiDataGridPresentation::Edit { max_chars: 128, intent: "asset.notes.edit".into() });
+        let formatted = format_nui_flow(source).unwrap();
+        assert!(formatted.contains("Name:240,State:120:select:asset.state.select,Owner:160:dropdown:me|team:asset.owner.select,Notes:280:edit:128:asset.notes.edit"));
     }
 
     #[test]

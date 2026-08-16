@@ -555,6 +555,7 @@ pub enum UiEffect {
     SemanticIntent { intent: UiIntent },
     BoundSemanticIntent { node_id: UiNodeId, intent: UiIntent },
     ControlPresentation { node_id: UiNodeId, state: UiControlPresentation },
+    DataGridFrame { declaration: UiDataGridDeclaration, frame: UiDataGridFrame },
     DragBinding { binding: UiDragBinding },
     DropBinding { binding: UiDropBinding },
 }
@@ -867,20 +868,153 @@ pub struct UiRepeatFrame { pub template_key: String, pub list_revision: Revision
 /// Declarative bound for one virtualized grid viewport. The grid node owns its
 /// stable key; a frame can replace only the currently visible row window.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum UiDataGridPresentation {
+    Text,
+    Select { intent: String },
+    Dropdown { options: Vec<String>, intent: String },
+    Edit { max_chars: u32, intent: String },
+}
+
+impl Default for UiDataGridPresentation {
+    fn default() -> Self { Self::Text }
+}
+
+impl UiDataGridPresentation {
+    pub fn validate(&self) -> bool {
+        match self {
+            Self::Text => true,
+            Self::Select { intent } => !intent.trim().is_empty(),
+            Self::Dropdown { options, intent } => valid_data_grid_options(options) && !intent.trim().is_empty(),
+            Self::Edit { max_chars, intent } => *max_chars > 0 && !intent.trim().is_empty(),
+        }
+    }
+}
+
+impl UiDataGridColumn {
+    pub fn validate(&self) -> bool {
+        !self.key.trim().is_empty()
+            && !self.label.trim().is_empty()
+            && self.width > 0
+            && self.presentation.validate()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum UiDataGridCellPresentation {
+    Text,
+    Dropdown { options: Vec<String> },
+    Edit { max_chars: u32 },
+}
+
+impl UiDataGridCellPresentation {
+    pub fn validate(&self) -> bool {
+        match self {
+            Self::Text => true,
+            Self::Dropdown { options } => valid_data_grid_options(options),
+            Self::Edit { max_chars } => *max_chars > 0,
+        }
+    }
+}
+
+fn valid_data_grid_options(options: &[String]) -> bool {
+    !options.is_empty()
+        && options.iter().all(|option| !option.trim().is_empty())
+        && options.iter().collect::<std::collections::HashSet<_>>().len() == options.len()
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct UiDataGridDeclaration { pub node_key: String, pub max_window_rows: u32 }
+pub struct UiDataGridColumn {
+    pub key: String,
+    pub label: String,
+    pub width: u32,
+    #[serde(default)]
+    pub presentation: UiDataGridPresentation,
+}
+
+/// Declarative geometry and bounded data contract for one virtual grid.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiDataGridDeclaration {
+    pub node_key: String,
+    pub max_window_rows: u32,
+    pub row_height: u32,
+    pub overscan: u32,
+    pub columns: Vec<UiDataGridColumn>,
+}
+
+impl UiDataGridDeclaration {
+    pub fn validate(&self) -> bool {
+        self.node_key.trim() != ""
+            && self.max_window_rows > 0
+            && self.row_height > 0
+            && self.overscan <= self.max_window_rows
+            && !self.columns.is_empty()
+            && self.columns.iter().all(UiDataGridColumn::validate)
+            && self.columns.iter().map(|column| &column.key).collect::<std::collections::HashSet<_>>().len() == self.columns.len()
+    }
+}
 
 /// One domain-prepared row in a virtual grid window. Its key is stable across
 /// window changes; row position is deliberately not an identity.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct UiDataGridWindowRow { pub stable_row_key: String }
+ pub struct UiDataGridWindowRow {
+     pub stable_row_key: String,
+     pub cells: std::collections::BTreeMap<String, UiDataGridCell>,
+ }
+
+/// A bounded cell contains a typed domain value and its domain-provided display
+/// handle. The UI runtime never formats or derives either value.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiDataGridCell {
+    pub value: UiInputValue,
+    pub display: UiTextHandle,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presentation_override: Option<UiDataGridCellPresentation>,
+}
+
+impl UiDataGridCell {
+    pub fn validate(&self) -> bool {
+        data_grid_value_is_valid(&self.value)
+            && self.presentation_override.as_ref().is_none_or(UiDataGridCellPresentation::validate)
+    }
+}
+
+fn data_grid_value_is_valid(value: &UiInputValue) -> bool {
+    match value {
+        UiInputValue::F32 { value } => value.is_finite(),
+        UiInputValue::Vec2 { value } => value.iter().all(|value| value.is_finite()),
+        UiInputValue::Vec4 { value } | UiInputValue::Color { value } => value.iter().all(|value| value.is_finite()),
+        UiInputValue::Enum { value } => !value.trim().is_empty(),
+        _ => true,
+    }
+}
 
 /// Revisioned bounded window for a declared virtual DataGrid. `first_row` is
 /// the zero-based logical row offset and `total_rows` is the full domain count.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+ #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+ #[serde(deny_unknown_fields)]
 pub struct UiDataGridFrame { pub data_grid_key: String, pub list_revision: Revision, pub total_rows: u64, pub first_row: u64, pub window_rows: Vec<UiDataGridWindowRow>, pub expected_program_revision: UiProgramRevision }
+
+/// Renderer-to-UI-runtime demand for a bounded replacement window. This carries
+/// only revisioned semantic identity; pointer coordinates and renderer hit IDs
+/// remain local to the renderer.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiDataGridWindowRequest {
+    pub renderer_epoch: u64,
+    pub composition_revision: Revision,
+    pub fragment: UiFragmentRevision,
+    pub data_grid_key: String,
+    pub expected_list_revision: Revision,
+    pub requested_first_row: u64,
+    pub max_window_rows: u32,
+    pub sequence: u64,
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1004,7 +1138,13 @@ pub struct UiTemplateRecord { pub template_key: String, pub node_range: Vec<Stri
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct UiDataGridRecord { pub node_key: String, pub max_window_rows: u32 }
+ pub struct UiDataGridRecord {
+     pub node_key: String,
+     pub max_window_rows: u32,
+     pub row_height: u32,
+     pub overscan: u32,
+     pub columns: Vec<UiDataGridColumn>,
+ }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1142,6 +1282,7 @@ impl UiFragment {
                 UiEffect::DragBinding { binding } if !nodes.contains(&binding.source_node_id.0) => return Err(UiSchemaError::InvalidProgramEvent),
                 UiEffect::DropBinding { binding } if !nodes.contains(&binding.target_node_id.0) || !drags.iter().any(|drag| drag.key == binding.accepts_drag_key) => return Err(UiSchemaError::InvalidProgramEvent),
                 UiEffect::ControlPresentation { node_id, .. } if !nodes.contains(&node_id.0) => return Err(UiSchemaError::InvalidProgramEvent),
+                UiEffect::DataGridFrame { declaration, frame } if !nodes.contains(&declaration.node_key) || declaration.node_key != frame.data_grid_key => return Err(UiSchemaError::InvalidProgramEvent),
                 _ => {}
             }
         }
@@ -1280,6 +1421,14 @@ impl UiEffect {
                     }
                 }
             }
+            Self::DataGridFrame { declaration, frame } => {
+                if !declaration.validate()
+                    || frame.data_grid_key != declaration.node_key
+                    || frame.window_rows.len() > declaration.max_window_rows as usize
+                    || frame.first_row.saturating_add(frame.window_rows.len() as u64) > frame.total_rows
+                    || frame.window_rows.iter().any(|row| row.cells.values().any(|cell| !cell.validate()))
+                { Err(UiSchemaError::InvalidProgramEvent) } else { Ok(()) }
+            }
             Self::DragBinding { binding } => {
                 if binding.key.trim().is_empty() || binding.source_node_id.0.trim().is_empty()
                     || !binding.snap.is_finite() || !binding.threshold.is_finite()
@@ -1328,6 +1477,21 @@ mod tests {
             serde_json::to_value(fragment).unwrap(),
             serde_json::from_str::<Value>(STATIC_FRAGMENT).unwrap()
         );
+    }
+
+    #[test]
+    fn data_grid_presentations_default_for_legacy_json_and_reject_invalid_values() {
+        let column: UiDataGridColumn = serde_json::from_value(serde_json::json!({
+            "key": "name", "label": "Name", "width": 120
+        })).unwrap();
+        assert_eq!(column.presentation, UiDataGridPresentation::Text);
+        let cell: UiDataGridCell = serde_json::from_value(serde_json::json!({
+            "value": { "kind": "i32", "value": 1 },
+            "display": { "id": 1, "generation": 1 }
+        })).unwrap();
+        assert_eq!(cell.presentation_override, None);
+        assert!(!UiDataGridPresentation::Dropdown { options: vec!["same".into(), "same".into()], intent: "set".into() }.validate());
+        assert!(!UiDataGridCellPresentation::Edit { max_chars: 0 }.validate());
     }
 
     #[test]
@@ -1710,8 +1874,15 @@ impl UiIrDocument {
         let mut data_grid_keys = std::collections::HashSet::new();
         for data_grid in &self.data_grids {
             if data_grid.node_key.trim().is_empty() || data_grid.max_window_rows == 0
+                || data_grid.row_height == 0
+                || data_grid.overscan > data_grid.max_window_rows
+                || data_grid.columns.is_empty()
                 || !data_grid_keys.insert(data_grid.node_key.clone())
                 || !matches!(find_ir_node(&self.root, &data_grid.node_key), Some(node) if node.kind == UiNodeKind::DataGrid)
+            { return Err(UiSchemaError::InvalidIrDocument); }
+            let mut column_keys = std::collections::HashSet::new();
+            if data_grid.columns.iter().any(|column| !column.validate()
+                || !column_keys.insert(&column.key))
             { return Err(UiSchemaError::InvalidIrDocument); }
         }
         let mut declared_grid_nodes = std::collections::HashSet::new();

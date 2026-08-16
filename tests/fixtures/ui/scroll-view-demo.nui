@@ -1,0 +1,13 @@
+surface scroll-view-demo column w 440 h 260 gap 8 pad 12 align stretch fill #17201E
+  text scroll-view-title h 24 value "Inspector Overflow"
+  scroll properties-scroll column h 192 gap 6 pad 8 align stretch fill #22302D
+    text property-01 h 24 value "Material: Oak Veneer"
+    text property-02 h 24 value "Category: Surface"
+    text property-03 h 24 value "Roughness: 0.42"
+    text property-04 h 24 value "Metallic: 0.00"
+    text property-05 h 24 value "Opacity: 1.00"
+    text property-06 h 24 value "Normal Map: Enabled"
+    text property-07 h 24 value "Scale: 2.00 m"
+    text property-08 h 24 value "Revision: 14"
+    text property-09 h 24 value "Author: Studio"
+    text property-10 h 24 value "Last Import: Today"
