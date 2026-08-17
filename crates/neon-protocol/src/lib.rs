@@ -58,6 +58,12 @@ pub struct InteractionId(pub String);
 pub enum InteractionTraceStage {
     Prepared,
     HitCaptureResolved,
+    DragStarted,
+    DragPreviewMoved,
+    DropTargetResolved,
+    DropTargetRejected,
+    DragReleased,
+    DragCancelled,
     SemanticEventForwarded,
     InboundReceived,
     AdapterValidationAccepted,
@@ -108,7 +114,11 @@ pub struct InteractionTraceRecord {
     pub stage: InteractionTraceStage,
     pub outcome: InteractionTraceOutcome,
     pub error: Option<InteractionTraceError>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_source_key: Option<String>,
     pub semantic_target: Option<InteractionSemanticTarget>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_intent: Option<String>,
     pub fragment_revision: Option<Revision>,
     pub composition_revision: Revision,
     pub downstream_request_id: Option<RequestId>,
@@ -120,6 +130,7 @@ pub struct InteractionTraceFilters {
     pub interaction_id: Option<InteractionId>,
     pub stage: Option<InteractionTraceStage>,
     pub outcome: Option<InteractionTraceOutcome>,
+    pub semantic_source_key: Option<String>,
     pub semantic_node_path: Option<String>,
     pub downstream_request_id: Option<RequestId>,
 }

@@ -23,7 +23,8 @@ use serde_json::{Value, json};
 
 use crate::{
     UiInputStore, UiInputStoreError, UiInputWriter, UiProgramSemanticEventRouter,
-    compile_nui_flow_program, host_adapter::UiHostAdapterConfig, parse_nui_flow,
+    compile_nui_flow_program, host_adapter::UiHostAdapterConfig, instantiate_ui_template,
+    parse_nui_flow,
 };
 
 /// Generic controlled-input demo domain. It resolves the slot from the program
@@ -136,6 +137,10 @@ impl DemoInputDomain {
     /// Runs the component-gallery program through the generic UI host boundary.
     /// It owns only typed inputs and bounded DataGrid frames.
     pub fn serve_component_gallery(endpoint: SocketAddr) -> Result<(), TransportError> {
+        Self::serve_component_gallery_server(RpcServer::bind(endpoint)?)
+    }
+
+    fn serve_component_gallery_server(server: RpcServer) -> Result<(), TransportError> {
         let (document, program) = component_gallery_program()
             .map_err(|error| TransportError::Io(std::io::Error::other(error)))?;
         let input_schema = document.input_schema.clone();
@@ -144,27 +149,28 @@ impl DemoInputDomain {
         let mut router =
             UiProgramSemanticEventRouter::new(program.clone(), domain.snapshot().inputs, 1);
         let mut grid = DemoDragDropDomain::new();
-        let grid_max_window_rows = program
+        let grid_record = program
             .data_grid_records
             .iter()
             .find(|record| record.source_key == "asset_window")
-            .map(|record| record.max_window_rows)
+            .cloned()
             .ok_or_else(|| {
                 TransportError::Io(std::io::Error::other(
                     "component gallery DataGrid declaration is missing",
                 ))
             })?;
-        let mut active_grid = None;
-        // The demo inventory adapter owns accepted presentation revisions. The
-        // renderer only supplies generic declared drag/drop identities.
-        let mut gallery_fragment = UiFragment {
-            fragment_id: neon_ui_schema::UiFragmentId("component-gallery-host".into()),
-            revision: Revision(1),
-            root: document.ir.root.clone(),
-            effects: crate::lower_nui_flow_effects(&document),
-        };
-        apply_visible_status_to_fragment(&mut gallery_fragment, &domain.snapshot());
-        let server = RpcServer::bind(endpoint)?;
+        let grid_max_window_rows = grid_record.max_window_rows;
+        let declared_grid_columns = grid_record
+            .columns
+            .iter()
+            .map(|column| column.key.as_str())
+            .collect::<Vec<_>>();
+        let mut active_grid = Some(grid.virtual_list_window_frame(
+            0,
+            grid_max_window_rows,
+            program.revision.clone(),
+            &declared_grid_columns,
+        ));
         server.serve_until(|request| {
             let shutdown = request.method == "service.shutdown";
             let response = if shutdown {
@@ -243,16 +249,17 @@ impl DemoInputDomain {
                             None => rejected(request, Some(grid.virtual_list_revision), "data_grid_cell_rejected", "DataGrid cell mutation was rejected"),
                         }
                     }
-                    Ok(UiHostInbound::DragDrop { event }) => {
+                    Ok(UiHostInbound::DragDrop { event, active_fragment }) => {
                         let before = domain.snapshot().inputs.input_revision;
+                        let active_fragment = active_fragment.into_fragment();
                         let semantic_event = UiSemanticEvent {
                             event: UiSemanticEventType::DragDrop,
                             event_id: event.event_id.clone(),
                             renderer_epoch: event.interaction.renderer_epoch,
-                            composition_revision: gallery_fragment.revision,
+                            composition_revision: active_fragment.revision,
                             fragment: neon_ui_schema::UiFragmentRevision {
-                                id: gallery_fragment.fragment_id.clone(),
-                                revision: gallery_fragment.revision,
+                                id: active_fragment.fragment_id.clone(),
+                                revision: active_fragment.revision,
                             },
                             intent: neon_ui_schema::UiIntent::Invoke { action: event.intent.clone(), params: json!({}) },
                             pointer: Some(neon_ui_schema::UiPointerMetadata { id: 0, sequence: event.interaction.sequence }),
@@ -263,9 +270,9 @@ impl DemoInputDomain {
                             drag_drop: Some(event.payload.clone()),
                         };
                         let applied = grid.handle(RpcRequest {
-                            params: json!({"event": semantic_event, "fragment": gallery_fragment}),
+                            params: json!({"event": semantic_event, "fragment": active_fragment}),
                             method: "ui.drag_drop.apply".into(),
-                            expected_revision: Some(gallery_fragment.revision),
+                            expected_revision: Some(active_fragment.revision),
                             ..request.clone()
                         });
                         let replacement = applied.result.and_then(|value| value.get("fragment").cloned())
@@ -283,21 +290,20 @@ impl DemoInputDomain {
                                         frame,
                                     });
                                 }
-                                gallery_fragment = replacement_fragment.clone();
                                 let replacement_snapshot = UiProgramInputSnapshot {
                                     scalar_inputs: domain.snapshot().inputs,
                                     grid_inputs: active_grid.clone().into_iter().map(|frame| UiDataGridInputFrame {
                                         source_key: "asset_window".into(), frame,
                                     }).collect(),
                                 };
-                                accepted(request, Some(gallery_fragment.revision), json!(UiHostPublication {
+                                accepted(request, Some(replacement_fragment.revision), json!(UiHostPublication {
                                     scalar_frame: UiInputFrame {
                                         program_revision: program.revision.clone(), expected_input_revision: before,
                                         request_id: event.request_id.clone(), idempotency_key: event.idempotency_key.clone(), changes: Vec::new(),
                                     },
                                     grid_inputs: Vec::new(),
                                     presentation_update: Some(UiHostPresentationUpdate {
-                                        expected_fragment_revision: Revision(gallery_fragment.revision.0 - 1),
+                                        expected_fragment_revision: active_fragment.revision,
                                         replacement_fragment,
                                         replacement_program: program.clone(),
                                         replacement_input_schema: input_schema.clone(),
@@ -308,7 +314,7 @@ impl DemoInputDomain {
                             None => {
                                 let message = applied.error.as_ref().map(|error| error.message.as_str())
                                     .unwrap_or("declared inventory drop was rejected by the demo adapter");
-                                rejected(request, Some(gallery_fragment.revision), "inventory_drop_rejected", message)
+                                rejected(request, Some(active_fragment.revision), "inventory_drop_rejected", message)
                             }
                         }
                     }
@@ -603,6 +609,61 @@ impl DemoDragDropDomain {
         if request.method == "service.shutdown" {
             return accepted(request, self.revision, json!({"state": "accepted"}));
         }
+        if request.method == "ui.host.adapter.get" {
+            let document = match parse_nui_flow(include_str!(
+                "../../../tests/fixtures/ui/kanban-reparent-workbench.nui"
+            )) {
+                Ok(document) => document,
+                Err(_) => {
+                    return rejected(
+                        request,
+                        self.revision,
+                        "ui_host_invalid_program",
+                        "drag/drop demo Flow is invalid",
+                    );
+                }
+            };
+            let program = match compile_nui_flow_program(
+                &document,
+                UiProgramRevision {
+                    program_id: "surface.editor.kanban.demo".into(),
+                    revision: Revision(1),
+                    schema_version: UI_PROGRAM_SCHEMA_VERSION,
+                    capabilities: [
+                        UI_PROGRAM_CAPABILITY_NAME,
+                        UI_PROGRAM_TEXT_REGISTRY_CAPABILITY_NAME,
+                        UI_PROGRAM_BOUNDED_STRUCTURE_CAPABILITY_NAME,
+                        UI_PROGRAM_SEMANTIC_EVENT_CAPABILITY_NAME,
+                    ]
+                    .into_iter()
+                    .map(|name| UiProgramCapability {
+                        name: name.into(),
+                        version: 1,
+                        owner: UiProgramCapabilityOwner::SharedContract,
+                        status: UiProgramCapabilityStatus::Supported,
+                    })
+                    .collect(),
+                },
+            ) {
+                Ok(program) => program,
+                Err(_) => {
+                    return rejected(
+                        request,
+                        self.revision,
+                        "ui_host_invalid_program",
+                        "drag/drop demo program did not compile",
+                    );
+                }
+            };
+            return accepted(
+                request,
+                self.revision,
+                json!(UiHostAdapterConfig {
+                    program,
+                    input_schema: document.input_schema,
+                }),
+            );
+        }
         if request.method == "ui.data_grid.window.request" {
             return self.handle_data_grid_window_request(request);
         }
@@ -753,12 +814,12 @@ impl DemoDragDropDomain {
         }
         let label = first_literal(&source).unwrap_or_else(|| source.node_id.0.clone());
         let next_revision = Revision(fragment.revision.0 + 1);
-        let mut representation = template;
-        namespace_node(
-            &mut representation,
+        let representation = instantiate_ui_template(
+            &template,
+            (drop.placement == UiDropPlacement::Into).then_some(target),
             &format!("{}-{}-r{}", template_key, drop.source_key, next_revision.0),
+            Some(TextRef::Literal { value: label }),
         );
-        set_first_literal(&mut representation, &label);
         remove_node(&mut fragment.root, &drop.source_key);
         fragment.effects.retain(|effect| match effect {
             UiEffect::DragBinding { binding } => binding.source_node_id.0 != drop.source_key,
@@ -1202,25 +1263,6 @@ fn first_literal(node: &UiNode) -> Option<String> {
     }
 }
 
-fn set_first_literal(node: &mut UiNode, value: &str) -> bool {
-    if matches!(node.text, Some(TextRef::Literal { .. })) {
-        node.text = Some(TextRef::Literal {
-            value: value.into(),
-        });
-        return true;
-    }
-    node.children
-        .iter_mut()
-        .any(|child| set_first_literal(child, value))
-}
-
-fn namespace_node(node: &mut UiNode, prefix: &str) {
-    node.node_id = UiNodeId(format!("{prefix}-{}", node.node_id.0));
-    for child in &mut node.children {
-        namespace_node(child, prefix);
-    }
-}
-
 fn accepted(request: RpcRequest, revision: Option<Revision>, result: Value) -> RpcResponse {
     RpcResponse {
         request_id: request.request_id,
@@ -1260,6 +1302,7 @@ mod tests {
         UiProgramSemanticEventRouter, compile_nui_flow_program, lower_nui_flow_effects,
         parse_nui_flow,
     };
+    use neon_ipc::RpcClient;
     use neon_protocol::{ClientIdentity, ClientKind, ProtocolVersion, RequestId, ServiceName};
     use neon_ui_schema::UiFragmentId;
 
@@ -1349,13 +1392,30 @@ mod tests {
             serde_json::from_value(response.result.unwrap()["fragment"].clone()).unwrap();
         assert_eq!(updated.revision, Revision(2));
         assert!(find_node(&updated.root, "backlog-card-01").is_none());
-        assert!(
-            find_node(
-                &updated.root,
-                "progress-template-backlog-card-01-r2-progress-template"
-            )
-            .is_some()
+        let target = find_node(&updated.root, "in-progress-panel").unwrap();
+        let prototype = find_node(&updated.root, "progress-template").unwrap();
+        let representation = find_node(
+            &updated.root,
+            "progress-template-backlog-card-01-r2-progress-template",
+        )
+        .unwrap();
+        assert!(!prototype.visible);
+        assert!(!prototype.enabled);
+        assert!(representation.visible);
+        assert!(representation.enabled);
+        assert_eq!(
+            target
+                .children
+                .iter()
+                .filter(|child| child.node_id == representation.node_id)
+                .count(),
+            1
         );
+        assert_eq!(
+            first_literal(representation).as_deref(),
+            Some("Card 01 / Terraform cliff")
+        );
+        updated.validate().unwrap();
     }
 
     #[test]
@@ -1530,6 +1590,85 @@ mod tests {
             frame.window_rows[0].cells["owner"].value,
             UiInputValue::Bool { value: false }
         );
+    }
+
+    #[test]
+    fn component_gallery_accepts_a_grid_cell_as_its_first_inbound_event() {
+        let server = RpcServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let endpoint = server.local_addr().unwrap();
+        let server_thread = std::thread::spawn(move || {
+            DemoInputDomain::serve_component_gallery_server(server).unwrap();
+        });
+        let (_, program) = component_gallery_program().unwrap();
+        let event = UiSemanticEvent {
+            event: UiSemanticEventType::SelectionChanged,
+            event_id: "gallery-first-grid-cell".into(),
+            renderer_epoch: 1,
+            composition_revision: Revision(1),
+            fragment: neon_ui_schema::UiFragmentRevision {
+                id: UiFragmentId("component-gallery".into()),
+                revision: Revision(1),
+            },
+            intent: neon_ui_schema::UiIntent::Invoke {
+                action: "virtual_list.owner.toggle".into(),
+                params: json!({}),
+            },
+            pointer: None,
+            focus: None,
+            data_grid_cell: Some(neon_ui_schema::UiDataGridCellTarget {
+                source_key: "asset_window".into(),
+                stable_row_key: "virtual-row-0".into(),
+                column_key: "owner".into(),
+            }),
+            text: None,
+            control_value: Some(UiSemanticPayloadValue::Bool { value: false }),
+            drag_drop: None,
+        };
+        let request = RpcRequest {
+            protocol: "neon3.rpc".into(),
+            version: ProtocolVersion { major: 1, minor: 0 },
+            request_id: RequestId("gallery-first-grid-cell".into()),
+            client: ClientIdentity {
+                kind: ClientKind::WgpuRuntime,
+                instance_id: "test-window".into(),
+                pid: 1,
+                origin: "test".into(),
+            },
+            target: ServiceName("ui-runtime".into()),
+            method: "ui.host.inbound".into(),
+            params: json!(UiHostInbound::DataGridCell { event }),
+            expected_revision: Some(Revision(1)),
+            idempotency_key: Some("gallery-first-grid-cell".into()),
+        };
+        let response = RpcClient::connect(endpoint)
+            .and_then(|mut client| client.call(&request))
+            .unwrap();
+        assert_eq!(response.status, RpcStatus::Accepted, "{:?}", response.error);
+        assert_ne!(
+            response.error.as_ref().map(|error| error.code.as_str()),
+            Some("ui_host_grid_unavailable")
+        );
+        let publication: UiHostPublication =
+            serde_json::from_value(response.result.unwrap()).unwrap();
+        let frame = &publication.grid_inputs[0].frame;
+        assert_eq!(frame.expected_program_revision, program.revision);
+        assert_eq!(frame.window_rows.len(), 80);
+        assert_eq!(frame.list_revision, Revision(2));
+        assert_eq!(
+            frame.window_rows[0].cells["owner"].value,
+            UiInputValue::Bool { value: false }
+        );
+
+        let shutdown = RpcRequest {
+            request_id: RequestId("gallery-shutdown".into()),
+            method: "service.shutdown".into(),
+            idempotency_key: Some("gallery-shutdown".into()),
+            ..request
+        };
+        RpcClient::connect(endpoint)
+            .and_then(|mut client| client.call(&shutdown))
+            .unwrap();
+        server_thread.join().unwrap();
     }
 
     #[test]

@@ -1597,12 +1597,46 @@ pub enum UiHostInbound {
     /// A completed renderer-local drag resolved against declared program keys.
     DragDrop {
         event: UiProgramDragDropEvent,
+        active_fragment: UiHostFragmentContext,
     },
     /// A renderer-validated mutation for a currently published DataGrid cell.
     /// This preserves the cell target and typed payload for a generic host.
     DataGridCell {
         event: UiSemanticEvent,
     },
+}
+
+/// The active presentation supplied to a host for a structural update. Keeping
+/// revisioned identity separate from the tree makes replacement identity an
+/// explicit part of the host contract.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiHostFragmentContext {
+    pub fragment: UiFragmentRevision,
+    pub root: UiNode,
+    pub effects: Vec<UiEffect>,
+}
+
+impl UiHostFragmentContext {
+    pub fn from_fragment(fragment: &UiFragment) -> Self {
+        Self {
+            fragment: UiFragmentRevision {
+                id: fragment.fragment_id.clone(),
+                revision: fragment.revision,
+            },
+            root: fragment.root.clone(),
+            effects: fragment.effects.clone(),
+        }
+    }
+
+    pub fn into_fragment(self) -> UiFragment {
+        UiFragment {
+            fragment_id: self.fragment.id,
+            revision: self.fragment.revision,
+            root: self.root,
+            effects: self.effects,
+        }
+    }
 }
 
 /// An externally accepted input publication. The host applies its scalar and

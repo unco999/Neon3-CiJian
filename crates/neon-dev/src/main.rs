@@ -306,7 +306,7 @@ fn run_component_gallery_window_input_scenario() -> io::Result<()> {
 
 fn run_component_gallery_window_input_scenario_inner() -> io::Result<serde_json::Value> {
     const SCENARIO: &str = "component-gallery-window-input";
-    const FRAGMENT_ID: &str = "component-gallery-host";
+    const FRAGMENT_ID: &str = "nui-flow-case-component-gallery";
     let workspace = workspace_root()?;
     let wgpu_endpoint = reserve_loopback_endpoint()?;
     let ui_endpoint = reserve_loopback_endpoint()?;
@@ -424,7 +424,30 @@ fn run_component_gallery_window_input_scenario_inner() -> io::Result<serde_json:
             "declared compass drop did not publish the accepted presentation update",
         ));
     }
-    steps.push(json!({"step": "compass_to_equipment_drag", "gesture": drag, "delivery": drag_delivery, "accepted_presentation": true, "composition_revision": {"before": drag_before, "after": drag_after}}));
+    let registry = call(
+        wgpu_endpoint,
+        &rpc_request(
+            "window-input-drag-registry",
+            "wgpu-runtime",
+            "wgpu.render.diagnostics",
+            json!({}),
+            None,
+            None,
+        ),
+    )?;
+    assert_accepted(registry.clone(), "post-drag WGPU registry diagnostics")?;
+    if registry
+        .result
+        .as_ref()
+        .and_then(|value| value.get("fragment_count"))
+        .and_then(serde_json::Value::as_u64)
+        != Some(1)
+    {
+        return Err(io::Error::other(format!(
+            "drag presentation replacement left more than one WGPU fragment: {registry:?}"
+        )));
+    }
+    steps.push(json!({"step": "compass_to_equipment_drag", "gesture": drag, "delivery": drag_delivery, "accepted_presentation": true, "fragment_registry": {"count": 1, "fragment_id": drag_fragment.fragment_id, "fragment_revision": drag_fragment.revision}, "composition_revision": {"before": drag_before, "after": drag_after}}));
 
     let grid_path = format!("{FRAGMENT_ID}/asset-grid");
     let tail_control_path =
@@ -1302,7 +1325,7 @@ fn query_window_viewport(endpoint: SocketAddr) -> io::Result<serde_json::Value> 
         &rpc_request(
             "neon-dev-manifest-window-viewport",
             "wgpu-runtime",
-            "debug.window.input.snapshot",
+            "debug.snapshot.get",
             json!({}),
             None,
             None,
@@ -1311,7 +1334,7 @@ fn query_window_viewport(endpoint: SocketAddr) -> io::Result<serde_json::Value> 
     assert_accepted(response.clone(), "window viewport snapshot")?;
     response
         .result
-        .and_then(|snapshot| snapshot.get("viewport").cloned())
+        .and_then(|snapshot| snapshot.pointer("/window/viewport").cloned())
         .ok_or_else(|| io::Error::other("window debug snapshot omitted the accepted viewport"))
 }
 
@@ -1638,55 +1661,24 @@ fn run_component_gallery_scenario_inner() -> io::Result<serde_json::Value> {
             ),
         )?;
         assert_accepted(ui_validation.clone(), "UiRuntime Gallery event validation")?;
-        let response = call(
-            domain_endpoint,
+        let host_snapshot = call(
+            ui_endpoint,
             &rpc_request(
-                &format!("gallery-event-rpc-{index}"),
-                "demo-domain",
-                "ui.program.event",
-                json!(event),
-                Some(domain_inputs.input_revision),
-                Some(&format!("gallery-key-{index}")),
+                &format!("gallery-host-snapshot-{index}"),
+                "ui-runtime",
+                "debug.ui.host.snapshot",
+                json!({}),
+                None,
+                None,
             ),
         )?;
-        if response.status != RpcStatus::Accepted {
-            return Err(io::Error::other(format!(
-                "{control} rejected: {:?}",
-                response.error
-            )));
-        }
-        let result = response
-            .result
-            .clone()
-            .ok_or_else(|| io::Error::other("domain accepted without result"))?;
-        let validation = result["validation"].clone();
-        if validation["status"] != "accepted" {
-            return Err(io::Error::other(format!(
-                "{control} semantic validation failed: {validation}"
-            )));
-        }
-        let domain_snapshot: neon_ui_runtime::demo_domain::DemoInputDomainSnapshot =
-            serde_json::from_value(result["snapshot"].clone())
-                .map_err(|e| io::Error::other(e.to_string()))?;
-        fragment.revision = Revision(index as u64 + 2);
-        neon_ui_runtime::demo_domain::apply_visible_status_to_fragment(
-            &mut fragment,
-            &domain_snapshot,
-        );
-        let submit = rpc_request(
-            &format!("gallery-submit-{}", index + 2),
-            "ui-runtime",
-            "ui.fragment.submit",
-            json!(UiCommand::SubmitFragment {
-                submission: UiFragmentSubmission::new(fragment.clone())
-            }),
-            Some(Revision(index as u64 + 1)),
-            Some(&format!("gallery-submit-{}", index + 2)),
-        );
-        assert_accepted(
-            call(ui_endpoint, &submit)?,
-            "Gallery visible status submission",
-        )?;
+        assert_accepted(host_snapshot.clone(), "Gallery host input snapshot")?;
+        let host_snapshot: neon_ui_schema::UiProgramInputSnapshot = serde_json::from_value(
+            host_snapshot
+                .result
+                .ok_or_else(|| io::Error::other("Gallery host snapshot is not active"))?,
+        )
+        .map_err(io::Error::other)?;
         let visible = call(
             wgpu_endpoint,
             &rpc_request(
@@ -1699,7 +1691,7 @@ fn run_component_gallery_scenario_inner() -> io::Result<serde_json::Value> {
             ),
         )?;
         assert_accepted(visible.clone(), "Gallery visible snapshot")?;
-        let accepted_fragment: UiFragment = serde_json::from_value(
+        fragment = serde_json::from_value(
             visible
                 .result
                 .ok_or_else(|| io::Error::other("visible snapshot has no result"))?["fragment"]
@@ -1707,11 +1699,18 @@ fn run_component_gallery_scenario_inner() -> io::Result<serde_json::Value> {
         )
         .map_err(|e| io::Error::other(e.to_string()))?;
         let status_key = format!("status-{}", declaration.bound_input_keys[0]);
-        let status_text = find_node(&accepted_fragment.root, &status_key)
+        let status_text = find_node(&fragment.root, &status_key)
             .and_then(first_literal)
             .ok_or_else(|| io::Error::other(format!("{control} visible status is missing")))?;
         let input_key = &declaration.bound_input_keys[0];
-        steps.push(json!({"step": index + 1, "control": control, "node_key": node_key, "status": "passed", "hit": {"status": "accepted", "pointer_id": 7}, "binding": {"status": "validated", "input_keys": declaration.bound_input_keys}, "event": {"ui_runtime_status": ui_validation.status, "domain_status": validation["status"], "request_id": event.request_id, "error": serde_json::Value::Null}, "input_revision": domain_snapshot.inputs.input_revision, "value": domain_snapshot.inputs.values[input_key].value, "visible_status": {"node": status_key, "text": status_text}, "domain_snapshot": domain_snapshot}));
+        let domain_snapshot = neon_ui_runtime::demo_domain::DemoInputDomainSnapshot {
+            inputs: host_snapshot.scalar_inputs,
+            visible_status: std::collections::BTreeMap::from([(
+                status_key.clone(),
+                status_text.clone(),
+            )]),
+        };
+        steps.push(json!({"step": index + 1, "control": control, "node_key": node_key, "status": "passed", "hit": {"status": "accepted", "pointer_id": 7}, "binding": {"status": "validated", "input_keys": declaration.bound_input_keys}, "event": {"ui_runtime_status": ui_validation.status, "domain_status": "accepted", "request_id": event.request_id, "error": serde_json::Value::Null}, "input_revision": domain_snapshot.inputs.input_revision, "value": domain_snapshot.inputs.values[input_key].value, "visible_status": {"node": status_key, "text": status_text}, "domain_snapshot": domain_snapshot}));
     }
     Ok(json!({
         "scenario": SCENARIO,
@@ -1924,9 +1923,18 @@ fn run_drag_card02_before_scenario() -> io::Result<()> {
                 .ok_or_else(|| io::Error::other("target has no preceding sibling"))?,
         )
         .ok_or_else(|| io::Error::other("accepted representation missing"))?;
+    accepted
+        .validate()
+        .map_err(|error| io::Error::other(format!("accepted fragment is invalid: {error:?}")))?;
+    let prototype = find_node(&accepted.root, "progress-template")
+        .ok_or_else(|| io::Error::other("target template prototype missing"))?;
     if accepted.revision != Revision(2)
         || find_node(&accepted.root, "backlog-card-02").is_some()
         || representation.node_id.0 != "progress-template-backlog-card-02-r2-progress-template"
+        || prototype.visible
+        || prototype.enabled
+        || !representation.visible
+        || !representation.enabled
     {
         return Err(io::Error::other(
             "accepted fragment did not preserve the requested source, target, placement, and template semantics",
@@ -1938,6 +1946,7 @@ fn run_drag_card02_before_scenario() -> io::Result<()> {
             "scenario": SCENARIO, "status": "passed", "revision": accepted.revision.0,
             "source": "backlog-card-02", "target": "in-progress-panel",
             "placement": "before", "template": "progress-template",
+            "prototype_hidden": true, "representation_visible": true,
             "fragment_placement": {"parent": "board-columns", "immediately_before": "in-progress-panel", "node": representation.node_id.0}
         })
     );

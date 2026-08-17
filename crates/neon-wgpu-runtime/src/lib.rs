@@ -93,13 +93,42 @@ impl InteractionTraceStore {
         composition_revision: Revision,
         downstream_request_id: Option<RequestId>,
     ) {
+        self.append_with_intent(
+            interaction_id,
+            stage,
+            outcome,
+            error,
+            None,
+            semantic_target,
+            None,
+            fragment_revision,
+            composition_revision,
+            downstream_request_id,
+        );
+    }
+
+    fn append_with_intent(
+        &mut self,
+        interaction_id: InteractionId,
+        stage: InteractionTraceStage,
+        outcome: InteractionTraceOutcome,
+        error: Option<InteractionTraceError>,
+        semantic_source_key: Option<String>,
+        semantic_target: Option<InteractionSemanticTarget>,
+        semantic_intent: Option<String>,
+        fragment_revision: Option<Revision>,
+        composition_revision: Revision,
+        downstream_request_id: Option<RequestId>,
+    ) {
         let record = InteractionTraceRecord {
             sequence: self.next_sequence,
             interaction_id,
             stage,
             outcome,
             error,
+            semantic_source_key,
             semantic_target,
+            semantic_intent,
             fragment_revision,
             composition_revision,
             downstream_request_id,
@@ -158,6 +187,113 @@ impl InteractionTraceStore {
     }
 }
 
+fn append_drag_interaction_record(
+    traces: &Arc<Mutex<InteractionTraceStore>>,
+    interaction_id: InteractionId,
+    stage: InteractionTraceStage,
+    outcome: InteractionTraceOutcome,
+    semantic_key: Option<String>,
+    semantic_intent: Option<String>,
+    fragment_revision: Revision,
+    composition_revision: Revision,
+    error: Option<InteractionTraceError>,
+) {
+    if let Ok(mut traces) = traces.lock() {
+        let source_stage = matches!(
+            stage,
+            InteractionTraceStage::DragStarted
+                | InteractionTraceStage::DragPreviewMoved
+                | InteractionTraceStage::DragReleased
+                | InteractionTraceStage::DragCancelled
+        );
+        let (semantic_source_key, semantic_target) = if source_stage {
+            (semantic_key, None)
+        } else {
+            (
+                None,
+                semantic_key.map(|node_path| InteractionSemanticTarget { node_path }),
+            )
+        };
+        traces.append_with_intent(
+            interaction_id,
+            stage,
+            outcome,
+            error,
+            semantic_source_key,
+            semantic_target,
+            semantic_intent,
+            Some(fragment_revision),
+            composition_revision,
+            None,
+        );
+    }
+}
+
+fn semantic_intent_name(intent: &neon_ui_schema::UiIntent) -> String {
+    match intent {
+        neon_ui_schema::UiIntent::Invoke { action, .. } => action.clone(),
+    }
+}
+
+fn record_drag_release_lifecycle(
+    traces: &Arc<Mutex<InteractionTraceStore>>,
+    interaction_id: &InteractionId,
+    source_key: &str,
+    fragment_revision: Revision,
+    moved: bool,
+    resolved: Option<&ui_renderer::UiResolvedDragDrop>,
+    composition_revision: Revision,
+) {
+    match resolved {
+        Some(target) => append_drag_interaction_record(
+            traces,
+            interaction_id.clone(),
+            InteractionTraceStage::DropTargetResolved,
+            InteractionTraceOutcome::Accepted,
+            Some(target.target_key.clone()),
+            Some(semantic_intent_name(&target.intent)),
+            fragment_revision,
+            composition_revision,
+            None,
+        ),
+        None => append_drag_interaction_record(
+            traces,
+            interaction_id.clone(),
+            InteractionTraceStage::DropTargetRejected,
+            InteractionTraceOutcome::Rejected,
+            None,
+            None,
+            fragment_revision,
+            composition_revision,
+            Some(InteractionTraceError {
+                code: if moved {
+                    "drop_target_not_declared"
+                } else {
+                    "drag_threshold_not_met"
+                }
+                .into(),
+                message: if moved {
+                    "drag release did not resolve a declared semantic drop target"
+                } else {
+                    "drag release occurred before the declared movement threshold"
+                }
+                .into(),
+            }),
+        ),
+    }
+    append_drag_interaction_record(
+        traces,
+        interaction_id.clone(),
+        InteractionTraceStage::DragReleased,
+        InteractionTraceOutcome::Accepted,
+        Some(source_key.into()),
+        None,
+        fragment_revision,
+        composition_revision,
+        None,
+    );
+}
+
 fn interaction_matches(record: &InteractionTraceRecord, filters: &InteractionTraceFilters) -> bool {
     filters
         .interaction_id
@@ -167,6 +303,10 @@ fn interaction_matches(record: &InteractionTraceRecord, filters: &InteractionTra
         && filters
             .outcome
             .is_none_or(|outcome| record.outcome == outcome)
+        && filters
+            .semantic_source_key
+            .as_ref()
+            .is_none_or(|key| record.semantic_source_key.as_ref() == Some(key))
         && filters.semantic_node_path.as_ref().is_none_or(|path| {
             record
                 .semantic_target
@@ -1077,6 +1217,25 @@ impl WindowedRuntime {
         let physical_size = gpu.physical_viewport_size();
         let logical_size = gpu.logical_viewport_size();
         let requirement = aggregate_root_viewport_requirement(&self.fragments);
+        let active_drag = gpu
+            .ui
+            .active_drag_semantic_source()
+            .map(|(source_key, fragment)| {
+                let candidate = gpu
+                    .ui
+                    .current_drag_drop_target(&self.fragments)
+                    .map(|target| {
+                        json!({
+                            "target_key": target.target_key,
+                            "intent": semantic_intent_name(&target.intent),
+                        })
+                    });
+                json!({
+                    "source_key": source_key,
+                    "fragment_revision": fragment.revision.0,
+                    "current_candidate_target": candidate,
+                })
+            });
         json!({
             "state": gpu.input.state_name(),
             "applied_composition_revision": self.applied_composition_revision.0,
@@ -1100,6 +1259,7 @@ impl WindowedRuntime {
             "captured_node_path": node_path(gpu.input.capture_id),
             "last_pointer_outcome": gpu.last_pointer_outcome,
             "last_pointer_node_path": gpu.last_pointer_node_path,
+            "active_drag": active_drag,
             "pending_hit_readback": gpu.pending_hit_slot.is_some(),
             "pending_hit_pixel": gpu.pending_hit_pixel.is_some(),
             "semantic_hit_nodes": gpu.ui.semantic_hit_nodes(),
@@ -1437,8 +1597,10 @@ impl WindowedRuntime {
             self.epoch,
             self.applied_composition_revision,
             sequence,
+            None,
             resolved,
             self.pointer_delivery.clone(),
+            self.interaction_traces.clone(),
         );
         Ok(
             json!({"state": "forwarded", "sequence": sequence, "source_node_key": source_node_key, "target_node_key": target_node_key, "interaction_id": interaction_id}),
@@ -2145,11 +2307,40 @@ fn forward_drag_drop(
     renderer_epoch: u64,
     composition_revision: Revision,
     sequence: u64,
+    interaction_id: Option<InteractionId>,
     resolved: ui_renderer::UiResolvedDragDrop,
     delivery: Arc<Mutex<Value>>,
+    traces: Arc<Mutex<InteractionTraceStore>>,
 ) {
+    let request_id = RequestId(format!("wgpu-drag-drop-{sequence}"));
+    let semantic_target = InteractionSemanticTarget {
+        node_path: resolved.target_key.clone(),
+    };
+    let semantic_intent = semantic_intent_name(&resolved.intent);
+    let fragment_revision = resolved.fragment.revision;
+    if let Ok(mut current) = delivery.lock() {
+        *current = json!({
+            "state": "pending",
+            "sequence": sequence,
+            "source_key": resolved.source_key,
+            "target_key": resolved.target_key,
+        });
+    }
+    if let (Some(interaction_id), Ok(mut traces)) = (interaction_id.clone(), traces.lock()) {
+        traces.append_with_intent(
+            interaction_id,
+            InteractionTraceStage::SemanticEventForwarded,
+            InteractionTraceOutcome::Pending,
+            None,
+            None,
+            Some(semantic_target.clone()),
+            Some(semantic_intent.clone()),
+            Some(fragment_revision),
+            composition_revision,
+            Some(request_id.clone()),
+        );
+    }
     thread::spawn(move || {
-        let request_id = RequestId(format!("wgpu-drag-drop-{sequence}"));
         let event = UiSemanticEvent {
             event: neon_ui_schema::UiSemanticEventType::DragDrop,
             event_id: request_id.0.clone(),
@@ -2185,14 +2376,80 @@ fn forward_drag_drop(
             expected_revision: Some(event.fragment.revision),
             idempotency_key: Some(format!("wgpu-drag-drop:{renderer_epoch}:{sequence}")),
         };
-        let outcome =
-            match RpcClient::connect(endpoint).and_then(|mut client| client.call(&request)) {
-                Ok(response) if response.status == RpcStatus::Accepted => {
-                    json!({"state": "accepted", "response": response})
+        let outcome = match RpcClient::connect(endpoint)
+            .and_then(|mut client| client.call(&request))
+        {
+            Ok(response) if response.status == RpcStatus::Accepted => {
+                if let (Some(interaction_id), Ok(mut traces)) =
+                    (interaction_id.clone(), traces.lock())
+                {
+                    traces.append_with_intent(
+                        interaction_id.clone(),
+                        InteractionTraceStage::DeliveryAccepted,
+                        InteractionTraceOutcome::Accepted,
+                        None,
+                        None,
+                        Some(semantic_target.clone()),
+                        Some(semantic_intent.clone()),
+                        Some(fragment_revision),
+                        composition_revision,
+                        Some(request_id.clone()),
+                    );
+                    traces.delivery_accepted(interaction_id);
                 }
-                Ok(response) => json!({"state": "rejected", "response": response}),
-                Err(error) => json!({"state": "transport_failed", "error": error.to_string()}),
-            };
+                json!({"state": "accepted", "response": response})
+            }
+            Ok(response) => {
+                if let (Some(interaction_id), Ok(mut traces)) =
+                    (interaction_id.clone(), traces.lock())
+                {
+                    let error = response
+                        .error
+                        .as_ref()
+                        .map(|error| InteractionTraceError {
+                            code: error.code.clone(),
+                            message: error.message.clone(),
+                        })
+                        .unwrap_or(InteractionTraceError {
+                            code: "delivery_rejected".into(),
+                            message: "UI host rejected drag/drop delivery".into(),
+                        });
+                    traces.append_with_intent(
+                        interaction_id,
+                        InteractionTraceStage::DeliveryRejected,
+                        InteractionTraceOutcome::Rejected,
+                        Some(error),
+                        None,
+                        Some(semantic_target.clone()),
+                        Some(semantic_intent.clone()),
+                        Some(fragment_revision),
+                        composition_revision,
+                        Some(request_id.clone()),
+                    );
+                }
+                json!({"state": "rejected", "response": response})
+            }
+            Err(error) => {
+                if let (Some(interaction_id), Ok(mut traces)) = (interaction_id, traces.lock()) {
+                    traces.append_with_intent(
+                        interaction_id,
+                        InteractionTraceStage::TransportFailed,
+                        InteractionTraceOutcome::Failed,
+                        Some(InteractionTraceError {
+                            code: "transport_failed".into(),
+                            message: error.to_string(),
+                        }),
+                        None,
+                        Some(semantic_target),
+                        Some(semantic_intent),
+                        Some(fragment_revision),
+                        composition_revision,
+                        Some(request_id),
+                    );
+                }
+                json!({"state": "transport_failed", "error": error.to_string()})
+            }
+        };
         if let Ok(mut current) = delivery.lock() {
             *current = outcome;
         }
@@ -2278,6 +2535,7 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 let mut scroll_changed = false;
+                let mut drag_preview = None;
                 if let Some(gpu) = self.gpu.as_mut() {
                     let logical = position.to_logical::<f32>(gpu.scale_factor);
                     gpu.ui.set_pointer_position([logical.x, logical.y]);
@@ -2285,8 +2543,17 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                         gpu.ui
                             .set_text_input_caret_from_pointer([logical.x, logical.y], true);
                     }
-                    if gpu.ui.drag_active() {
-                        gpu.ui.update_drag_preview();
+                    if gpu.ui.drag_active() && gpu.ui.update_drag_preview() {
+                        drag_preview =
+                            gpu.active_interaction_id
+                                .clone()
+                                .and_then(|interaction_id| {
+                                    gpu.ui.active_drag_semantic_source().map(
+                                        |(source_key, fragment)| {
+                                            (interaction_id, source_key, fragment.revision)
+                                        },
+                                    )
+                                });
                     }
                     scroll_changed = gpu.ui.update_scroll_drag() || gpu.ui.update_scroll_pan();
                     if scroll_changed {
@@ -2305,6 +2572,19 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                         as u32;
                     gpu.pending_hit_pixel = Some([x, y]);
                     self.redraw_pending = true;
+                }
+                if let Some((interaction_id, source_key, fragment_revision)) = drag_preview {
+                    append_drag_interaction_record(
+                        &self.interaction_traces,
+                        interaction_id,
+                        InteractionTraceStage::DragPreviewMoved,
+                        InteractionTraceOutcome::Pending,
+                        Some(source_key),
+                        None,
+                        fragment_revision,
+                        self.applied_composition_revision,
+                        None,
+                    );
                 }
                 if scroll_changed {
                     self.schedule_data_grid_window_requests();
@@ -2471,6 +2751,20 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                         gpu.input.cancel();
                         self.redraw_pending = true;
                     } else if gpu.ui.begin_drag_at_pointer(&self.fragments) {
+                        gpu.active_interaction_id = Some(interaction_id.clone());
+                        if let Some((source_key, fragment)) = gpu.ui.active_drag_semantic_source() {
+                            append_drag_interaction_record(
+                                &interaction_traces,
+                                interaction_id,
+                                InteractionTraceStage::DragStarted,
+                                InteractionTraceOutcome::Accepted,
+                                Some(source_key),
+                                None,
+                                fragment.revision,
+                                composition_revision,
+                                None,
+                            );
+                        }
                         self.redraw_pending = true;
                     } else {
                         // Pointer release uses the captured hit binding. Fall back to the
@@ -2584,25 +2878,67 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                     if !gpu.ui.drag_active() {
                         return None;
                     }
+                    let (source_key, fragment) = gpu.ui.active_drag_semantic_source()?;
+                    let moved = gpu.ui.active_drag_moved();
                     let resolved = gpu.ui.finish_drag_at_pointer(&self.fragments);
                     gpu.next_semantic_sequence += 1;
-                    Some((gpu.next_semantic_sequence, resolved))
-                });
-                if let (Some(endpoint), Some((sequence, Some(resolved)))) =
-                    (self.ui_endpoint, drag.clone())
-                {
-                    forward_drag_drop(
-                        endpoint,
-                        self.epoch,
-                        self.applied_composition_revision,
-                        sequence,
+                    let interaction_id = gpu.active_interaction_id.take()?;
+                    Some((
+                        gpu.next_semantic_sequence,
+                        interaction_id,
+                        source_key,
+                        fragment.revision,
+                        moved,
                         resolved,
-                        self.pointer_delivery.clone(),
+                    ))
+                });
+                if let Some((
+                    sequence,
+                    interaction_id,
+                    source_key,
+                    fragment_revision,
+                    moved,
+                    resolved,
+                )) = drag
+                {
+                    record_drag_release_lifecycle(
+                        &self.interaction_traces,
+                        &interaction_id,
+                        &source_key,
+                        fragment_revision,
+                        moved,
+                        resolved.as_ref(),
+                        self.applied_composition_revision,
                     );
-                    self.redraw_pending = true;
-                    return;
-                }
-                if drag.is_some() {
+                    if let Some(resolved) = resolved {
+                        if let Some(endpoint) = self.ui_endpoint {
+                            forward_drag_drop(
+                                endpoint,
+                                self.epoch,
+                                self.applied_composition_revision,
+                                sequence,
+                                Some(interaction_id),
+                                resolved,
+                                self.pointer_delivery.clone(),
+                                self.interaction_traces.clone(),
+                            );
+                        } else {
+                            append_drag_interaction_record(
+                                &self.interaction_traces,
+                                interaction_id,
+                                InteractionTraceStage::TransportFailed,
+                                InteractionTraceOutcome::Failed,
+                                Some(resolved.target_key),
+                                Some(semantic_intent_name(&resolved.intent)),
+                                fragment_revision,
+                                self.applied_composition_revision,
+                                Some(InteractionTraceError {
+                                    code: "ui_host_unavailable".into(),
+                                    message: "UI host endpoint is unavailable".into(),
+                                }),
+                            );
+                        }
+                    }
                     self.redraw_pending = true;
                     return;
                 }
@@ -2818,6 +3154,7 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                 }
             }
             WindowEvent::Focused(false) => {
+                let mut cancelled_drag = None;
                 let commit = self.gpu.as_mut().and_then(take_data_grid_text_commit);
                 if let (Some(endpoint), Some((sequence, binding, value))) =
                     (self.ui_endpoint, commit)
@@ -2835,6 +3172,16 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                     window.set_ime_allowed(false);
                 }
                 if let Some(gpu) = self.gpu.as_mut() {
+                    if gpu.ui.drag_active() {
+                        cancelled_drag =
+                            gpu.active_interaction_id.take().and_then(|interaction_id| {
+                                gpu.ui.active_drag_semantic_source().map(
+                                    |(source_key, fragment)| {
+                                        (interaction_id, source_key, fragment.revision)
+                                    },
+                                )
+                            });
+                    }
                     gpu.ui.clear_text_focus();
                     gpu.ui.cancel_drag();
                     gpu.ui.cancel_value_gesture();
@@ -2843,6 +3190,22 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                     gpu.pending_control_value = None;
                     gpu.input.cancel();
                     self.redraw_pending = true;
+                }
+                if let Some((interaction_id, source_key, fragment_revision)) = cancelled_drag {
+                    append_drag_interaction_record(
+                        &self.interaction_traces,
+                        interaction_id,
+                        InteractionTraceStage::DragCancelled,
+                        InteractionTraceOutcome::Rejected,
+                        Some(source_key),
+                        None,
+                        fragment_revision,
+                        self.applied_composition_revision,
+                        Some(InteractionTraceError {
+                            code: "window_focus_lost".into(),
+                            message: "drag was cancelled when the window lost focus".into(),
+                        }),
+                    );
                 }
             }
             WindowEvent::RedrawRequested => {
@@ -3143,6 +3506,40 @@ fn handle_window_input_debug_snapshot(
             request_id,
             "window_compositor_timeout",
             "window compositor did not report input state",
+            None,
+        ),
+    }
+}
+
+fn handle_window_debug_snapshot(
+    runtime: &mut WgpuRuntime,
+    proxy: &EventLoopProxy<WindowCommand>,
+    request_id: RequestId,
+) -> RpcResponse {
+    let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+    if proxy
+        .send_event(WindowCommand::InputDebugSnapshot {
+            completed: completed_tx,
+        })
+        .is_err()
+    {
+        return runtime.reject(
+            request_id,
+            "window_compositor_unavailable",
+            "window compositor is unavailable",
+            None,
+        );
+    }
+    match completed_rx.recv_timeout(std::time::Duration::from_secs(5)) {
+        Ok(window) => {
+            let mut snapshot = json!(runtime.debug_snapshot());
+            snapshot["window"] = window;
+            runtime.accept(request_id, snapshot)
+        }
+        Err(_) => runtime.reject(
+            request_id,
+            "window_compositor_timeout",
+            "window compositor did not report its debug snapshot",
             None,
         ),
     }
@@ -3571,6 +3968,8 @@ fn spawn_window_server(
                 handle_window_ai_generate(&mut runtime, &proxy, request)
             } else if request.method == "wgpu.ai.model.status" {
                 handle_window_ai_model_status(&mut runtime, &proxy, request.request_id)
+            } else if request.method == "debug.snapshot.get" {
+                handle_window_debug_snapshot(&mut runtime, &proxy, request.request_id)
             } else if request.method == "debug.window.input.snapshot" {
                 handle_window_input_debug_snapshot(&mut runtime, &proxy, request.request_id)
             } else if request.method == "debug.window.input.probe" {
@@ -4918,6 +5317,27 @@ mod tests {
     }
 
     #[test]
+    fn next_fragment_revision_atomically_replaces_the_registry_entry() {
+        let mut runtime = WgpuRuntime::headless(1);
+        assert_eq!(
+            runtime.handle(submit("initial", 1)).status,
+            RpcStatus::Accepted
+        );
+        assert_eq!(
+            runtime.handle(submit("replacement", 2)).status,
+            RpcStatus::Accepted
+        );
+
+        let fragments = runtime.fragments_snapshot();
+        assert_eq!(fragments.len(), 1);
+        let active = fragments
+            .get(&UiFragmentId("static-fragment".into()))
+            .unwrap();
+        assert_eq!(active.revision, Revision(2));
+        assert_eq!(runtime.diagnostics().fragment_count, 1);
+    }
+
+    #[test]
     fn window_mailbox_ignores_stale_composition_and_idles_without_dirty_work() {
         let mut window = WindowedRuntime::new(1);
         window.redraw_pending = false;
@@ -4969,6 +5389,30 @@ mod tests {
             LogicalViewportRequirement {
                 width: 1200.0,
                 height: 720.0,
+            }
+        );
+    }
+
+    #[test]
+    fn component_gallery_declares_its_window_requirement() {
+        let document = neon_ui_runtime::parse_nui_flow(include_str!(
+            "../../../tests/fixtures/ui/imgui-component-gallery.nui"
+        ))
+        .expect("component gallery must parse");
+        let fragment = UiFragment {
+            fragment_id: UiFragmentId("component-gallery".into()),
+            revision: Revision(1),
+            root: document.ir.root,
+            effects: Vec::new(),
+        };
+        assert_eq!(
+            aggregate_root_viewport_requirement(&HashMap::from([(
+                fragment.fragment_id.clone(),
+                fragment,
+            )])),
+            LogicalViewportRequirement {
+                width: 1668.0,
+                height: 900.0,
             }
         );
     }
@@ -6137,6 +6581,187 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0]["stage"], "delivery_rejected");
         assert_eq!(records[0]["error"]["code"], "intent_not_bound");
+    }
+
+    #[test]
+    fn accepted_real_drag_lifecycle_records_semantics_and_delivery() {
+        let server = neon_ipc::RpcServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let endpoint = server.local_addr().unwrap();
+        let server_thread = std::thread::spawn(move || {
+            server
+                .serve_one(|request| RpcResponse {
+                    request_id: request.request_id,
+                    status: RpcStatus::Accepted,
+                    revision: Some(Revision(12)),
+                    result: Some(json!({"state": "accepted"})),
+                    snapshot: None,
+                    error: None,
+                })
+                .unwrap();
+        });
+        let traces = Arc::new(Mutex::new(InteractionTraceStore::new()));
+        let delivery = Arc::new(Mutex::new(json!({"state": "none"})));
+        let interaction_id = InteractionId("wgpu-window-4-1".into());
+        traces.lock().unwrap().append(
+            interaction_id.clone(),
+            InteractionTraceStage::Prepared,
+            InteractionTraceOutcome::Pending,
+            None,
+            None,
+            None,
+            Revision(8),
+            None,
+        );
+        append_drag_interaction_record(
+            &traces,
+            interaction_id.clone(),
+            InteractionTraceStage::DragStarted,
+            InteractionTraceOutcome::Accepted,
+            Some("backpack-compass".into()),
+            None,
+            Revision(3),
+            Revision(8),
+            None,
+        );
+        append_drag_interaction_record(
+            &traces,
+            interaction_id.clone(),
+            InteractionTraceStage::DragPreviewMoved,
+            InteractionTraceOutcome::Pending,
+            Some("backpack-compass".into()),
+            None,
+            Revision(3),
+            Revision(8),
+            None,
+        );
+        let resolved = ui_renderer::UiResolvedDragDrop {
+            fragment: neon_ui_schema::UiFragmentRevision {
+                id: UiFragmentId("gallery".into()),
+                revision: Revision(3),
+            },
+            intent: neon_ui_schema::UiIntent::Invoke {
+                action: "inventory.item.equip".into(),
+                params: json!({}),
+            },
+            source_key: "backpack-compass".into(),
+            target_key: "equipment-zone".into(),
+            placement: neon_ui_schema::UiDropPlacement::Into,
+            presentation_template_key: Some("equipment-item-template".into()),
+        };
+        record_drag_release_lifecycle(
+            &traces,
+            &interaction_id,
+            "backpack-compass",
+            Revision(3),
+            true,
+            Some(&resolved),
+            Revision(8),
+        );
+        forward_drag_drop(
+            endpoint,
+            4,
+            Revision(8),
+            11,
+            Some(interaction_id.clone()),
+            resolved,
+            delivery.clone(),
+            traces.clone(),
+        );
+        server_thread.join().unwrap();
+        for _ in 0..100 {
+            if delivery.lock().unwrap()["state"] == "accepted" {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let records = traces.lock().unwrap().get(&interaction_id);
+        let stages = records
+            .iter()
+            .map(|record| record.stage)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            stages,
+            vec![
+                InteractionTraceStage::Prepared,
+                InteractionTraceStage::DragStarted,
+                InteractionTraceStage::DragPreviewMoved,
+                InteractionTraceStage::DropTargetResolved,
+                InteractionTraceStage::DragReleased,
+                InteractionTraceStage::SemanticEventForwarded,
+                InteractionTraceStage::DeliveryAccepted,
+            ]
+        );
+        assert_eq!(
+            records[3].semantic_target.as_ref().unwrap().node_path,
+            "equipment-zone"
+        );
+        assert_eq!(
+            records[1].semantic_source_key.as_deref(),
+            Some("backpack-compass")
+        );
+        assert!(records[1].semantic_target.is_none());
+        assert_eq!(
+            records[3].semantic_intent.as_deref(),
+            Some("inventory.item.equip")
+        );
+        assert_eq!(records[3].fragment_revision, Some(Revision(3)));
+        assert!(records.iter().all(|record| {
+            let value = serde_json::to_value(record).unwrap();
+            value.get("coordinates").is_none() && value.get("hit_id").is_none()
+        }));
+    }
+
+    #[test]
+    fn rejected_real_drag_lifecycle_records_a_stable_target_reason() {
+        let traces = Arc::new(Mutex::new(InteractionTraceStore::new()));
+        let interaction_id = InteractionId("wgpu-window-4-2".into());
+        append_drag_interaction_record(
+            &traces,
+            interaction_id.clone(),
+            InteractionTraceStage::DragStarted,
+            InteractionTraceOutcome::Accepted,
+            Some("backpack-gem".into()),
+            None,
+            Revision(5),
+            Revision(9),
+            None,
+        );
+        append_drag_interaction_record(
+            &traces,
+            interaction_id.clone(),
+            InteractionTraceStage::DragPreviewMoved,
+            InteractionTraceOutcome::Pending,
+            Some("backpack-gem".into()),
+            None,
+            Revision(5),
+            Revision(9),
+            None,
+        );
+        record_drag_release_lifecycle(
+            &traces,
+            &interaction_id,
+            "backpack-gem",
+            Revision(5),
+            true,
+            None,
+            Revision(9),
+        );
+
+        let records = traces.lock().unwrap().get(&interaction_id);
+        assert_eq!(records[2].stage, InteractionTraceStage::DropTargetRejected);
+        assert_eq!(
+            records[2].error.as_ref().unwrap().code,
+            "drop_target_not_declared"
+        );
+        assert!(
+            records
+                .iter()
+                .all(|record| record.downstream_request_id.is_none())
+        );
+        assert_eq!(
+            records.last().unwrap().stage,
+            InteractionTraceStage::DragReleased
+        );
     }
 
     #[test]

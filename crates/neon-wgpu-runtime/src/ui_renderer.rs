@@ -2298,6 +2298,31 @@ impl UiWgpuRenderer {
         self.drag.is_some()
     }
 
+    pub(crate) fn active_drag_semantic_source(&self) -> Option<(String, UiFragmentRevision)> {
+        self.drag.as_ref().map(|active| {
+            (
+                active.binding.source_node_id.0.clone(),
+                active.fragment.clone(),
+            )
+        })
+    }
+
+    pub(crate) fn active_drag_moved(&self) -> bool {
+        self.drag.as_ref().is_some_and(|active| active.moved)
+    }
+
+    pub(crate) fn current_drag_drop_target(
+        &self,
+        fragments: &HashMap<neon_ui_schema::UiFragmentId, UiFragment>,
+    ) -> Option<UiResolvedDragDrop> {
+        let active = self.drag.as_ref()?;
+        let pointer = self.pointer_position?;
+        active
+            .moved
+            .then(|| self.resolve_drop_target(fragments, active, pointer))
+            .flatten()
+    }
+
     fn resolve_drop_target(
         &self,
         fragments: &HashMap<neon_ui_schema::UiFragmentId, UiFragment>,
@@ -4788,7 +4813,7 @@ fn flatten_fragments_with_data_grid_display_cache(
             None,
             None,
             font,
-            None,
+            Some(viewport_logical_size),
             false,
         );
     }
@@ -5540,10 +5565,14 @@ fn resolve_children(
     }
     let row = parent_layout.mode == UiLayoutMode::Row;
     let available = if row { inner.width } else { inner.height };
+    let participating_count = node.children.iter().filter(|child| child.visible).count();
     let mut main_sizes = node
         .children
         .iter()
         .map(|child| {
+            if !child.visible {
+                return 0.0;
+            }
             let layout = child.layout.unwrap_or_default();
             layout.flex_basis.unwrap_or_else(|| {
                 resolved_dimension(
@@ -5564,6 +5593,9 @@ fn resolve_children(
         .children
         .iter()
         .map(|child| {
+            if !child.visible {
+                return 0.0;
+            }
             let margin = child.layout.unwrap_or_default().margin;
             if row {
                 margin[3] + margin[1]
@@ -5574,12 +5606,13 @@ fn resolve_children(
         .collect::<Vec<_>>();
     let occupied = main_sizes.iter().sum::<f32>()
         + outer.iter().sum::<f32>()
-        + parent_layout.gap * node.children.len().saturating_sub(1) as f32;
+        + parent_layout.gap * participating_count.saturating_sub(1) as f32;
     let free = available - occupied;
     if free > 0.0 {
         let total = node
             .children
             .iter()
+            .filter(|child| child.visible)
             .map(|child| child.layout.unwrap_or_default().flex_grow)
             .sum::<f32>();
         if total > 0.0 {
@@ -5592,6 +5625,7 @@ fn resolve_children(
             .children
             .iter()
             .zip(&main_sizes)
+            .filter(|(child, _)| child.visible)
             .map(|(child, size)| child.layout.unwrap_or_default().flex_shrink * *size)
             .sum::<f32>();
         if total > 0.0 {
@@ -5604,9 +5638,9 @@ fn resolve_children(
     }
     let used = main_sizes.iter().sum::<f32>()
         + outer.iter().sum::<f32>()
-        + parent_layout.gap * node.children.len().saturating_sub(1) as f32;
+        + parent_layout.gap * participating_count.saturating_sub(1) as f32;
     let remaining = (available - used).max(0.0);
-    let count = node.children.len() as f32;
+    let count = participating_count as f32;
     let (mut cursor, gap) = match parent_layout.justify_content {
         UiJustifyContent::Start => (0.0, parent_layout.gap),
         UiJustifyContent::Center => (remaining * 0.5, parent_layout.gap),
@@ -5624,10 +5658,19 @@ fn resolve_children(
         ),
         _ => (0.0, parent_layout.gap),
     };
+    let mut participating_index = 0usize;
     node.children
         .iter()
         .enumerate()
         .map(|(index, child)| {
+            if !child.visible {
+                return UiBounds {
+                    x: inner.x,
+                    y: inner.y,
+                    width: 0.0,
+                    height: 0.0,
+                };
+            }
             let layout = child.layout.unwrap_or_default();
             let margin = layout.margin;
             let cross_available = if row { inner.height } else { inner.width };
@@ -5676,7 +5719,11 @@ fn resolve_children(
                     height: main_sizes[index],
                 }
             };
-            cursor += main_sizes[index] + main_margin_end + gap;
+            cursor += main_sizes[index] + main_margin_end;
+            participating_index += 1;
+            if participating_index < participating_count {
+                cursor += gap;
+            }
             result
         })
         .collect()
@@ -5914,11 +5961,13 @@ mod tests {
         ClientIdentity, ClientKind, ProtocolVersion, RequestId, Revision, RpcRequest, RpcStatus,
         ServiceName,
     };
-    use neon_ui_runtime::{UiRuntime, lower_nui_flow_effects, parse_nui_flow};
+    use neon_ui_runtime::{
+        UiRuntime, demo_domain::DemoDragDropDomain, lower_nui_flow_effects, parse_nui_flow,
+    };
     use neon_ui_schema::{
-        TextRef, UiAlignItems, UiCommand, UiEffect, UiFragmentId, UiFragmentSubmission, UiIntent,
-        UiJustifyContent, UiLayout, UiNodeId, UiSemanticEvent, UiSemanticEventType,
-        UiTransitionState,
+        TextRef, UiAlignItems, UiCommand, UiDropPlacement, UiEffect, UiFragmentId,
+        UiFragmentSubmission, UiIntent, UiJustifyContent, UiLayout, UiNodeId, UiSemanticEvent,
+        UiSemanticEventType, UiTransitionState,
     };
     use serde_json::json;
     use std::sync::Mutex;
@@ -8750,6 +8799,171 @@ mod tests {
                 response.error
             );
         }
+    }
+
+    #[test]
+    fn accepted_into_drop_materializes_visible_target_pixels_from_hidden_template() {
+        const SIZE: [u32; 2] = [1680, 900];
+        let _gpu_test = GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let (device, queue) = test_device("neon3-ui-accepted-drop-materialization");
+        let document = parse_nui_flow(include_str!(
+            "../../../tests/fixtures/ui/imgui-component-gallery.nui"
+        ))
+        .expect("component gallery must parse");
+        let initial = UiFragment {
+            fragment_id: UiFragmentId("component-gallery-drop".into()),
+            revision: Revision(1),
+            root: document.ir.root.clone(),
+            effects: lower_nui_flow_effects(&document),
+        };
+        let intent = initial
+            .effects
+            .iter()
+            .find_map(|effect| match effect {
+                UiEffect::DropBinding { binding } if binding.key == "equipment-compass-drop" => {
+                    Some(binding.intent.clone())
+                }
+                _ => None,
+            })
+            .unwrap();
+        let event = UiSemanticEvent {
+            event: UiSemanticEventType::DragDrop,
+            event_id: "accepted-equipment-drop".into(),
+            renderer_epoch: 1,
+            composition_revision: Revision(1),
+            fragment: neon_ui_schema::UiFragmentRevision {
+                id: initial.fragment_id.clone(),
+                revision: initial.revision,
+            },
+            intent,
+            pointer: None,
+            focus: None,
+            data_grid_cell: None,
+            text: None,
+            control_value: None,
+            drag_drop: Some(neon_ui_schema::UiDragDropPayload {
+                source_key: "backpack-compass".into(),
+                target_key: "equipment-zone".into(),
+                placement: UiDropPlacement::Into,
+                presentation_template_key: Some("equipment-item-template".into()),
+            }),
+        };
+        let response = DemoDragDropDomain::new().handle(RpcRequest {
+            protocol: "neon3.rpc".into(),
+            version: ProtocolVersion { major: 1, minor: 0 },
+            request_id: RequestId("accepted-equipment-drop".into()),
+            client: ClientIdentity {
+                kind: ClientKind::UiRuntime,
+                instance_id: "renderer-test".into(),
+                pid: 1,
+                origin: "test".into(),
+            },
+            target: ServiceName("demo-domain".into()),
+            method: "ui.drag_drop.apply".into(),
+            params: json!({"event": event, "fragment": initial.clone()}),
+            expected_revision: Some(Revision(1)),
+            idempotency_key: Some("accepted-equipment-drop".into()),
+        });
+        assert_eq!(response.status, RpcStatus::Accepted, "{:?}", response.error);
+        let accepted: UiFragment =
+            serde_json::from_value(response.result.unwrap()["fragment"].clone()).unwrap();
+        accepted.validate().unwrap();
+
+        let instance_key = "equipment-item-template-backpack-compass-r2-equipment-item-template";
+        let label_key = "equipment-item-template-backpack-compass-r2-equipment-item-template-label";
+        fn find_test_node<'a>(node: &'a UiNode, key: &str) -> Option<&'a UiNode> {
+            (node.node_id.0 == key).then_some(node).or_else(|| {
+                node.children
+                    .iter()
+                    .find_map(|child| find_test_node(child, key))
+            })
+        }
+        assert!(find_test_node(&accepted.root, "backpack-compass").is_none());
+        assert!(
+            !find_test_node(&accepted.root, "equipment-item-template")
+                .unwrap()
+                .visible
+        );
+        assert!(
+            find_test_node(&accepted.root, instance_key)
+                .unwrap()
+                .visible
+        );
+        assert!(matches!(
+            find_test_node(&accepted.root, label_key)
+                .unwrap()
+                .text
+                .as_ref(),
+            Some(TextRef::Literal { value }) if value == "Brass compass"
+        ));
+
+        let initial_fragments = HashMap::from([(initial.fragment_id.clone(), initial.clone())]);
+        let accepted_fragments = HashMap::from([(accepted.fragment_id.clone(), accepted.clone())]);
+        let font = fixture_font();
+        let before = render_offscreen_for_test(
+            &device,
+            &queue,
+            wgpu::TextureFormat::Rgba8Unorm,
+            &initial_fragments,
+            SIZE,
+            1.0,
+            std::slice::from_ref(&font),
+            Vec::new(),
+        );
+        let after = render_offscreen_for_test(
+            &device,
+            &queue,
+            wgpu::TextureFormat::Rgba8Unorm,
+            &accepted_fragments,
+            SIZE,
+            1.0,
+            &[font],
+            Vec::new(),
+        );
+        let flattened = flatten_fragments(&accepted_fragments, [1680.0, 900.0], None);
+        let visual = |key: &str| {
+            &flattened
+                .iter()
+                .find(|(path, _, _, _)| path == &format!("component-gallery-drop/{key}"))
+                .unwrap()
+                .2
+        };
+        assert!(
+            flattened
+                .iter()
+                .all(|(path, _, _, _)| path != "component-gallery-drop/equipment-item-template")
+        );
+        let target = visual("equipment-zone").bounds;
+        let instance = visual(instance_key).bounds;
+        let label = visual(label_key);
+        assert!(instance.x >= target.x && instance.y >= target.y);
+        assert!(instance.x + instance.width <= target.x + target.width);
+        assert!(instance.y + instance.height <= target.y + target.height);
+        assert!(matches!(
+            label.text.as_ref(),
+            Some(TextRef::Literal { value }) if value == "Brass compass"
+        ));
+        assert!(label.bounds.x >= target.x && label.bounds.y >= target.y);
+        assert!(label.bounds.x + label.bounds.width <= target.x + target.width);
+        assert!(label.bounds.y + label.bounds.height <= target.y + target.height);
+
+        let left = instance.x.floor().max(0.0) as usize;
+        let top = instance.y.floor().max(0.0) as usize;
+        let right = (instance.x + instance.width).ceil().min(SIZE[0] as f32) as usize;
+        let bottom = (instance.y + instance.height).ceil().min(SIZE[1] as f32) as usize;
+        let changed_target_pixels = (top..bottom)
+            .flat_map(|y| (left..right).map(move |x| (y * SIZE[0] as usize + x) * 4))
+            .filter(|offset| before[*offset..*offset + 4] != after[*offset..*offset + 4])
+            .count();
+        let center_offset = (((top + bottom) / 2) * SIZE[0] as usize + (left + right) / 2) * 4;
+        assert!(
+            changed_target_pixels > 0,
+            "accepted instance must paint inside target: target={target:?} instance={instance:?} before={:?} after={:?}",
+            &before[center_offset..center_offset + 4],
+            &after[center_offset..center_offset + 4],
+        );
     }
 
     #[test]

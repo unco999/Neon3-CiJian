@@ -35,13 +35,13 @@ use neon_ui_schema::{
     UiCpuSemanticTarget, UiCpuViewport, UiDataGridCellTarget, UiDataGridDeclaration,
     UiDataGridFrame, UiDataGridInputFrame, UiDataGridRecord, UiDependencyIndex, UiDiagnostic,
     UiDiagnosticSeverity, UiDiagnosticsState, UiEffect, UiEventTraceRecord, UiFragment,
-    UiFragmentId, UiFragmentSubmission, UiHostInbound, UiHostPublication, UiInputChange,
-    UiInputFrame, UiInputSchema, UiInputUpdateClass, UiInputValue, UiInputValueSource,
-    UiInspectorState, UiInspectorTab, UiIntent, UiIrDocument, UiNode, UiNodeId, UiNodeKind,
-    UiProgram, UiProgramDragDropEvent, UiProgramLayoutRecord, UiProgramLiteralText, UiProgramNode,
-    UiProgramResourceKind, UiProgramRevision, UiProgramSemanticEvent, UiProgramSemanticEventKind,
-    UiProgramSemanticEventResult, UiProgramSemanticEventStatus, UiRepeatFrame,
-    UiResolvedInputValue, UiResolvedInputs, UiSchemaError, UiSemanticEvent,
+    UiFragmentId, UiFragmentSubmission, UiHostFragmentContext, UiHostInbound, UiHostPublication,
+    UiInputChange, UiInputFrame, UiInputSchema, UiInputUpdateClass, UiInputValue,
+    UiInputValueSource, UiInspectorState, UiInspectorTab, UiIntent, UiIrDocument, UiNode, UiNodeId,
+    UiNodeKind, UiProgram, UiProgramDragDropEvent, UiProgramLayoutRecord, UiProgramLiteralText,
+    UiProgramNode, UiProgramResourceKind, UiProgramRevision, UiProgramSemanticEvent,
+    UiProgramSemanticEventKind, UiProgramSemanticEventResult, UiProgramSemanticEventStatus,
+    UiRepeatFrame, UiResolvedInputValue, UiResolvedInputs, UiSchemaError, UiSemanticEvent,
     UiSemanticInteractionMetadata, UiSemanticPayloadValue, UiStyle, UiSurfaceEvent,
     UiSurfaceEventKind, UiSurfaceEventRequest, UiSurfaceId, UiSurfaceSnapshot, UiSurfaceState,
     UiTemplateRecord, UiTextHandle, UiTextHandleDiagnostic, UiTextHandleStatus, UiTextRecord,
@@ -72,6 +72,54 @@ pub const AI_TERRAIN_SURFACE_ID: &str = "surface.ai.terrain-generator";
 pub const CAPABILITY_DEBUG_INTERACTION: &str = "debug.interaction.v1";
 const INTERACTION_TRACE_CAPACITY: usize = 256;
 
+/// Materializes one visible instance from a hidden declarative template prototype.
+/// The prototype remains unchanged; instance IDs are scoped by the caller's stable key.
+pub fn instantiate_ui_template(
+    prototype: &UiNode,
+    into_parent: Option<&UiNode>,
+    instance_namespace: &str,
+    content: Option<TextRef>,
+) -> UiNode {
+    fn namespace(node: &mut UiNode, prefix: &str) {
+        node.node_id = UiNodeId(format!("{prefix}-{}", node.node_id.0));
+        for child in &mut node.children {
+            namespace(child, prefix);
+        }
+    }
+
+    fn set_first_text(node: &mut UiNode, content: &TextRef) -> bool {
+        if node.text.is_some() {
+            node.text = Some(content.clone());
+            return true;
+        }
+        node.children
+            .iter_mut()
+            .any(|child| set_first_text(child, content))
+    }
+
+    let mut instance = prototype.clone();
+    namespace(&mut instance, instance_namespace);
+    if let Some(content) = content.as_ref() {
+        set_first_text(&mut instance, content);
+    }
+    if let Some(parent) = into_parent {
+        let parent_layout = parent.layout.unwrap_or_default();
+        let instance_layout = instance.layout.get_or_insert_default();
+        match parent_layout.mode {
+            neon_ui_schema::UiLayoutMode::Column if instance.bounds.width == 0.0 => {
+                instance_layout.align_self = Some(neon_ui_schema::UiAlignItems::Stretch);
+            }
+            neon_ui_schema::UiLayoutMode::Row if instance.bounds.height == 0.0 => {
+                instance_layout.align_self = Some(neon_ui_schema::UiAlignItems::Stretch);
+            }
+            _ => {}
+        }
+    }
+    instance.visible = true;
+    instance.enabled = true;
+    instance
+}
+
 #[derive(Default)]
 struct InteractionTraceStore {
     next_sequence: u64,
@@ -99,13 +147,16 @@ fn inbound_interaction_context(
             fragment_revision: Some(event.program_revision.revision),
             composition_revision: fallback_composition_revision,
         }),
-        UiHostInbound::DragDrop { event } => Some(InteractionTraceContext {
+        UiHostInbound::DragDrop {
+            event,
+            active_fragment,
+        } => Some(InteractionTraceContext {
             interaction_id: InteractionId(event.interaction.interaction_id.clone()),
             semantic_target: Some(InteractionSemanticTarget {
                 node_path: event.payload.target_key.clone(),
             }),
-            fragment_revision: Some(event.program_revision.revision),
-            composition_revision: fallback_composition_revision,
+            fragment_revision: Some(active_fragment.fragment.revision),
+            composition_revision: active_fragment.fragment.revision,
         }),
         UiHostInbound::DataGridCell { event } => Some(InteractionTraceContext {
             interaction_id: InteractionId(event.event_id.clone()),
@@ -145,7 +196,9 @@ impl InteractionTraceStore {
             stage,
             outcome,
             error,
+            semantic_source_key: None,
             semantic_target,
+            semantic_intent: None,
             fragment_revision,
             composition_revision,
             downstream_request_id,
@@ -176,6 +229,10 @@ impl InteractionTraceStore {
                         && filters
                             .outcome
                             .is_none_or(|outcome| outcome == record.outcome)
+                        && filters
+                            .semantic_source_key
+                            .as_ref()
+                            .is_none_or(|key| record.semantic_source_key.as_ref() == Some(key))
                         && filters.semantic_node_path.as_ref().is_none_or(|path| {
                             record
                                 .semantic_target
@@ -2761,6 +2818,17 @@ impl UiRuntime {
             Ok(inbound) => inbound,
             Err(_) => self.renderer_event_to_host_inbound(request.params.clone())?,
         };
+        if let UiHostInbound::DragDrop {
+            active_fragment, ..
+        } = &inbound
+            && self.cached_fragment.as_ref() != Some(&active_fragment.clone().into_fragment())
+        {
+            return Ok(self.rejected(
+                request_id,
+                "ui_host_stale_fragment_revision",
+                "drag/drop active fragment context is not the cached fragment",
+            ));
+        }
         let context = inbound_interaction_context(
             &inbound,
             self.cached_fragment
@@ -2935,23 +3003,15 @@ impl UiRuntime {
             }
         };
         let mut updated = if let Some(update) = replacement {
-            if update.expected_fragment_revision != fragment.revision {
-                return Ok(self.rejected(
-                    request_id,
-                    "ui_host_stale_fragment_revision",
-                    "presentation update fragment revision is stale",
-                ));
-            }
-            candidate = match UiHostAdapter::activate_from_snapshot(
-                update.replacement_program,
-                update.replacement_input_schema,
-                update.replacement_input_snapshot,
-                self.epoch,
-            ) {
-                Ok(adapter) => adapter,
-                Err(error) => return Ok(self.rejected(request_id, error.code, error.message)),
-            };
-            update.replacement_fragment
+            let (replacement_adapter, replacement_fragment) =
+                match candidate.apply_presentation_update(update, &fragment) {
+                    Ok(replacement) => replacement,
+                    Err(error) => {
+                        return Ok(self.rejected(request_id, error.code, error.message));
+                    }
+                };
+            candidate = replacement_adapter;
+            replacement_fragment
         } else {
             let mut updated = fragment.clone();
             updated.revision = Revision(updated.revision.0 + 1);
@@ -3192,6 +3252,11 @@ impl UiRuntime {
                         renderer_epoch: event.renderer_epoch,
                     },
                 },
+                active_fragment: UiHostFragmentContext::from_fragment(
+                    self.cached_fragment
+                        .as_ref()
+                        .expect("validated renderer event has an active fragment"),
+                ),
             });
         }
         let neon_ui_schema::UiIntent::Invoke { action, .. } = &event.intent;
@@ -3344,6 +3409,16 @@ impl UiRuntime {
             .is_some_and(|expected| expected != self.debug_snapshot().revision)
         {
             return Err(("revision_conflict", "UI fragment revision is stale"));
+        }
+        if self
+            .cached_fragment
+            .as_ref()
+            .is_some_and(|current| submission.fragment.fragment_id != current.fragment_id)
+        {
+            return Err((
+                "fragment_identity_change",
+                "active UI fragment identity cannot be changed by submission",
+            ));
         }
         if self
             .cached_fragment
@@ -4052,6 +4127,35 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn active_fragment_submission_rejects_identity_change_without_mutating_cache() {
+        let mut runtime = UiRuntime::new(1, "fragment-identity-test");
+        let mut active = runtime.static_fragment(Revision(1));
+        active.fragment_id = UiFragmentId("nui-flow-case-component-gallery".into());
+        runtime.cached_fragment = Some(active.clone());
+        let mut hardcoded = active.clone();
+        hardcoded.fragment_id = UiFragmentId("component-gallery-host".into());
+        hardcoded.revision = Revision(2);
+
+        let response = runtime.handle_service_request(RpcRequest {
+            protocol: "neon3.rpc".into(),
+            version: PROTOCOL_VERSION,
+            request_id: RequestId("identity-change".into()),
+            client: runtime.client.clone(),
+            target: ServiceName(SERVICE_NAME.into()),
+            method: "ui.fragment.submit".into(),
+            params: json!(UiCommand::SubmitFragment {
+                submission: UiFragmentSubmission::new(hardcoded)
+            }),
+            expected_revision: Some(Revision(1)),
+            idempotency_key: Some("identity-change".into()),
+        });
+
+        assert_eq!(response.status, RpcStatus::Rejected);
+        assert_eq!(response.error.unwrap().code, "fragment_identity_change");
+        assert_eq!(runtime.cached_fragment(), Some(&active));
     }
 
     #[test]

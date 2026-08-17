@@ -6,8 +6,9 @@
 use std::collections::{HashMap, HashSet};
 
 use neon_ui_schema::{
-    UiDataGridInputFrame, UiHostInbound, UiHostPublication, UiInputSchema, UiProgram,
-    UiProgramDragDropEvent, UiProgramInputSnapshot, UiProgramSemanticEvent, UiWindowRequest,
+    UiDataGridInputFrame, UiFragment, UiHostInbound, UiHostPresentationUpdate, UiHostPublication,
+    UiInputSchema, UiProgram, UiProgramDragDropEvent, UiProgramInputSnapshot,
+    UiProgramSemanticEvent, UiWindowRequest,
 };
 use serde::{Deserialize, Serialize};
 
@@ -236,6 +237,53 @@ impl UiHostAdapter {
         Ok(result)
     }
 
+    pub fn apply_presentation_update(
+        &self,
+        update: UiHostPresentationUpdate,
+        active_fragment: &UiFragment,
+    ) -> Result<(Self, UiFragment), UiHostAdapterError> {
+        let Some(next_revision) = active_fragment.revision.0.checked_add(1) else {
+            return Err(UiHostAdapterError {
+                code: "ui_host_invalid_fragment_revision",
+                message: "active fragment revision cannot be advanced",
+            });
+        };
+        if update.expected_fragment_revision != active_fragment.revision {
+            return Err(UiHostAdapterError {
+                code: "ui_host_stale_fragment_revision",
+                message: "presentation update fragment revision is stale",
+            });
+        }
+        if update.replacement_fragment.fragment_id != active_fragment.fragment_id {
+            return Err(UiHostAdapterError {
+                code: "ui_host_fragment_identity_change",
+                message: "presentation update cannot change the active fragment identity",
+            });
+        }
+        if update.replacement_fragment.revision != neon_protocol::Revision(next_revision) {
+            return Err(UiHostAdapterError {
+                code: "ui_host_invalid_fragment_revision",
+                message: "presentation replacement must use the next fragment revision",
+            });
+        }
+        if update.replacement_program != self.program
+            || update.replacement_input_schema != *self.input_schema()
+            || update.replacement_input_snapshot != self.snapshot()
+        {
+            return Err(UiHostAdapterError {
+                code: "ui_host_presentation_state_change",
+                message: "presentation update must preserve the active program and input snapshot",
+            });
+        }
+        if update.replacement_fragment.validate().is_err() {
+            return Err(UiHostAdapterError {
+                code: "ui_host_invalid_fragment",
+                message: "host presentation replacement is not a valid fragment",
+            });
+        }
+        Ok((self.clone(), update.replacement_fragment))
+    }
+
     pub fn validate_inbound(
         &self,
         inbound: UiHostInbound,
@@ -249,7 +297,17 @@ impl UiHostAdapter {
                 self.validate_semantic_intent(&event)?;
                 Ok(UiHostInboundResult::SemanticIntent(event))
             }
-            UiHostInbound::DragDrop { event } => {
+            UiHostInbound::DragDrop {
+                event,
+                active_fragment,
+            } => {
+                let fragment = active_fragment.into_fragment();
+                if fragment.validate().is_err() {
+                    return Err(UiHostAdapterError {
+                        code: "ui_host_invalid_active_fragment",
+                        message: "drag/drop active fragment context is invalid",
+                    });
+                }
                 self.validate_drag_drop(&event)?;
                 Ok(UiHostInboundResult::DragDrop(event))
             }
@@ -443,13 +501,14 @@ mod tests {
 
     use neon_protocol::Revision;
     use neon_ui_schema::{
-        UiDataGridCell, UiDataGridColumn, UiDataGridFrame, UiDataGridPresentation,
-        UiDataGridRecord, UiDataGridWindowRequest, UiDataGridWindowRow, UiGridInputSlot,
-        UiInputChange, UiInputKind, UiInputPacking, UiInputSlot, UiInputUpdateClass, UiInputValue,
+        UiBounds, UiDataGridCell, UiDataGridColumn, UiDataGridFrame, UiDataGridPresentation,
+        UiDataGridRecord, UiDataGridWindowRequest, UiDataGridWindowRow, UiFragmentId,
+        UiGridInputSlot, UiHostFragmentContext, UiInputChange, UiInputKind, UiInputPacking,
+        UiInputSlot, UiInputUpdateClass, UiInputValue, UiNode, UiNodeId, UiNodeKind,
         UiProgramCapability, UiProgramCapabilityOwner, UiProgramCapabilityStatus,
         UiProgramDragRecord, UiProgramDropRecord, UiProgramEventDeclaration, UiProgramNode,
         UiProgramRevision, UiProgramSemanticEventKind, UiResourceBudget,
-        UiSemanticInteractionMetadata,
+        UiSemanticInteractionMetadata, UiStyle,
     };
 
     use super::*;
@@ -578,6 +637,36 @@ mod tests {
         }
     }
 
+    fn active_fragment() -> UiHostFragmentContext {
+        UiHostFragmentContext {
+            fragment: neon_ui_schema::UiFragmentRevision {
+                id: UiFragmentId("arbitrary-fragment".into()),
+                revision: Revision(1),
+            },
+            root: UiNode {
+                node_id: UiNodeId("root".into()),
+                kind: UiNodeKind::Panel,
+                bounds: UiBounds {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1.0,
+                    height: 1.0,
+                },
+                layout: None,
+                visible: true,
+                enabled: true,
+                text_key: None,
+                text: None,
+                image: None,
+                surface: None,
+                style: UiStyle::default(),
+                enter_transition: None,
+                children: Vec::new(),
+            },
+            effects: Vec::new(),
+        }
+    }
+
     fn publication(
         expected_input_revision: u64,
         grid_inputs: Vec<UiDataGridInputFrame>,
@@ -607,6 +696,44 @@ mod tests {
         assert_eq!(result.snapshot.scalar_inputs.input_revision, Revision(1));
         assert_eq!(result.snapshot.grid_inputs.len(), 1);
         assert_eq!(result.accepted_grid_sources, vec!["grid"]);
+    }
+
+    #[test]
+    fn presentation_update_preserves_active_identity_program_and_inputs() {
+        let adapter = adapter();
+        let active = active_fragment().into_fragment();
+        let original_program = adapter.program().clone();
+        let original_snapshot = adapter.snapshot();
+        let mut replacement = active.clone();
+        replacement.revision = Revision(2);
+        replacement.root.enabled = false;
+        let update = UiHostPresentationUpdate {
+            expected_fragment_revision: Revision(1),
+            replacement_fragment: replacement.clone(),
+            replacement_program: original_program.clone(),
+            replacement_input_schema: adapter.input_schema().clone(),
+            replacement_input_snapshot: original_snapshot.clone(),
+        };
+
+        let (next, accepted) = adapter
+            .apply_presentation_update(update.clone(), &active)
+            .unwrap();
+        assert_eq!(accepted.fragment_id, active.fragment_id);
+        assert_eq!(accepted.revision, Revision(2));
+        assert_eq!(next.program(), &original_program);
+        assert_eq!(next.snapshot(), original_snapshot);
+
+        let mut hardcoded = update;
+        hardcoded.replacement_fragment.fragment_id = UiFragmentId("component-gallery-host".into());
+        assert_eq!(
+            adapter
+                .apply_presentation_update(hardcoded, &active)
+                .unwrap_err()
+                .code,
+            "ui_host_fragment_identity_change"
+        );
+        assert_eq!(adapter.program(), &original_program);
+        assert_eq!(adapter.snapshot(), original_snapshot);
     }
 
     #[test]
@@ -733,7 +860,8 @@ mod tests {
         };
         assert!(matches!(
             adapter.validate_inbound(UiHostInbound::DragDrop {
-                event: event.clone()
+                event: event.clone(),
+                active_fragment: active_fragment(),
             }),
             Ok(UiHostInboundResult::DragDrop(_))
         ));
@@ -741,7 +869,10 @@ mod tests {
         invalid.payload.presentation_template_key = None;
         assert_eq!(
             adapter
-                .validate_inbound(UiHostInbound::DragDrop { event: invalid })
+                .validate_inbound(UiHostInbound::DragDrop {
+                    event: invalid,
+                    active_fragment: active_fragment(),
+                })
                 .unwrap_err()
                 .code,
             "ui_host_invalid_drag_drop"

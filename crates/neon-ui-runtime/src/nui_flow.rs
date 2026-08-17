@@ -131,7 +131,7 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
                 continue;
             }
         }
-        let node = parse_node(content, line)?;
+        let mut node = parse_node(content, line)?;
         if let Some(previous) = stack.last() {
             if indent > previous.0 + 2 {
                 return Err(error(
@@ -209,6 +209,10 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
             });
         }
         if let Some(template) = &node.template {
+            // Templates are inert structural prototypes. Runtime instances clone
+            // and activate them without exposing the prototype to layout or input.
+            node.node.visible = false;
+            node.node.enabled = false;
             templates.push(UiTemplateDeclaration {
                 template_key: node.node.node_id.0.clone(),
                 root_node_key: node.node.node_id.0.clone(),
@@ -3175,6 +3179,9 @@ panel workspace row gap 8
             Some("target-row")
         );
         assert!(lower_nui_flow_effects(&document).iter().any(|effect| matches!(effect, UiEffect::DropBinding { binding } if binding.key == "target-drop" && binding.presentation_template_key.as_deref() == Some("target-row"))));
+        let prototype = &document.ir.root.children[1].children[0];
+        assert!(!prototype.visible);
+        assert!(!prototype.enabled);
     }
 
     #[test]
