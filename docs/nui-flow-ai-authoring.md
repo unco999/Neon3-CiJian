@@ -46,7 +46,7 @@ The complex reference fixture is
 ## Component Controls
 
 The first generic control batch is `checkbox`, `radio_button`, `slider`,
-`drag_value`, `combo`, `dropdown`, `selectable`, `list_box`, `scrollbar`, and
+`drag_value`, `combo`, `dropdown`, `tabs`, `selectable`, `list_box`, `scrollbar`, and
 `progress_bar`. Bind control state only through typed inputs:
 
 ```text

@@ -3,6 +3,7 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 use std::fs::{self, OpenOptions};
+use std::io::BufReader;
 use std::io::{self, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -12,8 +13,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use neon_ipc::RpcClient;
 use neon_protocol::{
-    ClientIdentity, ClientKind, ProtocolVersion, RequestId, Revision, RpcRequest, RpcStatus,
-    ServiceName,
+    AssetRef, ClientIdentity, ClientKind, ProtocolVersion, RequestId, Revision, RpcRequest,
+    RpcStatus, ServiceName,
 };
 use neon_ui_runtime::{lower_nui_flow_effects, parse_nui_flow};
 use neon_ui_schema::{
@@ -182,13 +183,39 @@ fn run_case_session(
     children: &mut ChildSession,
     manifest: &mut LiveSessionManifest,
 ) -> io::Result<()> {
+    let projectd_endpoint = if case == "component-gallery" {
+        Some(reserve_loopback_endpoint()?)
+    } else {
+        None
+    };
+    if let Some(endpoint) = projectd_endpoint {
+        let projectd = spawn_service(
+            executable(workspace, "neon-projectd"),
+            &["--server", &endpoint.to_string()],
+            show_logs,
+        )?;
+        job.assign(&projectd)?;
+        children.push(projectd);
+        wait_for_endpoint(endpoint)?;
+    }
+    let wgpu_endpoint_text = wgpu_endpoint.to_string();
+    let ui_endpoint_text = ui_endpoint.to_string();
+    let projectd_endpoint_text = projectd_endpoint.map(|endpoint| endpoint.to_string());
+    let gallery_image_json = projectd_endpoint
+        .map(component_gallery_image_asset)
+        .transpose()?
+        .map(|asset| serde_json::to_string(&asset).expect("AssetRef serializes"));
+    let mut wgpu_args = vec![
+        "--window-server",
+        wgpu_endpoint_text.as_str(),
+        ui_endpoint_text.as_str(),
+    ];
+    if let Some(endpoint) = projectd_endpoint_text.as_deref() {
+        wgpu_args.push(endpoint);
+    }
     let wgpu = spawn_service(
         executable(workspace, "neon-wgpu-runtime"),
-        &[
-            "--window-server".as_ref(),
-            &wgpu_endpoint.to_string(),
-            &ui_endpoint.to_string(),
-        ],
+        &wgpu_args,
         show_logs,
     )?;
     job.assign(&wgpu)?;
@@ -204,7 +231,14 @@ fn run_case_session(
 
     let host_endpoint_text = host_endpoint.to_string();
     let domain_args = if case == "component-gallery" {
-        vec![host_endpoint_text.as_str(), "--component-gallery"]
+        vec![
+            host_endpoint_text.as_str(),
+            "--component-gallery",
+            "--gallery-image",
+            gallery_image_json
+                .as_deref()
+                .expect("component gallery has projectd asset"),
+        ]
     } else {
         vec![host_endpoint_text.as_str()]
     };
@@ -252,6 +286,9 @@ fn run_case_session(
     submitter
         .args([case, &ui_endpoint.to_string()])
         .current_dir(workspace);
+    if let Some(asset) = gallery_image_json.as_deref() {
+        submitter.arg(asset);
+    }
     hide_console_window(&mut submitter);
     let demo = submitter.spawn()?;
     job.assign(&demo)?;
@@ -311,14 +348,30 @@ fn run_component_gallery_window_input_scenario_inner() -> io::Result<serde_json:
     let wgpu_endpoint = reserve_loopback_endpoint()?;
     let ui_endpoint = reserve_loopback_endpoint()?;
     let domain_endpoint = reserve_loopback_endpoint()?;
+    let projectd_endpoint = reserve_loopback_endpoint()?;
     let job = ProcessJob::new()?;
     let mut children = ChildSession::default();
+
+    let projectd = spawn_service(
+        executable(&workspace, "neon-projectd"),
+        &["--server", &projectd_endpoint.to_string()],
+        false,
+    )?;
+    job.assign(&projectd)?;
+    children.push(projectd);
+    wait_for_endpoint(projectd_endpoint)?;
+    let gallery_image = component_gallery_image_asset(projectd_endpoint)?;
+    let gallery_image_json = serde_json::to_string(&gallery_image).expect("AssetRef serializes");
+    let wgpu_endpoint_text = wgpu_endpoint.to_string();
+    let ui_endpoint_text = ui_endpoint.to_string();
+    let projectd_endpoint_text = projectd_endpoint.to_string();
     let wgpu = spawn_service(
         executable(&workspace, "neon-wgpu-runtime"),
         &[
             "--window-server",
-            &wgpu_endpoint.to_string(),
-            &ui_endpoint.to_string(),
+            &wgpu_endpoint_text,
+            &ui_endpoint_text,
+            &projectd_endpoint_text,
         ],
         false,
     )?;
@@ -328,7 +381,7 @@ fn run_component_gallery_window_input_scenario_inner() -> io::Result<serde_json:
     wait_for_window_gpu(wgpu_endpoint)?;
     let domain = spawn_service(
         executable(&workspace, "component_gallery_domain_controller"),
-        &[&domain_endpoint.to_string()],
+        &[&domain_endpoint.to_string(), &gallery_image_json],
         false,
     )?;
     job.assign(&domain)?;
@@ -348,8 +401,10 @@ fn run_component_gallery_window_input_scenario_inner() -> io::Result<serde_json:
     children.push(ui);
     wait_for_endpoint(ui_endpoint)?;
 
+    let gallery_image = component_gallery_image_asset(projectd_endpoint)?;
     let (document, program) =
-        neon_ui_runtime::demo_domain::component_gallery_program().map_err(io::Error::other)?;
+        neon_ui_runtime::demo_domain::component_gallery_program(gallery_image)
+            .map_err(io::Error::other)?;
     let effects = lower_nui_flow_effects(&document);
     let mut fragment = UiFragment {
         fragment_id: UiFragmentId(FRAGMENT_ID.into()),
@@ -382,6 +437,62 @@ fn run_component_gallery_window_input_scenario_inner() -> io::Result<serde_json:
     )?;
 
     let mut steps = Vec::new();
+    let action_before = window_graph_revision(wgpu_endpoint)?;
+    let action = debug_window_target_command(
+        wgpu_endpoint,
+        "window-input-action-button",
+        "debug.window.input.activate_target",
+        &format!("{FRAGMENT_ID}/action-button"),
+    )?;
+    let action_delivery = wait_for_pointer_delivery(wgpu_endpoint, Duration::from_secs(5))?;
+    if action_delivery
+        .get("state")
+        .and_then(serde_json::Value::as_str)
+        != Some("accepted")
+    {
+        return Err(io::Error::other(format!(
+            "gallery action button delivery was not accepted: {action_delivery}"
+        )));
+    }
+    let _action_after =
+        wait_for_graph_revision_after(wgpu_endpoint, action_before, Duration::from_secs(5))?;
+    let action_snapshot = call(
+        wgpu_endpoint,
+        &rpc_request(
+            "window-input-action-button-snapshot",
+            "wgpu-runtime",
+            "wgpu.ui.fragment.snapshot",
+            json!({"fragment_id": FRAGMENT_ID}),
+            None,
+            None,
+        ),
+    )?;
+    assert_accepted(
+        action_snapshot.clone(),
+        "accepted gallery action button update",
+    )?;
+    let action_fragment: UiFragment = serde_json::from_value(
+        action_snapshot
+            .result
+            .ok_or_else(|| io::Error::other("action button snapshot omitted result"))?["fragment"]
+            .clone(),
+    )
+    .map_err(io::Error::other)?;
+    let action_toggled = action_fragment.effects.iter().any(|effect| {
+        matches!(
+            effect,
+            UiEffect::ControlPresentation {
+                node_id,
+                state: UiControlPresentation::Toggle { selected: false }
+            } if node_id.0 == "feature-toggle"
+        )
+    });
+    if !action_toggled {
+        return Err(io::Error::other(format!(
+            "action button did not publish the feature toggle presentation"
+        )));
+    }
+    steps.push(json!({"step": "action_button_toggles_feature", "gesture": action, "delivery": action_delivery, "feature_enabled": false}));
     let drag_before = window_graph_revision(wgpu_endpoint)?;
     let drag = debug_window_drag_gesture(
         wgpu_endpoint,
@@ -417,7 +528,7 @@ fn run_component_gallery_window_input_scenario_inner() -> io::Result<serde_json:
         "accepted backpack presentation update",
     )?;
     let drag_fragment: UiFragment = serde_json::from_value(drag_snapshot.result.ok_or_else(|| io::Error::other("drag presentation snapshot omitted result"))?["fragment"].clone()).map_err(io::Error::other)?;
-    if drag_fragment.revision != Revision(2)
+    if drag_fragment.revision != Revision(action_fragment.revision.0 + 1)
         || find_node(&drag_fragment.root, "backpack-compass").is_some()
     {
         return Err(io::Error::other(
@@ -504,6 +615,30 @@ fn run_component_gallery_window_input_scenario_inner() -> io::Result<serde_json:
             input_key,
             expected,
         )?;
+        if id == "slider" {
+            let capture_path = workspace.join("target/neon-dev").join(format!(
+                "neon3-component-gallery-immediate-grid-{}-{}.png",
+                std::process::id(),
+                TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+            ));
+            let capture = capture_final_target(wgpu_endpoint, &capture_path)?;
+            if capture
+                .get("composition_revision")
+                .and_then(serde_json::Value::as_u64)
+                != Some(after)
+            {
+                return Err(io::Error::other(format!(
+                    "immediate final target did not contain scalar composition {after}: {capture}"
+                )));
+            }
+            let nonblank_pixels = assert_nonblank_data_grid_region(&capture_path)?;
+            steps.push(json!({
+                "step": "immediate_scalar_data_grid_render",
+                "capture": capture,
+                "nonblank_data_grid_header_pixels": nonblank_pixels,
+                "scroll": "not_performed",
+            }));
+        }
         steps.push(json!({
             "step": format!("{id}_drag_commit"),
             "gesture": gesture,
@@ -558,8 +693,70 @@ fn run_component_gallery_window_input_scenario_inner() -> io::Result<serde_json:
     )?;
     steps.push(json!({"step": "grid_scroll_tail_window", "scroll": grid_scroll, "final_window": final_window, "tail_control": {"semantic_node_path": tail_control_path, "activation": tail_activation, "delivery": tail_delivery, "trace": tail_trace}, "composition_revision": {"before": grid_before, "after_window": grid_after, "after_tail_activation": tail_after}}));
     Ok(
-        json!({"scenario": SCENARIO, "status": "passed", "acceptance_level": "composition-ready", "steps": steps}),
+        json!({"scenario": SCENARIO, "status": "passed", "acceptance_level": "wgpu-rendered", "steps": steps}),
     )
+}
+
+fn capture_final_target(endpoint: SocketAddr, path: &Path) -> io::Result<serde_json::Value> {
+    let response = call(
+        endpoint,
+        &rpc_request(
+            "component-gallery-immediate-grid-capture",
+            "wgpu-runtime",
+            "wgpu.render.target.capture",
+            json!({"target": "ui.color.v1", "path": path.to_string_lossy(), "redraw": false}),
+            None,
+            None,
+        ),
+    )?;
+    assert_accepted(response.clone(), "immediate final-target capture")?;
+    response
+        .result
+        .ok_or_else(|| io::Error::other("immediate final-target capture omitted result"))
+}
+
+fn assert_nonblank_data_grid_region(path: &Path) -> io::Result<usize> {
+    let file = std::fs::File::open(path)?;
+    let decoder = png::Decoder::new(BufReader::new(file));
+    let mut reader = decoder.read_info().map_err(io::Error::other)?;
+    let mut pixels = vec![
+        0;
+        reader.output_buffer_size().ok_or_else(|| io::Error::other(
+            "PNG output buffer size overflowed"
+        ))?
+    ];
+    let info = reader.next_frame(&mut pixels).map_err(io::Error::other)?;
+    if info.color_type != png::ColorType::Rgba {
+        return Err(io::Error::other(format!(
+            "final target capture must be RGBA, got {:?}",
+            info.color_type
+        )));
+    }
+    let width = info.width as usize;
+    let height = info.height as usize;
+    // At the gallery's minimum viewport the center pane occupies x=384..984
+    // and the DataGrid header occupies y=14..38. Percentages also work at
+    // non-unit physical scale factors.
+    let x_start = width * 24 / 100;
+    let x_end = width * 58 / 100;
+    let y_start = height * 2 / 100;
+    let y_end = height * 4 / 100;
+    let mut nonblank = 0usize;
+    for y in y_start..y_end {
+        for x in x_start..x_end {
+            let pixel = &pixels[(y * width + x) * 4..][..4];
+            if pixel[0].abs_diff(6) > 8 || pixel[1].abs_diff(7) > 8 || pixel[2].abs_diff(9) > 8 {
+                nonblank += 1;
+            }
+        }
+    }
+    let sample_pixels = (x_end - x_start) * (y_end - y_start);
+    if nonblank < sample_pixels / 2 {
+        return Err(io::Error::other(format!(
+            "immediate DataGrid header was blank in {path:?}: {nonblank}/{sample_pixels} nonblank pixels"
+        )));
+    }
+    Ok(nonblank)
 }
 
 fn debug_window_target_command(
@@ -1006,9 +1203,9 @@ fn inspect_window_input(endpoint: &str) -> io::Result<()> {
     let response = call(
         endpoint,
         &rpc_request(
-            "window-input-inspect",
+            "window-image-inspect",
             "wgpu-runtime",
-            "debug.window.input.snapshot",
+            "debug.window.images",
             json!({}),
             None,
             None,
@@ -1475,8 +1672,20 @@ fn run_component_gallery_scenario_inner() -> io::Result<serde_json::Value> {
     let wgpu_endpoint = reserve_loopback_endpoint()?;
     let ui_endpoint = reserve_loopback_endpoint()?;
     let domain_endpoint = reserve_loopback_endpoint()?;
+    let projectd_endpoint = reserve_loopback_endpoint()?;
     let job = ProcessJob::new()?;
     let mut children = ChildSession::default();
+
+    let projectd = spawn_service(
+        executable(&workspace, "neon-projectd"),
+        &["--server", &projectd_endpoint.to_string()],
+        false,
+    )?;
+    job.assign(&projectd)?;
+    children.push(projectd);
+    wait_for_endpoint(projectd_endpoint)?;
+    let gallery_image = component_gallery_image_asset(projectd_endpoint)?;
+    let gallery_image_json = serde_json::to_string(&gallery_image).expect("AssetRef serializes");
 
     let wgpu = spawn_service(
         executable(&workspace, "neon-wgpu-runtime"),
@@ -1488,7 +1697,7 @@ fn run_component_gallery_scenario_inner() -> io::Result<serde_json::Value> {
     wait_for_endpoint(wgpu_endpoint)?;
     let domain = spawn_service(
         executable(&workspace, "component_gallery_domain_controller"),
-        &[&domain_endpoint.to_string()],
+        &[&domain_endpoint.to_string(), &gallery_image_json],
         false,
     )?;
     job.assign(&domain)?;
@@ -1509,7 +1718,8 @@ fn run_component_gallery_scenario_inner() -> io::Result<serde_json::Value> {
     wait_for_endpoint(ui_endpoint)?;
 
     let (document, program) =
-        neon_ui_runtime::demo_domain::component_gallery_program().map_err(io::Error::other)?;
+        neon_ui_runtime::demo_domain::component_gallery_program(gallery_image)
+            .map_err(io::Error::other)?;
     let mut fragment = UiFragment {
         fragment_id: UiFragmentId(FRAGMENT_ID.into()),
         revision: Revision(1),
@@ -1966,6 +2176,31 @@ fn call(endpoint: SocketAddr, request: &RpcRequest) -> io::Result<neon_protocol:
     RpcClient::connect(endpoint)
         .and_then(|mut client| client.call(request))
         .map_err(|error| io::Error::other(error.to_string()))
+}
+
+fn component_gallery_image_asset(projectd_endpoint: SocketAddr) -> io::Result<AssetRef> {
+    let response = call(
+        projectd_endpoint,
+        &rpc_request(
+            "component-gallery-assets",
+            "projectd",
+            "asset.list",
+            json!({}),
+            None,
+            None,
+        ),
+    )?;
+    assert_accepted(response.clone(), "component gallery asset snapshot")?;
+    let assets: Vec<AssetRef> = serde_json::from_value(
+        response
+            .result
+            .ok_or_else(|| io::Error::other("projectd asset snapshot has no result"))?,
+    )
+    .map_err(io::Error::other)?;
+    assets
+        .into_iter()
+        .find(|asset| asset.kind == "image")
+        .ok_or_else(|| io::Error::other("projectd snapshot has no image AssetRef"))
 }
 
 fn assert_accepted(response: neon_protocol::RpcResponse, operation: &str) -> io::Result<()> {

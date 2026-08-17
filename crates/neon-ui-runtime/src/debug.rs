@@ -384,6 +384,7 @@ impl UiDebugSession {
                 key: format!("{}:{}", image.project_id, image.asset_id),
                 kind: neon_ui_schema::UiProgramResourceKind::Image,
                 has_fallback: false,
+                asset_ref: Some(image.clone()),
             });
         }
         if let Some(surface) = &node.surface {
@@ -391,6 +392,7 @@ impl UiDebugSession {
                 key: surface.target_id.clone(),
                 kind: neon_ui_schema::UiProgramResourceKind::RenderSurface,
                 has_fallback: false,
+                asset_ref: None,
             });
         }
         resources

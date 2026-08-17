@@ -6,7 +6,7 @@
 use std::net::SocketAddr;
 
 use neon_ipc::{RpcServer, TransportError};
-use neon_protocol::{Revision, RpcError, RpcRequest, RpcResponse, RpcStatus};
+use neon_protocol::{AssetRef, Revision, RpcError, RpcRequest, RpcResponse, RpcStatus};
 use neon_ui_schema::{
     TextRef, UI_PROGRAM_BOUNDED_STRUCTURE_CAPABILITY_NAME, UI_PROGRAM_CAPABILITY_NAME,
     UI_PROGRAM_SCHEMA_VERSION, UI_PROGRAM_SEMANTIC_EVENT_CAPABILITY_NAME,
@@ -53,7 +53,7 @@ impl DemoInputDomain {
             .iter()
             .map(|(key, value)| {
                 let label = match key.as_str() {
-                    "list_choice" => "Selected mode",
+                    "list_choice" | "tabs_choice" => "Selected mode",
                     "drag_value" => "Current count",
                     _ => key,
                 };
@@ -91,9 +91,11 @@ impl DemoInputDomain {
                         && matches!(
                             binding.property,
                             neon_ui_schema::UiBoundProperty::Active
+                                | neon_ui_schema::UiBoundProperty::Enabled
                                 | neon_ui_schema::UiBoundProperty::Selected
                                 | neon_ui_schema::UiBoundProperty::NumericValue
                                 | neon_ui_schema::UiBoundProperty::StateToken
+                                | neon_ui_schema::UiBoundProperty::TextValue
                         )
                 })
             })
@@ -110,11 +112,16 @@ impl DemoInputDomain {
             .values
             .get(key)
             .ok_or("controlled input value is missing")?;
-        let value = match &event.requested_value {
-            Some(requested) => requested_input_value(&slot.kind, requested)
-                .ok_or("requested control value does not match the bound input kind")?,
-            None => advance_value(&slot.kind, &current.value)
-                .ok_or("controlled input kind is not supported")?,
+        let value = if event.intent == "gallery.button.activate" {
+            advance_value(&slot.kind, &current.value)
+                .ok_or("controlled input kind is not supported")?
+        } else {
+            match &event.requested_value {
+                Some(requested) => requested_input_value(&slot.kind, requested)
+                    .ok_or("requested control value does not match the bound input kind")?,
+                None => advance_value(&slot.kind, &current.value)
+                    .ok_or("controlled input kind is not supported")?,
+            }
         };
         self.inputs
             .apply(
@@ -136,12 +143,18 @@ impl DemoInputDomain {
 
     /// Runs the component-gallery program through the generic UI host boundary.
     /// It owns only typed inputs and bounded DataGrid frames.
-    pub fn serve_component_gallery(endpoint: SocketAddr) -> Result<(), TransportError> {
-        Self::serve_component_gallery_server(RpcServer::bind(endpoint)?)
+    pub fn serve_component_gallery(
+        endpoint: SocketAddr,
+        image_asset: AssetRef,
+    ) -> Result<(), TransportError> {
+        Self::serve_component_gallery_server(RpcServer::bind(endpoint)?, image_asset)
     }
 
-    fn serve_component_gallery_server(server: RpcServer) -> Result<(), TransportError> {
-        let (document, program) = component_gallery_program()
+    fn serve_component_gallery_server(
+        server: RpcServer,
+        image_asset: AssetRef,
+    ) -> Result<(), TransportError> {
+        let (document, program) = component_gallery_program(image_asset)
             .map_err(|error| TransportError::Io(std::io::Error::other(error)))?;
         let input_schema = document.input_schema.clone();
         let mut domain = Self::new(program.clone(), input_schema.clone())
@@ -340,12 +353,16 @@ impl DemoInputDomain {
     }
 }
 
-pub fn component_gallery_program()
--> Result<(neon_ui_schema::NuiFlowDocument, neon_ui_schema::UiProgram), String> {
-    let document = parse_nui_flow(include_str!(
+pub fn component_gallery_program(
+    image_asset: AssetRef,
+) -> Result<(neon_ui_schema::NuiFlowDocument, neon_ui_schema::UiProgram), String> {
+    let mut document = parse_nui_flow(include_str!(
         "../../../tests/fixtures/ui/imgui-component-gallery.nui"
     ))
     .map_err(|error| format!("component gallery fixture is invalid: {error:?}"))?;
+    let bindings = std::collections::HashMap::from([("gallery-image".into(), image_asset)]);
+    crate::bind_nui_flow_resources(&mut document, &bindings)
+        .map_err(|error| format!("component gallery resource binding failed: {error:?}"))?;
     let revision = UiProgramRevision {
         program_id: "surface.component-gallery.demo".into(),
         revision: Revision(1),
@@ -435,6 +452,7 @@ pub fn apply_visible_status_to_fragment(
     for (node_id, input_key) in [
         ("mode-combo", "combo_choice"),
         ("mode-dropdown", "dropdown_choice"),
+        ("mode-tabs", "tabs_choice"),
         ("item-list", "list_choice"),
     ] {
         if let Some(UiInputValue::Enum { value }) = values.get(input_key).map(|value| &value.value)
@@ -473,8 +491,10 @@ pub fn apply_visible_status_to_fragment(
 /// node from the program declaration instead of a renderer identity.
 pub fn gallery_event_kind(node_key: &str) -> UiProgramSemanticEventKind {
     match node_key {
-        "feature-toggle" | "mode-radio" | "mode-combo" | "mode-dropdown" | "item-selectable"
-        | "item-list" => UiProgramSemanticEventKind::SelectionChanged,
+        "feature-toggle" | "mode-radio" | "mode-combo" | "mode-dropdown" | "mode-tabs"
+        | "item-selectable" | "item-list" => UiProgramSemanticEventKind::SelectionChanged,
+        "action-button" => UiProgramSemanticEventKind::Activate,
+        "gallery-text" => UiProgramSemanticEventKind::TextEditCommit,
         _ => UiProgramSemanticEventKind::ValueCommit,
     }
 }
@@ -508,6 +528,9 @@ fn advance_value(kind: &UiInputKind, value: &UiInputValue) -> Option<UiInputValu
                 .nth(1)?
                 .clone(),
         },
+        (UiInputKind::TextHandle, UiInputValue::TextHandle { value }) => {
+            UiInputValue::TextHandle { value: *value }
+        }
         _ => return None,
     })
 }
@@ -551,6 +574,9 @@ fn requested_input_value(
                 value: value.clone(),
             })
         }
+        (UiInputKind::TextHandle, UiSemanticPayloadValue::TextHandle { value }) => {
+            Some(UiInputValue::TextHandle { value: *value })
+        }
         _ => None,
     }
 }
@@ -562,6 +588,7 @@ fn display_value(value: &UiInputValue) -> String {
         UiInputValue::U32 { value } => value.to_string(),
         UiInputValue::F32 { value } => format!("{value:.2}"),
         UiInputValue::Enum { value } => value.clone(),
+        UiInputValue::TextHandle { value } => format!("handle:{}:{}", value.id, value.generation),
         _ => "unavailable".into(),
     }
 }
@@ -1372,13 +1399,19 @@ fn rejected(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        UiProgramSemanticEventRouter, compile_nui_flow_program, lower_nui_flow_effects,
-        parse_nui_flow,
-    };
+    use crate::{UiProgramSemanticEventRouter, lower_nui_flow_effects, parse_nui_flow};
     use neon_ipc::RpcClient;
     use neon_protocol::{ClientIdentity, ClientKind, ProtocolVersion, RequestId, ServiceName};
     use neon_ui_schema::UiFragmentId;
+
+    fn gallery_asset() -> AssetRef {
+        AssetRef {
+            project_id: "test-project".into(),
+            asset_id: 1,
+            revision: Revision(1),
+            kind: "image".into(),
+        }
+    }
 
     fn fragment() -> UiFragment {
         let document = parse_nui_flow(include_str!(
@@ -1702,9 +1735,9 @@ mod tests {
         let server = RpcServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
         let endpoint = server.local_addr().unwrap();
         let server_thread = std::thread::spawn(move || {
-            DemoInputDomain::serve_component_gallery_server(server).unwrap();
+            DemoInputDomain::serve_component_gallery_server(server, gallery_asset()).unwrap();
         });
-        let (_, program) = component_gallery_program().unwrap();
+        let (_, program) = component_gallery_program(gallery_asset()).unwrap();
         let event = UiSemanticEvent {
             event: UiSemanticEventType::SelectionChanged,
             event_id: "gallery-first-grid-cell".into(),
@@ -1778,26 +1811,25 @@ mod tests {
 
     #[test]
     fn component_gallery_headless_scenario_accepts_events_and_publishes_visible_status() {
-        let document = parse_nui_flow(include_str!(
-            "../../../tests/fixtures/ui/imgui-component-gallery.nui"
-        ))
-        .unwrap();
-        let revision = program_revision();
-        let program = compile_nui_flow_program(&document, revision.clone()).unwrap();
+        let (document, program) = component_gallery_program(gallery_asset()).unwrap();
+        let revision = program.revision.clone();
         let mut domain =
             DemoInputDomain::new(program.clone(), document.input_schema.clone()).unwrap();
         let mut router =
             UiProgramSemanticEventRouter::new(program.clone(), domain.snapshot().inputs, 7);
         for (index, node_key) in [
+            "action-button",
             "feature-toggle",
             "mode-radio",
             "exposure-slider",
             "count-drag",
             "mode-combo",
             "mode-dropdown",
+            "mode-tabs",
             "item-selectable",
             "item-list",
             "gallery-scroll",
+            "gallery-text",
         ]
         .iter()
         .enumerate()
@@ -1829,6 +1861,9 @@ mod tests {
                                     value: value.clone(),
                                 }
                             }
+                            UiInputValue::TextHandle { value } => {
+                                neon_ui_schema::UiSemanticPayloadValue::TextHandle { value: *value }
+                            }
                             _ => unreachable!(),
                         },
                     )
@@ -1838,9 +1873,17 @@ mod tests {
                 event_id: format!("gallery-scenario-{index}"),
                 kind: if matches!(
                     *node_key,
-                    "feature-toggle" | "mode-radio" | "mode-combo" | "item-selectable"
+                    "feature-toggle"
+                        | "mode-radio"
+                        | "mode-combo"
+                        | "mode-tabs"
+                        | "item-selectable"
                 ) {
                     neon_ui_schema::UiProgramSemanticEventKind::SelectionChanged
+                } else if *node_key == "action-button" {
+                    neon_ui_schema::UiProgramSemanticEventKind::Activate
+                } else if *node_key == "gallery-text" {
+                    neon_ui_schema::UiProgramSemanticEventKind::TextEditCommit
                 } else {
                     neon_ui_schema::UiProgramSemanticEventKind::ValueCommit
                 },
@@ -1870,7 +1913,7 @@ mod tests {
         let snapshot = domain.snapshot();
         assert_eq!(
             snapshot.inputs.values["feature_enabled"].value,
-            UiInputValue::Bool { value: false }
+            UiInputValue::Bool { value: true }
         );
         assert_eq!(
             snapshot.inputs.values["combo_choice"].value,
@@ -1880,6 +1923,12 @@ mod tests {
         );
         assert_eq!(
             snapshot.inputs.values["dropdown_choice"].value,
+            UiInputValue::Enum {
+                value: "gamma".into()
+            }
+        );
+        assert_eq!(
+            snapshot.inputs.values["tabs_choice"].value,
             UiInputValue::Enum {
                 value: "gamma".into()
             }
@@ -1909,36 +1958,8 @@ mod tests {
             effect,
             UiEffect::ControlPresentation {
                 node_id,
-                state: UiControlPresentation::Toggle { selected: false }
+                state: UiControlPresentation::Toggle { selected: true }
             } if node_id.0 == "feature-toggle"
         )));
-    }
-
-    fn program_revision() -> neon_ui_schema::UiProgramRevision {
-        use neon_ui_schema::{
-            UI_PROGRAM_BOUNDED_STRUCTURE_CAPABILITY_NAME, UI_PROGRAM_CAPABILITY_NAME,
-            UI_PROGRAM_SCHEMA_VERSION, UI_PROGRAM_SEMANTIC_EVENT_CAPABILITY_NAME,
-            UI_PROGRAM_TEXT_REGISTRY_CAPABILITY_NAME, UiProgramCapability,
-            UiProgramCapabilityOwner, UiProgramCapabilityStatus,
-        };
-        neon_ui_schema::UiProgramRevision {
-            program_id: "component-gallery-test".into(),
-            revision: Revision(1),
-            schema_version: UI_PROGRAM_SCHEMA_VERSION,
-            capabilities: [
-                UI_PROGRAM_CAPABILITY_NAME,
-                UI_PROGRAM_TEXT_REGISTRY_CAPABILITY_NAME,
-                UI_PROGRAM_BOUNDED_STRUCTURE_CAPABILITY_NAME,
-                UI_PROGRAM_SEMANTIC_EVENT_CAPABILITY_NAME,
-            ]
-            .into_iter()
-            .map(|name| UiProgramCapability {
-                name: name.into(),
-                version: 1,
-                owner: UiProgramCapabilityOwner::SharedContract,
-                status: UiProgramCapabilityStatus::Supported,
-            })
-            .collect(),
-        }
     }
 }

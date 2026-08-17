@@ -5,7 +5,8 @@ use std::time::Duration;
 
 use neon_ipc::RpcClient;
 use neon_protocol::{
-    ClientIdentity, ClientKind, ProtocolVersion, RequestId, Revision, RpcRequest, ServiceName,
+    AssetRef, ClientIdentity, ClientKind, ProtocolVersion, RequestId, Revision, RpcRequest,
+    ServiceName,
 };
 use neon_ui_runtime::{
     UiDataGridStore, UiInputStore, UiLocalPresentationState, compile_nui_flow_program,
@@ -41,6 +42,10 @@ fn main() {
         .unwrap_or_else(|| "127.0.0.1:40102".into())
         .parse::<SocketAddr>()
         .expect("UI runtime endpoint must be a socket address");
+    let gallery_image = args.next().map(|value| {
+        serde_json::from_str::<AssetRef>(&value)
+            .expect("component gallery image must be a stable AssetRef JSON value")
+    });
     let source = match case.as_str() {
         "asset-review" => ASSET_REVIEW_SOURCE,
         "kanban-reparent" => KANBAN_REPARENT_SOURCE,
@@ -51,16 +56,20 @@ fn main() {
         _ => panic!("unsupported NUI Flow case: {case}"),
     };
     let document = parse_nui_flow(source).expect("NUI Flow fixture must parse");
-    let effects = lower_nui_flow_effects(&document);
     let mut fragment = UiFragment {
         fragment_id: UiFragmentId(format!("nui-flow-case-{case}")),
         revision: neon_protocol::Revision(1),
         root: initial_visible_root(&document),
-        effects,
+        effects: lower_nui_flow_effects(&document),
     };
     if case == "component-gallery" {
-        let (_, program) = neon_ui_runtime::demo_domain::component_gallery_program()
-            .expect("component Gallery program must compile");
+        let (gallery_document, program) = neon_ui_runtime::demo_domain::component_gallery_program(
+            gallery_image
+                .expect("component gallery requires an externally supplied image AssetRef"),
+        )
+        .expect("component Gallery program must compile");
+        fragment.root = initial_visible_root(&gallery_document);
+        fragment.effects = lower_nui_flow_effects(&gallery_document);
         let domain = neon_ui_runtime::demo_domain::DemoInputDomain::new(
             program,
             document.input_schema.clone(),
@@ -191,9 +200,16 @@ fn attach_demo_data_grid_frame(document: &NuiFlowDocument, fragment: &mut UiFrag
 }
 
 fn attach_demo_virtual_list_frame(document: &NuiFlowDocument, fragment: &mut UiFragment) {
-    let program =
-        compile_nui_flow_program(document, demo_program_revision(&document.ir.surface_id.0))
-            .expect("Virtual list demo fixture must compile");
+    let mut compile_document = document.clone();
+    declare_preview_fallbacks(
+        &compile_document.ir.root,
+        &mut compile_document.ir.resources,
+    );
+    let program = compile_nui_flow_program(
+        &compile_document,
+        demo_program_revision(&document.ir.surface_id.0),
+    )
+    .expect("Virtual list demo fixture must compile");
     let column_keys = program.data_grid_records[0]
         .columns
         .iter()
@@ -337,6 +353,7 @@ fn declare_preview_fallbacks(node: &UiNode, resources: &mut Vec<UiProgramResourc
                 key: node.node_id.0.clone(),
                 kind,
                 has_fallback: true,
+                asset_ref: None,
             });
         }
     }

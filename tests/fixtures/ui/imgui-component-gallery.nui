@@ -2,7 +2,7 @@
 # and a semantic intent; no renderer identity or domain-specific rule is present.
 version 1
 surface surface.component-gallery revision 1
-budget nodes=160 bindings=112 instances=96 text=160 glyphs=12288 events=64 clips=72
+budget nodes=196 bindings=132 instances=140 text=196 glyphs=16384 events=76 clips=84
 input controls_enabled bool default true
 input feature_enabled bool default true
 input radio_selected bool default false
@@ -10,21 +10,33 @@ input slider_value f32:0..1 default 0.5
 input drag_value i32:0..24 default 12
 input combo_choice enum:alpha|beta|gamma default beta
 input dropdown_choice enum:alpha|beta|gamma default beta
+input tabs_choice enum:alpha|beta|gamma default beta
 input list_choice enum:alpha|beta|gamma default beta
 input item_selected bool default true
 input scroll_position f32:0..1 default 0.35
 input dialog_visible bool default false
+input gallery_text text default text:empty
+input progress_value f32:0..1 default 0.68
 input asset_window grid default grid:empty
-drag compass-drag source backpack-compass axis both snap 8 threshold 3 within surface
-drag potion-drag source backpack-potion axis both snap 8 threshold 3 within surface
-drag gem-drag source backpack-gem axis both snap 8 threshold 3 within surface
+resource gallery-image image
+drag compass-drag source backpack-compass axis both snap 0 threshold 3 within surface
+drag potion-drag source backpack-potion axis both snap 0 threshold 3 within surface
+drag gem-drag source backpack-gem axis both snap 0 threshold 3 within surface
 drop equipment-compass-drop target equipment-zone accepts compass-drag placement into present equipment-item-template emit inventory.item.equip
 drop crafting-potion-drop target crafting-zone accepts potion-drag placement into present crafting-item-template emit inventory.item.craft
 drop discard-gem-drop target discard-zone accepts gem-drag placement into present discarded-item-template emit inventory.item.discard
-surface component-gallery overlay minw 1668 h 900 align stretch clip scroll fill #17201E
-  panel gallery-layout row minw 1668 gap 10 pad 14 align stretch fill #17201E
-    panel gallery-controls column minw 360 maxw 430 grow 1 shrink 0 gap 6 pad 10 align stretch fill #1D2A28
+surface component-gallery overlay minw 2048 h 1080 align stretch clip scroll fill #17201E
+  panel gallery-layout row minw 2048 gap 12 pad 16 align stretch fill #17201E
+    scroll gallery-controls column minw 360 maxw 430 grow 1 shrink 0 gap 6 pad 10 align stretch fill #1D2A28
       text gallery-title h 28 value "Component Gallery"
+      button action-button h 30 checked $feature_enabled enabled $controls_enabled value "Toggle feature" event gallery.button.activate
+      input gallery-text h 32 enabled $controls_enabled value $gallery_text event gallery.text.commit
+      text status-gallery_text h 18 value "Text input: empty"
+      progress_bar gallery-progress h 24 numeric $progress_value enabled $controls_enabled value "Progress"
+      text status-progress_value h 18 value "progress_value: 0.68"
+      panel image-preview column h 126 gap 6 pad 8 align stretch fill #243634 line #46766D
+        text image-preview-title h 18 value "Image preview"
+        image gallery-image h 88 resource gallery-image fill #315360 line #76B7BE
       checkbox feature-toggle h 30 checked $feature_enabled enabled $controls_enabled value "Enable feature" event gallery.checkbox.toggle
       text status-feature_enabled h 18 value "feature_enabled: true"
       radio_button mode-radio h 30 selected $radio_selected enabled $controls_enabled value "Select mode" event gallery.radio.select
@@ -37,6 +49,8 @@ surface component-gallery overlay minw 1668 h 900 align stretch clip scroll fill
       text status-combo_choice h 18 value "combo_choice: beta"
       dropdown mode-dropdown h 32 state $dropdown_choice enabled $controls_enabled value "Mode menu" event gallery.dropdown.select
       text status-dropdown_choice h 18 value "dropdown_choice: beta"
+      tabs mode-tabs h 32 state $tabs_choice enabled $controls_enabled value "Mode tabs" event gallery.tabs.select
+      text status-tabs_choice h 18 value "Selected mode: beta"
       selectable item-selectable h 30 selected $item_selected enabled $controls_enabled value "Selectable item" event gallery.selectable.select
       text status-item_selected h 18 value "item_selected: true"
       list_box item-list h 90 state $list_choice enabled $controls_enabled value "Available modes" event gallery.list_box.select
@@ -48,8 +62,8 @@ surface component-gallery overlay minw 1668 h 900 align stretch clip scroll fill
         text control-reference-title value "Control notes"
         text control-reference-body value "Bound state, semantic events, and local presentation stay visible in this scroll rail."
       checkbox dialog-toggle h 30 checked $dialog_visible enabled $controls_enabled value "Open dialog" event gallery.dialog.toggle
-    data_grid asset-grid minw 600 grow 2 shrink 0 source $asset_window capacity 80 row_height 24 overscan 20 columns "name:180:edit:64:virtual_list.name.commit,status:130:dropdown:draft|ready|archived:virtual_list.status.set,owner:110:select:virtual_list.owner.toggle,notes:220:edit:128:virtual_list.notes.commit"
-    panel field-pack column minw 660 maxw 760 grow 1 shrink 0 pad 12 gap 10 align stretch clip none fill #202A32 line #4E8391
+    data_grid asset-grid minw 720 grow 2 shrink 0 source $asset_window capacity 80 row_height 24 overscan 20 columns "name:220:edit:64:virtual_list.name.commit,status:150:dropdown:draft|ready|archived:virtual_list.status.set,owner:130:select:virtual_list.owner.toggle,notes:260:edit:128:virtual_list.notes.commit"
+    scroll field-pack column minw 720 maxw 860 grow 1 shrink 0 pad 12 gap 10 align stretch fill #202A32 line #4E8391
       panel pack-header row h 42 pad 8 gap 8 align center fill #293943
         text pack-title value "Field Pack / 18.4 kg"
         text pack-budget value "Capacity 12 / 16"

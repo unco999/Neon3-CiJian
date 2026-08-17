@@ -58,8 +58,8 @@ pub mod nui_state_machine;
 pub mod terrain_workbench;
 use host_adapter::{UiHostAdapter, UiHostAdapterConfig};
 pub use nui_flow::{
-    NuiFlowError, apply_nui_ir_patch, compile_nui_flow_program, format_nui_flow, lower_nui_flow,
-    lower_nui_flow_effects, parse_nui_flow, parse_nui_flow_patch,
+    NuiFlowError, apply_nui_ir_patch, bind_nui_flow_resources, compile_nui_flow_program,
+    format_nui_flow, lower_nui_flow, lower_nui_flow_effects, parse_nui_flow, parse_nui_flow_patch,
 };
 pub use nui_state_machine::{
     NuiFlowDragController, NuiFlowDragUpdate, NuiFlowDropResult, NuiFlowStateMachineRuntime,
@@ -1272,10 +1272,12 @@ fn program_semantic_event_kind(
             | UiNodeKind::Selectable
             | UiNodeKind::Combo
             | UiNodeKind::Dropdown
+            | UiNodeKind::Tabs
             | UiNodeKind::ListBox => UiProgramSemanticEventKind::SelectionChanged,
-            UiNodeKind::Slider | UiNodeKind::DragValue | UiNodeKind::Scrollbar => {
-                UiProgramSemanticEventKind::ValueCommit
-            }
+            UiNodeKind::Slider
+            | UiNodeKind::DragValue
+            | UiNodeKind::Scrollbar
+            | UiNodeKind::ProgressBar => UiProgramSemanticEventKind::ValueCommit,
             UiNodeKind::TextInput => UiProgramSemanticEventKind::TextEditCommit,
             UiNodeKind::Button => UiProgramSemanticEventKind::Activate,
             _ => UiProgramSemanticEventKind::Activate,
@@ -1402,7 +1404,7 @@ fn refresh_fragment_from_program(
                         },
                     )
             }),
-            UiNodeKind::Combo | UiNodeKind::Dropdown | UiNodeKind::ListBox => {
+            UiNodeKind::Combo | UiNodeKind::Dropdown | UiNodeKind::Tabs | UiNodeKind::ListBox => {
                 state.state_token.as_ref().map(|token| {
                     let options = program
                         .binding_records
@@ -1798,8 +1800,17 @@ pub fn compile_ui_program(
             } else {
                 UiProgramResourceKind::RenderSurface
             };
+            let resource_key = if node.kind == UiNodeKind::Image {
+                document
+                    .image_resources
+                    .get(&node.node_id.0)
+                    .map(String::as_str)
+                    .unwrap_or(&node.node_id.0)
+            } else {
+                &node.node_id.0
+            };
             if !document.resources.iter().any(|resource| {
-                resource.key == node.node_id.0 && (resource.kind == kind || resource.has_fallback)
+                resource.key == resource_key && (resource.kind == kind || resource.has_fallback)
             }) {
                 return Err(compile_error(
                     "ui_program_missing_resource",
@@ -4054,6 +4065,15 @@ fn validate_data_grid_edit_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn gallery_asset() -> neon_protocol::AssetRef {
+        neon_protocol::AssetRef {
+            project_id: "test-project".into(),
+            asset_id: 1,
+            revision: Revision(1),
+            kind: "image".into(),
+        }
+    }
     use neon_ipc::RpcServer;
     use neon_protocol::RpcError;
     use neon_ui_schema::{UiProgramEventDeclaration, UiResourceBudget};
@@ -4321,7 +4341,8 @@ mod tests {
 
     #[test]
     fn generic_host_route_validates_inbound_and_submits_publication_fragment() {
-        let (document, program) = crate::demo_domain::component_gallery_program().unwrap();
+        let (document, program) =
+            crate::demo_domain::component_gallery_program(gallery_asset()).unwrap();
         let declaration = program
             .event_records
             .iter()
@@ -4621,7 +4642,8 @@ mod tests {
             }
         }
 
-        let (document, program) = crate::demo_domain::component_gallery_program().unwrap();
+        let (document, program) =
+            crate::demo_domain::component_gallery_program(gallery_asset()).unwrap();
         let declaration = program.event_records.first().unwrap().clone();
         let mut fragment = UiFragment {
             fragment_id: UiFragmentId("component-gallery-host".into()),
@@ -5184,12 +5206,9 @@ mod tests {
 
     #[test]
     fn compiled_program_control_semantics_route_and_refresh_generically() {
-        let document = parse_nui_flow(include_str!(
-            "../../../tests/fixtures/ui/imgui-component-gallery.nui"
-        ))
-        .unwrap();
-        let revision = compiler_program_revision();
-        let program = compile_nui_flow_program(&document, revision.clone()).unwrap();
+        let (document, program) =
+            crate::demo_domain::component_gallery_program(gallery_asset()).unwrap();
+        let revision = program.revision.clone();
         let inputs = UiInputStore::activate(revision.clone(), document.input_schema.clone())
             .unwrap()
             .snapshot();
@@ -5208,6 +5227,16 @@ mod tests {
             &UiLocalPresentationState::default(),
         );
         let controls = [
+            (
+                "action-button",
+                UiNodeKind::Button,
+                UiProgramSemanticEventKind::Activate,
+            ),
+            (
+                "gallery-text",
+                UiNodeKind::TextInput,
+                UiProgramSemanticEventKind::TextEditCommit,
+            ),
             (
                 "feature-toggle",
                 UiNodeKind::Checkbox,
@@ -5239,6 +5268,11 @@ mod tests {
                 UiProgramSemanticEventKind::SelectionChanged,
             ),
             (
+                "mode-tabs",
+                UiNodeKind::Tabs,
+                UiProgramSemanticEventKind::SelectionChanged,
+            ),
+            (
                 "item-selectable",
                 UiNodeKind::Selectable,
                 UiProgramSemanticEventKind::SelectionChanged,
@@ -5254,7 +5288,7 @@ mod tests {
                 UiProgramSemanticEventKind::ValueCommit,
             ),
         ];
-        for (node_key, kind, _) in &controls {
+        for (node_key, kind, event_kind) in &controls {
             assert_eq!(
                 program
                     .nodes
@@ -5270,7 +5304,23 @@ mod tests {
                     .iter()
                     .any(|primitive| primitive.node_key == *node_key)
             );
+            assert_eq!(
+                program_semantic_event_kind(
+                    kind,
+                    &neon_ui_schema::UiSemanticEventType::PointerClick
+                ),
+                *event_kind
+            );
         }
+        assert_eq!(
+            program
+                .nodes
+                .iter()
+                .find(|node| node.key == "gallery-progress")
+                .unwrap()
+                .kind,
+            UiNodeKind::ProgressBar
+        );
         assert_eq!(
             frame
                 .nodes
@@ -5935,6 +5985,7 @@ mod tests {
                 bound_input_keys: Vec::new(),
             }],
             resources: Vec::new(),
+            image_resources: BTreeMap::new(),
             branches: Vec::new(),
             templates: Vec::new(),
             data_grids: Vec::new(),

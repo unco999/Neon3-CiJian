@@ -11,3 +11,4 @@ neon-protocol = { path = "../neon-protocol" }
 neon-ui-runtime = { path = "../neon-ui-runtime" }
 neon-ui-schema = { path = "../neon-ui-schema" }
 serde_json.workspace = true
+png = "0.18"

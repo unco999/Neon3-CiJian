@@ -654,6 +654,7 @@ pub enum UiNodeKind {
     DragValue,
     Combo,
     Dropdown,
+    Tabs,
     /// A non-modal top-level presentation layer, normally anchored by its bounds.
     Tooltip,
     /// A modal top-level presentation layer with a renderer-owned backdrop.
@@ -1141,6 +1142,10 @@ pub struct UiIrDocument {
     pub events: Vec<UiProgramEventDeclaration>,
     #[serde(default)]
     pub resources: Vec<UiProgramResource>,
+    /// Image node key to stable resource key bindings. The resource table is
+    /// declarative; AssetRef values are supplied by the external owner.
+    #[serde(default)]
+    pub image_resources: std::collections::BTreeMap<String, String>,
     /// Finite subtrees selected by one direct input predicate. The subtree is
     /// already present in `root`; this table only supplies its runtime rule.
     #[serde(default)]
@@ -1783,6 +1788,8 @@ pub struct UiProgramResource {
     pub kind: UiProgramResourceKind,
     #[serde(default)]
     pub has_fallback: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asset_ref: Option<AssetRef>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -3100,6 +3107,27 @@ impl UiIrDocument {
         }
         let mut keys = std::collections::HashSet::new();
         collect_ir_keys(&self.root, &mut keys);
+        let mut resource_keys = std::collections::HashSet::new();
+        for resource in &self.resources {
+            if resource.key.trim().is_empty()
+                || !resource_keys.insert(&resource.key)
+                || matches!(resource.kind, UiProgramResourceKind::Image)
+                    && resource
+                        .asset_ref
+                        .as_ref()
+                        .is_some_and(|asset| asset.kind != "image")
+            {
+                return Err(UiSchemaError::InvalidIrDocument);
+            }
+        }
+        if self.image_resources.iter().any(|(node_key, resource_key)| {
+            !matches!(find_ir_node(&self.root, node_key), Some(node) if node.kind == UiNodeKind::Image)
+                || !self.resources.iter().any(|resource| {
+                    resource.key == *resource_key && resource.kind == UiProgramResourceKind::Image
+                })
+        }) {
+            return Err(UiSchemaError::InvalidIrDocument);
+        }
         let mut branch_keys = std::collections::HashSet::new();
         for branch in &self.branches {
             if branch.branch_key.trim().is_empty()

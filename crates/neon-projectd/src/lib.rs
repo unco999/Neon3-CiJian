@@ -43,12 +43,25 @@ impl Projectd {
             revision: Revision(5),
             kind: "image".into(),
         };
+        let mut image_bytes = Vec::with_capacity(32 * 32 * 4);
+        for y in 0..32 {
+            for x in 0..32 {
+                let color = if x >= 16 {
+                    [234, 163, 78, 0]
+                } else if (x / 4 + y / 4) % 2 == 0 {
+                    [74, 196, 191, 255]
+                } else {
+                    [234, 163, 78, 255]
+                };
+                image_bytes.extend_from_slice(&color);
+            }
+        }
         let image = AssetBytes {
             asset: image_asset.clone(),
             media_type: "application/x-neon-rgba8".into(),
-            width: Some(2),
-            height: Some(1),
-            bytes: vec![51, 204, 102, 255, 51, 204, 102, 0],
+            width: Some(32),
+            height: Some(32),
+            bytes: image_bytes,
         };
         let font_asset = AssetRef {
             project_id: "fixture-project".into(),
@@ -410,7 +423,7 @@ mod tests {
         let response = service.handle(request("asset", "asset.get_bytes", json!(asset)));
         assert_eq!(response.status, RpcStatus::Accepted);
         let content: AssetBytes = serde_json::from_value(response.result.unwrap()).unwrap();
-        assert_eq!(content.bytes.len(), 8);
+        assert_eq!(content.bytes.len(), 32 * 32 * 4);
         let stale = service.handle(request(
             "stale",
             "asset.get_bytes",

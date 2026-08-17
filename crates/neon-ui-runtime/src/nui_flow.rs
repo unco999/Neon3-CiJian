@@ -3,9 +3,9 @@
 //! Flow is deliberately parsed into the canonical JSON IR. It has no evaluator,
 //! expressions, callbacks, or source of domain truth.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
-use neon_protocol::Revision;
+use neon_protocol::{AssetRef, Revision};
 use neon_ui_schema::{
     NuiFlowDocument, NuiFlowDragAxis, NuiFlowDragDeclaration, NuiFlowDropDeclaration,
     NuiFlowParseDiagnostic, NuiFlowStateMachine, NuiFlowStateTransition, NuiFlowStateTrigger,
@@ -44,6 +44,8 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
     let mut state_machines = Vec::new();
     let mut drags = Vec::new();
     let mut drops = Vec::new();
+    let mut resources = Vec::new();
+    let mut image_resources = BTreeMap::new();
 
     for (index, raw) in source.lines().enumerate() {
         let line = (index + 1) as u32;
@@ -75,6 +77,23 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
         let content = without_comment.trim();
         reject_forbidden(content, line)?;
         if indent == 0 {
+            if let Some(resource) = parse_resource_declaration(content, line)? {
+                if resources
+                    .iter()
+                    .any(|existing: &neon_ui_schema::UiProgramResource| {
+                        existing.key == resource.key
+                    })
+                {
+                    return Err(error(
+                        "nui_flow_duplicate_resource",
+                        "resource keys must be unique",
+                        line,
+                        1,
+                    ));
+                }
+                resources.push(resource);
+                continue;
+            }
             if let Some(drop) = parse_drop_declaration(content, line)? {
                 if drops
                     .iter()
@@ -132,6 +151,27 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
             }
         }
         let mut node = parse_node(content, line)?;
+        if let Some(resource_key) = node.image_resource.take() {
+            if node.node.kind != UiNodeKind::Image {
+                return Err(error(
+                    "nui_flow_invalid_resource",
+                    "only image nodes may reference image resources",
+                    line,
+                    1,
+                ));
+            }
+            if image_resources
+                .insert(node.node.node_id.0.clone(), resource_key)
+                .is_some()
+            {
+                return Err(error(
+                    "nui_flow_duplicate_resource",
+                    "an image node may reference only one resource",
+                    line,
+                    1,
+                ));
+            }
+        }
         if let Some(previous) = stack.last() {
             if indent > previous.0 + 2 {
                 return Err(error(
@@ -340,6 +380,20 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
             }
         }
     }
+    for (node_key, resource_key) in &image_resources {
+        if !resources
+            .iter()
+            .any(|resource| resource.key == *resource_key)
+        {
+            return Err(error_at(
+                "nui_flow_unknown_resource",
+                "image resource is not declared",
+                source_map
+                    .get(node_key)
+                    .expect("image node has a source span"),
+            ));
+        }
+    }
     apply_boolean_binding_defaults(&mut root.node, &bindings, &schema);
     for grid in &data_grids {
         if !schema
@@ -418,7 +472,8 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
         root: root.node,
         bindings,
         events,
-        resources: Vec::new(),
+        resources,
+        image_resources,
         branches,
         templates,
         data_grids,
@@ -446,6 +501,67 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
 
 pub fn lower_nui_flow(document: &NuiFlowDocument) -> UiIrDocument {
     document.ir.clone()
+}
+
+/// Binds stable resource declarations from an external project/resource owner.
+/// Paths, decoded bytes, and GPU handles never enter the Flow document.
+pub fn bind_nui_flow_resources(
+    document: &mut NuiFlowDocument,
+    snapshot: &HashMap<String, AssetRef>,
+) -> FlowResult<()> {
+    for (node_key, resource_key) in &document.ir.image_resources {
+        let resource = document
+            .ir
+            .resources
+            .iter_mut()
+            .find(|resource| resource.key == *resource_key)
+            .ok_or_else(|| {
+                error(
+                    "nui_flow_unknown_resource",
+                    "image references an undeclared resource",
+                    1,
+                    1,
+                )
+            })?;
+        if resource.kind != neon_ui_schema::UiProgramResourceKind::Image {
+            return Err(error(
+                "nui_flow_invalid_resource",
+                "image resource must have image kind",
+                1,
+                1,
+            ));
+        }
+        let asset = snapshot
+            .get(resource_key)
+            .ok_or_else(|| {
+                error(
+                    "nui_flow_unresolved_resource",
+                    "resource binding is missing from the external snapshot",
+                    1,
+                    1,
+                )
+            })?
+            .clone();
+        if asset.kind != "image" {
+            return Err(error(
+                "nui_flow_invalid_resource",
+                "bound AssetRef kind must be image",
+                1,
+                1,
+            ));
+        }
+        resource.asset_ref = Some(asset.clone());
+        let node = find_node_mut(&mut document.ir.root, node_key).ok_or_else(|| {
+            error(
+                "nui_flow_unknown_node",
+                "image resource references an unknown node",
+                1,
+                1,
+            )
+        })?;
+        node.image = Some(asset);
+    }
+    Ok(())
 }
 
 /// Lowers Flow's declarative interaction vocabulary into the renderer-neutral
@@ -564,12 +680,21 @@ pub fn format_nui_flow(source: &str) -> FlowResult<String> {
     for slot in &parsed.input_schema.slots {
         lines.push(format_input(slot));
     }
+    for resource in &parsed.ir.resources {
+        let kind = match resource.kind {
+            neon_ui_schema::UiProgramResourceKind::Image => "image",
+            neon_ui_schema::UiProgramResourceKind::RenderSurface => "render_surface",
+            neon_ui_schema::UiProgramResourceKind::ThemeToken => "theme_token",
+        };
+        lines.push(format!("resource {} {kind}", resource.key));
+    }
     format_node(
         &parsed.ir.root,
         0,
         &parsed.ir.bindings,
         &parsed.ir.events,
         &parsed.ir.data_grids,
+        &parsed.ir.image_resources,
         &mut lines,
     );
     Ok(lines.join("\n") + "\n")
@@ -805,6 +930,44 @@ struct NodeBuild {
     branch_predicate: Option<UiBranchPredicate>,
     template: Option<(u32, BTreeMap<String, UiInputKind>, String, bool)>,
     data_grid: Option<UiDataGridDeclaration>,
+    image_resource: Option<String>,
+}
+
+fn parse_resource_declaration(
+    text: &str,
+    line: u32,
+) -> FlowResult<Option<neon_ui_schema::UiProgramResource>> {
+    let parts = text.split_whitespace().collect::<Vec<_>>();
+    if parts.first() != Some(&"resource") {
+        return Ok(None);
+    }
+    if parts.len() != 3 || !valid_key(parts[1]) {
+        return Err(error(
+            "nui_flow_invalid_resource",
+            "resource syntax is: resource <key> image",
+            line,
+            1,
+        ));
+    }
+    let kind = match parts[2] {
+        "image" => neon_ui_schema::UiProgramResourceKind::Image,
+        "render_surface" => neon_ui_schema::UiProgramResourceKind::RenderSurface,
+        "theme_token" => neon_ui_schema::UiProgramResourceKind::ThemeToken,
+        _ => {
+            return Err(error(
+                "nui_flow_invalid_resource",
+                "resource kind is not supported",
+                line,
+                1,
+            ));
+        }
+    };
+    Ok(Some(neon_ui_schema::UiProgramResource {
+        key: parts[1].into(),
+        kind,
+        has_fallback: false,
+        asset_ref: None,
+    }))
 }
 
 fn parse_header(text: &str, header: &mut Header, line: u32) -> FlowResult<bool> {
@@ -1361,6 +1524,7 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
         "drag_value" => UiNodeKind::DragValue,
         "combo" => UiNodeKind::Combo,
         "dropdown" => UiNodeKind::Dropdown,
+        "tabs" => UiNodeKind::Tabs,
         "selectable" => UiNodeKind::Selectable,
         "list_box" => UiNodeKind::ListBox,
         "scrollbar" => UiNodeKind::Scrollbar,
@@ -1385,6 +1549,7 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
         ));
     }
     let is_render_surface = kind == UiNodeKind::RenderSurface;
+    let is_image = kind == UiNodeKind::Image;
     let mut node = UiNode {
         node_id: UiNodeId(parts[1].into()),
         kind,
@@ -1399,7 +1564,12 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
         enabled: true,
         text_key: None,
         text: None,
-        image: None,
+        image: is_image.then(|| AssetRef {
+            project_id: "flow-unresolved".into(),
+            asset_id: 0,
+            revision: Revision(0),
+            kind: "image".into(),
+        }),
         surface: None,
         style: UiStyle::default(),
         enter_transition: None,
@@ -1422,6 +1592,7 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
     let mut data_grid_overscan = None;
     let mut data_grid_columns = None;
     let mut data_grid_source = None;
+    let mut image_resource = None;
     let mut used = HashSet::new();
     let mut index = 2;
     while index < parts.len() {
@@ -1622,6 +1793,26 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
                 }
                 data_grid_source = Some(key.into());
             }
+            "resource" if parts[0] == "image" => {
+                let value = *parts.get(index + 1).ok_or_else(|| {
+                    error(
+                        "nui_flow_invalid_resource",
+                        "image resource requires a key",
+                        line,
+                        1,
+                    )
+                })?;
+                if !valid_key(value) {
+                    return Err(error(
+                        "nui_flow_invalid_resource",
+                        "image resource key is invalid",
+                        line,
+                        1,
+                    ));
+                }
+                image_resource = Some(value.into());
+                index += 1;
+            }
             "key" if matches!(parts[0], "repeat" | "template") => {
                 let value = *parts.get(index + 1).ok_or_else(|| {
                     error(
@@ -1739,6 +1930,7 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
         branch_predicate,
         template,
         data_grid,
+        image_resource,
     })
 }
 
@@ -2170,7 +2362,7 @@ fn parse_attribute(
 }
 
 fn attach(
-    mut child: NodeBuild,
+    child: NodeBuild,
     stack: &mut Vec<(usize, NodeBuild)>,
     root: &mut Option<NodeBuild>,
     line: u32,
@@ -2471,6 +2663,7 @@ fn format_node(
     bindings: &[UiIrBinding],
     events: &[UiProgramEventDeclaration],
     data_grids: &[UiDataGridDeclaration],
+    image_resources: &BTreeMap<String, String>,
     lines: &mut Vec<String>,
 ) {
     let kind = match &node.kind {
@@ -2484,6 +2677,7 @@ fn format_node(
         UiNodeKind::DragValue => "drag_value",
         UiNodeKind::Combo => "combo",
         UiNodeKind::Dropdown => "dropdown",
+        UiNodeKind::Tabs => "tabs",
         UiNodeKind::Tooltip => "tooltip",
         UiNodeKind::Modal => "modal",
         UiNodeKind::Dialog => "dialog",
@@ -2520,6 +2714,11 @@ fn format_node(
                     .join(",")
             ));
         }
+    }
+    if node.kind == UiNodeKind::Image
+        && let Some(resource_key) = image_resources.get(&node.node_id.0)
+    {
+        line.push_str(&format!(" resource {resource_key}"));
     }
     if let Some(layout) = node.layout {
         match layout.mode {
@@ -2568,7 +2767,15 @@ fn format_node(
     }
     lines.push(line);
     for child in &node.children {
-        format_node(child, indent + 2, bindings, events, data_grids, lines);
+        format_node(
+            child,
+            indent + 2,
+            bindings,
+            events,
+            data_grids,
+            image_resources,
+            lines,
+        );
     }
 }
 
@@ -2719,6 +2926,7 @@ fn insert_node(
         "drag_value" => UiNodeKind::DragValue,
         "combo" => UiNodeKind::Combo,
         "dropdown" => UiNodeKind::Dropdown,
+        "tabs" => UiNodeKind::Tabs,
         "selectable" => UiNodeKind::Selectable,
         "list_box" => UiNodeKind::ListBox,
         "scrollbar" => UiNodeKind::Scrollbar,
@@ -2856,6 +3064,51 @@ panel workspace row gap 8
     }
 
     #[test]
+    fn image_resource_declaration_binds_external_stable_asset_ref() {
+        let mut document = parse_nui_flow(
+            "resource preview image\nsurface root\n  image thumbnail resource preview\n",
+        )
+        .unwrap();
+        assert_eq!(document.ir.image_resources["thumbnail"], "preview");
+        let asset = AssetRef {
+            project_id: "project-a".into(),
+            asset_id: 42,
+            revision: Revision(7),
+            kind: "image".into(),
+        };
+        bind_nui_flow_resources(
+            &mut document,
+            &HashMap::from([("preview".into(), asset.clone())]),
+        )
+        .unwrap();
+        assert_eq!(
+            find_node(&document.ir.root, "thumbnail").unwrap().image,
+            Some(asset.clone())
+        );
+        assert_eq!(document.ir.resources[0].asset_ref, Some(asset));
+    }
+
+    #[test]
+    fn image_resource_binding_requires_external_snapshot_value() {
+        let mut document = parse_nui_flow(
+            "resource preview image\nsurface root\n  image thumbnail resource preview\n",
+        )
+        .unwrap();
+        let error = bind_nui_flow_resources(&mut document, &HashMap::new()).unwrap_err();
+        assert_eq!(error.diagnostics[0].code, "nui_flow_unresolved_resource");
+    }
+
+    #[test]
+    fn formatter_preserves_image_resource_declarations_without_asset_values() {
+        let source = "resource preview image\nsurface root\n  image thumbnail resource preview\n";
+        let formatted = format_nui_flow(source).unwrap();
+        assert!(formatted.contains("resource preview image"));
+        assert!(formatted.contains("image thumbnail resource preview"));
+        assert_eq!(format_nui_flow(&formatted).unwrap(), formatted);
+        assert!(!formatted.contains("project_id"));
+    }
+
+    #[test]
     fn parses_closed_enum_input_domains_for_direct_branch_predicates() {
         let document = parse_nui_flow(
             "input state enum:loading|ready|error default loading\nsurface root\n  branch ready when $state=ready\n    text label value \"Ready\"\n",
@@ -2867,6 +3120,29 @@ panel workspace row gap 8
             }
         );
         assert_eq!(document.ir.branches.len(), 1);
+    }
+
+    #[test]
+    fn tabs_parse_format_and_patch_as_enum_selection_controls() {
+        let source = "input mode enum:alpha|beta|gamma default beta\nsurface root\n  tabs mode-tabs h 32 state $mode enabled true value \"Modes\" event settings.mode.select\n";
+        let document = parse_nui_flow(source).unwrap();
+        let tabs = find_node(&document.ir.root, "mode-tabs").unwrap();
+        assert_eq!(tabs.kind, UiNodeKind::Tabs);
+        assert!(document.ir.bindings.iter().any(|binding| {
+            binding.node_key == "mode-tabs" && binding.property == UiBoundProperty::StateToken
+        }));
+        assert!(format_nui_flow(source).unwrap().contains("tabs mode-tabs"));
+
+        let patch = parse_nui_flow_patch(&format!(
+            "@ revision {}\n+ root tabs extra-tabs\n",
+            document.ir.revision.0
+        ))
+        .unwrap();
+        let patched = apply_nui_ir_patch(&document.ir, &patch).unwrap();
+        assert_eq!(
+            find_node(&patched.root, "extra-tabs").unwrap().kind,
+            UiNodeKind::Tabs
+        );
     }
 
     #[test]

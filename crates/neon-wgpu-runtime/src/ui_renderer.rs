@@ -118,16 +118,16 @@ struct View { viewport: vec2<f32>, _pad: vec2<f32> }
 fn srgb_to_linear(value: vec3<f32>) -> vec3<f32> {
  let low = value / 12.92; let high = pow((value + vec3<f32>(0.055)) / 1.055, vec3<f32>(2.4)); return select(low, high, value > vec3<f32>(0.04045));
 }
-struct VsIn { @location(0) rect: vec4<f32>, @location(1) tint: vec4<f32>, @location(2) clip: vec4<f32> }
-struct VsOut { @builtin(position) position: vec4<f32>, @location(0) local: vec2<f32>, @location(1) tint: vec4<f32>, @location(2) clip: vec4<f32>, @location(3) pixel: vec2<f32> }
+struct VsIn { @location(0) rect: vec4<f32>, @location(1) tint: vec4<f32>, @location(2) clip: vec4<f32>, @location(3) uv: vec4<f32> }
+struct VsOut { @builtin(position) position: vec4<f32>, @location(0) local: vec2<f32>, @location(1) tint: vec4<f32>, @location(2) clip: vec4<f32>, @location(3) pixel: vec2<f32>, @location(4) uv: vec2<f32> }
 @vertex fn vs_main(@builtin(vertex_index) index: u32, input: VsIn) -> VsOut {
  var corners = array<vec2<f32>, 6>(vec2<f32>(0.0,0.0),vec2<f32>(1.0,0.0),vec2<f32>(0.0,1.0),vec2<f32>(0.0,1.0),vec2<f32>(1.0,0.0),vec2<f32>(1.0,1.0));
  let local = corners[index]; let pixel = input.rect.xy + local * input.rect.zw; var output: VsOut;
- output.position = vec4<f32>(pixel.x / view.viewport.x * 2.0 - 1.0, 1.0 - pixel.y / view.viewport.y * 2.0, 0.0, 1.0); output.local = local; output.tint = input.tint; output.clip = input.clip; output.pixel = pixel; return output;
+  output.position = vec4<f32>(pixel.x / view.viewport.x * 2.0 - 1.0, 1.0 - pixel.y / view.viewport.y * 2.0, 0.0, 1.0); output.local = local; output.tint = input.tint; output.clip = input.clip; output.pixel = pixel; output.uv = input.uv.xy + local * input.uv.zw; return output;
 }
 @fragment fn fs_main(input: VsOut) -> @location(0) vec4<f32> {
  if (input.pixel.x < input.clip.x || input.pixel.y < input.clip.y || input.pixel.x > input.clip.z || input.pixel.y > input.clip.w) { discard; }
-  let sample = textureSample(image_texture, image_sampler, input.local);
+   let sample = textureSample(image_texture, image_sampler, input.uv);
   return vec4<f32>(sample.rgb * srgb_to_linear(input.tint.rgb), sample.a * input.tint.a);
 }
 "#;
@@ -214,6 +214,41 @@ struct RendererDrag {
     moved: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct PendingLocalPresentationKey {
+    pub semantic_sequence: u64,
+    pub fragment_id: String,
+    pub fragment_revision: u64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum LocalPresentationCommit {
+    Value {
+        node_path: String,
+        value: UiSemanticPayloadValue,
+    },
+    Drag {
+        source_path: String,
+        offset: [f32; 2],
+    },
+}
+
+impl LocalPresentationCommit {
+    fn node_path(&self) -> &str {
+        match self {
+            Self::Value { node_path, .. } => node_path,
+            Self::Drag { source_path, .. } => source_path,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PendingLocalPresentationCommit {
+    presentation: LocalPresentationCommit,
+    delivery_accepted: bool,
+    presentation_applied: bool,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct UiResolvedDragDrop {
     pub fragment: UiFragmentRevision,
@@ -222,6 +257,7 @@ pub(crate) struct UiResolvedDragDrop {
     pub target_key: String,
     pub placement: UiDropPlacement,
     pub presentation_template_key: Option<String>,
+    pub local_presentation: LocalPresentationCommit,
 }
 
 /// Process-local state for immediate IME composition. It never crosses the UI RPC boundary.
@@ -377,8 +413,7 @@ struct UiImageInstance {
     rect: [f32; 4],
     tint: [f32; 4],
     clip: [f32; 4],
-    asset_id: u32,
-    _pad: [u32; 3],
+    uv: [f32; 4],
 }
 
 #[repr(C)]
@@ -391,6 +426,16 @@ struct UiTextInstance {
 }
 
 struct ResidentImage {
+    width: u32,
+    height: u32,
+    bytes: Vec<u8>,
+    uv: [f32; 4],
+}
+
+struct ResidentImageAtlas {
+    _texture: wgpu::Texture,
+    _view: wgpu::TextureView,
+    _sampler: wgpu::Sampler,
     bind_group: wgpu::BindGroup,
 }
 
@@ -424,6 +469,8 @@ struct AtlasGlyph {
 }
 
 const FONT_ATLAS_SIZE: u32 = 2048;
+const IMAGE_ATLAS_WIDTH: u32 = 2048;
+const IMAGE_ATLAS_PADDING: u32 = 1;
 const FONT_RASTER_SIZE: f32 = 16.0;
 const TEXT_INPUT_INSET: f32 = 6.0;
 const CARET_WIDTH: f32 = 2.0;
@@ -617,6 +664,15 @@ struct ScrollPan {
     offset_start: [f32; 2],
 }
 
+#[derive(Clone, Debug)]
+struct DataGridScrollHold {
+    body_offset: [f32; 2],
+    desired_offset: [f32; 2],
+    fallback_frame: neon_ui_schema::UiDataGridFrame,
+    release_fragment_revision: Option<neon_protocol::Revision>,
+    pending_sequence: Option<u64>,
+}
+
 /// Renderer-local identity for a virtual cell. It deliberately excludes
 /// renderer topology, GPU hit IDs, and the row's current frame position.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -644,7 +700,6 @@ pub struct UiWgpuRenderer {
     debug_semantic_nodes: Vec<DebugSemanticNode>,
     sampled: Vec<UiVisual>,
     instances: Vec<UiInstance>,
-    dirty_instances: Vec<usize>,
     viewport_physical_size: [u32; 2],
     viewport_logical_size: [f32; 2],
     viewport_revision: u64,
@@ -664,6 +719,7 @@ pub struct UiWgpuRenderer {
     image_buffer: wgpu::Buffer,
     image_capacity: usize,
     resident_images: HashMap<(String, u64, u64), ResidentImage>,
+    image_atlas: Option<ResidentImageAtlas>,
     resident_render_surfaces: HashMap<String, ResidentRenderSurface>,
     image_texture_layout: wgpu::BindGroupLayout,
     text_pipeline: wgpu::RenderPipeline,
@@ -681,11 +737,15 @@ pub struct UiWgpuRenderer {
     drag_offsets: HashMap<String, [f32; 2]>,
     value_gesture: Option<UiValueGesture>,
     value_previews: HashMap<String, UiSemanticPayloadValue>,
+    pending_local_presentations:
+        HashMap<PendingLocalPresentationKey, PendingLocalPresentationCommit>,
     open_dropdown: Option<String>,
     scroll_offsets: HashMap<String, [f32; 2]>,
     scroll_metrics: HashMap<String, ScrollMetrics>,
     scroll_drag: Option<ScrollDrag>,
     scroll_pan: Option<ScrollPan>,
+    data_grid_frames: HashMap<String, neon_ui_schema::UiDataGridFrame>,
+    data_grid_scroll_holds: HashMap<String, DataGridScrollHold>,
     data_grid_text_display_cache: HashMap<DataGridCellIdentity, CachedDataGridTextDisplay>,
 }
 
@@ -921,6 +981,11 @@ impl UiWgpuRenderer {
                             offset: 32,
                             shader_location: 2,
                         },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x4,
+                            offset: 48,
+                            shader_location: 3,
+                        },
                     ],
                 })],
                 compilation_options: Default::default(),
@@ -1035,7 +1100,6 @@ impl UiWgpuRenderer {
             debug_semantic_nodes: Vec::new(),
             sampled: Vec::new(),
             instances: Vec::new(),
-            dirty_instances: Vec::new(),
             viewport_physical_size: [0, 0],
             viewport_logical_size: [0.0, 0.0],
             viewport_revision: 0,
@@ -1055,6 +1119,7 @@ impl UiWgpuRenderer {
             image_buffer: create_image_buffer(device, 1),
             image_capacity: 1,
             resident_images: HashMap::new(),
+            image_atlas: None,
             resident_render_surfaces: HashMap::new(),
             image_texture_layout,
             text_pipeline,
@@ -1072,11 +1137,14 @@ impl UiWgpuRenderer {
             drag_offsets: HashMap::new(),
             value_gesture: None,
             value_previews: HashMap::new(),
+            pending_local_presentations: HashMap::new(),
             open_dropdown: None,
             scroll_offsets: HashMap::new(),
             scroll_metrics: HashMap::new(),
             scroll_drag: None,
             scroll_pan: None,
+            data_grid_frames: HashMap::new(),
+            data_grid_scroll_holds: HashMap::new(),
             data_grid_text_display_cache: HashMap::new(),
         }
     }
@@ -1246,15 +1314,20 @@ impl UiWgpuRenderer {
                 .any(|segment| segment.starts_with("data-grid-row-"));
             let data_grid_scroll = if sticky_vertical || fixed_data_grid_body_clip {
                 let mut ancestor = parent;
-                let mut scroll = [0.0; 2];
+                let mut scroll = None;
                 while let Some(ancestor_index) = ancestor {
                     let ancestor_node = &self.plan[ancestor_index];
                     if ancestor_node.target.kind == UiNodeKind::DataGrid {
-                        scroll = self
+                        let desired = self
                             .scroll_offsets
                             .get(&ancestor_node.id)
                             .copied()
                             .unwrap_or(ancestor_node.target.declared_scroll_offset);
+                        let body = self
+                            .data_grid_scroll_holds
+                            .get(&ancestor_node.id)
+                            .map_or(desired, |hold| hold.body_offset);
+                        scroll = Some((desired, body));
                         break;
                     }
                     ancestor = ancestor_node
@@ -1262,18 +1335,23 @@ impl UiWgpuRenderer {
                         .as_deref()
                         .and_then(|parent_id| plan_index.get(parent_id).copied());
                 }
-                scroll
+                scroll.unwrap_or(([0.0; 2], [0.0; 2]))
             } else {
-                [0.0; 2]
+                ([0.0; 2], [0.0; 2])
             };
-            let applied_scroll = [
-                inherited_scroll[0],
-                if sticky_vertical {
-                    inherited_scroll[1] - data_grid_scroll[1]
-                } else {
-                    inherited_scroll[1]
-                },
-            ];
+            let applied_scroll = if sticky_vertical {
+                [
+                    inherited_scroll[0] - data_grid_scroll.0[0] + data_grid_scroll.1[0],
+                    inherited_scroll[1] - data_grid_scroll.0[1],
+                ]
+            } else if fixed_data_grid_body_clip {
+                [
+                    inherited_scroll[0] - data_grid_scroll.0[0] + data_grid_scroll.1[0],
+                    inherited_scroll[1] - data_grid_scroll.0[1] + data_grid_scroll.1[1],
+                ]
+            } else {
+                inherited_scroll
+            };
             self.sampled[index].bounds.x += inherited_translation[0];
             self.sampled[index].bounds.y += inherited_translation[1];
             self.sampled[index].bounds.x -= applied_scroll[0];
@@ -1285,8 +1363,8 @@ impl UiWgpuRenderer {
                 self.sampled[index].clip.y += own_translation[1];
             }
             if fixed_data_grid_body_clip {
-                self.sampled[index].clip.x -= inherited_scroll[0] - data_grid_scroll[0];
-                self.sampled[index].clip.y -= inherited_scroll[1] - data_grid_scroll[1];
+                self.sampled[index].clip.x -= inherited_scroll[0] - data_grid_scroll.0[0];
+                self.sampled[index].clip.y -= inherited_scroll[1] - data_grid_scroll.0[1];
             } else {
                 self.sampled[index].clip.x -= applied_scroll[0];
                 self.sampled[index].clip.y -= applied_scroll[1];
@@ -1632,19 +1710,37 @@ impl UiWgpuRenderer {
     /// is emitted only when the current bounded frame no longer covers the desired
     /// viewport plus overscan.
     pub(crate) fn data_grid_window_requests(
-        &self,
+        &mut self,
         fragments: &HashMap<neon_ui_schema::UiFragmentId, UiFragment>,
         renderer_epoch: u64,
         composition_revision: neon_protocol::Revision,
         sequence: &mut u64,
+        only_grid_path: Option<&str>,
+        force_request: bool,
     ) -> Vec<UiDataGridWindowRequest> {
+        if only_grid_path.is_none() && self.data_grid_scroll_drag_active() {
+            return Vec::new();
+        }
         let mut requests = Vec::new();
+        let mut settled = Vec::new();
         for fragment in fragments.values() {
             for effect in &fragment.effects {
                 let neon_ui_schema::UiEffect::DataGridFrame { declaration, frame } = effect else {
                     continue;
                 };
                 let grid_path = format!("{}/{}", fragment.fragment_id.0, declaration.node_key);
+                if only_grid_path.is_some_and(|path| path != grid_path) {
+                    continue;
+                }
+                if force_request
+                    && self
+                        .data_grid_scroll_holds
+                        .get(&grid_path)
+                        .is_some_and(|hold| hold.pending_sequence.is_some())
+                {
+                    continue;
+                }
+                let release_fragment_revision = fragment.revision;
                 let Some(grid) = self.plan.iter().find(|node| node.id == grid_path) else {
                     continue;
                 };
@@ -1660,6 +1756,9 @@ impl UiWgpuRenderer {
                     offset_y,
                     grid.target.bounds.height,
                 ) else {
+                    if self.data_grid_scroll_holds.contains_key(&grid_path) {
+                        settled.push(grid_path);
+                    }
                     continue;
                 };
                 let requested_end = requested_first_row
@@ -1669,11 +1768,17 @@ impl UiWgpuRenderer {
                     .first_row
                     .saturating_add(frame.window_rows.len() as u64)
                     .min(frame.total_rows);
-                if requested_first_row >= frame.first_row && requested_end <= frame_end {
+                if !force_request
+                    && requested_first_row >= frame.first_row
+                    && requested_end <= frame_end
+                {
+                    if self.data_grid_scroll_holds.contains_key(&grid_path) {
+                        settled.push(grid_path);
+                    }
                     continue;
                 }
                 *sequence += 1;
-                requests.push(UiDataGridWindowRequest {
+                let request = UiDataGridWindowRequest {
                     renderer_epoch,
                     composition_revision,
                     fragment: UiFragmentRevision {
@@ -1685,8 +1790,19 @@ impl UiWgpuRenderer {
                     requested_first_row,
                     max_window_rows: declaration.max_window_rows,
                     sequence: *sequence,
-                });
+                };
+                if let Some(hold) = self.data_grid_scroll_holds.get_mut(&grid_path) {
+                    hold.release_fragment_revision = Some(release_fragment_revision);
+                    hold.pending_sequence = Some(request.sequence);
+                }
+                requests.push(request);
             }
+        }
+        for grid_path in settled {
+            self.data_grid_scroll_holds.remove(&grid_path);
+        }
+        if !requests.is_empty() || only_grid_path.is_some() {
+            self.pointer_visual_dirty = true;
         }
         requests
     }
@@ -1703,11 +1819,33 @@ impl UiWgpuRenderer {
             ScrollAxis::Y => pointer[1],
         };
         self.scroll_drag = Some(ScrollDrag {
-            node_path,
+            node_path: node_path.clone(),
             axis,
             pointer_start,
             offset_start: offset,
         });
+        if self
+            .plan
+            .iter()
+            .any(|node| node.id == node_path && node.target.kind == UiNodeKind::DataGrid)
+            && let Some(frame) = self.data_grid_frames.get(&node_path).cloned()
+        {
+            let body_offset = self
+                .scroll_offsets
+                .get(&node_path)
+                .copied()
+                .unwrap_or_default();
+            self.data_grid_scroll_holds.insert(
+                node_path,
+                DataGridScrollHold {
+                    body_offset,
+                    desired_offset: body_offset,
+                    fallback_frame: frame,
+                    release_fragment_revision: None,
+                    pending_sequence: None,
+                },
+            );
+        }
         true
     }
 
@@ -1736,19 +1874,63 @@ impl UiWgpuRenderer {
             .clamp(0.0, metrics.max_offset[axis]);
         let offsets = self
             .scroll_offsets
-            .entry(drag.node_path)
+            .entry(drag.node_path.clone())
             .or_insert([0.0; 2]);
         offsets[axis] = offset;
+        if let Some(hold) = self.data_grid_scroll_holds.get_mut(&drag.node_path) {
+            hold.desired_offset[axis] = offset;
+        }
         self.pointer_visual_dirty = true;
         true
     }
 
-    pub(crate) fn end_scroll_drag(&mut self) {
+    pub(crate) fn end_scroll_drag(&mut self) -> Option<String> {
+        let data_grid = self.scroll_drag.as_ref().and_then(|drag| {
+            self.data_grid_scroll_holds
+                .contains_key(&drag.node_path)
+                .then(|| drag.node_path.clone())
+        });
         self.scroll_drag = None;
+        data_grid
     }
 
     pub(crate) fn scroll_drag_active(&self) -> bool {
         self.scroll_drag.is_some()
+    }
+
+    pub(crate) fn data_grid_scroll_drag_active(&self) -> bool {
+        self.scroll_drag
+            .as_ref()
+            .is_some_and(|drag| self.data_grid_scroll_holds.contains_key(&drag.node_path))
+    }
+
+    pub(crate) fn cancel_scroll_drag(&mut self) -> bool {
+        let Some(drag) = self.scroll_drag.take() else {
+            return false;
+        };
+        let Some(hold) = self.data_grid_scroll_holds.remove(&drag.node_path) else {
+            return false;
+        };
+        self.scroll_offsets.insert(drag.node_path, hold.body_offset);
+        self.pointer_visual_dirty = true;
+        true
+    }
+
+    pub(crate) fn fail_data_grid_window_request(&mut self, sequence: u64) -> bool {
+        let Some((grid_path, body_offset)) =
+            self.data_grid_scroll_holds
+                .iter()
+                .find_map(|(grid_path, hold)| {
+                    (hold.pending_sequence == Some(sequence))
+                        .then(|| (grid_path.clone(), hold.body_offset))
+                })
+        else {
+            return false;
+        };
+        self.data_grid_scroll_holds.remove(&grid_path);
+        self.scroll_offsets.insert(grid_path, body_offset);
+        self.pointer_visual_dirty = true;
+        true
     }
 
     pub(crate) fn begin_scroll_pan_at_pointer(&mut self) -> bool {
@@ -1876,6 +2058,7 @@ impl UiWgpuRenderer {
         {
             return false;
         }
+        self.discard_pending_local_presentation_for(&binding.node_path);
         self.value_gesture = Some(UiValueGesture {
             node_path: binding.node_path.clone(),
             kind,
@@ -1921,15 +2104,28 @@ impl UiWgpuRenderer {
         true
     }
 
-    pub(crate) fn finish_value_gesture(&mut self) -> Option<UiSemanticPayloadValue> {
+    pub(crate) fn finish_value_gesture(
+        &mut self,
+    ) -> Option<(UiSemanticPayloadValue, LocalPresentationCommit)> {
         let gesture = self.value_gesture.take()?;
-        self.value_previews.remove(&gesture.node_path)
+        let value = self.value_previews.get(&gesture.node_path)?.clone();
+        Some((
+            value.clone(),
+            LocalPresentationCommit::Value {
+                node_path: gesture.node_path,
+                value,
+            },
+        ))
     }
 
     pub(crate) fn cancel_value_gesture(&mut self) {
         if let Some(gesture) = self.value_gesture.take() {
             self.value_previews.remove(&gesture.node_path);
         }
+    }
+
+    pub(crate) fn value_gesture_active(&self) -> bool {
+        self.value_gesture.is_some()
     }
 
     pub(crate) fn toggle_dropdown_at_pointer(&mut self) -> bool {
@@ -2002,6 +2198,33 @@ impl UiWgpuRenderer {
         let index = list_box_rows(self.visual_at(index).bounds, options.len())
             .iter()
             .position(|row| contains(*row, pointer))?;
+        let value = options.get(index)?.clone();
+        let binding = self
+            .hit_bindings
+            .values()
+            .find(|binding| binding.node_path == node.id)?
+            .clone();
+        Some((binding, UiSemanticPayloadValue::Enum { value }))
+    }
+
+    pub(crate) fn tab_option_at_pointer(&self) -> Option<(UiHitBinding, UiSemanticPayloadValue)> {
+        if self.modal_active() {
+            return None;
+        }
+        let pointer = self.pointer_position?;
+        let (index, node) = self.plan.iter().enumerate().find(|(index, node)| {
+            node.target.kind == UiNodeKind::Tabs
+                && self.visual_at(*index).enabled
+                && contains(self.visual_at(*index).bounds, pointer)
+                && contains(self.visual_at(*index).clip, pointer)
+        })?;
+        let UiControlPresentation::Choice { options, .. } = node.target.presentation.as_ref()?
+        else {
+            return None;
+        };
+        let index = tab_segments(self.visual_at(index).bounds, options.len())
+            .iter()
+            .position(|segment| contains(*segment, pointer))?;
         let value = options.get(index)?.clone();
         let binding = self
             .hit_bindings
@@ -2220,6 +2443,7 @@ impl UiWgpuRenderer {
                     }),
                     UiDragBoundary::Free => None,
                 };
+                self.discard_pending_local_presentation_for(&source_path);
                 self.drag = Some(RendererDrag {
                     binding: binding.clone(),
                     fragment: UiFragmentRevision {
@@ -2282,9 +2506,23 @@ impl UiWgpuRenderer {
         let result = active
             .moved
             .then(|| self.resolve_drop_target(fragments, &active, pointer));
-        self.drag_offsets.remove(&active.source_path);
+        let result = result.flatten().map(|mut resolved| {
+            let offset = self
+                .drag_offsets
+                .get(&active.source_path)
+                .copied()
+                .unwrap_or(active.origin);
+            resolved.local_presentation = LocalPresentationCommit::Drag {
+                source_path: active.source_path.clone(),
+                offset,
+            };
+            resolved
+        });
+        if result.is_none() {
+            self.drag_offsets.remove(&active.source_path);
+        }
         self.pointer_visual_dirty = true;
-        result.flatten()
+        result
     }
 
     pub(crate) fn cancel_drag(&mut self) {
@@ -2360,9 +2598,145 @@ impl UiWgpuRenderer {
                             target_key: binding.target_node_id.0.clone(),
                             placement: binding.placement,
                             presentation_template_key: binding.presentation_template_key.clone(),
+                            local_presentation: LocalPresentationCommit::Drag {
+                                source_path: active.source_path.clone(),
+                                offset: [0.0; 2],
+                            },
                         })
                 })
             })
+    }
+
+    pub(crate) fn retain_local_presentation(
+        &mut self,
+        semantic_sequence: u64,
+        fragment: &UiFragmentRevision,
+        presentation: LocalPresentationCommit,
+    ) -> PendingLocalPresentationKey {
+        let node_path = presentation.node_path().to_owned();
+        self.pending_local_presentations
+            .retain(|_, pending| pending.presentation.node_path() != node_path);
+        let key = PendingLocalPresentationKey {
+            semantic_sequence,
+            fragment_id: fragment.id.0.clone(),
+            fragment_revision: fragment.revision.0,
+        };
+        self.pending_local_presentations.insert(
+            key.clone(),
+            PendingLocalPresentationCommit {
+                presentation,
+                delivery_accepted: false,
+                presentation_applied: true,
+            },
+        );
+        key
+    }
+
+    pub(crate) fn complete_local_presentation(
+        &mut self,
+        key: &PendingLocalPresentationKey,
+        accepted: bool,
+        fragments: &HashMap<neon_ui_schema::UiFragmentId, UiFragment>,
+    ) -> bool {
+        if accepted {
+            let Some(pending) = self.pending_local_presentations.get_mut(key) else {
+                return false;
+            };
+            pending.delivery_accepted = true;
+            return self.reconcile_pending_local_presentations(fragments);
+        }
+        let Some(pending) = self.pending_local_presentations.remove(key) else {
+            return false;
+        };
+        self.clear_local_presentation(&pending.presentation)
+    }
+
+    pub(crate) fn reconcile_pending_local_presentations(
+        &mut self,
+        fragments: &HashMap<neon_ui_schema::UiFragmentId, UiFragment>,
+    ) -> bool {
+        let advanced = self
+            .pending_local_presentations
+            .iter()
+            .filter(|(key, _)| {
+                fragments
+                    .get(&neon_ui_schema::UiFragmentId(key.fragment_id.clone()))
+                    .is_none_or(|fragment| fragment.revision.0 > key.fragment_revision)
+            })
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        let mut changed = false;
+        for key in advanced {
+            let (presentation, applied, accepted) = {
+                let pending = self
+                    .pending_local_presentations
+                    .get_mut(&key)
+                    .expect("pending presentation key was collected from this map");
+                let applied = pending.presentation_applied;
+                pending.presentation_applied = false;
+                (
+                    pending.presentation.clone(),
+                    applied,
+                    pending.delivery_accepted,
+                )
+            };
+            if applied {
+                changed |= self.clear_local_presentation(&presentation);
+            }
+            if accepted {
+                self.pending_local_presentations.remove(&key);
+            }
+        }
+        changed
+    }
+
+    pub(crate) fn rollback_local_presentation(
+        &mut self,
+        presentation: &LocalPresentationCommit,
+    ) -> bool {
+        self.clear_local_presentation(presentation)
+    }
+
+    pub(crate) fn cancel_pending_local_presentations(&mut self) -> bool {
+        let presentations = self
+            .pending_local_presentations
+            .drain()
+            .map(|(_, pending)| pending.presentation)
+            .collect::<Vec<_>>();
+        let mut changed = false;
+        for presentation in presentations {
+            changed |= self.clear_local_presentation(&presentation);
+        }
+        changed
+    }
+
+    fn discard_pending_local_presentation_for(&mut self, node_path: &str) {
+        self.pending_local_presentations
+            .retain(|_, pending| pending.presentation.node_path() != node_path);
+    }
+
+    fn clear_local_presentation(&mut self, presentation: &LocalPresentationCommit) -> bool {
+        let changed = match presentation {
+            LocalPresentationCommit::Value { node_path, value } => {
+                self.value_previews
+                    .get(node_path)
+                    .is_some_and(|current| current == value)
+                    && self.value_previews.remove(node_path).is_some()
+            }
+            LocalPresentationCommit::Drag {
+                source_path,
+                offset,
+            } => {
+                self.drag_offsets
+                    .get(source_path)
+                    .is_some_and(|current| current == offset)
+                    && self.drag_offsets.remove(source_path).is_some()
+            }
+        };
+        if changed {
+            self.pointer_visual_dirty = true;
+        }
+        changed
     }
 
     fn drag_offset_for_node(
@@ -2614,6 +2988,29 @@ impl UiWgpuRenderer {
         self.pointer_visual_dirty = true;
     }
 
+    pub(crate) fn image_debug_snapshot(&self) -> serde_json::Value {
+        let sampled_images = self
+            .sampled
+            .iter()
+            .filter_map(|visual| visual.image.as_ref().map(|asset| (visual, asset)))
+            .map(|(visual, asset)| {
+                let key = (asset.project_id.clone(), asset.asset_id, asset.revision.0);
+                serde_json::json!({
+                    "asset": asset,
+                    "bounds": visual.bounds,
+                    "clip": visual.clip,
+                    "resident": self.resident_images.contains_key(&key),
+                    "uv": self.resident_images.get(&key).map(|image| image.uv),
+                })
+            })
+            .collect::<Vec<_>>();
+        serde_json::json!({
+            "atlas_ready": self.image_atlas.is_some(),
+            "resident_count": self.resident_images.len(),
+            "sampled_images": sampled_images,
+        })
+    }
+
     pub(crate) fn has_active_animation(&mut self, time_seconds: f32) -> bool {
         self.active.retain(|_, active| {
             let end = active.started_at_seconds
@@ -2636,15 +3033,60 @@ impl UiWgpuRenderer {
         let (Some(width), Some(height)) = (content.width, content.height) else {
             return Err("invalid_image_dimensions");
         };
-        if width == 0 || height == 0 || content.bytes.len() != width as usize * height as usize * 4
+        let Some(byte_len) = (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|pixels| pixels.checked_mul(4))
+        else {
+            return Err("invalid_image_bytes");
+        };
+        if width == 0
+            || height == 0
+            || width > IMAGE_ATLAS_WIDTH - IMAGE_ATLAS_PADDING * 2
+            || content.bytes.len() != byte_len
         {
             return Err("invalid_image_bytes");
         }
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("neon3-ui-resident-image"),
-            size: wgpu::Extent3d {
+        self.resident_images.insert(
+            (
+                content.asset.project_id.clone(),
+                content.asset.asset_id,
+                content.asset.revision.0,
+            ),
+            ResidentImage {
                 width,
                 height,
+                bytes: content.bytes.clone(),
+                uv: [0.0; 4],
+            },
+        );
+        self.rebuild_image_atlas(device, queue);
+        Ok(())
+    }
+
+    fn rebuild_image_atlas(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        let mut keys = self.resident_images.keys().cloned().collect::<Vec<_>>();
+        keys.sort();
+        let mut placements = Vec::with_capacity(keys.len());
+        let mut x = IMAGE_ATLAS_PADDING;
+        let mut y = IMAGE_ATLAS_PADDING;
+        let mut row_height = 0;
+        for key in &keys {
+            let image = &self.resident_images[key];
+            if x + image.width + IMAGE_ATLAS_PADDING > IMAGE_ATLAS_WIDTH {
+                x = IMAGE_ATLAS_PADDING;
+                y += row_height + IMAGE_ATLAS_PADDING;
+                row_height = 0;
+            }
+            placements.push((key.clone(), x, y));
+            x += image.width + IMAGE_ATLAS_PADDING;
+            row_height = row_height.max(image.height);
+        }
+        let atlas_height = (y + row_height + IMAGE_ATLAS_PADDING).max(1);
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("neon3-ui-image-atlas"),
+            size: wgpu::Extent3d {
+                width: IMAGE_ATLAS_WIDTH,
+                height: atlas_height,
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
@@ -2654,34 +3096,46 @@ impl UiWgpuRenderer {
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            &content.bytes,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(width * 4),
-                rows_per_image: Some(height),
-            },
-            wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-        );
+        for (key, x, y) in placements {
+            let image = self
+                .resident_images
+                .get_mut(&key)
+                .expect("image placement has a resident image");
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d { x, y, z: 0 },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &image.bytes,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(image.width * 4),
+                    rows_per_image: Some(image.height),
+                },
+                wgpu::Extent3d {
+                    width: image.width,
+                    height: image.height,
+                    depth_or_array_layers: 1,
+                },
+            );
+            image.uv = [
+                (x as f32 + 0.5) / IMAGE_ATLAS_WIDTH as f32,
+                (y as f32 + 0.5) / atlas_height as f32,
+                (image.width as f32 - 1.0) / IMAGE_ATLAS_WIDTH as f32,
+                (image.height as f32 - 1.0) / atlas_height as f32,
+            ];
+        }
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("neon3-ui-resident-image-sampler"),
+            label: Some("neon3-ui-image-atlas-sampler"),
             mag_filter: wgpu::FilterMode::Nearest,
             min_filter: wgpu::FilterMode::Nearest,
             ..Default::default()
         });
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("neon3-ui-resident-image-bind-group"),
+            label: Some("neon3-ui-image-atlas-bind-group"),
             layout: &self.image_texture_layout,
             entries: &[
                 wgpu::BindGroupEntry {
@@ -2694,15 +3148,12 @@ impl UiWgpuRenderer {
                 },
             ],
         });
-        self.resident_images.insert(
-            (
-                content.asset.project_id.clone(),
-                content.asset.asset_id,
-                content.asset.revision.0,
-            ),
-            ResidentImage { bind_group },
-        );
-        Ok(())
+        self.image_atlas = Some(ResidentImageAtlas {
+            _texture: texture,
+            _view: view,
+            _sampler: sampler,
+            bind_group,
+        });
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -2907,9 +3358,8 @@ impl UiWgpuRenderer {
             );
             self.view_buffer_viewport_revision = self.viewport_revision;
         }
-        let plan_changed = self.refresh_plan(fragments, viewport_logical_size);
+        self.refresh_plan(fragments, viewport_logical_size);
         self.instances.clear();
-        self.dirty_instances.clear();
         let top_layer = self.compose_sampled_visuals(time_seconds);
         let plan_index = self
             .plan
@@ -2928,14 +3378,11 @@ impl UiWgpuRenderer {
                 {
                     continue;
                 }
-                let first_instance = self.instances.len();
                 let visual = &self.sampled[index];
                 self.instances
                     .push(self.instance(visual, &self.plan[index].id, time_seconds));
                 self.instances
                     .extend(self.component_chrome_instances(visual, &self.plan[index].id));
-                self.dirty_instances
-                    .extend(first_instance..self.instances.len());
             }
         }
         // CPU first-press handling must be ready as soon as the visible frame is
@@ -2994,33 +3441,23 @@ impl UiWgpuRenderer {
         self.pointer_visual_dirty = false;
         self.append_text_input_overlays();
         self.last_panel_instance_count = self.instances.len();
-        let mut instance_buffer_recreated = false;
         if self.instances.len() > self.instance_capacity {
             self.instance_capacity = self.instances.len().next_power_of_two();
             self.instance_buffer = create_instance_buffer(device, self.instance_capacity);
-            instance_buffer_recreated = true;
         }
         if popup_instances.len() > self.popup_instance_capacity {
             self.popup_instance_capacity = popup_instances.len().next_power_of_two();
             self.popup_instance_buffer =
                 create_instance_buffer(device, self.popup_instance_capacity);
         }
-        if plan_changed || instance_buffer_recreated || self.editing.node_path.is_some() {
-            queue.write_buffer(
-                &self.instance_buffer,
-                0,
-                bytemuck::cast_slice(&self.instances),
-            );
-        } else {
-            for &index in &self.dirty_instances {
-                let offset = (index * std::mem::size_of::<UiInstance>()) as u64;
-                queue.write_buffer(
-                    &self.instance_buffer,
-                    offset,
-                    bytemuck::bytes_of(&self.instances[index]),
-                );
-            }
-        }
+        // The instance vector is rebuilt from the current plan on every draw.
+        // Upload it as a complete snapshot so a composition update cannot draw
+        // a newly sized DataGrid from stale buffer contents.
+        queue.write_buffer(
+            &self.instance_buffer,
+            0,
+            bytemuck::cast_slice(&self.instances),
+        );
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.view_bind_group, &[]);
         pass.set_vertex_buffer(0, self.instance_buffer.slice(..));
@@ -3031,31 +3468,22 @@ impl UiWgpuRenderer {
             .filter_map(|visual| {
                 let asset = visual.image.as_ref()?;
                 let key = (asset.project_id.clone(), asset.asset_id, asset.revision.0);
-                self.resident_images.contains_key(&key).then_some((
-                    key,
-                    UiImageInstance {
-                        rect: [
-                            visual.bounds.x,
-                            visual.bounds.y,
-                            visual.bounds.width,
-                            visual.bounds.height,
-                        ],
-                        tint: [
-                            visual.style.background_color[0],
-                            visual.style.background_color[1],
-                            visual.style.background_color[2],
-                            visual.style.background_color[3] * visual.style.opacity,
-                        ],
-                        clip: [
-                            visual.clip.x,
-                            visual.clip.y,
-                            visual.clip.x + visual.clip.width,
-                            visual.clip.y + visual.clip.height,
-                        ],
-                        asset_id: asset.asset_id as u32,
-                        _pad: [0; 3],
-                    },
-                ))
+                self.resident_images.get(&key).map(|image| UiImageInstance {
+                    rect: [
+                        visual.bounds.x,
+                        visual.bounds.y,
+                        visual.bounds.width,
+                        visual.bounds.height,
+                    ],
+                    tint: [1.0, 1.0, 1.0, visual.style.opacity],
+                    clip: [
+                        visual.clip.x,
+                        visual.clip.y,
+                        visual.clip.x + visual.clip.width,
+                        visual.clip.y + visual.clip.height,
+                    ],
+                    uv: image.uv,
+                })
             })
             .collect::<Vec<_>>();
         if !images.is_empty() {
@@ -3065,13 +3493,18 @@ impl UiWgpuRenderer {
             }
             pass.set_pipeline(&self.image_pipeline);
             pass.set_bind_group(0, &self.view_bind_group, &[]);
-            for (index, (key, image)) in images.iter().enumerate() {
-                queue.write_buffer(&self.image_buffer, 0, bytemuck::bytes_of(image));
-                pass.set_bind_group(1, &self.resident_images[key].bind_group, &[]);
-                pass.set_vertex_buffer(0, self.image_buffer.slice(..));
-                pass.draw(0..6, 0..1);
-                let _ = index;
-            }
+            queue.write_buffer(&self.image_buffer, 0, bytemuck::cast_slice(&images));
+            pass.set_bind_group(
+                1,
+                &self
+                    .image_atlas
+                    .as_ref()
+                    .expect("resident image atlas")
+                    .bind_group,
+                &[],
+            );
+            pass.set_vertex_buffer(0, self.image_buffer.slice(..));
+            pass.draw(0..6, 0..images.len() as u32);
         }
         let surfaces = self
             .sampled
@@ -3096,8 +3529,7 @@ impl UiWgpuRenderer {
                                 visual.clip.x + visual.clip.width,
                                 visual.clip.y + visual.clip.height,
                             ],
-                            asset_id: 0,
-                            _pad: [0; 3],
+                            uv: [0.0, 0.0, 1.0, 1.0],
                         },
                     ))
             })
@@ -3114,6 +3546,7 @@ impl UiWgpuRenderer {
         }
         let dropdown_texts = self.dropdown_option_texts();
         let list_box_texts = self.list_box_option_texts();
+        let tab_texts = self.tab_option_texts();
         let drag_value_texts = self.drag_value_texts();
         let visible_top_layer = top_layer
             .iter()
@@ -3181,6 +3614,11 @@ impl UiWgpuRenderer {
                         texts.extend(instances);
                     }
                 }
+                for (visual, text) in &tab_texts {
+                    if let Some(instances) = layout_text(device, queue, font, visual, text, None) {
+                        texts.extend(instances);
+                    }
+                }
                 for (visual, text) in &drag_value_texts {
                     if let Some(instances) = layout_text(device, queue, font, visual, text, None) {
                         texts.extend(instances);
@@ -3211,6 +3649,7 @@ impl UiWgpuRenderer {
                                 | UiNodeKind::DragValue
                                 | UiNodeKind::Combo
                                 | UiNodeKind::Dropdown
+                                | UiNodeKind::Tabs
                                 | UiNodeKind::Selectable
                                 | UiNodeKind::Scrollbar
                                 | UiNodeKind::ProgressBar
@@ -3289,6 +3728,8 @@ impl UiWgpuRenderer {
         fragments: &HashMap<neon_ui_schema::UiFragmentId, UiFragment>,
         viewport_logical_size: [f32; 2],
     ) -> bool {
+        self.reconcile_pending_local_presentations(fragments);
+        let data_grid_hold_changed = self.reconcile_data_grid_scroll_holds(fragments);
         let viewport_logical_size =
             normalize_logical_viewport(viewport_logical_size, self.viewport_physical_size);
         if self.viewport_logical_size != viewport_logical_size {
@@ -3301,12 +3742,13 @@ impl UiWgpuRenderer {
             && fragments
                 .iter()
                 .all(|(id, fragment)| self.plan_revisions.get(id) == Some(&fragment.revision));
-        if matches {
+        if matches && !data_grid_hold_changed {
             return false;
         }
-        self.reconcile_data_grid_text_display_cache(fragments);
+        let display_fragments = self.data_grid_display_fragments(fragments);
+        self.reconcile_data_grid_text_display_cache(&display_fragments);
         let nodes = flatten_fragments_with_data_grid_display_cache(
-            fragments,
+            &display_fragments,
             viewport_logical_size,
             self.resident_font.as_ref(),
             &self.data_grid_text_display_cache,
@@ -3374,6 +3816,86 @@ impl UiWgpuRenderer {
         true
     }
 
+    fn reconcile_data_grid_scroll_holds(
+        &mut self,
+        fragments: &HashMap<neon_ui_schema::UiFragmentId, UiFragment>,
+    ) -> bool {
+        let mut live = HashSet::new();
+        let mut covered = Vec::new();
+        self.data_grid_frames.clear();
+        for fragment in fragments.values() {
+            for effect in &fragment.effects {
+                let neon_ui_schema::UiEffect::DataGridFrame { declaration, frame } = effect else {
+                    continue;
+                };
+                let grid_path = format!("{}/{}", fragment.fragment_id.0, declaration.node_key);
+                live.insert(grid_path.clone());
+                self.data_grid_frames
+                    .insert(grid_path.clone(), frame.clone());
+                let Some(hold) = self.data_grid_scroll_holds.get(&grid_path) else {
+                    continue;
+                };
+                if self
+                    .scroll_drag
+                    .as_ref()
+                    .is_some_and(|drag| drag.node_path == grid_path)
+                {
+                    continue;
+                }
+                let viewport_height = self
+                    .plan
+                    .iter()
+                    .find(|node| node.id == grid_path)
+                    .map_or(0.0, |node| node.target.bounds.height);
+                let replacement_allowed =
+                    match (hold.pending_sequence, hold.release_fragment_revision) {
+                        (Some(_), Some(revision)) => fragment.revision > revision,
+                        (None, None) => true,
+                        _ => false,
+                    };
+                if replacement_allowed
+                    && data_grid_frame_covers_offset(
+                        frame,
+                        declaration,
+                        hold.desired_offset[1],
+                        viewport_height,
+                    )
+                {
+                    covered.push(grid_path);
+                }
+            }
+        }
+        self.data_grid_scroll_holds
+            .retain(|grid_path, _| live.contains(grid_path));
+        let changed = !covered.is_empty();
+        for grid_path in covered {
+            self.data_grid_scroll_holds.remove(&grid_path);
+        }
+        changed
+    }
+
+    fn data_grid_display_fragments(
+        &self,
+        fragments: &HashMap<neon_ui_schema::UiFragmentId, UiFragment>,
+    ) -> HashMap<neon_ui_schema::UiFragmentId, UiFragment> {
+        if self.data_grid_scroll_holds.is_empty() {
+            return fragments.clone();
+        }
+        let mut display = fragments.clone();
+        for fragment in display.values_mut() {
+            for effect in &mut fragment.effects {
+                let neon_ui_schema::UiEffect::DataGridFrame { declaration, frame } = effect else {
+                    continue;
+                };
+                let grid_path = format!("{}/{}", fragment.fragment_id.0, declaration.node_key);
+                if let Some(hold) = self.data_grid_scroll_holds.get(&grid_path) {
+                    *frame = hold.fallback_frame.clone();
+                }
+            }
+        }
+        display
+    }
+
     fn reconcile_data_grid_text_display_cache(
         &mut self,
         fragments: &HashMap<neon_ui_schema::UiFragmentId, UiFragment>,
@@ -3416,7 +3938,7 @@ impl UiWgpuRenderer {
         &mut self,
         fragments: &HashMap<neon_ui_schema::UiFragmentId, UiFragment>,
     ) -> Vec<(u32, usize)> {
-        let declarations = collect_hit_declarations(fragments);
+        let declarations = collect_hit_declarations(&self.data_grid_display_fragments(fragments));
         self.hit_bindings.clear();
         let mut hit_nodes = Vec::new();
         for index in 0..self.plan.len() {
@@ -3479,7 +4001,7 @@ impl UiWgpuRenderer {
                 continue;
             }
             let viewport = node.target.bounds;
-            let content_extent = self
+            let raw_content_extent = self
                 .plan
                 .iter()
                 .filter_map(|child| {
@@ -3488,14 +4010,56 @@ impl UiWgpuRenderer {
                         child.target.bounds.y + child.target.bounds.height,
                     ])
                 })
-                .fold(
-                    [viewport.x + viewport.width, viewport.y + viewport.height],
-                    |extent, child| [extent[0].max(child[0]), extent[1].max(child[1])],
-                );
-            let content_size = [
-                (content_extent[0] - viewport.x).max(viewport.width),
-                (content_extent[1] - viewport.y).max(viewport.height),
+                .fold([viewport.x, viewport.y], |extent, child| {
+                    [extent[0].max(child[0]), extent[1].max(child[1])]
+                });
+            let raw_content_size = [
+                (raw_content_extent[0] - viewport.x).max(0.0),
+                (raw_content_extent[1] - viewport.y).max(0.0),
             ];
+            let content_size = if node.target.kind == UiNodeKind::DataGrid {
+                let mut horizontal = false;
+                let mut vertical = false;
+                for _ in 0..3 {
+                    horizontal = raw_content_size[0]
+                        > (viewport.width
+                            - if vertical {
+                                DATA_GRID_SCROLLBAR_GUTTER
+                            } else {
+                                0.0
+                            })
+                        .max(0.0);
+                    vertical = raw_content_size[1]
+                        > (viewport.height
+                            - if horizontal {
+                                DATA_GRID_SCROLLBAR_GUTTER
+                            } else {
+                                0.0
+                            })
+                        .max(0.0);
+                }
+                [
+                    (raw_content_size[0]
+                        + if vertical {
+                            DATA_GRID_SCROLLBAR_GUTTER
+                        } else {
+                            0.0
+                        })
+                    .max(viewport.width),
+                    (raw_content_size[1]
+                        + if horizontal {
+                            DATA_GRID_SCROLLBAR_GUTTER
+                        } else {
+                            0.0
+                        })
+                    .max(viewport.height),
+                ]
+            } else {
+                [
+                    raw_content_size[0].max(viewport.width),
+                    raw_content_size[1].max(viewport.height),
+                ]
+            };
             let metrics = ScrollMetrics {
                 viewport,
                 content_size,
@@ -3659,12 +4223,11 @@ impl UiWgpuRenderer {
             };
         }
         let mut fill = style.background_color;
-        let bounds = visual.bounds;
-        if is_interactive_control(&visual.kind)
-            && self
-                .pointer_position
-                .is_some_and(|position| contains(bounds, position))
-        {
+        let mut bounds = visual.bounds;
+        let pointer_over = self
+            .pointer_position
+            .is_some_and(|position| contains(bounds, position));
+        if is_interactive_control(&visual.kind) && pointer_over {
             let factor = if time_seconds < self.pressed_until_seconds {
                 1.28
             } else {
@@ -3673,6 +4236,13 @@ impl UiWgpuRenderer {
             fill[0] = (fill[0] * factor).min(1.0);
             fill[1] = (fill[1] * factor).min(1.0);
             fill[2] = (fill[2] * factor).min(1.0);
+        }
+        if visual.kind == UiNodeKind::Button
+            && pointer_over
+            && time_seconds < self.pressed_until_seconds
+        {
+            bounds.y += 1.0;
+            bounds.height = (bounds.height - 1.0).max(0.0);
         }
         if self.focused_control.as_deref() == Some(node_path) {
             fill[0] = (fill[0] * 1.08).min(1.0);
@@ -3725,7 +4295,36 @@ impl UiWgpuRenderer {
                 _ => preview.presentation,
             };
         }
-        let instances = component_chrome_instances(&preview);
+        let mut instances = component_chrome_instances(&preview);
+        if preview.kind == UiNodeKind::Tabs
+            && preview.enabled
+            && let Some(pointer) = self.pointer_position
+            && let Some(segment) =
+                preview
+                    .presentation
+                    .as_ref()
+                    .and_then(|presentation| match presentation {
+                        UiControlPresentation::Choice { options, .. } => {
+                            tab_segments(preview.bounds, options.len())
+                                .into_iter()
+                                .find(|segment| contains(*segment, pointer))
+                        }
+                        _ => None,
+                    })
+        {
+            instances.push(UiInstance {
+                rect: [segment.x, segment.y, segment.width, segment.height],
+                fill: [0.48, 0.76, 0.64, 0.13],
+                border: [0.62, 0.92, 0.78, 0.80],
+                params: [1.0, 3.0, preview.style.opacity, preview.clip_radius],
+                clip: [
+                    preview.clip.x,
+                    preview.clip.y,
+                    preview.clip.x + preview.clip.width,
+                    preview.clip.y + preview.clip.height,
+                ],
+            });
+        }
         instances
     }
 
@@ -3882,6 +4481,34 @@ impl UiWgpuRenderer {
             .collect()
     }
 
+    fn tab_option_texts(&self) -> Vec<(UiVisual, String)> {
+        self.plan
+            .iter()
+            .enumerate()
+            .flat_map(|(plan_index, node)| {
+                if node.target.kind != UiNodeKind::Tabs {
+                    return Vec::new();
+                }
+                let Some(UiControlPresentation::Choice { options, .. }) =
+                    self.sampled[plan_index].presentation.as_ref()
+                else {
+                    return Vec::new();
+                };
+                tab_segments(self.sampled[plan_index].bounds, options.len())
+                    .into_iter()
+                    .zip(options)
+                    .map(|(segment, option)| {
+                        let mut visual = self.sampled[plan_index].clone();
+                        visual.kind = UiNodeKind::Label;
+                        visual.text = None;
+                        visual.bounds = segment;
+                        (visual, option.clone())
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
     fn drag_value_texts(&self) -> Vec<(UiVisual, String)> {
         self.plan
             .iter()
@@ -3942,6 +4569,27 @@ fn data_grid_requested_range(
     Some((requested_first_row, required_rows))
 }
 
+fn data_grid_frame_covers_offset(
+    frame: &neon_ui_schema::UiDataGridFrame,
+    declaration: &neon_ui_schema::UiDataGridDeclaration,
+    offset_y: f32,
+    viewport_height: f32,
+) -> bool {
+    let Some((requested_first_row, required_rows)) =
+        data_grid_requested_range(frame, declaration, offset_y, viewport_height)
+    else {
+        return false;
+    };
+    let requested_end = requested_first_row
+        .saturating_add(required_rows)
+        .min(frame.total_rows);
+    let frame_end = frame
+        .first_row
+        .saturating_add(frame.window_rows.len() as u64)
+        .min(frame.total_rows);
+    requested_first_row >= frame.first_row && requested_end <= frame_end
+}
+
 fn list_box_rows(bounds: UiBounds, option_count: usize) -> Vec<UiBounds> {
     if option_count == 0 {
         return Vec::new();
@@ -3954,6 +4602,22 @@ fn list_box_rows(bounds: UiBounds, option_count: usize) -> Vec<UiBounds> {
             y: bounds.y + inset + index as f32 * row_height,
             width: (bounds.width - inset * 2.0).max(0.0),
             height: row_height,
+        })
+        .collect()
+}
+
+fn tab_segments(bounds: UiBounds, option_count: usize) -> Vec<UiBounds> {
+    if option_count == 0 {
+        return Vec::new();
+    }
+    let inset = 2.0;
+    let width = (bounds.width - inset * 2.0).max(0.0) / option_count as f32;
+    (0..option_count)
+        .map(|index| UiBounds {
+            x: bounds.x + inset + index as f32 * width,
+            y: bounds.y + inset,
+            width,
+            height: (bounds.height - inset * 2.0).max(0.0),
         })
         .collect()
 }
@@ -3992,6 +4656,13 @@ fn default_component_style(kind: &UiNodeKind) -> UiStyle {
             corner_radius: 5.0,
             opacity: 1.0,
         },
+        UiNodeKind::Button => UiStyle {
+            background_color: [0.12, 0.32, 0.31, 1.0],
+            border_color: [0.43, 0.78, 0.73, 1.0],
+            border_width: 1.0,
+            corner_radius: 4.0,
+            opacity: 1.0,
+        },
         UiNodeKind::Slider | UiNodeKind::DragValue | UiNodeKind::Scrollbar => UiStyle {
             background_color: [0.09, 0.12, 0.12, 1.0],
             border_color: [0.27, 0.46, 0.40, 0.82],
@@ -3999,13 +4670,15 @@ fn default_component_style(kind: &UiNodeKind) -> UiStyle {
             corner_radius: 5.0,
             opacity: 1.0,
         },
-        UiNodeKind::Combo | UiNodeKind::Dropdown | UiNodeKind::ListBox => UiStyle {
-            background_color: [0.11, 0.16, 0.15, 1.0],
-            border_color: [0.35, 0.56, 0.49, 0.88],
-            border_width: 1.0,
-            corner_radius: 5.0,
-            opacity: 1.0,
-        },
+        UiNodeKind::Combo | UiNodeKind::Dropdown | UiNodeKind::Tabs | UiNodeKind::ListBox => {
+            UiStyle {
+                background_color: [0.11, 0.16, 0.15, 1.0],
+                border_color: [0.35, 0.56, 0.49, 0.88],
+                border_width: 1.0,
+                corner_radius: 5.0,
+                opacity: 1.0,
+            }
+        }
         UiNodeKind::ProgressBar => UiStyle {
             background_color: [0.08, 0.10, 0.10, 1.0],
             border_color: [0.32, 0.50, 0.43, 0.70],
@@ -4063,6 +4736,30 @@ fn component_chrome_instances(visual: &UiVisual) -> Vec<UiInstance> {
         _ => mint,
     };
     match visual.kind {
+        UiNodeKind::Button => vec![
+            chrome(
+                UiBounds {
+                    x: bounds.x + 1.0,
+                    y: bounds.y + bounds.height - 4.0,
+                    width: (bounds.width - 2.0).max(0.0),
+                    height: 3.0,
+                },
+                [0.035, 0.11, 0.11, 0.95],
+                [0.035, 0.11, 0.11, 0.95],
+                2.0,
+            ),
+            chrome(
+                UiBounds {
+                    x: bounds.x + 2.0,
+                    y: bounds.y + 2.0,
+                    width: (bounds.width - 4.0).max(0.0),
+                    height: 1.0,
+                },
+                [0.68, 0.95, 0.88, 0.56],
+                [0.68, 0.95, 0.88, 0.56],
+                1.0,
+            ),
+        ],
         UiNodeKind::Checkbox => vec![chrome(
             UiBounds {
                 x: bounds.x + 8.0,
@@ -4193,6 +4890,36 @@ fn component_chrome_instances(visual: &UiVisual) -> Vec<UiInstance> {
             }
             _ => Vec::new(),
         },
+        UiNodeKind::Tabs => match &visual.presentation {
+            Some(UiControlPresentation::Choice { token, options, .. }) => {
+                tab_segments(bounds, options.len())
+                    .into_iter()
+                    .zip(options)
+                    .map(|(segment, option)| {
+                        let active = option == token;
+                        chrome(
+                            segment,
+                            if !visual.enabled {
+                                [0.055, 0.075, 0.07, 0.72]
+                            } else if active {
+                                [0.16, 0.35, 0.28, 1.0]
+                            } else {
+                                [0.075, 0.12, 0.11, 1.0]
+                            },
+                            if !visual.enabled {
+                                inactive
+                            } else if active {
+                                choice_tint
+                            } else {
+                                muted
+                            },
+                            3.0,
+                        )
+                    })
+                    .collect()
+            }
+            _ => Vec::new(),
+        },
         UiNodeKind::Scrollbar => {
             let track = UiBounds {
                 x: bounds.x + 10.0,
@@ -4215,6 +4942,17 @@ fn component_chrome_instances(visual: &UiVisual) -> Vec<UiInstance> {
                 ),
             ]
         }
+        UiNodeKind::Image => vec![chrome(
+            UiBounds {
+                x: bounds.x + 1.0,
+                y: bounds.y + 1.0,
+                width: (bounds.width - 2.0).max(0.0),
+                height: (bounds.height - 2.0).max(0.0),
+            },
+            [0.12, 0.28, 0.31, 0.92],
+            [0.46, 0.72, 0.76, 0.95],
+            3.0,
+        )],
         _ => Vec::new(),
     }
 }
@@ -4856,6 +5594,68 @@ fn flatten_fragments_with_data_grid_display_cache(
 /// DataGrid frames carry only the current virtual window. Expand that window
 /// into ordinary renderer visuals so it follows the same composition path as
 /// declared UI without materializing domain rows outside the frame.
+const DATA_GRID_SCROLLBAR_GUTTER: f32 = 12.0;
+
+fn data_grid_effective_columns(
+    declaration: &neon_ui_schema::UiDataGridDeclaration,
+    grid: UiBounds,
+    total_rows: u64,
+    row_height: f32,
+) -> (Vec<f32>, f32, bool, bool) {
+    let basis = declaration
+        .columns
+        .iter()
+        .map(|column| column.width as f32)
+        .sum::<f32>();
+    let content_height = row_height * (total_rows as f32 + 1.0);
+    let mut vertical_scrollbar = false;
+    let mut horizontal_scrollbar = false;
+    // Horizontal and vertical gutters can make each other necessary at the
+    // boundary, so resolve the two scrollbar decisions to a fixed point.
+    for _ in 0..3 {
+        let viewport_width = (grid.width
+            - if vertical_scrollbar {
+                DATA_GRID_SCROLLBAR_GUTTER
+            } else {
+                0.0
+            })
+        .max(0.0);
+        horizontal_scrollbar = basis > viewport_width;
+        vertical_scrollbar = content_height
+            > (grid.height
+                - if horizontal_scrollbar {
+                    DATA_GRID_SCROLLBAR_GUTTER
+                } else {
+                    0.0
+                })
+            .max(0.0);
+    }
+    let viewport_width = (grid.width
+        - if vertical_scrollbar {
+            DATA_GRID_SCROLLBAR_GUTTER
+        } else {
+            0.0
+        })
+    .max(0.0);
+    let scale = if !horizontal_scrollbar && basis > 0.0 {
+        viewport_width / basis
+    } else {
+        1.0
+    };
+    let widths = declaration
+        .columns
+        .iter()
+        .map(|column| column.width as f32 * scale)
+        .collect::<Vec<_>>();
+    let content_width = widths.iter().sum();
+    (
+        widths,
+        content_width,
+        horizontal_scrollbar,
+        vertical_scrollbar,
+    )
+}
+
 fn append_data_grid_frames(
     out: &mut Vec<(String, Option<String>, UiVisual, Option<UiTransition>)>,
     fragments: &HashMap<neon_ui_schema::UiFragmentId, UiFragment>,
@@ -4889,20 +5689,24 @@ fn append_data_grid_frames(
             if row_height <= 0.0 {
                 continue;
             }
-            let content_width = declaration
-                .columns
-                .iter()
-                .map(|column| column.width as f32)
-                .sum::<f32>();
-            let horizontal_scrollbar_band = if content_width > grid.bounds.width {
-                12.0
+            let (column_widths, content_width, horizontal_scrollbar, vertical_scrollbar) =
+                data_grid_effective_columns(declaration, grid.bounds, frame.total_rows, row_height);
+            let horizontal_scrollbar_band = if horizontal_scrollbar {
+                DATA_GRID_SCROLLBAR_GUTTER
             } else {
                 0.0
             };
+            let viewport_width = (grid.bounds.width
+                - if vertical_scrollbar {
+                    DATA_GRID_SCROLLBAR_GUTTER
+                } else {
+                    0.0
+                })
+            .max(0.0);
             let body_clip = UiBounds {
                 x: grid.bounds.x,
                 y: grid.bounds.y + row_height,
-                width: grid.bounds.width,
+                width: viewport_width,
                 height: (grid.bounds.height - row_height - horizontal_scrollbar_band).max(0.0),
             };
             let mut extent = grid.clone();
@@ -4959,7 +5763,7 @@ fn append_data_grid_frames(
 
             let mut x = grid.bounds.x;
             for (column_index, column) in declaration.columns.iter().enumerate() {
-                let width = column.width as f32;
+                let width = column_widths[column_index];
                 let mut label = grid.clone();
                 label.bounds = UiBounds {
                     x: x + 5.0,
@@ -5028,8 +5832,8 @@ fn append_data_grid_frames(
                 out.push((row_path.clone(), Some(grid_path.clone()), row_visual, None));
 
                 let mut x = grid.bounds.x;
-                for column in &declaration.columns {
-                    let width = column.width as f32;
+                for (column_index, column) in declaration.columns.iter().enumerate() {
+                    let width = column_widths[column_index];
                     if let Some(cell) = row.cells.get(&column.key) {
                         let mut label = grid.clone();
                         label.bounds = UiBounds {
@@ -5487,6 +6291,22 @@ fn resolved_dimension(
     value
 }
 
+fn dimension_limits(layout: &UiLayout, height: bool) -> (f32, f32) {
+    let minimum = layout
+        .min_size
+        .map_or(0.0, |size| if height { size[1] } else { size[0] });
+    let maximum = layout
+        .max_size
+        .map_or(f32::INFINITY, |size| if height { size[1] } else { size[0] })
+        .max(minimum);
+    (minimum, maximum)
+}
+
+fn clamp_dimension(value: f32, layout: &UiLayout, height: bool) -> f32 {
+    let (minimum, maximum) = dimension_limits(layout, height);
+    value.clamp(minimum, maximum)
+}
+
 fn intrinsic_size(node: &UiNode, font: Option<&ResidentFont>) -> [f32; 2] {
     let Some(text) = node.text.as_ref().and_then(text_ref_value) else {
         return [0.0, 0.0];
@@ -5522,6 +6342,7 @@ fn is_interactive_control(kind: &UiNodeKind) -> bool {
             | UiNodeKind::DragValue
             | UiNodeKind::Combo
             | UiNodeKind::Dropdown
+            | UiNodeKind::Tabs
             | UiNodeKind::Selectable
             | UiNodeKind::ListBox
             | UiNodeKind::Scrollbar
@@ -5548,10 +6369,10 @@ fn resolve_children(
                     && parent_layout.align_items == UiAlignItems::Stretch
                 {
                     if child.bounds.width == 0.0 {
-                        width = width.max(inner.width);
+                        width = clamp_dimension(inner.width, &layout, false);
                     }
                     if child.bounds.height == 0.0 {
-                        height = height.max(inner.height);
+                        height = clamp_dimension(inner.height, &layout, true);
                     }
                 }
                 UiBounds {
@@ -5604,35 +6425,49 @@ fn resolve_children(
             }
         })
         .collect::<Vec<_>>();
-    let occupied = main_sizes.iter().sum::<f32>()
-        + outer.iter().sum::<f32>()
-        + parent_layout.gap * participating_count.saturating_sub(1) as f32;
-    let free = available - occupied;
-    if free > 0.0 {
-        let total = node
-            .children
-            .iter()
-            .filter(|child| child.visible)
-            .map(|child| child.layout.unwrap_or_default().flex_grow)
-            .sum::<f32>();
-        if total > 0.0 {
-            for (size, child) in main_sizes.iter_mut().zip(&node.children) {
-                *size += free * child.layout.unwrap_or_default().flex_grow / total;
-            }
+    for (size, child) in main_sizes.iter_mut().zip(&node.children) {
+        if child.visible {
+            *size = clamp_dimension(*size, &child.layout.unwrap_or_default(), !row);
         }
-    } else if free < 0.0 {
-        let total = node
+    }
+    let fixed_space = outer.iter().sum::<f32>()
+        + parent_layout.gap * participating_count.saturating_sub(1) as f32;
+    let track_space = (available - fixed_space).max(0.0);
+    // A track that reaches a bound is frozen; the next pass gives the residual
+    // space to tracks that can still grow or shrink.
+    for _ in 0..=node.children.len() {
+        let free = track_space - main_sizes.iter().sum::<f32>();
+        if free.abs() <= 0.001 {
+            break;
+        }
+        let growing = free > 0.0;
+        let factors = node
             .children
             .iter()
             .zip(&main_sizes)
-            .filter(|(child, _)| child.visible)
-            .map(|(child, size)| child.layout.unwrap_or_default().flex_shrink * *size)
-            .sum::<f32>();
-        if total > 0.0 {
-            for (size, child) in main_sizes.iter_mut().zip(&node.children) {
-                *size = (*size
-                    + free * child.layout.unwrap_or_default().flex_shrink * *size / total)
-                    .max(0.0);
+            .map(|(child, size)| {
+                if !child.visible {
+                    return 0.0;
+                }
+                let layout = child.layout.unwrap_or_default();
+                let (minimum, maximum) = dimension_limits(&layout, !row);
+                if growing && *size < maximum - 0.001 {
+                    layout.flex_grow
+                } else if !growing && *size > minimum + 0.001 {
+                    layout.flex_shrink * *size
+                } else {
+                    0.0
+                }
+            })
+            .collect::<Vec<_>>();
+        let total = factors.iter().sum::<f32>();
+        if total <= 0.0 {
+            break;
+        }
+        for ((size, child), factor) in main_sizes.iter_mut().zip(&node.children).zip(factors) {
+            if factor > 0.0 {
+                let layout = child.layout.unwrap_or_default();
+                *size = clamp_dimension(*size + free * factor / total, &layout, !row);
             }
         }
     }
@@ -5682,13 +6517,17 @@ fn resolve_children(
             let mut cross_size = resolved_dimension(declared_cross, child, &layout, font, row);
             let align = layout.align_self.unwrap_or(parent_layout.align_items);
             if align == UiAlignItems::Stretch && declared_cross == 0.0 {
-                cross_size = (cross_available
-                    - if row {
-                        margin[0] + margin[2]
-                    } else {
-                        margin[3] + margin[1]
-                    })
-                .max(0.0);
+                cross_size = clamp_dimension(
+                    (cross_available
+                        - if row {
+                            margin[0] + margin[2]
+                        } else {
+                            margin[3] + margin[1]
+                        })
+                    .max(0.0),
+                    &layout,
+                    row,
+                );
             }
             let cross_margin_start = if row { margin[0] } else { margin[3] };
             let cross_margin_end = if row { margin[2] } else { margin[1] };
@@ -6763,6 +7602,104 @@ mod tests {
     }
 
     #[test]
+    fn tabs_render_labeled_selected_segments_and_select_the_clicked_option() {
+        let _gpu_test = GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let (device, _queue) = test_device("neon3-ui-tabs");
+        let node_path = "gallery/mode-tabs".to_owned();
+        let bounds = UiBounds {
+            x: 20.0,
+            y: 30.0,
+            width: 150.0,
+            height: 32.0,
+        };
+        let visual = UiVisual {
+            bounds,
+            style: UiStyle::default(),
+            kind: UiNodeKind::Tabs,
+            enabled: true,
+            clip: UiBounds {
+                x: 0.0,
+                y: 0.0,
+                width: 200.0,
+                height: 100.0,
+            },
+            clip_radius: 0.0,
+            image: None,
+            surface: None,
+            text: Some(TextRef::Literal {
+                value: "Modes".into(),
+            }),
+            presentation: Some(UiControlPresentation::Choice {
+                token: "beta".into(),
+                options: vec!["alpha".into(), "beta".into(), "gamma".into()],
+                selected: true,
+            }),
+            scroll: false,
+            declared_scroll_offset: [0.0; 2],
+        };
+        let mut renderer = UiWgpuRenderer::new(&device, wgpu::TextureFormat::Rgba8Unorm);
+        renderer.plan.push(PlannedNode {
+            id: node_path.clone(),
+            parent_id: None,
+            target: visual.clone(),
+            transition: None,
+            instance_index: None,
+        });
+        renderer.sampled.push(visual);
+        renderer.hit_bindings.insert(
+            1,
+            UiHitBinding {
+                node_path: node_path.clone(),
+                fragment: UiFragmentRevision {
+                    id: UiFragmentId("gallery".into()),
+                    revision: Revision(1),
+                },
+                intent: Some(UiIntent::Invoke {
+                    action: "gallery.tabs.select".into(),
+                    params: json!({}),
+                }),
+                text_input: None,
+                data_grid_cell: None,
+                control_value: None,
+                max_text_length: None,
+            },
+        );
+
+        assert_eq!(
+            renderer
+                .tab_option_texts()
+                .into_iter()
+                .map(|(_, label)| label)
+                .collect::<Vec<_>>(),
+            vec!["alpha", "beta", "gamma"]
+        );
+        let chrome = component_chrome_instances(&renderer.sampled[0]);
+        assert_eq!(chrome.len(), 3);
+        assert_eq!(chrome[1].fill, [0.16, 0.35, 0.28, 1.0]);
+
+        renderer.set_pointer_position([145.0, 46.0]);
+        let (binding, value) = renderer.tab_option_at_pointer().unwrap();
+        assert_eq!(binding.node_path, node_path);
+        assert_eq!(
+            value,
+            UiSemanticPayloadValue::Enum {
+                value: "gamma".into()
+            }
+        );
+        assert_eq!(
+            renderer
+                .component_chrome_instances(&renderer.sampled[0].clone(), "gallery/mode-tabs")
+                .len(),
+            4
+        );
+
+        renderer.sampled[0].enabled = false;
+        assert!(renderer.tab_option_at_pointer().is_none());
+    }
+
+    #[test]
     fn generic_control_focus_is_local_and_skips_disabled_controls() {
         let _gpu_test = GPU_TEST_LOCK
             .lock()
@@ -7209,6 +8146,342 @@ mod tests {
             data_grid_requested_range(&frame, &declaration, 999_999.0, 252.0),
             Some((9_988, 12))
         );
+    }
+
+    #[test]
+    fn data_grid_thumb_drag_holds_body_until_one_release_window_is_applied() {
+        let _gpu_test = GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let (device, queue) = test_device("neon3-data-grid-thumb-drag-hold");
+        let declaration = neon_ui_schema::UiDataGridDeclaration {
+            node_key: "grid".into(),
+            source_key: "rows".into(),
+            max_window_rows: 8,
+            row_height: 20,
+            overscan: 1,
+            columns: vec![neon_ui_schema::UiDataGridColumn {
+                key: "name".into(),
+                label: "Name".into(),
+                width: 120,
+                presentation: neon_ui_schema::UiDataGridPresentation::Text,
+            }],
+        };
+        let row = |index| neon_ui_schema::UiDataGridWindowRow {
+            stable_row_key: format!("row-{index}"),
+            cells: std::collections::BTreeMap::from([(
+                "name".into(),
+                neon_ui_schema::UiDataGridCell {
+                    value: neon_ui_schema::UiInputValue::U32 {
+                        value: index as u32,
+                    },
+                    display: neon_ui_schema::UiTextHandle {
+                        id: index + 1,
+                        generation: 1,
+                    },
+                    presentation_override: None,
+                },
+            )]),
+        };
+        let fragments_at = |revision, first_row| {
+            let root = UiNode {
+                node_id: UiNodeId("grid".into()),
+                kind: UiNodeKind::DataGrid,
+                bounds: UiBounds {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 120.0,
+                    height: 100.0,
+                },
+                layout: None,
+                visible: true,
+                enabled: true,
+                text_key: None,
+                text: None,
+                image: None,
+                surface: None,
+                style: UiStyle {
+                    background_color: [0.08, 0.1, 0.12, 1.0],
+                    ..UiStyle::default()
+                },
+                enter_transition: None,
+                children: Vec::new(),
+            };
+            let fragment = UiFragment {
+                fragment_id: UiFragmentId("f".into()),
+                revision: Revision(revision),
+                root,
+                effects: vec![UiEffect::DataGridFrame {
+                    declaration: declaration.clone(),
+                    frame: neon_ui_schema::UiDataGridFrame {
+                        list_revision: Revision(1),
+                        total_rows: 100,
+                        first_row,
+                        window_rows: (first_row..first_row + 8).map(row).collect(),
+                        expected_program_revision: neon_ui_schema::UiProgramRevision {
+                            program_id: "drag-hold".into(),
+                            revision: Revision(1),
+                            schema_version: 1,
+                            capabilities: Vec::new(),
+                        },
+                    },
+                }],
+            };
+            HashMap::from([(fragment.fragment_id.clone(), fragment)])
+        };
+        let body_rows = |renderer: &UiWgpuRenderer| {
+            renderer
+                .plan
+                .iter()
+                .filter(|node| {
+                    node.id.starts_with("f/grid/data-grid-row-") && !node.id.contains("/cell-")
+                })
+                .map(|node| node.id.clone())
+                .collect::<Vec<_>>()
+        };
+        let visible_body_rows = |renderer: &UiWgpuRenderer| {
+            renderer
+                .plan
+                .iter()
+                .enumerate()
+                .filter(|(_, node)| {
+                    node.id.starts_with("f/grid/data-grid-row-") && !node.id.contains("/cell-")
+                })
+                .filter_map(|(index, node)| {
+                    let visual = renderer.visual_at(index);
+                    (intersect_clip(Some(visual.clip), visual.bounds).height > 0.0)
+                        .then(|| node.id.clone())
+                })
+                .collect::<Vec<_>>()
+        };
+        let nonblank = |pixels: &[u8]| pixels.chunks_exact(4).any(|pixel| pixel[3] != 0);
+        let mut renderer = UiWgpuRenderer::new(&device, wgpu::TextureFormat::Rgba8Unorm);
+        let initial = fragments_at(1, 0);
+        let initial_pixels = render_renderer_offscreen_for_test(
+            &mut renderer,
+            &device,
+            &queue,
+            wgpu::TextureFormat::Rgba8Unorm,
+            &initial,
+            [120, 100],
+            0.0,
+        );
+        assert!(nonblank(&initial_pixels));
+        let initial_rows = body_rows(&renderer);
+        let initial_visible_rows = visible_body_rows(&renderer);
+        assert!(!initial_visible_rows.is_empty());
+
+        renderer.set_pointer_position([115.0, 10.0]);
+        assert!(renderer.begin_scroll_drag_at_pointer());
+        renderer.set_pointer_position([115.0, 70.0]);
+        assert!(renderer.update_scroll_drag());
+        let desired_offset = renderer.scroll_offsets["f/grid"][1];
+        assert!(desired_offset > 0.0);
+        let mut sequence = 0;
+        assert!(
+            renderer
+                .data_grid_window_requests(&initial, 1, Revision(1), &mut sequence, None, false)
+                .is_empty(),
+            "CursorMoved must not schedule a DataGrid window request"
+        );
+        let drag_pixels = render_renderer_offscreen_for_test(
+            &mut renderer,
+            &device,
+            &queue,
+            wgpu::TextureFormat::Rgba8Unorm,
+            &initial,
+            [120, 100],
+            1.0,
+        );
+        assert!(nonblank(&drag_pixels));
+        assert_eq!(body_rows(&renderer), initial_rows);
+        assert_eq!(visible_body_rows(&renderer), initial_visible_rows);
+
+        assert_eq!(renderer.end_scroll_drag().as_deref(), Some("f/grid"));
+        let requests = renderer.data_grid_window_requests(
+            &initial,
+            1,
+            Revision(1),
+            &mut sequence,
+            Some("f/grid"),
+            true,
+        );
+        assert_eq!(
+            requests.len(),
+            1,
+            "release must schedule exactly one request"
+        );
+        let expected_first_row = data_grid_requested_range(
+            renderer.data_grid_frames.get("f/grid").unwrap(),
+            &declaration,
+            desired_offset,
+            100.0,
+        )
+        .unwrap()
+        .0;
+        assert_eq!(requests[0].requested_first_row, expected_first_row);
+        assert!(
+            renderer
+                .data_grid_window_requests(
+                    &initial,
+                    1,
+                    Revision(1),
+                    &mut sequence,
+                    Some("f/grid"),
+                    true,
+                )
+                .is_empty(),
+            "a pending release request must not be duplicated"
+        );
+        let pending_pixels = render_renderer_offscreen_for_test(
+            &mut renderer,
+            &device,
+            &queue,
+            wgpu::TextureFormat::Rgba8Unorm,
+            &initial,
+            [120, 100],
+            2.0,
+        );
+        assert!(nonblank(&pending_pixels));
+        assert_eq!(body_rows(&renderer), initial_rows);
+        assert_eq!(visible_body_rows(&renderer), initial_visible_rows);
+
+        let mut unrelated = initial.clone();
+        unrelated
+            .get_mut(&UiFragmentId("f".into()))
+            .unwrap()
+            .revision = Revision(2);
+        let unrelated_pixels = render_renderer_offscreen_for_test(
+            &mut renderer,
+            &device,
+            &queue,
+            wgpu::TextureFormat::Rgba8Unorm,
+            &unrelated,
+            [120, 100],
+            2.5,
+        );
+        assert!(nonblank(&unrelated_pixels));
+        assert_eq!(body_rows(&renderer), initial_rows);
+        assert_eq!(visible_body_rows(&renderer), initial_visible_rows);
+
+        let replacement = fragments_at(3, requests[0].requested_first_row);
+        let accepted_pixels = render_renderer_offscreen_for_test(
+            &mut renderer,
+            &device,
+            &queue,
+            wgpu::TextureFormat::Rgba8Unorm,
+            &replacement,
+            [120, 100],
+            3.0,
+        );
+        assert!(nonblank(&accepted_pixels));
+        assert!(!renderer.data_grid_scroll_holds.contains_key("f/grid"));
+        assert_eq!(renderer.scroll_offsets["f/grid"][1], desired_offset);
+        assert!(
+            body_rows(&renderer)
+                .iter()
+                .all(|path| !initial_rows.contains(path))
+        );
+
+        let rollback = fragments_at(4, 0);
+        renderer.scroll_offsets.insert("f/grid".into(), [0.0; 2]);
+        render_renderer_offscreen_for_test(
+            &mut renderer,
+            &device,
+            &queue,
+            wgpu::TextureFormat::Rgba8Unorm,
+            &rollback,
+            [120, 100],
+            4.0,
+        );
+        renderer.set_pointer_position([115.0, 10.0]);
+        assert!(renderer.begin_scroll_drag_at_pointer());
+        renderer.set_pointer_position([115.0, 90.0]);
+        assert!(renderer.update_scroll_drag());
+        let rollback_offset = renderer.data_grid_scroll_holds["f/grid"].body_offset;
+        renderer.end_scroll_drag();
+        let failed = renderer.data_grid_window_requests(
+            &rollback,
+            1,
+            Revision(4),
+            &mut sequence,
+            Some("f/grid"),
+            true,
+        );
+        assert_eq!(failed.len(), 1);
+        assert!(renderer.fail_data_grid_window_request(failed[0].sequence));
+        assert!(!renderer.data_grid_scroll_holds.contains_key("f/grid"));
+        assert_eq!(renderer.scroll_offsets["f/grid"], rollback_offset);
+    }
+
+    #[test]
+    fn data_grid_wide_columns_stretch_proportionally_without_a_blank_track() {
+        let declaration = neon_ui_schema::UiDataGridDeclaration {
+            node_key: "grid".into(),
+            source_key: "rows".into(),
+            max_window_rows: 4,
+            row_height: 24,
+            overscan: 0,
+            columns: [100_u32, 200]
+                .into_iter()
+                .enumerate()
+                .map(|(index, width)| neon_ui_schema::UiDataGridColumn {
+                    key: format!("column-{index}"),
+                    label: format!("Column {index}"),
+                    width,
+                    presentation: neon_ui_schema::UiDataGridPresentation::Text,
+                })
+                .collect(),
+        };
+        let (widths, content_width, horizontal, vertical) = data_grid_effective_columns(
+            &declaration,
+            UiBounds {
+                x: 0.0,
+                y: 0.0,
+                width: 500.0,
+                height: 100.0,
+            },
+            100,
+            24.0,
+        );
+
+        assert!(vertical);
+        assert!(!horizontal);
+        assert!((content_width - 488.0).abs() < 0.001);
+        assert!((widths[1] / widths[0] - 2.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn data_grid_narrow_columns_preserve_basis_for_horizontal_scroll() {
+        let declaration = neon_ui_schema::UiDataGridDeclaration {
+            node_key: "grid".into(),
+            source_key: "rows".into(),
+            max_window_rows: 4,
+            row_height: 24,
+            overscan: 0,
+            columns: [100_u32, 200]
+                .into_iter()
+                .enumerate()
+                .map(|(index, width)| neon_ui_schema::UiDataGridColumn {
+                    key: format!("column-{index}"),
+                    label: format!("Column {index}"),
+                    width,
+                    presentation: neon_ui_schema::UiDataGridPresentation::Text,
+                })
+                .collect(),
+        };
+        let grid = UiBounds {
+            x: 0.0,
+            y: 0.0,
+            width: 250.0,
+            height: 100.0,
+        };
+        let (widths, content_width, horizontal, _) =
+            data_grid_effective_columns(&declaration, grid, 100, 24.0);
+
+        assert!(horizontal);
+        assert_eq!(widths, vec![100.0, 200.0]);
+        assert_eq!(content_width - grid.width, 50.0);
     }
 
     #[test]
@@ -8203,6 +9476,125 @@ mod tests {
     }
 
     #[test]
+    fn two_resident_images_render_from_one_atlas_with_distinct_uvs() {
+        let _gpu_test = GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let (device, queue) = test_device("neon3-ui-image-atlas");
+        let image = |node_id: &str, bounds: UiBounds, asset_id: u64| {
+            let mut value = node();
+            value.node_id = UiNodeId(node_id.into());
+            value.kind = UiNodeKind::Image;
+            value.bounds = bounds;
+            value.enter_transition = None;
+            value.style.background_color = [1.0, 1.0, 1.0, 1.0];
+            value.image = Some(AssetRef {
+                project_id: "atlas-test".into(),
+                asset_id,
+                revision: Revision(1),
+                kind: "image".into(),
+            });
+            value
+        };
+        let mut root = node();
+        root.enter_transition = None;
+        root.bounds = UiBounds {
+            x: 0.0,
+            y: 0.0,
+            width: 16.0,
+            height: 8.0,
+        };
+        root.children = vec![
+            image(
+                "red",
+                UiBounds {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 8.0,
+                    height: 8.0,
+                },
+                1,
+            ),
+            image(
+                "green",
+                UiBounds {
+                    x: 8.0,
+                    y: 0.0,
+                    width: 8.0,
+                    height: 8.0,
+                },
+                2,
+            ),
+        ];
+        let fragment_id = UiFragmentId("image-atlas".into());
+        let fragments = HashMap::from([(
+            fragment_id.clone(),
+            UiFragment {
+                fragment_id,
+                revision: Revision(1),
+                root,
+                effects: Vec::new(),
+            },
+        )]);
+        let red = AssetBytes {
+            asset: AssetRef {
+                project_id: "atlas-test".into(),
+                asset_id: 1,
+                revision: Revision(1),
+                kind: "image".into(),
+            },
+            media_type: "application/x-neon-rgba8".into(),
+            width: Some(2),
+            height: Some(2),
+            bytes: [255, 0, 0, 255].repeat(4),
+        };
+        let green = AssetBytes {
+            asset: AssetRef {
+                project_id: "atlas-test".into(),
+                asset_id: 2,
+                revision: Revision(1),
+                kind: "image".into(),
+            },
+            media_type: "application/x-neon-rgba8".into(),
+            width: Some(2),
+            height: Some(2),
+            bytes: [0, 255, 0, 128].repeat(4),
+        };
+        let mut renderer = UiWgpuRenderer::new(&device, wgpu::TextureFormat::Rgba8Unorm);
+        renderer.preload_image(&device, &queue, &red).unwrap();
+        renderer.preload_image(&device, &queue, &green).unwrap();
+        assert_eq!(renderer.resident_images.len(), 2);
+        assert!(renderer.image_atlas.is_some());
+        assert_ne!(
+            renderer.resident_images[&("atlas-test".into(), 1, 1)].uv,
+            renderer.resident_images[&("atlas-test".into(), 2, 1)].uv,
+        );
+        let pixels = render_renderer_offscreen_for_test(
+            &mut renderer,
+            &device,
+            &queue,
+            wgpu::TextureFormat::Rgba8Unorm,
+            &fragments,
+            [16, 8],
+            1.0,
+        );
+        let pixel = |x: usize, y: usize| {
+            let offset = (y * 16 + x) * 4;
+            &pixels[offset..offset + 4]
+        };
+        assert!(
+            pixel(3, 3)[0] > 200 && pixel(3, 3)[1] < 40 && pixel(3, 3)[3] > 240,
+            "red pixel: {:?}",
+            pixel(3, 3)
+        );
+        assert!(
+            pixel(11, 3)[1] > 100 && pixel(11, 3)[0] < 40 && pixel(11, 3)[3] > 150,
+            "green pixel: {:?}",
+            pixel(11, 3)
+        );
+    }
+
+    #[test]
     fn prepare_interaction_binds_the_first_press_after_fragment_application() {
         let _gpu_test = GPU_TEST_LOCK
             .lock()
@@ -8279,8 +9671,242 @@ mod tests {
         let binding = renderer.hit_binding(hit_id).unwrap();
         assert!(renderer.begin_value_gesture(&binding));
         assert_eq!(
-            renderer.finish_value_gesture(),
+            renderer.finish_value_gesture().map(|(value, _)| value),
             Some(UiSemanticPayloadValue::I32 { value: 15 })
+        );
+    }
+
+    #[test]
+    fn numeric_commit_frames_hold_preview_then_reconcile_or_rollback() {
+        let _gpu_test = GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let (device, _queue) = test_device("neon3-ui-pending-numeric-commit-frames");
+        let fragment = |revision, value| {
+            let mut root = node();
+            root.kind = UiNodeKind::DragValue;
+            root.bounds = UiBounds {
+                x: 0.0,
+                y: 0.0,
+                width: 300.0,
+                height: 40.0,
+            };
+            root.enter_transition = None;
+            let fragment_id = UiFragmentId("numeric".into());
+            HashMap::from([(
+                fragment_id.clone(),
+                UiFragment {
+                    fragment_id,
+                    revision: Revision(revision),
+                    root,
+                    effects: vec![
+                        UiEffect::ControlPresentation {
+                            node_id: UiNodeId("root".into()),
+                            state: UiControlPresentation::Numeric {
+                                value,
+                                min: 0.0,
+                                max: 20.0,
+                            },
+                        },
+                        UiEffect::BoundSemanticIntent {
+                            node_id: UiNodeId("root".into()),
+                            intent: UiIntent::Invoke {
+                                action: "numeric.commit".into(),
+                                params: json!({}),
+                            },
+                        },
+                    ],
+                },
+            )])
+        };
+        let presented_value = |renderer: &UiWgpuRenderer| {
+            if let Some(UiSemanticPayloadValue::I32 { value }) =
+                renderer.value_previews.get("numeric/root")
+            {
+                return *value as f32;
+            }
+            let index = renderer
+                .plan
+                .iter()
+                .position(|node| node.id == "numeric/root")
+                .unwrap();
+            match renderer.sampled[index].presentation {
+                Some(UiControlPresentation::Numeric { value, .. }) => value,
+                _ => panic!("numeric presentation is required"),
+            }
+        };
+        let start_commit =
+            |renderer: &mut UiWgpuRenderer, fragments: &HashMap<UiFragmentId, UiFragment>| {
+                renderer.prepare_interaction(fragments, [320, 80], [320.0, 80.0], 0.0);
+                let (start, end) = renderer
+                    .debug_value_gesture_points("numeric/root", 0.75)
+                    .unwrap();
+                renderer.set_pointer_position(start);
+                let binding = renderer
+                    .hit_id_at_pointer()
+                    .and_then(|hit_id| renderer.hit_binding(hit_id))
+                    .unwrap();
+                assert!(renderer.begin_value_gesture(&binding));
+                renderer.set_pointer_position(end);
+                assert!(renderer.update_value_gesture());
+                let (value, presentation) = renderer.finish_value_gesture().unwrap();
+                (binding.fragment, value, presentation)
+            };
+
+        let initial = fragment(1, 4.0);
+        let mut renderer = UiWgpuRenderer::new(&device, wgpu::TextureFormat::Rgba8Unorm);
+        let (source_revision, value, presentation) = start_commit(&mut renderer, &initial);
+        assert_eq!(value, UiSemanticPayloadValue::I32 { value: 15 });
+        let rejected_key = renderer.retain_local_presentation(1, &source_revision, presentation);
+
+        renderer.compose_sampled_visuals(0.0);
+        assert_eq!(presented_value(&renderer), 15.0, "release pending frame");
+        assert!(renderer.complete_local_presentation(&rejected_key, false, &initial));
+        renderer.compose_sampled_visuals(0.0);
+        assert_eq!(presented_value(&renderer), 4.0, "rejected rollback frame");
+
+        let (source_revision, _, presentation) = start_commit(&mut renderer, &initial);
+        let accepted_key = renderer.retain_local_presentation(2, &source_revision, presentation);
+        assert_eq!(presented_value(&renderer), 15.0, "second pending frame");
+        let authoritative = fragment(2, 13.0);
+        renderer.prepare_interaction(&authoritative, [320, 80], [320.0, 80.0], 0.0);
+        assert_eq!(
+            presented_value(&renderer),
+            13.0,
+            "replacement composition must not render the stale preview"
+        );
+        renderer.complete_local_presentation(&accepted_key, true, &authoritative);
+        assert!(renderer.pending_local_presentations.is_empty());
+        assert_eq!(
+            presented_value(&renderer),
+            13.0,
+            "accepted authoritative frame"
+        );
+    }
+
+    #[test]
+    fn drag_commit_frames_hold_drop_offset_then_reconcile_or_rollback() {
+        let _gpu_test = GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let (device, _queue) = test_device("neon3-ui-pending-drag-commit-frames");
+        let fragment = |revision, reparented| {
+            let mut root = node();
+            root.bounds = UiBounds {
+                x: 0.0,
+                y: 0.0,
+                width: 220.0,
+                height: 100.0,
+            };
+            root.enter_transition = None;
+            let mut source = node();
+            source.node_id = UiNodeId("source".into());
+            source.bounds = UiBounds {
+                x: if reparented { 15.0 } else { 10.0 },
+                y: if reparented { 10.0 } else { 20.0 },
+                width: 30.0,
+                height: 20.0,
+            };
+            source.enter_transition = None;
+            let mut target = node();
+            target.node_id = UiNodeId("target".into());
+            target.bounds = UiBounds {
+                x: 130.0,
+                y: 10.0,
+                width: 60.0,
+                height: 50.0,
+            };
+            target.enter_transition = None;
+            if reparented {
+                target.children.push(source);
+                root.children.push(target);
+            } else {
+                root.children.extend([source, target]);
+            }
+            let fragment_id = UiFragmentId("drag".into());
+            HashMap::from([(
+                fragment_id.clone(),
+                UiFragment {
+                    fragment_id,
+                    revision: Revision(revision),
+                    root,
+                    effects: vec![
+                        UiEffect::DragBinding {
+                            binding: UiDragBinding {
+                                key: "source-drag".into(),
+                                source_node_id: UiNodeId("source".into()),
+                                axis: UiDragAxis::Both,
+                                snap: 0.0,
+                                threshold: 1.0,
+                                boundary: UiDragBoundary::Surface,
+                            },
+                        },
+                        UiEffect::DropBinding {
+                            binding: neon_ui_schema::UiDropBinding {
+                                key: "target-drop".into(),
+                                target_node_id: UiNodeId("target".into()),
+                                accepts_drag_key: "source-drag".into(),
+                                placement: UiDropPlacement::Into,
+                                presentation_template_key: None,
+                                intent: UiIntent::Invoke {
+                                    action: "drag.commit".into(),
+                                    params: json!({}),
+                                },
+                            },
+                        },
+                    ],
+                },
+            )])
+        };
+        let source_x = |renderer: &UiWgpuRenderer| {
+            let index = renderer
+                .plan
+                .iter()
+                .position(|node| node.id == "drag/source")
+                .unwrap();
+            renderer.sampled[index].bounds.x
+        };
+        let finish_drag =
+            |renderer: &mut UiWgpuRenderer, fragments: &HashMap<UiFragmentId, UiFragment>| {
+                renderer.prepare_interaction(fragments, [220, 100], [220.0, 100.0], 0.0);
+                renderer.set_pointer_position([25.0, 30.0]);
+                assert!(renderer.begin_drag_at_pointer(fragments));
+                renderer.set_pointer_position([160.0, 30.0]);
+                assert!(renderer.update_drag_preview());
+                renderer.finish_drag_at_pointer(fragments).unwrap()
+            };
+
+        let initial = fragment(1, false);
+        let mut renderer = UiWgpuRenderer::new(&device, wgpu::TextureFormat::Rgba8Unorm);
+        let resolved = finish_drag(&mut renderer, &initial);
+        let rejected_key =
+            renderer.retain_local_presentation(1, &resolved.fragment, resolved.local_presentation);
+        renderer.compose_sampled_visuals(0.0);
+        assert_eq!(source_x(&renderer), 145.0, "release pending drag frame");
+        assert!(renderer.complete_local_presentation(&rejected_key, false, &initial));
+        renderer.compose_sampled_visuals(0.0);
+        assert_eq!(source_x(&renderer), 10.0, "rejected drag rollback frame");
+
+        let resolved = finish_drag(&mut renderer, &initial);
+        let accepted_key =
+            renderer.retain_local_presentation(2, &resolved.fragment, resolved.local_presentation);
+        renderer.compose_sampled_visuals(0.0);
+        assert_eq!(source_x(&renderer), 145.0, "second pending drag frame");
+        let authoritative = fragment(2, true);
+        renderer.prepare_interaction(&authoritative, [220, 100], [220.0, 100.0], 0.0);
+        assert_eq!(source_x(&renderer), 145.0, "authoritative reparent frame");
+        let source = renderer
+            .plan
+            .iter()
+            .find(|node| node.id == "drag/source")
+            .unwrap();
+        assert_eq!(source.parent_id.as_deref(), Some("drag/target"));
+        renderer.complete_local_presentation(&accepted_key, true, &authoritative);
+        assert!(renderer.pending_local_presentations.is_empty());
+        assert_eq!(
+            source_x(&renderer),
+            145.0,
+            "accepted authoritative drag frame"
         );
     }
 
@@ -8443,6 +10069,73 @@ mod tests {
         assert_eq!(
             nodes[1].2.bounds.y, nodes[2].2.bounds.y,
             "center alignment uses common cross-axis placement"
+        );
+    }
+
+    #[test]
+    fn flex_redistributes_after_tracks_reach_minimum_and_maximum_widths() {
+        let make_child = |id: &str, basis: f32, minimum: f32, maximum: Option<f32>| {
+            let mut child = node();
+            child.node_id = UiNodeId(id.into());
+            child.bounds = UiBounds {
+                x: 0.0,
+                y: 0.0,
+                width: 0.0,
+                height: 0.0,
+            };
+            child.layout = Some(UiLayout {
+                min_size: Some([minimum, 0.0]),
+                max_size: maximum.map(|maximum| [maximum, f32::INFINITY]),
+                flex_basis: Some(basis),
+                flex_grow: 1.0,
+                flex_shrink: 1.0,
+                ..UiLayout::default()
+            });
+            child.enter_transition = None;
+            child.children.clear();
+            child
+        };
+        let bounds = UiBounds {
+            x: 0.0,
+            y: 0.0,
+            width: 500.0,
+            height: 40.0,
+        };
+        let layout = UiLayout {
+            mode: UiLayoutMode::Row,
+            align_items: UiAlignItems::Stretch,
+            ..UiLayout::default()
+        };
+
+        let mut growing = node();
+        growing.bounds = bounds;
+        growing.layout = Some(layout);
+        growing.children = vec![
+            make_child("left", 100.0, 0.0, Some(120.0)),
+            make_child("middle", 100.0, 0.0, Some(160.0)),
+            make_child("right", 100.0, 0.0, None),
+        ];
+        let grown = resolve_children(&growing, bounds, layout, bounds, None);
+        assert_eq!(grown[0].width, 120.0);
+        assert_eq!(grown[1].width, 160.0);
+        assert!((grown[2].width - 220.0).abs() < 0.001);
+
+        let mut shrinking = node();
+        shrinking.bounds = bounds;
+        shrinking.layout = Some(layout);
+        shrinking.children = vec![
+            make_child("left", 300.0, 100.0, None),
+            make_child("middle", 300.0, 250.0, None),
+            make_child("right", 100.0, 100.0, None),
+        ];
+        let shrunk = resolve_children(&shrinking, bounds, layout, bounds, None);
+        assert!((shrunk[0].width - 150.0).abs() < 0.001);
+        assert_eq!(shrunk[1].width, 250.0);
+        assert_eq!(shrunk[2].width, 100.0);
+        assert!(
+            shrunk
+                .iter()
+                .all(|pane| pane.x + pane.width <= bounds.width + 0.001)
         );
     }
 
@@ -8967,7 +10660,7 @@ mod tests {
     }
 
     #[test]
-    fn component_gallery_tracks_authoritative_viewport_across_resize() {
+    fn component_gallery_fixture_offscreen_captures_remain_responsive() {
         let _gpu_test = GPU_TEST_LOCK
             .lock()
             .unwrap_or_else(|error| error.into_inner());
@@ -8976,18 +10669,82 @@ mod tests {
             "../../../tests/fixtures/ui/imgui-component-gallery.nui"
         ))
         .expect("component gallery must parse");
-        let fragment = UiFragment {
+        let declaration = document.ir.data_grids[0].clone();
+        let handle = |id| neon_ui_schema::UiTextHandle { id, generation: 1 };
+        let cells = std::collections::BTreeMap::from([
+            (
+                "name".into(),
+                neon_ui_schema::UiDataGridCell {
+                    value: neon_ui_schema::UiInputValue::TextHandle { value: handle(1) },
+                    display: handle(101),
+                    presentation_override: None,
+                },
+            ),
+            (
+                "status".into(),
+                neon_ui_schema::UiDataGridCell {
+                    value: neon_ui_schema::UiInputValue::Enum {
+                        value: "ready".into(),
+                    },
+                    display: handle(102),
+                    presentation_override: None,
+                },
+            ),
+            (
+                "owner".into(),
+                neon_ui_schema::UiDataGridCell {
+                    value: neon_ui_schema::UiInputValue::Bool { value: true },
+                    display: handle(103),
+                    presentation_override: None,
+                },
+            ),
+            (
+                "notes".into(),
+                neon_ui_schema::UiDataGridCell {
+                    value: neon_ui_schema::UiInputValue::TextHandle { value: handle(4) },
+                    display: handle(104),
+                    presentation_override: None,
+                },
+            ),
+        ]);
+        let mut fragment = UiFragment {
             fragment_id: UiFragmentId("component-gallery".into()),
             revision: Revision(1),
             root: document.ir.root.clone(),
             effects: lower_nui_flow_effects(&document),
         };
+        fragment.effects.push(UiEffect::DataGridFrame {
+            declaration,
+            frame: neon_ui_schema::UiDataGridFrame {
+                list_revision: Revision(1),
+                total_rows: 100,
+                first_row: 0,
+                window_rows: vec![neon_ui_schema::UiDataGridWindowRow {
+                    stable_row_key: "asset-1".into(),
+                    cells,
+                }],
+                expected_program_revision: neon_ui_schema::UiProgramRevision {
+                    program_id: "component-gallery-responsive-test".into(),
+                    revision: Revision(1),
+                    schema_version: 1,
+                    capabilities: Vec::new(),
+                },
+            },
+        });
         let fragments = HashMap::from([(fragment.fragment_id.clone(), fragment)]);
         let mut renderer = UiWgpuRenderer::new(&device, wgpu::TextureFormat::Rgba8Unorm);
         let mut prior_revision = 0;
 
-        for size in [[1920, 1080], [1680, 900], [1280, 720]] {
+        for size in [[1920, 1080], [1820, 634], [1668, 900], [1280, 720]] {
             let logical_size = [size[0] as f32, size[1] as f32];
+            for path in [
+                "component-gallery/component-gallery",
+                "component-gallery/gallery-controls",
+                "component-gallery/asset-grid",
+                "component-gallery/field-pack",
+            ] {
+                renderer.scroll_offsets.insert(path.into(), [0.0; 2]);
+            }
             let pixels = render_renderer_offscreen_for_test(
                 &mut renderer,
                 &device,
@@ -9009,6 +10766,8 @@ mod tests {
                     .unwrap();
                 renderer.visual_at(index)
             };
+            let responsive_width = logical_size[0].max(2048.0);
+            let free = responsive_width - 1856.0;
             assert_eq!(
                 visual("component-gallery/component-gallery").bounds,
                 UiBounds {
@@ -9022,8 +10781,6 @@ mod tests {
             let controls = visual("component-gallery/gallery-controls").bounds;
             let grid = visual("component-gallery/asset-grid").bounds;
             let field_pack = visual("component-gallery/field-pack").bounds;
-            let responsive_width = logical_size[0].max(1668.0);
-            let free = responsive_width - 1668.0;
             assert_eq!(
                 gallery,
                 UiBounds {
@@ -9034,20 +10791,45 @@ mod tests {
                 }
             );
             assert_eq!(controls.width, 360.0 + free * 0.25);
-            assert_eq!(grid.width, 600.0 + free * 0.5);
-            assert_eq!(field_pack.width, 660.0 + free * 0.25);
-            assert_eq!(grid.x, controls.x + controls.width + 10.0);
-            assert_eq!(field_pack.x, grid.x + grid.width + 10.0);
-            assert_eq!(field_pack.x + field_pack.width + 14.0, responsive_width);
-            assert_eq!(controls.height, (logical_size[1] - 28.0).max(0.0));
+            assert_eq!(grid.width, 720.0 + free * 0.5);
+            assert_eq!(field_pack.width, 720.0 + free * 0.25);
+            assert!(controls.width <= 430.0);
+            assert!(field_pack.width <= 860.0);
+            assert_eq!(grid.x, controls.x + controls.width + 12.0);
+            assert_eq!(field_pack.x, grid.x + grid.width + 12.0);
+            assert_eq!(field_pack.x + field_pack.width + 16.0, responsive_width);
+            assert_eq!(controls.height, (logical_size[1] - 32.0).max(0.0));
             assert_eq!(grid.height, controls.height);
             assert_eq!(field_pack.height, controls.height);
-            if size[0] == 1280 {
-                assert_eq!(
-                    renderer.scroll_metrics["component-gallery/component-gallery"].max_offset[0],
-                    388.0
-                );
+            if logical_size[0] >= 2048.0 {
+                for pane in [controls, grid, field_pack] {
+                    assert!(pane.x >= 0.0 && pane.x + pane.width <= logical_size[0]);
+                }
             }
+            assert_eq!(
+                renderer.scroll_metrics["component-gallery/component-gallery"].max_offset[0],
+                (2048.0 - logical_size[0]).max(0.0)
+            );
+            let controls_overflow =
+                renderer.scroll_metrics["component-gallery/gallery-controls"].max_offset;
+            let field_pack_overflow =
+                renderer.scroll_metrics["component-gallery/field-pack"].max_offset;
+            assert!(controls_overflow[1] > 0.0);
+            assert_eq!(field_pack_overflow[0], 0.0);
+
+            let extent = visual("component-gallery/asset-grid/data-grid-content-extent");
+            let header = visual("component-gallery/asset-grid/data-grid-header");
+            let notes = visual("component-gallery/asset-grid/data-grid-row-asset-1/cell-notes");
+            let status =
+                visual("component-gallery/asset-grid/data-grid-row-asset-1/cell-status").bounds;
+            let header_y = header.bounds.y;
+            let expected_content_width = (grid.width - DATA_GRID_SCROLLBAR_GUTTER).max(640.0);
+            assert!((extent.bounds.width - expected_content_width).abs() < 0.001);
+            assert_eq!(header.bounds.width, extent.bounds.width);
+            assert!(
+                (notes.bounds.x + notes.bounds.width + 5.0 - (grid.x + extent.bounds.width)).abs()
+                    < 0.001
+            );
 
             let feature = visual("component-gallery/feature-toggle").bounds;
             let logical_point = [feature.x + 12.0, feature.y + feature.height * 0.5];
@@ -9070,6 +10852,51 @@ mod tests {
             assert_eq!(
                 renderer.hit_binding(hit_id).unwrap().node_path,
                 "component-gallery/feature-toggle",
+            );
+            let status_point = [
+                (status.x + status.width * 0.5).floor() as usize,
+                (status.y + status.height * 0.5).floor() as usize,
+            ];
+            let status_hit = hits[status_point[1] * size[0] as usize + status_point[0]];
+            let status_binding = renderer.hit_binding(status_hit).unwrap();
+            assert_eq!(
+                status_binding.node_path,
+                "component-gallery/asset-grid/data-grid-row-asset-1/cell-status"
+            );
+            assert_eq!(
+                status_binding.data_grid_cell.as_ref().unwrap().column_key,
+                "status"
+            );
+
+            let vertical_max =
+                renderer.scroll_metrics["component-gallery/asset-grid"].max_offset[1];
+            assert!(vertical_max > 0.0);
+            renderer.scroll_offsets.insert(
+                "component-gallery/asset-grid".into(),
+                [0.0, vertical_max.min(48.0)],
+            );
+            let scrolled_pixels = render_renderer_offscreen_for_test(
+                &mut renderer,
+                &device,
+                &queue,
+                wgpu::TextureFormat::Rgba8Unorm,
+                &fragments,
+                size,
+                2.0,
+            );
+            let header = renderer
+                .plan
+                .iter()
+                .position(|node| node.id == "component-gallery/asset-grid/data-grid-header")
+                .map(|index| renderer.visual_at(index))
+                .unwrap();
+            assert_eq!(header.bounds.y, header_y);
+            let header_point = [
+                (header.bounds.x + 2.0).floor() as usize,
+                (header.bounds.y + 2.0).floor() as usize,
+            ];
+            assert!(
+                scrolled_pixels[(header_point[1] * size[0] as usize + header_point[0]) * 4 + 3] > 0
             );
         }
 
@@ -9187,40 +11014,37 @@ mod tests {
         assert_eq!(
             controls.bounds,
             UiBounds {
-                x: 14.0,
-                y: 14.0,
-                width: 363.0,
-                height: 872.0
+                x: 16.0,
+                y: 16.0,
+                width: 408.0,
+                height: 868.0
             }
         );
         assert_eq!(
             grid.bounds,
             UiBounds {
-                x: 387.0,
-                y: 14.0,
-                width: 606.0,
-                height: 872.0
+                x: 436.0,
+                y: 16.0,
+                width: 816.0,
+                height: 868.0
             }
         );
         assert_eq!(
             field_pack.bounds,
             UiBounds {
-                x: 1003.0,
-                y: 14.0,
-                width: 663.0,
-                height: 872.0
+                x: 1264.0,
+                y: 16.0,
+                width: 768.0,
+                height: 868.0
             }
         );
         assert_eq!(controls.clip, controls.bounds);
         assert_eq!(grid.clip, grid.bounds);
         assert!(
-            !controls.scroll,
-            "gallery-controls is a normal panel, not a ScrollView"
+            controls.scroll,
+            "gallery-controls must be a scroll viewport"
         );
-        assert!(
-            !field_pack.scroll,
-            "field-pack is a normal panel, not a ScrollView"
-        );
+        assert!(field_pack.scroll, "field-pack must be a scroll viewport");
         for path in [
             "component-gallery/backpack-compass",
             "component-gallery/backpack-potion",
@@ -9235,13 +11059,13 @@ mod tests {
                 "{path} must have a composed visual"
             );
         }
-        assert_eq!(visual("component-gallery/feature-toggle").bounds.y, 58.0);
+        assert_eq!(visual("component-gallery/feature-toggle").bounds.y, 344.0);
         assert_eq!(
             visual("component-gallery/asset-grid/data-grid-row-asset-1/cell-status").bounds,
             UiBounds {
-                x: 572.0,
-                y: 38.0,
-                width: 120.0,
+                x: 661.0,
+                y: 40.0,
+                width: 140.0,
                 height: 24.0
             }
         );
@@ -9340,29 +11164,17 @@ mod tests {
             "component-gallery/feature-toggle"
         );
         assert!(probe["fallback_hit"].get("render_id").is_none());
-        assert!(
-            !renderer
-                .scroll_metrics
-                .contains_key("component-gallery/gallery-controls")
+        assert_eq!(
+            renderer.scroll_metrics["component-gallery/gallery-controls"].max_offset,
+            [0.0, 284.0]
         );
-        assert!(
-            !renderer
-                .scroll_offsets
-                .contains_key("component-gallery/gallery-controls")
-        );
-        assert!(
-            !renderer
-                .scroll_metrics
-                .contains_key("component-gallery/field-pack")
-        );
-        assert!(
-            !renderer
-                .scroll_offsets
-                .contains_key("component-gallery/field-pack")
+        assert_eq!(
+            renderer.scroll_metrics["component-gallery/field-pack"].max_offset,
+            [0.0, 0.0]
         );
         assert_eq!(
             renderer.scroll_metrics["component-gallery/asset-grid"].max_offset,
-            [134.0, 239_152.0]
+            [56.0, 239_168.0]
         );
 
         let (item_point, drop_point) = renderer
@@ -9382,6 +11194,7 @@ mod tests {
             .expect("equipment drop zone must resolve the compass drag");
         assert_eq!(resolved_drop.source_key, "backpack-compass");
         assert_eq!(resolved_drop.target_key, "equipment-zone");
+        renderer.rollback_local_presentation(&resolved_drop.local_presentation);
 
         let pixels = render_hit_ids_with_renderer_for_test(
             &mut renderer,
@@ -9586,23 +11399,25 @@ mod tests {
             let visual = renderer.visual_at(index);
             let bounds = visual.bounds;
             let actual_visible = intersect_clip(Some(visual.clip), bounds);
-            assert_eq!(
-                actual_visible, bounds,
-                "{path} must be fully visible in the normal controls panel"
-            );
-            let x = (bounds.x + 12.0).floor() as usize;
-            let center = [x, (bounds.y + bounds.height * 0.5).floor() as usize];
-            let bottom = [x, (bounds.y + bounds.height - 2.0).floor() as usize];
-            assert_ne!(
-                rgba_at(&pixels, center),
-                controls_background,
-                "{path} must paint through its center"
-            );
-            assert_ne!(
-                rgba_at(&pixels, bottom),
-                controls_background,
-                "{path} must paint through its bottom edge"
-            );
+            assert!(actual_visible.width >= 0.0 && actual_visible.height >= 0.0);
+            if actual_visible.height > 0.0
+                && actual_visible.x >= 0.0
+                && actual_visible.y >= 0.0
+                && actual_visible.x + actual_visible.width <= TARGET_SIZE[0] as f32
+                && actual_visible.y + actual_visible.height <= TARGET_SIZE[1] as f32
+            {
+                let x = (actual_visible.x + 12.0).floor() as usize;
+                let center = [
+                    x,
+                    (actual_visible.y + actual_visible.height * 0.5).floor() as usize,
+                ];
+                let bottom = [
+                    x,
+                    (actual_visible.y + actual_visible.height - 2.0).floor() as usize,
+                ];
+                assert_ne!(rgba_at(&pixels, center), controls_background);
+                assert_ne!(rgba_at(&pixels, bottom), controls_background);
+            }
         }
 
         let grid_offset = renderer.scroll_metrics["component-gallery/asset-grid"].max_offset;
@@ -9610,8 +11425,14 @@ mod tests {
             .scroll_offsets
             .insert("component-gallery/asset-grid".into(), grid_offset);
         let mut sequence = 0;
-        let requests =
-            renderer.data_grid_window_requests(&fragments, 1, Revision(1), &mut sequence);
+        let requests = renderer.data_grid_window_requests(
+            &fragments,
+            1,
+            Revision(1),
+            &mut sequence,
+            None,
+            false,
+        );
         assert_eq!(requests.len(), 1);
         let request = &requests[0];
         let viewport_rows = (grid.bounds.height / row_height).ceil() as u64;

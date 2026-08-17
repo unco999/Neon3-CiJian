@@ -46,6 +46,7 @@ pub fn terrain_workbench_document() -> neon_ui_schema::NuiFlowDocument {
         key: "terrain-render-surface".into(),
         kind: UiProgramResourceKind::RenderSurface,
         has_fallback: true,
+        asset_ref: None,
     });
     document
 }

@@ -927,6 +927,7 @@ dependencies = [
  "neon-protocol",
  "neon-ui-runtime",
  "neon-ui-schema",
+ "png",
  "serde_json",
  "windows-sys 0.59.0",
 ]

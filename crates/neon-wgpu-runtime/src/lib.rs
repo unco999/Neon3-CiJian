@@ -46,7 +46,9 @@ mod ui_program_gpu;
 mod ui_renderer;
 use gpu_preview::HeightmapPreviewConverter;
 pub use ui_program_gpu::GpuUiProgramBackend;
-use ui_renderer::{UiHitBinding, UiWgpuRenderer};
+use ui_renderer::{
+    LocalPresentationCommit, PendingLocalPresentationKey, UiHitBinding, UiWgpuRenderer,
+};
 
 pub const SERVICE_NAME: &str = "wgpu-runtime";
 pub const CAPABILITY_UI_FRAGMENT: &str = "wgpu.ui.fragment.v1";
@@ -632,8 +634,10 @@ pub struct WindowedRuntime {
     applied_composition_revision: Revision,
     redraw_pending: bool,
     animation_active: bool,
-    pending_composition_ack: Option<std::sync::mpsc::Sender<()>>,
+    pending_composition_acks: VecDeque<(Revision, std::sync::mpsc::Sender<()>)>,
+    composition_ack_in_flight: bool,
     ui_endpoint: Option<SocketAddr>,
+    projectd_endpoint: Option<SocketAddr>,
     pointer_delivery: Arc<Mutex<Value>>,
     interaction_traces: Arc<Mutex<InteractionTraceStore>>,
     next_interaction_id: u64,
@@ -641,6 +645,14 @@ pub struct WindowedRuntime {
     next_data_grid_window_sequence: u64,
     data_grid_window_delivery: Arc<Mutex<Value>>,
     initial_window_sizing: InitialWindowSizing,
+    event_proxy: Option<EventLoopProxy<WindowCommand>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SemanticDeliveryOutcome {
+    Accepted,
+    Rejected,
+    TransportFailed,
 }
 
 #[derive(Clone, Debug)]
@@ -659,6 +671,9 @@ enum WindowCommand {
         completed: std::sync::mpsc::Sender<Option<neon_wgpu_ai::ModelInfo>>,
     },
     InputDebugSnapshot {
+        completed: std::sync::mpsc::Sender<Value>,
+    },
+    ImageDebugSnapshot {
         completed: std::sync::mpsc::Sender<Value>,
     },
     InputDebugProbe {
@@ -690,7 +705,19 @@ enum WindowCommand {
     },
     CaptureFinalTarget {
         artifact_path: Option<PathBuf>,
+        redraw: bool,
         completed: std::sync::mpsc::Sender<Result<Value, String>>,
+    },
+    CompositionDrawCompleted {
+        acknowledgements: Vec<std::sync::mpsc::Sender<()>>,
+    },
+    SemanticDeliveryCompleted {
+        pending: Option<PendingLocalPresentationKey>,
+        outcome: SemanticDeliveryOutcome,
+    },
+    DataGridWindowDeliveryCompleted {
+        sequence: u64,
+        accepted: bool,
     },
     Shutdown,
 }
@@ -783,8 +810,10 @@ impl WindowedRuntime {
             applied_composition_revision: Revision(0),
             redraw_pending: true,
             animation_active: false,
-            pending_composition_ack: None,
+            pending_composition_acks: VecDeque::new(),
+            composition_ack_in_flight: false,
             ui_endpoint: None,
+            projectd_endpoint: None,
             pointer_delivery: Arc::new(Mutex::new(json!({"state": "none"}))),
             interaction_traces: Arc::new(Mutex::new(InteractionTraceStore::new())),
             next_interaction_id: 0,
@@ -792,25 +821,28 @@ impl WindowedRuntime {
             next_data_grid_window_sequence: 0,
             data_grid_window_delivery: Arc::new(Mutex::new(json!({"state": "idle"}))),
             initial_window_sizing: InitialWindowSizing::default(),
+            event_proxy: None,
         }
     }
 
     pub fn run(epoch: u64) -> Result<(), String> {
-        Self::run_with_server(epoch, None, None, true)
+        Self::run_with_server(epoch, None, None, None, true)
     }
 
     pub fn run_server(
         epoch: u64,
         endpoint: SocketAddr,
         ui_endpoint: Option<SocketAddr>,
+        projectd_endpoint: Option<SocketAddr>,
     ) -> Result<(), String> {
-        Self::run_with_server(epoch, Some(endpoint), ui_endpoint, false)
+        Self::run_with_server(epoch, Some(endpoint), ui_endpoint, projectd_endpoint, false)
     }
 
     fn run_with_server(
         epoch: u64,
         endpoint: Option<SocketAddr>,
         ui_endpoint: Option<SocketAddr>,
+        projectd_endpoint: Option<SocketAddr>,
         demo: bool,
     ) -> Result<(), String> {
         let event_loop = EventLoop::<WindowCommand>::with_user_event()
@@ -818,7 +850,9 @@ impl WindowedRuntime {
             .map_err(|error| format!("create event loop: {error}"))?;
         let proxy = event_loop.create_proxy();
         let mut runtime = Self::new(epoch);
+        runtime.event_proxy = Some(proxy.clone());
         runtime.ui_endpoint = ui_endpoint;
+        runtime.projectd_endpoint = projectd_endpoint;
         if demo {
             runtime.fragments = runtime.demo_fragments();
             runtime.applied_composition_revision = Revision(1);
@@ -847,9 +881,56 @@ impl WindowedRuntime {
         let gpu = WindowGpu::new(&window, instance)?;
         self.window = Some(window);
         self.gpu = Some(gpu);
+        if let Some(endpoint) = self.projectd_endpoint {
+            self.preload_fixture_image(endpoint)?;
+        }
         self.request_scripted_initial_size();
         self.redraw_pending = true;
         Ok(())
+    }
+
+    fn preload_fixture_image(&mut self, endpoint: SocketAddr) -> Result<(), String> {
+        let asset = AssetRef {
+            project_id: "fixture-project".into(),
+            asset_id: 81,
+            revision: Revision(5),
+            kind: "image".into(),
+        };
+        let request = RpcRequest {
+            protocol: "neon3.rpc".into(),
+            version: PROTOCOL_VERSION,
+            request_id: RequestId("gallery-image-preload".into()),
+            client: ClientIdentity {
+                kind: ClientKind::WgpuRuntime,
+                instance_id: format!("window-{}", self.epoch),
+                pid: std::process::id(),
+                origin: "neon-wgpu-runtime".into(),
+            },
+            target: ServiceName("projectd".into()),
+            method: "asset.get_bytes".into(),
+            params: json!(asset.clone()),
+            expected_revision: Some(asset.revision),
+            idempotency_key: Some("gallery-image-preload".into()),
+        };
+        let response = RpcClient::connect(endpoint)
+            .and_then(|mut client| client.call(&request))
+            .map_err(|error| format!("fixture image owner request failed: {error}"))?;
+        if response.status != RpcStatus::Accepted {
+            return Err(format!(
+                "fixture image owner rejected preload: {:?}",
+                response.error
+            ));
+        }
+        let content: AssetBytes = serde_json::from_value(
+            response
+                .result
+                .ok_or_else(|| "fixture image owner omitted asset bytes".to_string())?,
+        )
+        .map_err(|error| format!("fixture image asset bytes were invalid: {error}"))?;
+        let gpu = self.gpu.as_mut().ok_or("GPU is not initialized")?;
+        gpu.ui
+            .preload_image(&gpu.device, &gpu.queue, &content)
+            .map_err(|error| format!("fixture image preload failed: {error}"))
     }
 
     fn resize(&mut self, size: PhysicalSize<u32>) {
@@ -1058,9 +1139,26 @@ impl WindowedRuntime {
             gpu.final_composition_revision = self.applied_composition_revision;
         }
         if self.initial_window_sizing.pending_request.is_none()
-            && let Some(applied) = self.pending_composition_ack.take()
+            && !self.composition_ack_in_flight
+            && let Some(proxy) = self.event_proxy.clone()
         {
-            let _ = applied.send(());
+            let mut acknowledgements = Vec::new();
+            while self
+                .pending_composition_acks
+                .front()
+                .is_some_and(|(revision, _)| *revision <= self.applied_composition_revision)
+            {
+                if let Some((_, acknowledgement)) = self.pending_composition_acks.pop_front() {
+                    acknowledgements.push(acknowledgement);
+                }
+            }
+            if !acknowledgements.is_empty() {
+                self.composition_ack_in_flight = true;
+                gpu.queue.on_submitted_work_done(move || {
+                    let _ = proxy
+                        .send_event(WindowCommand::CompositionDrawCompleted { acknowledgements });
+                });
+            }
         }
         self.redraw_pending = false;
         self.animation_active = gpu
@@ -1086,7 +1184,6 @@ impl WindowedRuntime {
 
     #[cfg(debug_assertions)]
     fn capture_final_target(&mut self, artifact_path: Option<PathBuf>) -> Result<Value, String> {
-        self.redraw()?;
         let gpu = self
             .gpu
             .as_mut()
@@ -1141,21 +1238,29 @@ impl WindowedRuntime {
             traces.composition_applied(composition_revision);
         }
         if let Some(gpu) = self.gpu.as_mut() {
+            gpu.ui
+                .reconcile_pending_local_presentations(&self.fragments);
             gpu.hit_target_dirty = true;
         }
         true
     }
 
     fn schedule_data_grid_window_requests(&mut self) -> usize {
+        self.schedule_data_grid_window_requests_for(None)
+    }
+
+    fn schedule_data_grid_window_requests_for(&mut self, grid_path: Option<&str>) -> usize {
         let requests = self
             .gpu
-            .as_ref()
+            .as_mut()
             .map(|gpu| {
                 gpu.ui.data_grid_window_requests(
                     &self.fragments,
                     self.epoch,
                     self.applied_composition_revision,
                     &mut self.next_data_grid_window_sequence,
+                    grid_path,
+                    grid_path.is_some(),
                 )
             })
             .unwrap_or_default();
@@ -1176,6 +1281,7 @@ impl WindowedRuntime {
                 endpoint,
                 request,
                 self.data_grid_window_delivery.clone(),
+                self.event_proxy.clone(),
             );
         }
     }
@@ -1192,6 +1298,7 @@ impl WindowedRuntime {
                 endpoint,
                 request,
                 self.data_grid_window_delivery.clone(),
+                self.event_proxy.clone(),
             );
         }
     }
@@ -1199,6 +1306,7 @@ impl WindowedRuntime {
     fn needs_redraw(&self) -> bool {
         self.redraw_pending
             || self.animation_active
+            || self.composition_ack_in_flight
             || self
                 .gpu
                 .as_ref()
@@ -1336,6 +1444,11 @@ impl WindowedRuntime {
     /// same prepared CPU binding and capture state used by pointer release;
     /// renderer hit identifiers never leave this process.
     fn input_debug_activate(&mut self, logical_position: [f64; 2]) -> Result<Value, &'static str> {
+        let endpoint = self.ui_endpoint.ok_or("ui_host_unavailable")?;
+        let proxy = self
+            .event_proxy
+            .clone()
+            .ok_or("window_event_proxy_unavailable")?;
         let Some(gpu) = self.gpu.as_mut() else {
             return Err("window_gpu_unavailable");
         };
@@ -1369,39 +1482,53 @@ impl WindowedRuntime {
             gpu.input.cancel();
             return Err("debug_activation_not_supported_for_control");
         }
-        let (binding, control_value, sequence) =
-            release_captured_binding(gpu).ok_or("interaction_cancelled")?;
-        let node_path = diagnostic_node_path(&binding);
+        let released = release_captured_binding(gpu).ok_or("interaction_cancelled")?;
+        let node_path = diagnostic_node_path(&released.binding);
         gpu.last_pointer_node_path = node_path.clone();
-        gpu.last_pointer_outcome = if binding.intent.is_some() {
+        gpu.last_pointer_outcome = if released.binding.intent.is_some() {
             "semantic_event_forwarded".into()
         } else {
             "release_without_semantic_binding".into()
         };
-        let endpoint = self.ui_endpoint.ok_or("ui_host_unavailable")?;
-        let interaction_id = InteractionId(format!("debug-window-input-{sequence}"));
+        let interaction_id = InteractionId(format!("debug-window-input-{}", released.sequence));
         append_interaction_record(
             &self.interaction_traces,
             interaction_id.clone(),
             InteractionTraceStage::HitCaptureResolved,
             InteractionTraceOutcome::Accepted,
             None,
-            Some(&binding),
+            Some(&released.binding),
             self.applied_composition_revision,
         );
+        let pending = if released.binding.intent.is_some() {
+            released.local_presentation.map(|presentation| {
+                gpu.ui.retain_local_presentation(
+                    released.sequence,
+                    &released.binding.fragment,
+                    presentation,
+                )
+            })
+        } else {
+            if let Some(presentation) = released.local_presentation.as_ref() {
+                gpu.ui.rollback_local_presentation(presentation);
+            }
+            None
+        };
         forward_pointer_click(
             endpoint,
             self.epoch,
             self.applied_composition_revision,
-            sequence,
+            released.sequence,
             Some(interaction_id.clone()),
-            binding,
-            control_value,
+            released.binding,
+            released.control_value,
             self.pointer_delivery.clone(),
             self.interaction_traces.clone(),
+            Some(proxy),
+            pending,
         );
         Ok(
-            json!({"state": "forwarded", "sequence": sequence, "node_path": node_path, "interaction_id": interaction_id}),
+            json!({"state": "forwarded", "sequence": released.sequence, "node_path": node_path, "interaction_id": interaction_id}),
         )
     }
 
@@ -1420,6 +1547,10 @@ impl WindowedRuntime {
             gpu.ui.debug_semantic_target_binding(&semantic_node_path)?
         };
         let endpoint = self.ui_endpoint.ok_or("ui_host_unavailable")?;
+        let proxy = self
+            .event_proxy
+            .clone()
+            .ok_or("window_event_proxy_unavailable")?;
         let gpu = self.gpu.as_mut().ok_or("window_gpu_unavailable")?;
         gpu.next_semantic_sequence += 1;
         let sequence = gpu.next_semantic_sequence;
@@ -1444,6 +1575,8 @@ impl WindowedRuntime {
             binding.control_value.clone(),
             self.pointer_delivery.clone(),
             self.interaction_traces.clone(),
+            Some(proxy),
+            None,
         );
         Ok(
             json!({"state": "forwarded", "sequence": sequence, "node_path": node_path, "interaction_id": interaction_id}),
@@ -1472,6 +1605,10 @@ impl WindowedRuntime {
         target_fraction: f32,
     ) -> Result<Value, &'static str> {
         let endpoint = self.ui_endpoint.ok_or("ui_host_unavailable")?;
+        let proxy = self
+            .event_proxy
+            .clone()
+            .ok_or("window_event_proxy_unavailable")?;
         let gpu = self.gpu.as_mut().ok_or("window_gpu_unavailable")?;
         gpu.ui.prepare_interaction(
             &self.fragments,
@@ -1514,39 +1651,54 @@ impl WindowedRuntime {
             gpu.input.cancel();
             return Err("value_gesture_not_updated");
         }
-        let (binding, control_value, sequence) =
-            release_captured_binding(gpu).ok_or("interaction_cancelled")?;
-        let interaction_id = InteractionId(format!("debug-window-input-{sequence}"));
+        let released = release_captured_binding(gpu).ok_or("interaction_cancelled")?;
+        let interaction_id = InteractionId(format!("debug-window-input-{}", released.sequence));
         append_interaction_record(
             &self.interaction_traces,
             interaction_id.clone(),
             InteractionTraceStage::HitCaptureResolved,
             InteractionTraceOutcome::Accepted,
             None,
-            Some(&binding),
+            Some(&released.binding),
             self.applied_composition_revision,
         );
-        gpu.last_pointer_node_path = diagnostic_node_path(&binding);
+        gpu.last_pointer_node_path = diagnostic_node_path(&released.binding);
         gpu.last_pointer_outcome = "semantic_event_forwarded".into();
         self.redraw_pending = true;
+        let pending = if released.binding.intent.is_some() {
+            released.local_presentation.map(|presentation| {
+                gpu.ui.retain_local_presentation(
+                    released.sequence,
+                    &released.binding.fragment,
+                    presentation,
+                )
+            })
+        } else {
+            if let Some(presentation) = released.local_presentation.as_ref() {
+                gpu.ui.rollback_local_presentation(presentation);
+            }
+            None
+        };
         forward_pointer_click(
             endpoint,
             self.epoch,
             self.applied_composition_revision,
-            sequence,
+            released.sequence,
             Some(interaction_id.clone()),
-            binding,
-            control_value.clone(),
+            released.binding,
+            released.control_value.clone(),
             self.pointer_delivery.clone(),
             self.interaction_traces.clone(),
+            Some(proxy),
+            pending,
         );
         Ok(json!({
             "state": "forwarded",
-            "sequence": sequence,
+            "sequence": released.sequence,
             "node_path": semantic_node_path,
             "interaction_id": interaction_id,
             "pointer": {"start": start, "end": end},
-            "committed_value": control_value,
+            "committed_value": released.control_value,
         }))
     }
 
@@ -1556,6 +1708,10 @@ impl WindowedRuntime {
         target_node_key: String,
     ) -> Result<Value, &'static str> {
         let endpoint = self.ui_endpoint.ok_or("ui_host_unavailable")?;
+        let proxy = self
+            .event_proxy
+            .clone()
+            .ok_or("window_event_proxy_unavailable")?;
         let gpu = self.gpu.as_mut().ok_or("window_gpu_unavailable")?;
         gpu.ui.prepare_interaction(
             &self.fragments,
@@ -1581,6 +1737,11 @@ impl WindowedRuntime {
             .ok_or("drop_target_not_declared")?;
         gpu.next_semantic_sequence += 1;
         let sequence = gpu.next_semantic_sequence;
+        let pending = gpu.ui.retain_local_presentation(
+            sequence,
+            &resolved.fragment,
+            resolved.local_presentation.clone(),
+        );
         let interaction_id = InteractionId(format!("debug-window-drag-{sequence}"));
         append_interaction_record(
             &self.interaction_traces,
@@ -1601,6 +1762,8 @@ impl WindowedRuntime {
             resolved,
             self.pointer_delivery.clone(),
             self.interaction_traces.clone(),
+            Some(proxy),
+            pending,
         );
         Ok(
             json!({"state": "forwarded", "sequence": sequence, "source_node_key": source_node_key, "target_node_key": target_node_key, "interaction_id": interaction_id}),
@@ -1610,23 +1773,42 @@ impl WindowedRuntime {
 
 /// Finalizes a captured pointer using the normal release semantics. Both OS
 /// release and debug activation use this so tests cannot bypass control state.
-fn release_captured_binding(
-    gpu: &mut WindowGpu,
-) -> Option<(
-    UiHitBinding,
-    Option<neon_ui_schema::UiSemanticPayloadValue>,
-    u64,
-)> {
+struct ReleasedBinding {
+    binding: UiHitBinding,
+    control_value: Option<neon_ui_schema::UiSemanticPayloadValue>,
+    sequence: u64,
+    local_presentation: Option<LocalPresentationCommit>,
+}
+
+fn release_captured_binding(gpu: &mut WindowGpu) -> Option<ReleasedBinding> {
     let initial_value = gpu.pending_control_value.take();
-    let control_value = gpu.ui.finish_value_gesture().or(initial_value);
+    let finished_value = gpu.ui.finish_value_gesture();
+    let control_value = finished_value
+        .as_ref()
+        .map(|(value, _)| value.clone())
+        .or(initial_value);
+    let local_presentation = finished_value.map(|(_, presentation)| presentation);
     let binding = gpu.captured_binding.take();
-    gpu.input.pointer_up(binding.is_some()).ok()?;
+    if gpu.input.pointer_up(binding.is_some()).is_err() {
+        if let Some(presentation) = local_presentation.as_ref() {
+            gpu.ui.rollback_local_presentation(presentation);
+        }
+        return None;
+    }
     let binding = binding?;
     if binding.text_input.is_some() {
+        if let Some(presentation) = local_presentation.as_ref() {
+            gpu.ui.rollback_local_presentation(presentation);
+        }
         return None;
     }
     gpu.next_semantic_sequence += 1;
-    Some((binding, control_value, gpu.next_semantic_sequence))
+    Some(ReleasedBinding {
+        binding,
+        control_value,
+        sequence: gpu.next_semantic_sequence,
+        local_presentation,
+    })
 }
 
 fn diagnostic_node_path(binding: &UiHitBinding) -> Option<String> {
@@ -2097,6 +2279,8 @@ fn forward_pointer_click(
     control_value: Option<neon_ui_schema::UiSemanticPayloadValue>,
     delivery: Arc<Mutex<Value>>,
     traces: Arc<Mutex<InteractionTraceStore>>,
+    proxy: Option<EventLoopProxy<WindowCommand>>,
+    pending: Option<PendingLocalPresentationKey>,
 ) {
     let node_path = diagnostic_node_path(&binding);
     let Some(intent) = binding.intent.clone() else {
@@ -2178,6 +2362,11 @@ fn forward_pointer_click(
                     );
                     traces.delivery_accepted(interaction_id);
                 }
+                report_semantic_delivery(
+                    proxy.as_ref(),
+                    pending.as_ref(),
+                    SemanticDeliveryOutcome::Accepted,
+                );
             }
             Ok(response) => {
                 let error = response.error;
@@ -2205,6 +2394,11 @@ fn forward_pointer_click(
                         Some(request_id),
                     );
                 }
+                report_semantic_delivery(
+                    proxy.as_ref(),
+                    pending.as_ref(),
+                    SemanticDeliveryOutcome::Rejected,
+                );
             }
             Err(error) => {
                 if let Ok(mut state) = delivery.lock() {
@@ -2225,6 +2419,11 @@ fn forward_pointer_click(
                         Some(request_id),
                     );
                 }
+                report_semantic_delivery(
+                    proxy.as_ref(),
+                    pending.as_ref(),
+                    SemanticDeliveryOutcome::TransportFailed,
+                );
             }
         }
     });
@@ -2311,6 +2510,8 @@ fn forward_drag_drop(
     resolved: ui_renderer::UiResolvedDragDrop,
     delivery: Arc<Mutex<Value>>,
     traces: Arc<Mutex<InteractionTraceStore>>,
+    proxy: Option<EventLoopProxy<WindowCommand>>,
+    pending: PendingLocalPresentationKey,
 ) {
     let request_id = RequestId(format!("wgpu-drag-drop-{sequence}"));
     let semantic_target = InteractionSemanticTarget {
@@ -2376,7 +2577,7 @@ fn forward_drag_drop(
             expected_revision: Some(event.fragment.revision),
             idempotency_key: Some(format!("wgpu-drag-drop:{renderer_epoch}:{sequence}")),
         };
-        let outcome = match RpcClient::connect(endpoint)
+        let (outcome, delivery_outcome) = match RpcClient::connect(endpoint)
             .and_then(|mut client| client.call(&request))
         {
             Ok(response) if response.status == RpcStatus::Accepted => {
@@ -2397,7 +2598,10 @@ fn forward_drag_drop(
                     );
                     traces.delivery_accepted(interaction_id);
                 }
-                json!({"state": "accepted", "response": response})
+                (
+                    json!({"state": "accepted", "response": response}),
+                    SemanticDeliveryOutcome::Accepted,
+                )
             }
             Ok(response) => {
                 if let (Some(interaction_id), Ok(mut traces)) =
@@ -2427,7 +2631,10 @@ fn forward_drag_drop(
                         Some(request_id.clone()),
                     );
                 }
-                json!({"state": "rejected", "response": response})
+                (
+                    json!({"state": "rejected", "response": response}),
+                    SemanticDeliveryOutcome::Rejected,
+                )
             }
             Err(error) => {
                 if let (Some(interaction_id), Ok(mut traces)) = (interaction_id, traces.lock()) {
@@ -2447,19 +2654,37 @@ fn forward_drag_drop(
                         Some(request_id),
                     );
                 }
-                json!({"state": "transport_failed", "error": error.to_string()})
+                (
+                    json!({"state": "transport_failed", "error": error.to_string()}),
+                    SemanticDeliveryOutcome::TransportFailed,
+                )
             }
         };
         if let Ok(mut current) = delivery.lock() {
             *current = outcome;
         }
+        report_semantic_delivery(proxy.as_ref(), Some(&pending), delivery_outcome);
     });
+}
+
+fn report_semantic_delivery(
+    proxy: Option<&EventLoopProxy<WindowCommand>>,
+    pending: Option<&PendingLocalPresentationKey>,
+    outcome: SemanticDeliveryOutcome,
+) {
+    if let Some(proxy) = proxy {
+        let _ = proxy.send_event(WindowCommand::SemanticDeliveryCompleted {
+            pending: pending.cloned(),
+            outcome,
+        });
+    }
 }
 
 fn forward_data_grid_window_request(
     endpoint: SocketAddr,
     window_request: UiDataGridWindowRequest,
     delivery: Arc<Mutex<Value>>,
+    proxy: Option<EventLoopProxy<WindowCommand>>,
 ) {
     thread::spawn(move || {
         let sequence = window_request.sequence;
@@ -2487,6 +2712,7 @@ fn forward_data_grid_window_request(
             }),
         };
         let result = RpcClient::connect(endpoint).and_then(|mut client| client.call(&request));
+        let accepted = matches!(&result, Ok(response) if response.status == RpcStatus::Accepted);
         if let Ok(mut delivery) = delivery.lock() {
             *delivery = match result {
                 Ok(response) if response.status == RpcStatus::Accepted => {
@@ -2499,6 +2725,10 @@ fn forward_data_grid_window_request(
                     json!({"state": "transport_failed", "sequence": sequence, "error": error.to_string()})
                 }
             };
+        }
+        if let Some(proxy) = proxy {
+            let _ = proxy
+                .send_event(WindowCommand::DataGridWindowDeliveryCompleted { sequence, accepted });
         }
     });
 }
@@ -2586,7 +2816,11 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                         None,
                     );
                 }
-                if scroll_changed {
+                let data_grid_thumb_drag = self
+                    .gpu
+                    .as_ref()
+                    .is_some_and(|gpu| gpu.ui.data_grid_scroll_drag_active());
+                if scroll_changed && !data_grid_thumb_drag {
                     self.schedule_data_grid_window_requests();
                 }
             }
@@ -2719,6 +2953,7 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                     if let Some((binding, value)) = gpu
                         .ui
                         .dropdown_option_at_pointer()
+                        .or_else(|| gpu.ui.tab_option_at_pointer())
                         .or_else(|| gpu.ui.list_option_at_pointer())
                     {
                         gpu.input.set_hover_id(Some(0));
@@ -2867,8 +3102,11 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                 if let Some(gpu) = self.gpu.as_mut()
                     && gpu.ui.scroll_drag_active()
                 {
-                    gpu.ui.end_scroll_drag();
+                    let released_data_grid = gpu.ui.end_scroll_drag();
                     self.redraw_pending = true;
+                    if let Some(grid_path) = released_data_grid {
+                        self.schedule_data_grid_window_requests_for(Some(&grid_path));
+                    }
                     return;
                 }
                 if let Some(gpu) = self.gpu.as_mut() {
@@ -2911,7 +3149,20 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                         self.applied_composition_revision,
                     );
                     if let Some(resolved) = resolved {
-                        if let Some(endpoint) = self.ui_endpoint {
+                        if let (Some(endpoint), Some(proxy)) =
+                            (self.ui_endpoint, self.event_proxy.clone())
+                        {
+                            let pending = self
+                                .gpu
+                                .as_mut()
+                                .map(|gpu| {
+                                    gpu.ui.retain_local_presentation(
+                                        sequence,
+                                        &resolved.fragment,
+                                        resolved.local_presentation.clone(),
+                                    )
+                                })
+                                .expect("window GPU exists while finishing a drag");
                             forward_drag_drop(
                                 endpoint,
                                 self.epoch,
@@ -2921,8 +3172,14 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                                 resolved,
                                 self.pointer_delivery.clone(),
                                 self.interaction_traces.clone(),
+                                Some(proxy),
+                                pending,
                             );
                         } else {
+                            if let Some(gpu) = self.gpu.as_mut() {
+                                gpu.ui
+                                    .rollback_local_presentation(&resolved.local_presentation);
+                            }
                             append_drag_interaction_record(
                                 &self.interaction_traces,
                                 interaction_id,
@@ -2950,12 +3207,11 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                     if text_binding {
                         let binding = gpu.captured_binding.take()?;
                         gpu.input.pointer_up(true).ok()?;
-                        return Some((None, binding, None));
+                        return Some(Err(binding));
                     }
-                    let (binding, control_value, sequence) = release_captured_binding(gpu)?;
-                    Some((Some(sequence), binding, control_value))
+                    release_captured_binding(gpu).map(Ok)
                 });
-                if let Some((None, binding, _)) = &binding
+                if let Some(Err(binding)) = &binding
                     && let (Some(window), Some(input)) =
                         (self.window.as_ref(), binding.text_input.as_ref())
                 {
@@ -2970,15 +3226,13 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                         LogicalSize::new(rect.width.max(1.0), rect.height.max(1.0)),
                     );
                 }
-                if let (Some(endpoint), Some((Some(sequence), binding, control_value))) =
-                    (self.ui_endpoint, binding)
-                {
+                if let Some(Ok(released)) = binding {
                     if let Some(window) = self.window.as_ref() {
                         window.set_ime_allowed(false);
                     }
                     if let Some(gpu) = self.gpu.as_mut() {
-                        gpu.last_pointer_node_path = diagnostic_node_path(&binding);
-                        gpu.last_pointer_outcome = if binding.intent.is_some() {
+                        gpu.last_pointer_node_path = diagnostic_node_path(&released.binding);
+                        gpu.last_pointer_outcome = if released.binding.intent.is_some() {
                             "semantic_event_forwarded".into()
                         } else {
                             "release_without_semantic_binding".into()
@@ -2988,17 +3242,40 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                         .gpu
                         .as_mut()
                         .and_then(|gpu| gpu.active_interaction_id.take());
-                    forward_pointer_click(
-                        endpoint,
-                        self.epoch,
-                        self.applied_composition_revision,
-                        sequence,
-                        interaction_id,
-                        binding,
-                        control_value,
-                        self.pointer_delivery.clone(),
-                        self.interaction_traces.clone(),
-                    );
+                    if let (Some(endpoint), Some(proxy)) =
+                        (self.ui_endpoint, self.event_proxy.clone())
+                        && released.binding.intent.is_some()
+                    {
+                        let pending = released.local_presentation.map(|presentation| {
+                            self.gpu
+                                .as_mut()
+                                .expect("window GPU exists while releasing a control")
+                                .ui
+                                .retain_local_presentation(
+                                    released.sequence,
+                                    &released.binding.fragment,
+                                    presentation,
+                                )
+                        });
+                        forward_pointer_click(
+                            endpoint,
+                            self.epoch,
+                            self.applied_composition_revision,
+                            released.sequence,
+                            interaction_id,
+                            released.binding,
+                            released.control_value,
+                            self.pointer_delivery.clone(),
+                            self.interaction_traces.clone(),
+                            Some(proxy),
+                            pending,
+                        );
+                    } else if let Some(presentation) = released.local_presentation.as_ref()
+                        && let Some(gpu) = self.gpu.as_mut()
+                    {
+                        gpu.ui.rollback_local_presentation(presentation);
+                    }
+                    self.redraw_pending = true;
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
@@ -3076,6 +3353,48 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                 }
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
+                if matches!(&event.logical_key, Key::Named(NamedKey::Escape)) {
+                    let mut cancelled_drag = None;
+                    let cancelled = self.gpu.as_mut().is_some_and(|gpu| {
+                        if gpu.ui.drag_active() {
+                            cancelled_drag = gpu.active_interaction_id.take().and_then(|id| {
+                                gpu.ui
+                                    .active_drag_semantic_source()
+                                    .map(|(source, fragment)| (id, source, fragment.revision))
+                            });
+                        }
+                        let active = gpu.ui.drag_active() || gpu.ui.value_gesture_active();
+                        let cancelled = gpu.ui.cancel_pending_local_presentations() || active;
+                        gpu.ui.cancel_drag();
+                        gpu.ui.cancel_value_gesture();
+                        if cancelled {
+                            gpu.captured_binding = None;
+                            gpu.pending_control_value = None;
+                            gpu.input.cancel();
+                        }
+                        cancelled
+                    });
+                    if let Some((interaction_id, source_key, fragment_revision)) = cancelled_drag {
+                        append_drag_interaction_record(
+                            &self.interaction_traces,
+                            interaction_id,
+                            InteractionTraceStage::DragCancelled,
+                            InteractionTraceOutcome::Rejected,
+                            Some(source_key),
+                            None,
+                            fragment_revision,
+                            self.applied_composition_revision,
+                            Some(InteractionTraceError {
+                                code: "interaction_cancelled".into(),
+                                message: "drag was cancelled explicitly".into(),
+                            }),
+                        );
+                    }
+                    if cancelled {
+                        self.redraw_pending = true;
+                        return;
+                    }
+                }
                 let ending_data_grid_edit = matches!(
                     &event.logical_key,
                     Key::Named(NamedKey::Enter | NamedKey::Escape)
@@ -3185,6 +3504,8 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                     gpu.ui.clear_text_focus();
                     gpu.ui.cancel_drag();
                     gpu.ui.cancel_value_gesture();
+                    gpu.ui.cancel_pending_local_presentations();
+                    gpu.ui.cancel_scroll_drag();
                     gpu.ui.end_scroll_pan();
                     gpu.captured_binding = None;
                     gpu.pending_control_value = None;
@@ -3226,14 +3547,13 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                 applied,
             } => {
                 let accepted = self.apply_fragments(composition_revision, fragments);
+                if let Some(applied) = applied {
+                    self.pending_composition_acks
+                        .push_back((composition_revision, applied));
+                    self.redraw_pending = true;
+                }
                 if accepted {
-                    self.pending_composition_ack = applied;
                     self.request_scripted_initial_size();
-                } else if let Some(applied) = applied {
-                    // A duplicate/idempotent composition can already be current in
-                    // the window mailbox. That is successful convergence, not a
-                    // renderer rejection.
-                    let _ = applied.send(());
                 }
             }
             WindowCommand::GenerateTerrainPreview {
@@ -3257,6 +3577,13 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
             }
             WindowCommand::InputDebugSnapshot { completed } => {
                 let _ = completed.send(self.input_debug_snapshot());
+            }
+            WindowCommand::ImageDebugSnapshot { completed } => {
+                let value = self.gpu.as_ref().map_or_else(
+                    || json!({"error": "window_gpu_unavailable"}),
+                    |gpu| gpu.ui.image_debug_snapshot(),
+                );
+                let _ = completed.send(value);
             }
             WindowCommand::InputDebugProbe {
                 logical_position,
@@ -3301,9 +3628,43 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
             }
             WindowCommand::CaptureFinalTarget {
                 artifact_path,
+                redraw,
                 completed,
             } => {
+                if redraw && let Err(error) = self.redraw() {
+                    let _ = completed.send(Err(error));
+                    return;
+                }
                 let _ = completed.send(self.capture_final_target(artifact_path));
+            }
+            WindowCommand::CompositionDrawCompleted { acknowledgements } => {
+                self.composition_ack_in_flight = false;
+                for acknowledgement in acknowledgements {
+                    let _ = acknowledgement.send(());
+                }
+                if !self.pending_composition_acks.is_empty() {
+                    self.redraw_pending = true;
+                }
+            }
+            WindowCommand::SemanticDeliveryCompleted { pending, outcome } => {
+                if let (Some(gpu), Some(pending)) = (self.gpu.as_mut(), pending) {
+                    gpu.ui.complete_local_presentation(
+                        &pending,
+                        outcome == SemanticDeliveryOutcome::Accepted,
+                        &self.fragments,
+                    );
+                    gpu.hit_target_dirty = true;
+                    self.redraw_pending = true;
+                }
+            }
+            WindowCommand::DataGridWindowDeliveryCompleted { sequence, accepted } => {
+                if !accepted
+                    && let Some(gpu) = self.gpu.as_mut()
+                    && gpu.ui.fail_data_grid_window_request(sequence)
+                {
+                    gpu.hit_target_dirty = true;
+                    self.redraw_pending = true;
+                }
             }
             WindowCommand::Shutdown => event_loop.exit(),
         }
@@ -3506,6 +3867,36 @@ fn handle_window_input_debug_snapshot(
             request_id,
             "window_compositor_timeout",
             "window compositor did not report input state",
+            None,
+        ),
+    }
+}
+
+fn handle_window_image_debug_snapshot(
+    runtime: &mut WgpuRuntime,
+    proxy: &EventLoopProxy<WindowCommand>,
+    request_id: RequestId,
+) -> RpcResponse {
+    let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+    if proxy
+        .send_event(WindowCommand::ImageDebugSnapshot {
+            completed: completed_tx,
+        })
+        .is_err()
+    {
+        return runtime.reject(
+            request_id,
+            "window_compositor_unavailable",
+            "window compositor is unavailable",
+            None,
+        );
+    }
+    match completed_rx.recv_timeout(std::time::Duration::from_secs(5)) {
+        Ok(snapshot) => runtime.accept(request_id, snapshot),
+        Err(_) => runtime.reject(
+            request_id,
+            "window_compositor_timeout",
+            "window compositor did not report image state",
             None,
         ),
     }
@@ -3910,10 +4301,15 @@ fn handle_window_target_capture(
             );
         }
     };
+    let redraw = params
+        .get("redraw")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
     let (completed_tx, completed_rx) = std::sync::mpsc::channel();
     if proxy
         .send_event(WindowCommand::CaptureFinalTarget {
             artifact_path,
+            redraw,
             completed: completed_tx,
         })
         .is_err()
@@ -3972,6 +4368,8 @@ fn spawn_window_server(
                 handle_window_debug_snapshot(&mut runtime, &proxy, request.request_id)
             } else if request.method == "debug.window.input.snapshot" {
                 handle_window_input_debug_snapshot(&mut runtime, &proxy, request.request_id)
+            } else if request.method == "debug.window.images" {
+                handle_window_image_debug_snapshot(&mut runtime, &proxy, request.request_id)
             } else if request.method == "debug.window.input.probe" {
                 handle_window_input_debug_probe(
                     &mut runtime,
@@ -5411,8 +5809,8 @@ mod tests {
                 fragment,
             )])),
             LogicalViewportRequirement {
-                width: 1668.0,
-                height: 900.0,
+                width: 2048.0,
+                height: 1080.0,
             }
         );
     }
@@ -6647,6 +7045,10 @@ mod tests {
             target_key: "equipment-zone".into(),
             placement: neon_ui_schema::UiDropPlacement::Into,
             presentation_template_key: Some("equipment-item-template".into()),
+            local_presentation: LocalPresentationCommit::Drag {
+                source_path: "gallery/backpack-compass".into(),
+                offset: [24.0, 16.0],
+            },
         };
         record_drag_release_lifecycle(
             &traces,
@@ -6666,6 +7068,12 @@ mod tests {
             resolved,
             delivery.clone(),
             traces.clone(),
+            None,
+            PendingLocalPresentationKey {
+                semantic_sequence: 11,
+                fragment_id: "gallery".into(),
+                fragment_revision: 3,
+            },
         );
         server_thread.join().unwrap();
         for _ in 0..100 {
