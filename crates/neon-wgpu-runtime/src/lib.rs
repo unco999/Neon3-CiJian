@@ -54,7 +54,7 @@ pub use ui_program_gpu::GpuUiProgramBackend;
 use ui_renderer::{
     LocalPresentationCommit, PendingLocalPresentationKey, UiHitBinding, UiWgpuRenderer,
 };
-use world_ui_pipeline::WorldUiPipeline;
+use world_ui_pipeline::{WorldUiCamera, WorldUiCameraState, WorldUiPipeline};
 
 pub const SERVICE_NAME: &str = "wgpu-runtime";
 pub const CAPABILITY_UI_FRAGMENT: &str = "wgpu.ui.fragment.v1";
@@ -72,6 +72,10 @@ pub const RENDER_HIT_NONE: u32 = u32::MAX;
 const DATA_GRID_WINDOW_DEBOUNCE: Duration = Duration::from_millis(24);
 const INTERACTION_TRACE_CAPACITY: usize = 256;
 const WORLD_UI_LAB_SURFACE_TARGET: &str = "render.world-ui-lab.preview";
+const WORLD_UI_LAB_PANEL_TARGET: &str = "world-ui-lab.panel";
+const WORLD_UI_LAB_LOGICAL_SIZE: [u32; 2] = [640, 360];
+const WORLD_UI_LAB_PANEL_SIZE: [u32; 2] = [1280, 720];
+const WORLD_UI_LAB_PREVIEW_SIZE: [u32; 2] = [640, 360];
 
 #[derive(Clone, Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -82,13 +86,38 @@ struct WorldUiLabCameraRegistration {
     camera_id: CameraId,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorldUiLabDragMode {
+    None,
+    PendingPan,
+    Pan,
+    Rotate,
+}
+
+impl Default for WorldUiLabDragMode {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
 #[derive(Default)]
 struct WorldUiLabCameraController {
     enabled: bool,
     window_focused: bool,
     surface_focused: bool,
     axes: [f32; 3],
-    preview_offset: [f32; 2],
+    forward_held: bool,
+    backward_held: bool,
+    left_held: bool,
+    right_held: bool,
+    camera_position: [f32; 3],
+    yaw: f32,
+    pitch: f32,
+    vertical_fov: f32,
+    movement_speed: f32,
+    drag_mode: WorldUiLabDragMode,
+    last_pointer: Option<[f32; 2]>,
+    drag_origin: Option<[f32; 2]>,
     sequence: u64,
     registration: Option<WorldUiLabCameraRegistration>,
     socket: Option<UdpSocket>,
@@ -98,27 +127,55 @@ struct WorldUiLabCameraController {
 impl WorldUiLabCameraController {
     fn clear_axes(&mut self) {
         self.axes = [0.0; 3];
+        self.forward_held = false;
+        self.backward_held = false;
+        self.left_held = false;
+        self.right_held = false;
+        self.drag_mode = WorldUiLabDragMode::None;
+        self.last_pointer = None;
+        self.drag_origin = None;
     }
 
-    fn set_key(
+    fn active(&self) -> bool {
+        self.enabled && self.window_focused && self.surface_focused
+    }
+
+    fn state(&self) -> WorldUiCameraState {
+        WorldUiCameraState {
+            position: self.camera_position,
+            yaw: self.yaw,
+            pitch: self.pitch,
+            vertical_fov: if self.vertical_fov == 0.0 {
+                35.0f32.to_radians()
+            } else {
+                self.vertical_fov
+            },
+        }
+    }
+
+    fn move_camera(&mut self) {
+        let (sin_yaw, cos_yaw) = self.yaw.sin_cos();
+        let right = [cos_yaw, 0.0, sin_yaw];
+        let forward = [sin_yaw, 0.0, -cos_yaw];
+        let speed = if self.movement_speed == 0.0 {
+            0.35
+        } else {
+            self.movement_speed
+        };
+        for index in 0..3 {
+            self.camera_position[index] +=
+                speed * (right[index] * self.axes[0] + forward[index] * self.axes[1]);
+        }
+        self.camera_position[1] += speed * self.axes[2];
+    }
+
+    fn sample(
         &mut self,
-        key: KeyCode,
-        pressed: bool,
         epoch: u64,
         elapsed: Duration,
+        look_delta: [f32; 2],
+        wheel_delta: f32,
     ) -> Option<CameraControlSample> {
-        if !self.enabled || !self.window_focused || !self.surface_focused {
-            return None;
-        }
-        match key {
-            KeyCode::KeyW => self.axes[1] = if pressed { 1.0 } else { 0.0 },
-            KeyCode::KeyS => self.axes[1] = if pressed { -1.0 } else { 0.0 },
-            KeyCode::KeyA => self.axes[0] = if pressed { -1.0 } else { 0.0 },
-            KeyCode::KeyD => self.axes[0] = if pressed { 1.0 } else { 0.0 },
-            _ => return None,
-        }
-        self.preview_offset[0] += self.axes[0] * 0.08;
-        self.preview_offset[1] += self.axes[1] * 0.08;
         let registration = self.registration.as_ref()?;
         self.sequence += 1;
         Some(CameraControlSample {
@@ -128,9 +185,101 @@ impl WorldUiLabCameraController {
             sequence: self.sequence,
             timestamp_monotonic_ns: elapsed.as_nanos().min(u128::from(u64::MAX)) as u64,
             movement_axes: self.axes,
-            look_delta: [0.0; 2],
-            wheel_delta: 0.0,
+            look_delta,
+            wheel_delta,
         })
+    }
+
+    fn set_drag(&mut self, button: winit::event::MouseButton, pressed: bool) {
+        if !self.active() {
+            return;
+        }
+        self.drag_mode = match (button, pressed) {
+            (winit::event::MouseButton::Left, true) => WorldUiLabDragMode::PendingPan,
+            (winit::event::MouseButton::Right, true) => WorldUiLabDragMode::Rotate,
+            (_, false) => WorldUiLabDragMode::None,
+            _ => self.drag_mode,
+        };
+        self.last_pointer = None;
+        self.drag_origin = None;
+    }
+
+    fn pointer_moved(
+        &mut self,
+        pointer: [f32; 2],
+        epoch: u64,
+        elapsed: Duration,
+    ) -> Option<CameraControlSample> {
+        let Some(previous) = self.last_pointer.replace(pointer) else {
+            self.drag_origin = Some(pointer);
+            return None;
+        };
+        if !self.active() {
+            return None;
+        }
+        let delta = [pointer[0] - previous[0], pointer[1] - previous[1]];
+        let origin = self.drag_origin.unwrap_or(previous);
+        if self.drag_mode == WorldUiLabDragMode::PendingPan
+            && (pointer[0] - origin[0]).hypot(pointer[1] - origin[1]) >= 3.0
+        {
+            self.drag_mode = WorldUiLabDragMode::Pan;
+        }
+        match self.drag_mode {
+            WorldUiLabDragMode::Rotate => {
+                self.yaw += delta[0] * 0.008;
+                self.pitch = (self.pitch - delta[1] * 0.008).clamp(-1.5, 1.5);
+                self.sample(epoch, elapsed, delta, 0.0)
+            }
+            WorldUiLabDragMode::Pan => {
+                let (sin_yaw, cos_yaw) = self.yaw.sin_cos();
+                let scale = self.movement_speed.max(0.35) * 0.01;
+                self.camera_position[0] -= (cos_yaw * delta[0] - sin_yaw * delta[1]) * scale;
+                self.camera_position[1] += delta[1] * scale;
+                self.camera_position[2] -= (sin_yaw * delta[0] + cos_yaw * delta[1]) * scale;
+                self.sample(epoch, elapsed, delta, 0.0)
+            }
+            _ => None,
+        }
+    }
+
+    fn wheel(&mut self, delta: f32, epoch: u64, elapsed: Duration) -> Option<CameraControlSample> {
+        if !self.active() {
+            return None;
+        }
+        self.movement_speed = (if self.movement_speed == 0.0 {
+            0.35
+        } else {
+            self.movement_speed
+        } * (1.0 + delta * 0.04))
+            .clamp(0.05, 10.0);
+        self.sample(epoch, elapsed, [0.0; 2], delta)
+    }
+
+    fn set_key(
+        &mut self,
+        key: KeyCode,
+        pressed: bool,
+        epoch: u64,
+        elapsed: Duration,
+    ) -> Option<CameraControlSample> {
+        if !self.active() {
+            return None;
+        }
+        match key {
+            KeyCode::KeyW => self.forward_held = pressed,
+            KeyCode::KeyS => self.backward_held = pressed,
+            KeyCode::KeyA => self.left_held = pressed,
+            KeyCode::KeyD => self.right_held = pressed,
+            KeyCode::KeyQ => self.axes[2] = if pressed { -1.0 } else { 0.0 },
+            KeyCode::KeyE => self.axes[2] = if pressed { 1.0 } else { 0.0 },
+            _ => return None,
+        }
+        self.axes[..2].copy_from_slice(&[
+            self.right_held as u8 as f32 - self.left_held as u8 as f32,
+            self.forward_held as u8 as f32 - self.backward_held as u8 as f32,
+        ]);
+        self.move_camera();
+        self.sample(epoch, elapsed, [0.0; 2], 0.0)
     }
 
     fn send(&mut self, sample: &CameraControlSample) {
@@ -856,7 +1005,10 @@ struct WindowGpu {
     final_composition_revision: Revision,
     ui: UiWgpuRenderer,
     world_ui: WorldUiPipeline,
+    world_ui_lab_panel: wgpu::TextureView,
     world_ui_lab_surface: wgpu::TextureView,
+    _world_ui_lab_depth: wgpu::Texture,
+    world_ui_lab_depth: wgpu::TextureView,
     world_ui_lab_fragment: HashMap<UiFragmentId, UiFragment>,
     ai: neon_wgpu_ai::AiEngine,
     heightmap_preview: HeightmapPreviewConverter,
@@ -1182,19 +1334,14 @@ impl WindowedRuntime {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("neon3-final-composition"),
             });
-        // The lab panel is an ordinary UiNode tree rendered to a renderer-private
-        // transparent surface before that surface is sampled by the world pass.
+        // The panel remains a stable renderer-private input; the gallery surface
+        // receives the composed, depth-tested world scene below.
         {
-            if let Ok(camera) = gpu.world_ui_lab_camera.lock()
-                && let Some(fragment) = gpu.world_ui_lab_fragment.values_mut().next()
-            {
-                fragment.root.bounds.x = camera.preview_offset[0] * 20.0;
-                fragment.root.bounds.y = -camera.preview_offset[1] * 20.0;
-            }
+            gpu.world_ui_lab_fragment = world_ui_lab_fragment();
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("neon3-world-ui-lab-panel-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &gpu.world_ui_lab_surface,
+                    view: &gpu.world_ui_lab_panel,
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
@@ -1212,11 +1359,34 @@ impl WindowedRuntime {
                 &gpu.queue,
                 &mut pass,
                 &gpu.world_ui_lab_fragment,
-                [640, 360],
-                [640.0, 360.0],
+                WORLD_UI_LAB_PANEL_SIZE,
+                [
+                    WORLD_UI_LAB_LOGICAL_SIZE[0] as f32,
+                    WORLD_UI_LAB_LOGICAL_SIZE[1] as f32,
+                ],
                 gpu.started_at.elapsed().as_secs_f32(),
             );
         }
+        let camera_state = gpu
+            .world_ui_lab_camera
+            .lock()
+            .map(|camera| camera.state())
+            .unwrap_or(WorldUiCameraState {
+                position: [0.0; 3],
+                yaw: 0.0,
+                pitch: 0.0,
+                vertical_fov: 35.0f32.to_radians(),
+            });
+        gpu.world_ui.render_lab_scene(
+            &gpu.device,
+            &gpu.queue,
+            &mut encoder,
+            &gpu.world_ui_lab_surface,
+            &gpu.world_ui_lab_depth,
+            WORLD_UI_LAB_PREVIEW_SIZE,
+            &gpu.world_ui_lab_panel,
+            world_ui_lab_camera(WORLD_UI_LAB_PREVIEW_SIZE, camera_state),
+        )?;
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("neon3-final-clear-pass"),
@@ -1413,8 +1583,23 @@ impl WindowedRuntime {
                 .as_mut()
                 .ok_or_else(|| "window GPU is unavailable".to_owned())?;
             gpu.render_world_ui_lab_panel();
-            gpu.world_ui
-                .capture_lab(&gpu.device, &gpu.queue, size, &gpu.world_ui_lab_surface)?
+            let camera_state = gpu
+                .world_ui_lab_camera
+                .lock()
+                .map(|camera| camera.state())
+                .unwrap_or(WorldUiCameraState {
+                    position: [0.0; 3],
+                    yaw: 0.0,
+                    pitch: 0.0,
+                    vertical_fov: 35.0f32.to_radians(),
+                });
+            gpu.world_ui.capture_lab(
+                &gpu.device,
+                &gpu.queue,
+                size,
+                &gpu.world_ui_lab_panel,
+                world_ui_lab_camera(size, camera_state),
+            )?
         };
         let artifact_path = write_capture_png(&artifact_path, size, &rgba)?;
         Ok(json!({
@@ -2171,7 +2356,7 @@ impl WindowGpu {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("neon3-world-ui-lab-panel-capture-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &self.world_ui_lab_surface,
+                    view: &self.world_ui_lab_panel,
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
@@ -2189,8 +2374,11 @@ impl WindowGpu {
                 &self.queue,
                 &mut pass,
                 &self.world_ui_lab_fragment,
-                [640, 360],
-                [640.0, 360.0],
+                WORLD_UI_LAB_PANEL_SIZE,
+                [
+                    WORLD_UI_LAB_LOGICAL_SIZE[0] as f32,
+                    WORLD_UI_LAB_LOGICAL_SIZE[1] as f32,
+                ],
                 self.started_at.elapsed().as_secs_f32(),
             );
         }
@@ -2377,8 +2565,33 @@ impl WindowGpu {
         let final_target_blitter = wgpu::util::TextureBlitter::new(&device, config.format);
         let ui = UiWgpuRenderer::new(&device, config.format);
         let mut ui = ui;
-        let world_ui_lab_surface =
-            ui.ensure_ui_render_surface(&device, "render.world-ui-lab.preview", [640, 360]);
+        // Keep the normal UI pipeline in logical units while supersampling its private
+        // transparent texture for the world quad's linear sampler.
+        let world_ui_lab_panel = ui.ensure_ui_render_surface(
+            &device,
+            WORLD_UI_LAB_PANEL_TARGET,
+            WORLD_UI_LAB_PANEL_SIZE,
+        );
+        let world_ui_lab_surface = ui.ensure_render_surface(
+            &device,
+            WORLD_UI_LAB_SURFACE_TARGET,
+            WORLD_UI_LAB_PREVIEW_SIZE,
+        );
+        let world_ui_lab_depth = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("neon3-world-ui-lab-preview-depth"),
+            size: wgpu::Extent3d {
+                width: WORLD_UI_LAB_PREVIEW_SIZE[0],
+                height: WORLD_UI_LAB_PREVIEW_SIZE[1],
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth32Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let world_ui_lab_depth_view = world_ui_lab_depth.create_view(&Default::default());
         let world_ui = WorldUiPipeline::new(&device, wgpu::TextureFormat::Rgba8Unorm);
         let heightmap_preview = HeightmapPreviewConverter::new(&device);
         let mut ai = neon_wgpu_ai::AiEngine::new(device.clone(), queue.clone());
@@ -2420,7 +2633,10 @@ impl WindowGpu {
             final_composition_revision: Revision(0),
             ui,
             world_ui,
+            world_ui_lab_panel,
             world_ui_lab_surface,
+            _world_ui_lab_depth: world_ui_lab_depth,
+            world_ui_lab_depth: world_ui_lab_depth_view,
             world_ui_lab_fragment: world_ui_lab_fragment(),
             ai,
             heightmap_preview,
@@ -3156,6 +3372,16 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                 if let Some(gpu) = self.gpu.as_mut() {
                     let logical = position.to_logical::<f32>(gpu.scale_factor);
                     gpu.ui.set_pointer_position([logical.x, logical.y]);
+                    if let Ok(mut camera) = self.world_ui_lab_camera.lock()
+                        && let Some(sample) = camera.pointer_moved(
+                            [logical.x, logical.y],
+                            self.epoch,
+                            gpu.started_at.elapsed(),
+                        )
+                    {
+                        camera.send(&sample);
+                        self.redraw_pending = true;
+                    }
                     if gpu.text_selection_drag {
                         gpu.ui
                             .set_text_input_caret_from_pointer([logical.x, logical.y], true);
@@ -3240,7 +3466,15 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                     if !camera.surface_focused {
                         camera.clear_axes();
                     }
+                    #[cfg(debug_assertions)]
+                    eprintln!(
+                        "world-ui-lab camera focus: window={} surface={} target={}",
+                        camera.window_focused, camera.surface_focused, WORLD_UI_LAB_SURFACE_TARGET
+                    );
                     self.redraw_pending = true;
+                }
+                if let Ok(mut camera) = self.world_ui_lab_camera.lock() {
+                    camera.set_drag(winit::event::MouseButton::Left, true);
                 }
                 let interaction_id = self.begin_os_pointer_interaction();
                 let interaction_traces = self.interaction_traces.clone();
@@ -3486,6 +3720,14 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                 }
             }
             WindowEvent::MouseInput { state, button, .. }
+                if state == winit::event::ElementState::Pressed
+                    && button == winit::event::MouseButton::Right =>
+            {
+                if let Ok(mut camera) = self.world_ui_lab_camera.lock() {
+                    camera.set_drag(winit::event::MouseButton::Right, true);
+                }
+            }
+            WindowEvent::MouseInput { state, button, .. }
                 if state == winit::event::ElementState::Released
                     && button == winit::event::MouseButton::Middle =>
             {
@@ -3500,6 +3742,9 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                 if state == winit::event::ElementState::Released
                     && button == winit::event::MouseButton::Left =>
             {
+                if let Ok(mut camera) = self.world_ui_lab_camera.lock() {
+                    camera.set_drag(winit::event::MouseButton::Left, false);
+                }
                 if let Some(gpu) = self.gpu.as_mut()
                     && gpu.ui.scroll_drag_active()
                 {
@@ -3679,6 +3924,14 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                     self.redraw_pending = true;
                 }
             }
+            WindowEvent::MouseInput { state, button, .. }
+                if state == winit::event::ElementState::Released
+                    && button == winit::event::MouseButton::Right =>
+            {
+                if let Ok(mut camera) = self.world_ui_lab_camera.lock() {
+                    camera.set_drag(winit::event::MouseButton::Right, false);
+                }
+            }
             WindowEvent::MouseWheel { delta, .. } => {
                 let delta = match delta {
                     MouseScrollDelta::LineDelta(x, y) => [x * 24.0, y * 24.0],
@@ -3699,6 +3952,19 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                 if scrolled {
                     self.redraw_pending = true;
                     self.schedule_data_grid_window_requests();
+                }
+                if let Ok(mut camera) = self.world_ui_lab_camera.lock()
+                    && let Some(sample) = camera.wheel(
+                        delta[1],
+                        self.epoch,
+                        self.gpu
+                            .as_ref()
+                            .map(|gpu| gpu.started_at.elapsed())
+                            .unwrap_or_default(),
+                    )
+                {
+                    camera.send(&sample);
+                    self.redraw_pending = true;
                 }
             }
             WindowEvent::Ime(winit::event::Ime::Enabled) => {
@@ -3756,7 +4022,8 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
             WindowEvent::KeyboardInput { event, .. } => {
                 if let PhysicalKey::Code(code) = event.physical_key
                     && let Ok(mut camera) = self.world_ui_lab_camera.lock()
-                    && let Some(sample) = camera.set_key(
+                {
+                    let sample = camera.set_key(
                         code,
                         event.state == ElementState::Pressed,
                         self.epoch,
@@ -3764,10 +4031,32 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                             .as_ref()
                             .map(|gpu| gpu.started_at.elapsed())
                             .unwrap_or_default(),
-                    )
-                {
-                    camera.send(&sample);
-                    self.redraw_pending = true;
+                    );
+                    #[cfg(debug_assertions)]
+                    if matches!(
+                        code,
+                        KeyCode::KeyW
+                            | KeyCode::KeyA
+                            | KeyCode::KeyS
+                            | KeyCode::KeyD
+                            | KeyCode::KeyQ
+                            | KeyCode::KeyE
+                    ) {
+                        eprintln!(
+                            "world-ui-lab camera key: code={code:?} pressed={} enabled={} window={} surface={} axes={:?} position={:?} sample={}",
+                            event.state == ElementState::Pressed,
+                            camera.enabled,
+                            camera.window_focused,
+                            camera.surface_focused,
+                            camera.axes,
+                            camera.camera_position,
+                            sample.as_ref().map_or(0, |value| value.sequence),
+                        );
+                    }
+                    if let Some(sample) = sample {
+                        camera.send(&sample);
+                        self.redraw_pending = true;
+                    }
                 }
                 if event.state != ElementState::Pressed {
                     return;
@@ -4894,8 +5183,17 @@ fn world_ui_lab_camera_status(camera: &WorldUiLabCameraController) -> Value {
         "provider_epoch": camera.registration.as_ref().map(|registration| registration.provider_epoch),
         "last_udp_error": camera.last_udp_error,
         "sequence": camera.sequence,
-        "preview_offset": camera.preview_offset,
+        "position": camera.camera_position,
+        "yaw_radians": camera.yaw,
+        "pitch_radians": camera.pitch,
+        "vertical_fov_radians": camera.state().vertical_fov,
+        "movement_speed": if camera.movement_speed == 0.0 { 0.35 } else { camera.movement_speed },
+        "active_drag_mode": match camera.drag_mode { WorldUiLabDragMode::None => "none", WorldUiLabDragMode::PendingPan => "pending_pan", WorldUiLabDragMode::Pan => "pan", WorldUiLabDragMode::Rotate => "rotate" },
     })
+}
+
+fn world_ui_lab_camera(size: [u32; 2], state: WorldUiCameraState) -> WorldUiCamera {
+    WorldUiCamera::perspective(size, state)
 }
 
 fn handle_world_ui_lab_camera_register(
@@ -6240,7 +6538,7 @@ mod tests {
                 .set_key(KeyCode::KeyW, true, 1, Duration::from_secs(1))
                 .is_none()
         );
-        assert_eq!(disabled.preview_offset, [0.0; 2]);
+        assert_eq!(disabled.camera_position, [0.0; 3]);
         let mut unfocused = registered_camera_controller();
         unfocused.surface_focused = false;
         assert!(
@@ -6248,7 +6546,7 @@ mod tests {
                 .set_key(KeyCode::KeyW, true, 1, Duration::from_secs(1))
                 .is_none()
         );
-        assert_eq!(unfocused.preview_offset, [0.0; 2]);
+        assert_eq!(unfocused.camera_position, [0.0; 3]);
     }
 
     #[test]
@@ -6260,7 +6558,7 @@ mod tests {
         assert_eq!(sample.camera_id.0, "world-ui-lab");
         assert_eq!(sample.producer_epoch, 7);
         assert_eq!(sample.movement_axes, [1.0, 0.0, 0.0]);
-        assert!(controller.preview_offset[0] > 0.0);
+        assert!(controller.camera_position[0] > 0.0);
     }
 
     #[test]
@@ -6276,6 +6574,70 @@ mod tests {
                 .set_key(KeyCode::KeyW, false, 1, Duration::ZERO)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn lab_camera_release_preserves_the_opposite_held_axis() {
+        let mut controller = registered_camera_controller();
+        controller.set_key(KeyCode::KeyW, true, 1, Duration::ZERO);
+        controller.set_key(KeyCode::KeyS, true, 1, Duration::ZERO);
+        let sample = controller
+            .set_key(KeyCode::KeyW, false, 1, Duration::ZERO)
+            .unwrap();
+        assert_eq!(sample.movement_axes, [0.0, -1.0, 0.0]);
+    }
+
+    #[test]
+    fn lab_camera_moves_in_its_yaw_oriented_horizontal_plane() {
+        let mut controller = registered_camera_controller();
+        controller.yaw = std::f32::consts::FRAC_PI_2;
+        controller.set_key(KeyCode::KeyW, true, 1, Duration::ZERO);
+        assert!(controller.camera_position[0] > 0.3);
+        assert!(controller.camera_position[2].abs() < 0.001);
+        controller.set_key(KeyCode::KeyE, true, 1, Duration::ZERO);
+        assert!(controller.camera_position[1] > 0.3);
+    }
+
+    #[test]
+    fn lab_camera_drag_modes_require_focus_and_clamp_pitch() {
+        let mut controller = registered_camera_controller();
+        controller.set_drag(winit::event::MouseButton::Right, true);
+        controller.pointer_moved([0.0, 0.0], 1, Duration::ZERO);
+        let sample = controller
+            .pointer_moved([10.0, -10_000.0], 1, Duration::ZERO)
+            .unwrap();
+        assert_eq!(controller.drag_mode, WorldUiLabDragMode::Rotate);
+        assert_eq!(controller.pitch, 1.5);
+        assert_ne!(sample.look_delta, [0.0; 2]);
+        controller.set_drag(winit::event::MouseButton::Left, true);
+        controller.pointer_moved([0.0, 0.0], 1, Duration::ZERO);
+        assert_eq!(controller.drag_mode, WorldUiLabDragMode::PendingPan);
+        assert!(
+            controller
+                .pointer_moved([1.0, 1.0], 1, Duration::ZERO)
+                .is_none()
+        );
+        assert_eq!(controller.drag_mode, WorldUiLabDragMode::PendingPan);
+        assert!(
+            controller
+                .pointer_moved([8.0, 1.0], 1, Duration::ZERO)
+                .is_some()
+        );
+        assert_eq!(controller.drag_mode, WorldUiLabDragMode::Pan);
+        controller.surface_focused = false;
+        controller.set_drag(winit::event::MouseButton::Right, true);
+        assert_eq!(controller.drag_mode, WorldUiLabDragMode::Pan);
+    }
+
+    #[test]
+    fn lab_camera_wheel_bounds_speed_and_emits_semantic_delta() {
+        let mut controller = registered_camera_controller();
+        let faster = controller.wheel(1000.0, 1, Duration::ZERO).unwrap();
+        assert_eq!(controller.movement_speed, 10.0);
+        assert_eq!(faster.wheel_delta, 1000.0);
+        let slower = controller.wheel(-1000.0, 1, Duration::ZERO).unwrap();
+        assert_eq!(controller.movement_speed, 0.05);
+        assert_eq!(slower.wheel_delta, -1000.0);
     }
 
     #[test]
@@ -7179,6 +7541,120 @@ mod tests {
         let center = 4 * (32 * 64 + 32);
         assert_eq!(&rendered[0][center..center + 4], [0, 0, 0, 255]);
         assert_eq!(&rendered[1][center..center + 4], [255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn world_ui_panel_text_survives_supersampled_world_composition_and_occlusion() {
+        let (device, queue) = test_device("neon3-world-ui-panel-composition");
+        let fragments = world_ui_lab_fragment();
+        let mut ui = UiWgpuRenderer::new(&device, wgpu::TextureFormat::Rgba8Unorm);
+        let panel_pixels = ui_renderer::render_renderer_with_viewport_offscreen_for_test(
+            &mut ui,
+            &device,
+            &queue,
+            wgpu::TextureFormat::Rgba8Unorm,
+            &fragments,
+            WORLD_UI_LAB_PANEL_SIZE,
+            [
+                WORLD_UI_LAB_LOGICAL_SIZE[0] as f32,
+                WORLD_UI_LAB_LOGICAL_SIZE[1] as f32,
+            ],
+            0.0,
+        );
+        let glyph_pixels = |pixels: &[u8]| {
+            pixels
+                .chunks_exact(4)
+                .filter(|pixel| {
+                    pixel[0] > 150 && pixel[1] > 180 && pixel[2] > 190 && pixel[3] > 200
+                })
+                .count()
+        };
+        assert!(
+            glyph_pixels(&panel_pixels) > 100,
+            "the supersampled panel texture must contain visible glyph pixels"
+        );
+
+        let panel = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("neon3-world-ui-panel-composition-source"),
+            size: wgpu::Extent3d {
+                width: WORLD_UI_LAB_PANEL_SIZE[0],
+                height: WORLD_UI_LAB_PANEL_SIZE[1],
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let panel_view = panel.create_view(&Default::default());
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("neon3-world-ui-panel-composition-source-encoder"),
+        });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("neon3-world-ui-panel-composition-source-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &panel_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            ui.draw(
+                &device,
+                &queue,
+                &mut pass,
+                &fragments,
+                WORLD_UI_LAB_PANEL_SIZE,
+                [
+                    WORLD_UI_LAB_LOGICAL_SIZE[0] as f32,
+                    WORLD_UI_LAB_LOGICAL_SIZE[1] as f32,
+                ],
+                0.0,
+            );
+        }
+        queue.submit(Some(encoder.finish()));
+
+        let pipeline = WorldUiPipeline::new(&device, wgpu::TextureFormat::Rgba8Unorm);
+        let composed = pipeline
+            .capture_lab(
+                &device,
+                &queue,
+                WORLD_UI_LAB_PREVIEW_SIZE,
+                &panel_view,
+                world_ui_lab_camera(
+                    WORLD_UI_LAB_PREVIEW_SIZE,
+                    WorldUiCameraState {
+                        position: [0.0; 3],
+                        yaw: 0.0,
+                        pitch: 0.0,
+                        vertical_fov: 35.0f32.to_radians(),
+                    },
+                ),
+            )
+            .expect("world UI composition must render");
+        assert!(
+            glyph_pixels(&composed) >= 8,
+            "the composed world preview must retain visible panel glyph pixels; found {} pixels",
+            glyph_pixels(&composed)
+        );
+        let occluder_pixels = composed
+            .chunks_exact(4)
+            .filter(|pixel| pixel[0] > 180 && pixel[1] < 20 && pixel[2] < 20 && pixel[3] == 255)
+            .count();
+        assert!(
+            occluder_pixels > 100,
+            "the minimal scene occluder must remain visible over the world panel; found {occluder_pixels} pixels"
+        );
     }
 
     #[test]

@@ -77,6 +77,64 @@ pub(crate) struct WorldUiCamera {
     pub view_projection: [[f32; 4]; 4],
 }
 
+/// Renderer-local perspective camera state for the dev-only world UI lab.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct WorldUiCameraState {
+    pub position: [f32; 3],
+    pub yaw: f32,
+    pub pitch: f32,
+    pub vertical_fov: f32,
+}
+
+impl WorldUiCamera {
+    pub(crate) fn perspective(size: [u32; 2], state: WorldUiCameraState) -> Self {
+        let aspect = size[0].max(1) as f32 / size[1].max(1) as f32;
+        let f = 1.0 / (state.vertical_fov * 0.5).tan();
+        let near = 0.1;
+        let far = 20.0;
+        let (sin_yaw, cos_yaw) = state.yaw.sin_cos();
+        let (sin_pitch, cos_pitch) = state.pitch.sin_cos();
+        let forward = [sin_yaw * cos_pitch, sin_pitch, -cos_yaw * cos_pitch];
+        let right = [cos_yaw, 0.0, sin_yaw];
+        let up = [
+            right[1] * forward[2] - right[2] * forward[1],
+            right[2] * forward[0] - right[0] * forward[2],
+            right[0] * forward[1] - right[1] * forward[0],
+        ];
+        let translate = |axis: [f32; 3]| {
+            -(axis[0] * state.position[0]
+                + axis[1] * state.position[1]
+                + axis[2] * state.position[2])
+        };
+        let view = [
+            [right[0], up[0], -forward[0], 0.0],
+            [right[1], up[1], -forward[1], 0.0],
+            [right[2], up[2], -forward[2], 0.0],
+            [
+                translate(right),
+                translate(up),
+                translate([-forward[0], -forward[1], -forward[2]]),
+                1.0,
+            ],
+        ];
+        let projection = [
+            [f / aspect, 0.0, 0.0, 0.0],
+            [0.0, f, 0.0, 0.0],
+            [0.0, 0.0, far / (near - far), -1.0],
+            [0.0, 0.0, near * far / (near - far), 0.0],
+        ];
+        let mut view_projection = [[0.0; 4]; 4];
+        for column in 0..4 {
+            for row in 0..4 {
+                view_projection[column][row] = (0..4)
+                    .map(|index| projection[index][row] * view[column][index])
+                    .sum();
+            }
+        }
+        Self { view_projection }
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 pub(crate) struct WorldUiQuad {
@@ -93,6 +151,7 @@ pub(crate) struct WorldUiPipeline {
     camera_bind_group: wgpu::BindGroup,
     vertex_buffer: wgpu::Buffer,
     quad_buffer: wgpu::Buffer,
+    surface_quad_buffer: wgpu::Buffer,
     texture_layout: wgpu::BindGroupLayout,
 }
 
@@ -141,6 +200,12 @@ impl WorldUiPipeline {
         let quad_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("neon3-world-ui-quads"),
             size: (std::mem::size_of::<WorldUiQuad>() * MAX_WORLD_UI_QUADS) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let surface_quad_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("neon3-world-ui-surface-quad"),
+            size: std::mem::size_of::<WorldUiQuad>() as u64,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -305,6 +370,7 @@ impl WorldUiPipeline {
             camera_bind_group,
             vertex_buffer,
             quad_buffer,
+            surface_quad_buffer,
             texture_layout,
         }
     }
@@ -340,12 +406,12 @@ impl WorldUiPipeline {
             ],
         });
         queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&camera));
-        queue.write_buffer(&self.quad_buffer, 0, bytemuck::bytes_of(&quad));
+        queue.write_buffer(&self.surface_quad_buffer, 0, bytemuck::bytes_of(&quad));
         pass.set_pipeline(&self.textured_pipeline);
         pass.set_bind_group(0, &self.camera_bind_group, &[]);
         pass.set_bind_group(1, &bind_group, &[]);
         pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-        pass.set_vertex_buffer(1, self.quad_buffer.slice(..));
+        pass.set_vertex_buffer(1, self.surface_quad_buffer.slice(..));
         pass.draw(0..6, 0..1);
     }
 
@@ -373,13 +439,74 @@ impl WorldUiPipeline {
         pass.draw(0..6, 0..quads.len() as u32);
     }
 
-    /// Renders a deterministic depth-tested showcase without involving the window surface.
+    /// Renders the lab scene into the supplied target using its shared depth attachment.
+    pub(crate) fn render_lab_scene(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        output: &wgpu::TextureView,
+        depth: &wgpu::TextureView,
+        size: [u32; 2],
+        panel_surface: &wgpu::TextureView,
+        camera: WorldUiCamera,
+    ) -> Result<(), String> {
+        let [width, height] = size;
+        if width == 0 || height == 0 {
+            return Err("world UI lab size must be non-zero".into());
+        }
+        // This is scene geometry, not UI decoration. It deliberately intersects the
+        // projected panel so captures prove the final quad uses shared scene depth.
+        let occluder = [WorldUiQuad {
+            model: lab_transform(0.0, 0.0, -5.40, 0.24, 0.72),
+            color: [0.9, 0.02, 0.01, 1.0],
+        }];
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("neon3-world-ui-lab-pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: output,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: depth,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(1.0),
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        self.render(queue, &mut pass, camera, &occluder);
+        self.render_surface(
+            device,
+            queue,
+            &mut pass,
+            camera,
+            panel_surface,
+            WorldUiQuad {
+                model: lab_transform(0.0, 0.0, -5.75, 2.08, 1.14),
+                color: [1.0; 4],
+            },
+        );
+        Ok(())
+    }
+
+    /// Captures the same lab scene rendered into the registered preview target.
     pub(crate) fn capture_lab(
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         size: [u32; 2],
         panel_surface: &wgpu::TextureView,
+        camera: WorldUiCamera,
     ) -> Result<Vec<u8>, String> {
         let [width, height] = size;
         if width == 0 || height == 0 {
@@ -412,65 +539,19 @@ impl WorldUiPipeline {
         });
         let color_view = color.create_view(&Default::default());
         let depth_view = depth.create_view(&Default::default());
-        let camera = WorldUiCamera {
-            view_projection: perspective_matrix(width as f32 / height as f32),
-        };
-        let panel = |x, y, z, sx, sy, color| WorldUiQuad {
-            model: lab_transform(x, y, z, sx, sy),
-            color,
-        };
-        let quads = [
-            panel(0.0, -0.02, -6.12, 2.25, 1.38, [0.01, 0.02, 0.05, 1.0]),
-            panel(0.0, 0.0, -6.0, 2.18, 1.32, [0.10, 0.13, 0.20, 1.0]),
-            panel(0.0, 0.92, -5.92, 2.08, 0.29, [0.13, 0.42, 0.72, 1.0]),
-            panel(0.0, -0.17, -5.93, 2.08, 0.88, [0.15, 0.18, 0.26, 1.0]),
-            panel(-0.55, 0.18, -5.84, 1.28, 0.16, [0.16, 0.82, 0.43, 1.0]),
-            panel(0.78, 0.18, -5.84, 0.54, 0.16, [0.94, 0.64, 0.19, 1.0]),
-            panel(-1.30, -0.78, -5.82, 0.42, 0.18, [0.22, 0.76, 0.92, 1.0]),
-            panel(-0.38, -0.78, -5.82, 0.42, 0.18, [0.85, 0.30, 0.45, 1.0]),
-            panel(0.54, -0.78, -5.82, 0.42, 0.18, [0.67, 0.45, 0.94, 1.0]),
-            panel(0.95, -0.30, -5.66, 0.72, 0.55, [0.92, 0.24, 0.18, 1.0]),
-        ];
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("neon3-world-ui-lab-encoder"),
         });
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("neon3-world-ui-lab-pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &color_view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &depth_view,
-                    depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(1.0),
-                        store: wgpu::StoreOp::Store,
-                    }),
-                    stencil_ops: None,
-                }),
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            self.render(queue, &mut pass, camera, &quads);
-            self.render_surface(
-                device,
-                queue,
-                &mut pass,
-                camera,
-                panel_surface,
-                WorldUiQuad {
-                    model: lab_transform(0.0, 0.0, -5.75, 2.08, 1.14),
-                    color: [1.0; 4],
-                },
-            );
-        }
+        self.render_lab_scene(
+            device,
+            queue,
+            &mut encoder,
+            &color_view,
+            &depth_view,
+            size,
+            panel_surface,
+            camera,
+        )?;
         let row_bytes = width
             .checked_mul(4)
             .ok_or_else(|| "world UI lab row size overflowed".to_owned())?;
@@ -546,21 +627,10 @@ fn lab_transform(x: f32, y: f32, z: f32, sx: f32, sy: f32) -> [[f32; 4]; 4] {
     ]
 }
 
-fn perspective_matrix(aspect: f32) -> [[f32; 4]; 4] {
-    let f = 1.0 / (35.0f32.to_radians() * 0.5).tan();
-    let near = 0.1;
-    let far = 20.0;
-    [
-        [f / aspect, 0.0, 0.0, 0.0],
-        [0.0, f, 0.0, 0.0],
-        [0.0, 0.0, (far + near) / (near - far), -1.0],
-        [0.0, 0.0, 2.0 * near * far / (near - far), 0.0],
-    ]
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::world_ui_lab_camera;
     use std::sync::mpsc;
 
     fn test_device() -> (wgpu::Device, wgpu::Queue) {
@@ -725,6 +795,116 @@ mod tests {
             !pixels
                 .chunks_exact(4)
                 .any(|pixel| pixel == [0, 255, 0, 255])
+        );
+    }
+
+    #[test]
+    fn lab_capture_changes_when_the_camera_view_changes() {
+        let (device, queue) = test_device();
+        let pipeline = WorldUiPipeline::new(&device, wgpu::TextureFormat::Rgba8Unorm);
+        let panel = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("neon3-world-ui-lab-camera-test-panel"),
+            size: wgpu::Extent3d {
+                width: 64,
+                height: 32,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let panel_view = panel.create_view(&Default::default());
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("neon3-world-ui-lab-camera-test-panel-clear"),
+        });
+        encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("neon3-world-ui-lab-camera-test-panel-clear-pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &panel_view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::RED),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        queue.submit(Some(encoder.finish()));
+        let size = [64, 32];
+        let base = pipeline
+            .capture_lab(
+                &device,
+                &queue,
+                size,
+                &panel_view,
+                world_ui_lab_camera(
+                    size,
+                    WorldUiCameraState {
+                        position: [0.0; 3],
+                        yaw: 0.0,
+                        pitch: 0.0,
+                        vertical_fov: 35.0f32.to_radians(),
+                    },
+                ),
+            )
+            .unwrap();
+        let moved = pipeline
+            .capture_lab(
+                &device,
+                &queue,
+                size,
+                &panel_view,
+                world_ui_lab_camera(
+                    size,
+                    WorldUiCameraState {
+                        position: [0.35, 0.0, 0.0],
+                        yaw: 0.0,
+                        pitch: 0.0,
+                        vertical_fov: 35.0f32.to_radians(),
+                    },
+                ),
+            )
+            .unwrap();
+        assert_ne!(
+            base, moved,
+            "camera movement must change the composed world scene"
+        );
+    }
+
+    #[test]
+    fn perspective_camera_matrix_changes_for_fov_and_orientation() {
+        let base = WorldUiCamera::perspective(
+            [640, 360],
+            WorldUiCameraState {
+                position: [0.0; 3],
+                yaw: 0.0,
+                pitch: 0.0,
+                vertical_fov: 35.0f32.to_radians(),
+            },
+        );
+        let changed = WorldUiCamera::perspective(
+            [640, 360],
+            WorldUiCameraState {
+                position: [0.0; 3],
+                yaw: 0.3,
+                pitch: 0.2,
+                vertical_fov: 55.0f32.to_radians(),
+            },
+        );
+        assert_ne!(base.view_projection, changed.view_projection);
+        assert!(
+            changed
+                .view_projection
+                .iter()
+                .flatten()
+                .all(|value| value.is_finite())
         );
     }
 }

@@ -40,6 +40,9 @@ pub enum DebugCommand {
         path: String,
         size: [u32; 2],
     },
+    WorldUiCamera {
+        endpoint: SocketAddr,
+    },
 }
 
 impl DebugCommand {
@@ -104,6 +107,13 @@ impl DebugCommand {
                 ];
                 parse_world_ui_capture(endpoint, path, Some(size))
             }
+            [debug, world, camera, endpoint]
+                if debug == "debug" && world == "world-ui" && camera == "camera" =>
+            {
+                Ok(Self::WorldUiCamera {
+                    endpoint: parse_endpoint(endpoint)?,
+                })
+            }
             _ => Err(debug_usage().into()),
         }
     }
@@ -114,7 +124,8 @@ impl DebugCommand {
             | Self::InteractionGet { endpoint, .. }
             | Self::InteractionQuery { endpoint, .. }
             | Self::RenderCapture { endpoint, .. }
-            | Self::WorldUiCapture { endpoint, .. } => *endpoint,
+            | Self::WorldUiCapture { endpoint, .. }
+            | Self::WorldUiCamera { endpoint } => *endpoint,
         }
     }
 
@@ -134,12 +145,13 @@ impl DebugCommand {
                 "wgpu.world_ui.lab.capture",
                 json!({"path": path, "width": size[0], "height": size[1]}),
             ),
+            Self::WorldUiCamera { .. } => ("wgpu.world_ui.lab.camera.snapshot", json!({})),
         }
     }
 }
 
 pub fn debug_usage() -> &'static str {
-    "neon-cli debug snapshot <endpoint>\nneon-cli debug interaction get <endpoint> <interaction-id>\nneon-cli debug interaction query <endpoint> [<query-json>]\nneon-cli debug render capture <endpoint> <output.png>\nneon-cli debug world-ui capture <endpoint> <output.png> [width height]"
+    "neon-cli debug snapshot <endpoint>\nneon-cli debug interaction get <endpoint> <interaction-id>\nneon-cli debug interaction query <endpoint> [<query-json>]\nneon-cli debug render capture <endpoint> <output.png>\nneon-cli debug world-ui capture <endpoint> <output.png> [width height]\nneon-cli debug world-ui camera <endpoint>"
 }
 
 fn parse_world_ui_capture(

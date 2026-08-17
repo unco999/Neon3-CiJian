@@ -5112,6 +5112,29 @@ pub(crate) fn render_renderer_offscreen_for_test(
     size: [u32; 2],
     time_seconds: f32,
 ) -> Vec<u8> {
+    render_renderer_with_viewport_offscreen_for_test(
+        renderer,
+        device,
+        queue,
+        format,
+        fragments,
+        size,
+        [size[0] as f32, size[1] as f32],
+        time_seconds,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn render_renderer_with_viewport_offscreen_for_test(
+    renderer: &mut UiWgpuRenderer,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    format: wgpu::TextureFormat,
+    fragments: &HashMap<neon_ui_schema::UiFragmentId, UiFragment>,
+    size: [u32; 2],
+    logical_viewport: [f32; 2],
+    time_seconds: f32,
+) -> Vec<u8> {
     let row_bytes = size[0] * 4;
     let padded_bytes_per_row =
         row_bytes.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
@@ -5162,7 +5185,7 @@ pub(crate) fn render_renderer_offscreen_for_test(
             &mut pass,
             fragments,
             size,
-            [size[0] as f32, size[1] as f32],
+            logical_viewport,
             time_seconds,
         );
     }
