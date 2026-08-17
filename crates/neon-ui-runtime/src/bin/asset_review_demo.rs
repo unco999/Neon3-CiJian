@@ -1,7 +1,9 @@
 use std::net::SocketAddr;
 
 use neon_ipc::RpcClient;
-use neon_protocol::{ClientIdentity, ClientKind, ProtocolVersion, RequestId, Revision, RpcRequest, ServiceName};
+use neon_protocol::{
+    ClientIdentity, ClientKind, ProtocolVersion, RequestId, Revision, RpcRequest, ServiceName,
+};
 use neon_ui_runtime::{lower_nui_flow_effects, parse_nui_flow};
 use neon_ui_schema::{TextRef, UiCommand, UiFragment, UiFragmentId, UiFragmentSubmission, UiNode};
 use serde_json::json;
@@ -45,7 +47,10 @@ fn main() {
     let mut client = RpcClient::connect(endpoint).expect("connect to window server");
     let response = client.call(&request).expect("submit complex Flow fragment");
     if !matches!(response.status, neon_protocol::RpcStatus::Accepted) {
-        panic!("window server rejected complex Flow fragment: {:?}", response.error);
+        panic!(
+            "window server rejected complex Flow fragment: {:?}",
+            response.error
+        );
     }
 }
 
@@ -76,5 +81,7 @@ fn hide_tree(node: &mut UiNode) {
 }
 
 fn set_text(node: &mut UiNode, value: &str) {
-    node.text = Some(TextRef::Literal { value: value.into() });
+    node.text = Some(TextRef::Literal {
+        value: value.into(),
+    });
 }

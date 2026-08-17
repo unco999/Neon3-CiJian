@@ -14,10 +14,12 @@ fn main() {
         let server =
             neon_ipc::RpcServer::bind(endpoint).expect("headless server must bind loopback");
         let mut runtime = neon_wgpu_runtime::WgpuRuntime::headless(1);
-        server.serve_until(|request| {
+        server
+            .serve_until(|request| {
                 let shutdown = request.method == "service.shutdown";
                 (runtime.handle(request), !shutdown)
-        }).expect("headless server request must complete");
+            })
+            .expect("headless server request must complete");
         return;
     }
     if args.get(1).is_some_and(|argument| argument == "--window") {
@@ -36,11 +38,12 @@ fn main() {
             .expect("window server endpoint is required")
             .parse()
             .expect("window server endpoint must be a socket address");
-        let ui_endpoint = args
-            .get(3)
-            .map(|endpoint| endpoint.parse().expect("UI runtime endpoint must be a socket address"));
-        if let Err(error) =
-            neon_wgpu_runtime::WindowedRuntime::run_server(1, endpoint, ui_endpoint)
+        let ui_endpoint = args.get(3).map(|endpoint| {
+            endpoint
+                .parse()
+                .expect("UI runtime endpoint must be a socket address")
+        });
+        if let Err(error) = neon_wgpu_runtime::WindowedRuntime::run_server(1, endpoint, ui_endpoint)
         {
             eprintln!("neon-wgpu-runtime failed: {error}");
             std::process::exit(1);

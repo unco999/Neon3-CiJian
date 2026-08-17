@@ -8,16 +8,24 @@
 use neon_wgpu_ai::format::{TerrainUnetSpec, WeightPack};
 
 fn main() {
-    let path = std::env::args().nth(1).expect("usage: verify_pack <path-to.pack>");
+    let path = std::env::args()
+        .nth(1)
+        .expect("usage: verify_pack <path-to.pack>");
     let bytes = std::fs::read(&path).unwrap_or_else(|error| panic!("read {path}: {error}"));
     let pack = WeightPack::parse(&bytes).expect("pack parse failed");
     let spec = TerrainUnetSpec::default_v1();
-    spec.validate_terrain_pack(&pack).expect("structural schema validation failed");
+    spec.validate_terrain_pack(&pack)
+        .expect("structural schema validation failed");
 
     let count: u64 = pack.tensors.values().map(|t| t.numel()).sum();
     println!(
         "pack OK: model={} dtype={} T={} base={} schedule={} source={}",
-        pack.meta.model_kind, pack.meta.dtype, pack.meta.T, pack.meta.base, pack.meta.schedule, pack.meta.source_ckpt
+        pack.meta.model_kind,
+        pack.meta.dtype,
+        pack.meta.T,
+        pack.meta.base,
+        pack.meta.schedule,
+        pack.meta.source_ckpt
     );
     println!(
         "tensors={} params={} resident_bytes={} sha256={}",

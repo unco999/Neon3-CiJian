@@ -11,7 +11,7 @@
 //!     --steps 10 --size 64 --out out.ppm
 
 use neon_wgpu_ai::format::{
-    PARENT_CLASSES, RELIEF_CLASSES, SUB_CLASSES, TEXTURE_CLASSES, WATER_CLASSES, TerrainCond,
+    PARENT_CLASSES, RELIEF_CLASSES, SUB_CLASSES, TEXTURE_CLASSES, TerrainCond, WATER_CLASSES,
 };
 use neon_wgpu_ai::{AiEngine, GenerateRequest};
 
@@ -48,11 +48,18 @@ fn main() {
     let mut cond = TerrainCond::default();
     for (dim, value) in &labels {
         let index = match dim.as_str() {
-            "sub" => class_index(value, &SUB_CLASSES).ok_or_else(|| format!("unknown sub '{value}'")),
-            "parent" => class_index(value, &PARENT_CLASSES).ok_or_else(|| format!("unknown parent '{value}'")),
-            "relief" => class_index(value, &RELIEF_CLASSES).ok_or_else(|| format!("unknown relief '{value}'")),
-            "texture" => class_index(value, &TEXTURE_CLASSES).ok_or_else(|| format!("unknown texture '{value}'")),
-            "water" => class_index(value, &WATER_CLASSES).ok_or_else(|| format!("unknown water '{value}'")),
+            "sub" => {
+                class_index(value, &SUB_CLASSES).ok_or_else(|| format!("unknown sub '{value}'"))
+            }
+            "parent" => class_index(value, &PARENT_CLASSES)
+                .ok_or_else(|| format!("unknown parent '{value}'")),
+            "relief" => class_index(value, &RELIEF_CLASSES)
+                .ok_or_else(|| format!("unknown relief '{value}'")),
+            "texture" => class_index(value, &TEXTURE_CLASSES)
+                .ok_or_else(|| format!("unknown texture '{value}'")),
+            "water" => {
+                class_index(value, &WATER_CLASSES).ok_or_else(|| format!("unknown water '{value}'"))
+            }
             _ => unreachable!(),
         }
         .expect("label lookup failed");
@@ -65,8 +72,10 @@ fn main() {
             _ => unreachable!(),
         }
     }
-    println!("cond: sub={:?} parent={:?} relief={:?} texture={:?} water={:?}",
-             cond.sub, cond.parent, cond.relief, cond.texture, cond.water);
+    println!(
+        "cond: sub={:?} parent={:?} relief={:?} texture={:?} water={:?}",
+        cond.sub, cond.parent, cond.relief, cond.texture, cond.water
+    );
 
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends: wgpu::Backends::PRIMARY,
@@ -80,21 +89,23 @@ fn main() {
     }))
     .expect("no wgpu adapter available");
     let info = adapter.get_info();
-    println!("adapter: {} ({:?}, {:?})", info.name, info.backend, info.device_type);
-    let (device, queue) = pollster::block_on(adapter.request_device(
-        &wgpu::DeviceDescriptor {
+    println!(
+        "adapter: {} ({:?}, {:?})",
+        info.name, info.backend, info.device_type
+    );
+    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("neon-wgpu-ai generate_label"),
         required_features: wgpu::Features::empty(),
         required_limits: wgpu::Limits::default(),
         experimental_features: wgpu::ExperimentalFeatures::default(),
         memory_hints: wgpu::MemoryHints::default(),
         trace: wgpu::Trace::Off,
-        },
-    ))
+    }))
     .expect("device request failed");
 
     let mut engine = AiEngine::new(device, queue);
-    let bytes = std::fs::read(&pack_path).unwrap_or_else(|error| panic!("read {pack_path}: {error}"));
+    let bytes =
+        std::fs::read(&pack_path).unwrap_or_else(|error| panic!("read {pack_path}: {error}"));
     let info = engine.load_model(&bytes).expect("model load failed");
     println!(
         "model loaded: {} params, {} MB resident",
@@ -129,7 +140,10 @@ fn main() {
         generation.elapsed_ms / 1000.0
     );
     println!("gpu submissions: {submission_count}");
-    assert!(map.iter().all(|v| v.is_finite()), "heightmap must be finite");
+    assert!(
+        map.iter().all(|v| v.is_finite()),
+        "heightmap must be finite"
+    );
 
     if let Some(out_path) = out_path {
         let lo = map.iter().copied().fold(f32::INFINITY, f32::min);

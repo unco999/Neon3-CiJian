@@ -94,14 +94,21 @@ impl HeightmapPreviewConverter {
             compilation_options: Default::default(),
             cache: None,
         });
-        Self { pipeline, bind_group_layout }
+        Self {
+            pipeline,
+            bind_group_layout,
+        }
     }
 
     /// Converts the model's clamped `[-3, 3]` latent directly into a sampled texture.
     pub(crate) fn create_texture(&self, device: &wgpu::Device, size: u32) -> wgpu::Texture {
         device.create_texture(&wgpu::TextureDescriptor {
             label: Some("neon3-heightmap-preview-texture"),
-            size: wgpu::Extent3d { width: size, height: size, depth_or_array_layers: 1 },
+            size: wgpu::Extent3d {
+                width: size,
+                height: size,
+                depth_or_array_layers: 1,
+            },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -135,8 +142,14 @@ impl HeightmapPreviewConverter {
             label: Some("neon3-heightmap-preview-bind-group"),
             layout: &self.bind_group_layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: params.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: heightmap.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: params.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: heightmap.as_entire_binding(),
+                },
                 wgpu::BindGroupEntry {
                     binding: 2,
                     resource: wgpu::BindingResource::TextureView(output),
@@ -234,11 +247,17 @@ mod tests {
                     rows_per_image: Some(size),
                 },
             },
-            wgpu::Extent3d { width: size, height: size, depth_or_array_layers: 1 },
+            wgpu::Extent3d {
+                width: size,
+                height: size,
+                depth_or_array_layers: 1,
+            },
         );
         queue.submit(Some(encoder.finish()));
         let (sender, receiver) = std::sync::mpsc::channel();
-        readback.slice(..).map_async(wgpu::MapMode::Read, move |result| {
+        readback
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |result| {
                 sender.send(result).unwrap();
             });
         device.poll(wgpu::PollType::wait_indefinitely()).unwrap();

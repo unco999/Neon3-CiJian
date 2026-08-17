@@ -20,10 +20,28 @@ pub const MODEL_NAME: &str = MODEL_KIND_TERRAIN_UNET_DDIM_V1;
 /// Embedding index tables, mirrored from `train.py`. `None` means the null
 /// (unconditional) class, which maps to index `len(classes)`.
 pub const SUB_CLASSES: [&str; 23] = [
-    "alpine", "caldera_rim", "canyon_gorge", "cliff_coast", "delta", "dissected_hills",
-    "dune_sea", "fjord", "flat_plain", "glacier_highland", "hamada", "high_plateau",
-    "lava_plateau", "mesa_badlands", "mid_mountain", "rocky_wadi", "rolling_hills",
-    "salt_playa", "sandy_coast", "shield_volcano", "stratovolcano", "tundra_lowland",
+    "alpine",
+    "caldera_rim",
+    "canyon_gorge",
+    "cliff_coast",
+    "delta",
+    "dissected_hills",
+    "dune_sea",
+    "fjord",
+    "flat_plain",
+    "glacier_highland",
+    "hamada",
+    "high_plateau",
+    "lava_plateau",
+    "mesa_badlands",
+    "mid_mountain",
+    "rocky_wadi",
+    "rolling_hills",
+    "salt_playa",
+    "sandy_coast",
+    "shield_volcano",
+    "stratovolcano",
+    "tundra_lowland",
     "undulating_plain",
 ];
 pub const PARENT_CLASSES: [&str; 8] = [
@@ -197,12 +215,12 @@ impl<'a> WeightPack<'a> {
         if dtype != DTYPE_F32 {
             return Err(AiError::InvalidPack("only f32 packs are supported".into()));
         }
-        let tensor_count = u32::from_le_bytes(take(4, "tensor count")?.try_into().unwrap()) as usize;
+        let tensor_count =
+            u32::from_le_bytes(take(4, "tensor count")?.try_into().unwrap()) as usize;
         let meta_len = u32::from_le_bytes(take(4, "meta length")?.try_into().unwrap()) as usize;
         let meta_bytes = take(meta_len, "meta")?;
-        let meta: PackMeta = serde_json::from_slice(meta_bytes).map_err(|error| {
-            AiError::InvalidPack(format!("meta is not valid JSON: {error}"))
-        })?;
+        let meta: PackMeta = serde_json::from_slice(meta_bytes)
+            .map_err(|error| AiError::InvalidPack(format!("meta is not valid JSON: {error}")))?;
         if meta.model_kind != MODEL_KIND_TERRAIN_UNET_DDIM_V1 {
             return Err(AiError::InvalidPack(format!(
                 "pack is for model '{}', expected '{MODEL_KIND_TERRAIN_UNET_DDIM_V1}'",
@@ -218,12 +236,14 @@ impl<'a> WeightPack<'a> {
 
         let mut tensors = HashMap::with_capacity(tensor_count);
         for _ in 0..tensor_count {
-            let name_len = u32::from_le_bytes(take(4, "tensor name length")?.try_into().unwrap()) as usize;
+            let name_len =
+                u32::from_le_bytes(take(4, "tensor name length")?.try_into().unwrap()) as usize;
             let name_bytes = take(name_len, "tensor name")?;
             let name = std::str::from_utf8(name_bytes)
                 .map_err(|_| AiError::InvalidPack("tensor name is not UTF-8".into()))?
                 .to_owned();
-            let dim_count = u32::from_le_bytes(take(4, "tensor dim count")?.try_into().unwrap()) as usize;
+            let dim_count =
+                u32::from_le_bytes(take(4, "tensor dim count")?.try_into().unwrap()) as usize;
             if dim_count > 8 {
                 return Err(AiError::InvalidPack(format!(
                     "tensor '{name}' has implausible rank {dim_count}"
@@ -239,7 +259,8 @@ impl<'a> WeightPack<'a> {
                 }
                 dims.push(d);
             }
-            let byte_len = u32::from_le_bytes(take(4, "tensor byte length")?.try_into().unwrap()) as usize;
+            let byte_len =
+                u32::from_le_bytes(take(4, "tensor byte length")?.try_into().unwrap()) as usize;
             let data = take(byte_len, &format!("tensor '{name}' data"))?;
             let numel = dims.iter().map(|d| *d as u64).product::<u64>() as usize;
             if numel * 4 != data.len() {
@@ -248,7 +269,17 @@ impl<'a> WeightPack<'a> {
                     data.len()
                 )));
             }
-            if tensors.insert(name.clone(), TensorRef { name, dims, bytes: data }).is_some() {
+            if tensors
+                .insert(
+                    name.clone(),
+                    TensorRef {
+                        name,
+                        dims,
+                        bytes: data,
+                    },
+                )
+                .is_some()
+            {
                 return Err(AiError::InvalidPack("duplicate tensor name in pack".into()));
             }
         }
@@ -262,9 +293,9 @@ impl<'a> WeightPack<'a> {
     }
 
     pub fn tensor(&self, name: &str) -> Result<&TensorRef<'a>, AiError> {
-        self.tensors.get(name).ok_or_else(|| {
-            AiError::InvalidPack(format!("pack is missing tensor '{name}'"))
-        })
+        self.tensors
+            .get(name)
+            .ok_or_else(|| AiError::InvalidPack(format!("pack is missing tensor '{name}'")))
     }
 }
 
@@ -455,10 +486,7 @@ mod tests {
             for d in dims {
                 pack.extend_from_slice(&d.to_le_bytes());
             }
-            let bytes: Vec<u8> = data
-                .into_iter()
-                .flat_map(|v| v.to_le_bytes())
-                .collect();
+            let bytes: Vec<u8> = data.into_iter().flat_map(|v| v.to_le_bytes()).collect();
             pack.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
             pack.extend_from_slice(&bytes);
         }
@@ -499,7 +527,10 @@ mod tests {
         };
         assert_eq!(cond.indices(), [0, 5, 5, 2, 3]);
         assert!(cond.validate().is_ok());
-        let bad = TerrainCond { sub: Some(23), ..cond };
+        let bad = TerrainCond {
+            sub: Some(23),
+            ..cond
+        };
         assert!(bad.validate().is_err());
     }
 

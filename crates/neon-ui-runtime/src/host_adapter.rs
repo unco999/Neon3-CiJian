@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 
 use neon_ui_schema::{
     UiDataGridInputFrame, UiHostInbound, UiHostPublication, UiInputSchema, UiProgram,
-    UiProgramInputSnapshot, UiProgramSemanticEvent, UiWindowRequest,
+    UiProgramDragDropEvent, UiProgramInputSnapshot, UiProgramSemanticEvent, UiWindowRequest,
 };
 use serde::{Deserialize, Serialize};
 
@@ -47,6 +47,7 @@ pub struct UiHostPublicationResult {
 pub enum UiHostInboundResult {
     WindowRequest(UiWindowRequest),
     SemanticIntent(UiProgramSemanticEvent),
+    DragDrop(UiProgramDragDropEvent),
     DataGridCell(neon_ui_schema::UiSemanticEvent),
 }
 
@@ -139,8 +140,20 @@ impl UiHostAdapter {
                             frame,
                         })
                 })
-            .collect(),
+                .collect(),
         }
+    }
+
+    pub fn activate_from_snapshot(
+        program: UiProgram,
+        schema: UiInputSchema,
+        snapshot: UiProgramInputSnapshot,
+        renderer_epoch: u64,
+    ) -> Result<Self, UiHostAdapterError> {
+        let mut adapter = Self::activate(program, schema, renderer_epoch)?;
+        adapter.inputs.restore_snapshot(snapshot.scalar_inputs)?;
+        adapter.seed_grid_inputs(snapshot.grid_inputs)?;
+        Ok(adapter)
     }
 
     /// Hydrates renderer-visible grid windows submitted before this adapter was
@@ -236,19 +249,40 @@ impl UiHostAdapter {
                 self.validate_semantic_intent(&event)?;
                 Ok(UiHostInboundResult::SemanticIntent(event))
             }
+            UiHostInbound::DragDrop { event } => {
+                self.validate_drag_drop(&event)?;
+                Ok(UiHostInboundResult::DragDrop(event))
+            }
             UiHostInbound::DataGridCell { event } => {
                 let Some(target) = event.data_grid_cell.as_ref() else {
-                    return Err(UiHostAdapterError { code: "ui_host_invalid_data_grid_cell", message: "DataGrid cell event has no cell target" });
+                    return Err(UiHostAdapterError {
+                        code: "ui_host_invalid_data_grid_cell",
+                        message: "DataGrid cell event has no cell target",
+                    });
                 };
                 let Some(frame) = self.grids.frame(&target.source_key) else {
-                    return Err(UiHostAdapterError { code: "ui_host_grid_unavailable", message: "DataGrid cell event has no active grid frame" });
+                    return Err(UiHostAdapterError {
+                        code: "ui_host_grid_unavailable",
+                        message: "DataGrid cell event has no active grid frame",
+                    });
                 };
                 if event.renderer_epoch != self.renderer_epoch
-                    || !frame.window_rows.iter().any(|row| row.stable_row_key == target.stable_row_key)
+                    || !frame
+                        .window_rows
+                        .iter()
+                        .any(|row| row.stable_row_key == target.stable_row_key)
                     || !self.program.data_grid_records.iter().any(|grid| {
-                        grid.source_key == target.source_key && grid.columns.iter().any(|column| column.key == target.column_key)
-                    }) {
-                    return Err(UiHostAdapterError { code: "ui_host_invalid_data_grid_cell", message: "DataGrid cell event is not active in the declared grid" });
+                        grid.source_key == target.source_key
+                            && grid
+                                .columns
+                                .iter()
+                                .any(|column| column.key == target.column_key)
+                    })
+                {
+                    return Err(UiHostAdapterError {
+                        code: "ui_host_invalid_data_grid_cell",
+                        message: "DataGrid cell event is not active in the declared grid",
+                    });
                 }
                 Ok(UiHostInboundResult::DataGridCell(event))
             }
@@ -340,6 +374,67 @@ impl UiHostAdapter {
         }
         Ok(())
     }
+
+    fn validate_drag_drop(&self, event: &UiProgramDragDropEvent) -> Result<(), UiHostAdapterError> {
+        if event.event_id.trim().is_empty()
+            || event.request_id.trim().is_empty()
+            || event.idempotency_key.trim().is_empty()
+            || event.drag_key.trim().is_empty()
+            || event.drop_key.trim().is_empty()
+            || event.intent.trim().is_empty()
+            || event.interaction.interaction_id.trim().is_empty()
+        {
+            return Err(UiHostAdapterError {
+                code: "ui_host_invalid_drag_drop",
+                message: "drag/drop identity is incomplete",
+            });
+        }
+        if event.program_revision != self.program.revision
+            || event.input_revision != self.inputs.snapshot().input_revision
+        {
+            return Err(UiHostAdapterError {
+                code: "ui_host_stale_drag_drop",
+                message: "drag/drop program or input revision is stale",
+            });
+        }
+        if event.interaction.renderer_epoch != self.renderer_epoch {
+            return Err(UiHostAdapterError {
+                code: "ui_host_renderer_epoch_mismatch",
+                message: "drag/drop renderer epoch is not active",
+            });
+        }
+        let drag = self
+            .program
+            .drag_records
+            .iter()
+            .find(|record| record.key == event.drag_key)
+            .ok_or(UiHostAdapterError {
+                code: "ui_host_invalid_drag_drop",
+                message: "drag key is not declared by the active program",
+            })?;
+        let drop = self
+            .program
+            .drop_records
+            .iter()
+            .find(|record| record.key == event.drop_key)
+            .ok_or(UiHostAdapterError {
+                code: "ui_host_invalid_drag_drop",
+                message: "drop key is not declared by the active program",
+            })?;
+        if drag.source_node_key != event.payload.source_key
+            || drop.target_node_key != event.payload.target_key
+            || drop.accepts_drag_key != drag.key
+            || drop.intent != event.intent
+            || drop.placement != event.payload.placement
+            || drop.presentation_template_key != event.payload.presentation_template_key
+        {
+            return Err(UiHostAdapterError {
+                code: "ui_host_invalid_drag_drop",
+                message: "drag/drop payload does not match the active program declaration",
+            });
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -352,8 +447,9 @@ mod tests {
         UiDataGridRecord, UiDataGridWindowRequest, UiDataGridWindowRow, UiGridInputSlot,
         UiInputChange, UiInputKind, UiInputPacking, UiInputSlot, UiInputUpdateClass, UiInputValue,
         UiProgramCapability, UiProgramCapabilityOwner, UiProgramCapabilityStatus,
-        UiProgramEventDeclaration, UiProgramNode, UiProgramRevision, UiProgramSemanticEventKind,
-        UiResourceBudget, UiSemanticInteractionMetadata,
+        UiProgramDragRecord, UiProgramDropRecord, UiProgramEventDeclaration, UiProgramNode,
+        UiProgramRevision, UiProgramSemanticEventKind, UiResourceBudget,
+        UiSemanticInteractionMetadata,
     };
 
     use super::*;
@@ -428,6 +524,8 @@ mod tests {
                     presentation: UiDataGridPresentation::Text,
                 }],
             }],
+            drag_records: Vec::new(),
+            drop_records: Vec::new(),
             event_records: vec![UiProgramEventDeclaration {
                 node_key: "control".into(),
                 intent: "invoke".into(),
@@ -496,6 +594,7 @@ mod tests {
                 }],
             },
             grid_inputs,
+            presentation_update: None,
         }
     }
 
@@ -560,7 +659,10 @@ mod tests {
         let mut adapter = adapter();
         adapter.seed_grid_inputs(vec![grid_input(3)]).unwrap();
         assert_eq!(adapter.snapshot().scalar_inputs.input_revision, Revision(0));
-        assert_eq!(adapter.snapshot().grid_inputs[0].frame.list_revision, Revision(3));
+        assert_eq!(
+            adapter.snapshot().grid_inputs[0].frame.list_revision,
+            Revision(3)
+        );
     }
 
     #[test]
@@ -587,5 +689,62 @@ mod tests {
             adapter.validate_inbound(UiHostInbound::SemanticIntent { event }),
             Ok(UiHostInboundResult::SemanticIntent(_))
         ));
+    }
+
+    #[test]
+    fn inbound_drag_drop_requires_the_active_declared_contract() {
+        let mut adapter = adapter();
+        adapter.program.drag_records.push(UiProgramDragRecord {
+            key: "item-drag".into(),
+            source_node_key: "control".into(),
+            axis: neon_ui_schema::UiDragAxis::Both,
+            snap: 0.0,
+            threshold: 0.0,
+            boundary: neon_ui_schema::UiDragBoundary::Free,
+        });
+        adapter.program.drop_records.push(UiProgramDropRecord {
+            key: "target-drop".into(),
+            target_node_key: "grid_node".into(),
+            accepts_drag_key: "item-drag".into(),
+            placement: neon_ui_schema::UiDropPlacement::Into,
+            presentation_template_key: Some("target-template".into()),
+            intent: "workspace.item.move".into(),
+        });
+        let event = UiProgramDragDropEvent {
+            event_id: "drop-event".into(),
+            drag_key: "item-drag".into(),
+            drop_key: "target-drop".into(),
+            intent: "workspace.item.move".into(),
+            payload: neon_ui_schema::UiDragDropPayload {
+                source_key: "control".into(),
+                target_key: "grid_node".into(),
+                placement: neon_ui_schema::UiDropPlacement::Into,
+                presentation_template_key: Some("target-template".into()),
+            },
+            program_revision: revision(),
+            input_revision: Revision(0),
+            request_id: "drop-request".into(),
+            idempotency_key: "drop-key".into(),
+            interaction: UiSemanticInteractionMetadata {
+                interaction_id: "drop-interaction".into(),
+                sequence: 1,
+                renderer_epoch: 7,
+            },
+        };
+        assert!(matches!(
+            adapter.validate_inbound(UiHostInbound::DragDrop {
+                event: event.clone()
+            }),
+            Ok(UiHostInboundResult::DragDrop(_))
+        ));
+        let mut invalid = event;
+        invalid.payload.presentation_template_key = None;
+        assert_eq!(
+            adapter
+                .validate_inbound(UiHostInbound::DragDrop { event: invalid })
+                .unwrap_err()
+                .code,
+            "ui_host_invalid_drag_drop"
+        );
     }
 }

@@ -390,8 +390,16 @@ mod tests {
     #[test]
     fn asset_bytes_are_revisioned_content_without_a_local_path() {
         let content = AssetBytes {
-            asset: AssetRef { project_id: "project-001".into(), asset_id: 81, revision: Revision(5), kind: "image".into() },
-            media_type: "application/x-neon-rgba8".into(), width: Some(1), height: Some(1), bytes: vec![1, 2, 3, 4],
+            asset: AssetRef {
+                project_id: "project-001".into(),
+                asset_id: 81,
+                revision: Revision(5),
+                kind: "image".into(),
+            },
+            media_type: "application/x-neon-rgba8".into(),
+            width: Some(1),
+            height: Some(1),
+            bytes: vec![1, 2, 3, 4],
         };
         let value = serde_json::to_value(content).unwrap();
         assert!(value.get("path").is_none());

@@ -2,22 +2,28 @@
 # and a semantic intent; no renderer identity or domain-specific rule is present.
 version 1
 surface surface.component-gallery revision 1
-budget nodes=96 bindings=96 instances=64 text=96 glyphs=8192 events=48 clips=48
+budget nodes=160 bindings=112 instances=96 text=160 glyphs=12288 events=64 clips=72
 input controls_enabled bool default true
 input feature_enabled bool default true
 input radio_selected bool default false
-input slider_value f32 default 0.5
-input drag_value i32 default 12
+input slider_value f32:0..1 default 0.5
+input drag_value i32:0..24 default 12
 input combo_choice enum:alpha|beta|gamma default beta
 input dropdown_choice enum:alpha|beta|gamma default beta
 input list_choice enum:alpha|beta|gamma default beta
 input item_selected bool default true
-input scroll_position f32 default 0.35
+input scroll_position f32:0..1 default 0.35
 input dialog_visible bool default false
 input asset_window grid default grid:empty
-surface component-gallery overlay w 1280 h 680 fill #17201E
-  panel gallery-layout x 0 y 0 row w 1280 h 680 gap 10 pad 14 align stretch fill #17201E
-    scroll gallery-controls column w 390 h 652 gap 6 pad 10 align stretch fill #1D2A28
+drag compass-drag source backpack-compass axis both snap 8 threshold 3 within surface
+drag potion-drag source backpack-potion axis both snap 8 threshold 3 within surface
+drag gem-drag source backpack-gem axis both snap 8 threshold 3 within surface
+drop equipment-compass-drop target equipment-zone accepts compass-drag placement into present equipment-item-template emit inventory.item.equip
+drop crafting-potion-drop target crafting-zone accepts potion-drag placement into present crafting-item-template emit inventory.item.craft
+drop discard-gem-drop target discard-zone accepts gem-drag placement into present discarded-item-template emit inventory.item.discard
+surface component-gallery overlay minw 1668 h 900 align stretch clip scroll fill #17201E
+  panel gallery-layout row minw 1668 gap 10 pad 14 align stretch fill #17201E
+    panel gallery-controls column minw 360 maxw 430 grow 1 shrink 0 gap 6 pad 10 align stretch fill #1D2A28
       text gallery-title h 28 value "Component Gallery"
       checkbox feature-toggle h 30 checked $feature_enabled enabled $controls_enabled value "Enable feature" event gallery.checkbox.toggle
       text status-feature_enabled h 18 value "feature_enabled: true"
@@ -38,9 +44,42 @@ surface component-gallery overlay w 1280 h 680 fill #17201E
       scrollbar gallery-scroll h 20 scroll $scroll_position enabled $controls_enabled value "Scrollbar" event gallery.scrollbar.commit
         tooltip gallery-scroll-tooltip x 0 y 26 w 184 h 34 fill #25363B value "Tooltip: local overlay"
       text status-scroll_position h 18 value "scroll_position: 0.35"
+      panel control-reference h 132 column pad 8 gap 6 fill #243634 line #46766D
+        text control-reference-title value "Control notes"
+        text control-reference-body value "Bound state, semantic events, and local presentation stay visible in this scroll rail."
       checkbox dialog-toggle h 30 checked $dialog_visible enabled $controls_enabled value "Open dialog" event gallery.dialog.toggle
-    data_grid asset-grid w 840 h 652 source $asset_window capacity 24 row_height 24 overscan 6 columns "name:220:edit:64:virtual_list.name.commit,status:180:dropdown:draft|ready|archived:virtual_list.status.set,owner:160:select:virtual_list.owner.toggle,notes:260:edit:128:virtual_list.notes.commit"
-  dialog gallery-dialog x 492 y 190 column w 296 h 184 pad 14 gap 10 align stretch visible $dialog_visible fill #263334 line #66B7A0
+    data_grid asset-grid minw 600 grow 2 shrink 0 source $asset_window capacity 80 row_height 24 overscan 20 columns "name:180:edit:64:virtual_list.name.commit,status:130:dropdown:draft|ready|archived:virtual_list.status.set,owner:110:select:virtual_list.owner.toggle,notes:220:edit:128:virtual_list.notes.commit"
+    panel field-pack column minw 660 maxw 760 grow 1 shrink 0 pad 12 gap 10 align stretch clip none fill #202A32 line #4E8391
+      panel pack-header row h 42 pad 8 gap 8 align center fill #293943
+        text pack-title value "Field Pack / 18.4 kg"
+        text pack-budget value "Capacity 12 / 16"
+      panel backpack-items column w 636 h 196 shrink 0 pad 8 gap 8 clip none fill #18252D line #38616E
+        text backpack-heading h 22 value "Backpack items"
+        panel backpack-compass row w 620 h 42 shrink 0 pad 8 gap 8 align center fill #315360 line #76B7BE
+          text backpack-compass-name value "Brass compass"
+          text backpack-compass-meta value "Navigation / 0.2 kg"
+        panel backpack-potion row w 620 h 42 shrink 0 pad 8 gap 8 align center fill #47365A line #B48DCE
+          text backpack-potion-name value "Restoration potion"
+          text backpack-potion-meta value "Consumable / 0.6 kg"
+        panel backpack-gem row w 620 h 42 shrink 0 pad 8 gap 8 align center fill #4C4030 line #D6AA62
+          text backpack-gem-name value "Sunstone gem"
+          text backpack-gem-meta value "Crafting / 1.1 kg"
+      panel equipment-zone column h 126 pad 10 gap 6 fill #243E47 line #67B6C5
+        text equipment-heading value "Equipment bay"
+        text equipment-hint value "Compass accepts navigation gear"
+        template equipment-item-template h 44 capacity 2 key item_key overflow_summary
+          text equipment-item-template-label value "Equipped item"
+      panel crafting-zone column h 126 pad 10 gap 6 fill #3D3348 line #B48DCE
+        text crafting-heading value "Crafting satchel"
+        text crafting-hint value "Potion accepts blend ingredients"
+        template crafting-item-template h 44 capacity 2 key item_key overflow_summary
+          text crafting-item-template-label value "Crafted item"
+      panel discard-zone column grow 1 pad 10 gap 6 fill #46362E line #D8A65E
+        text discard-heading value "Drop zone"
+        text discard-hint value "Gem accepts salvage items"
+        template discarded-item-template h 44 capacity 2 key item_key overflow_summary
+          text discarded-item-template-label value "Discarded item"
+  dialog gallery-dialog x 692 y 310 column w 296 h 184 pad 14 gap 10 align stretch visible $dialog_visible fill #263334 line #66B7A0
     text dialog-title h 26 value "Dialog example"
     text dialog-body h 48 value "This dialog blocks the gallery behind it."
     checkbox dialog-close h 32 checked $dialog_visible value "Close dialog" event gallery.dialog.toggle

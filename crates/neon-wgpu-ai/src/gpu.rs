@@ -164,14 +164,14 @@ impl GpuCtx {
                         count: None,
                     })
                     .collect();
-                let layout = self
-                    .device
+                let layout =
+                    self.device
                         .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                             label: None,
                             entries: &entries,
                         });
-                let pipeline_layout = self
-                    .device
+                let pipeline_layout =
+                    self.device
                         .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                             label: None,
                             bind_group_layouts: &[Some(&layout)],
@@ -183,8 +183,8 @@ impl GpuCtx {
                         label: Some($key),
                         source: wgpu::ShaderSource::Wgsl($src.into()),
                     });
-                let pipeline = self
-                    .device
+                let pipeline =
+                    self.device
                         .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                             label: Some($key),
                             layout: Some(&pipeline_layout),
@@ -193,13 +193,7 @@ impl GpuCtx {
                             compilation_options: Default::default(),
                             cache: None,
                         });
-                self.pipelines.insert(
-                    $key,
-                    Pipeline {
-                        pipeline,
-                        layout,
-                    },
-                );
+                self.pipelines.insert($key, Pipeline { pipeline, layout });
             };
         }
         // bindings: uniform(0) + storage(1..n). `&[..]` lists the read-write storage bindings.
@@ -298,13 +292,15 @@ impl GpuCtx {
     /// Record subsequent compute passes into one command encoder. The caller
     /// must submit or discard the batch before readback or waiting.
     pub fn begin_batch(&mut self) {
-        assert!(self.pending_encoder.is_none(), "GPU compute batch already active");
-        self.pending_encoder = Some(
-            self.device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("neon-ai-ddim-step"),
-                }),
+        assert!(
+            self.pending_encoder.is_none(),
+            "GPU compute batch already active"
         );
+        self.pending_encoder = Some(self.device.create_command_encoder(
+            &wgpu::CommandEncoderDescriptor {
+                label: Some("neon-ai-ddim-step"),
+            },
+        ));
     }
 
     /// Submit the active compute batch, if any.
@@ -328,7 +324,10 @@ impl GpuCtx {
 
     /// Wait for all queued inference work once at a public operation boundary.
     pub fn wait(&self) -> Result<(), AiError> {
-        assert!(self.pending_encoder.is_none(), "cannot wait with an active GPU compute batch");
+        assert!(
+            self.pending_encoder.is_none(),
+            "cannot wait with an active GPU compute batch"
+        );
         self.device
             .poll(wgpu::PollType::wait_indefinitely())
             .map_err(|error| AiError::Gpu(format!("device poll failed: {error}")))?;
@@ -359,7 +358,10 @@ impl GpuCtx {
 
     /// Synchronous buffer readback (copy + map + poll). Diagnostic/test path.
     pub fn readback(&self, buffer: &wgpu::Buffer, bytes: u64) -> Result<Vec<u8>, AiError> {
-        assert!(self.pending_encoder.is_none(), "cannot read back with an active GPU compute batch");
+        assert!(
+            self.pending_encoder.is_none(),
+            "cannot read back with an active GPU compute batch"
+        );
         let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("neon-ai-staging"),
             size: bytes,

@@ -214,7 +214,10 @@ impl GpuUiProgramBackend {
                     bounds.width = bounds.width.min(active.viewport.width);
                     bounds.height = bounds.height.min(active.viewport.height);
                 }
-                let clip = record.layout.filter(|layout| layout.clip != neon_ui_schema::UiClipPolicy::None).map(|_| bounds);
+                let clip = record
+                    .layout
+                    .filter(|layout| layout.clip != neon_ui_schema::UiClipPolicy::None)
+                    .map(|_| bounds);
                 if let Some(clip) = clip {
                     clips.insert(record.node_key.clone(), clip);
                 }

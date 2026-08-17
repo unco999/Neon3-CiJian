@@ -52,7 +52,7 @@ The first generic control batch is `checkbox`, `radio_button`, `slider`,
 ```text
 input enabled bool default true
 input checked bool default false
-input amount f32 default 0.5
+input amount f32:0..1 default 0.5
 input choice enum:alpha|beta default alpha
 surface controls column w 320 h 220
   checkbox feature checked $checked enabled $enabled event settings.feature.toggle
@@ -62,7 +62,9 @@ surface controls column w 320 h 220
 ```
 
 `checked` and `selected` require bool inputs. `numeric` and `scroll` require
-`i32`, `u32`, or `f32` inputs. `state` requires an enum input. Use an event for
+`i32`, `u32`, or `f32` inputs. Interactive numeric controls should declare a
+range with deterministic `<kind>:<minimum>..<maximum>` syntax, such as
+`i32:0..24` or `f32:0..1`. `state` requires an enum input. Use an event for
 the declared preview, commit, or selection semantic; do not encode a control
 value in the intent name, pointer coordinates, or a renderer-local identifier.
 The renderer keeps focus and pointer capture local, excludes disabled controls

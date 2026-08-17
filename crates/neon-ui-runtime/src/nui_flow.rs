@@ -7,17 +7,17 @@ use std::collections::{BTreeMap, HashSet};
 
 use neon_protocol::Revision;
 use neon_ui_schema::{
-    NuiFlowDocument, NuiFlowParseDiagnostic, NuiSourceSpan, TextRef, UiAlignItems, UiBoundProperty,
-    UiBounds, UiDiagnosticSeverity, UiGridInputSlot, UiInputKind, UiInputPacking, UiInputSchema, UiInputSlot,
-    UiInputUpdateClass, UiInputValue, UiIrBinding, UiIrDocument, UiIrPatch, UiIrPatchOperation,
+    NuiFlowDocument, NuiFlowDragAxis, NuiFlowDragDeclaration, NuiFlowDropDeclaration,
+    NuiFlowParseDiagnostic, NuiFlowStateMachine, NuiFlowStateTransition, NuiFlowStateTrigger,
+    NuiSourceSpan, RenderSurfaceRef, TextRef, UiAlignItems, UiBoundProperty, UiBounds,
+    UiBranchDeclaration, UiBranchLayoutParticipation, UiBranchPredicate, UiClipPolicy,
+    UiDataGridColumn, UiDataGridDeclaration, UiDataGridPresentation, UiDiagnosticSeverity,
+    UiDragAxis, UiDragBinding, UiDragBoundary, UiDropBinding, UiDropPlacement, UiEffect,
+    UiGridInputSlot, UiInputKind, UiInputPacking, UiInputSchema, UiInputSlot, UiInputUpdateClass,
+    UiInputValue, UiIntent, UiIrBinding, UiIrDocument, UiIrPatch, UiIrPatchOperation,
     UiIrPatchOperationKind, UiJustifyContent, UiLayout, UiLayoutMode, UiNode, UiNodeId, UiNodeKind,
-    RenderSurfaceRef, UiProgramEventDeclaration, UiResourceBudget, UiSourceSpan, UiStyle,
-    UiSurfaceId, UiProgram, UiProgramRevision, UiBranchDeclaration, UiBranchPredicate,
-    UiBranchLayoutParticipation, UiTemplateDeclaration, UiDataGridDeclaration, UiDataGridColumn,
-    UiDataGridPresentation,
-    NuiFlowStateMachine, NuiFlowStateTransition, NuiFlowStateTrigger,
-    NuiFlowDragAxis, NuiFlowDragDeclaration, UiDragAxis, UiDragBinding, UiDragBoundary, UiDropBinding, UiEffect, UiIntent,
-    NuiFlowDropDeclaration, UiClipPolicy, UiDropPlacement,
+    UiProgram, UiProgramEventDeclaration, UiProgramRevision, UiResourceBudget, UiSourceSpan,
+    UiStyle, UiSurfaceId, UiTemplateDeclaration,
 };
 use serde_json::json;
 
@@ -76,15 +76,31 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
         reject_forbidden(content, line)?;
         if indent == 0 {
             if let Some(drop) = parse_drop_declaration(content, line)? {
-                if drops.iter().any(|existing: &NuiFlowDropDeclaration| existing.key == drop.key) {
-                    return Err(error("nui_flow_invalid_drop", "drop keys must be unique", line, 1));
+                if drops
+                    .iter()
+                    .any(|existing: &NuiFlowDropDeclaration| existing.key == drop.key)
+                {
+                    return Err(error(
+                        "nui_flow_invalid_drop",
+                        "drop keys must be unique",
+                        line,
+                        1,
+                    ));
                 }
                 drops.push(drop);
                 continue;
             }
             if let Some(drag) = parse_drag_declaration(content, line)? {
-                if drags.iter().any(|existing: &NuiFlowDragDeclaration| existing.key == drag.key) {
-                    return Err(error("nui_flow_invalid_drag", "drag keys must be unique", line, 1));
+                if drags
+                    .iter()
+                    .any(|existing: &NuiFlowDragDeclaration| existing.key == drag.key)
+                {
+                    return Err(error(
+                        "nui_flow_invalid_drag",
+                        "drag keys must be unique",
+                        line,
+                        1,
+                    ));
                 }
                 drags.push(drag);
                 continue;
@@ -93,7 +109,10 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
                 continue;
             }
             if let Some(input) = parse_input(content, line)? {
-                let key = match &input { ParsedInput::Scalar(slot) => &slot.key, ParsedInput::Grid(slot) => &slot.key };
+                let key = match &input {
+                    ParsedInput::Scalar(slot) => &slot.key,
+                    ParsedInput::Grid(slot) => &slot.key,
+                };
                 if !seen_inputs.insert(key.clone()) {
                     return Err(error(
                         "ui_program_duplicate_input_key",
@@ -102,7 +121,10 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
                         1,
                     ));
                 }
-                match input { ParsedInput::Scalar(slot) => input_slots.push(slot), ParsedInput::Grid(slot) => grid_slots.push(slot) }
+                match input {
+                    ParsedInput::Scalar(slot) => input_slots.push(slot),
+                    ParsedInput::Grid(slot) => grid_slots.push(slot),
+                }
                 continue;
             }
             if parse_header(content, &mut header, line)? {
@@ -133,7 +155,10 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
             ));
         }
         if source_map
-            .insert(node.node.node_id.0.clone(), span(line, (indent + 1) as u32, content))
+            .insert(
+                node.node.node_id.0.clone(),
+                span(line, (indent + 1) as u32, content),
+            )
             .is_some()
         {
             return Err(error(
@@ -158,20 +183,46 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
                 literal_payload: std::collections::BTreeMap::new(),
                 // A control event carries its declared controlled input through
                 // the generic semantic boundary, never a renderer-local value.
-                bound_input_keys: node.bindings.iter().filter_map(|(property, key)| {
-                    matches!(property, UiBoundProperty::TextValue | UiBoundProperty::Active | UiBoundProperty::Selected | UiBoundProperty::NumericValue | UiBoundProperty::StateToken)
+                bound_input_keys: node
+                    .bindings
+                    .iter()
+                    .filter_map(|(property, key)| {
+                        matches!(
+                            property,
+                            UiBoundProperty::TextValue
+                                | UiBoundProperty::Active
+                                | UiBoundProperty::Selected
+                                | UiBoundProperty::NumericValue
+                                | UiBoundProperty::StateToken
+                        )
                         .then_some(key.clone())
-                }).collect(),
+                    })
+                    .collect(),
             });
         }
         if let Some(predicate) = &node.branch_predicate {
-            branches.push(UiBranchDeclaration { branch_key: node.node.node_id.0.clone(), root_node_key: node.node.node_id.0.clone(), predicate: predicate.clone(), layout_participation: UiBranchLayoutParticipation::HiddenSubtree });
+            branches.push(UiBranchDeclaration {
+                branch_key: node.node.node_id.0.clone(),
+                root_node_key: node.node.node_id.0.clone(),
+                predicate: predicate.clone(),
+                layout_participation: UiBranchLayoutParticipation::HiddenSubtree,
+            });
         }
         if let Some(template) = &node.template {
-            templates.push(UiTemplateDeclaration { template_key: node.node.node_id.0.clone(), root_node_key: node.node.node_id.0.clone(), max_instances: template.0, row_schema: template.1.clone(), instance_key_field: template.2.clone(), overflow_summary: template.3 });
+            templates.push(UiTemplateDeclaration {
+                template_key: node.node.node_id.0.clone(),
+                root_node_key: node.node.node_id.0.clone(),
+                max_instances: template.0,
+                row_schema: template.1.clone(),
+                instance_key_field: template.2.clone(),
+                overflow_summary: template.3,
+            });
         }
         if let Some(ref grid) = node.data_grid {
-            data_grids.push(UiDataGridDeclaration { node_key: node.node.node_id.0.clone(), ..grid.clone() });
+            data_grids.push(UiDataGridDeclaration {
+                node_key: node.node.node_id.0.clone(),
+                ..grid.clone()
+            });
         }
         stack.push((indent, node));
     }
@@ -214,7 +265,11 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
         let binding_span = source_map
             .get(&binding.node_key)
             .expect("Flow node keys populate the source map");
-        let slot = schema.slots.iter().find(|slot| slot.key == binding.input_key).ok_or_else(|| {
+        let slot = schema
+            .slots
+            .iter()
+            .find(|slot| slot.key == binding.input_key)
+            .ok_or_else(|| {
                 error_at(
                     "ui_program_unknown_binding_target",
                     "binding references an input that is not declared by this Flow document",
@@ -232,46 +287,123 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
     for branch in &branches {
         match &branch.predicate {
             UiBranchPredicate::MachineState { machine_key, state } => {
-                let machine = state_machines.iter().find(|machine| &machine.key == machine_key).ok_or_else(|| error("nui_flow_invalid_state_machine", "branch references an undeclared machine", 1, 1))?;
+                let machine = state_machines
+                    .iter()
+                    .find(|machine| &machine.key == machine_key)
+                    .ok_or_else(|| {
+                        error(
+                            "nui_flow_invalid_state_machine",
+                            "branch references an undeclared machine",
+                            1,
+                            1,
+                        )
+                    })?;
                 if !machine.states.iter().any(|candidate| candidate == state) {
-                    return Err(error("nui_flow_invalid_state_machine", "branch references an undeclared machine state", 1, 1));
+                    return Err(error(
+                        "nui_flow_invalid_state_machine",
+                        "branch references an undeclared machine state",
+                        1,
+                        1,
+                    ));
                 }
             }
-            UiBranchPredicate::Bool { input_key, .. } | UiBranchPredicate::EnumEquals { input_key, .. } => {
-                let slot = schema.slots.iter().find(|slot| &slot.key == input_key).ok_or_else(|| error("ui_program_invalid_branch_template", "branch predicate input is not declared", 1, 1))?;
+            UiBranchPredicate::Bool { input_key, .. }
+            | UiBranchPredicate::EnumEquals { input_key, .. } => {
+                let slot = schema
+                    .slots
+                    .iter()
+                    .find(|slot| &slot.key == input_key)
+                    .ok_or_else(|| {
+                        error(
+                            "ui_program_invalid_branch_template",
+                            "branch predicate input is not declared",
+                            1,
+                            1,
+                        )
+                    })?;
                 match (&branch.predicate, &slot.kind) {
-                    (UiBranchPredicate::Bool { .. }, UiInputKind::Bool) | (UiBranchPredicate::EnumEquals { .. }, UiInputKind::Enum { .. }) => {}
-                    _ => return Err(error("ui_program_invalid_branch_template", "branch when requires a bool or enum input", 1, 1)),
+                    (UiBranchPredicate::Bool { .. }, UiInputKind::Bool)
+                    | (UiBranchPredicate::EnumEquals { .. }, UiInputKind::Enum { .. }) => {}
+                    _ => {
+                        return Err(error(
+                            "ui_program_invalid_branch_template",
+                            "branch when requires a bool or enum input",
+                            1,
+                            1,
+                        ));
+                    }
                 }
             }
         }
     }
     apply_boolean_binding_defaults(&mut root.node, &bindings, &schema);
     for grid in &data_grids {
-        if !schema.grid_slots.iter().any(|slot| slot.key == grid.source_key) {
-            return Err(error("ui_program_unknown_input_key", "DataGrid source must reference a declared grid input", 1, 1));
+        if !schema
+            .grid_slots
+            .iter()
+            .any(|slot| slot.key == grid.source_key)
+        {
+            return Err(error(
+                "ui_program_unknown_input_key",
+                "DataGrid source must reference a declared grid input",
+                1,
+                1,
+            ));
         }
     }
     validate_state_machines(&state_machines, &schema)?;
     for drag in &drags {
         if !source_map.contains_key(&drag.source_node_key) {
-            return Err(error("nui_flow_invalid_drag", "drag source node is not declared", 1, 1));
+            return Err(error(
+                "nui_flow_invalid_drag",
+                "drag source node is not declared",
+                1,
+                1,
+            ));
         }
     }
     for drop in &drops {
         if !source_map.contains_key(&drop.target_node_key) {
-            return Err(error("nui_flow_invalid_drop", "drop target node is not declared", 1, 1));
+            return Err(error(
+                "nui_flow_invalid_drop",
+                "drop target node is not declared",
+                1,
+                1,
+            ));
         }
         if !drags.iter().any(|drag| drag.key == drop.accepts_drag_key) {
-            return Err(error("nui_flow_invalid_drop", "drop accepts an undeclared drag key", 1, 1));
+            return Err(error(
+                "nui_flow_invalid_drop",
+                "drop accepts an undeclared drag key",
+                1,
+                1,
+            ));
         }
         if let Some(template_key) = &drop.presentation_template_key {
-            let template = templates.iter().find(|template| &template.template_key == template_key)
-                .ok_or_else(|| error("nui_flow_invalid_drop", "drop present references an undeclared bounded template", 1, 1))?;
+            let template = templates
+                .iter()
+                .find(|template| &template.template_key == template_key)
+                .ok_or_else(|| {
+                    error(
+                        "nui_flow_invalid_drop",
+                        "drop present references an undeclared bounded template",
+                        1,
+                        1,
+                    )
+                })?;
             let target = find_node(&root.node, &drop.target_node_key)
                 .expect("declared drop target exists in the Flow tree");
-            if !target.children.iter().any(|child| child.node_id.0 == template.root_node_key) {
-                return Err(error("nui_flow_invalid_drop", "drop present template must be directly owned by its target", 1, 1));
+            if !target
+                .children
+                .iter()
+                .any(|child| child.node_id.0 == template.root_node_key)
+            {
+                return Err(error(
+                    "nui_flow_invalid_drop",
+                    "drop present template must be directly owned by its target",
+                    1,
+                    1,
+                ));
             }
         }
     }
@@ -315,24 +447,43 @@ pub fn lower_nui_flow(document: &NuiFlowDocument) -> UiIrDocument {
 /// Lowers Flow's declarative interaction vocabulary into the renderer-neutral
 /// fragment effect contract. Pointer capture and preview remain WGPU-local.
 pub fn lower_nui_flow_effects(document: &NuiFlowDocument) -> Vec<UiEffect> {
-    let mut effects = document.ir.events.iter().map(|event| UiEffect::BoundSemanticIntent {
+    let mut effects = document
+        .ir
+        .events
+        .iter()
+        .map(|event| UiEffect::BoundSemanticIntent {
             node_id: UiNodeId(event.node_key.clone()),
-        intent: UiIntent::Invoke { action: event.intent.clone(), params: json!({}) },
-    }).collect::<Vec<_>>();
+            intent: UiIntent::Invoke {
+                action: event.intent.clone(),
+                params: json!({}),
+            },
+        })
+        .collect::<Vec<_>>();
     effects.extend(document.drags.iter().map(|drag| UiEffect::DragBinding {
         binding: UiDragBinding {
-            key: drag.key.clone(), source_node_id: UiNodeId(drag.source_node_key.clone()),
-            axis: match drag.axis { NuiFlowDragAxis::Horizontal => UiDragAxis::Horizontal, NuiFlowDragAxis::Vertical => UiDragAxis::Vertical, NuiFlowDragAxis::Both => UiDragAxis::Both },
-            snap: drag.snap, threshold: drag.threshold, boundary: drag.boundary,
+            key: drag.key.clone(),
+            source_node_id: UiNodeId(drag.source_node_key.clone()),
+            axis: match drag.axis {
+                NuiFlowDragAxis::Horizontal => UiDragAxis::Horizontal,
+                NuiFlowDragAxis::Vertical => UiDragAxis::Vertical,
+                NuiFlowDragAxis::Both => UiDragAxis::Both,
+            },
+            snap: drag.snap,
+            threshold: drag.threshold,
+            boundary: drag.boundary,
         },
     }));
     effects.extend(document.drops.iter().map(|drop| UiEffect::DropBinding {
         binding: UiDropBinding {
-            key: drop.key.clone(), target_node_id: UiNodeId(drop.target_node_key.clone()),
+            key: drop.key.clone(),
+            target_node_id: UiNodeId(drop.target_node_key.clone()),
             accepts_drag_key: drop.accepts_drag_key.clone(),
             placement: drop.placement,
             presentation_template_key: drop.presentation_template_key.clone(),
-            intent: UiIntent::Invoke { action: drop.emit_intent.clone(), params: json!({}) },
+            intent: UiIntent::Invoke {
+                action: drop.emit_intent.clone(),
+                params: json!({}),
+            },
         },
     }));
     effects
@@ -345,6 +496,34 @@ pub fn compile_nui_flow_program(
     revision: UiProgramRevision,
 ) -> Result<UiProgram, crate::UiProgramCompileError> {
     let mut program = crate::compile_ui_program(&document.ir, revision, &document.input_schema)?;
+    program.drag_records = document
+        .drags
+        .iter()
+        .map(|drag| neon_ui_schema::UiProgramDragRecord {
+            key: drag.key.clone(),
+            source_node_key: drag.source_node_key.clone(),
+            axis: match drag.axis {
+                NuiFlowDragAxis::Horizontal => UiDragAxis::Horizontal,
+                NuiFlowDragAxis::Vertical => UiDragAxis::Vertical,
+                NuiFlowDragAxis::Both => UiDragAxis::Both,
+            },
+            snap: drag.snap,
+            threshold: drag.threshold,
+            boundary: drag.boundary,
+        })
+        .collect();
+    program.drop_records = document
+        .drops
+        .iter()
+        .map(|drop| neon_ui_schema::UiProgramDropRecord {
+            key: drop.key.clone(),
+            target_node_key: drop.target_node_key.clone(),
+            accepts_drag_key: drop.accepts_drag_key.clone(),
+            placement: drop.placement,
+            presentation_template_key: drop.presentation_template_key.clone(),
+            intent: drop.emit_intent.clone(),
+        })
+        .collect();
     for node in &mut program.nodes {
         if let Some(span) = document.source_map.get(&node.key) {
             let source_span = UiSourceSpan {
@@ -385,7 +564,8 @@ pub fn format_nui_flow(source: &str) -> FlowResult<String> {
         &parsed.ir.root,
         0,
         &parsed.ir.bindings,
-        &parsed.ir.events, &parsed.ir.data_grids,
+        &parsed.ir.events,
+        &parsed.ir.data_grids,
         &mut lines,
     );
     Ok(lines.join("\n") + "\n")
@@ -440,7 +620,7 @@ pub fn parse_nui_flow_patch(source: &str) -> FlowResult<UiIrPatch> {
                     "expected @ revision, +, -, ~, or > patch operation",
                     line,
                     1,
-                ))
+                ));
             }
         }
     }
@@ -551,7 +731,9 @@ impl StablePath {
             .map(str::to_owned)
             .collect::<Vec<_>>();
         if segments.is_empty()
-            || segments.iter().any(|segment| !valid_key(segment) || segment.bytes().all(|b| b.is_ascii_digit()))
+            || segments
+                .iter()
+                .any(|segment| !valid_key(segment) || segment.bytes().all(|b| b.is_ascii_digit()))
         {
             return Err(error_at(
                 "nui_flow_invalid_patch_path",
@@ -562,20 +744,33 @@ impl StablePath {
         Ok(Self(segments))
     }
 
-    fn last(&self) -> &str { self.0.last().expect("validated path") }
-    fn segments(&self) -> &[String] { &self.0 }
-    fn matches_root(&self, root: &str) -> bool { self.0.len() == 1 && self.0[0] == root }
+    fn last(&self) -> &str {
+        self.0.last().expect("validated path")
+    }
+    fn segments(&self) -> &[String] {
+        &self.0
+    }
+    fn matches_root(&self, root: &str) -> bool {
+        self.0.len() == 1 && self.0[0] == root
+    }
 }
 
 fn path_exists(root: &UiNode, segments: &[String]) -> bool {
-    let segments = if segments.first().is_some_and(|segment| segment == &root.node_id.0) {
+    let segments = if segments
+        .first()
+        .is_some_and(|segment| segment == &root.node_id.0)
+    {
         &segments[1..]
     } else {
         return false;
     };
     let mut node = root;
     for segment in segments {
-        let Some(child) = node.children.iter().find(|child| child.node_id.0 == *segment) else {
+        let Some(child) = node
+            .children
+            .iter()
+            .find(|child| child.node_id.0 == *segment)
+        else {
             return false;
         };
         node = child;
@@ -642,7 +837,7 @@ fn parse_header(text: &str, header: &mut Header, line: u32) -> FlowResult<bool> 
                             "unknown budget field",
                             line,
                             1,
-                        ))
+                        ));
                     }
                 };
             }
@@ -662,20 +857,32 @@ fn parse_state_machine_declaration(
     let invalid = |message| error("nui_flow_invalid_state_machine", message, line, 1);
     match words.first().copied() {
         Some("machine") => {
-            if words.len() != 4 || words[2] != "initial" || !valid_key(words[1]) || !valid_key(words[3]) {
+            if words.len() != 4
+                || words[2] != "initial"
+                || !valid_key(words[1])
+                || !valid_key(words[3])
+            {
                 return Err(invalid("machine syntax is: machine <key> initial <state>"));
             }
             if machines.iter().any(|machine| machine.key == words[1]) {
                 return Err(invalid("machine keys must be unique"));
             }
-            machines.push(NuiFlowStateMachine { key: words[1].into(), initial_state: words[3].into(), states: vec![words[3].into()], transitions: Vec::new() });
+            machines.push(NuiFlowStateMachine {
+                key: words[1].into(),
+                initial_state: words[3].into(),
+                states: vec![words[3].into()],
+                transitions: Vec::new(),
+            });
             Ok(true)
         }
         Some("state") => {
             if words.len() != 3 || !valid_key(words[1]) || !valid_key(words[2]) {
                 return Err(invalid("state syntax is: state <machine> <state>"));
             }
-            let machine = machines.iter_mut().find(|machine| machine.key == words[1]).ok_or_else(|| invalid("state references an undeclared machine"))?;
+            let machine = machines
+                .iter_mut()
+                .find(|machine| machine.key == words[1])
+                .ok_or_else(|| invalid("state references an undeclared machine"))?;
             if machine.states.iter().any(|state| state == words[2]) {
                 return Err(invalid("state keys must be unique within a machine"));
             }
@@ -684,31 +891,64 @@ fn parse_state_machine_declaration(
         }
         Some("sync") => {
             if words.len() != 6 || words[2] != "when" || words[4] != "->" {
-                return Err(invalid("sync syntax is: sync <machine> when <predicate> -> <state>"));
+                return Err(invalid(
+                    "sync syntax is: sync <machine> when <predicate> -> <state>",
+                ));
             }
             let predicate = parse_branch_predicate(words[3], line)?;
-            let machine = machines.iter_mut().find(|machine| machine.key == words[1]).ok_or_else(|| invalid("sync references an undeclared machine"))?;
-            machine.transitions.push(NuiFlowStateTransition { from_state: "*".into(), trigger: NuiFlowStateTrigger::Sync, predicate: Some(predicate), target_state: words[5].into(), emit_intent: None });
+            let machine = machines
+                .iter_mut()
+                .find(|machine| machine.key == words[1])
+                .ok_or_else(|| invalid("sync references an undeclared machine"))?;
+            machine.transitions.push(NuiFlowStateTransition {
+                from_state: "*".into(),
+                trigger: NuiFlowStateTrigger::Sync,
+                predicate: Some(predicate),
+                target_state: words[5].into(),
+                emit_intent: None,
+            });
             Ok(true)
         }
         Some("on") => {
             let when_index = words.iter().position(|word| *word == "when");
-            let arrow_index = words.iter().position(|word| *word == "->").ok_or_else(|| invalid("event transition requires -> <state>"))?;
+            let arrow_index = words
+                .iter()
+                .position(|word| *word == "->")
+                .ok_or_else(|| invalid("event transition requires -> <state>"))?;
             if words.len() < 5 || arrow_index + 1 >= words.len() || !valid_intent(words[2]) {
-                return Err(invalid("on syntax is: on <machine> <intent> [when <predicate>] -> <state> [emit <intent>]"));
+                return Err(invalid(
+                    "on syntax is: on <machine> <intent> [when <predicate>] -> <state> [emit <intent>]",
+                ));
             }
             if let Some(index) = when_index {
-                if index != 3 || arrow_index != 5 { return Err(invalid("event transition has an invalid when clause")); }
-            } else if arrow_index != 3 { return Err(invalid("event transition has an invalid target")); }
+                if index != 3 || arrow_index != 5 {
+                    return Err(invalid("event transition has an invalid when clause"));
+                }
+            } else if arrow_index != 3 {
+                return Err(invalid("event transition has an invalid target"));
+            }
             let trailing = &words[arrow_index + 2..];
             let emit_intent = match trailing {
                 [] => None,
                 ["emit", intent] if valid_intent(intent) => Some((*intent).into()),
                 _ => return Err(invalid("emit accepts one dotted semantic intent")),
             };
-            let predicate = when_index.map(|_| parse_branch_predicate(words[4], line)).transpose()?;
-            let machine = machines.iter_mut().find(|machine| machine.key == words[1]).ok_or_else(|| invalid("event transition references an undeclared machine"))?;
-            machine.transitions.push(NuiFlowStateTransition { from_state: "*".into(), trigger: NuiFlowStateTrigger::Intent { name: words[2].into() }, predicate, target_state: words[arrow_index + 1].into(), emit_intent });
+            let predicate = when_index
+                .map(|_| parse_branch_predicate(words[4], line))
+                .transpose()?;
+            let machine = machines
+                .iter_mut()
+                .find(|machine| machine.key == words[1])
+                .ok_or_else(|| invalid("event transition references an undeclared machine"))?;
+            machine.transitions.push(NuiFlowStateTransition {
+                from_state: "*".into(),
+                trigger: NuiFlowStateTrigger::Intent {
+                    name: words[2].into(),
+                },
+                predicate,
+                target_state: words[arrow_index + 1].into(),
+                emit_intent,
+            });
             Ok(true)
         }
         _ => Ok(false),
@@ -718,34 +958,85 @@ fn parse_state_machine_declaration(
 fn parse_drag_declaration(text: &str, line: u32) -> FlowResult<Option<NuiFlowDragDeclaration>> {
     let parts = tokenize(text, line)?;
     let words = parts.iter().map(String::as_str).collect::<Vec<_>>();
-    if words.first().copied() != Some("drag") { return Ok(None); }
-    if words.len() != 12 || words[2] != "source" || words[4] != "axis" || words[6] != "snap" || words[8] != "threshold" || words[10] != "within" || !valid_key(words[1]) || !valid_key(words[3]) {
-        return Err(error("nui_flow_invalid_drag", "drag syntax is: drag <key> source <node> axis <horizontal|vertical|both> snap <px> threshold <px> within <parent|surface|free>", line, 1));
+    if words.first().copied() != Some("drag") {
+        return Ok(None);
+    }
+    if words.len() != 12
+        || words[2] != "source"
+        || words[4] != "axis"
+        || words[6] != "snap"
+        || words[8] != "threshold"
+        || words[10] != "within"
+        || !valid_key(words[1])
+        || !valid_key(words[3])
+    {
+        return Err(error(
+            "nui_flow_invalid_drag",
+            "drag syntax is: drag <key> source <node> axis <horizontal|vertical|both> snap <px> threshold <px> within <parent|surface|free>",
+            line,
+            1,
+        ));
     }
     let axis = match words[5] {
         "horizontal" => NuiFlowDragAxis::Horizontal,
         "vertical" => NuiFlowDragAxis::Vertical,
         "both" => NuiFlowDragAxis::Both,
-        _ => return Err(error("nui_flow_invalid_drag", "drag axis must be horizontal, vertical, or both", line, 1)),
+        _ => {
+            return Err(error(
+                "nui_flow_invalid_drag",
+                "drag axis must be horizontal, vertical, or both",
+                line,
+                1,
+            ));
+        }
     };
     let snap = number(words[7], line)?;
     let threshold = number(words[9], line)?;
-    if snap < 0.0 || threshold < 0.0 { return Err(error("nui_flow_invalid_drag", "drag snap and threshold must be nonnegative", line, 1)); }
+    if snap < 0.0 || threshold < 0.0 {
+        return Err(error(
+            "nui_flow_invalid_drag",
+            "drag snap and threshold must be nonnegative",
+            line,
+            1,
+        ));
+    }
     let boundary = match words[11] {
         "parent" => UiDragBoundary::Parent,
         "surface" => UiDragBoundary::Surface,
         "free" => UiDragBoundary::Free,
-        _ => return Err(error("nui_flow_invalid_drag", "drag within must be parent, surface, or free", line, 1)),
+        _ => {
+            return Err(error(
+                "nui_flow_invalid_drag",
+                "drag within must be parent, surface, or free",
+                line,
+                1,
+            ));
+        }
     };
-    Ok(Some(NuiFlowDragDeclaration { key: words[1].into(), source_node_key: words[3].into(), axis, snap, threshold, boundary }))
+    Ok(Some(NuiFlowDragDeclaration {
+        key: words[1].into(),
+        source_node_key: words[3].into(),
+        axis,
+        snap,
+        threshold,
+        boundary,
+    }))
 }
 
 fn parse_drop_declaration(text: &str, line: u32) -> FlowResult<Option<NuiFlowDropDeclaration>> {
     let parts = tokenize(text, line)?;
     let words = parts.iter().map(String::as_str).collect::<Vec<_>>();
-    if words.first().copied() != Some("drop") { return Ok(None); }
-    if words.len() < 8 || words[..6] != ["drop", words[1], "target", words[3], "accepts", words[5]] {
-        return Err(error("nui_flow_invalid_drop", "drop syntax is: drop <key> target <node> accepts <drag> [placement <into|before|after>] [present <template-key>] emit <intent>", line, 1));
+    if words.first().copied() != Some("drop") {
+        return Ok(None);
+    }
+    if words.len() < 8 || words[..6] != ["drop", words[1], "target", words[3], "accepts", words[5]]
+    {
+        return Err(error(
+            "nui_flow_invalid_drop",
+            "drop syntax is: drop <key> target <node> accepts <drag> [placement <into|before|after>] [present <template-key>] emit <intent>",
+            line,
+            1,
+        ));
     }
     let mut cursor = 6;
     let mut placement = UiDropPlacement::Into;
@@ -754,24 +1045,62 @@ fn parse_drop_declaration(text: &str, line: u32) -> FlowResult<Option<NuiFlowDro
             Some("into") => UiDropPlacement::Into,
             Some("before") => UiDropPlacement::Before,
             Some("after") => UiDropPlacement::After,
-            _ => return Err(error("nui_flow_invalid_drop", "drop placement must be into, before, or after", line, 1)),
+            _ => {
+                return Err(error(
+                    "nui_flow_invalid_drop",
+                    "drop placement must be into, before, or after",
+                    line,
+                    1,
+                ));
+            }
         };
         cursor += 2;
     }
     let presentation_template_key = if words.get(cursor) == Some(&"present") {
-        let template_key = words.get(cursor + 1).ok_or_else(|| error("nui_flow_invalid_drop", "drop present requires a template key", line, 1))?;
+        let template_key = words.get(cursor + 1).ok_or_else(|| {
+            error(
+                "nui_flow_invalid_drop",
+                "drop present requires a template key",
+                line,
+                1,
+            )
+        })?;
         cursor += 2;
         Some((*template_key).to_string())
     } else {
         None
     };
     if words.get(cursor) != Some(&"emit") || cursor + 2 != words.len() {
-        return Err(error("nui_flow_invalid_drop", "drop syntax is: drop <key> target <node> accepts <drag> [placement <into|before|after>] [present <template-key>] emit <intent>", line, 1));
+        return Err(error(
+            "nui_flow_invalid_drop",
+            "drop syntax is: drop <key> target <node> accepts <drag> [placement <into|before|after>] [present <template-key>] emit <intent>",
+            line,
+            1,
+        ));
     }
-    if !valid_key(words[1]) || !valid_key(words[3]) || !valid_key(words[5]) || !presentation_template_key.as_ref().is_none_or(|key| valid_key(key)) || !valid_intent(words[cursor + 1]) {
-        return Err(error("nui_flow_invalid_drop", "drop keys and intent are invalid", line, 1));
+    if !valid_key(words[1])
+        || !valid_key(words[3])
+        || !valid_key(words[5])
+        || !presentation_template_key
+            .as_ref()
+            .is_none_or(|key| valid_key(key))
+        || !valid_intent(words[cursor + 1])
+    {
+        return Err(error(
+            "nui_flow_invalid_drop",
+            "drop keys and intent are invalid",
+            line,
+            1,
+        ));
     }
-    Ok(Some(NuiFlowDropDeclaration { key: words[1].into(), target_node_key: words[3].into(), accepts_drag_key: words[5].into(), placement, presentation_template_key, emit_intent: words[cursor + 1].into() }))
+    Ok(Some(NuiFlowDropDeclaration {
+        key: words[1].into(),
+        target_node_key: words[3].into(),
+        accepts_drag_key: words[5].into(),
+        placement,
+        presentation_template_key,
+        emit_intent: words[cursor + 1].into(),
+    }))
 }
 
 fn find_node<'a>(node: &'a UiNode, key: &str) -> Option<&'a UiNode> {
@@ -781,20 +1110,75 @@ fn find_node<'a>(node: &'a UiNode, key: &str) -> Option<&'a UiNode> {
     node.children.iter().find_map(|child| find_node(child, key))
 }
 
-fn validate_state_machines(machines: &[NuiFlowStateMachine], schema: &UiInputSchema) -> FlowResult<()> {
+fn validate_state_machines(
+    machines: &[NuiFlowStateMachine],
+    schema: &UiInputSchema,
+) -> FlowResult<()> {
     for machine in machines {
-        if !machine.states.iter().any(|state| state == &machine.initial_state) {
-            return Err(error("nui_flow_invalid_state_machine", "initial state must be declared", 1, 1));
+        if !machine
+            .states
+            .iter()
+            .any(|state| state == &machine.initial_state)
+        {
+            return Err(error(
+                "nui_flow_invalid_state_machine",
+                "initial state must be declared",
+                1,
+                1,
+            ));
         }
         for transition in &machine.transitions {
-            if !machine.states.iter().any(|state| state == &transition.target_state) {
-                return Err(error("nui_flow_invalid_state_machine", "transition target state is not declared", 1, 1));
+            if !machine
+                .states
+                .iter()
+                .any(|state| state == &transition.target_state)
+            {
+                return Err(error(
+                    "nui_flow_invalid_state_machine",
+                    "transition target state is not declared",
+                    1,
+                    1,
+                ));
             }
             if let Some(predicate) = &transition.predicate {
-                let input_key = match predicate { UiBranchPredicate::Bool { input_key, .. } | UiBranchPredicate::EnumEquals { input_key, .. } => input_key, UiBranchPredicate::MachineState { .. } => return Err(error("nui_flow_invalid_state_machine", "state transitions cannot predicate on another machine", 1, 1)) };
-                let slot = schema.slots.iter().find(|slot| slot.key == *input_key).ok_or_else(|| error("nui_flow_invalid_state_machine", "transition predicate input is not declared", 1, 1))?;
-                if !matches!((predicate, &slot.kind), (UiBranchPredicate::Bool { .. }, UiInputKind::Bool) | (UiBranchPredicate::EnumEquals { .. }, UiInputKind::Enum { .. })) {
-                    return Err(error("nui_flow_invalid_state_machine", "transition predicate type is incompatible", 1, 1));
+                let input_key = match predicate {
+                    UiBranchPredicate::Bool { input_key, .. }
+                    | UiBranchPredicate::EnumEquals { input_key, .. } => input_key,
+                    UiBranchPredicate::MachineState { .. } => {
+                        return Err(error(
+                            "nui_flow_invalid_state_machine",
+                            "state transitions cannot predicate on another machine",
+                            1,
+                            1,
+                        ));
+                    }
+                };
+                let slot = schema
+                    .slots
+                    .iter()
+                    .find(|slot| slot.key == *input_key)
+                    .ok_or_else(|| {
+                        error(
+                            "nui_flow_invalid_state_machine",
+                            "transition predicate input is not declared",
+                            1,
+                            1,
+                        )
+                    })?;
+                if !matches!(
+                    (predicate, &slot.kind),
+                    (UiBranchPredicate::Bool { .. }, UiInputKind::Bool)
+                        | (
+                            UiBranchPredicate::EnumEquals { .. },
+                            UiInputKind::Enum { .. }
+                        )
+                ) {
+                    return Err(error(
+                        "nui_flow_invalid_state_machine",
+                        "transition predicate type is incompatible",
+                        1,
+                        1,
+                    ));
                 }
             }
         }
@@ -802,7 +1186,10 @@ fn validate_state_machines(machines: &[NuiFlowStateMachine], schema: &UiInputSch
     Ok(())
 }
 
-enum ParsedInput { Scalar(UiInputSlot), Grid(UiGridInputSlot) }
+enum ParsedInput {
+    Scalar(UiInputSlot),
+    Grid(UiGridInputSlot),
+}
 
 fn parse_input(text: &str, line: u32) -> FlowResult<Option<ParsedInput>> {
     let parts = text.split_whitespace().collect::<Vec<_>>();
@@ -819,9 +1206,16 @@ fn parse_input(text: &str, line: u32) -> FlowResult<Option<ParsedInput>> {
     }
     if parts[2] == "grid" {
         if parts[4] != "grid:empty" {
-            return Err(error("nui_flow_invalid_literal", "grid inputs require default grid:empty", line, 1));
+            return Err(error(
+                "nui_flow_invalid_literal",
+                "grid inputs require default grid:empty",
+                line,
+                1,
+            ));
         }
-        return Ok(Some(ParsedInput::Grid(UiGridInputSlot { key: parts[1].into() })));
+        return Ok(Some(ParsedInput::Grid(UiGridInputSlot {
+            key: parts[1].into(),
+        })));
     }
     let kind = match parts[2] {
         "bool" => UiInputKind::Bool,
@@ -829,6 +1223,26 @@ fn parse_input(text: &str, line: u32) -> FlowResult<Option<ParsedInput>> {
         "u32" => UiInputKind::U32,
         "f32" => UiInputKind::F32,
         "text" => UiInputKind::TextHandle,
+        range_spec if range_spec.starts_with("i32:") => {
+            let (minimum, maximum) = parse_range(range_spec, "i32", line, str::parse::<i32>)?;
+            UiInputKind::I32Range { minimum, maximum }
+        }
+        range_spec if range_spec.starts_with("u32:") => {
+            let (minimum, maximum) = parse_range(range_spec, "u32", line, str::parse::<u32>)?;
+            UiInputKind::U32Range { minimum, maximum }
+        }
+        range_spec if range_spec.starts_with("f32:") => {
+            let (minimum, maximum) = parse_range(range_spec, "f32", line, str::parse::<f32>)?;
+            if !minimum.is_finite() || !maximum.is_finite() {
+                return Err(error(
+                    "nui_flow_invalid_input",
+                    "f32 range bounds must be finite",
+                    line,
+                    1,
+                ));
+            }
+            UiInputKind::F32Range { minimum, maximum }
+        }
         enum_spec if enum_spec.starts_with("enum:") => {
             let variants = enum_spec[5..]
                 .split('|')
@@ -836,33 +1250,38 @@ fn parse_input(text: &str, line: u32) -> FlowResult<Option<ParsedInput>> {
                 .map(str::to_owned)
                 .collect::<Vec<_>>();
             if variants.is_empty() || variants.iter().any(|variant| !valid_key(variant)) {
-                return Err(error("nui_flow_invalid_input", "enum input variants use enum:one|two and stable variant keys", line, 1));
+                return Err(error(
+                    "nui_flow_invalid_input",
+                    "enum input variants use enum:one|two and stable variant keys",
+                    line,
+                    1,
+                ));
             }
             UiInputKind::Enum { variants }
         }
         _ => {
             return Err(error(
                 "nui_flow_unknown_input_kind",
-                "Flow supports bool, i32, u32, f32, text, and enum:one|two inputs",
+                "Flow supports bool, i32, u32, f32, ranged numeric kinds such as i32:0..24, text, and enum:one|two inputs",
                 line,
                 1,
-            ))
+            ));
         }
     };
-    let value = match (parts[2], parts[4]) {
-        ("bool", "true") => UiInputValue::Bool { value: true },
-        ("bool", "false") => UiInputValue::Bool { value: false },
-        ("i32", value) => UiInputValue::I32 {
+    let value = match (&kind, parts[4]) {
+        (UiInputKind::Bool, "true") => UiInputValue::Bool { value: true },
+        (UiInputKind::Bool, "false") => UiInputValue::Bool { value: false },
+        (UiInputKind::I32 | UiInputKind::I32Range { .. }, value) => UiInputValue::I32 {
             value: value
                 .parse()
                 .map_err(|_| error("nui_flow_invalid_literal", "invalid i32 default", line, 1))?,
         },
-        ("u32", value) => UiInputValue::U32 {
+        (UiInputKind::U32 | UiInputKind::U32Range { .. }, value) => UiInputValue::U32 {
             value: value
                 .parse()
                 .map_err(|_| error("nui_flow_invalid_literal", "invalid u32 default", line, 1))?,
         },
-        ("f32", value) => UiInputValue::F32 {
+        (UiInputKind::F32 | UiInputKind::F32Range { .. }, value) => UiInputValue::F32 {
             value: value
                 .parse::<f32>()
                 .ok()
@@ -876,20 +1295,22 @@ fn parse_input(text: &str, line: u32) -> FlowResult<Option<ParsedInput>> {
                     )
                 })?,
         },
-        ("text", "text:empty") => UiInputValue::TextHandle {
+        (UiInputKind::TextHandle, "text:empty") => UiInputValue::TextHandle {
             value: neon_ui_schema::UiTextHandle {
                 id: 0,
                 generation: 0,
             },
         },
-        (enum_spec, value) if enum_spec.starts_with("enum:") => UiInputValue::Enum { value: value.into() },
+        (UiInputKind::Enum { .. }, value) => UiInputValue::Enum {
+            value: value.into(),
+        },
         _ => {
             return Err(error(
                 "nui_flow_invalid_literal",
                 "input default does not match its type",
                 line,
                 1,
-            ))
+            ));
         }
     };
     let (alignment, lanes, representation) = kind.packing();
@@ -948,7 +1369,7 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
                 "component is outside the closed Flow vocabulary",
                 line,
                 1,
-            ))
+            ));
         }
     };
     if !valid_key(parts[1]) {
@@ -1013,9 +1434,10 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
             "row" => node.layout.as_mut().unwrap().mode = UiLayoutMode::Row,
             "column" => node.layout.as_mut().unwrap().mode = UiLayoutMode::Column,
             "overlay" => node.layout.as_mut().unwrap().mode = UiLayoutMode::Overlay,
-            "x" | "y" | "w" | "h" | "minw" | "maxw" | "grow" | "shrink" | "basis" | "gap" | "pad" | "fill"
-             | "line" | "ink" | "value" | "checked" | "selected" | "state" | "numeric" | "scroll" | "enabled" | "visible" | "event" | "token" | "align" | "clip"
-            | "justify" => {
+            "x" | "y" | "w" | "h" | "minw" | "maxw" | "grow" | "shrink" | "basis" | "gap"
+            | "pad" | "fill" | "line" | "ink" | "value" | "checked" | "selected" | "state"
+            | "numeric" | "scroll" | "enabled" | "visible" | "event" | "token" | "align"
+            | "clip" | "justify" => {
                 let value = *parts.get(index + 1).ok_or_else(|| {
                     error(
                         "nui_flow_missing_value",
@@ -1028,67 +1450,202 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
                 parse_attribute(&mut node, &mut bindings, &mut intents, token, value, line)?;
             }
             "when" if parts[0] == "branch" => {
-                let value = *parts.get(index + 1).ok_or_else(|| error("nui_flow_missing_value", "when requires a direct input predicate", line, 1))?;
+                let value = *parts.get(index + 1).ok_or_else(|| {
+                    error(
+                        "nui_flow_missing_value",
+                        "when requires a direct input predicate",
+                        line,
+                        1,
+                    )
+                })?;
                 index += 1;
                 branch_predicate = Some(parse_branch_predicate(value, line)?);
             }
             "in" if parts[0] == "branch" => {
-                let value = *parts.get(index + 1).ok_or_else(|| error("nui_flow_missing_value", "in requires machine.state", line, 1))?;
+                let value = *parts.get(index + 1).ok_or_else(|| {
+                    error(
+                        "nui_flow_missing_value",
+                        "in requires machine.state",
+                        line,
+                        1,
+                    )
+                })?;
                 index += 1;
                 branch_predicate = Some(parse_machine_state_predicate(value, line)?);
             }
             "capacity" if matches!(parts[0], "repeat" | "template") => {
-                let value = *parts.get(index + 1).ok_or_else(|| error("nui_flow_missing_value", "capacity requires a positive bound", line, 1))?;
+                let value = *parts.get(index + 1).ok_or_else(|| {
+                    error(
+                        "nui_flow_missing_value",
+                        "capacity requires a positive bound",
+                        line,
+                        1,
+                    )
+                })?;
                 index += 1;
                 let capacity = parse_u64(value, line, "capacity")? as u32;
-                if capacity == 0 { return Err(error("ui_program_invalid_branch_template", "template capacity must be positive", line, 1)); }
-                template = Some((capacity, BTreeMap::from([("row_key".into(), UiInputKind::U32)]), "row_key".into(), false));
+                if capacity == 0 {
+                    return Err(error(
+                        "ui_program_invalid_branch_template",
+                        "template capacity must be positive",
+                        line,
+                        1,
+                    ));
+                }
+                template = Some((
+                    capacity,
+                    BTreeMap::from([("row_key".into(), UiInputKind::U32)]),
+                    "row_key".into(),
+                    false,
+                ));
             }
             "capacity" if parts[0] == "data_grid" => {
-                let value = *parts.get(index + 1).ok_or_else(|| error("nui_flow_missing_value", "capacity requires a positive bound", line, 1))?;
+                let value = *parts.get(index + 1).ok_or_else(|| {
+                    error(
+                        "nui_flow_missing_value",
+                        "capacity requires a positive bound",
+                        line,
+                        1,
+                    )
+                })?;
                 index += 1;
-                let capacity = u32::try_from(parse_u64(value, line, "capacity")?)
-                    .map_err(|_| error("nui_flow_invalid_data_grid", "DataGrid capacity exceeds u32", line, 1))?;
-                if capacity == 0 { return Err(error("nui_flow_invalid_data_grid", "DataGrid capacity must be positive", line, 1)); }
+                let capacity =
+                    u32::try_from(parse_u64(value, line, "capacity")?).map_err(|_| {
+                        error(
+                            "nui_flow_invalid_data_grid",
+                            "DataGrid capacity exceeds u32",
+                            line,
+                            1,
+                        )
+                    })?;
+                if capacity == 0 {
+                    return Err(error(
+                        "nui_flow_invalid_data_grid",
+                        "DataGrid capacity must be positive",
+                        line,
+                        1,
+                    ));
+                }
                 data_grid_capacity = Some(capacity);
             }
             "row_height" if parts[0] == "data_grid" => {
-                let value = *parts.get(index + 1).ok_or_else(|| error("nui_flow_missing_value", "row_height requires a positive pixel value", line, 1))?;
+                let value = *parts.get(index + 1).ok_or_else(|| {
+                    error(
+                        "nui_flow_missing_value",
+                        "row_height requires a positive pixel value",
+                        line,
+                        1,
+                    )
+                })?;
                 index += 1;
-                let height = u32::try_from(parse_u64(value, line, "row_height")?)
-                    .map_err(|_| error("nui_flow_invalid_data_grid", "DataGrid row_height exceeds u32", line, 1))?;
-                if height == 0 { return Err(error("nui_flow_invalid_data_grid", "DataGrid row_height must be positive", line, 1)); }
+                let height =
+                    u32::try_from(parse_u64(value, line, "row_height")?).map_err(|_| {
+                        error(
+                            "nui_flow_invalid_data_grid",
+                            "DataGrid row_height exceeds u32",
+                            line,
+                            1,
+                        )
+                    })?;
+                if height == 0 {
+                    return Err(error(
+                        "nui_flow_invalid_data_grid",
+                        "DataGrid row_height must be positive",
+                        line,
+                        1,
+                    ));
+                }
                 data_grid_row_height = Some(height);
             }
             "overscan" if parts[0] == "data_grid" => {
-                let value = *parts.get(index + 1).ok_or_else(|| error("nui_flow_missing_value", "overscan requires a nonnegative bound", line, 1))?;
+                let value = *parts.get(index + 1).ok_or_else(|| {
+                    error(
+                        "nui_flow_missing_value",
+                        "overscan requires a nonnegative bound",
+                        line,
+                        1,
+                    )
+                })?;
                 index += 1;
-                data_grid_overscan = Some(u32::try_from(parse_u64(value, line, "overscan")?)
-                    .map_err(|_| error("nui_flow_invalid_data_grid", "DataGrid overscan exceeds u32", line, 1))?);
+                data_grid_overscan = Some(
+                    u32::try_from(parse_u64(value, line, "overscan")?).map_err(|_| {
+                        error(
+                            "nui_flow_invalid_data_grid",
+                            "DataGrid overscan exceeds u32",
+                            line,
+                            1,
+                        )
+                    })?,
+                );
             }
             "columns" if parts[0] == "data_grid" => {
-                let value = *parts.get(index + 1).ok_or_else(|| error("nui_flow_missing_value", "columns requires a quoted key:width list", line, 1))?;
+                let value = *parts.get(index + 1).ok_or_else(|| {
+                    error(
+                        "nui_flow_missing_value",
+                        "columns requires a quoted key:width list",
+                        line,
+                        1,
+                    )
+                })?;
                 index += 1;
                 data_grid_columns = Some(parse_data_grid_columns(&quoted(value, line)?, line)?);
             }
             "source" if parts[0] == "data_grid" => {
-                let value = *parts.get(index + 1).ok_or_else(|| error("nui_flow_missing_value", "source requires a grid input binding", line, 1))?;
+                let value = *parts.get(index + 1).ok_or_else(|| {
+                    error(
+                        "nui_flow_missing_value",
+                        "source requires a grid input binding",
+                        line,
+                        1,
+                    )
+                })?;
                 index += 1;
-                let Some(key) = value.strip_prefix('$') else { return Err(error("nui_flow_invalid_data_grid", "DataGrid source must use $grid_input", line, 1)); };
-                if !valid_key(key) { return Err(error("nui_flow_invalid_data_grid", "DataGrid source must name a valid grid input", line, 1)); }
+                let Some(key) = value.strip_prefix('$') else {
+                    return Err(error(
+                        "nui_flow_invalid_data_grid",
+                        "DataGrid source must use $grid_input",
+                        line,
+                        1,
+                    ));
+                };
+                if !valid_key(key) {
+                    return Err(error(
+                        "nui_flow_invalid_data_grid",
+                        "DataGrid source must name a valid grid input",
+                        line,
+                        1,
+                    ));
+                }
                 data_grid_source = Some(key.into());
             }
             "key" if matches!(parts[0], "repeat" | "template") => {
-                let value = *parts.get(index + 1).ok_or_else(|| error("nui_flow_missing_value", "key requires a row key field", line, 1))?;
+                let value = *parts.get(index + 1).ok_or_else(|| {
+                    error(
+                        "nui_flow_missing_value",
+                        "key requires a row key field",
+                        line,
+                        1,
+                    )
+                })?;
                 index += 1;
-                let current = template.get_or_insert((1, BTreeMap::from([("row_key".into(), UiInputKind::U32)]), String::new(), false));
+                let current = template.get_or_insert((
+                    1,
+                    BTreeMap::from([("row_key".into(), UiInputKind::U32)]),
+                    String::new(),
+                    false,
+                ));
                 let prior_key = current.2.clone();
                 current.1.remove(&prior_key);
                 current.1.insert(value.into(), UiInputKind::U32);
                 current.2 = value.into();
             }
             "overflow_summary" if matches!(parts[0], "repeat" | "template") => {
-                let current = template.get_or_insert((1, BTreeMap::from([("row_key".into(), UiInputKind::U32)]), "row_key".into(), false));
+                let current = template.get_or_insert((
+                    1,
+                    BTreeMap::from([("row_key".into(), UiInputKind::U32)]),
+                    "row_key".into(),
+                    false,
+                ));
                 current.3 = true;
             }
             _ => {
@@ -1097,30 +1654,138 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
                     "unknown Flow layout, style, binding, or event token",
                     line,
                     1,
-                ))
+                ));
             }
         }
         index += 1;
     }
-    if parts[0] == "branch" && branch_predicate.is_none() { return Err(error("ui_program_invalid_branch_template", "branch requires `when` or `in machine.state`", line, 1)); }
+    if parts[0] == "branch" && branch_predicate.is_none() {
+        return Err(error(
+            "ui_program_invalid_branch_template",
+            "branch requires `when` or `in machine.state`",
+            line,
+            1,
+        ));
+    }
     if matches!(parts[0], "repeat" | "template") {
-        let Some(spec) = &template else { return Err(error("ui_program_invalid_branch_template", "repeat/template requires a finite capacity", line, 1)); };
-        if spec.2.trim().is_empty() { return Err(error("ui_program_invalid_branch_template", "repeat/template requires a stable key field", line, 1)); }
+        let Some(spec) = &template else {
+            return Err(error(
+                "ui_program_invalid_branch_template",
+                "repeat/template requires a finite capacity",
+                line,
+                1,
+            ));
+        };
+        if spec.2.trim().is_empty() {
+            return Err(error(
+                "ui_program_invalid_branch_template",
+                "repeat/template requires a stable key field",
+                line,
+                1,
+            ));
+        }
     }
     let data_grid = if parts[0] == "data_grid" {
-        let capacity = data_grid_capacity.ok_or_else(|| error("nui_flow_invalid_data_grid", "DataGrid requires a finite capacity", line, 1))?;
+        let capacity = data_grid_capacity.ok_or_else(|| {
+            error(
+                "nui_flow_invalid_data_grid",
+                "DataGrid requires a finite capacity",
+                line,
+                1,
+            )
+        })?;
         let overscan = data_grid_overscan.unwrap_or(0);
-        if overscan > capacity { return Err(error("nui_flow_invalid_data_grid", "DataGrid overscan cannot exceed capacity", line, 1)); }
+        if overscan > capacity {
+            return Err(error(
+                "nui_flow_invalid_data_grid",
+                "DataGrid overscan cannot exceed capacity",
+                line,
+                1,
+            ));
+        }
         Some(UiDataGridDeclaration {
             node_key: String::new(),
-            source_key: data_grid_source.ok_or_else(|| error("nui_flow_invalid_data_grid", "DataGrid requires source $grid_input", line, 1))?,
+            source_key: data_grid_source.ok_or_else(|| {
+                error(
+                    "nui_flow_invalid_data_grid",
+                    "DataGrid requires source $grid_input",
+                    line,
+                    1,
+                )
+            })?,
             max_window_rows: capacity,
             row_height: data_grid_row_height.unwrap_or(24),
             overscan,
-            columns: data_grid_columns.unwrap_or_else(|| vec![UiDataGridColumn { key: "value".into(), label: "Value".into(), width: 1, presentation: UiDataGridPresentation::Text }]),
+            columns: data_grid_columns.unwrap_or_else(|| {
+                vec![UiDataGridColumn {
+                    key: "value".into(),
+                    label: "Value".into(),
+                    width: 1,
+                    presentation: UiDataGridPresentation::Text,
+                }]
+            }),
         })
-    } else { None };
-    Ok(NodeBuild { node, bindings, intents, branch_predicate, template, data_grid })
+    } else {
+        None
+    };
+    Ok(NodeBuild {
+        node,
+        bindings,
+        intents,
+        branch_predicate,
+        template,
+        data_grid,
+    })
+}
+
+fn parse_range<T: PartialOrd, E>(
+    spec: &str,
+    prefix: &str,
+    line: u32,
+    parse: impl Fn(&str) -> Result<T, E>,
+) -> FlowResult<(T, T)> {
+    let value = spec
+        .strip_prefix(prefix)
+        .and_then(|value| value.strip_prefix(':'))
+        .ok_or_else(|| error("nui_flow_invalid_input", "invalid numeric range", line, 1))?;
+    let (minimum, maximum) = value
+        .split_once("..")
+        .filter(|(minimum, maximum)| {
+            !minimum.is_empty() && !maximum.is_empty() && !maximum.contains("..")
+        })
+        .ok_or_else(|| {
+            error(
+                "nui_flow_invalid_input",
+                "numeric ranges use <kind>:<minimum>..<maximum>",
+                line,
+                1,
+            )
+        })?;
+    let minimum = parse(minimum).map_err(|_| {
+        error(
+            "nui_flow_invalid_input",
+            "invalid numeric range minimum",
+            line,
+            1,
+        )
+    })?;
+    let maximum = parse(maximum).map_err(|_| {
+        error(
+            "nui_flow_invalid_input",
+            "invalid numeric range maximum",
+            line,
+            1,
+        )
+    })?;
+    if minimum > maximum {
+        return Err(error(
+            "nui_flow_invalid_input",
+            "numeric range minimum must not exceed maximum",
+            line,
+            1,
+        ));
+    }
+    Ok((minimum, maximum))
 }
 
 /// A lowered fragment may be submitted before an input frame is evaluated. Apply
@@ -1132,7 +1797,10 @@ fn apply_boolean_binding_defaults(
     schema: &UiInputSchema,
 ) {
     fn visit(node: &mut UiNode, bindings: &[UiIrBinding], schema: &UiInputSchema) {
-        for binding in bindings.iter().filter(|binding| binding.node_key == node.node_id.0) {
+        for binding in bindings
+            .iter()
+            .filter(|binding| binding.node_key == node.node_id.0)
+        {
             let Some(UiInputValue::Bool { value }) = schema
                 .slots
                 .iter()
@@ -1156,23 +1824,65 @@ fn apply_boolean_binding_defaults(
 }
 
 fn parse_data_grid_columns(value: &str, line: u32) -> FlowResult<Vec<UiDataGridColumn>> {
-    if value.is_empty() { return Err(error("nui_flow_invalid_data_grid", "DataGrid columns cannot be empty", line, 1)); }
+    if value.is_empty() {
+        return Err(error(
+            "nui_flow_invalid_data_grid",
+            "DataGrid columns cannot be empty",
+            line,
+            1,
+        ));
+    }
     let mut columns = Vec::new();
     let mut keys = HashSet::new();
     for entry in value.split(',') {
         let parts = entry.split(':').collect::<Vec<_>>();
         if parts.len() < 2 {
-            return Err(error("nui_flow_invalid_data_grid", "DataGrid columns use key:width[:presentation]", line, 1));
+            return Err(error(
+                "nui_flow_invalid_data_grid",
+                "DataGrid columns use key:width[:presentation]",
+                line,
+                1,
+            ));
         }
         let key = parts[0];
         let width = parts[1];
-        if !valid_key(key) || !keys.insert(key) { return Err(error("nui_flow_invalid_data_grid", "DataGrid column keys must be valid and unique", line, 1)); }
-        let width = u32::try_from(width.parse::<u64>().map_err(|_| error("nui_flow_invalid_data_grid", "DataGrid column width must be a positive integer", line, 1))?)
-            .map_err(|_| error("nui_flow_invalid_data_grid", "DataGrid column width exceeds u32", line, 1))?;
-        if width == 0 { return Err(error("nui_flow_invalid_data_grid", "DataGrid column width must be positive", line, 1)); }
+        if !valid_key(key) || !keys.insert(key) {
+            return Err(error(
+                "nui_flow_invalid_data_grid",
+                "DataGrid column keys must be valid and unique",
+                line,
+                1,
+            ));
+        }
+        let width = u32::try_from(width.parse::<u64>().map_err(|_| {
+            error(
+                "nui_flow_invalid_data_grid",
+                "DataGrid column width must be a positive integer",
+                line,
+                1,
+            )
+        })?)
+        .map_err(|_| {
+            error(
+                "nui_flow_invalid_data_grid",
+                "DataGrid column width exceeds u32",
+                line,
+                1,
+            )
+        })?;
+        if width == 0 {
+            return Err(error(
+                "nui_flow_invalid_data_grid",
+                "DataGrid column width must be positive",
+                line,
+                1,
+            ));
+        }
         let presentation = match parts.get(2).copied() {
             None | Some("text") if parts.len() <= 3 => UiDataGridPresentation::Text,
-            Some("select") if parts.len() == 4 => UiDataGridPresentation::Select { intent: parse_data_grid_token(parts[3], line, "select intent")? },
+            Some("select") if parts.len() == 4 => UiDataGridPresentation::Select {
+                intent: parse_data_grid_token(parts[3], line, "select intent")?,
+            },
             Some("dropdown") if parts.len() == 5 => UiDataGridPresentation::Dropdown {
                 options: parse_data_grid_options(parts[3], line)?,
                 intent: parse_data_grid_token(parts[4], line, "dropdown intent")?,
@@ -1181,54 +1891,126 @@ fn parse_data_grid_columns(value: &str, line: u32) -> FlowResult<Vec<UiDataGridC
                 max_chars: parse_data_grid_max_chars(parts[3], line)?,
                 intent: parse_data_grid_token(parts[4], line, "edit intent")?,
             },
-            _ => return Err(error("nui_flow_invalid_data_grid", "invalid DataGrid column presentation grammar", line, 1)),
+            _ => {
+                return Err(error(
+                    "nui_flow_invalid_data_grid",
+                    "invalid DataGrid column presentation grammar",
+                    line,
+                    1,
+                ));
+            }
         };
-        columns.push(UiDataGridColumn { key: key.into(), label: key.replace('_', " "), width, presentation });
+        columns.push(UiDataGridColumn {
+            key: key.into(),
+            label: key.replace('_', " "),
+            width,
+            presentation,
+        });
     }
     Ok(columns)
 }
 
 fn parse_data_grid_token(value: &str, line: u32, name: &str) -> FlowResult<String> {
     if value.is_empty() || value.contains('|') || !valid_key(value) {
-        return Err(error("nui_flow_invalid_data_grid", &format!("DataGrid {name} must be a valid token"), line, 1));
+        return Err(error(
+            "nui_flow_invalid_data_grid",
+            &format!("DataGrid {name} must be a valid token"),
+            line,
+            1,
+        ));
     }
     Ok(value.into())
 }
 
 fn parse_data_grid_options(value: &str, line: u32) -> FlowResult<Vec<String>> {
     let options = value.split('|').map(str::to_owned).collect::<Vec<_>>();
-    if options.is_empty() || options.iter().any(|option| option.trim().is_empty()) || options.iter().collect::<HashSet<_>>().len() != options.len() {
-        return Err(error("nui_flow_invalid_data_grid", "DataGrid dropdown options must be nonempty and unique", line, 1));
+    if options.is_empty()
+        || options.iter().any(|option| option.trim().is_empty())
+        || options.iter().collect::<HashSet<_>>().len() != options.len()
+    {
+        return Err(error(
+            "nui_flow_invalid_data_grid",
+            "DataGrid dropdown options must be nonempty and unique",
+            line,
+            1,
+        ));
     }
     Ok(options)
 }
 
 fn parse_data_grid_max_chars(value: &str, line: u32) -> FlowResult<u32> {
-    let max_chars = value.parse::<u64>().ok().and_then(|value| u32::try_from(value).ok()).unwrap_or(0);
-    if max_chars == 0 { return Err(error("nui_flow_invalid_data_grid", "DataGrid edit max_chars must be positive", line, 1)); }
+    let max_chars = value
+        .parse::<u64>()
+        .ok()
+        .and_then(|value| u32::try_from(value).ok())
+        .unwrap_or(0);
+    if max_chars == 0 {
+        return Err(error(
+            "nui_flow_invalid_data_grid",
+            "DataGrid edit max_chars must be positive",
+            line,
+            1,
+        ));
+    }
     Ok(max_chars)
 }
 
 fn parse_branch_predicate(value: &str, line: u32) -> FlowResult<UiBranchPredicate> {
-    let value = value.strip_prefix('$').ok_or_else(|| error("ui_program_invalid_branch_template", "branch predicate must reference one direct input", line, 1))?;
+    let value = value.strip_prefix('$').ok_or_else(|| {
+        error(
+            "ui_program_invalid_branch_template",
+            "branch predicate must reference one direct input",
+            line,
+            1,
+        )
+    })?;
     if let Some(input_key) = value.strip_prefix('!') {
-        return Ok(UiBranchPredicate::Bool { input_key: input_key.into(), expected: false });
+        return Ok(UiBranchPredicate::Bool {
+            input_key: input_key.into(),
+            expected: false,
+        });
     }
     if let Some((input_key, variant)) = value.split_once('=') {
-        if input_key.is_empty() || variant.is_empty() { return Err(error("ui_program_invalid_branch_template", "enum branch predicate requires input and variant", line, 1)); }
-        return Ok(UiBranchPredicate::EnumEquals { input_key: input_key.into(), variant: variant.into() });
+        if input_key.is_empty() || variant.is_empty() {
+            return Err(error(
+                "ui_program_invalid_branch_template",
+                "enum branch predicate requires input and variant",
+                line,
+                1,
+            ));
         }
-    Ok(UiBranchPredicate::Bool { input_key: value.into(), expected: true })
+        return Ok(UiBranchPredicate::EnumEquals {
+            input_key: input_key.into(),
+            variant: variant.into(),
+        });
+    }
+    Ok(UiBranchPredicate::Bool {
+        input_key: value.into(),
+        expected: true,
+    })
 }
 
 fn parse_machine_state_predicate(value: &str, line: u32) -> FlowResult<UiBranchPredicate> {
     let Some((machine_key, state)) = value.rsplit_once('.') else {
-        return Err(error("nui_flow_invalid_state_machine", "branch in requires machine.state", line, 1));
+        return Err(error(
+            "nui_flow_invalid_state_machine",
+            "branch in requires machine.state",
+            line,
+            1,
+        ));
     };
     if !valid_key(machine_key) || !valid_key(state) {
-        return Err(error("nui_flow_invalid_state_machine", "machine and state keys are invalid", line, 1));
+        return Err(error(
+            "nui_flow_invalid_state_machine",
+            "machine and state keys are invalid",
+            line,
+            1,
+        ));
     }
-    Ok(UiBranchPredicate::MachineState { machine_key: machine_key.into(), state: state.into() })
+    Ok(UiBranchPredicate::MachineState {
+        machine_key: machine_key.into(),
+        state: state.into(),
+    })
 }
 
 fn parse_attribute(
@@ -1291,13 +2073,22 @@ fn parse_attribute(
             }
         }
         "align" => layout.align_items = alignment(value, line)?,
-        "clip" => layout.clip = match value {
+        "clip" => {
+            layout.clip = match value {
                 "none" => UiClipPolicy::None,
                 "bounds" => UiClipPolicy::Bounds,
                 "rounded" => UiClipPolicy::Rounded,
                 "scroll" => UiClipPolicy::Scroll,
-            _ => return Err(error("nui_flow_invalid_layout", "clip must be none, bounds, rounded, or scroll", line, 1)),
-        },
+                _ => {
+                    return Err(error(
+                        "nui_flow_invalid_layout",
+                        "clip must be none, bounds, rounded, or scroll",
+                        line,
+                        1,
+                    ));
+                }
+            }
+        }
         "justify" => layout.justify_content = justify(value, line)?,
         "value" => {
             if let Some(input) = direct_binding(UiBoundProperty::TextValue) {
@@ -1309,16 +2100,44 @@ fn parse_attribute(
             }
         }
         "checked" => {
-            if direct_binding(UiBoundProperty::Active).is_none() { return Err(error("nui_flow_invalid_control_binding", "checked requires a bool input binding", line, 1)); }
+            if direct_binding(UiBoundProperty::Active).is_none() {
+                return Err(error(
+                    "nui_flow_invalid_control_binding",
+                    "checked requires a bool input binding",
+                    line,
+                    1,
+                ));
+            }
         }
         "selected" => {
-            if direct_binding(UiBoundProperty::Selected).is_none() { return Err(error("nui_flow_invalid_control_binding", "selected requires a bool input binding", line, 1)); }
+            if direct_binding(UiBoundProperty::Selected).is_none() {
+                return Err(error(
+                    "nui_flow_invalid_control_binding",
+                    "selected requires a bool input binding",
+                    line,
+                    1,
+                ));
+            }
         }
         "state" => {
-            if direct_binding(UiBoundProperty::StateToken).is_none() { return Err(error("nui_flow_invalid_control_binding", "state requires an enum input binding", line, 1)); }
+            if direct_binding(UiBoundProperty::StateToken).is_none() {
+                return Err(error(
+                    "nui_flow_invalid_control_binding",
+                    "state requires an enum input binding",
+                    line,
+                    1,
+                ));
+            }
         }
         "numeric" | "scroll" => {
-            if direct_binding(UiBoundProperty::NumericValue).is_none() { return Err(error("nui_flow_invalid_control_binding", "numeric and scroll require a numeric input binding", line, 1)); }
+            if direct_binding(UiBoundProperty::NumericValue).is_none() {
+                return Err(error(
+                    "nui_flow_invalid_control_binding",
+                    "numeric and scroll require a numeric input binding",
+                    line,
+                    1,
+                ));
+            }
         }
         "enabled" => {
             if direct_binding(UiBoundProperty::Enabled).is_none() {
@@ -1368,12 +2187,17 @@ fn attach(
     }
 }
 fn reject_forbidden(text: &str, line: u32) -> FlowResult<()> {
-    if text.chars().any(|character| matches!(character, '{' | '}' | '[' | ']'))
+    if text
+        .chars()
+        .any(|character| matches!(character, '{' | '}' | '[' | ']'))
         || text.contains("=>")
         || text.contains("function")
         || text.contains("http:")
         || text.contains("https:")
-        || text.contains("=") && !text.starts_with("budget") && !text.starts_with("@") && !text.contains("when $")
+        || text.contains("=")
+            && !text.starts_with("budget")
+            && !text.starts_with("@")
+            && !text.contains("when $")
     {
         Err(error(
             "ui_program_forbidden_flow_feature",
@@ -1548,13 +2372,26 @@ fn valid_intent(intent: &str) -> bool {
 fn binding_accepts(property: &UiBoundProperty, kind: &UiInputKind) -> bool {
     match property {
         UiBoundProperty::TextValue => matches!(kind, UiInputKind::TextHandle),
-        UiBoundProperty::Enabled | UiBoundProperty::Visible | UiBoundProperty::Selected | UiBoundProperty::Active => matches!(kind, UiInputKind::Bool),
+        UiBoundProperty::Enabled
+        | UiBoundProperty::Visible
+        | UiBoundProperty::Selected
+        | UiBoundProperty::Active => matches!(kind, UiInputKind::Bool),
         UiBoundProperty::StateToken => matches!(kind, UiInputKind::Enum { .. }),
-        UiBoundProperty::NumericValue => matches!(kind, UiInputKind::I32 | UiInputKind::U32 | UiInputKind::F32 | UiInputKind::I32Range { .. } | UiInputKind::U32Range { .. }),
+        UiBoundProperty::NumericValue => matches!(
+            kind,
+            UiInputKind::I32
+                | UiInputKind::U32
+                | UiInputKind::F32
+                | UiInputKind::I32Range { .. }
+                | UiInputKind::U32Range { .. }
+                | UiInputKind::F32Range { .. }
+        ),
         _ => false,
     }
 }
-fn align_up(value: u32, alignment: u32) -> u32 { (value + alignment - 1) / alignment * alignment }
+fn align_up(value: u32, alignment: u32) -> u32 {
+    (value + alignment - 1) / alignment * alignment
+}
 fn tokenize(text: &str, line: u32) -> FlowResult<Vec<String>> {
     let mut tokens = Vec::new();
     let mut current = String::new();
@@ -1603,12 +2440,16 @@ fn tokenize(text: &str, line: u32) -> FlowResult<Vec<String>> {
 }
 fn format_input(slot: &UiInputSlot) -> String {
     let kind = match &slot.kind {
-        UiInputKind::Bool => "bool",
-        UiInputKind::I32 => "i32",
-        UiInputKind::U32 => "u32",
-        UiInputKind::F32 => "f32",
-        UiInputKind::TextHandle => "text",
-        _ => "unsupported",
+        UiInputKind::Bool => "bool".into(),
+        UiInputKind::I32 => "i32".into(),
+        UiInputKind::U32 => "u32".into(),
+        UiInputKind::F32 => "f32".into(),
+        UiInputKind::I32Range { minimum, maximum } => format!("i32:{minimum}..{maximum}"),
+        UiInputKind::U32Range { minimum, maximum } => format!("u32:{minimum}..{maximum}"),
+        UiInputKind::F32Range { minimum, maximum } => format!("f32:{minimum}..{maximum}"),
+        UiInputKind::Enum { variants } => format!("enum:{}", variants.join("|")),
+        UiInputKind::TextHandle => "text".into(),
+        _ => "unsupported".into(),
     };
     let value = match &slot.default_value {
         UiInputValue::Bool { value } => value.to_string(),
@@ -1651,13 +2492,29 @@ fn format_node(
         UiNodeKind::RenderSurface => "render",
     };
     let mut line = format!("{}{} {}", " ".repeat(indent), kind, node.node_id.0);
-    if node.bounds.x != 0.0 { line.push_str(&format!(" x {}", node.bounds.x)); }
-    if node.bounds.y != 0.0 { line.push_str(&format!(" y {}", node.bounds.y)); }
+    if node.bounds.x != 0.0 {
+        line.push_str(&format!(" x {}", node.bounds.x));
+    }
+    if node.bounds.y != 0.0 {
+        line.push_str(&format!(" y {}", node.bounds.y));
+    }
     if node.kind == UiNodeKind::DataGrid {
-        if let Some(grid) = data_grids.iter().find(|grid| grid.node_key == node.node_id.0) {
-            line.push_str(&format!(" source ${} capacity {} row_height {} overscan {} columns \"{}\"",
-                grid.source_key, grid.max_window_rows, grid.row_height, grid.overscan,
-                grid.columns.iter().map(format_data_grid_column).collect::<Vec<_>>().join(",")));
+        if let Some(grid) = data_grids
+            .iter()
+            .find(|grid| grid.node_key == node.node_id.0)
+        {
+            line.push_str(&format!(
+                " source ${} capacity {} row_height {} overscan {} columns \"{}\"",
+                grid.source_key,
+                grid.max_window_rows,
+                grid.row_height,
+                grid.overscan,
+                grid.columns
+                    .iter()
+                    .map(format_data_grid_column)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ));
         }
     }
     if let Some(layout) = node.layout {
@@ -1714,9 +2571,20 @@ fn format_node(
 fn format_data_grid_column(column: &UiDataGridColumn) -> String {
     match &column.presentation {
         UiDataGridPresentation::Text => format!("{}:{}", column.key, column.width),
-        UiDataGridPresentation::Select { intent } => format!("{}:{}:select:{}", column.key, column.width, intent),
-        UiDataGridPresentation::Dropdown { options, intent } => format!("{}:{}:dropdown:{}:{}", column.key, column.width, options.join("|"), intent),
-        UiDataGridPresentation::Edit { max_chars, intent } => format!("{}:{}:edit:{}:{}", column.key, column.width, max_chars, intent),
+        UiDataGridPresentation::Select { intent } => {
+            format!("{}:{}:select:{}", column.key, column.width, intent)
+        }
+        UiDataGridPresentation::Dropdown { options, intent } => format!(
+            "{}:{}:dropdown:{}:{}",
+            column.key,
+            column.width,
+            options.join("|"),
+            intent
+        ),
+        UiDataGridPresentation::Edit { max_chars, intent } => format!(
+            "{}:{}:edit:{}:{}",
+            column.key, column.width, max_chars, intent
+        ),
     }
 }
 
@@ -1771,7 +2639,7 @@ fn set_node(
                 "nui_flow_invalid_patch",
                 "set supports enabled, visible, value, w, and h",
                 span,
-            ))
+            ));
         }
     }
     Ok(())
@@ -1792,7 +2660,10 @@ fn remove_node(parent: &mut UiNode, key: &str) -> bool {
 }
 
 fn remove_node_at_path(root: &mut UiNode, segments: &[String]) -> bool {
-    let segments = if segments.first().is_some_and(|segment| segment == &root.node_id.0) {
+    let segments = if segments
+        .first()
+        .is_some_and(|segment| segment == &root.node_id.0)
+    {
         &segments[1..]
     } else {
         segments
@@ -1855,7 +2726,7 @@ fn insert_node(
                 "nui_flow_unknown_component",
                 "component is outside the closed Flow vocabulary",
                 span,
-            ))
+            ));
         }
     };
     let parent = find_node_mut(root, parent_key).ok_or_else(|| {
@@ -1985,26 +2856,75 @@ panel workspace row gap 8
         let document = parse_nui_flow(
             "input state enum:loading|ready|error default loading\nsurface root\n  branch ready when $state=ready\n    text label value \"Ready\"\n",
         ).unwrap();
-        assert_eq!(document.input_schema.slots[0].kind, UiInputKind::Enum { variants: vec!["loading".into(), "ready".into(), "error".into()] });
+        assert_eq!(
+            document.input_schema.slots[0].kind,
+            UiInputKind::Enum {
+                variants: vec!["loading".into(), "ready".into(), "error".into()]
+            }
+        );
         assert_eq!(document.ir.branches.len(), 1);
     }
 
     #[test]
     fn rejects_unknown_and_incompatible_binding_inputs_at_lowering_boundary() {
         let unknown = parse_nui_flow("surface root\n  text title value $missing\n").unwrap_err();
-        assert_eq!(unknown.diagnostics[0].code, "ui_program_unknown_binding_target");
+        assert_eq!(
+            unknown.diagnostics[0].code,
+            "ui_program_unknown_binding_target"
+        );
 
         let incompatible = parse_nui_flow(
             "input can_commit bool default false\nsurface root\n  text title value $can_commit\n",
         )
         .unwrap_err();
-        assert_eq!(incompatible.diagnostics[0].code, "ui_program_input_type_mismatch");
+        assert_eq!(
+            incompatible.diagnostics[0].code,
+            "ui_program_input_type_mismatch"
+        );
     }
 
     #[test]
     fn rejects_forbidden_script_syntax() {
         let error = parse_nui_flow("panel root { eval() }").unwrap_err();
-        assert_eq!(error.diagnostics[0].code, "ui_program_forbidden_flow_feature");
+        assert_eq!(
+            error.diagnostics[0].code,
+            "ui_program_forbidden_flow_feature"
+        );
+    }
+
+    #[test]
+    fn numeric_ranges_parse_validate_and_format_deterministically() {
+        let source = "input count i32:0..24 default 12\ninput exposure f32:0..1 default 0.5\nsurface root\n  drag_value count numeric $count\n  slider exposure numeric $exposure\n";
+        let document = parse_nui_flow(source).unwrap();
+        assert_eq!(
+            document.input_schema.slots[0].kind,
+            UiInputKind::I32Range {
+                minimum: 0,
+                maximum: 24
+            }
+        );
+        assert_eq!(
+            document.input_schema.slots[1].kind,
+            UiInputKind::F32Range {
+                minimum: 0.0,
+                maximum: 1.0
+            }
+        );
+        let formatted = format_nui_flow(source).unwrap();
+        assert!(formatted.contains("input count i32:0..24 default 12"));
+        assert!(formatted.contains("input exposure f32:0..1 default 0.5"));
+
+        for invalid in [
+            "input count i32:24..0 default 12\nsurface root\n",
+            "input exposure f32:0..inf default 0.5\nsurface root\n",
+            "input count i32:0...24 default 12\nsurface root\n",
+            "input count i32:0..24 default 25\nsurface root\n",
+        ] {
+            assert!(
+                parse_nui_flow(invalid).is_err(),
+                "range must be rejected: {invalid}"
+            );
+        }
     }
 
     #[test]
@@ -2014,7 +2934,15 @@ panel workspace row gap 8
         let grid = &document.ir.data_grids[0];
         assert_eq!(grid.row_height, 28);
         assert_eq!(grid.overscan, 3);
-        assert_eq!(grid.columns[0], UiDataGridColumn { key: "Name".into(), label: "Name".into(), width: 240, presentation: UiDataGridPresentation::Text });
+        assert_eq!(
+            grid.columns[0],
+            UiDataGridColumn {
+                key: "Name".into(),
+                label: "Name".into(),
+                width: 240,
+                presentation: UiDataGridPresentation::Text
+            }
+        );
         assert_eq!(grid.columns[1].key, "Status");
         let formatted = format_nui_flow(source).unwrap();
         assert_eq!(grid.source_key, "asset_window");
@@ -2028,13 +2956,26 @@ panel workspace row gap 8
         assert_eq!(document.input_schema.grid_slots[0].key, "asset_window");
         assert_eq!(document.input_schema.slots[0].packing.offset, 0);
 
-        let error = parse_nui_flow("surface root\n  data_grid assets source $asset_window capacity 2\n").unwrap_err();
+        let error =
+            parse_nui_flow("surface root\n  data_grid assets source $asset_window capacity 2\n")
+                .unwrap_err();
         assert_eq!(error.diagnostics[0].code, "ui_program_unknown_input_key");
     }
 
     #[test]
     fn data_grid_columns_are_strict() {
-        for columns in ["Name", "Name:0", "Name:20,Name:30", "Name:-1", "Name:20:select", "Name:20:dropdown::set", "Name:20:dropdown: |a:set", "Name:20:dropdown:a|a:set", "Name:20:edit:0:set", "Name:20:unknown"] {
+        for columns in [
+            "Name",
+            "Name:0",
+            "Name:20,Name:30",
+            "Name:-1",
+            "Name:20:select",
+            "Name:20:dropdown::set",
+            "Name:20:dropdown: |a:set",
+            "Name:20:dropdown:a|a:set",
+            "Name:20:edit:0:set",
+            "Name:20:unknown",
+        ] {
             let error = parse_nui_flow(&format!("input asset_window grid default grid:empty\nsurface root\n  data_grid assets source $asset_window capacity 2 columns \"{columns}\"\n")).unwrap_err();
             assert_eq!(error.diagnostics[0].code, "nui_flow_invalid_data_grid");
         }
@@ -2044,9 +2985,26 @@ panel workspace row gap 8
     fn data_grid_columns_parse_presentations_and_format_deterministically() {
         let source = "input asset_window grid default grid:empty\nsurface root\n  data_grid assets source $asset_window capacity 2 columns \"Name:240:text,State:120:select:asset.state.select,Owner:160:dropdown:me|team:asset.owner.select,Notes:280:edit:128:asset.notes.edit\"\n";
         let document = parse_nui_flow(source).unwrap();
-        assert_eq!(document.ir.data_grids[0].columns[1].presentation, UiDataGridPresentation::Select { intent: "asset.state.select".into() });
-        assert_eq!(document.ir.data_grids[0].columns[2].presentation, UiDataGridPresentation::Dropdown { options: vec!["me".into(), "team".into()], intent: "asset.owner.select".into() });
-        assert_eq!(document.ir.data_grids[0].columns[3].presentation, UiDataGridPresentation::Edit { max_chars: 128, intent: "asset.notes.edit".into() });
+        assert_eq!(
+            document.ir.data_grids[0].columns[1].presentation,
+            UiDataGridPresentation::Select {
+                intent: "asset.state.select".into()
+            }
+        );
+        assert_eq!(
+            document.ir.data_grids[0].columns[2].presentation,
+            UiDataGridPresentation::Dropdown {
+                options: vec!["me".into(), "team".into()],
+                intent: "asset.owner.select".into()
+            }
+        );
+        assert_eq!(
+            document.ir.data_grids[0].columns[3].presentation,
+            UiDataGridPresentation::Edit {
+                max_chars: 128,
+                intent: "asset.notes.edit".into()
+            }
+        );
         let formatted = format_nui_flow(source).unwrap();
         assert!(formatted.contains("Name:240,State:120:select:asset.state.select,Owner:160:dropdown:me|team:asset.owner.select,Notes:280:edit:128:asset.notes.edit"));
     }
@@ -2070,7 +3028,8 @@ panel workspace row gap 8
         let error = apply_nui_ir_patch(&document.ir, &indexed).unwrap_err();
         assert_eq!(error.diagnostics[0].code, "nui_flow_invalid_patch_path");
 
-        let incorrect_parent = parse_nui_flow_patch("@ revision 12\n- /workspace/inspector/water\n").unwrap();
+        let incorrect_parent =
+            parse_nui_flow_patch("@ revision 12\n- /workspace/inspector/water\n").unwrap();
         let error = apply_nui_ir_patch(&document.ir, &incorrect_parent).unwrap_err();
         assert_eq!(error.diagnostics[0].code, "nui_flow_unknown_patch_target");
     }
@@ -2089,7 +3048,10 @@ panel workspace row gap 8
         let document = parse_nui_flow(source).unwrap();
         assert_eq!(document.ir.root.children[0].kind, UiNodeKind::Tooltip);
         assert_eq!(document.ir.root.children[1].kind, UiNodeKind::Modal);
-        assert_eq!(document.ir.root.children[1].children[0].kind, UiNodeKind::Dialog);
+        assert_eq!(
+            document.ir.root.children[1].children[0].kind,
+            UiNodeKind::Dialog
+        );
         assert!(format_nui_flow(source).unwrap().contains("tooltip hint"));
     }
 
@@ -2100,7 +3062,11 @@ panel workspace row gap 8
         assert_eq!(document.ir.root.children[0].kind, UiNodeKind::DataGrid);
         assert_eq!(document.ir.data_grids[0].node_key, "assets");
         assert_eq!(document.ir.data_grids[0].max_window_rows, 64);
-        assert!(format_nui_flow(source).unwrap().contains("data_grid assets source $asset_window capacity 64"));
+        assert!(
+            format_nui_flow(source)
+                .unwrap()
+                .contains("data_grid assets source $asset_window capacity 64")
+        );
 
         let error = parse_nui_flow("surface root\n  data_grid assets\n").unwrap_err();
         assert_eq!(error.diagnostics[0].code, "nui_flow_invalid_data_grid");
@@ -2110,7 +3076,11 @@ panel workspace row gap 8
     fn render_declaration_lowers_to_a_nonempty_render_target() {
         let document = parse_nui_flow("surface workbench\n  render terrain_view\n").unwrap();
         assert_eq!(
-            document.ir.root.children[0].surface.as_ref().unwrap().target_id,
+            document.ir.root.children[0]
+                .surface
+                .as_ref()
+                .unwrap()
+                .target_id,
             "render.terrain_view"
         );
     }
@@ -2123,13 +3093,29 @@ panel workspace row gap 8
         assert_eq!(document.input_schema.slots.len(), 12);
         assert_eq!(document.state_machines.len(), 2);
         assert_eq!(document.drags.len(), 1);
-        assert!(document.ir.events.iter().any(|event| event.intent == "asset.review.publish"));
-        assert!(document.ir.root.children.iter().any(|node| node.node_id.0 == "command-bar"));
+        assert!(
+            document
+                .ir
+                .events
+                .iter()
+                .any(|event| event.intent == "asset.review.publish")
+        );
+        assert!(
+            document
+                .ir
+                .root
+                .children
+                .iter()
+                .any(|node| node.node_id.0 == "command-bar")
+        );
     }
 
     #[test]
     fn flow_drag_and_drop_lower_to_generic_effect_bindings() {
-        let document = parse_nui_flow(include_str!("../../../tests/fixtures/ui/kanban-reparent-workbench.nui")).unwrap();
+        let document = parse_nui_flow(include_str!(
+            "../../../tests/fixtures/ui/kanban-reparent-workbench.nui"
+        ))
+        .unwrap();
         let effects = lower_nui_flow_effects(&document);
         assert!(effects.iter().any(|effect| matches!(effect, UiEffect::DragBinding { binding } if binding.key == "backlog-card-drag" && binding.source_node_id.0 == "backlog-card-01" && binding.boundary == UiDragBoundary::Surface)));
         assert!(effects.iter().any(|effect| matches!(effect, UiEffect::DropBinding { binding } if binding.target_node_id.0 == "in-progress-panel" && binding.accepts_drag_key == "backlog-card-drag" && binding.presentation_template_key.as_deref() == Some("progress-template"))));
@@ -2137,10 +3123,46 @@ panel workspace row gap 8
     }
 
     #[test]
+    fn flow_drag_and_drop_compile_to_program_records() {
+        let document = parse_nui_flow("drag item-drag source item axis both snap 0 threshold 0 within free\ndrop target-drop target target accepts item-drag placement after emit workspace.item.move\nsurface root\n  panel item\n  panel target\n").unwrap();
+        let program = compile_nui_flow_program(
+            &document,
+            UiProgramRevision {
+                program_id: "drag-contract".into(),
+                revision: Revision(1),
+                schema_version: 1,
+                capabilities: vec![neon_ui_schema::UiProgramCapability {
+                    name: "ui.program.v1".into(),
+                    version: 1,
+                    owner: neon_ui_schema::UiProgramCapabilityOwner::SharedContract,
+                    status: neon_ui_schema::UiProgramCapabilityStatus::Supported,
+                }],
+            },
+        )
+        .unwrap();
+        assert_eq!(program.drag_records[0].key, "item-drag");
+        assert_eq!(program.drag_records[0].source_node_key, "item");
+        assert_eq!(program.drop_records[0].key, "target-drop");
+        assert_eq!(program.drop_records[0].intent, "workspace.item.move");
+        assert_eq!(program.drop_records[0].placement, UiDropPlacement::After);
+    }
+
+    #[test]
     fn drop_placement_defaults_to_into_and_accepts_relative_targets() {
         let source = "drag item-drag source item axis both snap 0 threshold 0 within free\ndrop default target target accepts item-drag emit workspace.item.move\ndrop before target target accepts item-drag placement before emit workspace.item.move\ndrop after target target accepts item-drag placement after emit workspace.item.move\nsurface root\n  panel item\n  panel target\n";
         let document = parse_nui_flow(source).unwrap();
-        assert_eq!(document.drops.iter().map(|drop| drop.placement).collect::<Vec<_>>(), vec![UiDropPlacement::Into, UiDropPlacement::Before, UiDropPlacement::After]);
+        assert_eq!(
+            document
+                .drops
+                .iter()
+                .map(|drop| drop.placement)
+                .collect::<Vec<_>>(),
+            vec![
+                UiDropPlacement::Into,
+                UiDropPlacement::Before,
+                UiDropPlacement::After
+            ]
+        );
         assert!(lower_nui_flow_effects(&document).iter().any(|effect| matches!(effect, UiEffect::DropBinding { binding } if binding.key == "after" && binding.placement == UiDropPlacement::After)));
     }
 
@@ -2148,7 +3170,10 @@ panel workspace row gap 8
     fn drop_present_lowers_a_target_owned_template_key() {
         let source = "drag item-drag source item axis both snap 0 threshold 0 within free\ndrop target-drop target target accepts item-drag present target-row emit workspace.item.move\nsurface root\n  panel item\n  panel target\n    template target-row h 32 capacity 4 key row_key overflow_summary\n      text row value \"Target row\"\n";
         let document = parse_nui_flow(source).unwrap();
-        assert_eq!(document.drops[0].presentation_template_key.as_deref(), Some("target-row"));
+        assert_eq!(
+            document.drops[0].presentation_template_key.as_deref(),
+            Some("target-row")
+        );
         assert!(lower_nui_flow_effects(&document).iter().any(|effect| matches!(effect, UiEffect::DropBinding { binding } if binding.key == "target-drop" && binding.presentation_template_key.as_deref() == Some("target-row"))));
     }
 
@@ -2159,7 +3184,10 @@ panel workspace row gap 8
 
         let relative = parse_nui_flow("drag item-drag source item axis both snap 0 threshold 0 within free\ndrop target-drop target target accepts item-drag placement before present target-row emit workspace.item.move\nsurface root\n  panel item\n  panel target\n    template target-row h 32 capacity 4 key row_key overflow_summary\n      text row value \"Target row\"\n").unwrap();
         assert_eq!(relative.drops[0].placement, UiDropPlacement::Before);
-        assert_eq!(relative.drops[0].presentation_template_key.as_deref(), Some("target-row"));
+        assert_eq!(
+            relative.drops[0].presentation_template_key.as_deref(),
+            Some("target-row")
+        );
 
         let unowned = parse_nui_flow("drag item-drag source item axis both snap 0 threshold 0 within free\ndrop target-drop target target accepts item-drag present other-row emit workspace.item.move\nsurface root\n  panel item\n  panel target\n  template other-row h 32 capacity 4 key row_key overflow_summary\n    text row value \"Other row\"\n").unwrap_err();
         assert_eq!(unowned.diagnostics[0].code, "nui_flow_invalid_drop");
@@ -2169,10 +3197,23 @@ panel workspace row gap 8
     fn panel_clip_defaults_to_bounds_and_flow_accepts_explicit_policies() {
         let document = parse_nui_flow("surface root clip none\n  panel bounds\n  panel rounded clip rounded\n  scroll scroller\n").unwrap();
         assert_eq!(document.ir.root.layout.unwrap().clip, UiClipPolicy::None);
-        assert_eq!(document.ir.root.children[0].layout.unwrap().clip, UiClipPolicy::Bounds);
-        assert_eq!(document.ir.root.children[1].layout.unwrap().clip, UiClipPolicy::Rounded);
-        assert_eq!(document.ir.root.children[2].layout.unwrap().clip, UiClipPolicy::Scroll);
-        assert!(format_nui_flow("surface root clip none\n  panel rounded clip rounded\n").unwrap().contains("clip rounded"));
+        assert_eq!(
+            document.ir.root.children[0].layout.unwrap().clip,
+            UiClipPolicy::Bounds
+        );
+        assert_eq!(
+            document.ir.root.children[1].layout.unwrap().clip,
+            UiClipPolicy::Rounded
+        );
+        assert_eq!(
+            document.ir.root.children[2].layout.unwrap().clip,
+            UiClipPolicy::Scroll
+        );
+        assert!(
+            format_nui_flow("surface root clip none\n  panel rounded clip rounded\n")
+                .unwrap()
+                .contains("clip rounded")
+        );
     }
 
     #[test]
@@ -2182,7 +3223,9 @@ panel workspace row gap 8
             ("surface", UiDragBoundary::Surface),
             ("free", UiDragBoundary::Free),
         ] {
-            let source = format!("drag demo source panel axis both snap 0 threshold 0 within {within}\nsurface root\n  panel panel\n");
+            let source = format!(
+                "drag demo source panel axis both snap 0 threshold 0 within {within}\nsurface root\n  panel panel\n"
+            );
             assert_eq!(parse_nui_flow(&source).unwrap().drags[0].boundary, boundary);
         }
         let error = parse_nui_flow("drag demo source panel axis both snap 0 threshold 0 within column\nsurface root\n  panel panel\n").unwrap_err();

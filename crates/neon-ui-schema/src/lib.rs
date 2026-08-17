@@ -25,7 +25,8 @@ pub const ERROR_UI_PROGRAM_INVALID_DEFAULT: &str = "ui_program_invalid_default";
 pub const ERROR_UI_PROGRAM_INPUT_TYPE_MISMATCH: &str = "ui_program_input_type_mismatch";
 pub const ERROR_UI_PROGRAM_STALE_INPUT_REVISION: &str = "ui_program_stale_input_revision";
 pub const ERROR_UI_PROGRAM_UNKNOWN_TEXT_HANDLE: &str = "ui_program_unknown_text_handle";
-pub const ERROR_UI_PROGRAM_TEXT_REGISTRY_GENERATION_MISMATCH: &str = "ui_program_text_registry_generation_mismatch";
+pub const ERROR_UI_PROGRAM_TEXT_REGISTRY_GENERATION_MISMATCH: &str =
+    "ui_program_text_registry_generation_mismatch";
 pub const ERROR_UI_PROGRAM_UNKNOWN_BINDING_TARGET: &str = "ui_program_unknown_binding_target";
 pub const ERROR_UI_PROGRAM_CAPACITY_OVERFLOW: &str = "ui_program_capacity_overflow";
 pub const ERROR_UI_PROGRAM_INVALID_BRANCH_TEMPLATE: &str = "ui_program_invalid_branch_template";
@@ -34,47 +35,146 @@ pub const ERROR_UI_PROGRAM_EVENT_STALE_REVISION: &str = "ui_program_event_stale_
 pub const ERROR_UI_PROGRAM_EVENT_INVALID_SOURCE: &str = "ui_program_event_invalid_source";
 pub const ERROR_UI_PROGRAM_EVENT_CONTROL_UNAVAILABLE: &str = "ui_program_event_control_unavailable";
 pub const ERROR_UI_PROGRAM_EVENT_PAYLOAD_REJECTED: &str = "ui_program_event_payload_rejected";
-pub const ERROR_UI_PROGRAM_EVENT_DUPLICATE_IDEMPOTENCY_KEY: &str = "ui_program_event_duplicate_idempotency_key";
-pub const ERROR_UI_PROGRAM_EVENT_INTERACTION_EPOCH_MISMATCH: &str = "ui_program_event_interaction_epoch_mismatch";
+pub const ERROR_UI_PROGRAM_EVENT_DUPLICATE_IDEMPOTENCY_KEY: &str =
+    "ui_program_event_duplicate_idempotency_key";
+pub const ERROR_UI_PROGRAM_EVENT_INTERACTION_EPOCH_MISMATCH: &str =
+    "ui_program_event_interaction_epoch_mismatch";
 pub const ERROR_UI_PROGRAM_UNKNOWN_INPUT_KEY: &str = "ui_program_unknown_input_key";
 pub const ERROR_UI_PROGRAM_INPUT_UPDATE_FORBIDDEN: &str = "ui_program_input_update_forbidden";
 pub const ERROR_UI_PROGRAM_DUPLICATE_INPUT_CHANGE: &str = "ui_program_duplicate_input_change";
-pub const ERROR_UI_PROGRAM_TEXT_REGISTRY_STALE_REVISION: &str = "ui_program_text_registry_stale_revision";
-pub const ERROR_UI_PROGRAM_TEXT_REGISTRY_CAPACITY_OVERFLOW: &str = "ui_program_text_registry_capacity_overflow";
+pub const ERROR_UI_PROGRAM_TEXT_REGISTRY_STALE_REVISION: &str =
+    "ui_program_text_registry_stale_revision";
+pub const ERROR_UI_PROGRAM_TEXT_REGISTRY_CAPACITY_OVERFLOW: &str =
+    "ui_program_text_registry_capacity_overflow";
 pub const ERROR_UI_PROGRAM_TEXT_TOO_LONG: &str = "ui_program_text_too_long";
 pub const ERROR_NUI_FLOW_PARSE: &str = "nui_flow_parse";
 pub const ERROR_NUI_FLOW_FORBIDDEN_FEATURE: &str = "nui_flow_forbidden_feature";
 pub const ERROR_NUI_FLOW_INVALID_PATCH: &str = "nui_flow_invalid_patch";
 pub const ERROR_NUI_FLOW_STALE_PATCH_REVISION: &str = "nui_flow_stale_patch_revision";
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)] #[serde(rename_all = "snake_case")]
-pub enum UiGpuScalarRepresentation { Bool32, I32, U32, F32, Vec2F32, Vec4F32, HandleUvec2 }
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)] #[serde(deny_unknown_fields)]
-pub struct UiInputPacking { pub alignment: u32, pub lanes: u8, pub offset: u32, pub representation: UiGpuScalarRepresentation }
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)] #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum UiInputKind { Bool, I32, U32, F32, Vec2, Vec4, Color, Enum { variants: Vec<String> }, TextHandle, AssetHandle, I32Range { minimum: i32, maximum: i32 }, U32Range { minimum: u32, maximum: u32 } }
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)] #[serde(rename_all = "snake_case")]
-pub enum UiInputUpdateClass { StaticAtProgramActivation, ReliableExternal, LocalPresentation, TextRegistryReference }
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)] #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum UiInputValue { Bool { value: bool }, I32 { value: i32 }, U32 { value: u32 }, F32 { value: f32 }, Vec2 { value: [f32; 2] }, Vec4 { value: [f32; 4] }, Color { value: [f32; 4] }, Enum { value: String }, TextHandle { value: UiTextHandle }, AssetHandle { id: u64, generation: u32 } }
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)] #[serde(deny_unknown_fields)]
-pub struct UiInputSlot { pub key: String, pub kind: UiInputKind, pub default_value: UiInputValue, pub update_class: UiInputUpdateClass, pub semantic_label: String, pub packing: UiInputPacking }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UiGpuScalarRepresentation {
+    Bool32,
+    I32,
+    U32,
+    F32,
+    Vec2F32,
+    Vec4F32,
+    HandleUvec2,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiInputPacking {
+    pub alignment: u32,
+    pub lanes: u8,
+    pub offset: u32,
+    pub representation: UiGpuScalarRepresentation,
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum UiInputKind {
+    Bool,
+    I32,
+    U32,
+    F32,
+    Vec2,
+    Vec4,
+    Color,
+    Enum { variants: Vec<String> },
+    TextHandle,
+    AssetHandle,
+    I32Range { minimum: i32, maximum: i32 },
+    U32Range { minimum: u32, maximum: u32 },
+    F32Range { minimum: f32, maximum: f32 },
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UiInputUpdateClass {
+    StaticAtProgramActivation,
+    ReliableExternal,
+    LocalPresentation,
+    TextRegistryReference,
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum UiInputValue {
+    Bool { value: bool },
+    I32 { value: i32 },
+    U32 { value: u32 },
+    F32 { value: f32 },
+    Vec2 { value: [f32; 2] },
+    Vec4 { value: [f32; 4] },
+    Color { value: [f32; 4] },
+    Enum { value: String },
+    TextHandle { value: UiTextHandle },
+    AssetHandle { id: u64, generation: u32 },
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiInputSlot {
+    pub key: String,
+    pub kind: UiInputKind,
+    pub default_value: UiInputValue,
+    pub update_class: UiInputUpdateClass,
+    pub semantic_label: String,
+    pub packing: UiInputPacking,
+}
 /// A control-plane input which supplies a bounded DataGrid window. Grid inputs
 /// deliberately have no scalar value or GPU packing.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)] #[serde(deny_unknown_fields)]
-pub struct UiGridInputSlot { pub key: String }
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)] #[serde(deny_unknown_fields)]
-pub struct UiInputSchema { pub schema_id: String, pub version: u16, pub slots: Vec<UiInputSlot>, #[serde(default)] pub grid_slots: Vec<UiGridInputSlot>, pub layout_hash: String }
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)] #[serde(deny_unknown_fields)]
-pub struct UiInputChange { pub key: String, pub value: UiInputValue }
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)] #[serde(deny_unknown_fields)]
-pub struct UiInputFrame { pub program_revision: UiProgramRevision, pub expected_input_revision: Revision, pub request_id: String, pub idempotency_key: String, pub changes: Vec<UiInputChange> }
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)] #[serde(rename_all = "snake_case")]
-pub enum UiInputValueSource { Default, ReliableExternal, LocalPresentation, TextRegistryReference }
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)] #[serde(deny_unknown_fields)]
-pub struct UiResolvedInputValue { pub value: UiInputValue, pub source: UiInputValueSource, pub last_update_revision: Revision }
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)] #[serde(deny_unknown_fields)]
-pub struct UiResolvedInputs { pub program_revision: UiProgramRevision, pub input_revision: Revision, pub values: std::collections::BTreeMap<String, UiResolvedInputValue>, pub changed_slots: Vec<String> }
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiGridInputSlot {
+    pub key: String,
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiInputSchema {
+    pub schema_id: String,
+    pub version: u16,
+    pub slots: Vec<UiInputSlot>,
+    #[serde(default)]
+    pub grid_slots: Vec<UiGridInputSlot>,
+    pub layout_hash: String,
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiInputChange {
+    pub key: String,
+    pub value: UiInputValue,
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiInputFrame {
+    pub program_revision: UiProgramRevision,
+    pub expected_input_revision: Revision,
+    pub request_id: String,
+    pub idempotency_key: String,
+    pub changes: Vec<UiInputChange>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UiInputValueSource {
+    Default,
+    ReliableExternal,
+    LocalPresentation,
+    TextRegistryReference,
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiResolvedInputValue {
+    pub value: UiInputValue,
+    pub source: UiInputValueSource,
+    pub last_update_revision: Revision,
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiResolvedInputs {
+    pub program_revision: UiProgramRevision,
+    pub input_revision: Revision,
+    pub values: std::collections::BTreeMap<String, UiResolvedInputValue>,
+    pub changed_slots: Vec<String>,
+}
 
 /// Complete host-visible input state for one active UI program. Scalar inputs
 /// and bounded grid windows are kept separate because grids have no GPU scalar
@@ -87,28 +187,89 @@ pub struct UiProgramInputSnapshot {
 }
 
 impl UiInputKind {
-    pub fn packing(&self) -> (u32, u8, UiGpuScalarRepresentation) { match self { Self::Bool => (4, 1, UiGpuScalarRepresentation::Bool32), Self::I32 | Self::I32Range { .. } => (4, 1, UiGpuScalarRepresentation::I32), Self::U32 | Self::U32Range { .. } | Self::Enum { .. } => (4, 1, UiGpuScalarRepresentation::U32), Self::F32 => (4, 1, UiGpuScalarRepresentation::F32), Self::Vec2 => (8, 2, UiGpuScalarRepresentation::Vec2F32), Self::Vec4 | Self::Color => (16, 4, UiGpuScalarRepresentation::Vec4F32), Self::TextHandle | Self::AssetHandle => (8, 2, UiGpuScalarRepresentation::HandleUvec2) } }
-    pub fn accepts(&self, value: &UiInputValue) -> bool { let finite = |values: &[f32]| values.iter().all(|value| value.is_finite()); match (self, value) { (Self::Bool, UiInputValue::Bool { .. }) | (Self::I32, UiInputValue::I32 { .. }) | (Self::U32, UiInputValue::U32 { .. }) | (Self::TextHandle, UiInputValue::TextHandle { .. }) | (Self::AssetHandle, UiInputValue::AssetHandle { .. }) => true, (Self::F32, UiInputValue::F32 { value }) => value.is_finite(), (Self::Vec2, UiInputValue::Vec2 { value }) => finite(value), (Self::Vec4, UiInputValue::Vec4 { value }) | (Self::Color, UiInputValue::Color { value }) => finite(value), (Self::Enum { variants }, UiInputValue::Enum { value }) => variants.iter().any(|variant| variant == value), (Self::I32Range { minimum, maximum }, UiInputValue::I32 { value }) => minimum <= maximum && (*minimum..=*maximum).contains(value), (Self::U32Range { minimum, maximum }, UiInputValue::U32 { value }) => minimum <= maximum && (*minimum..=*maximum).contains(value), _ => false } }
+    pub fn packing(&self) -> (u32, u8, UiGpuScalarRepresentation) {
+        match self {
+            Self::Bool => (4, 1, UiGpuScalarRepresentation::Bool32),
+            Self::I32 | Self::I32Range { .. } => (4, 1, UiGpuScalarRepresentation::I32),
+            Self::U32 | Self::U32Range { .. } | Self::Enum { .. } => {
+                (4, 1, UiGpuScalarRepresentation::U32)
+            }
+            Self::F32 | Self::F32Range { .. } => (4, 1, UiGpuScalarRepresentation::F32),
+            Self::Vec2 => (8, 2, UiGpuScalarRepresentation::Vec2F32),
+            Self::Vec4 | Self::Color => (16, 4, UiGpuScalarRepresentation::Vec4F32),
+            Self::TextHandle | Self::AssetHandle => (8, 2, UiGpuScalarRepresentation::HandleUvec2),
+        }
+    }
+    pub fn accepts(&self, value: &UiInputValue) -> bool {
+        let finite = |values: &[f32]| values.iter().all(|value| value.is_finite());
+        match (self, value) {
+            (Self::Bool, UiInputValue::Bool { .. })
+            | (Self::I32, UiInputValue::I32 { .. })
+            | (Self::U32, UiInputValue::U32 { .. })
+            | (Self::TextHandle, UiInputValue::TextHandle { .. })
+            | (Self::AssetHandle, UiInputValue::AssetHandle { .. }) => true,
+            (Self::F32, UiInputValue::F32 { value }) => value.is_finite(),
+            (Self::Vec2, UiInputValue::Vec2 { value }) => finite(value),
+            (Self::Vec4, UiInputValue::Vec4 { value })
+            | (Self::Color, UiInputValue::Color { value }) => finite(value),
+            (Self::Enum { variants }, UiInputValue::Enum { value }) => {
+                variants.iter().any(|variant| variant == value)
+            }
+            (Self::I32Range { minimum, maximum }, UiInputValue::I32 { value }) => {
+                minimum <= maximum && (*minimum..=*maximum).contains(value)
+            }
+            (Self::U32Range { minimum, maximum }, UiInputValue::U32 { value }) => {
+                minimum <= maximum && (*minimum..=*maximum).contains(value)
+            }
+            (Self::F32Range { minimum, maximum }, UiInputValue::F32 { value }) => {
+                minimum.is_finite()
+                    && maximum.is_finite()
+                    && value.is_finite()
+                    && minimum <= maximum
+                    && *value >= *minimum
+                    && *value <= *maximum
+            }
+            _ => false,
+        }
+    }
 }
 
 /// Opaque session-stable text identity. Its generation prevents a released ID
 /// from resolving to unrelated replacement text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct UiTextHandle { pub id: u64, pub generation: u32 }
+pub struct UiTextHandle {
+    pub id: u64,
+    pub generation: u32,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum UiTextSourceCategory { Literal, Dynamic }
+pub enum UiTextSourceCategory {
+    Literal,
+    Dynamic,
+}
 
 /// Bounded UTF-8 text held by the text registry, never by a scalar input frame.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct UiTextRecord { pub handle: UiTextHandle, pub text: String, pub category: UiTextSourceCategory, pub revision: Revision, pub byte_length: u32 }
+pub struct UiTextRecord {
+    pub handle: UiTextHandle,
+    pub text: String,
+    pub category: UiTextSourceCategory,
+    pub revision: Revision,
+    pub byte_length: u32,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct UiTextRegistrySnapshot { pub registry_id: String, pub revision: Revision, pub capacity: u32, pub used: u32, pub records: Vec<UiTextRecord> }
+pub struct UiTextRegistrySnapshot {
+    pub registry_id: String,
+    pub revision: Revision,
+    pub capacity: u32,
+    pub used: u32,
+    pub records: Vec<UiTextRecord>,
+}
 
 /// Sanitized text-registry inspection data. This is the default diagnostic
 /// surface; text content is returned only by an explicitly approved query.
@@ -135,15 +296,98 @@ pub struct UiTextRegistryDebugSnapshot {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum UiTextHandleStatus { Ready, Missing, GenerationMismatch, Released, CapacityExceeded }
+pub enum UiTextHandleStatus {
+    Ready,
+    Missing,
+    GenerationMismatch,
+    Released,
+    CapacityExceeded,
+}
 
 /// Sanitized metadata for default diagnostics. Text content is deliberately not included.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct UiTextHandleDiagnostic { pub handle: UiTextHandle, pub status: UiTextHandleStatus, pub reference_count: u32, pub resident: bool, pub message: String }
+pub struct UiTextHandleDiagnostic {
+    pub handle: UiTextHandle,
+    pub status: UiTextHandleStatus,
+    pub reference_count: u32,
+    pub resident: bool,
+    pub message: String,
+}
 impl UiInputSchema {
-    pub fn validate(&self) -> Result<(), UiSchemaError> { if self.schema_id.trim().is_empty() || self.version == 0 || self.layout_hash.trim().is_empty() { return Err(UiSchemaError::InvalidInputSchema); } let mut keys = std::collections::HashSet::new(); let mut offsets = std::collections::HashSet::new(); for slot in &self.slots { if slot.key.trim().is_empty() || slot.semantic_label.trim().is_empty() { return Err(UiSchemaError::InvalidInputSlot); } if !keys.insert(slot.key.as_str()) { return Err(UiSchemaError::DuplicateInputKey); } if !slot.kind.accepts(&slot.default_value) { return Err(UiSchemaError::InvalidInputDefault); } let (alignment, lanes, representation) = slot.kind.packing(); if slot.packing.alignment != alignment || slot.packing.lanes != lanes || slot.packing.representation != representation || slot.packing.offset % alignment != 0 || !offsets.insert(slot.packing.offset) { return Err(UiSchemaError::InvalidInputPacking); } if let UiInputKind::Enum { variants } = &slot.kind { if variants.is_empty() || variants.iter().any(|variant| variant.trim().is_empty()) || variants.iter().collect::<std::collections::HashSet<_>>().len() != variants.len() { return Err(UiSchemaError::InvalidInputSlot); } } } for slot in &self.grid_slots { if slot.key.trim().is_empty() || !keys.insert(slot.key.as_str()) { return Err(UiSchemaError::DuplicateInputKey); } } Ok(()) }
-    pub fn validate_evolution_from(&self, previous: &Self) -> Result<(), UiSchemaError> { if self.schema_id != previous.schema_id || self.version <= previous.version { return Err(UiSchemaError::IncompatibleInputSchemaEvolution); } for old_slot in &previous.slots { let Some(new_slot) = self.slots.iter().find(|slot| slot.key == old_slot.key) else { return Err(UiSchemaError::IncompatibleInputSchemaEvolution); }; if new_slot.kind != old_slot.kind || new_slot.update_class != old_slot.update_class || new_slot.packing != old_slot.packing { return Err(UiSchemaError::IncompatibleInputSchemaEvolution); } } if previous.grid_slots.iter().any(|old_slot| !self.grid_slots.iter().any(|new_slot| new_slot.key == old_slot.key)) { return Err(UiSchemaError::IncompatibleInputSchemaEvolution); } self.validate() }
+    pub fn validate(&self) -> Result<(), UiSchemaError> {
+        if self.schema_id.trim().is_empty()
+            || self.version == 0
+            || self.layout_hash.trim().is_empty()
+        {
+            return Err(UiSchemaError::InvalidInputSchema);
+        }
+        let mut keys = std::collections::HashSet::new();
+        let mut offsets = std::collections::HashSet::new();
+        for slot in &self.slots {
+            if slot.key.trim().is_empty() || slot.semantic_label.trim().is_empty() {
+                return Err(UiSchemaError::InvalidInputSlot);
+            }
+            if !keys.insert(slot.key.as_str()) {
+                return Err(UiSchemaError::DuplicateInputKey);
+            }
+            if !slot.kind.accepts(&slot.default_value) {
+                return Err(UiSchemaError::InvalidInputDefault);
+            }
+            let (alignment, lanes, representation) = slot.kind.packing();
+            if slot.packing.alignment != alignment
+                || slot.packing.lanes != lanes
+                || slot.packing.representation != representation
+                || slot.packing.offset % alignment != 0
+                || !offsets.insert(slot.packing.offset)
+            {
+                return Err(UiSchemaError::InvalidInputPacking);
+            }
+            if let UiInputKind::Enum { variants } = &slot.kind {
+                if variants.is_empty()
+                    || variants.iter().any(|variant| variant.trim().is_empty())
+                    || variants
+                        .iter()
+                        .collect::<std::collections::HashSet<_>>()
+                        .len()
+                        != variants.len()
+                {
+                    return Err(UiSchemaError::InvalidInputSlot);
+                }
+            }
+        }
+        for slot in &self.grid_slots {
+            if slot.key.trim().is_empty() || !keys.insert(slot.key.as_str()) {
+                return Err(UiSchemaError::DuplicateInputKey);
+            }
+        }
+        Ok(())
+    }
+    pub fn validate_evolution_from(&self, previous: &Self) -> Result<(), UiSchemaError> {
+        if self.schema_id != previous.schema_id || self.version <= previous.version {
+            return Err(UiSchemaError::IncompatibleInputSchemaEvolution);
+        }
+        for old_slot in &previous.slots {
+            let Some(new_slot) = self.slots.iter().find(|slot| slot.key == old_slot.key) else {
+                return Err(UiSchemaError::IncompatibleInputSchemaEvolution);
+            };
+            if new_slot.kind != old_slot.kind
+                || new_slot.update_class != old_slot.update_class
+                || new_slot.packing != old_slot.packing
+            {
+                return Err(UiSchemaError::IncompatibleInputSchemaEvolution);
+            }
+        }
+        if previous.grid_slots.iter().any(|old_slot| {
+            !self
+                .grid_slots
+                .iter()
+                .any(|new_slot| new_slot.key == old_slot.key)
+        }) {
+            return Err(UiSchemaError::IncompatibleInputSchemaEvolution);
+        }
+        self.validate()
+    }
 }
 
 /// Declares a versioned UI program capability and its authority.
@@ -203,7 +447,14 @@ impl UiProgramRevision {
             if !names.insert((capability.name.as_str(), capability.version)) {
                 return Err(UiSchemaError::DuplicateProgramCapability);
             }
-            if !matches!(capability.name.as_str(), UI_PROGRAM_CAPABILITY_NAME | UI_PROGRAM_TEXT_REGISTRY_CAPABILITY_NAME | UI_PROGRAM_BOUNDED_STRUCTURE_CAPABILITY_NAME | UI_PROGRAM_SEMANTIC_EVENT_CAPABILITY_NAME) || capability.version != 1 {
+            if !matches!(
+                capability.name.as_str(),
+                UI_PROGRAM_CAPABILITY_NAME
+                    | UI_PROGRAM_TEXT_REGISTRY_CAPABILITY_NAME
+                    | UI_PROGRAM_BOUNDED_STRUCTURE_CAPABILITY_NAME
+                    | UI_PROGRAM_SEMANTIC_EVENT_CAPABILITY_NAME
+            ) || capability.version != 1
+            {
                 return Err(UiSchemaError::UnsupportedProgramCapability);
             }
         }
@@ -297,19 +548,31 @@ pub struct UiSurfaceState {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum UiDiagnosticsState { Collapsed, Expanded }
+pub enum UiDiagnosticsState {
+    Collapsed,
+    Expanded,
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct UiInspectorState { pub tab: UiInspectorTab }
+pub struct UiInspectorState {
+    pub tab: UiInspectorTab,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum UiInspectorTab { Overview, Materials, History }
+pub enum UiInspectorTab {
+    Overview,
+    Materials,
+    History,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum UiSurfaceEventKind { DiagnosticsToggle, InspectorTabSelect }
+pub enum UiSurfaceEventKind {
+    DiagnosticsToggle,
+    InspectorTabSelect,
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE")]
@@ -338,7 +601,10 @@ pub struct UiFragmentSubmission {
 
 impl UiFragmentSubmission {
     pub fn new(fragment: UiFragment) -> Self {
-        Self { schema_version: UI_FRAGMENT_SCHEMA_VERSION, fragment }
+        Self {
+            schema_version: UI_FRAGMENT_SCHEMA_VERSION,
+            fragment,
+        }
     }
 
     pub fn validate(&self) -> Result<(), UiSchemaError> {
@@ -403,13 +669,17 @@ pub enum UiNodeKind {
     DataGrid,
 }
 
-
 /// Source-independent text declaration. Renderers receive resolved immutable content only.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TextRef {
-    Key { key: String, arguments: serde_json::Value },
-    Literal { value: String },
+    Key {
+        key: String,
+        arguments: serde_json::Value,
+    },
+    Literal {
+        value: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -423,7 +693,12 @@ pub struct UiBounds {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum UiLayoutMode { Absolute, Overlay, Row, Column }
+pub enum UiLayoutMode {
+    Absolute,
+    Overlay,
+    Row,
+    Column,
+}
 
 /// Child-overflow policy for a layout container. `Rounded` uses the node's
 /// declared corner radius; `Scroll` clips identically to bounds while applying
@@ -450,7 +725,11 @@ pub enum UiJustifyContent {
     SpaceEvenly,
 }
 
-impl UiJustifyContent { fn is_start(value: &Self) -> bool { *value == Self::Start } }
+impl UiJustifyContent {
+    fn is_start(value: &Self) -> bool {
+        *value == Self::Start
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -462,7 +741,11 @@ pub enum UiAlignItems {
     Stretch,
 }
 
-impl UiAlignItems { fn is_start(value: &Self) -> bool { *value == Self::Start } }
+impl UiAlignItems {
+    fn is_start(value: &Self) -> bool {
+        *value == Self::Start
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -493,10 +776,30 @@ pub struct UiLayout {
     pub scroll_offset: [f32; 2],
 }
 
-fn is_zero(value: &f32) -> bool { *value == 0.0 }
+fn is_zero(value: &f32) -> bool {
+    *value == 0.0
+}
 
 impl Default for UiLayout {
-    fn default() -> Self { Self { mode: UiLayoutMode::Absolute, padding: [0.0; 4], margin: [0.0; 4], gap: 0.0, min_size: None, max_size: None, preferred_size: None, flex_basis: None, flex_grow: 0.0, flex_shrink: 0.0, justify_content: UiJustifyContent::Start, align_items: UiAlignItems::Start, align_self: None, clip: UiClipPolicy::Bounds, scroll_offset: [0.0; 2] } }
+    fn default() -> Self {
+        Self {
+            mode: UiLayoutMode::Absolute,
+            padding: [0.0; 4],
+            margin: [0.0; 4],
+            gap: 0.0,
+            min_size: None,
+            max_size: None,
+            preferred_size: None,
+            flex_basis: None,
+            flex_grow: 0.0,
+            flex_shrink: 0.0,
+            justify_content: UiJustifyContent::Start,
+            align_items: UiAlignItems::Start,
+            align_self: None,
+            clip: UiClipPolicy::Bounds,
+            scroll_offset: [0.0; 2],
+        }
+    }
 }
 
 /// Renderer-independent visual properties for a screen-space UI node.
@@ -565,13 +868,30 @@ pub struct UiTransitionState {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum UiEffect {
-    SemanticAction { action: String },
-    SemanticIntent { intent: UiIntent },
-    BoundSemanticIntent { node_id: UiNodeId, intent: UiIntent },
-    ControlPresentation { node_id: UiNodeId, state: UiControlPresentation },
-    DataGridFrame { declaration: UiDataGridDeclaration, frame: UiDataGridFrame },
-    DragBinding { binding: UiDragBinding },
-    DropBinding { binding: UiDropBinding },
+    SemanticAction {
+        action: String,
+    },
+    SemanticIntent {
+        intent: UiIntent,
+    },
+    BoundSemanticIntent {
+        node_id: UiNodeId,
+        intent: UiIntent,
+    },
+    ControlPresentation {
+        node_id: UiNodeId,
+        state: UiControlPresentation,
+    },
+    DataGridFrame {
+        declaration: UiDataGridDeclaration,
+        frame: UiDataGridFrame,
+    },
+    DragBinding {
+        binding: UiDragBinding,
+    },
+    DropBinding {
+        binding: UiDropBinding,
+    },
 }
 
 /// Domain-prepared visual value for a declared control. It contains only
@@ -579,23 +899,43 @@ pub enum UiEffect {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum UiControlPresentation {
-    Toggle { selected: bool },
-    Numeric { value: f32, min: f32, max: f32 },
-    Choice { token: String, options: Vec<String>, selected: bool },
-    Scroll { position: f32 },
+    Toggle {
+        selected: bool,
+    },
+    Numeric {
+        value: f32,
+        min: f32,
+        max: f32,
+    },
+    Choice {
+        token: String,
+        options: Vec<String>,
+        selected: bool,
+    },
+    Scroll {
+        position: f32,
+    },
 }
 
 /// Renderer-local pointer interaction policy. The keys name declared UI
 /// semantics; renderer hit IDs and pointer coordinates never leave WGPU.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum UiDragAxis { Horizontal, Vertical, Both }
+pub enum UiDragAxis {
+    Horizontal,
+    Vertical,
+    Both,
+}
 
 /// Bounds used by the renderer-local drag preview. This is presentation policy,
 /// not a domain placement rule.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum UiDragBoundary { Parent, Surface, Free }
+pub enum UiDragBoundary {
+    Parent,
+    Surface,
+    Free,
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -636,7 +976,10 @@ pub enum UiDropPlacement {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum UiIntent {
-    Invoke { action: String, params: serde_json::Value },
+    Invoke {
+        action: String,
+        params: serde_json::Value,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -694,7 +1037,14 @@ pub struct UiDataGridCellTarget {
 /// renderer instruction to mutate the canonical tree.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct UiDragDropPayload { pub source_key: String, pub target_key: String, #[serde(default)] pub placement: UiDropPlacement, #[serde(default, skip_serializing_if = "Option::is_none")] pub presentation_template_key: Option<String> }
+pub struct UiDragDropPayload {
+    pub source_key: String,
+    pub target_key: String,
+    #[serde(default)]
+    pub placement: UiDropPlacement,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presentation_template_key: Option<String>,
+}
 
 /// A renderer-resolved semantic event. It intentionally contains no render hit ID or node key.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -758,9 +1108,22 @@ pub enum UiSchemaError {
     MissingRenderSurfaceRef,
     InvalidRenderSurfaceRef,
     InvalidText,
-    InvalidInputSchema, InvalidInputSlot, DuplicateInputKey, InvalidInputDefault, InvalidInputPacking, IncompatibleInputSchemaEvolution, InvalidTextRegistry, InvalidTextRecord,
-    InvalidIrDocument, DuplicateIrNodeKey, InvalidBinding, InvalidBindingTarget, InvalidBindingType,
-    InvalidProgramBudget, InvalidProgramEvent, MissingProgramResource,
+    InvalidInputSchema,
+    InvalidInputSlot,
+    DuplicateInputKey,
+    InvalidInputDefault,
+    InvalidInputPacking,
+    IncompatibleInputSchemaEvolution,
+    InvalidTextRegistry,
+    InvalidTextRecord,
+    InvalidIrDocument,
+    DuplicateIrNodeKey,
+    InvalidBinding,
+    InvalidBindingTarget,
+    InvalidBindingType,
+    InvalidProgramBudget,
+    InvalidProgramEvent,
+    MissingProgramResource,
 }
 
 /// Canonical, versioned authoring document. It remains data-only: bindings are
@@ -796,101 +1159,227 @@ pub struct UiIrDocument {
 /// authoring metadata only and never identifies a renderer hit target.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct NuiSourceSpan { pub line: u32, pub column: u32, pub end_line: u32, pub end_column: u32 }
+pub struct NuiSourceSpan {
+    pub line: u32,
+    pub column: u32,
+    pub end_line: u32,
+    pub end_column: u32,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct NuiFlowParseDiagnostic { pub code: String, pub severity: UiDiagnosticSeverity, pub message: String, pub span: NuiSourceSpan, #[serde(default, skip_serializing_if = "Option::is_none")] pub suggestion: Option<String> }
+pub struct NuiFlowParseDiagnostic {
+    pub code: String,
+    pub severity: UiDiagnosticSeverity,
+    pub message: String,
+    pub span: NuiSourceSpan,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suggestion: Option<String>,
+}
 
 /// Parsed Flow source and its deterministic lowering result. JSON IR remains
 /// the canonical persisted representation; Flow is an authoring notation.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct NuiFlowDocument { pub version: u16, pub source: String, pub source_map: std::collections::BTreeMap<String, NuiSourceSpan>, pub ir: UiIrDocument, pub input_schema: UiInputSchema, #[serde(default)] pub state_machines: Vec<NuiFlowStateMachine>, #[serde(default)] pub drags: Vec<NuiFlowDragDeclaration>, #[serde(default)] pub drops: Vec<NuiFlowDropDeclaration> }
+pub struct NuiFlowDocument {
+    pub version: u16,
+    pub source: String,
+    pub source_map: std::collections::BTreeMap<String, NuiSourceSpan>,
+    pub ir: UiIrDocument,
+    pub input_schema: UiInputSchema,
+    #[serde(default)]
+    pub state_machines: Vec<NuiFlowStateMachine>,
+    #[serde(default)]
+    pub drags: Vec<NuiFlowDragDeclaration>,
+    #[serde(default)]
+    pub drops: Vec<NuiFlowDropDeclaration>,
+}
 
 /// Finite UI-local statechart declared by NUI Flow. It may only control
 /// presentation; domain mutations leave through declared semantic intents.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct NuiFlowStateMachine { pub key: String, pub initial_state: String, pub states: Vec<String>, #[serde(default)] pub transitions: Vec<NuiFlowStateTransition> }
+pub struct NuiFlowStateMachine {
+    pub key: String,
+    pub initial_state: String,
+    pub states: Vec<String>,
+    #[serde(default)]
+    pub transitions: Vec<NuiFlowStateTransition>,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum NuiFlowStateTrigger { Sync, Intent { name: String } }
+pub enum NuiFlowStateTrigger {
+    Sync,
+    Intent { name: String },
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct NuiFlowStateTransition { pub from_state: String, pub trigger: NuiFlowStateTrigger, #[serde(default, skip_serializing_if = "Option::is_none")] pub predicate: Option<UiBranchPredicate>, pub target_state: String, #[serde(default, skip_serializing_if = "Option::is_none")] pub emit_intent: Option<String> }
+pub struct NuiFlowStateTransition {
+    pub from_state: String,
+    pub trigger: NuiFlowStateTrigger,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub predicate: Option<UiBranchPredicate>,
+    pub target_state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emit_intent: Option<String>,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum NuiFlowDragAxis { Horizontal, Vertical, Both }
+pub enum NuiFlowDragAxis {
+    Horizontal,
+    Vertical,
+    Both,
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct NuiFlowDragDeclaration { pub key: String, pub source_node_key: String, pub axis: NuiFlowDragAxis, pub snap: f32, pub threshold: f32, pub boundary: UiDragBoundary }
+pub struct NuiFlowDragDeclaration {
+    pub key: String,
+    pub source_node_key: String,
+    pub axis: NuiFlowDragAxis,
+    pub snap: f32,
+    pub threshold: f32,
+    pub boundary: UiDragBoundary,
+}
 
 /// Declarative drop target. It proposes a revisioned semantic reparent command;
 /// it never moves a running program node directly. An optional presentation
 /// template is owned by an `into` target and guides domain patch construction.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct NuiFlowDropDeclaration { pub key: String, pub target_node_key: String, pub accepts_drag_key: String, #[serde(default)] pub placement: UiDropPlacement, #[serde(default, skip_serializing_if = "Option::is_none")] pub presentation_template_key: Option<String>, pub emit_intent: String }
+pub struct NuiFlowDropDeclaration {
+    pub key: String,
+    pub target_node_key: String,
+    pub accepts_drag_key: String,
+    #[serde(default)]
+    pub placement: UiDropPlacement,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presentation_template_key: Option<String>,
+    pub emit_intent: String,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum UiIrPatchOperationKind { Insert, Remove, Set, Move }
+pub enum UiIrPatchOperationKind {
+    Insert,
+    Remove,
+    Set,
+    Move,
+}
 
 /// Revisioned canonical patch operation originating from Flow. Targets use
 /// stable semantic keys/paths, never array indexes or renderer identities.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct UiIrPatchOperation { pub kind: UiIrPatchOperationKind, pub target_path: String, pub expected_revision: Revision, #[serde(default, skip_serializing_if = "Option::is_none")] pub payload: Option<serde_json::Value>, pub source_span: NuiSourceSpan }
+pub struct UiIrPatchOperation {
+    pub kind: UiIrPatchOperationKind,
+    pub target_path: String,
+    pub expected_revision: Revision,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload: Option<serde_json::Value>,
+    pub source_span: NuiSourceSpan,
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct UiIrPatch { pub expected_revision: Revision, pub operations: Vec<UiIrPatchOperation> }
+pub struct UiIrPatch {
+    pub expected_revision: Revision,
+    pub operations: Vec<UiIrPatchOperation>,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UiBoundProperty {
-    TextValue, Visible, Enabled, Selected, Active, NumericValue, ImageAsset,
-    Opacity, StateToken, ScrollOffset,
+    TextValue,
+    Visible,
+    Enabled,
+    Selected,
+    Active,
+    NumericValue,
+    ImageAsset,
+    Opacity,
+    StateToken,
+    ScrollOffset,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct UiIrBinding { pub input_key: String, pub node_key: String, pub property: UiBoundProperty }
+pub struct UiIrBinding {
+    pub input_key: String,
+    pub node_key: String,
+    pub property: UiBoundProperty,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum UiBranchPredicate {
-    Bool { input_key: String, #[serde(default = "default_true")] expected: bool },
-    EnumEquals { input_key: String, variant: String },
-    MachineState { machine_key: String, state: String },
+    Bool {
+        input_key: String,
+        #[serde(default = "default_true")]
+        expected: bool,
+    },
+    EnumEquals {
+        input_key: String,
+        variant: String,
+    },
+    MachineState {
+        machine_key: String,
+        state: String,
+    },
 }
 
-fn default_true() -> bool { true }
+fn default_true() -> bool {
+    true
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum UiBranchLayoutParticipation { HiddenSubtree, RetainLayout }
+pub enum UiBranchLayoutParticipation {
+    HiddenSubtree,
+    RetainLayout,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct UiBranchDeclaration { pub branch_key: String, pub root_node_key: String, pub predicate: UiBranchPredicate, pub layout_participation: UiBranchLayoutParticipation }
+pub struct UiBranchDeclaration {
+    pub branch_key: String,
+    pub root_node_key: String,
+    pub predicate: UiBranchPredicate,
+    pub layout_participation: UiBranchLayoutParticipation,
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct UiTemplateDeclaration { pub template_key: String, pub root_node_key: String, pub max_instances: u32, pub row_schema: std::collections::BTreeMap<String, UiInputKind>, pub instance_key_field: String, #[serde(default)] pub overflow_summary: bool }
+pub struct UiTemplateDeclaration {
+    pub template_key: String,
+    pub root_node_key: String,
+    pub max_instances: u32,
+    pub row_schema: std::collections::BTreeMap<String, UiInputKind>,
+    pub instance_key_field: String,
+    #[serde(default)]
+    pub overflow_summary: bool,
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct UiRepeatRow { pub stable_row_key: String, pub values: std::collections::BTreeMap<String, UiInputValue>, #[serde(default)] pub semantic_payload: std::collections::BTreeMap<String, String> }
+pub struct UiRepeatRow {
+    pub stable_row_key: String,
+    pub values: std::collections::BTreeMap<String, UiInputValue>,
+    #[serde(default)]
+    pub semantic_payload: std::collections::BTreeMap<String, String>,
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct UiRepeatFrame { pub template_key: String, pub list_revision: Revision, pub rows: Vec<UiRepeatRow>, pub expected_program_revision: UiProgramRevision }
+pub struct UiRepeatFrame {
+    pub template_key: String,
+    pub list_revision: Revision,
+    pub rows: Vec<UiRepeatRow>,
+    pub expected_program_revision: UiProgramRevision,
+}
 
 /// Declarative bound for one virtualized grid viewport. The grid node owns its
 /// stable key; a frame can replace only the currently visible row window.
@@ -898,13 +1387,23 @@ pub struct UiRepeatFrame { pub template_key: String, pub list_revision: Revision
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum UiDataGridPresentation {
     Text,
-    Select { intent: String },
-    Dropdown { options: Vec<String>, intent: String },
-    Edit { max_chars: u32, intent: String },
+    Select {
+        intent: String,
+    },
+    Dropdown {
+        options: Vec<String>,
+        intent: String,
+    },
+    Edit {
+        max_chars: u32,
+        intent: String,
+    },
 }
 
 impl Default for UiDataGridPresentation {
-    fn default() -> Self { Self::Text }
+    fn default() -> Self {
+        Self::Text
+    }
 }
 
 impl UiDataGridPresentation {
@@ -912,7 +1411,9 @@ impl UiDataGridPresentation {
         match self {
             Self::Text => true,
             Self::Select { intent } => !intent.trim().is_empty(),
-            Self::Dropdown { options, intent } => valid_data_grid_options(options) && !intent.trim().is_empty(),
+            Self::Dropdown { options, intent } => {
+                valid_data_grid_options(options) && !intent.trim().is_empty()
+            }
             Self::Edit { max_chars, intent } => *max_chars > 0 && !intent.trim().is_empty(),
         }
     }
@@ -948,7 +1449,11 @@ impl UiDataGridCellPresentation {
 fn valid_data_grid_options(options: &[String]) -> bool {
     !options.is_empty()
         && options.iter().all(|option| !option.trim().is_empty())
-        && options.iter().collect::<std::collections::HashSet<_>>().len() == options.len()
+        && options
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+            == options.len()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -982,7 +1487,13 @@ impl UiDataGridDeclaration {
             && self.overscan <= self.max_window_rows
             && !self.columns.is_empty()
             && self.columns.iter().all(UiDataGridColumn::validate)
-            && self.columns.iter().map(|column| &column.key).collect::<std::collections::HashSet<_>>().len() == self.columns.len()
+            && self
+                .columns
+                .iter()
+                .map(|column| &column.key)
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+                == self.columns.len()
     }
 }
 
@@ -990,10 +1501,10 @@ impl UiDataGridDeclaration {
 /// window changes; row position is deliberately not an identity.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
- pub struct UiDataGridWindowRow {
-     pub stable_row_key: String,
-     pub cells: std::collections::BTreeMap<String, UiDataGridCell>,
- }
+pub struct UiDataGridWindowRow {
+    pub stable_row_key: String,
+    pub cells: std::collections::BTreeMap<String, UiDataGridCell>,
+}
 
 /// A bounded cell contains a typed domain value and its domain-provided display
 /// handle. The UI runtime never formats or derives either value.
@@ -1009,7 +1520,10 @@ pub struct UiDataGridCell {
 impl UiDataGridCell {
     pub fn validate(&self) -> bool {
         data_grid_value_is_valid(&self.value)
-            && self.presentation_override.as_ref().is_none_or(UiDataGridCellPresentation::validate)
+            && self
+                .presentation_override
+                .as_ref()
+                .is_none_or(UiDataGridCellPresentation::validate)
     }
 }
 
@@ -1017,7 +1531,9 @@ fn data_grid_value_is_valid(value: &UiInputValue) -> bool {
     match value {
         UiInputValue::F32 { value } => value.is_finite(),
         UiInputValue::Vec2 { value } => value.iter().all(|value| value.is_finite()),
-        UiInputValue::Vec4 { value } | UiInputValue::Color { value } => value.iter().all(|value| value.is_finite()),
+        UiInputValue::Vec4 { value } | UiInputValue::Color { value } => {
+            value.iter().all(|value| value.is_finite())
+        }
         UiInputValue::Enum { value } => !value.trim().is_empty(),
         _ => true,
     }
@@ -1025,14 +1541,23 @@ fn data_grid_value_is_valid(value: &UiInputValue) -> bool {
 
 /// Revisioned bounded window for a declared virtual DataGrid. `first_row` is
 /// the zero-based logical row offset and `total_rows` is the full domain count.
- #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
- #[serde(deny_unknown_fields)]
-pub struct UiDataGridFrame { pub list_revision: Revision, pub total_rows: u64, pub first_row: u64, pub window_rows: Vec<UiDataGridWindowRow>, pub expected_program_revision: UiProgramRevision }
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiDataGridFrame {
+    pub list_revision: Revision,
+    pub total_rows: u64,
+    pub first_row: u64,
+    pub window_rows: Vec<UiDataGridWindowRow>,
+    pub expected_program_revision: UiProgramRevision,
+}
 
 /// One typed update for a declared control-plane grid input.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct UiDataGridInputFrame { pub source_key: String, pub frame: UiDataGridFrame }
+pub struct UiDataGridInputFrame {
+    pub source_key: String,
+    pub frame: UiDataGridFrame,
+}
 
 /// Renderer-to-UI-runtime demand for a bounded replacement window. This carries
 /// only revisioned semantic identity; pointer coordinates and renderer hit IDs
@@ -1063,11 +1588,21 @@ pub enum UiWindowRequest {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum UiHostInbound {
-    WindowRequest { request: UiWindowRequest },
-    SemanticIntent { event: UiProgramSemanticEvent },
+    WindowRequest {
+        request: UiWindowRequest,
+    },
+    SemanticIntent {
+        event: UiProgramSemanticEvent,
+    },
+    /// A completed renderer-local drag resolved against declared program keys.
+    DragDrop {
+        event: UiProgramDragDropEvent,
+    },
     /// A renderer-validated mutation for a currently published DataGrid cell.
     /// This preserves the cell target and typed payload for a generic host.
-    DataGridCell { event: UiSemanticEvent },
+    DataGridCell {
+        event: UiSemanticEvent,
+    },
 }
 
 /// An externally accepted input publication. The host applies its scalar and
@@ -1078,6 +1613,18 @@ pub struct UiHostPublication {
     pub scalar_frame: UiInputFrame,
     #[serde(default)]
     pub grid_inputs: Vec<UiDataGridInputFrame>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presentation_update: Option<UiHostPresentationUpdate>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiHostPresentationUpdate {
+    pub expected_fragment_revision: Revision,
+    pub replacement_fragment: UiFragment,
+    pub replacement_program: UiProgram,
+    pub replacement_input_schema: UiInputSchema,
+    pub replacement_input_snapshot: UiProgramInputSnapshot,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1087,9 +1634,12 @@ pub struct UiProgramEventDeclaration {
     pub intent: String,
     /// Compatibility list retained for existing IR documents. New declarations
     /// must use the typed literal or bound payload tables below.
-    #[serde(default)] pub allowed_payload_keys: Vec<String>,
-    #[serde(default)] pub literal_payload: std::collections::BTreeMap<String, UiSemanticPayloadValue>,
-    #[serde(default)] pub bound_input_keys: Vec<String>,
+    #[serde(default)]
+    pub allowed_payload_keys: Vec<String>,
+    #[serde(default)]
+    pub literal_payload: std::collections::BTreeMap<String, UiSemanticPayloadValue>,
+    #[serde(default)]
+    pub bound_input_keys: Vec<String>,
 }
 
 /// The finite payload vocabulary accepted at the program semantic boundary.
@@ -1098,17 +1648,33 @@ pub struct UiProgramEventDeclaration {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum UiSemanticPayloadValue {
-    Bool { value: bool }, I32 { value: i32 }, U32 { value: u32 }, F32 { value: f32 },
-    Enum { value: String }, TextHandle { value: UiTextHandle }, AssetHandle { id: u64, generation: u32 },
+    Bool { value: bool },
+    I32 { value: i32 },
+    U32 { value: u32 },
+    F32 { value: f32 },
+    Enum { value: String },
+    TextHandle { value: UiTextHandle },
+    AssetHandle { id: u64, generation: u32 },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum UiProgramSemanticEventKind { Activate, ValueTentative, ValueCommit, SelectionChanged, TextEditCommit, InteractionCancel }
+pub enum UiProgramSemanticEventKind {
+    Activate,
+    ValueTentative,
+    ValueCommit,
+    SelectionChanged,
+    TextEditCommit,
+    InteractionCancel,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct UiSemanticInteractionMetadata { pub interaction_id: String, pub sequence: u64, pub renderer_epoch: u64 }
+pub struct UiSemanticInteractionMetadata {
+    pub interaction_id: String,
+    pub sequence: u64,
+    pub renderer_epoch: u64,
+}
 
 /// Program-native semantic event. Unlike the legacy fragment event, this is
 /// revisioned against the compiled program and resolved input snapshot.
@@ -1131,15 +1697,21 @@ pub struct UiProgramSemanticEvent {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum UiProgramSemanticEventStatus { Accepted, Rejected, Duplicate }
+pub enum UiProgramSemanticEventStatus {
+    Accepted,
+    Rejected,
+    Duplicate,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UiProgramSemanticEventResult {
     pub event_id: String,
     pub status: UiProgramSemanticEventStatus,
-    #[serde(default, skip_serializing_if = "Option::is_none")] pub code: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")] pub accepted_input_revision: Option<Revision>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accepted_input_revision: Option<Revision>,
     pub message: String,
 }
 
@@ -1156,126 +1728,371 @@ pub struct UiEventTraceRecord {
     pub input_revision: Revision,
     pub renderer_epoch: u64,
     pub result: UiProgramSemanticEventStatus,
-    #[serde(default, skip_serializing_if = "Option::is_none")] pub code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
     pub timestamp_unix_ms: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum UiProgramResourceKind { Image, RenderSurface, ThemeToken }
+pub enum UiProgramResourceKind {
+    Image,
+    RenderSurface,
+    ThemeToken,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct UiProgramResource { pub key: String, pub kind: UiProgramResourceKind, #[serde(default)] pub has_fallback: bool }
+pub struct UiProgramResource {
+    pub key: String,
+    pub kind: UiProgramResourceKind,
+    #[serde(default)]
+    pub has_fallback: bool,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct UiResourceBudget { pub max_nodes: u32, pub max_bindings: u32, pub max_instances: u32, pub max_text_records: u32, pub max_glyph_instances: u32, pub max_events: u32, pub max_clips: u32 }
+pub struct UiResourceBudget {
+    pub max_nodes: u32,
+    pub max_bindings: u32,
+    pub max_instances: u32,
+    pub max_text_records: u32,
+    pub max_glyph_instances: u32,
+    pub max_events: u32,
+    pub max_clips: u32,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct UiProgramNode { pub key: String, pub parent_key: Option<String>, pub kind: UiNodeKind, pub source_span: Option<UiSourceSpan> }
+pub struct UiProgramNode {
+    pub key: String,
+    pub parent_key: Option<String>,
+    pub kind: UiNodeKind,
+    pub source_span: Option<UiSourceSpan>,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct UiProgramLiteralText { pub node_key: String, pub handle: UiTextHandle, pub text: String }
+pub struct UiProgramLiteralText {
+    pub node_key: String,
+    pub handle: UiTextHandle,
+    pub text: String,
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct UiProgramLayoutRecord { pub node_key: String, pub bounds: UiBounds, pub layout: Option<UiLayout> }
+pub struct UiProgramLayoutRecord {
+    pub node_key: String,
+    pub bounds: UiBounds,
+    pub layout: Option<UiLayout>,
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct UiBinding { pub binding_id: u32, pub input_key: String, pub node_key: String, pub property: UiBoundProperty, pub expected_kind: UiInputKind, pub default_resolved_value: UiInputValue }
+pub struct UiBinding {
+    pub binding_id: u32,
+    pub input_key: String,
+    pub node_key: String,
+    pub property: UiBoundProperty,
+    pub expected_kind: UiInputKind,
+    pub default_resolved_value: UiInputValue,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct UiDependencyIndex { pub input_to_bindings: std::collections::BTreeMap<String, Vec<u32>>, pub node_to_source_span: std::collections::BTreeMap<String, Option<UiSourceSpan>>, pub node_to_dependents: std::collections::BTreeMap<String, Vec<u32>> }
+pub struct UiDependencyIndex {
+    pub input_to_bindings: std::collections::BTreeMap<String, Vec<u32>>,
+    pub node_to_source_span: std::collections::BTreeMap<String, Option<UiSourceSpan>>,
+    pub node_to_dependents: std::collections::BTreeMap<String, Vec<u32>>,
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct UiBranchRecord { pub branch_key: String, pub predicate: UiBranchPredicate, pub node_range: Vec<String>, pub layout_participation: UiBranchLayoutParticipation }
+pub struct UiBranchRecord {
+    pub branch_key: String,
+    pub predicate: UiBranchPredicate,
+    pub node_range: Vec<String>,
+    pub layout_participation: UiBranchLayoutParticipation,
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct UiTemplateRecord { pub template_key: String, pub node_range: Vec<String>, pub max_instances: u32, pub row_schema: std::collections::BTreeMap<String, UiInputKind>, pub instance_key_field: String, pub overflow_summary: bool }
+pub struct UiTemplateRecord {
+    pub template_key: String,
+    pub node_range: Vec<String>,
+    pub max_instances: u32,
+    pub row_schema: std::collections::BTreeMap<String, UiInputKind>,
+    pub instance_key_field: String,
+    pub overflow_summary: bool,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
- pub struct UiDataGridRecord {
-     pub node_key: String,
-     pub source_key: String,
-     pub max_window_rows: u32,
-     pub row_height: u32,
-     pub overscan: u32,
-     pub columns: Vec<UiDataGridColumn>,
- }
+pub struct UiDataGridRecord {
+    pub node_key: String,
+    pub source_key: String,
+    pub max_window_rows: u32,
+    pub row_height: u32,
+    pub overscan: u32,
+    pub columns: Vec<UiDataGridColumn>,
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct UiProgram { pub revision: UiProgramRevision, pub nodes: Vec<UiProgramNode>, pub node_templates: Vec<UiNode>, pub literal_texts: Vec<UiProgramLiteralText>, pub layout_records: Vec<UiProgramLayoutRecord>, pub binding_records: Vec<UiBinding>, pub branch_records: Vec<UiBranchRecord>, pub template_records: Vec<UiTemplateRecord>, pub data_grid_records: Vec<UiDataGridRecord>, pub event_records: Vec<UiProgramEventDeclaration>, pub resource_budget: UiResourceBudget, pub dependency_index: UiDependencyIndex, pub layout_hash: String }
+pub struct UiProgramDragRecord {
+    pub key: String,
+    pub source_node_key: String,
+    pub axis: UiDragAxis,
+    pub snap: f32,
+    pub threshold: f32,
+    pub boundary: UiDragBoundary,
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct UiCpuNodeState { pub node_key: String, pub visible: bool, pub enabled: bool, pub selected: bool, pub active: bool, #[serde(default, skip_serializing_if = "Option::is_none")] pub numeric_value: Option<f32>, #[serde(default, skip_serializing_if = "Option::is_none")] pub state_token: Option<String>, pub text: Option<UiTextHandle>, pub image: Option<UiInputValue>, pub opacity: f32, pub scroll_offset: [f32; 2] }
+pub struct UiProgramDropRecord {
+    pub key: String,
+    pub target_node_key: String,
+    pub accepts_drag_key: String,
+    pub placement: UiDropPlacement,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presentation_template_key: Option<String>,
+    pub intent: String,
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct UiCpuRenderPrimitive { pub node_key: String, pub kind: UiNodeKind, pub bounds: UiBounds, pub clip: Option<UiBounds> }
+pub struct UiProgram {
+    pub revision: UiProgramRevision,
+    pub nodes: Vec<UiProgramNode>,
+    pub node_templates: Vec<UiNode>,
+    pub literal_texts: Vec<UiProgramLiteralText>,
+    pub layout_records: Vec<UiProgramLayoutRecord>,
+    pub binding_records: Vec<UiBinding>,
+    pub branch_records: Vec<UiBranchRecord>,
+    pub template_records: Vec<UiTemplateRecord>,
+    pub data_grid_records: Vec<UiDataGridRecord>,
+    #[serde(default)]
+    pub drag_records: Vec<UiProgramDragRecord>,
+    #[serde(default)]
+    pub drop_records: Vec<UiProgramDropRecord>,
+    pub event_records: Vec<UiProgramEventDeclaration>,
+    pub resource_budget: UiResourceBudget,
+    pub dependency_index: UiDependencyIndex,
+    pub layout_hash: String,
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct UiCpuSemanticTarget { pub node_key: String, pub intents: Vec<String>, pub enabled: bool, pub visible: bool }
+pub struct UiCpuNodeState {
+    pub node_key: String,
+    pub visible: bool,
+    pub enabled: bool,
+    pub selected: bool,
+    pub active: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub numeric_value: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_token: Option<String>,
+    pub text: Option<UiTextHandle>,
+    pub image: Option<UiInputValue>,
+    pub opacity: f32,
+    pub scroll_offset: [f32; 2],
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct UiCpuFrameOutput { pub program_revision: UiProgramRevision, pub input_revision: Revision, pub nodes: Vec<UiCpuNodeState>, pub logical_layout: Vec<UiProgramLayoutRecord>, pub clips: std::collections::BTreeMap<String, UiBounds>, pub render_primitives: Vec<UiCpuRenderPrimitive>, pub semantic_targets: Vec<UiCpuSemanticTarget>, pub diagnostics: Vec<UiDiagnostic> }
+pub struct UiCpuRenderPrimitive {
+    pub node_key: String,
+    pub kind: UiNodeKind,
+    pub bounds: UiBounds,
+    pub clip: Option<UiBounds>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiCpuSemanticTarget {
+    pub node_key: String,
+    pub intents: Vec<String>,
+    pub enabled: bool,
+    pub visible: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiCpuFrameOutput {
+    pub program_revision: UiProgramRevision,
+    pub input_revision: Revision,
+    pub nodes: Vec<UiCpuNodeState>,
+    pub logical_layout: Vec<UiProgramLayoutRecord>,
+    pub clips: std::collections::BTreeMap<String, UiBounds>,
+    pub render_primitives: Vec<UiCpuRenderPrimitive>,
+    pub semantic_targets: Vec<UiCpuSemanticTarget>,
+    pub diagnostics: Vec<UiDiagnostic>,
+}
 
 /// Compact, semantic inspection data. These records deliberately use stable
 /// node keys and logical bounds; render hit IDs and physical pixels are absent.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct UiIrOutlineEntry { pub node_key: String, #[serde(default, skip_serializing_if = "Option::is_none")] pub parent_key: Option<String>, pub kind: UiNodeKind, pub static_properties: std::collections::BTreeMap<String, serde_json::Value>, pub binding_summary: Vec<String>, #[serde(default, skip_serializing_if = "Option::is_none")] pub branch_key: Option<String>, #[serde(default, skip_serializing_if = "Option::is_none")] pub template_key: Option<String>, #[serde(default, skip_serializing_if = "Option::is_none")] pub source_span: Option<UiSourceSpan>, pub diagnostic_count: u32 }
+pub struct UiIrOutlineEntry {
+    pub node_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_key: Option<String>,
+    pub kind: UiNodeKind,
+    pub static_properties: std::collections::BTreeMap<String, serde_json::Value>,
+    pub binding_summary: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_span: Option<UiSourceSpan>,
+    pub diagnostic_count: u32,
+}
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct UiIrOutlinePage { pub entries: Vec<UiIrOutlineEntry>, pub offset: u32, pub limit: u32, pub total: u32, #[serde(default, skip_serializing_if = "Option::is_none")] pub next_offset: Option<u32> }
+pub struct UiIrOutlinePage {
+    pub entries: Vec<UiIrOutlineEntry>,
+    pub offset: u32,
+    pub limit: u32,
+    pub total: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_offset: Option<u32>,
+}
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct UiNodeInspection { pub node: UiProgramNode, pub declared_properties: serde_json::Value, pub effective_properties: serde_json::Value, pub provenance: std::collections::BTreeMap<String, String>, #[serde(default, skip_serializing_if = "Option::is_none")] pub layout: Option<UiProgramLayoutRecord>, #[serde(default, skip_serializing_if = "Option::is_none")] pub clip: Option<UiBounds>, pub visibility_reason: String, pub resources: Vec<UiProgramResource>, pub events: Vec<UiProgramEventDeclaration>, #[serde(default, skip_serializing_if = "Option::is_none")] pub source_span: Option<UiSourceSpan>, pub diagnostics: Vec<UiDiagnostic> }
+pub struct UiNodeInspection {
+    pub node: UiProgramNode,
+    pub declared_properties: serde_json::Value,
+    pub effective_properties: serde_json::Value,
+    pub provenance: std::collections::BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layout: Option<UiProgramLayoutRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clip: Option<UiBounds>,
+    pub visibility_reason: String,
+    pub resources: Vec<UiProgramResource>,
+    pub events: Vec<UiProgramEventDeclaration>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_span: Option<UiSourceSpan>,
+    pub diagnostics: Vec<UiDiagnostic>,
+}
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct UiPatchDryRun { pub accepted: bool, pub base_revision: Revision, pub resulting_revision: Revision, pub diff: serde_json::Value, pub impacted_nodes: Vec<String>, pub required_input_schema_changes: Vec<String>, pub budget: UiResourceBudget, pub diagnostics: Vec<UiDiagnostic> }
+pub struct UiPatchDryRun {
+    pub accepted: bool,
+    pub base_revision: Revision,
+    pub resulting_revision: Revision,
+    pub diff: serde_json::Value,
+    pub impacted_nodes: Vec<String>,
+    pub required_input_schema_changes: Vec<String>,
+    pub budget: UiResourceBudget,
+    pub diagnostics: Vec<UiDiagnostic>,
+}
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct UiLayoutDiagnosticSnapshot { pub program_revision: UiProgramRevision, pub input_revision: Revision, pub logical_layout: Vec<UiProgramLayoutRecord>, pub clips: std::collections::BTreeMap<String, UiBounds>, pub visibility_reasons: std::collections::BTreeMap<String, String>, pub diagnostics: Vec<UiDiagnostic>, #[serde(default)] pub gpu_differential_mismatches: Vec<UiDiagnostic> }
+pub struct UiLayoutDiagnosticSnapshot {
+    pub program_revision: UiProgramRevision,
+    pub input_revision: Revision,
+    pub logical_layout: Vec<UiProgramLayoutRecord>,
+    pub clips: std::collections::BTreeMap<String, UiBounds>,
+    pub visibility_reasons: std::collections::BTreeMap<String, String>,
+    pub diagnostics: Vec<UiDiagnostic>,
+    #[serde(default)]
+    pub gpu_differential_mismatches: Vec<UiDiagnostic>,
+}
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct UiProgramDescription { pub revision: UiProgramRevision, pub layout_hash: String, pub active_capabilities: Vec<UiProgramCapability>, pub resource_budget: UiResourceBudget, pub runtime_high_water_marks: std::collections::BTreeMap<String, u32>, pub overflow_counters: std::collections::BTreeMap<String, u64> }
+pub struct UiProgramDescription {
+    pub revision: UiProgramRevision,
+    pub layout_hash: String,
+    pub active_capabilities: Vec<UiProgramCapability>,
+    pub resource_budget: UiResourceBudget,
+    pub runtime_high_water_marks: std::collections::BTreeMap<String, u32>,
+    pub overflow_counters: std::collections::BTreeMap<String, u64>,
+}
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct UiDebugBundle { pub version: u16, pub flow_source_hash: String, pub ir_hash: String, pub program: UiProgram, pub schema: UiInputSchema, pub initial_inputs: UiResolvedInputs, pub input_timeline: Vec<UiInputFrame>, pub repeat_timeline: Vec<UiRepeatFrame>, pub text_registry: UiTextRegistryDebugSnapshot, pub event_timeline: Vec<UiProgramSemanticEvent>, pub viewport: UiCpuViewport, pub expected_frames: Vec<UiCpuFrameOutput>, pub diagnostics: Vec<UiDiagnostic>, #[serde(default, skip_serializing_if = "Option::is_none")] pub gpu_readbacks: Option<Vec<UiGpuLayoutReadback>> }
+pub struct UiDebugBundle {
+    pub version: u16,
+    pub flow_source_hash: String,
+    pub ir_hash: String,
+    pub program: UiProgram,
+    pub schema: UiInputSchema,
+    pub initial_inputs: UiResolvedInputs,
+    pub input_timeline: Vec<UiInputFrame>,
+    pub repeat_timeline: Vec<UiRepeatFrame>,
+    pub text_registry: UiTextRegistryDebugSnapshot,
+    pub event_timeline: Vec<UiProgramSemanticEvent>,
+    pub viewport: UiCpuViewport,
+    pub expected_frames: Vec<UiCpuFrameOutput>,
+    pub diagnostics: Vec<UiDiagnostic>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_readbacks: Option<Vec<UiGpuLayoutReadback>>,
+}
 
 /// Renderer-owned GPU state exposed only as revisioned diagnostics. Buffer
 /// handles deliberately do not cross this contract boundary.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct UiGpuFrameState { pub renderer_epoch: u64, pub program_revision: UiProgramRevision, pub input_revision: Revision, pub dirty_slots: Vec<String>, pub frame_sequence: u64 }
+pub struct UiGpuFrameState {
+    pub renderer_epoch: u64,
+    pub program_revision: UiProgramRevision,
+    pub input_revision: Revision,
+    pub dirty_slots: Vec<String>,
+    pub frame_sequence: u64,
+}
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct UiGpuLayoutNode { pub node_key: String, pub bounds: UiBounds, pub clip: Option<UiBounds>, pub visible: bool }
+pub struct UiGpuLayoutNode {
+    pub node_key: String,
+    pub bounds: UiBounds,
+    pub clip: Option<UiBounds>,
+    pub visible: bool,
+}
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct UiGpuLayoutReadback { pub renderer_epoch: u64, pub program_revision: UiProgramRevision, pub input_revision: Revision, pub nodes: Vec<UiGpuLayoutNode>, pub diagnostics: Vec<UiDiagnostic>, pub sampled_frame: u64, pub asynchronous: bool }
+pub struct UiGpuLayoutReadback {
+    pub renderer_epoch: u64,
+    pub program_revision: UiProgramRevision,
+    pub input_revision: Revision,
+    pub nodes: Vec<UiGpuLayoutNode>,
+    pub diagnostics: Vec<UiDiagnostic>,
+    pub sampled_frame: u64,
+    pub asynchronous: bool,
+}
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct UiGpuPassTiming { pub program_upload_us: u64, pub input_upload_us: u64, pub binding_us: u64, pub layout_us: u64, pub instance_us: u64, pub render_us: u64, pub readback_us: u64 }
+pub struct UiGpuPassTiming {
+    pub program_upload_us: u64,
+    pub input_upload_us: u64,
+    pub binding_us: u64,
+    pub layout_us: u64,
+    pub instance_us: u64,
+    pub render_us: u64,
+    pub readback_us: u64,
+}
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum UiGpuUploadStatus { Empty, Staged, Active, RejectedCapacity }
+pub enum UiGpuUploadStatus {
+    Empty,
+    Staged,
+    Active,
+    RejectedCapacity,
+}
 /// Public adapter summary. GPU objects remain private to the renderer process.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct UiGpuBackendAdapter { pub renderer_epoch: u64, pub program_revision: Option<UiProgramRevision>, pub input_revision: Option<Revision>, pub upload_status: UiGpuUploadStatus, pub capacity: UiResourceBudget, pub diagnostics: Vec<UiDiagnostic>, pub last_timing: UiGpuPassTiming }
+pub struct UiGpuBackendAdapter {
+    pub renderer_epoch: u64,
+    pub program_revision: Option<UiProgramRevision>,
+    pub input_revision: Option<Revision>,
+    pub upload_status: UiGpuUploadStatus,
+    pub capacity: UiResourceBudget,
+    pub diagnostics: Vec<UiDiagnostic>,
+    pub last_timing: UiGpuPassTiming,
+}
 
 /// Domain-prepared values consumed by the terrain workbench. These groups are
 /// an inspection convenience only; the program still receives individual,
@@ -1324,7 +2141,10 @@ pub struct UiGpuReactiveAcceptanceRecord {
 /// CPU evaluator input expressed exclusively in logical layout units.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct UiCpuViewport { pub logical_bounds: UiBounds, pub revision: Revision }
+pub struct UiCpuViewport {
+    pub logical_bounds: UiBounds,
+    pub revision: Revision,
+}
 
 impl UiFragment {
     pub fn validate(&self) -> Result<(), UiSchemaError> {
@@ -1338,16 +2158,40 @@ impl UiFragment {
         let mut nodes = std::collections::HashSet::new();
         fn collect(node: &UiNode, nodes: &mut std::collections::HashSet<String>) {
             nodes.insert(node.node_id.0.clone());
-            for child in &node.children { collect(child, nodes); }
+            for child in &node.children {
+                collect(child, nodes);
+            }
         }
         collect(&self.root, &mut nodes);
-        let drags = self.effects.iter().filter_map(|effect| match effect { UiEffect::DragBinding { binding } => Some(binding), _ => None }).collect::<Vec<_>>();
+        let drags = self
+            .effects
+            .iter()
+            .filter_map(|effect| match effect {
+                UiEffect::DragBinding { binding } => Some(binding),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
         for effect in &self.effects {
             match effect {
-                UiEffect::DragBinding { binding } if !nodes.contains(&binding.source_node_id.0) => return Err(UiSchemaError::InvalidProgramEvent),
-                UiEffect::DropBinding { binding } if !nodes.contains(&binding.target_node_id.0) || !drags.iter().any(|drag| drag.key == binding.accepts_drag_key) => return Err(UiSchemaError::InvalidProgramEvent),
-                UiEffect::ControlPresentation { node_id, .. } if !nodes.contains(&node_id.0) => return Err(UiSchemaError::InvalidProgramEvent),
-                UiEffect::DataGridFrame { declaration, .. } if !nodes.contains(&declaration.node_key) => return Err(UiSchemaError::InvalidProgramEvent),
+                UiEffect::DragBinding { binding } if !nodes.contains(&binding.source_node_id.0) => {
+                    return Err(UiSchemaError::InvalidProgramEvent);
+                }
+                UiEffect::DropBinding { binding }
+                    if !nodes.contains(&binding.target_node_id.0)
+                        || !drags
+                            .iter()
+                            .any(|drag| drag.key == binding.accepts_drag_key) =>
+                {
+                    return Err(UiSchemaError::InvalidProgramEvent);
+                }
+                UiEffect::ControlPresentation { node_id, .. } if !nodes.contains(&node_id.0) => {
+                    return Err(UiSchemaError::InvalidProgramEvent);
+                }
+                UiEffect::DataGridFrame { declaration, .. }
+                    if !nodes.contains(&declaration.node_key) =>
+                {
+                    return Err(UiSchemaError::InvalidProgramEvent);
+                }
                 _ => {}
             }
         }
@@ -1379,11 +2223,17 @@ impl UiNode {
         {
             return Err(UiSchemaError::InvalidRenderSurfaceRef);
         }
-        if self.text.as_ref().is_some_and(|text| !text.is_valid()) { return Err(UiSchemaError::InvalidText); }
-        if self.layout.is_some_and(|layout| !layout.is_valid()) { return Err(UiSchemaError::InvalidLayout); }
+        if self.text.as_ref().is_some_and(|text| !text.is_valid()) {
+            return Err(UiSchemaError::InvalidText);
+        }
+        if self.layout.is_some_and(|layout| !layout.is_valid()) {
+            return Err(UiSchemaError::InvalidLayout);
+        }
         let mut child_ids = std::collections::HashSet::new();
         for child in &self.children {
-            if !child_ids.insert(child.node_id.0.as_str()) { return Err(UiSchemaError::DuplicateNodeId); }
+            if !child_ids.insert(child.node_id.0.as_str()) {
+                return Err(UiSchemaError::DuplicateNodeId);
+            }
         }
         if let Some(transition) = &self.enter_transition
             && !transition.is_valid()
@@ -1410,14 +2260,29 @@ impl UiBounds {
 
 impl UiLayout {
     fn is_valid(self) -> bool {
-        self.padding.iter().chain(self.margin.iter()).all(|value| value.is_finite() && *value >= 0.0)
-            && self.gap.is_finite() && self.gap >= 0.0 && self.scroll_offset.iter().all(|value| value.is_finite())
-            && self.flex_basis.is_none_or(|value| value.is_finite() && value >= 0.0)
-            && self.flex_grow.is_finite() && self.flex_grow >= 0.0
-            && self.flex_shrink.is_finite() && self.flex_shrink >= 0.0
-            && self.min_size.is_none_or(|size| size.iter().all(|value| value.is_finite() && *value >= 0.0))
-            && self.max_size.is_none_or(|size| size.iter().all(|value| value.is_finite() && *value >= 0.0))
-            && self.preferred_size.is_none_or(|size| size.iter().all(|value| value.is_finite() && *value >= 0.0))
+        self.padding
+            .iter()
+            .chain(self.margin.iter())
+            .all(|value| value.is_finite() && *value >= 0.0)
+            && self.gap.is_finite()
+            && self.gap >= 0.0
+            && self.scroll_offset.iter().all(|value| value.is_finite())
+            && self
+                .flex_basis
+                .is_none_or(|value| value.is_finite() && value >= 0.0)
+            && self.flex_grow.is_finite()
+            && self.flex_grow >= 0.0
+            && self.flex_shrink.is_finite()
+            && self.flex_shrink >= 0.0
+            && self
+                .min_size
+                .is_none_or(|size| size.iter().all(|value| value.is_finite() && *value >= 0.0))
+            && self
+                .max_size
+                .is_none_or(|size| size.iter().all(|value| value.is_finite() && *value >= 0.0))
+            && self
+                .preferred_size
+                .is_none_or(|size| size.iter().all(|value| value.is_finite() && *value >= 0.0))
     }
 }
 
@@ -1475,34 +2340,68 @@ impl UiEffect {
             Self::SemanticIntent { intent } => intent.validate(),
             Self::BoundSemanticIntent { intent, .. } => intent.validate(),
             Self::ControlPresentation { node_id, state } => {
-                if node_id.0.trim().is_empty() { return Err(UiSchemaError::InvalidProgramEvent); }
+                if node_id.0.trim().is_empty() {
+                    return Err(UiSchemaError::InvalidProgramEvent);
+                }
                 match state {
-                    UiControlPresentation::Toggle { .. } | UiControlPresentation::Choice { .. } => Ok(()),
+                    UiControlPresentation::Toggle { .. } | UiControlPresentation::Choice { .. } => {
+                        Ok(())
+                    }
                     UiControlPresentation::Numeric { value, min, max } => {
-                        if value.is_finite() && min.is_finite() && max.is_finite() && min < max { Ok(()) } else { Err(UiSchemaError::InvalidProgramEvent) }
+                        if value.is_finite() && min.is_finite() && max.is_finite() && min < max {
+                            Ok(())
+                        } else {
+                            Err(UiSchemaError::InvalidProgramEvent)
+                        }
                     }
                     UiControlPresentation::Scroll { position } => {
-                        if position.is_finite() && (0.0..=1.0).contains(position) { Ok(()) } else { Err(UiSchemaError::InvalidProgramEvent) }
+                        if position.is_finite() && (0.0..=1.0).contains(position) {
+                            Ok(())
+                        } else {
+                            Err(UiSchemaError::InvalidProgramEvent)
+                        }
                     }
                 }
             }
             Self::DataGridFrame { declaration, frame } => {
                 if !declaration.validate()
                     || frame.window_rows.len() > declaration.max_window_rows as usize
-                    || frame.first_row.saturating_add(frame.window_rows.len() as u64) > frame.total_rows
-                    || frame.window_rows.iter().any(|row| row.cells.values().any(|cell| !cell.validate()))
-                { Err(UiSchemaError::InvalidProgramEvent) } else { Ok(()) }
+                    || frame
+                        .first_row
+                        .saturating_add(frame.window_rows.len() as u64)
+                        > frame.total_rows
+                    || frame
+                        .window_rows
+                        .iter()
+                        .any(|row| row.cells.values().any(|cell| !cell.validate()))
+                {
+                    Err(UiSchemaError::InvalidProgramEvent)
+                } else {
+                    Ok(())
+                }
             }
             Self::DragBinding { binding } => {
-                if binding.key.trim().is_empty() || binding.source_node_id.0.trim().is_empty()
-                    || !binding.snap.is_finite() || !binding.threshold.is_finite()
-                    || binding.snap < 0.0 || binding.threshold < 0.0
-                { Err(UiSchemaError::InvalidProgramEvent) } else { Ok(()) }
+                if binding.key.trim().is_empty()
+                    || binding.source_node_id.0.trim().is_empty()
+                    || !binding.snap.is_finite()
+                    || !binding.threshold.is_finite()
+                    || binding.snap < 0.0
+                    || binding.threshold < 0.0
+                {
+                    Err(UiSchemaError::InvalidProgramEvent)
+                } else {
+                    Ok(())
+                }
             }
             Self::DropBinding { binding } => {
-                if binding.key.trim().is_empty() || binding.target_node_id.0.trim().is_empty()
+                if binding.key.trim().is_empty()
+                    || binding.target_node_id.0.trim().is_empty()
                     || binding.accepts_drag_key.trim().is_empty()
-                { Err(UiSchemaError::InvalidProgramEvent) } else { binding.intent.validate() }
+                {
+                    Err(UiSchemaError::InvalidProgramEvent)
+                } else {
+                    binding.intent.validate()
+                }
             }
         }
     }
@@ -1511,7 +2410,9 @@ impl UiEffect {
 impl UiIntent {
     pub fn validate(&self) -> Result<(), UiSchemaError> {
         match self {
-            Self::Invoke { action, .. } if action.trim().is_empty() => Err(UiSchemaError::EmptyAction),
+            Self::Invoke { action, .. } if action.trim().is_empty() => {
+                Err(UiSchemaError::EmptyAction)
+            }
             Self::Invoke { .. } => Ok(()),
         }
     }
@@ -1547,14 +2448,22 @@ mod tests {
     fn data_grid_presentations_default_for_legacy_json_and_reject_invalid_values() {
         let column: UiDataGridColumn = serde_json::from_value(serde_json::json!({
             "key": "name", "label": "Name", "width": 120
-        })).unwrap();
+        }))
+        .unwrap();
         assert_eq!(column.presentation, UiDataGridPresentation::Text);
         let cell: UiDataGridCell = serde_json::from_value(serde_json::json!({
             "value": { "kind": "i32", "value": 1 },
             "display": { "id": 1, "generation": 1 }
-        })).unwrap();
+        }))
+        .unwrap();
         assert_eq!(cell.presentation_override, None);
-        assert!(!UiDataGridPresentation::Dropdown { options: vec!["same".into(), "same".into()], intent: "set".into() }.validate());
+        assert!(
+            !UiDataGridPresentation::Dropdown {
+                options: vec!["same".into(), "same".into()],
+                intent: "set".into()
+            }
+            .validate()
+        );
         assert!(!UiDataGridCellPresentation::Edit { max_chars: 0 }.validate());
     }
 
@@ -1566,12 +2475,15 @@ mod tests {
             placement: UiDropPlacement::Into,
             presentation_template_key: Some("accepted-template".into()),
         };
-        assert_eq!(serde_json::to_value(payload).unwrap(), serde_json::json!({
-                "source_key": "backlog-card-01",
-                "target_key": "done-panel",
-                "placement": "into",
-                "presentation_template_key": "accepted-template"
-        }));
+        assert_eq!(
+            serde_json::to_value(payload).unwrap(),
+            serde_json::json!({
+                    "source_key": "backlog-card-01",
+                    "target_key": "done-panel",
+                    "placement": "into",
+                    "presentation_template_key": "accepted-template"
+            })
+        );
     }
 
     #[test]
@@ -1580,25 +2492,39 @@ mod tests {
             "schema_version": 1,
             "surface_id": "surface.ui-workbench",
             "event": { "type": "INSPECTOR_TAB_SELECT", "tab": "materials" }
-        })).unwrap();
-        assert_eq!(request.event, UiSurfaceEvent::InspectorTabSelect { tab: UiInspectorTab::Materials });
+        }))
+        .unwrap();
+        assert_eq!(
+            request.event,
+            UiSurfaceEvent::InspectorTabSelect {
+                tab: UiInspectorTab::Materials
+            }
+        );
         let snapshot = UiSurfaceSnapshot {
             schema_version: UI_SURFACE_SCHEMA_VERSION,
             surface_id: UiSurfaceId("surface.ui-workbench".into()),
             revision: Revision(7),
             value: UiSurfaceState {
                 diagnostics: UiDiagnosticsState::Expanded,
-                inspector: UiInspectorState { tab: UiInspectorTab::Materials },
+                inspector: UiInspectorState {
+                    tab: UiInspectorTab::Materials,
+                },
             },
-            available_events: vec![UiSurfaceEventKind::DiagnosticsToggle, UiSurfaceEventKind::InspectorTabSelect],
+            available_events: vec![
+                UiSurfaceEventKind::DiagnosticsToggle,
+                UiSurfaceEventKind::InspectorTabSelect,
+            ],
         };
-        assert_eq!(serde_json::to_value(snapshot).unwrap(), serde_json::json!({
-                "schema_version": 1,
-                "surface_id": "surface.ui-workbench",
-                "revision": 7,
-                "value": { "diagnostics": "expanded", "inspector": { "tab": "materials" } },
-                "available_events": ["DIAGNOSTICS_TOGGLE", "INSPECTOR_TAB_SELECT"]
-        }));
+        assert_eq!(
+            serde_json::to_value(snapshot).unwrap(),
+            serde_json::json!({
+                    "schema_version": 1,
+                    "surface_id": "surface.ui-workbench",
+                    "revision": 7,
+                    "value": { "diagnostics": "expanded", "inspector": { "tab": "materials" } },
+                    "available_events": ["DIAGNOSTICS_TOGGLE", "INSPECTOR_TAB_SELECT"]
+            })
+        );
     }
 
     #[test]
@@ -1609,15 +2535,24 @@ mod tests {
         let encoded = serde_json::to_value(&submission).unwrap().to_string();
         assert!(encoded.contains("schema_version"));
         for forbidden in ["react", "jsx", "callback", "wgpu", "window", "handle"] {
-            assert!(!encoded.contains(forbidden), "submission contains {forbidden}");
+            assert!(
+                !encoded.contains(forbidden),
+                "submission contains {forbidden}"
+            );
         }
     }
 
     #[test]
     fn submission_rejects_unknown_schema_version() {
         let fragment: UiFragment = serde_json::from_str(STATIC_FRAGMENT).unwrap();
-        let submission = UiFragmentSubmission { schema_version: UI_FRAGMENT_SCHEMA_VERSION + 1, fragment };
-        assert_eq!(submission.validate(), Err(UiSchemaError::UnsupportedSchemaVersion));
+        let submission = UiFragmentSubmission {
+            schema_version: UI_FRAGMENT_SCHEMA_VERSION + 1,
+            fragment,
+        };
+        assert_eq!(
+            submission.validate(),
+            Err(UiSchemaError::UnsupportedSchemaVersion)
+        );
     }
 
     #[test]
@@ -1699,10 +2634,7 @@ mod tests {
                 action: "terrain.tool.select".into(),
                 params: serde_json::json!({"tool": "water_inject"}),
             },
-            pointer: Some(UiPointerMetadata {
-                id: 0,
-                sequence: 4,
-            }),
+            pointer: Some(UiPointerMetadata { id: 0, sequence: 4 }),
             focus: None,
             data_grid_cell: Some(UiDataGridCellTarget {
                 source_key: "assets_window".into(),
@@ -1729,7 +2661,10 @@ mod tests {
         let request = UiDataGridWindowRequest {
             renderer_epoch: 7,
             composition_revision: Revision(3),
-            fragment: UiFragmentRevision { id: UiFragmentId("asset-list".into()), revision: Revision(2) },
+            fragment: UiFragmentRevision {
+                id: UiFragmentId("asset-list".into()),
+                revision: Revision(2),
+            },
             source_key: "asset_window".into(),
             expected_list_revision: Revision(5),
             requested_first_row: 96,
@@ -1749,7 +2684,9 @@ mod tests {
         let manifest = include_str!("../Cargo.toml");
         for forbidden in ["wgpu", "winit", "react", "typescript", "tauri", "webview"] {
             assert!(
-                !manifest.lines().any(|line| line.trim_start().starts_with(&format!("{forbidden} ="))),
+                !manifest
+                    .lines()
+                    .any(|line| line.trim_start().starts_with(&format!("{forbidden} ="))),
                 "public UI schema must not depend on {forbidden}"
             );
         }
@@ -1757,13 +2694,72 @@ mod tests {
 
     fn layout_node(mode: UiLayoutMode) -> UiNode {
         UiNode {
-            node_id: UiNodeId("root".into()), kind: UiNodeKind::Panel,
-            bounds: UiBounds { x: 0.0, y: 0.0, width: 100.0, height: 60.0 },
-            layout: Some(UiLayout { mode, padding: [4.0, 4.0, 4.0, 4.0], gap: 3.0, ..UiLayout::default() }),
-            visible: true, enabled: true, text_key: None, text: None, image: None, surface: None, style: UiStyle::default(), enter_transition: None,
+            node_id: UiNodeId("root".into()),
+            kind: UiNodeKind::Panel,
+            bounds: UiBounds {
+                x: 0.0,
+                y: 0.0,
+                width: 100.0,
+                height: 60.0,
+            },
+            layout: Some(UiLayout {
+                mode,
+                padding: [4.0, 4.0, 4.0, 4.0],
+                gap: 3.0,
+                ..UiLayout::default()
+            }),
+            visible: true,
+            enabled: true,
+            text_key: None,
+            text: None,
+            image: None,
+            surface: None,
+            style: UiStyle::default(),
+            enter_transition: None,
             children: vec![
-                UiNode { node_id: UiNodeId("a".into()), kind: UiNodeKind::Button, bounds: UiBounds { x: 0.0, y: 0.0, width: 20.0, height: 10.0 }, layout: Some(UiLayout { margin: [1.0, 2.0, 3.0, 4.0], ..UiLayout::default() }), visible: true, enabled: true, text_key: None, text: None, image: None, surface: None, style: UiStyle::default(), enter_transition: None, children: Vec::new() },
-                UiNode { node_id: UiNodeId("b".into()), kind: UiNodeKind::Button, bounds: UiBounds { x: 0.0, y: 0.0, width: 20.0, height: 10.0 }, layout: None, visible: true, enabled: true, text_key: None, text: None, image: None, surface: None, style: UiStyle::default(), enter_transition: None, children: Vec::new() },
+                UiNode {
+                    node_id: UiNodeId("a".into()),
+                    kind: UiNodeKind::Button,
+                    bounds: UiBounds {
+                        x: 0.0,
+                        y: 0.0,
+                        width: 20.0,
+                        height: 10.0,
+                    },
+                    layout: Some(UiLayout {
+                        margin: [1.0, 2.0, 3.0, 4.0],
+                        ..UiLayout::default()
+                    }),
+                    visible: true,
+                    enabled: true,
+                    text_key: None,
+                    text: None,
+                    image: None,
+                    surface: None,
+                    style: UiStyle::default(),
+                    enter_transition: None,
+                    children: Vec::new(),
+                },
+                UiNode {
+                    node_id: UiNodeId("b".into()),
+                    kind: UiNodeKind::Button,
+                    bounds: UiBounds {
+                        x: 0.0,
+                        y: 0.0,
+                        width: 20.0,
+                        height: 10.0,
+                    },
+                    layout: None,
+                    visible: true,
+                    enabled: true,
+                    text_key: None,
+                    text: None,
+                    image: None,
+                    surface: None,
+                    style: UiStyle::default(),
+                    enter_transition: None,
+                    children: Vec::new(),
+                },
             ],
         }
     }
@@ -1807,9 +2803,13 @@ mod tests {
         let mut node = layout_node(UiLayoutMode::Absolute);
         node.kind = UiNodeKind::RenderSurface;
         assert_eq!(node.validate(), Err(UiSchemaError::MissingRenderSurfaceRef));
-        node.surface = Some(RenderSurfaceRef { target_id: " ".into() });
+        node.surface = Some(RenderSurfaceRef {
+            target_id: " ".into(),
+        });
         assert_eq!(node.validate(), Err(UiSchemaError::InvalidRenderSurfaceRef));
-        node.surface = Some(RenderSurfaceRef { target_id: "ai.terrain.preview".into() });
+        node.surface = Some(RenderSurfaceRef {
+            target_id: "ai.terrain.preview".into(),
+        });
         node.validate().unwrap();
         let value = serde_json::to_value(node).unwrap();
         assert_eq!(value["kind"], "render_surface");
@@ -1822,13 +2822,21 @@ mod tests {
     #[test]
     fn text_ref_is_source_independent_and_rejects_empty_content() {
         let mut node = layout_node(UiLayoutMode::Absolute);
-        node.text = Some(TextRef::Key { key: "ui.fixture.label".into(), arguments: serde_json::json!({"count": 2}) });
+        node.text = Some(TextRef::Key {
+            key: "ui.fixture.label".into(),
+            arguments: serde_json::json!({"count": 2}),
+        });
         node.validate().unwrap();
         let encoded = serde_json::to_value(&node).unwrap().to_string();
         for forbidden in ["path", "font_file", "wgpu", "handle"] {
-            assert!(!encoded.contains(forbidden), "text declaration contains {forbidden}");
+            assert!(
+                !encoded.contains(forbidden),
+                "text declaration contains {forbidden}"
+            );
         }
-        node.text = Some(TextRef::Literal { value: String::new() });
+        node.text = Some(TextRef::Literal {
+            value: String::new(),
+        });
         assert_eq!(node.validate(), Err(UiSchemaError::InvalidText));
     }
 
@@ -1852,8 +2860,14 @@ mod tests {
         revision.validate_baseline().unwrap();
         let encoded = serde_json::to_value(&revision).unwrap();
         assert_eq!(encoded["schema_version"], UI_PROGRAM_SCHEMA_VERSION);
-        assert_eq!(encoded["capabilities"][0]["name"], UI_PROGRAM_CAPABILITY_NAME);
-        assert_eq!(serde_json::from_value::<UiProgramRevision>(encoded).unwrap(), revision);
+        assert_eq!(
+            encoded["capabilities"][0]["name"],
+            UI_PROGRAM_CAPABILITY_NAME
+        );
+        assert_eq!(
+            serde_json::from_value::<UiProgramRevision>(encoded).unwrap(),
+            revision
+        );
         assert_eq!(UI_FRAGMENT_SCHEMA_VERSION, 1);
     }
 
@@ -1861,22 +2875,34 @@ mod tests {
     fn program_revision_rejects_unknown_schema_and_capability_versions() {
         let mut revision = baseline_program_revision();
         revision.schema_version += 1;
-        assert_eq!(revision.validate_baseline(), Err(UiSchemaError::UnsupportedProgramSchemaVersion));
+        assert_eq!(
+            revision.validate_baseline(),
+            Err(UiSchemaError::UnsupportedProgramSchemaVersion)
+        );
 
         let mut revision = baseline_program_revision();
         revision.capabilities[0].version += 1;
-        assert_eq!(revision.validate_baseline(), Err(UiSchemaError::UnsupportedProgramCapability));
+        assert_eq!(
+            revision.validate_baseline(),
+            Err(UiSchemaError::UnsupportedProgramCapability)
+        );
 
         let mut revision = baseline_program_revision();
         revision.capabilities.clear();
-        assert_eq!(revision.validate_baseline(), Err(UiSchemaError::UnsupportedProgramCapability));
+        assert_eq!(
+            revision.validate_baseline(),
+            Err(UiSchemaError::UnsupportedProgramCapability)
+        );
     }
 
     #[test]
     fn program_revision_rejects_duplicate_capabilities_and_unknown_fields() {
         let mut revision = baseline_program_revision();
         revision.capabilities.push(revision.capabilities[0].clone());
-        assert_eq!(revision.validate_baseline(), Err(UiSchemaError::DuplicateProgramCapability));
+        assert_eq!(
+            revision.validate_baseline(),
+            Err(UiSchemaError::DuplicateProgramCapability)
+        );
 
         let invalid = serde_json::json!({
             "program_id": "surface.editor",
@@ -1906,7 +2932,10 @@ mod tests {
             revision: Revision(12),
         };
         let encoded = serde_json::to_value(&diagnostic).unwrap();
-        assert_eq!(serde_json::from_value::<UiDiagnostic>(encoded.clone()).unwrap(), diagnostic);
+        assert_eq!(
+            serde_json::from_value::<UiDiagnostic>(encoded.clone()).unwrap(),
+            diagnostic
+        );
         for private_field in ["render_hit_id", "gpu_instance_index", "physical_pixels"] {
             assert!(encoded.get(private_field).is_none());
         }
@@ -1914,60 +2943,165 @@ mod tests {
 
     #[test]
     fn input_schema_round_trips_and_rejects_invalid_defaults() {
-        let kind = UiInputKind::Bool; let (alignment, lanes, representation) = kind.packing();
-        let schema = UiInputSchema { schema_id: "terrain-inputs".into(), version: 1, layout_hash: "layout-v1".into(), slots: vec![UiInputSlot { key: "can_commit".into(), kind, default_value: UiInputValue::Bool { value: false }, update_class: UiInputUpdateClass::ReliableExternal, semantic_label: "Can commit".into(), packing: UiInputPacking { alignment, lanes, offset: 0, representation } }], grid_slots: Vec::new() };
-        schema.validate().unwrap(); assert_eq!(serde_json::from_value::<UiInputSchema>(serde_json::to_value(&schema).unwrap()).unwrap(), schema);
-        let mut invalid = schema; invalid.slots[0].default_value = UiInputValue::F32 { value: f32::NAN }; assert_eq!(invalid.validate(), Err(UiSchemaError::InvalidInputDefault));
+        let kind = UiInputKind::Bool;
+        let (alignment, lanes, representation) = kind.packing();
+        let schema = UiInputSchema {
+            schema_id: "terrain-inputs".into(),
+            version: 1,
+            layout_hash: "layout-v1".into(),
+            slots: vec![UiInputSlot {
+                key: "can_commit".into(),
+                kind,
+                default_value: UiInputValue::Bool { value: false },
+                update_class: UiInputUpdateClass::ReliableExternal,
+                semantic_label: "Can commit".into(),
+                packing: UiInputPacking {
+                    alignment,
+                    lanes,
+                    offset: 0,
+                    representation,
+                },
+            }],
+            grid_slots: Vec::new(),
+        };
+        schema.validate().unwrap();
+        assert_eq!(
+            serde_json::from_value::<UiInputSchema>(serde_json::to_value(&schema).unwrap())
+                .unwrap(),
+            schema
+        );
+        let mut invalid = schema;
+        invalid.slots[0].default_value = UiInputValue::F32 { value: f32::NAN };
+        assert_eq!(invalid.validate(), Err(UiSchemaError::InvalidInputDefault));
+    }
+
+    #[test]
+    fn float_ranges_reject_non_finite_bounds_and_out_of_range_values() {
+        let kind = UiInputKind::F32Range {
+            minimum: 0.0,
+            maximum: 1.0,
+        };
+        assert!(kind.accepts(&UiInputValue::F32 { value: 0.5 }));
+        assert!(!kind.accepts(&UiInputValue::F32 { value: 1.5 }));
+        assert!(
+            !UiInputKind::F32Range {
+                minimum: 0.0,
+                maximum: f32::INFINITY
+            }
+            .accepts(&UiInputValue::F32 { value: 0.5 })
+        );
+        assert_eq!(kind.packing().2, UiGpuScalarRepresentation::F32);
+        assert_eq!(
+            serde_json::from_value::<UiInputKind>(serde_json::to_value(&kind).unwrap()).unwrap(),
+            kind
+        );
     }
 
     #[test]
     fn text_handles_and_registry_snapshots_round_trip_without_raw_input_text() {
-        let handle = UiTextHandle { id: 7, generation: 3 };
+        let handle = UiTextHandle {
+            id: 7,
+            generation: 3,
+        };
         let value = UiInputValue::TextHandle { value: handle };
         let encoded = serde_json::to_value(&value).unwrap();
         assert_eq!(encoded["kind"], "text_handle");
         assert!(encoded.get("text").is_none());
-        assert_eq!(serde_json::from_value::<UiInputValue>(encoded).unwrap(), value);
-        let snapshot = UiTextRegistrySnapshot { registry_id: "surface.editor.text".into(), revision: Revision(4), capacity: 32, used: 1, records: vec![UiTextRecord { handle, text: "Terrain \u{5730}\u{5f62}".into(), category: UiTextSourceCategory::Dynamic, revision: Revision(4), byte_length: 14 }] };
-        assert_eq!(serde_json::from_value::<UiTextRegistrySnapshot>(serde_json::to_value(&snapshot).unwrap()).unwrap(), snapshot);
-        let debug = UiTextRegistryDebugSnapshot { registry_id: "surface.editor.text".into(), revision: Revision(4), capacity: 32, used: 1, records: vec![UiTextRegistryEntryMetadata { handle, category: UiTextSourceCategory::Dynamic, revision: Revision(4), byte_length: 14, reference_count: 2, resident: false }] };
+        assert_eq!(
+            serde_json::from_value::<UiInputValue>(encoded).unwrap(),
+            value
+        );
+        let snapshot = UiTextRegistrySnapshot {
+            registry_id: "surface.editor.text".into(),
+            revision: Revision(4),
+            capacity: 32,
+            used: 1,
+            records: vec![UiTextRecord {
+                handle,
+                text: "Terrain \u{5730}\u{5f62}".into(),
+                category: UiTextSourceCategory::Dynamic,
+                revision: Revision(4),
+                byte_length: 14,
+            }],
+        };
+        assert_eq!(
+            serde_json::from_value::<UiTextRegistrySnapshot>(
+                serde_json::to_value(&snapshot).unwrap()
+            )
+            .unwrap(),
+            snapshot
+        );
+        let debug = UiTextRegistryDebugSnapshot {
+            registry_id: "surface.editor.text".into(),
+            revision: Revision(4),
+            capacity: 32,
+            used: 1,
+            records: vec![UiTextRegistryEntryMetadata {
+                handle,
+                category: UiTextSourceCategory::Dynamic,
+                revision: Revision(4),
+                byte_length: 14,
+                reference_count: 2,
+                resident: false,
+            }],
+        };
         let encoded_debug = serde_json::to_value(&debug).unwrap();
         assert!(encoded_debug["records"][0].get("text").is_none());
-        assert_eq!(serde_json::from_value::<UiTextRegistryDebugSnapshot>(encoded_debug).unwrap(), debug);
+        assert_eq!(
+            serde_json::from_value::<UiTextRegistryDebugSnapshot>(encoded_debug).unwrap(),
+            debug
+        );
     }
 }
 
 impl UiIrDocument {
     pub fn validate(&self) -> Result<(), UiSchemaError> {
-        if self.schema_version != 1 || self.surface_id.0.trim().is_empty() { return Err(UiSchemaError::InvalidIrDocument); }
+        if self.schema_version != 1 || self.surface_id.0.trim().is_empty() {
+            return Err(UiSchemaError::InvalidIrDocument);
+        }
         self.root.validate()?;
-        if self.resource_budget.max_nodes == 0 || self.resource_budget.max_instances == 0 { return Err(UiSchemaError::InvalidProgramBudget); }
+        if self.resource_budget.max_nodes == 0 || self.resource_budget.max_instances == 0 {
+            return Err(UiSchemaError::InvalidProgramBudget);
+        }
         let mut keys = std::collections::HashSet::new();
         collect_ir_keys(&self.root, &mut keys);
         let mut branch_keys = std::collections::HashSet::new();
         for branch in &self.branches {
-            if branch.branch_key.trim().is_empty() || !branch_keys.insert(&branch.branch_key) || !keys.contains(&branch.root_node_key) {
+            if branch.branch_key.trim().is_empty()
+                || !branch_keys.insert(&branch.branch_key)
+                || !keys.contains(&branch.root_node_key)
+            {
                 return Err(UiSchemaError::InvalidIrDocument);
             }
             match &branch.predicate {
                 UiBranchPredicate::Bool { input_key, .. } if !input_key.trim().is_empty() => {}
-                UiBranchPredicate::EnumEquals { input_key, variant } if !input_key.trim().is_empty() && !variant.trim().is_empty() => {}
-                UiBranchPredicate::MachineState { machine_key, state } if !machine_key.trim().is_empty() && !state.trim().is_empty() => {}
+                UiBranchPredicate::EnumEquals { input_key, variant }
+                    if !input_key.trim().is_empty() && !variant.trim().is_empty() => {}
+                UiBranchPredicate::MachineState { machine_key, state }
+                    if !machine_key.trim().is_empty() && !state.trim().is_empty() => {}
                 _ => return Err(UiSchemaError::InvalidIrDocument),
             }
         }
         let mut template_keys = std::collections::HashSet::new();
         for template in &self.templates {
-            if template.template_key.trim().is_empty() || !template_keys.insert(&template.template_key)
-                || !keys.contains(&template.root_node_key) || template.max_instances == 0
-                || template.instance_key_field.trim().is_empty() || template.row_schema.is_empty()
-                || !template.row_schema.contains_key(&template.instance_key_field)
-            { return Err(UiSchemaError::InvalidIrDocument); }
+            if template.template_key.trim().is_empty()
+                || !template_keys.insert(&template.template_key)
+                || !keys.contains(&template.root_node_key)
+                || template.max_instances == 0
+                || template.instance_key_field.trim().is_empty()
+                || template.row_schema.is_empty()
+                || !template
+                    .row_schema
+                    .contains_key(&template.instance_key_field)
+            {
+                return Err(UiSchemaError::InvalidIrDocument);
+            }
         }
         let mut data_grid_node_keys = std::collections::HashSet::new();
         let mut data_grid_sources = std::collections::HashSet::new();
         for data_grid in &self.data_grids {
-            if data_grid.node_key.trim().is_empty() || data_grid.source_key.trim().is_empty()
+            if data_grid.node_key.trim().is_empty()
+                || data_grid.source_key.trim().is_empty()
                 || data_grid.max_window_rows == 0
                 || data_grid.row_height == 0
                 || data_grid.overscan > data_grid.max_window_rows
@@ -1975,30 +3109,64 @@ impl UiIrDocument {
                 || !data_grid_node_keys.insert(data_grid.node_key.clone())
                 || !data_grid_sources.insert(data_grid.source_key.clone())
                 || !matches!(find_ir_node(&self.root, &data_grid.node_key), Some(node) if node.kind == UiNodeKind::DataGrid)
-            { return Err(UiSchemaError::InvalidIrDocument); }
+            {
+                return Err(UiSchemaError::InvalidIrDocument);
+            }
             let mut column_keys = std::collections::HashSet::new();
-            if data_grid.columns.iter().any(|column| !column.validate()
-                || !column_keys.insert(&column.key))
-            { return Err(UiSchemaError::InvalidIrDocument); }
+            if data_grid
+                .columns
+                .iter()
+                .any(|column| !column.validate() || !column_keys.insert(&column.key))
+            {
+                return Err(UiSchemaError::InvalidIrDocument);
+            }
         }
         let mut declared_grid_nodes = std::collections::HashSet::new();
         collect_data_grid_node_keys(&self.root, &mut declared_grid_nodes);
-        if declared_grid_nodes != data_grid_node_keys { return Err(UiSchemaError::InvalidIrDocument); }
+        if declared_grid_nodes != data_grid_node_keys {
+            return Err(UiSchemaError::InvalidIrDocument);
+        }
         Ok(())
     }
 }
 
 fn collect_ir_keys(node: &UiNode, keys: &mut std::collections::HashSet<String>) {
     keys.insert(node.node_id.0.clone());
-    for child in &node.children { collect_ir_keys(child, keys); }
+    for child in &node.children {
+        collect_ir_keys(child, keys);
+    }
 }
 
 fn find_ir_node<'a>(node: &'a UiNode, key: &str) -> Option<&'a UiNode> {
-    if node.node_id.0 == key { return Some(node); }
-    node.children.iter().find_map(|child| find_ir_node(child, key))
+    if node.node_id.0 == key {
+        return Some(node);
+    }
+    node.children
+        .iter()
+        .find_map(|child| find_ir_node(child, key))
 }
 
 fn collect_data_grid_node_keys(node: &UiNode, keys: &mut std::collections::HashSet<String>) {
-    if node.kind == UiNodeKind::DataGrid { keys.insert(node.node_id.0.clone()); }
-    for child in &node.children { collect_data_grid_node_keys(child, keys); }
+    if node.kind == UiNodeKind::DataGrid {
+        keys.insert(node.node_id.0.clone());
+    }
+    for child in &node.children {
+        collect_data_grid_node_keys(child, keys);
+    }
+}
+
+/// Program-native drag/drop commit using only stable declaration identities.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiProgramDragDropEvent {
+    pub event_id: String,
+    pub drag_key: String,
+    pub drop_key: String,
+    pub intent: String,
+    pub payload: UiDragDropPayload,
+    pub program_revision: UiProgramRevision,
+    pub input_revision: Revision,
+    pub request_id: String,
+    pub idempotency_key: String,
+    pub interaction: UiSemanticInteractionMetadata,
 }

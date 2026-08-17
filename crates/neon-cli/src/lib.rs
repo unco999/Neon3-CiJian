@@ -12,7 +12,7 @@ use neon_ui_schema::{
     UiFragmentSubmission, UiIntent, UiNode, UiNodeId, UiNodeKind, UiPointerMetadata,
     UiSemanticEvent, UiSemanticEventType, UiStyle,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 pub const SCENARIO_ID: &str = "ui.static-fragment.submit.v1";
 pub const DETAIL_TOGGLE_SCENARIO_ID: &str = "ui.detail-toggle.v1";
@@ -696,21 +696,25 @@ mod tests {
                 query: json!({"limit": 2}),
             })
         );
-        assert!(DebugCommand::parse(&[
-            "debug".into(),
-            "interaction".into(),
-            "query".into(),
-            "127.0.0.1:4010".into(),
-            "[]".into(),
-        ])
-        .is_err());
-        assert!(DebugCommand::parse(&[
-            "debug".into(),
-            "window".into(),
-            "activate".into(),
-            "127.0.0.1:4010".into(),
-        ])
-        .is_err());
+        assert!(
+            DebugCommand::parse(&[
+                "debug".into(),
+                "interaction".into(),
+                "query".into(),
+                "127.0.0.1:4010".into(),
+                "[]".into(),
+            ])
+            .is_err()
+        );
+        assert!(
+            DebugCommand::parse(&[
+                "debug".into(),
+                "window".into(),
+                "activate".into(),
+                "127.0.0.1:4010".into(),
+            ])
+            .is_err()
+        );
     }
 
     #[test]

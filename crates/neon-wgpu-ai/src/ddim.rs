@@ -1,11 +1,11 @@
 //! DDIM sampler with optional classifier-free guidance, batch size 1.
 //! Mirrors the inference loop in `assets/ai/terrain_run1/sample.py`.
 
+use crate::AiError;
 use crate::format::TerrainCond;
 use crate::gpu::{Buf, GpuCtx};
 use crate::ops;
 use crate::unet::{Model, UnetExecutor};
-use crate::AiError;
 
 /// Two-forward CFG. The unconditional pass is skipped when guidance is zero.
 pub struct DdimSampler<'a> {
@@ -71,14 +71,7 @@ impl<'a> DdimSampler<'a> {
                     self.model.schedule.s1ab[t0 as usize],
                 );
                 Ok(ops::ddim_step(
-                    self.ctx,
-                    current,
-                    &e.buffer,
-                    sab_t,
-                    s1ab_t,
-                    sab_t0,
-                    s1ab_t0,
-                    len,
+                    self.ctx, current, &e.buffer, sab_t, s1ab_t, sab_t0, s1ab_t0, len,
                 ))
             })();
             if batch_steps {

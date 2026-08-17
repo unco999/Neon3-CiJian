@@ -12,6 +12,7 @@ neon-ui-schema = { path = "../neon-ui-schema" }
 neon-ipc = { path = "../neon-ipc" }
 bytemuck.workspace = true
 pollster.workspace = true
+png = "0.18"
 serde_json.workspace = true
 wgpu.workspace = true
 winit.workspace = true

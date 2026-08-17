@@ -7,7 +7,7 @@ use neon_wgpu_ai::format::{TerrainCond, TerrainUnetSpec};
 use neon_wgpu_ai::{AiEngine, GenerateRequest};
 
 fn random_pack(seed: u64) -> Vec<u8> {
-    use neon_wgpu_ai::format::{MAGIC, FORMAT_VERSION, MODEL_KIND_TERRAIN_UNET_DDIM_V1};
+    use neon_wgpu_ai::format::{FORMAT_VERSION, MAGIC, MODEL_KIND_TERRAIN_UNET_DDIM_V1};
     let mut state = seed | 1;
     let mut rng = move || {
         state ^= state << 13;
@@ -56,24 +56,29 @@ fn main() {
     }))
     .expect("no wgpu adapter available");
     let info = adapter.get_info();
-    println!("adapter: {} ({:?}, {:?})", info.name, info.backend, info.device_type);
-    let (device, queue) = pollster::block_on(adapter.request_device(
-        &wgpu::DeviceDescriptor {
+    println!(
+        "adapter: {} ({:?}, {:?})",
+        info.name, info.backend, info.device_type
+    );
+    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("neon-wgpu-ai smoke"),
         required_features: wgpu::Features::empty(),
         required_limits: wgpu::Limits::default(),
         experimental_features: wgpu::ExperimentalFeatures::default(),
         memory_hints: wgpu::MemoryHints::default(),
         trace: wgpu::Trace::Off,
-        },
-    ))
+    }))
     .expect("device request failed");
 
     let mut engine = AiEngine::new(device, queue);
 
     let started = std::time::Instant::now();
     let pack = random_pack(0x5EED);
-    println!("random pack: {} MB generated in {:.1}s", pack.len() / 1_048_576, started.elapsed().as_secs_f64());
+    println!(
+        "random pack: {} MB generated in {:.1}s",
+        pack.len() / 1_048_576,
+        started.elapsed().as_secs_f64()
+    );
 
     let info = engine.load_model(&pack).expect("model load failed");
     println!(
@@ -113,7 +118,10 @@ fn main() {
         var.sqrt(),
         generation.elapsed_ms / 1000.0
     );
-    assert!(map.iter().all(|v| v.is_finite()), "heightmap must be finite");
+    assert!(
+        map.iter().all(|v| v.is_finite()),
+        "heightmap must be finite"
+    );
 
     // A second identical generation must be byte-identical (determinism).
     let again = engine
@@ -132,7 +140,10 @@ fn main() {
             preview_every: 0,
         })
         .expect("second generation failed");
-    assert_eq!(map, &again.heightmap, "same seed must reproduce the same heightmap");
+    assert_eq!(
+        map, &again.heightmap,
+        "same seed must reproduce the same heightmap"
+    );
 
     // CFG path with guidance, 1 step.
     let cfg = engine

@@ -176,7 +176,10 @@ impl AiEngine {
         })
     }
 
-    fn sample(&mut self, request: &GenerateRequest) -> Result<(crate::gpu::Buf, Vec<Vec<f32>>, f64), AiError> {
+    fn sample(
+        &mut self,
+        request: &GenerateRequest,
+    ) -> Result<(crate::gpu::Buf, Vec<Vec<f32>>, f64), AiError> {
         validate_request(request)?;
         let model = self
             .model

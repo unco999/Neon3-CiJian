@@ -34,7 +34,7 @@ surface workbench row gap 8 token token:surface
 
 The root declaration has no indentation. A Flow document has one root. `surface` is the preferred root vocabulary name; legacy-compatible `panel` roots remain accepted while the canonical IR uses the existing `Panel` node kind.
 
-Input declarations have the form `input <key> <kind> default <literal>`. V1 supports `bool`, `i32`, `u32`, `f32`, and `text`; text defaults use the immutable empty handle, `text:empty`. The input schema installs every default at program activation. Inputs are direct values only, never JSON, lists, arbitrary objects or raw variable-length frame text.
+Input declarations have the form `input <key> <kind> default <literal>`. V1 supports `bool`, `i32`, `u32`, `f32`, and `text`; numeric kinds may declare an inclusive range as `<kind>:<minimum>..<maximum>` (for example `i32:0..24` or `f32:0..1`), and text defaults use the immutable empty handle, `text:empty`. Range bounds and defaults must be ordered, finite where applicable, and type-correct. The input schema installs every default at program activation. Inputs are direct values only, never JSON, lists, arbitrary objects or raw variable-length frame text.
 
 ## Components and attributes
 

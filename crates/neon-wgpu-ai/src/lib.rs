@@ -76,11 +76,41 @@ mod tests {
             preview_every: 0,
         };
         assert!(engine::validate_request(&ok).is_ok());
-        assert!(engine::validate_request(&GenerateRequest { size: 64, ..ok.clone() }).is_ok());
-        assert!(engine::validate_request(&GenerateRequest { size: 100, ..ok.clone() }).is_err());
-        assert!(engine::validate_request(&GenerateRequest { size: 31, ..ok.clone() }).is_err());
-        assert!(engine::validate_request(&GenerateRequest { steps: 0, ..ok.clone() }).is_err());
-        assert!(engine::validate_request(&GenerateRequest { guidance: 20.0, ..ok.clone() }).is_err());
+        assert!(
+            engine::validate_request(&GenerateRequest {
+                size: 64,
+                ..ok.clone()
+            })
+            .is_ok()
+        );
+        assert!(
+            engine::validate_request(&GenerateRequest {
+                size: 100,
+                ..ok.clone()
+            })
+            .is_err()
+        );
+        assert!(
+            engine::validate_request(&GenerateRequest {
+                size: 31,
+                ..ok.clone()
+            })
+            .is_err()
+        );
+        assert!(
+            engine::validate_request(&GenerateRequest {
+                steps: 0,
+                ..ok.clone()
+            })
+            .is_err()
+        );
+        assert!(
+            engine::validate_request(&GenerateRequest {
+                guidance: 20.0,
+                ..ok.clone()
+            })
+            .is_err()
+        );
         let bad_cond = GenerateRequest {
             cond: TerrainCond {
                 sub: Some(23),

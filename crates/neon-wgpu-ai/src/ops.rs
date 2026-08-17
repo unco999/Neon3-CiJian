@@ -1,8 +1,8 @@
 //! Kernel dispatch wrappers. Each op acquires its output from the arena and
 //! returns a pooled `Buf`; the caller keeps outputs alive as long as needed.
 
-use crate::gpu::{Buf, GpuCtx};
 use crate::AiError;
+use crate::gpu::{Buf, GpuCtx};
 
 const GROUPNORM_WGS: u32 = 32;
 
@@ -218,7 +218,12 @@ pub fn film(ctx: &mut GpuCtx, h: &wgpu::Buffer, film_buf: &wgpu::Buffer, c: u32,
         d: 0.0,
         pad: 0,
     });
-    ctx.run("film", &uniform, &[h, film_buf, film_buf, &y.buffer], dispatch_1d(len));
+    ctx.run(
+        "film",
+        &uniform,
+        &[h, film_buf, film_buf, &y.buffer],
+        dispatch_1d(len),
+    );
     y
 }
 
@@ -238,7 +243,10 @@ pub fn conv2d(
     stride: u32,
     pad: u32,
 ) -> Buf {
-    assert!(stride == 1 && kh <= 3 && kw <= 3, "tiled conv2d supports stride 1 and kernels up to 3x3");
+    assert!(
+        stride == 1 && kh <= 3 && kw <= 3,
+        "tiled conv2d supports stride 1 and kernels up to 3x3"
+    );
     let out_h = (in_h + 2 * pad - kh) / stride + 1;
     let out_w = (in_w + 2 * pad - kw) / stride + 1;
     let y = ctx.scratch(out_c as u64 * out_h as u64 * out_w as u64 * 4);
@@ -345,7 +353,12 @@ pub fn avg_pool2d(ctx: &mut GpuCtx, x: &wgpu::Buffer, c: u32, in_h: u32, in_w: u
     let out_h = in_h / 2;
     let out_w = in_w / 2;
     let y = ctx.scratch(c as u64 * out_h as u64 * out_w as u64 * 4);
-    let uniform = ctx.uniform(&ResizeParams { c, h: in_h, w: in_w, c2: 0 });
+    let uniform = ctx.uniform(&ResizeParams {
+        c,
+        h: in_h,
+        w: in_w,
+        c2: 0,
+    });
     ctx.run(
         "avgpool",
         &uniform,
@@ -358,7 +371,12 @@ pub fn avg_pool2d(ctx: &mut GpuCtx, x: &wgpu::Buffer, c: u32, in_h: u32, in_w: u
 /// Nearest-neighbor 2x upsample.
 pub fn upsample2x(ctx: &mut GpuCtx, x: &wgpu::Buffer, c: u32, in_h: u32, in_w: u32) -> Buf {
     let y = ctx.scratch(c as u64 * in_h as u64 * in_w as u64 * 4 * 4);
-    let uniform = ctx.uniform(&ResizeParams { c, h: in_h, w: in_w, c2: 0 });
+    let uniform = ctx.uniform(&ResizeParams {
+        c,
+        h: in_h,
+        w: in_w,
+        c2: 0,
+    });
     ctx.run(
         "upsample",
         &uniform,
@@ -378,7 +396,12 @@ pub fn concat_c(
     hw: u64,
 ) -> Buf {
     let y = ctx.scratch((c1 as u64 + c2 as u64) * hw * 4);
-    let uniform = ctx.uniform(&ResizeParams { c: c1, h: 1, w: hw as u32, c2 });
+    let uniform = ctx.uniform(&ResizeParams {
+        c: c1,
+        h: 1,
+        w: hw as u32,
+        c2,
+    });
     ctx.run(
         "concat",
         &uniform,
@@ -489,7 +512,12 @@ pub fn softmax_rows(
     off: u32,
     scale: f32,
 ) {
-    let uniform = ctx.uniform(&SoftmaxParams { rows, cols, off, scale });
+    let uniform = ctx.uniform(&SoftmaxParams {
+        rows,
+        cols,
+        off,
+        scale,
+    });
     ctx.run("softmax", &uniform, &[x], dispatch_rows(rows));
 }
 

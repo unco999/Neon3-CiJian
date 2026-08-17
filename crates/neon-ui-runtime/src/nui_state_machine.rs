@@ -376,14 +376,16 @@ mod tests {
         };
         let idle =
             crate::evaluate_ui_program(&program, &inputs, viewport, &machine.presentation_state());
-        assert!(idle
-            .nodes
+        assert!(
+            idle.nodes
                 .iter()
-            .any(|node| node.node_key == "idle-panel" && node.visible));
-        assert!(idle
-            .nodes
+                .any(|node| node.node_key == "idle-panel" && node.visible)
+        );
+        assert!(
+            idle.nodes
                 .iter()
-            .any(|node| node.node_key == "active-panel" && !node.visible));
+                .any(|node| node.node_key == "active-panel" && !node.visible)
+        );
         let mut drag = NuiFlowDragController::default();
         drag.begin(&document, "demo-drag", [4.0, 4.0]).unwrap();
         drag.update([25.0, 19.0], [320.0, 180.0]).unwrap();
@@ -400,14 +402,18 @@ mod tests {
         machine.dispatch(&document, &inputs, "demo.activate");
         let active =
             crate::evaluate_ui_program(&program, &inputs, viewport, &machine.presentation_state());
-        assert!(active
+        assert!(
+            active
                 .nodes
                 .iter()
-            .any(|node| node.node_key == "idle-panel" && !node.visible));
-        assert!(active
+                .any(|node| node.node_key == "idle-panel" && !node.visible)
+        );
+        assert!(
+            active
                 .nodes
                 .iter()
-            .any(|node| node.node_key == "active-panel" && node.visible));
+                .any(|node| node.node_key == "active-panel" && node.visible)
+        );
     }
 
     #[test]
