@@ -23,8 +23,8 @@ use serde_json::{Value, json};
 
 use crate::{
     UiInputStore, UiInputStoreError, UiInputWriter, UiProgramSemanticEventRouter,
-    compile_nui_flow_program, host_adapter::UiHostAdapterConfig, instantiate_ui_template,
-    parse_nui_flow,
+    UiVariableEventPublisher, compile_nui_flow_program, host_adapter::UiHostAdapterConfig,
+    instantiate_ui_template, parse_nui_flow,
 };
 
 /// Generic controlled-input demo domain. It resolves the slot from the program
@@ -32,6 +32,8 @@ use crate::{
 pub struct DemoInputDomain {
     program: UiProgram,
     inputs: UiInputStore,
+    /// Optional eventd forwarder for `nui.variable.changed` observations.
+    publisher: Option<UiVariableEventPublisher>,
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -43,7 +45,42 @@ pub struct DemoInputDomainSnapshot {
 impl DemoInputDomain {
     pub fn new(program: UiProgram, schema: UiInputSchema) -> Result<Self, UiInputStoreError> {
         let inputs = UiInputStore::activate(program.revision.clone(), schema)?;
-        Ok(Self { program, inputs })
+        Ok(Self {
+            program,
+            inputs,
+            publisher: None,
+        })
+    }
+
+    /// Attaches an event publisher derived from the active input schema. Only
+    /// variables that declared `emitevent` produce directed
+    /// `flow.<flow_name>.<variable_key>` events; the flow name comes from the
+    /// Flow `flow <name>` declaration.
+    pub fn with_publisher(mut self, publisher: UiVariableEventPublisher) -> Self {
+        self.publisher = Some(publisher);
+        self
+    }
+
+    /// Builds a publisher from the active schema's `flow_name` and
+    /// `emit_event_keys`, then attaches it.
+    pub fn with_schema_publisher(
+        mut self,
+        endpoint: Option<std::net::SocketAddr>,
+        client: neon_protocol::ClientIdentity,
+        module: impl Into<String>,
+        surface: impl Into<String>,
+    ) -> Self {
+        let schema = self.inputs.schema().clone();
+        let publisher = UiVariableEventPublisher::new(
+            endpoint,
+            client,
+            module,
+            surface,
+            schema.flow_name.clone(),
+            schema.emit_event_keys.clone(),
+        );
+        self.publisher = Some(publisher);
+        self
     }
 
     pub fn snapshot(&self) -> DemoInputDomainSnapshot {
@@ -123,7 +160,8 @@ impl DemoInputDomain {
                     .ok_or("controlled input kind is not supported")?,
             }
         };
-        self.inputs
+        let result = self
+            .inputs
             .apply(
                 UiInputWriter::External,
                 UiInputFrame {
@@ -138,7 +176,11 @@ impl DemoInputDomain {
                 },
             )
             .map_err(|_| "controlled input frame was rejected")?;
-        Ok(self.snapshot())
+        let snapshot = self.snapshot();
+        if let Some(publisher) = &self.publisher {
+            let _ = publisher.publish_variable_changes(&result.variable_changes);
+        }
+        Ok(snapshot)
     }
 
     /// Runs the component-gallery program through the generic UI host boundary.
@@ -1399,7 +1441,9 @@ fn rejected(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{UiProgramSemanticEventRouter, lower_nui_flow_effects, parse_nui_flow};
+    use crate::{
+        UiProgramSemanticEventRouter, lower_nui_flow_effects, parse_nui_flow,
+    };
     use neon_ipc::RpcClient;
     use neon_protocol::{ClientIdentity, ClientKind, ProtocolVersion, RequestId, ServiceName};
     use neon_ui_schema::UiFragmentId;
@@ -1961,5 +2005,101 @@ mod tests {
                 state: UiControlPresentation::Toggle { selected: true }
             } if node_id.0 == "feature-toggle"
         )));
+    }
+
+    #[test]
+    fn variable_change_publishes_nui_variable_changed_over_loopback() {
+        use neon_ipc::{DEFAULT_MAX_FRAME_SIZE, read_json_frame, write_json_frame};
+        use neon_protocol::{EventAckStatus, EventFrame, EventResponse};
+
+        // Stand in for neon-eventd: accepts one publish frame, returns an ack.
+        let server = neon_ipc::RpcServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let endpoint = server.local_addr().unwrap();
+        let server_thread = std::thread::spawn(move || {
+            let mut stream = server.accept().unwrap();
+            let frame: EventFrame =
+                read_json_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE).unwrap();
+            let EventFrame::Publish(publish) = frame else {
+                panic!("expected a publish frame");
+            };
+            assert_eq!(publish.name, "flow.component-gallery.feature_enabled");
+            assert_eq!(publish.payload["variable_key"], "feature_enabled");
+            assert_eq!(publish.payload["kind"], "bool");
+            assert_eq!(publish.payload["module"], "gallery");
+            assert_eq!(publish.payload["new_value"], json!({"value": false}));
+            assert_eq!(publish.payload["old_value"], json!({"value": true}));
+            write_json_frame(
+                &mut stream,
+                &EventResponse::Ack(neon_protocol::EventAck {
+                    protocol: publish.protocol,
+                    version: publish.version,
+                    request_id: publish.request_id,
+                    status: EventAckStatus::Accepted,
+                    event_id: Some(neon_protocol::EventId("evt-1-1".into())),
+                    epoch: Some(1),
+                    sequence: Some(1),
+                    current_sequence: Some(1),
+                    error: None,
+                }),
+                DEFAULT_MAX_FRAME_SIZE,
+            )
+            .unwrap();
+        });
+
+        let (document, program) = component_gallery_program(gallery_asset()).unwrap();
+        let revision = program.revision.clone();
+        let mut domain = DemoInputDomain::new(program.clone(), document.input_schema.clone())
+            .unwrap()
+            .with_schema_publisher(
+                Some(endpoint),
+                ClientIdentity {
+                    kind: ClientKind::UiRuntime,
+                    instance_id: "gallery-test".into(),
+                    pid: 1,
+                    origin: "test".into(),
+                },
+                "gallery",
+                "surface.editor.gallery",
+            );
+        let snapshot = domain.snapshot();
+        let declaration = program
+            .event_records
+            .iter()
+            .find(|event| event.node_key == "feature-toggle")
+            .unwrap();
+        let event = UiProgramSemanticEvent {
+            event_id: "gallery-publish-event".into(),
+            kind: neon_ui_schema::UiProgramSemanticEventKind::SelectionChanged,
+            intent: declaration.intent.clone(),
+            source_node_key: "feature-toggle".into(),
+            payload: declaration
+                .bound_input_keys
+                .iter()
+                .map(|key| {
+                    (
+                        key.clone(),
+                        neon_ui_schema::UiSemanticPayloadValue::Bool { value: false },
+                    )
+                })
+                .collect(),
+            program_revision: revision.clone(),
+            input_revision: snapshot.inputs.input_revision,
+            request_id: "gallery-publish-request".into(),
+            idempotency_key: "gallery-publish-key".into(),
+            requested_value: Some(neon_ui_schema::UiSemanticPayloadValue::Bool {
+                value: false,
+            }),
+            interaction: neon_ui_schema::UiSemanticInteractionMetadata {
+                interaction_id: "gallery-publish-interaction".into(),
+                sequence: 1,
+                renderer_epoch: 7,
+            },
+        };
+        let updated = domain.apply(&event).unwrap();
+        assert_eq!(
+            updated.inputs.values["feature_enabled"].value,
+            UiInputValue::Bool { value: false }
+        );
+        server_thread.join().unwrap();
     }
 }

@@ -136,6 +136,15 @@ pub struct UiInputSchema {
     #[serde(default)]
     pub grid_slots: Vec<UiGridInputSlot>,
     pub layout_hash: String,
+    /// Flow document name for event naming. When a variable declared with
+    /// `emitevent` changes, the emitted event name is
+    /// `flow.<flow_name>.<variable_key>`. Empty means no `flow` declaration.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub flow_name: String,
+    /// Input keys that declared `emitevent`. Only these variables produce
+    /// directed events; undeclared variable changes stay silent.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub emit_event_keys: Vec<String>,
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -3037,6 +3046,8 @@ mod tests {
                 },
             }],
             grid_slots: Vec::new(),
+            flow_name: "terrain".into(),
+            emit_event_keys: vec!["can_commit".into()],
         };
         schema.validate().unwrap();
         assert_eq!(

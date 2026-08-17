@@ -133,6 +133,52 @@ impl RpcClient {
     }
 }
 
+/// Event protocol client. Uses the dedicated `neon3.event` frame protocol to
+/// publish events and receive acknowledgements. Subscription streaming is
+/// driven by the caller on a long-lived connection.
+pub struct EventClient {
+    stream: TcpStream,
+    max_frame_size: usize,
+}
+
+impl EventClient {
+    pub fn connect(endpoint: SocketAddr) -> Result<Self, TransportError> {
+        ensure_loopback(endpoint)?;
+        let stream = TcpStream::connect(endpoint).map_err(map_io_error)?;
+        Ok(Self {
+            stream,
+            max_frame_size: DEFAULT_MAX_FRAME_SIZE,
+        })
+    }
+
+    /// Send an event publish frame and await its publish ack.
+    pub fn publish(
+        &mut self,
+        publish: &neon_protocol::EventPublish,
+    ) -> Result<neon_protocol::EventAck, TransportError> {
+        write_json_frame(
+            &mut self.stream,
+            &neon_protocol::EventFrame::Publish(publish.clone()),
+            self.max_frame_size,
+        )?;
+        let response: neon_protocol::EventResponse =
+            read_json_frame(&mut self.stream, self.max_frame_size)?;
+        match response {
+            neon_protocol::EventResponse::Ack(ack) => Ok(ack),
+            neon_protocol::EventResponse::Delivery(_) => Err(TransportError::InvalidFrameLength),
+        }
+    }
+    /// Send one raw JSON frame (subscribe, unsubscribe, heartbeat, ...).
+    pub fn send_value(&mut self, value: &serde_json::Value) -> Result<(), TransportError> {
+        write_json_frame(&mut self.stream, value, self.max_frame_size)
+    }
+
+    /// Read one raw JSON frame from the stream (for subscription pushes).
+    pub fn recv_value(&mut self) -> Result<serde_json::Value, TransportError> {
+        read_json_frame(&mut self.stream, self.max_frame_size)
+    }
+}
+
 pub struct RpcServer {
     listener: TcpListener,
     max_frame_size: usize,
@@ -150,6 +196,14 @@ impl RpcServer {
 
     pub fn local_addr(&self) -> Result<SocketAddr, TransportError> {
         self.listener.local_addr().map_err(map_io_error)
+    }
+
+    /// Accept one loopback connection. Callers that need a long-lived
+    /// subscription stream (server push of many frames) take ownership of the
+    /// stream and drive read/write loops with `read_json_frame`/`write_json_frame`.
+    pub fn accept(&self) -> Result<TcpStream, TransportError> {
+        let (stream, _) = self.listener.accept().map_err(map_io_error)?;
+        Ok(stream)
     }
 
     pub fn serve_one<F>(&self, handler: F) -> Result<(), TransportError>
@@ -199,8 +253,9 @@ fn ensure_loopback(endpoint: SocketAddr) -> Result<(), TransportError> {
     }
 }
 
-fn write_json_frame<T: serde::Serialize>(
-    stream: &mut TcpStream,
+/// Write one length-prefixed JSON frame to any writer.
+pub fn write_json_frame<T: serde::Serialize>(
+    stream: &mut impl Write,
     value: &T,
     max: usize,
 ) -> Result<(), TransportError> {
@@ -209,8 +264,9 @@ fn write_json_frame<T: serde::Serialize>(
     stream.write_all(&frame).map_err(map_io_error)
 }
 
-fn read_json_frame<T: serde::de::DeserializeOwned>(
-    stream: &mut TcpStream,
+/// Read one length-prefixed JSON frame from any reader.
+pub fn read_json_frame<T: serde::de::DeserializeOwned>(
+    stream: &mut impl Read,
     max: usize,
 ) -> Result<T, TransportError> {
     let mut header = [0_u8; 4];
@@ -433,6 +489,61 @@ mod tests {
             client.call(&request("timeout")),
             Err(TransportError::Timeout)
         ));
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn event_publish_frame_round_trips_over_loopback() {
+        use neon_protocol::{EventAck, EventAckStatus, EventPublish, EventResponse, EVENT_PROTOCOL};
+
+        let server = RpcServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let endpoint = server.local_addr().unwrap();
+        let thread = thread::spawn(move || {
+            let mut stream = server.accept().unwrap();
+            let frame: neon_protocol::EventFrame =
+                read_json_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE).unwrap();
+            let neon_protocol::EventFrame::Publish(publish) = frame else {
+                panic!("expected publish frame");
+            };
+            assert_eq!(publish.protocol, EVENT_PROTOCOL);
+            assert_eq!(publish.name, "nui.variable.changed");
+            write_json_frame(
+                &mut stream,
+                &EventResponse::Ack(EventAck {
+                    protocol: EVENT_PROTOCOL.into(),
+                    version: neon_protocol::PROTOCOL_VERSION,
+                    request_id: publish.request_id,
+                    status: EventAckStatus::Accepted,
+                    event_id: Some(neon_protocol::EventId("event-001".into())),
+                    epoch: Some(7),
+                    sequence: Some(10042),
+                    current_sequence: Some(10042),
+                    error: None,
+                }),
+                DEFAULT_MAX_FRAME_SIZE,
+            )
+            .unwrap();
+        });
+        let mut client = EventClient::connect(endpoint).unwrap();
+        let ack = client
+            .publish(&EventPublish {
+                protocol: EVENT_PROTOCOL.into(),
+                version: neon_protocol::PROTOCOL_VERSION,
+                request_id: neon_protocol::RequestId("evt-req-1".into()),
+                publisher: neon_protocol::ClientIdentity {
+                    kind: neon_protocol::ClientKind::UiRuntime,
+                    instance_id: "ui-1".into(),
+                    pid: 1,
+                    origin: "test".into(),
+                },
+                name: "nui.variable.changed".into(),
+                schema_version: 1,
+                payload: serde_json::json!({"variable_key": "brush_size", "new_value": 8}),
+                idempotency_key: Some("evt-key-1".into()),
+            })
+            .unwrap();
+        assert_eq!(ack.status, EventAckStatus::Accepted);
+        assert_eq!(ack.event_id, Some(neon_protocol::EventId("event-001".into())));
         thread.join().unwrap();
     }
 }

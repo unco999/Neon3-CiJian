@@ -1,0 +1,12 @@
+[package]
+name = "neon-eventd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+neon-protocol = { path = "../neon-protocol" }
+neon-ipc = { path = "../neon-ipc" }
+neon-observability = { path = "../neon-observability" }
+serde_json.workspace = true
+serde.workspace = true

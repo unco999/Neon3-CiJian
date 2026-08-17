@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub const RPC_PROTOCOL: &str = "neon3.rpc";
+pub const EVENT_PROTOCOL: &str = "neon3.event";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -307,6 +308,152 @@ pub struct ProjectSnapshot {
     pub assets: Vec<AssetRef>,
 }
 
+/// Event module (neon-eventd) protocol types. These are the dedicated event
+/// protocol `neon3.event`, distinct from the RPC control plane `neon3.rpc`.
+
+/// One subscription filter. Filters in a single subscribe frame are OR-ed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EventFilter {
+    /// Exact dotted event name match.
+    pub name: Option<String>,
+    /// Prefix match, e.g. `nui.variable.`.
+    pub name_prefix: Option<String>,
+    /// Publisher client kinds that may deliver, e.g. `["ui_runtime"]`.
+    pub publisher_kinds: Option<Vec<String>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct EventId(pub String);
+
+/// A fully-stamped event as assigned and delivered by `neon-eventd`.
+/// Publishers supply the content fields; `neon-eventd` fills epoch/sequence.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EventEnvelope {
+    pub protocol: String,
+    pub version: ProtocolVersion,
+    pub event_id: EventId,
+    pub name: String,
+    pub schema_version: u16,
+    pub epoch: u64,
+    pub sequence: u64,
+    pub timestamp_unix_ms: u64,
+    pub publisher: ClientIdentity,
+    pub payload: Value,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EventAckStatus {
+    Accepted,
+    Rejected,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EventError {
+    pub code: String,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_id: Option<EventId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sequence: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EventPublish {
+    pub protocol: String,
+    pub version: ProtocolVersion,
+    pub request_id: RequestId,
+    pub publisher: ClientIdentity,
+    pub name: String,
+    pub schema_version: u16,
+    pub payload: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EventSubscribe {
+    pub protocol: String,
+    pub version: ProtocolVersion,
+    pub request_id: RequestId,
+    pub client: ClientIdentity,
+    pub filters: Vec<EventFilter>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay_from_sequence: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_rate_hz: Option<u32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EventAck {
+    pub protocol: String,
+    pub version: ProtocolVersion,
+    pub request_id: RequestId,
+    pub status: EventAckStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_id: Option<EventId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epoch: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sequence: Option<u64>,
+    /// Current service sequence after an accepted subscribe/publish.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_sequence: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<EventError>,
+}
+
+/// A full event delivered to a subscriber on a persistent subscription stream.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EventDelivery {
+    pub protocol: String,
+    pub version: ProtocolVersion,
+    pub event: EventEnvelope,
+}
+
+/// A frame sent from a client to `neon-eventd` on the event protocol.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum EventFrame {
+    Publish(EventPublish),
+    Subscribe(EventSubscribe),
+    Unsubscribe,
+    Heartbeat,
+}
+
+/// A frame sent from `neon-eventd` back to a client on the event protocol.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum EventResponse {
+    Ack(EventAck),
+    Delivery(EventDelivery),
+}
+
+/// Control-plane snapshot of the event service state.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EventSnapshot {
+    pub epoch: u64,
+    pub current_sequence: u64,
+    pub registered_namespaces: Vec<String>,
+}
+
+/// Retention settings for the event ring buffer.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EventRetention {
+    pub capacity: usize,
+    pub retained: usize,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -440,5 +587,276 @@ mod tests {
         for forbidden in ["texture", "buffer", "handle", "path"] {
             assert!(value.get(forbidden).is_none());
         }
+    }
+
+    fn event_publish() -> EventPublish {
+        EventPublish {
+            protocol: EVENT_PROTOCOL.into(),
+            version: PROTOCOL_VERSION,
+            request_id: RequestId("req-pub-1".into()),
+            publisher: ClientIdentity {
+                kind: ClientKind::UiRuntime,
+                instance_id: "ui-runtime-1".into(),
+                pid: 1234,
+                origin: "test".into(),
+            },
+            name: "nui.variable.changed".into(),
+            schema_version: 1,
+            payload: serde_json::json!({
+                "module": "terrain_workbench",
+                "surface": "surface.editor.terrain",
+                "variable_key": "brush_size",
+                "kind": "i32",
+                "old_value": 4,
+                "new_value": 8,
+            }),
+            idempotency_key: Some("evt-key-1".into()),
+        }
+    }
+
+    #[test]
+    fn event_publish_round_trips_and_uses_event_protocol() {
+        let publish = event_publish();
+        let value = serde_json::to_value(&publish).unwrap();
+        assert_eq!(value["protocol"], "neon3.event");
+        assert_eq!(value["name"], "nui.variable.changed");
+        assert_eq!(value["payload"]["new_value"], 8);
+        let decoded: EventPublish = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded, publish);
+    }
+
+    #[test]
+    fn event_publish_rejects_unknown_fields_and_extra_protocol() {
+        let mut value = serde_json::to_value(event_publish()).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.insert("unexpected".into(), serde_json::json!(true));
+        assert!(serde_json::from_value::<EventPublish>(value).is_err());
+
+        let mut value = serde_json::to_value(event_publish()).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.insert("protocol".into(), "neon3.rpc".into());
+        // A different protocol string is still structurally valid; caller must dispatch on it.
+        assert!(serde_json::from_value::<EventPublish>(value).is_ok());
+    }
+
+    #[test]
+    fn event_envelope_carries_epoch_sequence_and_no_gpu_handles() {
+        let envelope = EventEnvelope {
+            protocol: EVENT_PROTOCOL.into(),
+            version: PROTOCOL_VERSION,
+            event_id: EventId("event-001".into()),
+            name: "nui.variable.changed".into(),
+            schema_version: 1,
+            epoch: 7,
+            sequence: 10042,
+            timestamp_unix_ms: 0,
+            publisher: ClientIdentity {
+                kind: ClientKind::UiRuntime,
+                instance_id: "ui-runtime-1".into(),
+                pid: 1234,
+                origin: "test".into(),
+            },
+            payload: serde_json::json!({"variable_key": "brush_size", "new_value": 8}),
+        };
+        let value = serde_json::to_value(&envelope).unwrap();
+        assert_eq!(value["epoch"], 7);
+        assert_eq!(value["sequence"], 10042);
+        for forbidden in ["texture", "buffer", "handle", "path", "hit_id", "element_id"] {
+            assert!(value.get(forbidden).is_none());
+        }
+        let decoded: EventEnvelope = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded, envelope);
+    }
+
+    #[test]
+    fn event_subscribe_filter_round_trips() {
+        let subscribe = EventSubscribe {
+            protocol: EVENT_PROTOCOL.into(),
+            version: PROTOCOL_VERSION,
+            request_id: RequestId("req-sub-1".into()),
+            client: ClientIdentity {
+                kind: ClientKind::Cli,
+                instance_id: "cli-1".into(),
+                pid: 1,
+                origin: "test".into(),
+            },
+            filters: vec![
+                EventFilter {
+                    name: None,
+                    name_prefix: Some("nui.variable.".into()),
+                    publisher_kinds: None,
+                },
+                EventFilter {
+                    name: Some("project.opened".into()),
+                    name_prefix: None,
+                    publisher_kinds: Some(vec!["projectd".into()]),
+                },
+            ],
+            replay_from_sequence: Some(9000),
+            max_rate_hz: None,
+        };
+        let value = serde_json::to_value(&subscribe).unwrap();
+        assert_eq!(value["filters"][0]["name_prefix"], "nui.variable.");
+        assert_eq!(value["replay_from_sequence"], 9000);
+        let decoded: EventSubscribe = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded, subscribe);
+    }
+
+    #[test]
+    fn event_ack_rejects_with_stable_error_code_and_ids() {
+        let ack = EventAck {
+            protocol: EVENT_PROTOCOL.into(),
+            version: PROTOCOL_VERSION,
+            request_id: RequestId("req-001".into()),
+            status: EventAckStatus::Rejected,
+            event_id: None,
+            epoch: None,
+            sequence: None,
+            current_sequence: None,
+            error: Some(EventError {
+                code: "event_unknown_name".into(),
+                message: "事件名未注册".into(),
+                event_id: Some(EventId("event-001".into())),
+                sequence: None,
+            }),
+        };
+        let value = serde_json::to_value(&ack).unwrap();
+        assert_eq!(value["status"], "rejected");
+        assert_eq!(value["error"]["code"], "event_unknown_name");
+        let decoded: EventAck = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded, ack);
+    }
+
+    #[test]
+    fn event_frames_and_responses_are_tagged() {
+        let publish = EventFrame::Publish(event_publish());
+        let value = serde_json::to_value(&publish).unwrap();
+        assert_eq!(value["kind"], "publish");
+        assert_eq!(value["name"], "nui.variable.changed");
+        let decoded: EventFrame = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded, publish);
+
+        let subscribe = EventFrame::Subscribe(EventSubscribe {
+            protocol: EVENT_PROTOCOL.into(),
+            version: PROTOCOL_VERSION,
+            request_id: RequestId("req-sub-1".into()),
+            client: ClientIdentity {
+                kind: ClientKind::Cli,
+                instance_id: "cli-1".into(),
+                pid: 1,
+                origin: "test".into(),
+            },
+            filters: vec![EventFilter {
+                name: None,
+                name_prefix: Some("nui.variable.".into()),
+                publisher_kinds: None,
+            }],
+            replay_from_sequence: Some(0),
+            max_rate_hz: None,
+        });
+        let value = serde_json::to_value(&subscribe).unwrap();
+        assert_eq!(value["kind"], "subscribe");
+        let decoded: EventFrame = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded, subscribe);
+
+        assert_eq!(
+            serde_json::to_value(&EventFrame::Unsubscribe).unwrap()["kind"],
+            "unsubscribe"
+        );
+        assert_eq!(
+            serde_json::to_value(&EventFrame::Heartbeat).unwrap()["kind"],
+            "heartbeat"
+        );
+
+        let delivery = EventResponse::Delivery(EventDelivery {
+            protocol: EVENT_PROTOCOL.into(),
+            version: PROTOCOL_VERSION,
+            event: EventEnvelope {
+                protocol: EVENT_PROTOCOL.into(),
+                version: PROTOCOL_VERSION,
+                event_id: EventId("event-003".into()),
+                name: "nui.variable.changed".into(),
+                schema_version: 1,
+                epoch: 2,
+                sequence: 6,
+                timestamp_unix_ms: 0,
+                publisher: ClientIdentity {
+                    kind: ClientKind::UiRuntime,
+                    instance_id: "ui-1".into(),
+                    pid: 1,
+                    origin: "test".into(),
+                },
+                payload: serde_json::json!({"new_value": 8}),
+            },
+        });
+        let value = serde_json::to_value(&delivery).unwrap();
+        assert_eq!(value["kind"], "delivery");
+        let decoded: EventResponse = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded, delivery);
+
+        let ack = EventResponse::Ack(EventAck {
+            protocol: EVENT_PROTOCOL.into(),
+            version: PROTOCOL_VERSION,
+            request_id: RequestId("req-001".into()),
+            status: EventAckStatus::Accepted,
+            event_id: Some(EventId("event-003".into())),
+            epoch: Some(2),
+            sequence: Some(6),
+            current_sequence: Some(6),
+            error: None,
+        });
+        let value = serde_json::to_value(&ack).unwrap();
+        assert_eq!(value["kind"], "ack");
+        let decoded: EventResponse = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded, ack);
+    }
+
+    #[test]
+    fn event_delivery_and_snapshot_round_trip() {
+        let delivery = EventDelivery {
+            protocol: EVENT_PROTOCOL.into(),
+            version: PROTOCOL_VERSION,
+            event: EventEnvelope {
+                protocol: EVENT_PROTOCOL.into(),
+                version: PROTOCOL_VERSION,
+                event_id: EventId("event-002".into()),
+                name: "project.opened".into(),
+                schema_version: 1,
+                epoch: 2,
+                sequence: 5,
+                timestamp_unix_ms: 0,
+                publisher: ClientIdentity {
+                    kind: ClientKind::Projectd,
+                    instance_id: "projectd-1".into(),
+                    pid: 99,
+                    origin: "test".into(),
+                },
+                payload: serde_json::json!({"project_id": "project-001"}),
+            },
+        };
+        let value = serde_json::to_value(&delivery).unwrap();
+        assert_eq!(value["event"]["name"], "project.opened");
+        assert_eq!(value["event"]["epoch"], 2);
+        let decoded: EventDelivery = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded, delivery);
+
+        let snapshot = EventSnapshot {
+            epoch: 2,
+            current_sequence: 5,
+            registered_namespaces: vec!["nui.variable".into(), "project".into()],
+        };
+        let value = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(value["current_sequence"], 5);
+        let decoded: EventSnapshot = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded, snapshot);
+
+        let retention = EventRetention {
+            capacity: 4096,
+            retained: 3,
+        };
+        let value = serde_json::to_value(&retention).unwrap();
+        assert_eq!(value["capacity"], 4096);
+        let decoded: EventRetention = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded, retention);
     }
 }

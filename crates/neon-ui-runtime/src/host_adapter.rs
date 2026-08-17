@@ -546,6 +546,8 @@ mod tests {
                 },
             }],
             grid_slots: vec![UiGridInputSlot { key: "grid".into() }],
+            flow_name: String::new(),
+            emit_event_keys: Vec::new(),
         };
         let program = UiProgram {
             revision: revision.clone(),

@@ -52,11 +52,13 @@ use serde_json::{Value, json};
 
 pub mod debug;
 pub mod demo_domain;
+pub mod event_publisher;
 pub mod host_adapter;
 pub mod nui_flow;
 pub mod nui_state_machine;
 pub mod terrain_workbench;
 use host_adapter::{UiHostAdapter, UiHostAdapterConfig};
+pub use event_publisher::{EVENT_VARIABLE_CHANGED, FLOW_EVENT_PREFIX, UiVariableEventPublisher};
 pub use nui_flow::{
     NuiFlowError, apply_nui_ir_patch, bind_nui_flow_resources, compile_nui_flow_program,
     format_nui_flow, lower_nui_flow, lower_nui_flow_effects, parse_nui_flow, parse_nui_flow_patch,
@@ -393,6 +395,20 @@ pub struct UiInputApplyResult {
     pub input_revision: Revision,
     pub changed_slots: Vec<String>,
     pub snapshot: UiResolvedInputs,
+    /// Detailed variable changes for event forwarding. Each entry carries the
+    /// stable variable key, its input kind, and old/new values.
+    pub variable_changes: Vec<UiVariableChange>,
+}
+
+/// One UI input variable that changed during an input frame application.
+/// This is an observation record for the event protocol; it is not a domain
+/// command and does not authorize any receiver to mutate authoritative state.
+#[derive(Clone, Debug, PartialEq)]
+pub struct UiVariableChange {
+    pub key: String,
+    pub kind: String,
+    pub old_value: Option<serde_json::Value>,
+    pub new_value: serde_json::Value,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UiInputStoreError {
@@ -570,6 +586,7 @@ impl UiInputStore {
         }
         let next_revision = Revision(self.resolved_inputs.input_revision.0 + 1);
         let mut changed_slots = Vec::new();
+        let mut variable_changes = Vec::new();
         let mut values = self.resolved_inputs.values.clone();
         for UiInputChange { key, value } in frame.changes {
             let slot = self
@@ -588,12 +605,17 @@ impl UiInputStore {
                     unreachable!("static slots are not writable")
                 }
             };
-            if values
-                .get(&key)
-                .is_none_or(|current| current.value != value)
-            {
+            let old_value = values.get(&key).map(|current| current.value.clone());
+            let changed = old_value.as_ref().is_none_or(|old| *old != value);
+            if changed {
                 changed_slots.push(key.clone());
                 self.dirty_slots.insert(key.clone());
+                variable_changes.push(UiVariableChange {
+                    key: key.clone(),
+                    kind: ui_input_kind_name(&slot.kind),
+                    old_value: old_value.map(|value| input_value_to_json(&value)),
+                    new_value: input_value_to_json(&value),
+                });
             }
             values.insert(
                 key,
@@ -614,6 +636,7 @@ impl UiInputStore {
         let result = UiInputApplyResult {
             input_revision: next_revision,
             changed_slots,
+            variable_changes,
             snapshot,
         };
         self.idempotent_results
@@ -1248,6 +1271,41 @@ fn input_value_as_event_payload(value: &UiInputValue) -> Option<UiSemanticPayloa
             return None;
         }
     })
+}
+
+/// Stable string name of an input kind, used in `nui.variable.changed` payloads.
+fn ui_input_kind_name(kind: &neon_ui_schema::UiInputKind) -> String {
+    use neon_ui_schema::UiInputKind;
+    match kind {
+        UiInputKind::Bool => "bool".into(),
+        UiInputKind::I32 | UiInputKind::I32Range { .. } => "i32".into(),
+        UiInputKind::U32 | UiInputKind::U32Range { .. } => "u32".into(),
+        UiInputKind::F32 | UiInputKind::F32Range { .. } => "f32".into(),
+        UiInputKind::Vec2 => "vec2".into(),
+        UiInputKind::Vec4 => "vec4".into(),
+        UiInputKind::Color => "color".into(),
+        UiInputKind::Enum { .. } => "enum".into(),
+        UiInputKind::TextHandle => "text".into(),
+        UiInputKind::AssetHandle => "asset".into(),
+    }
+}
+
+/// Converts a typed input value into a JSON observation for event payloads.
+fn input_value_to_json(value: &UiInputValue) -> serde_json::Value {
+    use neon_ui_schema::UiInputValue;
+    match value {
+        UiInputValue::Bool { value } => json!({"value": value}),
+        UiInputValue::I32 { value } => json!({"value": value}),
+        UiInputValue::U32 { value } => json!({"value": value}),
+        UiInputValue::F32 { value } => json!({"value": value}),
+        UiInputValue::Enum { value } => json!({"value": value}),
+        UiInputValue::TextHandle { value } => json!({"text_handle": {"id": value.id, "generation": value.generation}}),
+        UiInputValue::AssetHandle { id, generation } => {
+            json!({"asset_id": id, "generation": generation})
+        }
+        UiInputValue::Vec2 { value } => json!({"value": value}),
+        UiInputValue::Vec4 { value } | UiInputValue::Color { value } => json!({"value": value}),
+    }
 }
 
 /// Converts legacy renderer transport events at the compiled-program boundary.
@@ -5679,6 +5737,8 @@ mod tests {
                 },
             }],
             grid_slots: Vec::new(),
+            flow_name: String::new(),
+            emit_event_keys: Vec::new(),
         };
         let mut store = UiInputStore::activate(program.clone(), schema).unwrap();
         assert_eq!(
@@ -5788,6 +5848,8 @@ mod tests {
                 },
             }],
             grid_slots: Vec::new(),
+            flow_name: String::new(),
+            emit_event_keys: Vec::new(),
         };
         let mut store = UiInputStore::activate(program.clone(), schema).unwrap();
         let missing = UiTextHandle {
@@ -5872,6 +5934,8 @@ mod tests {
                 },
             }],
             grid_slots: Vec::new(),
+            flow_name: String::new(),
+            emit_event_keys: Vec::new(),
         };
         assert_eq!(
             UiInputStore::activate_with_text_registry(program, schema, &registry)
@@ -5923,6 +5987,8 @@ mod tests {
             grid_slots: vec![neon_ui_schema::UiGridInputSlot {
                 key: "assets_window".into(),
             }],
+            flow_name: String::new(),
+            emit_event_keys: Vec::new(),
         }
     }
 

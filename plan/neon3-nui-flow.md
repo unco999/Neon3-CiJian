@@ -36,6 +36,25 @@ The root declaration has no indentation. A Flow document has one root. `surface`
 
 Input declarations have the form `input <key> <kind> default <literal>`. V1 supports `bool`, `i32`, `u32`, `f32`, and `text`; numeric kinds may declare an inclusive range as `<kind>:<minimum>..<maximum>` (for example `i32:0..24` or `f32:0..1`), and text defaults use the immutable empty handle, `text:empty`. Range bounds and defaults must be ordered, finite where applicable, and type-correct. The input schema installs every default at program activation. Inputs are direct values only, never JSON, lists, arbitrary objects or raw variable-length frame text.
 
+### Directed variable events (`emitevent`)
+
+An input may end with the trailing marker `emitevent` to declare that changes to
+that variable are forwarded to `neon-eventd` as a directed event:
+
+```text
+flow terrain-workbench
+input brush_size i32:0..24 default 4 emitevent
+```
+
+The event name follows the fixed rule `flow.<flow_name>.<variable_key>`, where
+`flow_name` comes from the `flow <name>` declaration line (required for any
+`emitevent` input). Grid inputs cannot declare `emitevent`. Only declared
+variables produce directed events; undeclared variable changes stay silent.
+The event payload carries `module`, `surface`, `variable_key`, `kind`, and
+old/new values as structured observation data. A directed event is an
+observation, not a domain command: receivers must never mutate authoritative
+state from an event payload.
+
 ## Components and attributes
 
 The closed V1 vocabulary is `surface`, `panel`, `text`, `button`, `input`, `checkbox`, `radio_button`, `slider`, `drag_value`, `combo`, `dropdown`, `tabs`, `selectable`, `list_box`, `scrollbar`, `progress_bar`, `image`, `render`, `scroll`, `overlay`, `branch`, `repeat`, and `template`. No other component name is valid. `surface`, `panel`, `scroll`, `overlay`, `branch`, `repeat`, and `template` lower through the current compatible panel topology; bounded branch and template records are completed by their dedicated runtime capability.

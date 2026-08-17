@@ -8,8 +8,9 @@ fn main() -> ExitCode {
     let args: Vec<_> = std::env::args().skip(1).collect();
     if args.as_slice() == ["--help"] {
         println!(
-            "neon-cli scenario <ui.static-fragment.submit.v1|ui.detail-toggle.v1> --headless\n{}",
-            neon_cli::debug_usage()
+            "neon-cli scenario <ui.static-fragment.submit.v1|ui.detail-toggle.v1> --headless\n{}\n{}",
+            neon_cli::debug_usage(),
+            neon_cli::event_usage()
         );
         return ExitCode::SUCCESS;
     }
@@ -29,6 +30,28 @@ fn main() -> ExitCode {
                 } else {
                     ExitCode::from(1)
                 }
+            }
+            Err(error) => {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({"status": "failed", "error": {"code": "transport_failed", "message": error.to_string()}})
+                );
+                ExitCode::from(1)
+            }
+        };
+    }
+    if args.first().is_some_and(|command| command == "event") {
+        let command = match neon_cli::EventCommand::parse(&args) {
+            Ok(command) => command,
+            Err(error) => {
+                eprintln!("{error}");
+                return ExitCode::from(2);
+            }
+        };
+        return match neon_cli::execute_event(command) {
+            Ok(output) => {
+                println!("{output}");
+                ExitCode::SUCCESS
             }
             Err(error) => {
                 eprintln!(

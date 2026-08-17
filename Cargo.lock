@@ -933,6 +933,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "neon-eventd"
+version = "0.1.0"
+dependencies = [
+ "neon-ipc",
+ "neon-observability",
+ "neon-protocol",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "neon-ipc"
 version = "0.1.0"
 dependencies = [

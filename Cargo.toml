@@ -5,6 +5,7 @@ members = [
     "crates/neon-observability",
     "crates/neon-world-bridge",
     "crates/neon-projectd",
+    "crates/neon-eventd",
     "crates/neon-ui-schema",
     "crates/neon-wgpu-runtime",
     "crates/neon-wgpu-ai",

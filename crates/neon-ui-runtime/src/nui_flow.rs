@@ -39,6 +39,7 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
     let mut input_slots = Vec::new();
     let mut grid_slots = Vec::new();
     let mut seen_inputs = HashSet::new();
+    let mut emit_event_keys = Vec::new();
     let mut branches = Vec::new();
     let mut templates = Vec::new();
     let mut data_grids = Vec::new();
@@ -129,7 +130,7 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
             if parse_state_machine_declaration(content, &mut state_machines, line)? {
                 continue;
             }
-            if let Some(input) = parse_input(content, line)? {
+            if let Some((input, emit_event)) = parse_input(content, line)? {
                 let key = match &input {
                     ParsedInput::Scalar(slot) => &slot.key,
                     ParsedInput::Grid(slot) => &slot.key,
@@ -141,6 +142,9 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
                         line,
                         1,
                     ));
+                }
+                if emit_event {
+                    emit_event_keys.push(key.clone());
                 }
                 match input {
                     ParsedInput::Scalar(slot) => input_slots.push(slot),
@@ -305,6 +309,8 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
         layout_hash: "nui-flow-v1".into(),
         slots: input_slots,
         grid_slots,
+        flow_name: header.flow_name.clone(),
+        emit_event_keys,
     };
     schema.validate().map_err(|_| {
         error(
@@ -696,11 +702,23 @@ pub fn format_nui_flow(source: &str) -> FlowResult<String> {
             parsed.ir.surface_id.0, parsed.ir.revision.0
         ),
     ];
+    if !parsed.input_schema.flow_name.is_empty() {
+        lines.push(format!("flow {}", parsed.input_schema.flow_name));
+    }
     for slot in &parsed.input_schema.grid_slots {
         lines.push(format!("input {} grid default grid:empty", slot.key));
     }
     for slot in &parsed.input_schema.slots {
-        lines.push(format_input(slot));
+        let emit = if parsed
+            .input_schema
+            .emit_event_keys
+            .contains(&slot.key)
+        {
+            " emitevent"
+        } else {
+            ""
+        };
+        lines.push(format!("{}{emit}", format_input(slot)));
     }
     for resource in &parsed.ir.resources {
         let kind = match resource.kind {
@@ -866,6 +884,7 @@ struct Header {
     surface_id: String,
     revision: u64,
     budget: UiResourceBudget,
+    flow_name: String,
 }
 
 /// A patch address is a semantic key or slash-separated semantic key path.
@@ -933,6 +952,7 @@ impl Default for Header {
         Self {
             surface_id: String::new(),
             revision: 1,
+            flow_name: String::new(),
             budget: UiResourceBudget {
                 max_nodes: 512,
                 max_bindings: 512,
@@ -1000,6 +1020,18 @@ fn parse_header(text: &str, header: &mut Header, line: u32) -> FlowResult<bool> 
         Some("surface") if parts.len() == 4 && parts[2] == "revision" => {
             header.surface_id = parts[1].into();
             header.revision = parse_u64(parts[3], line, "revision")?;
+            Ok(true)
+        }
+        Some("flow") if parts.len() == 2 => {
+            if !valid_key(parts[1]) {
+                return Err(error(
+                    "nui_flow_invalid_flow",
+                    "flow name uses letters, digits, '.', '_' and '-'",
+                    line,
+                    1,
+                ));
+            }
+            header.flow_name = parts[1].into();
             Ok(true)
         }
         Some("budget") => {
@@ -1381,15 +1413,23 @@ enum ParsedInput {
     Grid(UiGridInputSlot),
 }
 
-fn parse_input(text: &str, line: u32) -> FlowResult<Option<ParsedInput>> {
+fn parse_input(text: &str, line: u32) -> FlowResult<Option<(ParsedInput, bool)>> {
     let parts = text.split_whitespace().collect::<Vec<_>>();
     if parts.first() != Some(&"input") {
         return Ok(None);
     }
-    if parts.len() != 5 || parts[3] != "default" {
+    // Optional trailing `emitevent` declares that changes to this variable are
+    // forwarded as a directed `flow.<flow_name>.<variable_key>` event.
+    let emit_event = parts.last() == Some(&"emitevent");
+    let core_len = if emit_event {
+        parts.len() - 1
+    } else {
+        parts.len()
+    };
+    if core_len != 5 || parts[3] != "default" {
         return Err(error(
             "nui_flow_invalid_input",
-            "input syntax is: input <key> <kind> default <value>",
+            "input syntax is: input <key> <kind> default <value> [emitevent]",
             line,
             1,
         ));
@@ -1403,9 +1443,20 @@ fn parse_input(text: &str, line: u32) -> FlowResult<Option<ParsedInput>> {
                 1,
             ));
         }
-        return Ok(Some(ParsedInput::Grid(UiGridInputSlot {
-            key: parts[1].into(),
-        })));
+        if emit_event {
+            return Err(error(
+                "nui_flow_invalid_input",
+                "grid inputs cannot declare emitevent",
+                line,
+                1,
+            ));
+        }
+        return Ok(Some((
+            ParsedInput::Grid(UiGridInputSlot {
+                key: parts[1].into(),
+            }),
+            false,
+        )));
     }
     let kind = match parts[2] {
         "bool" => UiInputKind::Bool,
@@ -1504,19 +1555,22 @@ fn parse_input(text: &str, line: u32) -> FlowResult<Option<ParsedInput>> {
         }
     };
     let (alignment, lanes, representation) = kind.packing();
-    Ok(Some(ParsedInput::Scalar(UiInputSlot {
-        key: parts[1].into(),
-        kind,
-        default_value: value,
-        update_class: UiInputUpdateClass::ReliableExternal,
-        semantic_label: parts[1].replace('_', " "),
-        packing: UiInputPacking {
-            alignment,
-            lanes,
-            offset: 0,
-            representation,
-        },
-    })))
+    Ok(Some((
+        ParsedInput::Scalar(UiInputSlot {
+            key: parts[1].into(),
+            kind,
+            default_value: value,
+            update_class: UiInputUpdateClass::ReliableExternal,
+            semantic_label: parts[1].replace('_', " "),
+            packing: UiInputPacking {
+                alignment,
+                lanes,
+                offset: 0,
+                representation,
+            },
+        }),
+        emit_event,
+    )))
 }
 
 fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
@@ -3147,6 +3201,55 @@ panel workspace row gap 8
         assert_eq!(document.source_map["water"].column, 5);
         assert_eq!(document.ir.bindings.len(), 2);
         assert_eq!(document.input_schema.slots[1].packing.offset, 8);
+    }
+
+    #[test]
+    fn flow_declaration_and_emitevent_are_parsed_into_the_input_schema() {
+        let document = parse_nui_flow(
+            "version 1\nsurface surface.editor.terrain revision 1\nflow terrain-workbench\ninput can_commit bool default false\ninput brush_size i32:0..24 default 4 emitevent\nsurface root column\n",
+        )
+        .unwrap();
+        assert_eq!(document.input_schema.flow_name, "terrain-workbench");
+        assert_eq!(
+            document.input_schema.emit_event_keys,
+            vec!["brush_size".to_owned()]
+        );
+    }
+
+    #[test]
+    fn emitevent_requires_flow_declaration_for_an_event_name() {
+        let document = parse_nui_flow(
+            "surface surface.editor.terrain revision 1\ninput brush_size i32 default 4 emitevent\nsurface root column\n",
+        )
+        .unwrap();
+        assert!(document.input_schema.flow_name.is_empty());
+        assert_eq!(
+            document.input_schema.emit_event_keys,
+            vec!["brush_size".to_owned()]
+        );
+    }
+
+    #[test]
+    fn grid_inputs_cannot_declare_emitevent() {
+        let error = parse_nui_flow("input rows grid default grid:empty emitevent\n").unwrap_err();
+        assert!(error
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "nui_flow_invalid_input"));
+    }
+
+    #[test]
+    fn formatting_preserves_flow_and_emitevent_declarations() {
+        let source = "version 1\nsurface surface.editor.terrain revision 12\nflow terrain-workbench\ninput can_commit bool default false\ninput brush_size i32 default 4 emitevent\nsurface root column\n";
+        let formatted = format_nui_flow(source).unwrap();
+        assert!(formatted.contains("flow terrain-workbench\n"));
+        assert!(formatted.contains("input brush_size i32 default 4 emitevent\n"));
+        let reparsed = parse_nui_flow(&formatted).unwrap();
+        assert_eq!(reparsed.input_schema.flow_name, "terrain-workbench");
+        assert_eq!(
+            reparsed.input_schema.emit_event_keys,
+            vec!["brush_size".to_owned()]
+        );
     }
 
     #[test]
