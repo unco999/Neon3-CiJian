@@ -1653,12 +1653,13 @@ pub struct UiHostPublication {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+/// Replaces presentation only. The active adapter owns and carries forward all
+/// scalar and grid inputs; hosts cannot include input state in this update.
 pub struct UiHostPresentationUpdate {
     pub expected_fragment_revision: Revision,
     pub replacement_fragment: UiFragment,
     pub replacement_program: UiProgram,
     pub replacement_input_schema: UiInputSchema,
-    pub replacement_input_snapshot: UiProgramInputSnapshot,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

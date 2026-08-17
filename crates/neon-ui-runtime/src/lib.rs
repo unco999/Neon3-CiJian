@@ -3224,17 +3224,23 @@ impl UiRuntime {
                         "renderer drag source is not declared by the active host program",
                     ))
                 })?;
+            let neon_ui_schema::UiIntent::Invoke { action, .. } = &event.intent;
             let drop = adapter
                 .program()
                 .drop_records
                 .iter()
-                .find(|record| record.target_node_key == payload.target_key)
+                .find(|record| {
+                    record.target_node_key == payload.target_key
+                        && record.accepts_drag_key == drag.key
+                        && record.placement == payload.placement
+                        && record.presentation_template_key == payload.presentation_template_key
+                        && record.intent == *action
+                })
                 .ok_or_else(|| {
                     TransportError::Io(std::io::Error::other(
-                        "renderer drop target is not declared by the active host program",
+                        "renderer drop is not declared by the active host program",
                     ))
                 })?;
-            let neon_ui_schema::UiIntent::Invoke { action, .. } = &event.intent;
             return Ok(UiHostInbound::DragDrop {
                 event: UiProgramDragDropEvent {
                     event_id: event.event_id.clone(),
@@ -6216,13 +6222,11 @@ mod tests {
         runtime.host_adapter =
             Some(UiHostAdapter::activate(program.clone(), schema.clone(), 7).unwrap());
         let declaration = program.event_records[0].clone();
-        let snapshot = runtime.host_adapter.as_ref().unwrap().snapshot();
         let replacement = neon_ui_schema::UiHostPresentationUpdate {
             expected_fragment_revision: Revision(1),
             replacement_fragment: runtime.static_fragment(Revision(2)),
             replacement_program: program.clone(),
             replacement_input_schema: schema,
-            replacement_input_snapshot: snapshot,
         };
         let host = RpcServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
         let host_endpoint = host.local_addr().unwrap();

@@ -268,11 +268,10 @@ impl UiHostAdapter {
         }
         if update.replacement_program != self.program
             || update.replacement_input_schema != *self.input_schema()
-            || update.replacement_input_snapshot != self.snapshot()
         {
             return Err(UiHostAdapterError {
                 code: "ui_host_presentation_state_change",
-                message: "presentation update must preserve the active program and input snapshot",
+                message: "presentation update must preserve the active program and input schema",
             });
         }
         if update.replacement_fragment.validate().is_err() {
@@ -712,7 +711,6 @@ mod tests {
             replacement_fragment: replacement.clone(),
             replacement_program: original_program.clone(),
             replacement_input_schema: adapter.input_schema().clone(),
-            replacement_input_snapshot: original_snapshot.clone(),
         };
 
         let (next, accepted) = adapter
@@ -722,6 +720,26 @@ mod tests {
         assert_eq!(accepted.revision, Revision(2));
         assert_eq!(next.program(), &original_program);
         assert_eq!(next.snapshot(), original_snapshot);
+
+        let mut changed_program = update.clone();
+        changed_program.replacement_program.layout_hash = "changed".into();
+        assert_eq!(
+            adapter
+                .apply_presentation_update(changed_program, &active)
+                .unwrap_err()
+                .code,
+            "ui_host_presentation_state_change"
+        );
+
+        let mut changed_schema = update.clone();
+        changed_schema.replacement_input_schema.layout_hash = "changed".into();
+        assert_eq!(
+            adapter
+                .apply_presentation_update(changed_schema, &active)
+                .unwrap_err()
+                .code,
+            "ui_host_presentation_state_change"
+        );
 
         let mut hardcoded = update;
         hardcoded.replacement_fragment.fragment_id = UiFragmentId("component-gallery-host".into());
@@ -734,6 +752,101 @@ mod tests {
         );
         assert_eq!(adapter.program(), &original_program);
         assert_eq!(adapter.snapshot(), original_snapshot);
+    }
+
+    #[test]
+    fn drag_presentation_carries_forward_seeded_grid_and_scalar_snapshot() {
+        fn node(key: &str, kind: UiNodeKind) -> UiNode {
+            UiNode {
+                node_id: UiNodeId(key.into()),
+                kind,
+                bounds: UiBounds {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1.0,
+                    height: 1.0,
+                },
+                layout: None,
+                visible: true,
+                enabled: true,
+                text_key: None,
+                text: None,
+                image: None,
+                surface: None,
+                style: UiStyle::default(),
+                enter_transition: None,
+                children: Vec::new(),
+            }
+        }
+
+        let mut adapter = adapter();
+        adapter.seed_grid_inputs(vec![grid_input(3)]).unwrap();
+        adapter
+            .apply_publication(publication(0, Vec::new()))
+            .unwrap();
+        let original_snapshot = adapter.snapshot();
+        let original_bytes = serde_json::to_vec(&original_snapshot).unwrap();
+        assert_eq!(original_snapshot.scalar_inputs.input_revision, Revision(1));
+        assert_eq!(original_snapshot.grid_inputs, vec![grid_input(3)]);
+
+        let mut active = active_fragment().into_fragment();
+        active.root.children = vec![
+            node("drag-source", UiNodeKind::Button),
+            node("drop-target", UiNodeKind::Panel),
+        ];
+        let mut replacement = active.clone();
+        replacement.revision = Revision(2);
+        replacement
+            .root
+            .children
+            .retain(|child| child.node_id.0 != "drag-source");
+        let representation = node("target-representation", UiNodeKind::Button);
+        replacement
+            .root
+            .children
+            .iter_mut()
+            .find(|child| child.node_id.0 == "drop-target")
+            .unwrap()
+            .children
+            .push(representation.clone());
+
+        let update = UiHostPresentationUpdate {
+            expected_fragment_revision: Revision(1),
+            replacement_fragment: replacement,
+            replacement_program: adapter.program().clone(),
+            replacement_input_schema: adapter.input_schema().clone(),
+        };
+        let mut encoded_update = serde_json::to_value(&update).unwrap();
+        assert!(encoded_update.get("replacement_input_snapshot").is_none());
+        encoded_update.as_object_mut().unwrap().insert(
+            "replacement_input_snapshot".into(),
+            serde_json::to_value(&original_snapshot).unwrap(),
+        );
+        assert!(serde_json::from_value::<UiHostPresentationUpdate>(encoded_update).is_err());
+
+        let (next, accepted) = adapter.apply_presentation_update(update, &active).unwrap();
+        let carried_snapshot = next.snapshot();
+        assert_eq!(carried_snapshot, original_snapshot);
+        assert_eq!(
+            serde_json::to_vec(&carried_snapshot).unwrap(),
+            original_bytes
+        );
+        assert!(
+            accepted
+                .root
+                .children
+                .iter()
+                .all(|child| child.node_id.0 != "drag-source")
+        );
+        let inserted = accepted
+            .root
+            .children
+            .iter()
+            .find(|child| child.node_id.0 == "drop-target")
+            .and_then(|target| target.children.first())
+            .unwrap();
+        assert_eq!(inserted.node_id, representation.node_id);
+        assert!(inserted.visible);
     }
 
     #[test]

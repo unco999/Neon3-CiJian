@@ -15,7 +15,7 @@ use neon_ui_schema::{
     UiDropPlacement, UiEffect, UiFragment, UiHostInbound, UiHostPresentationUpdate,
     UiHostPublication, UiInputChange, UiInputFrame, UiInputKind, UiInputSchema, UiInputValue,
     UiNode, UiNodeId, UiProgram, UiProgramCapability, UiProgramCapabilityOwner,
-    UiProgramCapabilityStatus, UiProgramInputSnapshot, UiProgramRevision, UiProgramSemanticEvent,
+    UiProgramCapabilityStatus, UiProgramRevision, UiProgramSemanticEvent,
     UiProgramSemanticEventKind, UiProgramSemanticEventStatus, UiResolvedInputs, UiSemanticEvent,
     UiSemanticEventType, UiSemanticPayloadValue,
 };
@@ -290,12 +290,6 @@ impl DemoInputDomain {
                                         frame,
                                     });
                                 }
-                                let replacement_snapshot = UiProgramInputSnapshot {
-                                    scalar_inputs: domain.snapshot().inputs,
-                                    grid_inputs: active_grid.clone().into_iter().map(|frame| UiDataGridInputFrame {
-                                        source_key: "asset_window".into(), frame,
-                                    }).collect(),
-                                };
                                 accepted(request, Some(replacement_fragment.revision), json!(UiHostPublication {
                                     scalar_frame: UiInputFrame {
                                         program_revision: program.revision.clone(), expected_input_revision: before,
@@ -307,7 +301,6 @@ impl DemoInputDomain {
                                         replacement_fragment,
                                         replacement_program: program.clone(),
                                         replacement_input_schema: input_schema.clone(),
-                                        replacement_input_snapshot: replacement_snapshot,
                                     }),
                                 }))
                             }
@@ -587,6 +580,40 @@ struct VirtualListRowState {
     notes: Option<String>,
 }
 
+fn drag_drop_adapter_config() -> Result<UiHostAdapterConfig, &'static str> {
+    let document = parse_nui_flow(include_str!(
+        "../../../tests/fixtures/ui/kanban-reparent-workbench.nui"
+    ))
+    .map_err(|_| "drag/drop demo Flow is invalid")?;
+    let program = compile_nui_flow_program(
+        &document,
+        UiProgramRevision {
+            program_id: "surface.editor.kanban.demo".into(),
+            revision: Revision(1),
+            schema_version: UI_PROGRAM_SCHEMA_VERSION,
+            capabilities: [
+                UI_PROGRAM_CAPABILITY_NAME,
+                UI_PROGRAM_TEXT_REGISTRY_CAPABILITY_NAME,
+                UI_PROGRAM_BOUNDED_STRUCTURE_CAPABILITY_NAME,
+                UI_PROGRAM_SEMANTIC_EVENT_CAPABILITY_NAME,
+            ]
+            .into_iter()
+            .map(|name| UiProgramCapability {
+                name: name.into(),
+                version: 1,
+                owner: UiProgramCapabilityOwner::SharedContract,
+                status: UiProgramCapabilityStatus::Supported,
+            })
+            .collect(),
+        },
+    )
+    .map_err(|_| "drag/drop demo program did not compile")?;
+    Ok(UiHostAdapterConfig {
+        program,
+        input_schema: document.input_schema,
+    })
+}
+
 impl DemoDragDropDomain {
     pub fn new() -> Self {
         Self {
@@ -605,64 +632,111 @@ impl DemoDragDropDomain {
         })
     }
 
-    pub fn handle(&mut self, request: RpcRequest) -> RpcResponse {
+    pub fn handle(&mut self, mut request: RpcRequest) -> RpcResponse {
         if request.method == "service.shutdown" {
             return accepted(request, self.revision, json!({"state": "accepted"}));
         }
         if request.method == "ui.host.adapter.get" {
-            let document = match parse_nui_flow(include_str!(
-                "../../../tests/fixtures/ui/kanban-reparent-workbench.nui"
-            )) {
-                Ok(document) => document,
+            return match drag_drop_adapter_config() {
+                Ok(config) => accepted(request, self.revision, json!(config)),
+                Err(message) => {
+                    rejected(request, self.revision, "ui_host_invalid_program", message)
+                }
+            };
+        }
+        if request.method == "ui.host.inbound" {
+            let inbound: UiHostInbound = match serde_json::from_value(request.params.clone()) {
+                Ok(inbound) => inbound,
                 Err(_) => {
                     return rejected(
                         request,
                         self.revision,
-                        "ui_host_invalid_program",
-                        "drag/drop demo Flow is invalid",
+                        "invalid_request",
+                        "UI host inbound payload is invalid",
                     );
                 }
             };
-            let program = match compile_nui_flow_program(
-                &document,
-                UiProgramRevision {
-                    program_id: "surface.editor.kanban.demo".into(),
-                    revision: Revision(1),
-                    schema_version: UI_PROGRAM_SCHEMA_VERSION,
-                    capabilities: [
-                        UI_PROGRAM_CAPABILITY_NAME,
-                        UI_PROGRAM_TEXT_REGISTRY_CAPABILITY_NAME,
-                        UI_PROGRAM_BOUNDED_STRUCTURE_CAPABILITY_NAME,
-                        UI_PROGRAM_SEMANTIC_EVENT_CAPABILITY_NAME,
-                    ]
-                    .into_iter()
-                    .map(|name| UiProgramCapability {
-                        name: name.into(),
-                        version: 1,
-                        owner: UiProgramCapabilityOwner::SharedContract,
-                        status: UiProgramCapabilityStatus::Supported,
-                    })
-                    .collect(),
+            let UiHostInbound::DragDrop {
+                event,
+                active_fragment,
+            } = inbound
+            else {
+                return rejected(
+                    request,
+                    self.revision,
+                    "unsupported_host_inbound",
+                    "drag/drop demo accepts only drag/drop host input",
+                );
+            };
+            let fragment = active_fragment.into_fragment();
+            let active_revision = fragment.revision;
+            let publication_request_id = event.request_id.clone();
+            let publication_idempotency_key = event.idempotency_key.clone();
+            let semantic_event = UiSemanticEvent {
+                event: UiSemanticEventType::DragDrop,
+                event_id: event.event_id,
+                renderer_epoch: event.interaction.renderer_epoch,
+                composition_revision: fragment.revision,
+                fragment: neon_ui_schema::UiFragmentRevision {
+                    id: fragment.fragment_id.clone(),
+                    revision: fragment.revision,
                 },
-            ) {
-                Ok(program) => program,
-                Err(_) => {
-                    return rejected(
-                        request,
-                        self.revision,
-                        "ui_host_invalid_program",
-                        "drag/drop demo program did not compile",
-                    );
-                }
-            };
-            return accepted(
-                request,
-                self.revision,
-                json!(UiHostAdapterConfig {
-                    program,
-                    input_schema: document.input_schema,
+                intent: neon_ui_schema::UiIntent::Invoke {
+                    action: event.intent,
+                    params: json!({}),
+                },
+                pointer: Some(neon_ui_schema::UiPointerMetadata {
+                    id: 0,
+                    sequence: event.interaction.sequence,
                 }),
-            );
+                focus: None,
+                data_grid_cell: None,
+                text: None,
+                control_value: None,
+                drag_drop: Some(event.payload),
+            };
+            request.method = "ui.drag_drop.apply".into();
+            request.expected_revision = Some(fragment.revision);
+            request.params = json!({"event": semantic_event, "fragment": fragment});
+            let mut response = self.handle(request);
+            if response.status != RpcStatus::Accepted {
+                return response;
+            }
+            let Some(replacement_fragment) = response
+                .result
+                .as_ref()
+                .and_then(|value| value.get("fragment"))
+                .cloned()
+                .and_then(|value| serde_json::from_value::<UiFragment>(value).ok())
+            else {
+                response.status = RpcStatus::Rejected;
+                response.result = None;
+                response.error = Some(RpcError {
+                    code: "ui_host_invalid_fragment".into(),
+                    message: "accepted drag/drop did not produce a valid fragment".into(),
+                    current_revision: self.revision,
+                    object_id: None,
+                });
+                return response;
+            };
+            let config = drag_drop_adapter_config().expect("validated demo adapter config");
+            response.result = Some(json!(UiHostPublication {
+                scalar_frame: UiInputFrame {
+                    program_revision: config.program.revision.clone(),
+                    expected_input_revision: Revision(0),
+                    request_id: publication_request_id,
+                    idempotency_key: publication_idempotency_key,
+                    changes: Vec::new(),
+                },
+                grid_inputs: Vec::new(),
+                presentation_update: Some(UiHostPresentationUpdate {
+                    expected_fragment_revision: active_revision,
+                    replacement_fragment,
+                    replacement_program: config.program,
+                    replacement_input_schema: config.input_schema,
+                }),
+            }));
+            return response;
         }
         if request.method == "ui.data_grid.window.request" {
             return self.handle_data_grid_window_request(request);
@@ -1416,6 +1490,37 @@ mod tests {
             Some("Card 01 / Terraform cliff")
         );
         updated.validate().unwrap();
+
+        let mut duplicate = request(
+            fragment(),
+            "progress-drop",
+            "backlog-card-01",
+            "in-progress-panel",
+            UiDropPlacement::Into,
+            "progress-template",
+        );
+        let mut duplicate_event: UiSemanticEvent =
+            serde_json::from_value(duplicate.params["event"].clone()).unwrap();
+        duplicate_event.composition_revision = updated.revision;
+        duplicate_event.fragment.revision = updated.revision;
+        duplicate.params = json!({"event": duplicate_event, "fragment": updated.clone()});
+        duplicate.expected_revision = Some(updated.revision);
+        let duplicate = domain.handle(duplicate);
+        assert_eq!(duplicate.status, RpcStatus::Rejected);
+        assert_eq!(
+            duplicate.error.unwrap().code,
+            "drag_drop_not_declared",
+            "the consumed drag binding must prevent a second materialization"
+        );
+        assert_eq!(
+            find_node(&updated.root, "in-progress-panel")
+                .unwrap()
+                .children
+                .iter()
+                .filter(|child| child.visible && child.node_id == representation.node_id)
+                .count(),
+            1
+        );
     }
 
     #[test]
