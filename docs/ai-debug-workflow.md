@@ -24,6 +24,17 @@ Snapshots contain revisioned state and service diagnostics. They do not expose
 render IDs, coordinates, GPU handles, or internal pointer state as business
 identity.
 
+## Dev Lab Camera
+
+`neon-dev case component-gallery` explicitly enables the dev-only World UI Lab
+camera. `neon-dev` only starts a passive loopback UDP observer and registers it
+through `wgpu.world_ui.lab.camera.register`; it never reads keyboard input.
+Only `neon-wgpu-runtime`'s winit `WindowEvent::KeyboardInput` loop emits WASD
+camera samples, after both the OS window and stable
+`render.world-ui-lab.preview` surface are focused. NUI Flow declares no camera
+shortcut binding. Query `wgpu.world_ui.lab.camera.snapshot` for focus and UDP
+availability.
+
 ## Trace An Interaction
 
 Real OS interactions receive a stable `interaction_id`. WGPU records the

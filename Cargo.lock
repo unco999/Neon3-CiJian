@@ -976,6 +976,7 @@ dependencies = [
  "neon-observability",
  "neon-protocol",
  "neon-ui-schema",
+ "neon-world-bridge",
  "serde",
  "serde_json",
 ]
@@ -985,6 +986,7 @@ name = "neon-ui-schema"
 version = "0.1.0"
 dependencies = [
  "neon-protocol",
+ "neon-world-bridge",
  "serde",
  "serde_json",
 ]
@@ -1013,11 +1015,21 @@ dependencies = [
  "neon-ui-runtime",
  "neon-ui-schema",
  "neon-wgpu-ai",
+ "neon-world-bridge",
  "png",
  "pollster",
+ "serde",
  "serde_json",
  "wgpu",
  "winit",
+]
+
+[[package]]
+name = "neon-world-bridge"
+version = "0.1.0"
+dependencies = [
+ "neon-protocol",
+ "serde",
 ]
 
 [[package]]

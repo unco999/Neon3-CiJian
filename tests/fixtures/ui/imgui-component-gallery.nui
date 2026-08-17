@@ -2,7 +2,7 @@
 # and a semantic intent; no renderer identity or domain-specific rule is present.
 version 1
 surface surface.component-gallery revision 1
-budget nodes=196 bindings=132 instances=140 text=196 glyphs=16384 events=76 clips=84
+budget nodes=200 bindings=132 instances=144 text=200 glyphs=16384 events=76 clips=84
 input controls_enabled bool default true
 input feature_enabled bool default true
 input radio_selected bool default false
@@ -19,6 +19,7 @@ input gallery_text text default text:empty
 input progress_value f32:0..1 default 0.68
 input asset_window grid default grid:empty
 resource gallery-image image
+resource world-ui-lab.preview render_surface
 drag compass-drag source backpack-compass axis both snap 0 threshold 3 within surface
 drag potion-drag source backpack-potion axis both snap 0 threshold 3 within surface
 drag gem-drag source backpack-gem axis both snap 0 threshold 3 within surface
@@ -67,6 +68,10 @@ surface component-gallery overlay minw 2048 h 1080 align stretch clip scroll fil
       panel pack-header row h 42 pad 8 gap 8 align center fill #293943
         text pack-title value "Field Pack / 18.4 kg"
         text pack-budget value "Capacity 12 / 16"
+      panel world-ui-lab-preview column h 238 shrink 0 pad 8 gap 6 align stretch fill #172531 line #4EA6BE
+        text world-ui-lab-preview-title h 20 value "World UI Lab Preview"
+        text world-ui-lab-preview-description h 18 value "Normal UI surface sampled by the world-space panel pass."
+        render world-ui-lab.preview h 180
       panel backpack-items column w 636 h 196 shrink 0 pad 8 gap 8 clip none fill #18252D line #38616E
         text backpack-heading h 22 value "Backpack items"
         panel backpack-compass row w 620 h 42 shrink 0 pad 8 gap 8 align center fill #315360 line #76B7BE

@@ -31,6 +31,15 @@ pub enum DebugCommand {
         endpoint: SocketAddr,
         query: Value,
     },
+    RenderCapture {
+        endpoint: SocketAddr,
+        path: String,
+    },
+    WorldUiCapture {
+        endpoint: SocketAddr,
+        path: String,
+        size: [u32; 2],
+    },
 }
 
 impl DebugCommand {
@@ -70,6 +79,31 @@ impl DebugCommand {
                     query,
                 })
             }
+            [debug, render, capture, endpoint, path]
+                if debug == "debug" && render == "render" && capture == "capture" =>
+            {
+                if !path.ends_with(".png") {
+                    return Err("capture path must end with .png".into());
+                }
+                Ok(Self::RenderCapture {
+                    endpoint: parse_endpoint(endpoint)?,
+                    path: path.clone(),
+                })
+            }
+            [debug, world, capture, endpoint, path]
+                if debug == "debug" && world == "world-ui" && capture == "capture" =>
+            {
+                parse_world_ui_capture(endpoint, path, None)
+            }
+            [debug, world, capture, endpoint, path, width, height]
+                if debug == "debug" && world == "world-ui" && capture == "capture" =>
+            {
+                let size = [
+                    parse_capture_dimension(width)?,
+                    parse_capture_dimension(height)?,
+                ];
+                parse_world_ui_capture(endpoint, path, Some(size))
+            }
             _ => Err(debug_usage().into()),
         }
     }
@@ -78,7 +112,9 @@ impl DebugCommand {
         match self {
             Self::Snapshot { endpoint }
             | Self::InteractionGet { endpoint, .. }
-            | Self::InteractionQuery { endpoint, .. } => *endpoint,
+            | Self::InteractionQuery { endpoint, .. }
+            | Self::RenderCapture { endpoint, .. }
+            | Self::WorldUiCapture { endpoint, .. } => *endpoint,
         }
     }
 
@@ -90,12 +126,41 @@ impl DebugCommand {
                 json!({"interaction_id": interaction_id}),
             ),
             Self::InteractionQuery { query, .. } => ("debug.interaction.query", query.clone()),
+            Self::RenderCapture { path, .. } => (
+                "wgpu.render.target.capture",
+                json!({"target": "ui.color.v1", "path": path, "redraw": true}),
+            ),
+            Self::WorldUiCapture { path, size, .. } => (
+                "wgpu.world_ui.lab.capture",
+                json!({"path": path, "width": size[0], "height": size[1]}),
+            ),
         }
     }
 }
 
 pub fn debug_usage() -> &'static str {
-    "neon-cli debug snapshot <endpoint>\nneon-cli debug interaction get <endpoint> <interaction-id>\nneon-cli debug interaction query <endpoint> [<query-json>]"
+    "neon-cli debug snapshot <endpoint>\nneon-cli debug interaction get <endpoint> <interaction-id>\nneon-cli debug interaction query <endpoint> [<query-json>]\nneon-cli debug render capture <endpoint> <output.png>\nneon-cli debug world-ui capture <endpoint> <output.png> [width height]"
+}
+
+fn parse_world_ui_capture(
+    endpoint: &str,
+    path: &str,
+    size: Option<[u32; 2]>,
+) -> Result<DebugCommand, String> {
+    if !path.ends_with(".png") {
+        return Err("capture path must end with .png".into());
+    }
+    Ok(DebugCommand::WorldUiCapture {
+        endpoint: parse_endpoint(endpoint)?,
+        path: path.into(),
+        size: size.unwrap_or([1920, 1080]),
+    })
+}
+
+fn parse_capture_dimension(value: &str) -> Result<u32, String> {
+    value
+        .parse()
+        .map_err(|_| format!("capture dimension must be an integer: {value}"))
 }
 
 pub fn execute_debug(command: DebugCommand) -> Result<Value, TransportError> {
@@ -714,6 +779,40 @@ mod tests {
                 "127.0.0.1:4010".into(),
             ])
             .is_err()
+        );
+    }
+
+    #[test]
+    fn debug_world_ui_capture_parses_defaults_and_dimensions() {
+        assert_eq!(
+            DebugCommand::parse(&[
+                "debug".into(),
+                "world-ui".into(),
+                "capture".into(),
+                "127.0.0.1:4010".into(),
+                "world-ui.png".into(),
+            ]),
+            Ok(DebugCommand::WorldUiCapture {
+                endpoint: "127.0.0.1:4010".parse().unwrap(),
+                path: "world-ui.png".into(),
+                size: [1920, 1080],
+            })
+        );
+        assert_eq!(
+            DebugCommand::parse(&[
+                "debug".into(),
+                "world-ui".into(),
+                "capture".into(),
+                "127.0.0.1:4010".into(),
+                "world-ui.png".into(),
+                "800".into(),
+                "600".into(),
+            ]),
+            Ok(DebugCommand::WorldUiCapture {
+                endpoint: "127.0.0.1:4010".parse().unwrap(),
+                path: "world-ui.png".into(),
+                size: [800, 600],
+            })
         );
     }
 

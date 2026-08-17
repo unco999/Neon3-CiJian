@@ -9,11 +9,13 @@ neon-wgpu-ai = { path = "../neon-wgpu-ai" }
 neon-protocol = { path = "../neon-protocol" }
 neon-observability = { path = "../neon-observability" }
 neon-ui-schema = { path = "../neon-ui-schema" }
+neon-world-bridge = { path = "../neon-world-bridge" }
 neon-ipc = { path = "../neon-ipc" }
 bytemuck.workspace = true
 pollster.workspace = true
 png = "0.18"
 serde_json.workspace = true
+serde.workspace = true
 wgpu.workspace = true
 winit.workspace = true
 fontdue.workspace = true

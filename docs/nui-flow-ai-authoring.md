@@ -213,3 +213,21 @@ or WGPU resources in an AI/Flow client.
 Never add these to Flow: arbitrary JavaScript/Rust/Lua, callbacks, URLs, file
 paths, GPU handles, pointer coordinates, element IDs, dynamic topology, raw
 text payloads, domain mutation, filtering, sorting, or permission logic.
+
+## Camera-Gated World Panels
+
+`world panel` is a normal `panel` subtree with one additional renderer gate. It
+uses the same layout, text, styles, and semantic events as a screen panel, but
+is not rendered until its declared camera has supplied a valid frame through
+the world information bridge:
+
+```text
+surface editor column
+  world panel mission-marker camera 3d:editor-camera w 240 h 48
+    text mission-title value "Mission"
+```
+
+The only accepted camera forms are `2d:<stable-camera-id>` and
+`3d:<stable-camera-id>`. A camera at the coordinate origin is valid; missing
+means no valid frame has been accepted for that ID and kind. Flow cannot define
+camera matrices, world coordinates, shader parameters, or transport details.

@@ -1,11 +1,9 @@
 [package]
-name = "neon-ui-schema"
+name = "neon-world-bridge"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
 neon-protocol = { path = "../neon-protocol" }
-neon-world-bridge = { path = "../neon-world-bridge" }
 serde.workspace = true
-serde_json.workspace = true

@@ -48,6 +48,15 @@ Direct bindings use `$input_key` only. `value $name`, `enabled $can_commit`, and
 
 `event <dotted.intent>` declares a typed semantic intent. V1 event declarations contain no handlers and no computed payload expressions. Payload fields must be declared through the canonical event schema; Flow cannot inject pointer positions, render hit IDs, GPU handles or domain mutations.
 
+### Camera-Gated World Panels
+
+`world panel <key> camera <2d:id|3d:id>` lowers to the same `Panel` node kind
+as `panel`, plus a renderer-neutral camera visibility effect. Its descendants
+remain a normal fixed NUI subtree. WGPU excludes the full subtree from layout,
+hit testing, and drawing until the named camera has a valid frame in the active
+world information bridge session. Camera coordinates, matrices, transport, and
+GPU resources are not Flow features.
+
 The program event boundary distinguishes activation, value preview, value commit, selection change, text commit, and cancellation. The renderer may retain hover, pointer capture, and focus locally for enabled interactive controls, but it emits only the declared semantic intent. `progress_bar` is display-only in the renderer; a preview event, when declared, remains a typed program event rather than a pointer-derived domain mutation.
 
 ## Local Statecharts

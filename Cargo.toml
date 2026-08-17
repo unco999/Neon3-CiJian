@@ -3,6 +3,7 @@ members = [
     "crates/neon-protocol",
     "crates/neon-ipc",
     "crates/neon-observability",
+    "crates/neon-world-bridge",
     "crates/neon-projectd",
     "crates/neon-ui-schema",
     "crates/neon-wgpu-runtime",

@@ -5,7 +5,7 @@
 use std::fs::{self, OpenOptions};
 use std::io::BufReader;
 use std::io::{self, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -213,6 +213,9 @@ fn run_case_session(
     if let Some(endpoint) = projectd_endpoint_text.as_deref() {
         wgpu_args.push(endpoint);
     }
+    if case == "component-gallery" {
+        wgpu_args.push("--enable-world-ui-lab-camera");
+    }
     let wgpu = spawn_service(
         executable(workspace, "neon-wgpu-runtime"),
         &wgpu_args,
@@ -228,6 +231,10 @@ fn run_case_session(
         ManifestService::Wgpu,
         query_process_epoch(wgpu_endpoint, "wgpu-runtime"),
     )?;
+    if case == "component-gallery" {
+        let provider_endpoint = start_world_ui_lab_camera_observer()?;
+        register_world_ui_lab_camera(wgpu_endpoint, provider_endpoint)?;
+    }
 
     let host_endpoint_text = host_endpoint.to_string();
     let domain_args = if case == "component-gallery" {
@@ -305,6 +312,53 @@ fn run_case_session(
     println!("{}", manifest.value());
     wait_for_session_end(children);
     Ok(())
+}
+
+fn start_world_ui_lab_camera_observer() -> io::Result<SocketAddr> {
+    let socket = UdpSocket::bind("127.0.0.1:0")?;
+    let endpoint = socket.local_addr()?;
+    std::thread::spawn(move || {
+        let mut buffer = [0_u8; 2048];
+        // This dev-only provider observes datagrams only. It has no window/input access.
+        while socket.recv_from(&mut buffer).is_ok() {}
+    });
+    Ok(endpoint)
+}
+
+fn register_world_ui_lab_camera(
+    wgpu_endpoint: SocketAddr,
+    udp_endpoint: SocketAddr,
+) -> io::Result<()> {
+    let request = RpcRequest {
+        protocol: "neon3.rpc".into(),
+        version: ProtocolVersion { major: 1, minor: 0 },
+        request_id: RequestId("component-gallery-world-ui-lab-camera-register".into()),
+        client: ClientIdentity {
+            kind: ClientKind::Cli,
+            instance_id: "neon-dev-component-gallery".into(),
+            pid: std::process::id(),
+            origin: "neon-dev".into(),
+        },
+        target: ServiceName("wgpu-runtime".into()),
+        method: "wgpu.world_ui.lab.camera.register".into(),
+        params: json!({"udp_endpoint": udp_endpoint, "session_id": "component-gallery-world-ui-lab", "provider_epoch": 1, "camera_id": "world-ui-lab"}),
+        expected_revision: Some(Revision(0)),
+        idempotency_key: Some("component-gallery-world-ui-lab-camera-register-v1".into()),
+    };
+    let response = RpcClient::connect(wgpu_endpoint)
+        .and_then(|mut client| client.call(&request))
+        .map_err(|error| {
+            io::Error::other(format!(
+                "world UI lab camera registration transport failed: {error}"
+            ))
+        })?;
+    if response.status == RpcStatus::Accepted {
+        Ok(())
+    } else {
+        Err(io::Error::other(
+            "world UI lab camera registration was rejected",
+        ))
+    }
 }
 
 fn run_component_gallery_scenario() -> io::Result<()> {

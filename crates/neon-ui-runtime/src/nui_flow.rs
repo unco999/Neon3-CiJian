@@ -9,16 +9,17 @@ use neon_protocol::{AssetRef, Revision};
 use neon_ui_schema::{
     NuiFlowDocument, NuiFlowDragAxis, NuiFlowDragDeclaration, NuiFlowDropDeclaration,
     NuiFlowParseDiagnostic, NuiFlowStateMachine, NuiFlowStateTransition, NuiFlowStateTrigger,
-    NuiSourceSpan, RenderSurfaceRef, TextRef, UiAlignItems, UiBoundProperty, UiBounds,
-    UiBranchDeclaration, UiBranchLayoutParticipation, UiBranchPredicate, UiClipPolicy,
-    UiDataGridColumn, UiDataGridDeclaration, UiDataGridPresentation, UiDiagnosticSeverity,
-    UiDragAxis, UiDragBinding, UiDragBoundary, UiDropBinding, UiDropPlacement, UiEffect,
-    UiGridInputSlot, UiInputKind, UiInputPacking, UiInputSchema, UiInputSlot, UiInputUpdateClass,
-    UiInputValue, UiIntent, UiIrBinding, UiIrDocument, UiIrPatch, UiIrPatchOperation,
-    UiIrPatchOperationKind, UiJustifyContent, UiLayout, UiLayoutMode, UiNode, UiNodeId, UiNodeKind,
-    UiProgram, UiProgramEventDeclaration, UiProgramRevision, UiResourceBudget, UiSourceSpan,
-    UiStyle, UiSurfaceId, UiTemplateDeclaration,
+    NuiFlowWorldPanelDeclaration, NuiSourceSpan, RenderSurfaceRef, TextRef, UiAlignItems,
+    UiBoundProperty, UiBounds, UiBranchDeclaration, UiBranchLayoutParticipation, UiBranchPredicate,
+    UiCameraVisibilityBinding, UiClipPolicy, UiDataGridColumn, UiDataGridDeclaration,
+    UiDataGridPresentation, UiDiagnosticSeverity, UiDragAxis, UiDragBinding, UiDragBoundary,
+    UiDropBinding, UiDropPlacement, UiEffect, UiGridInputSlot, UiInputKind, UiInputPacking,
+    UiInputSchema, UiInputSlot, UiInputUpdateClass, UiInputValue, UiIntent, UiIrBinding,
+    UiIrDocument, UiIrPatch, UiIrPatchOperation, UiIrPatchOperationKind, UiJustifyContent,
+    UiLayout, UiLayoutMode, UiNode, UiNodeId, UiNodeKind, UiProgram, UiProgramEventDeclaration,
+    UiProgramRevision, UiResourceBudget, UiSourceSpan, UiStyle, UiSurfaceId, UiTemplateDeclaration,
 };
+use neon_world_bridge::{CameraId, CameraKind};
 use serde_json::json;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -44,6 +45,7 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
     let mut state_machines = Vec::new();
     let mut drags = Vec::new();
     let mut drops = Vec::new();
+    let mut world_panels = Vec::new();
     let mut resources = Vec::new();
     let mut image_resources = BTreeMap::new();
 
@@ -266,6 +268,13 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
             data_grids.push(UiDataGridDeclaration {
                 node_key: node.node.node_id.0.clone(),
                 ..grid.clone()
+            });
+        }
+        if let Some(world_panel) = &node.world_panel {
+            world_panels.push(NuiFlowWorldPanelDeclaration {
+                node_key: node.node.node_id.0.clone(),
+                camera_id: world_panel.camera_id.clone(),
+                camera_kind: world_panel.camera_kind,
             });
         }
         stack.push((indent, node));
@@ -496,6 +505,7 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
         state_machines,
         drags,
         drops,
+        world_panels,
     })
 }
 
@@ -606,6 +616,18 @@ pub fn lower_nui_flow_effects(document: &NuiFlowDocument) -> Vec<UiEffect> {
             },
         },
     }));
+    effects.extend(
+        document
+            .world_panels
+            .iter()
+            .map(|panel| UiEffect::CameraVisibility {
+                binding: UiCameraVisibilityBinding {
+                    node_id: UiNodeId(panel.node_key.clone()),
+                    camera_id: panel.camera_id.clone(),
+                    camera_kind: panel.camera_kind,
+                },
+            }),
+    );
     effects
 }
 
@@ -931,6 +953,7 @@ struct NodeBuild {
     template: Option<(u32, BTreeMap<String, UiInputKind>, String, bool)>,
     data_grid: Option<UiDataGridDeclaration>,
     image_resource: Option<String>,
+    world_panel: Option<NuiFlowWorldPanelDeclaration>,
 }
 
 fn parse_resource_declaration(
@@ -1499,15 +1522,19 @@ fn parse_input(text: &str, line: u32) -> FlowResult<Option<ParsedInput>> {
 fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
     let values = tokenize(text, line)?;
     let parts = values.iter().map(String::as_str).collect::<Vec<_>>();
-    if parts.len() < 2 {
+    let is_world_panel = parts.first() == Some(&"world");
+    let component_index = usize::from(is_world_panel);
+    let key_index = component_index + 1;
+    if parts.len() <= key_index {
         return Err(error(
             "nui_flow_invalid_node",
-            "node syntax is: <component> <stable-key> [tokens]",
+            "node syntax is: [world] <component> <stable-key> [tokens]",
             line,
             1,
         ));
     }
-    let kind = match parts[0] {
+    let component = parts[component_index];
+    let kind = match component {
         "surface" | "panel" | "scroll" | "overlay" | "branch" | "repeat" | "template" => {
             UiNodeKind::Panel
         }
@@ -1540,7 +1567,15 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
             ));
         }
     };
-    if !valid_key(parts[1]) {
+    if is_world_panel && component != "panel" {
+        return Err(error(
+            "nui_flow_invalid_world_panel",
+            "world may only prefix panel",
+            line,
+            1,
+        ));
+    }
+    if !valid_key(parts[key_index]) {
         return Err(error(
             "nui_flow_invalid_key",
             "node keys use letters, digits, '.', '_' and '-'",
@@ -1551,7 +1586,7 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
     let is_render_surface = kind == UiNodeKind::RenderSurface;
     let is_image = kind == UiNodeKind::Image;
     let mut node = UiNode {
-        node_id: UiNodeId(parts[1].into()),
+        node_id: UiNodeId(parts[key_index].into()),
         kind,
         bounds: UiBounds {
             x: 0.0,
@@ -1580,7 +1615,7 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
             target_id: format!("render.{}", node.node_id.0),
         });
     }
-    if parts[0] == "scroll" {
+    if component == "scroll" {
         node.layout.as_mut().expect("Flow nodes have layout").clip = UiClipPolicy::Scroll;
     }
     let mut bindings = Vec::new();
@@ -1593,8 +1628,9 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
     let mut data_grid_columns = None;
     let mut data_grid_source = None;
     let mut image_resource = None;
+    let mut world_camera = None;
     let mut used = HashSet::new();
-    let mut index = 2;
+    let mut index = key_index + 1;
     while index < parts.len() {
         let token = parts[index];
         if !used.insert(token) && !matches!(token, "row" | "column" | "overlay") {
@@ -1624,7 +1660,39 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
                 index += 1;
                 parse_attribute(&mut node, &mut bindings, &mut intents, token, value, line)?;
             }
-            "when" if parts[0] == "branch" => {
+            "camera" if is_world_panel => {
+                let value = *parts.get(index + 1).ok_or_else(|| {
+                    error(
+                        "nui_flow_missing_value",
+                        "camera requires 2d:<id> or 3d:<id>",
+                        line,
+                        1,
+                    )
+                })?;
+                index += 1;
+                let (kind, id) = if let Some(id) = value.strip_prefix("2d:") {
+                    (CameraKind::TwoDimensional, id)
+                } else if let Some(id) = value.strip_prefix("3d:") {
+                    (CameraKind::ThreeDimensional, id)
+                } else {
+                    return Err(error(
+                        "nui_flow_invalid_world_camera",
+                        "camera uses 2d:<id> or 3d:<id>",
+                        line,
+                        1,
+                    ));
+                };
+                if !valid_key(id) {
+                    return Err(error(
+                        "nui_flow_invalid_world_camera",
+                        "world camera ID is invalid",
+                        line,
+                        1,
+                    ));
+                }
+                world_camera = Some((CameraId(id.into()), kind));
+            }
+            "when" if component == "branch" => {
                 let value = *parts.get(index + 1).ok_or_else(|| {
                     error(
                         "nui_flow_missing_value",
@@ -1636,7 +1704,7 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
                 index += 1;
                 branch_predicate = Some(parse_branch_predicate(value, line)?);
             }
-            "in" if parts[0] == "branch" => {
+            "in" if component == "branch" => {
                 let value = *parts.get(index + 1).ok_or_else(|| {
                     error(
                         "nui_flow_missing_value",
@@ -1648,7 +1716,7 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
                 index += 1;
                 branch_predicate = Some(parse_machine_state_predicate(value, line)?);
             }
-            "capacity" if matches!(parts[0], "repeat" | "template") => {
+            "capacity" if matches!(component, "repeat" | "template") => {
                 let value = *parts.get(index + 1).ok_or_else(|| {
                     error(
                         "nui_flow_missing_value",
@@ -1674,7 +1742,7 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
                     false,
                 ));
             }
-            "capacity" if parts[0] == "data_grid" => {
+            "capacity" if component == "data_grid" => {
                 let value = *parts.get(index + 1).ok_or_else(|| {
                     error(
                         "nui_flow_missing_value",
@@ -1703,7 +1771,7 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
                 }
                 data_grid_capacity = Some(capacity);
             }
-            "row_height" if parts[0] == "data_grid" => {
+            "row_height" if component == "data_grid" => {
                 let value = *parts.get(index + 1).ok_or_else(|| {
                     error(
                         "nui_flow_missing_value",
@@ -1732,7 +1800,7 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
                 }
                 data_grid_row_height = Some(height);
             }
-            "overscan" if parts[0] == "data_grid" => {
+            "overscan" if component == "data_grid" => {
                 let value = *parts.get(index + 1).ok_or_else(|| {
                     error(
                         "nui_flow_missing_value",
@@ -1753,7 +1821,7 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
                     })?,
                 );
             }
-            "columns" if parts[0] == "data_grid" => {
+            "columns" if component == "data_grid" => {
                 let value = *parts.get(index + 1).ok_or_else(|| {
                     error(
                         "nui_flow_missing_value",
@@ -1765,7 +1833,7 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
                 index += 1;
                 data_grid_columns = Some(parse_data_grid_columns(&quoted(value, line)?, line)?);
             }
-            "source" if parts[0] == "data_grid" => {
+            "source" if component == "data_grid" => {
                 let value = *parts.get(index + 1).ok_or_else(|| {
                     error(
                         "nui_flow_missing_value",
@@ -1793,7 +1861,7 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
                 }
                 data_grid_source = Some(key.into());
             }
-            "resource" if parts[0] == "image" => {
+            "resource" if component == "image" => {
                 let value = *parts.get(index + 1).ok_or_else(|| {
                     error(
                         "nui_flow_invalid_resource",
@@ -1813,7 +1881,7 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
                 image_resource = Some(value.into());
                 index += 1;
             }
-            "key" if matches!(parts[0], "repeat" | "template") => {
+            "key" if matches!(component, "repeat" | "template") => {
                 let value = *parts.get(index + 1).ok_or_else(|| {
                     error(
                         "nui_flow_missing_value",
@@ -1834,7 +1902,7 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
                 current.1.insert(value.into(), UiInputKind::U32);
                 current.2 = value.into();
             }
-            "overflow_summary" if matches!(parts[0], "repeat" | "template") => {
+            "overflow_summary" if matches!(component, "repeat" | "template") => {
                 let current = template.get_or_insert((
                     1,
                     BTreeMap::from([("row_key".into(), UiInputKind::U32)]),
@@ -1854,7 +1922,7 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
         }
         index += 1;
     }
-    if parts[0] == "branch" && branch_predicate.is_none() {
+    if component == "branch" && branch_predicate.is_none() {
         return Err(error(
             "ui_program_invalid_branch_template",
             "branch requires `when` or `in machine.state`",
@@ -1862,7 +1930,7 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
             1,
         ));
     }
-    if matches!(parts[0], "repeat" | "template") {
+    if matches!(component, "repeat" | "template") {
         let Some(spec) = &template else {
             return Err(error(
                 "ui_program_invalid_branch_template",
@@ -1880,7 +1948,7 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
             ));
         }
     }
-    let data_grid = if parts[0] == "data_grid" {
+    let data_grid = if component == "data_grid" {
         let capacity = data_grid_capacity.ok_or_else(|| {
             error(
                 "nui_flow_invalid_data_grid",
@@ -1923,6 +1991,23 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
     } else {
         None
     };
+    let world_panel = if is_world_panel {
+        let (camera_id, camera_kind) = world_camera.ok_or_else(|| {
+            error(
+                "nui_flow_missing_world_camera",
+                "world panel requires camera 2d:<id> or 3d:<id>",
+                line,
+                1,
+            )
+        })?;
+        Some(NuiFlowWorldPanelDeclaration {
+            node_key: node.node_id.0.clone(),
+            camera_id,
+            camera_kind,
+        })
+    } else {
+        None
+    };
     Ok(NodeBuild {
         node,
         bindings,
@@ -1931,6 +2016,7 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
         template,
         data_grid,
         image_resource,
+        world_panel,
     })
 }
 
@@ -3061,6 +3147,33 @@ panel workspace row gap 8
         assert_eq!(document.source_map["water"].column, 5);
         assert_eq!(document.ir.bindings.len(), 2);
         assert_eq!(document.input_schema.slots[1].packing.offset, 8);
+    }
+
+    #[test]
+    fn world_panel_is_a_panel_with_camera_visibility_effect() {
+        let document = parse_nui_flow(
+            "input title text default text:empty\nsurface root\n  world panel marker camera 3d:editor-camera w 240 h 48\n    text label value $title\n",
+        )
+        .unwrap();
+        assert_eq!(document.world_panels.len(), 1);
+        assert_eq!(document.world_panels[0].node_key, "marker");
+        assert_eq!(document.world_panels[0].camera_id.0, "editor-camera");
+        assert!(matches!(
+            lower_nui_flow_effects(&document).last(),
+            Some(UiEffect::CameraVisibility { binding }) if binding.node_id.0 == "marker"
+        ));
+        assert_eq!(document.ir.root.children[0].kind, UiNodeKind::Panel);
+    }
+
+    #[test]
+    fn world_panel_requires_a_typed_camera() {
+        let error = parse_nui_flow("surface root\n  world panel marker w 20 h 20\n").unwrap_err();
+        assert!(
+            error
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "nui_flow_missing_world_camera")
+        );
     }
 
     #[test]

@@ -73,6 +73,24 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32, input: VsIn) -> VsOut {
 @fragment
 fn fs_main(input: VsOut) -> @location(0) vec4<f32> {
     if (outside_clip(input.pixel, input.clip, input.params.w)) { discard; }
+    if (input.params.y < 0.0) {
+        let cut = min(-input.params.y, input.size.x * 0.25);
+        let point = input.local * input.size;
+        let left = cut * (1.0 - input.local.y);
+        let right = input.size.x - cut * input.local.y;
+        let edge_distance = min(
+            min(point.x - left, right - point.x),
+            min(point.y, input.size.y - point.y)
+        );
+        let shape_alpha = smoothstep(-1.0, 1.0, edge_distance);
+        let border_alpha = 1.0 - smoothstep(
+            input.params.x - 1.0,
+            input.params.x + 1.0,
+            edge_distance
+        );
+        let color = mix(input.fill, input.border, border_alpha);
+        return vec4<f32>(srgb_to_linear(color.rgb), color.a * input.params.z * shape_alpha);
+    }
     let radius = min(input.params.y, min(input.size.x, input.size.y) * 0.5);
     let point = input.local * input.size - input.size * 0.5;
     let extent = max(input.size * 0.5 - vec2<f32>(radius), vec2<f32>(0.0));
@@ -96,8 +114,14 @@ struct VsOut { @builtin(position) position: vec4<f32>, @location(0) local: vec2<
  output.position = vec4<f32>(pixel.x / view.viewport.x * 2.0 - 1.0, 1.0 - pixel.y / view.viewport.y * 2.0, 0.0, 1.0); output.local = local; output.size = input.rect.zw; output.params = input.params; output.hit_id = input.hit_id; output.clip = input.clip; output.pixel = pixel; return output;
 }
 @fragment fn fs_main(input: VsOut) -> @location(0) u32 {
-  if (outside_clip(input.pixel, input.clip, input.params.w)) { discard; }
- let radius = min(input.params.y, min(input.size.x,input.size.y)*0.5); let point = input.local*input.size-input.size*0.5; let extent=max(input.size*0.5-vec2<f32>(radius),vec2<f32>(0.0)); let corner_distance=length(max(abs(point)-extent,vec2<f32>(0.0)))-radius;
+   if (outside_clip(input.pixel, input.clip, input.params.w)) { discard; }
+  if (input.params.y < 0.0) {
+   let cut=min(-input.params.y,input.size.x*0.25); let point=input.local*input.size;
+   let left=cut*(1.0-input.local.y); let right=input.size.x-cut*input.local.y;
+   let edge_distance=min(min(point.x-left,right-point.x),min(point.y,input.size.y-point.y));
+   if (edge_distance < 0.0 || input.params.z <= 0.0) { discard; } return input.hit_id;
+  }
+  let radius = min(input.params.y, min(input.size.x,input.size.y)*0.5); let point = input.local*input.size-input.size*0.5; let extent=max(input.size*0.5-vec2<f32>(radius),vec2<f32>(0.0)); let corner_distance=length(max(abs(point)-extent,vec2<f32>(0.0)))-radius;
  if (corner_distance > 0.0 || input.params.z <= 0.0) { discard; } return input.hit_id;
 }
 "#;
@@ -688,6 +712,7 @@ struct CachedDataGridTextDisplay {
 }
 
 pub struct UiWgpuRenderer {
+    color_format: wgpu::TextureFormat,
     pipeline: wgpu::RenderPipeline,
     view_buffer: wgpu::Buffer,
     view_bind_group: wgpu::BindGroup,
@@ -747,6 +772,7 @@ pub struct UiWgpuRenderer {
     data_grid_frames: HashMap<String, neon_ui_schema::UiDataGridFrame>,
     data_grid_scroll_holds: HashMap<String, DataGridScrollHold>,
     data_grid_text_display_cache: HashMap<DataGridCellIdentity, CachedDataGridTextDisplay>,
+    available_cameras: HashSet<(neon_world_bridge::CameraId, neon_world_bridge::CameraKind)>,
 }
 
 impl UiWgpuRenderer {
@@ -1088,6 +1114,7 @@ impl UiWgpuRenderer {
             cache: None,
         });
         Self {
+            color_format: format,
             pipeline,
             view_buffer,
             view_bind_group,
@@ -1146,6 +1173,7 @@ impl UiWgpuRenderer {
             data_grid_frames: HashMap::new(),
             data_grid_scroll_holds: HashMap::new(),
             data_grid_text_display_cache: HashMap::new(),
+            available_cameras: HashSet::new(),
         }
     }
 
@@ -1464,6 +1492,21 @@ impl UiWgpuRenderer {
                     .iter()
                     .find_map(|(hit_id, binding)| (binding.node_path == node.id).then_some(*hit_id))
             })
+    }
+
+    /// Renderer-local RenderSurface hit testing. The stable target is retained
+    /// for diagnostics; no node path or GPU hit ID crosses the process boundary.
+    pub(crate) fn render_surface_contains(&self, target_id: &str, pointer: [f32; 2]) -> bool {
+        self.plan.iter().enumerate().rev().any(|(index, _node)| {
+            let visual = self.visual_at(index);
+            visual.kind == UiNodeKind::RenderSurface
+                && visual
+                    .surface
+                    .as_ref()
+                    .is_some_and(|surface| surface.target_id == target_id)
+                && contains(visual.bounds, pointer)
+                && contains(visual.clip, pointer)
+        })
     }
 
     /// Debug-only semantic diagnostics for a prepared pointer sample. Renderer
@@ -2224,7 +2267,7 @@ impl UiWgpuRenderer {
         };
         let index = tab_segments(self.visual_at(index).bounds, options.len())
             .iter()
-            .position(|segment| contains(*segment, pointer))?;
+            .position(|segment| tag_contains(*segment, pointer))?;
         let value = options.get(index)?.clone();
         let binding = self
             .hit_bindings
@@ -3219,6 +3262,7 @@ impl UiWgpuRenderer {
             format: wgpu::TextureFormat::Rgba8Unorm,
             usage: wgpu::TextureUsages::STORAGE_BINDING
                 | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::RENDER_ATTACHMENT
                 | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
@@ -3253,6 +3297,37 @@ impl UiWgpuRenderer {
             },
         );
         view
+    }
+
+    /// Creates a renderer-private color target suitable for drawing an ordinary
+    /// UiNode subtree with this renderer's panel/text pipelines.
+    pub(crate) fn ensure_ui_render_surface(
+        &mut self,
+        device: &wgpu::Device,
+        target_id: &str,
+        size: [u32; 2],
+    ) -> wgpu::TextureView {
+        if let Some(surface) = self.resident_render_surfaces.get(target_id)
+            && surface.size == Some(size)
+        {
+            return surface._view.clone();
+        }
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("neon3-ui-color-render-surface"),
+            size: wgpu::Extent3d {
+                width: size[0],
+                height: size[1],
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: self.color_format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        self.register_render_surface(device, target_id, texture);
+        self.resident_render_surfaces[target_id]._view.clone()
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -3752,6 +3827,7 @@ impl UiWgpuRenderer {
             viewport_logical_size,
             self.resident_font.as_ref(),
             &self.data_grid_text_display_cache,
+            &self.available_cameras,
         );
         let live: HashSet<_> = nodes.iter().map(|(id, _, _, _)| id.clone()).collect();
         if viewport_changed {
@@ -4307,7 +4383,7 @@ impl UiWgpuRenderer {
                         UiControlPresentation::Choice { options, .. } => {
                             tab_segments(preview.bounds, options.len())
                                 .into_iter()
-                                .find(|segment| contains(*segment, pointer))
+                                .find(|segment| tag_contains(*segment, pointer))
                         }
                         _ => None,
                     })
@@ -4316,7 +4392,7 @@ impl UiWgpuRenderer {
                 rect: [segment.x, segment.y, segment.width, segment.height],
                 fill: [0.48, 0.76, 0.64, 0.13],
                 border: [0.62, 0.92, 0.78, 0.80],
-                params: [1.0, 3.0, preview.style.opacity, preview.clip_radius],
+                params: [1.0, -4.0, preview.style.opacity, preview.clip_radius],
                 clip: [
                     preview.clip.x,
                     preview.clip.y,
@@ -4611,15 +4687,29 @@ fn tab_segments(bounds: UiBounds, option_count: usize) -> Vec<UiBounds> {
         return Vec::new();
     }
     let inset = 2.0;
-    let width = (bounds.width - inset * 2.0).max(0.0) / option_count as f32;
+    let gap = 0.0;
+    let width = ((bounds.width - inset * 2.0 - gap * option_count.saturating_sub(1) as f32)
+        .max(0.0))
+        / option_count as f32;
     (0..option_count)
         .map(|index| UiBounds {
-            x: bounds.x + inset + index as f32 * width,
+            x: bounds.x + inset + index as f32 * (width + gap),
             y: bounds.y + inset,
             width,
             height: (bounds.height - inset * 2.0).max(0.0),
         })
         .collect()
+}
+
+fn tag_contains(bounds: UiBounds, point: [f32; 2]) -> bool {
+    if point[1] < bounds.y || point[1] > bounds.y + bounds.height || bounds.height <= 0.0 {
+        return false;
+    }
+    let cut = 4.0_f32.min(bounds.width * 0.25);
+    let local_y = (point[1] - bounds.y) / bounds.height;
+    let left = bounds.x + cut * (1.0 - local_y);
+    let right = bounds.x + bounds.width - cut * local_y;
+    point[0] >= left && point[0] <= right
 }
 
 fn drag_value_bounds(bounds: UiBounds) -> UiBounds {
@@ -4670,15 +4760,20 @@ fn default_component_style(kind: &UiNodeKind) -> UiStyle {
             corner_radius: 5.0,
             opacity: 1.0,
         },
-        UiNodeKind::Combo | UiNodeKind::Dropdown | UiNodeKind::Tabs | UiNodeKind::ListBox => {
-            UiStyle {
-                background_color: [0.11, 0.16, 0.15, 1.0],
-                border_color: [0.35, 0.56, 0.49, 0.88],
-                border_width: 1.0,
-                corner_radius: 5.0,
-                opacity: 1.0,
-            }
-        }
+        UiNodeKind::Tabs => UiStyle {
+            background_color: [0.0, 0.0, 0.0, 0.0],
+            border_color: [0.0, 0.0, 0.0, 0.0],
+            border_width: 0.0,
+            corner_radius: 0.0,
+            opacity: 1.0,
+        },
+        UiNodeKind::Combo | UiNodeKind::Dropdown | UiNodeKind::ListBox => UiStyle {
+            background_color: [0.11, 0.16, 0.15, 1.0],
+            border_color: [0.35, 0.56, 0.49, 0.88],
+            border_width: 1.0,
+            corner_radius: 5.0,
+            opacity: 1.0,
+        },
         UiNodeKind::ProgressBar => UiStyle {
             background_color: [0.08, 0.10, 0.10, 1.0],
             border_color: [0.32, 0.50, 0.43, 0.70],
@@ -4892,13 +4987,14 @@ fn component_chrome_instances(visual: &UiVisual) -> Vec<UiInstance> {
         },
         UiNodeKind::Tabs => match &visual.presentation {
             Some(UiControlPresentation::Choice { token, options, .. }) => {
-                tab_segments(bounds, options.len())
-                    .into_iter()
+                let segments = tab_segments(bounds, options.len());
+                let mut tags = segments
+                    .iter()
                     .zip(options)
                     .map(|(segment, option)| {
                         let active = option == token;
                         chrome(
-                            segment,
+                            *segment,
                             if !visual.enabled {
                                 [0.055, 0.075, 0.07, 0.72]
                             } else if active {
@@ -4913,10 +5009,25 @@ fn component_chrome_instances(visual: &UiVisual) -> Vec<UiInstance> {
                             } else {
                                 muted
                             },
-                            3.0,
+                            -4.0,
                         )
                     })
-                    .collect()
+                    .collect::<Vec<_>>();
+                tags.extend(segments.windows(2).map(|pair| {
+                    let boundary = pair[0].x + pair[0].width;
+                    chrome(
+                        UiBounds {
+                            x: boundary - 3.0,
+                            y: bounds.y + 7.0,
+                            width: 6.0,
+                            height: (bounds.height - 14.0).max(0.0),
+                        },
+                        [0.62, 0.94, 0.78, 0.9],
+                        [0.72, 1.0, 0.84, 1.0],
+                        -1.5,
+                    )
+                }));
+                tags
             }
             _ => Vec::new(),
         },
@@ -5521,6 +5632,7 @@ fn flatten_fragments(
         viewport_logical_size,
         font,
         &HashMap::new(),
+        &HashSet::new(),
     )
 }
 
@@ -5529,12 +5641,26 @@ fn flatten_fragments_with_data_grid_display_cache(
     viewport_logical_size: [f32; 2],
     font: Option<&ResidentFont>,
     data_grid_text_display_cache: &HashMap<DataGridCellIdentity, CachedDataGridTextDisplay>,
+    available_cameras: &HashSet<(neon_world_bridge::CameraId, neon_world_bridge::CameraKind)>,
 ) -> Vec<(String, Option<String>, UiVisual, Option<UiTransition>)> {
     let presentations = collect_control_presentations(fragments);
     let mut ordered = fragments.values().collect::<Vec<_>>();
     ordered.sort_by(|left, right| left.fragment_id.0.cmp(&right.fragment_id.0));
     let mut result = Vec::new();
     for fragment in ordered {
+        let hidden_world_nodes = fragment
+            .effects
+            .iter()
+            .filter_map(|effect| match effect {
+                neon_ui_schema::UiEffect::CameraVisibility { binding }
+                    if !available_cameras
+                        .contains(&(binding.camera_id.clone(), binding.camera_kind)) =>
+                {
+                    Some(binding.node_id.0.as_str())
+                }
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
         let mut root = fragment.root.clone();
         root.bounds = UiBounds {
             x: 0.0,
@@ -5553,6 +5679,7 @@ fn flatten_fragments_with_data_grid_display_cache(
             font,
             Some(viewport_logical_size),
             false,
+            &hidden_world_nodes,
         );
     }
     append_data_grid_frames(&mut result, fragments, data_grid_text_display_cache);
@@ -6157,6 +6284,7 @@ fn flatten_node(
     font: Option<&ResidentFont>,
     assigned_size: Option<[f32; 2]>,
     inherited_top_layer: bool,
+    hidden_world_nodes: &HashSet<&str>,
 ) {
     let node_layout = node.layout.unwrap_or_default();
     let bounds = UiBounds {
@@ -6201,7 +6329,7 @@ fn flatten_node(
         width: 2_000_000.0,
         height: 2_000_000.0,
     });
-    if !node.visible {
+    if !node.visible || hidden_world_nodes.contains(node.node_id.0.as_str()) {
         return;
     }
     if node.style.opacity > 0.0 {
@@ -6260,6 +6388,7 @@ fn flatten_node(
             font,
             Some([child_bounds.width, child_bounds.height]),
             top_layer,
+            hidden_world_nodes,
         );
     }
 }
@@ -7490,6 +7619,7 @@ mod tests {
             [128.0, 80.0],
             None,
             &renderer.data_grid_text_display_cache,
+            &renderer.available_cameras,
         );
         let label = &flattened
             .iter()
@@ -7676,8 +7806,14 @@ mod tests {
             vec!["alpha", "beta", "gamma"]
         );
         let chrome = component_chrome_instances(&renderer.sampled[0]);
-        assert_eq!(chrome.len(), 3);
+        assert_eq!(chrome.len(), 5);
         assert_eq!(chrome[1].fill, [0.16, 0.35, 0.28, 1.0]);
+        assert_eq!(chrome[1].params[1], -4.0);
+        assert_eq!(chrome[0].rect[0] + chrome[0].rect[2], chrome[1].rect[0]);
+        assert_eq!(chrome[3].params[1], -1.5);
+
+        renderer.set_pointer_position([23.0, 33.0]);
+        assert!(renderer.tab_option_at_pointer().is_none());
 
         renderer.set_pointer_position([145.0, 46.0]);
         let (binding, value) = renderer.tab_option_at_pointer().unwrap();
@@ -7692,7 +7828,7 @@ mod tests {
             renderer
                 .component_chrome_instances(&renderer.sampled[0].clone(), "gallery/mode-tabs")
                 .len(),
-            4
+            6
         );
 
         renderer.sampled[0].enabled = false;

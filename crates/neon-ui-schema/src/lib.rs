@@ -893,6 +893,19 @@ pub enum UiEffect {
     DropBinding {
         binding: UiDropBinding,
     },
+    CameraVisibility {
+        binding: UiCameraVisibilityBinding,
+    },
+}
+
+/// A world panel is rendered only while its declared camera has supplied a
+/// valid frame for the active world information session.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiCameraVisibilityBinding {
+    pub node_id: UiNodeId,
+    pub camera_id: neon_world_bridge::CameraId,
+    pub camera_kind: neon_world_bridge::CameraKind,
 }
 
 /// Domain-prepared visual value for a declared control. It contains only
@@ -1198,6 +1211,18 @@ pub struct NuiFlowDocument {
     pub drags: Vec<NuiFlowDragDeclaration>,
     #[serde(default)]
     pub drops: Vec<NuiFlowDropDeclaration>,
+    #[serde(default)]
+    pub world_panels: Vec<NuiFlowWorldPanelDeclaration>,
+}
+
+/// `world panel` preserves the normal panel subtree and only adds a camera
+/// availability gate at the renderer boundary.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NuiFlowWorldPanelDeclaration {
+    pub node_key: String,
+    pub camera_id: neon_world_bridge::CameraId,
+    pub camera_kind: neon_world_bridge::CameraKind,
 }
 
 /// Finite UI-local statechart declared by NUI Flow. It may only control
@@ -2443,6 +2468,13 @@ impl UiEffect {
                     Err(UiSchemaError::InvalidProgramEvent)
                 } else {
                     binding.intent.validate()
+                }
+            }
+            Self::CameraVisibility { binding } => {
+                if binding.node_id.0.trim().is_empty() || binding.camera_id.0.trim().is_empty() {
+                    Err(UiSchemaError::InvalidProgramEvent)
+                } else {
+                    Ok(())
                 }
             }
         }

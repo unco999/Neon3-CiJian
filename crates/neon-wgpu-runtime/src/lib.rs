@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use std::{
     collections::{HashMap, VecDeque},
-    net::SocketAddr,
+    net::{SocketAddr, UdpSocket},
     path::PathBuf,
     thread,
 };
@@ -28,8 +28,12 @@ use neon_protocol::{
 #[cfg(test)]
 use neon_ui_schema::UiFragmentSubmission;
 use neon_ui_schema::{
-    UiBounds, UiCommand, UiDataGridWindowRequest, UiFragment, UiFragmentId, UiHostInbound, UiNode,
-    UiNodeKind, UiSemanticEvent, UiStyle, UiTransition, UiTransitionState, UiWindowRequest,
+    TextRef, UiBounds, UiCommand, UiDataGridWindowRequest, UiFragment, UiFragmentId, UiHostInbound,
+    UiNode, UiNodeId, UiNodeKind, UiSemanticEvent, UiStyle, UiTransition, UiTransitionState,
+    UiWindowRequest,
+};
+use neon_world_bridge::{
+    CameraControlSample, CameraFrame, CameraId, WorldInformationBridge, WorldInformationSnapshot,
 };
 use serde_json::{Value, json};
 use winit::{
@@ -37,18 +41,20 @@ use winit::{
     dpi::{LogicalPosition, LogicalSize, PhysicalSize},
     event::{ElementState, MouseScrollDelta, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy},
-    keyboard::{Key, NamedKey},
+    keyboard::{Key, KeyCode, NamedKey, PhysicalKey},
     window::{Window, WindowId},
 };
 
 mod gpu_preview;
 mod ui_program_gpu;
 mod ui_renderer;
+mod world_ui_pipeline;
 use gpu_preview::HeightmapPreviewConverter;
 pub use ui_program_gpu::GpuUiProgramBackend;
 use ui_renderer::{
     LocalPresentationCommit, PendingLocalPresentationKey, UiHitBinding, UiWgpuRenderer,
 };
+use world_ui_pipeline::WorldUiPipeline;
 
 pub const SERVICE_NAME: &str = "wgpu-runtime";
 pub const CAPABILITY_UI_FRAGMENT: &str = "wgpu.ui.fragment.v1";
@@ -59,11 +65,110 @@ pub const CAPABILITY_UI_RENDER_SURFACE: &str = "wgpu.ui.render_surface.v1";
 pub const CAPABILITY_AI_TERRAIN_GENERATION: &str = "wgpu.ai.terrain_generation.v1";
 pub const CAPABILITY_DEBUG_INTERACTION: &str = "debug.interaction.v1";
 pub const CAPABILITY_DEBUG_WINDOW_CAPTURE: &str = "debug.window.capture.v1";
+pub const CAPABILITY_WORLD_UI_LAB_CAMERA: &str = "wgpu.world_ui.lab.camera.v1";
 pub const UI_HIT_TARGET: &str = "ui.hit_id.v1";
 pub const UI_COLOR_TARGET: &str = "ui.color.v1";
 pub const RENDER_HIT_NONE: u32 = u32::MAX;
 const DATA_GRID_WINDOW_DEBOUNCE: Duration = Duration::from_millis(24);
 const INTERACTION_TRACE_CAPACITY: usize = 256;
+const WORLD_UI_LAB_SURFACE_TARGET: &str = "render.world-ui-lab.preview";
+
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorldUiLabCameraRegistration {
+    udp_endpoint: SocketAddr,
+    session_id: String,
+    provider_epoch: u64,
+    camera_id: CameraId,
+}
+
+#[derive(Default)]
+struct WorldUiLabCameraController {
+    enabled: bool,
+    window_focused: bool,
+    surface_focused: bool,
+    axes: [f32; 3],
+    preview_offset: [f32; 2],
+    sequence: u64,
+    registration: Option<WorldUiLabCameraRegistration>,
+    socket: Option<UdpSocket>,
+    last_udp_error: Option<String>,
+}
+
+impl WorldUiLabCameraController {
+    fn clear_axes(&mut self) {
+        self.axes = [0.0; 3];
+    }
+
+    fn set_key(
+        &mut self,
+        key: KeyCode,
+        pressed: bool,
+        epoch: u64,
+        elapsed: Duration,
+    ) -> Option<CameraControlSample> {
+        if !self.enabled || !self.window_focused || !self.surface_focused {
+            return None;
+        }
+        match key {
+            KeyCode::KeyW => self.axes[1] = if pressed { 1.0 } else { 0.0 },
+            KeyCode::KeyS => self.axes[1] = if pressed { -1.0 } else { 0.0 },
+            KeyCode::KeyA => self.axes[0] = if pressed { -1.0 } else { 0.0 },
+            KeyCode::KeyD => self.axes[0] = if pressed { 1.0 } else { 0.0 },
+            _ => return None,
+        }
+        self.preview_offset[0] += self.axes[0] * 0.08;
+        self.preview_offset[1] += self.axes[1] * 0.08;
+        let registration = self.registration.as_ref()?;
+        self.sequence += 1;
+        Some(CameraControlSample {
+            camera_id: registration.camera_id.clone(),
+            session_id: registration.session_id.clone(),
+            producer_epoch: epoch,
+            sequence: self.sequence,
+            timestamp_monotonic_ns: elapsed.as_nanos().min(u128::from(u64::MAX)) as u64,
+            movement_axes: self.axes,
+            look_delta: [0.0; 2],
+            wheel_delta: 0.0,
+        })
+    }
+
+    fn send(&mut self, sample: &CameraControlSample) {
+        let Some(socket) = self.socket.as_ref() else {
+            return;
+        };
+        match serde_json::to_vec(sample)
+            .map_err(|error| error.to_string())
+            .and_then(|bytes| {
+                socket
+                    .send(&bytes)
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
+            }) {
+            Ok(()) => self.last_udp_error = None,
+            Err(error) => self.last_udp_error = Some(error.to_string()),
+        }
+    }
+
+    fn register(&mut self, registration: WorldUiLabCameraRegistration) -> Result<(), &'static str> {
+        if !registration.udp_endpoint.ip().is_loopback()
+            || registration.session_id.trim().is_empty()
+            || registration.provider_epoch == 0
+            || registration.camera_id.0.trim().is_empty()
+        {
+            return Err("invalid_world_ui_lab_camera_registration");
+        }
+        let socket =
+            UdpSocket::bind("127.0.0.1:0").map_err(|_| "world_ui_lab_camera_socket_unavailable")?;
+        socket
+            .connect(registration.udp_endpoint)
+            .map_err(|_| "world_ui_lab_camera_endpoint_unavailable")?;
+        self.registration = Some(registration);
+        self.socket = Some(socket);
+        self.last_udp_error = None;
+        Ok(())
+    }
+}
 #[cfg(debug_assertions)]
 const MAX_WINDOW_CAPTURE_BYTES: u64 = 256 * 1024 * 1024;
 
@@ -646,6 +751,7 @@ pub struct WindowedRuntime {
     data_grid_window_delivery: Arc<Mutex<Value>>,
     initial_window_sizing: InitialWindowSizing,
     event_proxy: Option<EventLoopProxy<WindowCommand>>,
+    world_ui_lab_camera: Arc<Mutex<WorldUiLabCameraController>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -703,6 +809,11 @@ enum WindowCommand {
         target_node_key: String,
         completed: std::sync::mpsc::Sender<Result<Value, &'static str>>,
     },
+    CaptureWorldUiLab {
+        artifact_path: PathBuf,
+        size: [u32; 2],
+        completed: std::sync::mpsc::Sender<Result<Value, String>>,
+    },
     CaptureFinalTarget {
         artifact_path: Option<PathBuf>,
         redraw: bool,
@@ -718,6 +829,10 @@ enum WindowCommand {
     DataGridWindowDeliveryCompleted {
         sequence: u64,
         accepted: bool,
+    },
+    RegisterWorldUiLabCamera {
+        registration: WorldUiLabCameraRegistration,
+        completed: std::sync::mpsc::Sender<Result<Value, &'static str>>,
     },
     Shutdown,
 }
@@ -740,6 +855,9 @@ struct WindowGpu {
     #[cfg(debug_assertions)]
     final_composition_revision: Revision,
     ui: UiWgpuRenderer,
+    world_ui: WorldUiPipeline,
+    world_ui_lab_surface: wgpu::TextureView,
+    world_ui_lab_fragment: HashMap<UiFragmentId, UiFragment>,
     ai: neon_wgpu_ai::AiEngine,
     heightmap_preview: HeightmapPreviewConverter,
     hit_target: wgpu::Texture,
@@ -764,6 +882,7 @@ struct WindowGpu {
     last_pointer_outcome: String,
     last_pointer_node_path: Option<String>,
     active_interaction_id: Option<InteractionId>,
+    world_ui_lab_camera: Arc<Mutex<WorldUiLabCameraController>>,
 }
 
 impl WindowedRuntime {
@@ -822,11 +941,12 @@ impl WindowedRuntime {
             data_grid_window_delivery: Arc::new(Mutex::new(json!({"state": "idle"}))),
             initial_window_sizing: InitialWindowSizing::default(),
             event_proxy: None,
+            world_ui_lab_camera: Arc::new(Mutex::new(WorldUiLabCameraController::default())),
         }
     }
 
     pub fn run(epoch: u64) -> Result<(), String> {
-        Self::run_with_server(epoch, None, None, None, true)
+        Self::run_with_server(epoch, None, None, None, true, false)
     }
 
     pub fn run_server(
@@ -834,8 +954,16 @@ impl WindowedRuntime {
         endpoint: SocketAddr,
         ui_endpoint: Option<SocketAddr>,
         projectd_endpoint: Option<SocketAddr>,
+        enable_world_ui_lab_camera: bool,
     ) -> Result<(), String> {
-        Self::run_with_server(epoch, Some(endpoint), ui_endpoint, projectd_endpoint, false)
+        Self::run_with_server(
+            epoch,
+            Some(endpoint),
+            ui_endpoint,
+            projectd_endpoint,
+            false,
+            enable_world_ui_lab_camera,
+        )
     }
 
     fn run_with_server(
@@ -844,6 +972,7 @@ impl WindowedRuntime {
         ui_endpoint: Option<SocketAddr>,
         projectd_endpoint: Option<SocketAddr>,
         demo: bool,
+        enable_world_ui_lab_camera: bool,
     ) -> Result<(), String> {
         let event_loop = EventLoop::<WindowCommand>::with_user_event()
             .build()
@@ -853,13 +982,24 @@ impl WindowedRuntime {
         runtime.event_proxy = Some(proxy.clone());
         runtime.ui_endpoint = ui_endpoint;
         runtime.projectd_endpoint = projectd_endpoint;
+        runtime
+            .world_ui_lab_camera
+            .lock()
+            .expect("camera controller lock")
+            .enabled = enable_world_ui_lab_camera;
         if demo {
             runtime.fragments = runtime.demo_fragments();
             runtime.applied_composition_revision = Revision(1);
         }
         if let Some(endpoint) = endpoint {
             let interaction_traces = runtime.interaction_traces.clone();
-            spawn_window_server(epoch, endpoint, proxy, interaction_traces);
+            spawn_window_server(
+                epoch,
+                endpoint,
+                proxy,
+                interaction_traces,
+                runtime.world_ui_lab_camera.clone(),
+            );
         }
         event_loop
             .run_app(&mut runtime)
@@ -878,7 +1018,10 @@ impl WindowedRuntime {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_with_display_handle(
             Box::new(event_loop.owned_display_handle()),
         ));
-        let gpu = WindowGpu::new(&window, instance)?;
+        let gpu = WindowGpu::new(&window, instance, self.world_ui_lab_camera.clone())?;
+        if let Ok(mut camera) = self.world_ui_lab_camera.lock() {
+            camera.window_focused = window.has_focus();
+        }
         self.window = Some(window);
         self.gpu = Some(gpu);
         if let Some(endpoint) = self.projectd_endpoint {
@@ -1039,6 +1182,41 @@ impl WindowedRuntime {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("neon3-final-composition"),
             });
+        // The lab panel is an ordinary UiNode tree rendered to a renderer-private
+        // transparent surface before that surface is sampled by the world pass.
+        {
+            if let Ok(camera) = gpu.world_ui_lab_camera.lock()
+                && let Some(fragment) = gpu.world_ui_lab_fragment.values_mut().next()
+            {
+                fragment.root.bounds.x = camera.preview_offset[0] * 20.0;
+                fragment.root.bounds.y = -camera.preview_offset[1] * 20.0;
+            }
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("neon3-world-ui-lab-panel-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &gpu.world_ui_lab_surface,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            gpu.ui.draw(
+                &gpu.device,
+                &gpu.queue,
+                &mut pass,
+                &gpu.world_ui_lab_fragment,
+                [640, 360],
+                [640.0, 360.0],
+                gpu.started_at.elapsed().as_secs_f32(),
+            );
+        }
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("neon3-final-clear-pass"),
@@ -1223,6 +1401,36 @@ impl WindowedRuntime {
         Err("window capture is only available in debug builds".into())
     }
 
+    #[cfg(debug_assertions)]
+    fn capture_world_ui_lab(
+        &mut self,
+        artifact_path: PathBuf,
+        size: [u32; 2],
+    ) -> Result<Value, String> {
+        let rgba = {
+            let gpu = self
+                .gpu
+                .as_mut()
+                .ok_or_else(|| "window GPU is unavailable".to_owned())?;
+            gpu.render_world_ui_lab_panel();
+            gpu.world_ui
+                .capture_lab(&gpu.device, &gpu.queue, size, &gpu.world_ui_lab_surface)?
+        };
+        let artifact_path = write_capture_png(&artifact_path, size, &rgba)?;
+        Ok(json!({
+            "target": "world-ui-lab",
+            "format": "rgba8unorm",
+            "size": {"width": size[0], "height": size[1]},
+            "rgba_bytes": rgba.len(),
+            "artifact_path": artifact_path.to_string_lossy(),
+        }))
+    }
+
+    #[cfg(not(debug_assertions))]
+    fn capture_world_ui_lab(&mut self, _: PathBuf, _: [u32; 2]) -> Result<Value, String> {
+        Err("world UI lab capture is only available in debug builds".into())
+    }
+
     fn apply_fragments(
         &mut self,
         composition_revision: Revision,
@@ -1346,6 +1554,7 @@ impl WindowedRuntime {
             });
         json!({
             "state": gpu.input.state_name(),
+            "world_ui_lab_camera": self.world_ui_lab_camera.lock().ok().map(|camera| world_ui_lab_camera_status(&camera)),
             "applied_composition_revision": self.applied_composition_revision.0,
             "viewport": {
                 "physical_size": {"width": physical_size[0], "height": physical_size[1]},
@@ -1952,6 +2161,42 @@ fn write_capture_png(path: &Path, size: [u32; 2], rgba: &[u8]) -> Result<PathBuf
 }
 
 impl WindowGpu {
+    fn render_world_ui_lab_panel(&mut self) {
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("neon3-world-ui-lab-panel-capture"),
+            });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("neon3-world-ui-lab-panel-capture-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.world_ui_lab_surface,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            self.ui.draw(
+                &self.device,
+                &self.queue,
+                &mut pass,
+                &self.world_ui_lab_fragment,
+                [640, 360],
+                [640.0, 360.0],
+                self.started_at.elapsed().as_secs_f32(),
+            );
+        }
+        self.queue.submit(Some(encoder.finish()));
+    }
+
     fn physical_viewport_size(&self) -> [u32; 2] {
         [self.config.width.max(1), self.config.height.max(1)]
     }
@@ -2045,7 +2290,11 @@ impl WindowGpu {
         Ok(rgba)
     }
 
-    fn new(window: &Window, instance: wgpu::Instance) -> Result<Self, String> {
+    fn new(
+        window: &Window,
+        instance: wgpu::Instance,
+        world_ui_lab_camera: Arc<Mutex<WorldUiLabCameraController>>,
+    ) -> Result<Self, String> {
         // SAFETY: `WindowedRuntime` declares `gpu` before `window`, so the surface is dropped
         // before the window handle it references.
         let surface = unsafe {
@@ -2127,6 +2376,10 @@ impl WindowGpu {
         #[cfg(debug_assertions)]
         let final_target_blitter = wgpu::util::TextureBlitter::new(&device, config.format);
         let ui = UiWgpuRenderer::new(&device, config.format);
+        let mut ui = ui;
+        let world_ui_lab_surface =
+            ui.ensure_ui_render_surface(&device, "render.world-ui-lab.preview", [640, 360]);
+        let world_ui = WorldUiPipeline::new(&device, wgpu::TextureFormat::Rgba8Unorm);
         let heightmap_preview = HeightmapPreviewConverter::new(&device);
         let mut ai = neon_wgpu_ai::AiEngine::new(device.clone(), queue.clone());
         let configured_pack = std::env::var_os("NEON_AI_PACK")
@@ -2166,6 +2419,9 @@ impl WindowGpu {
             #[cfg(debug_assertions)]
             final_composition_revision: Revision(0),
             ui,
+            world_ui,
+            world_ui_lab_surface,
+            world_ui_lab_fragment: world_ui_lab_fragment(),
             ai,
             heightmap_preview,
             hit_target,
@@ -2190,6 +2446,7 @@ impl WindowGpu {
             last_pointer_outcome: "none".into(),
             last_pointer_node_path: None,
             active_interaction_id: None,
+            world_ui_lab_camera,
         })
     }
 
@@ -2267,6 +2524,136 @@ fn create_hit_target(
     });
     let view = target.create_view(&wgpu::TextureViewDescriptor::default());
     (target, view)
+}
+
+fn world_ui_lab_fragment() -> HashMap<UiFragmentId, UiFragment> {
+    let label = |id: &str, x, y, width, height, value: &str, color| UiNode {
+        node_id: UiNodeId(id.into()),
+        kind: UiNodeKind::Label,
+        bounds: UiBounds {
+            x,
+            y,
+            width,
+            height,
+        },
+        layout: None,
+        visible: true,
+        enabled: false,
+        text_key: None,
+        text: Some(TextRef::Literal {
+            value: value.into(),
+        }),
+        image: None,
+        surface: None,
+        style: UiStyle {
+            background_color: color,
+            border_color: [0.0; 4],
+            border_width: 0.0,
+            corner_radius: 2.0,
+            opacity: 1.0,
+        },
+        enter_transition: None,
+        children: Vec::new(),
+    };
+    let root = UiNode {
+        node_id: UiNodeId("world-ui-lab-panel".into()),
+        kind: UiNodeKind::Panel,
+        bounds: UiBounds {
+            x: 0.0,
+            y: 0.0,
+            width: 640.0,
+            height: 360.0,
+        },
+        layout: None,
+        visible: true,
+        enabled: false,
+        text_key: None,
+        text: None,
+        image: None,
+        surface: None,
+        style: UiStyle {
+            background_color: [0.035, 0.06, 0.12, 0.96],
+            border_color: [0.12, 0.72, 0.94, 1.0],
+            border_width: 2.0,
+            corner_radius: 8.0,
+            opacity: 1.0,
+        },
+        enter_transition: None,
+        children: vec![
+            label(
+                "callsign",
+                24.0,
+                22.0,
+                280.0,
+                34.0,
+                "VANGUARD-07",
+                [0.04, 0.22, 0.34, 1.0],
+            ),
+            label(
+                "class",
+                24.0,
+                62.0,
+                300.0,
+                26.0,
+                "LEVEL 24 / ASSAULT",
+                [0.02, 0.08, 0.16, 1.0],
+            ),
+            label(
+                "health",
+                24.0,
+                116.0,
+                270.0,
+                42.0,
+                "742 / 900",
+                [0.08, 0.30, 0.17, 1.0],
+            ),
+            label(
+                "shield",
+                24.0,
+                166.0,
+                270.0,
+                42.0,
+                "SHIELD 180 / 250",
+                [0.08, 0.18, 0.34, 1.0],
+            ),
+            label(
+                "status",
+                24.0,
+                246.0,
+                136.0,
+                30.0,
+                "ONLINE",
+                [0.06, 0.36, 0.21, 1.0],
+            ),
+            label(
+                "squad",
+                170.0,
+                246.0,
+                150.0,
+                30.0,
+                "SQUAD LEAD",
+                [0.26, 0.18, 0.04, 1.0],
+            ),
+            label(
+                "sector",
+                24.0,
+                300.0,
+                420.0,
+                28.0,
+                "SECTOR: ORBITAL RELAY",
+                [0.08, 0.11, 0.20, 1.0],
+            ),
+        ],
+    };
+    HashMap::from([(
+        UiFragmentId("world-ui-lab.panel".into()),
+        UiFragment {
+            fragment_id: UiFragmentId("world-ui-lab.panel".into()),
+            revision: Revision(1),
+            root,
+            effects: Vec::new(),
+        },
+    )])
 }
 
 fn forward_pointer_click(
@@ -2841,6 +3228,20 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                 if state == winit::event::ElementState::Pressed
                     && button == winit::event::MouseButton::Left =>
             {
+                if let Some(gpu) = self.gpu.as_ref()
+                    && let Some(pointer) = gpu.ui.pointer_position()
+                    && let Ok(mut camera) = self.world_ui_lab_camera.lock()
+                {
+                    camera.surface_focused = camera.enabled
+                        && camera.window_focused
+                        && gpu
+                            .ui
+                            .render_surface_contains(WORLD_UI_LAB_SURFACE_TARGET, pointer);
+                    if !camera.surface_focused {
+                        camera.clear_axes();
+                    }
+                    self.redraw_pending = true;
+                }
                 let interaction_id = self.begin_os_pointer_interaction();
                 let interaction_traces = self.interaction_traces.clone();
                 let composition_revision = self.applied_composition_revision;
@@ -3352,7 +3753,25 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                     self.redraw_pending = true;
                 }
             }
-            WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
+            WindowEvent::KeyboardInput { event, .. } => {
+                if let PhysicalKey::Code(code) = event.physical_key
+                    && let Ok(mut camera) = self.world_ui_lab_camera.lock()
+                    && let Some(sample) = camera.set_key(
+                        code,
+                        event.state == ElementState::Pressed,
+                        self.epoch,
+                        self.gpu
+                            .as_ref()
+                            .map(|gpu| gpu.started_at.elapsed())
+                            .unwrap_or_default(),
+                    )
+                {
+                    camera.send(&sample);
+                    self.redraw_pending = true;
+                }
+                if event.state != ElementState::Pressed {
+                    return;
+                }
                 if matches!(&event.logical_key, Key::Named(NamedKey::Escape)) {
                     let mut cancelled_drag = None;
                     let cancelled = self.gpu.as_mut().is_some_and(|gpu| {
@@ -3473,6 +3892,11 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                 }
             }
             WindowEvent::Focused(false) => {
+                if let Ok(mut camera) = self.world_ui_lab_camera.lock() {
+                    camera.window_focused = false;
+                    camera.surface_focused = false;
+                    camera.clear_axes();
+                }
                 let mut cancelled_drag = None;
                 let commit = self.gpu.as_mut().and_then(take_data_grid_text_commit);
                 if let (Some(endpoint), Some((sequence, binding, value))) =
@@ -3529,6 +3953,12 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                     );
                 }
             }
+            WindowEvent::Focused(true) => {
+                if let Ok(mut camera) = self.world_ui_lab_camera.lock() {
+                    camera.window_focused = true;
+                    camera.clear_axes();
+                }
+            }
             WindowEvent::RedrawRequested => {
                 if let Err(error) = self.redraw() {
                     self.exit_error = Some(error);
@@ -3574,6 +4004,23 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
             WindowCommand::AiModelStatus { completed } => {
                 let status = self.gpu.as_ref().and_then(|gpu| gpu.ai.model_info());
                 let _ = completed.send(status);
+            }
+            WindowCommand::RegisterWorldUiLabCamera {
+                registration,
+                completed,
+            } => {
+                let result = self
+                    .world_ui_lab_camera
+                    .lock()
+                    .map_err(|_| "world_ui_lab_camera_unavailable")
+                    .and_then(|mut camera| {
+                        if !camera.enabled {
+                            return Err("world_ui_lab_camera_disabled");
+                        }
+                        camera.register(registration)?;
+                        Ok(world_ui_lab_camera_status(&camera))
+                    });
+                let _ = completed.send(result);
             }
             WindowCommand::InputDebugSnapshot { completed } => {
                 let _ = completed.send(self.input_debug_snapshot());
@@ -3636,6 +4083,13 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                     return;
                 }
                 let _ = completed.send(self.capture_final_target(artifact_path));
+            }
+            WindowCommand::CaptureWorldUiLab {
+                artifact_path,
+                size,
+                completed,
+            } => {
+                let _ = completed.send(self.capture_world_ui_lab(artifact_path, size));
             }
             WindowCommand::CompositionDrawCompleted { acknowledgements } => {
                 self.composition_ack_in_flight = false;
@@ -4338,11 +4792,195 @@ fn handle_window_target_capture(
     }
 }
 
+fn handle_world_ui_lab_capture(
+    runtime: &mut WgpuRuntime,
+    proxy: &EventLoopProxy<WindowCommand>,
+    request_id: RequestId,
+    params: Value,
+) -> RpcResponse {
+    if !cfg!(debug_assertions) {
+        return runtime.reject(
+            request_id,
+            "debug_endpoint_unavailable",
+            "world UI lab capture is only available in debug builds",
+            None,
+        );
+    }
+    let Some(path) = params
+        .get("path")
+        .and_then(Value::as_str)
+        .filter(|path| !path.trim().is_empty() && path.ends_with(".png"))
+    else {
+        return runtime.reject(
+            request_id,
+            "invalid_request",
+            "path must be a non-empty PNG path",
+            None,
+        );
+    };
+    let width = match params.get("width") {
+        None => 1920,
+        Some(value) => match value.as_u64() {
+            Some(width) => width,
+            None => {
+                return runtime.reject(
+                    request_id,
+                    "invalid_request",
+                    "width must be an integer",
+                    None,
+                );
+            }
+        },
+    };
+    let height = match params.get("height") {
+        None => 1080,
+        Some(value) => match value.as_u64() {
+            Some(height) => height,
+            None => {
+                return runtime.reject(
+                    request_id,
+                    "invalid_request",
+                    "height must be an integer",
+                    None,
+                );
+            }
+        },
+    };
+    if width == 0 || height == 0 || width > 3840 || height > 2160 {
+        return runtime.reject(
+            request_id,
+            "invalid_request",
+            "width and height must be between 1 and 3840x2160",
+            None,
+        );
+    }
+    let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+    if proxy
+        .send_event(WindowCommand::CaptureWorldUiLab {
+            artifact_path: PathBuf::from(path),
+            size: [width as u32, height as u32],
+            completed: completed_tx,
+        })
+        .is_err()
+    {
+        return runtime.reject(
+            request_id,
+            "window_compositor_unavailable",
+            "window compositor is unavailable",
+            None,
+        );
+    }
+    match completed_rx.recv_timeout(Duration::from_secs(30)) {
+        Ok(Ok(capture)) => runtime.accept(request_id, capture),
+        Ok(Err(error)) => runtime.reject(request_id, "world_ui_lab_capture_failed", &error, None),
+        Err(_) => runtime.reject(
+            request_id,
+            "window_compositor_timeout",
+            "window compositor did not complete world UI lab capture",
+            None,
+        ),
+    }
+}
+
+fn world_ui_lab_camera_status(camera: &WorldUiLabCameraController) -> Value {
+    json!({
+        "surface_target_id": WORLD_UI_LAB_SURFACE_TARGET,
+        "enabled": camera.enabled,
+        "window_focused": camera.window_focused,
+        "surface_focused": camera.surface_focused,
+        "udp": if camera.registration.is_some() { "available" } else { "unavailable" },
+        "session_id": camera.registration.as_ref().map(|registration| registration.session_id.clone()),
+        "camera_id": camera.registration.as_ref().map(|registration| registration.camera_id.0.clone()),
+        "provider_epoch": camera.registration.as_ref().map(|registration| registration.provider_epoch),
+        "last_udp_error": camera.last_udp_error,
+        "sequence": camera.sequence,
+        "preview_offset": camera.preview_offset,
+    })
+}
+
+fn handle_world_ui_lab_camera_register(
+    runtime: &mut WgpuRuntime,
+    proxy: &EventLoopProxy<WindowCommand>,
+    request: RpcRequest,
+) -> RpcResponse {
+    let request_id = request.request_id.clone();
+    if request.expected_revision != Some(runtime.graph_revision) {
+        return runtime.reject(
+            request_id,
+            "revision_conflict",
+            "expected_revision must match the current WGPU graph revision",
+            Some(runtime.graph_revision),
+        );
+    }
+    let Some(key) = request.idempotency_key.as_ref() else {
+        return runtime.reject(
+            request_id,
+            "invalid_request",
+            "idempotency_key is required",
+            None,
+        );
+    };
+    if let Some(existing) = runtime.idempotent_responses.get(key) {
+        let mut response = existing.clone();
+        response.request_id = request_id;
+        return response;
+    }
+    let registration = match serde_json::from_value::<WorldUiLabCameraRegistration>(request.params)
+    {
+        Ok(value) => value,
+        Err(_) => {
+            return runtime.reject(
+                request_id,
+                "invalid_request",
+                "invalid world UI lab camera registration",
+                None,
+            );
+        }
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    if proxy
+        .send_event(WindowCommand::RegisterWorldUiLabCamera {
+            registration,
+            completed: tx,
+        })
+        .is_err()
+    {
+        return runtime.reject(
+            request_id,
+            "window_compositor_unavailable",
+            "window compositor is unavailable",
+            None,
+        );
+    }
+    let response = match rx.recv_timeout(Duration::from_secs(5)) {
+        Ok(Ok(status)) => runtime.accept(request_id, status),
+        Ok(Err(code)) => runtime.reject(
+            request_id,
+            code,
+            "world UI lab camera registration was rejected",
+            None,
+        ),
+        Err(_) => runtime.reject(
+            request_id,
+            "window_compositor_timeout",
+            "window compositor did not register camera provider",
+            None,
+        ),
+    };
+    if response.status == RpcStatus::Accepted {
+        runtime
+            .idempotent_responses
+            .insert(key.clone(), response.clone());
+    }
+    response
+}
+
 fn spawn_window_server(
     epoch: u64,
     endpoint: SocketAddr,
     proxy: EventLoopProxy<WindowCommand>,
     interaction_traces: Arc<Mutex<InteractionTraceStore>>,
+    world_ui_lab_camera: Arc<Mutex<WorldUiLabCameraController>>,
 ) {
     thread::spawn(move || {
         let server = match neon_ipc::RpcServer::bind(endpoint) {
@@ -4353,12 +4991,17 @@ fn spawn_window_server(
                 return;
             }
         };
-        let mut runtime = WgpuRuntime::window_control(epoch, interaction_traces);
+        let mut runtime =
+            WgpuRuntime::window_control(epoch, interaction_traces, world_ui_lab_camera);
         if let Err(error) = server.serve_until(|request| {
             let shutdown = request.method == "service.shutdown";
             let mutates_composition = matches!(
                 request.method.as_str(),
-                "wgpu.ui.submit_fragment" | "wgpu.ui.remove_fragment"
+                "wgpu.ui.submit_fragment"
+                    | "wgpu.ui.remove_fragment"
+                    | "wgpu.world.info.configure"
+                    | "wgpu.world.camera.submit_frame"
+                    | "wgpu.world_ui.lab.camera.register"
             );
             let response = if request.method == "wgpu.ai.terrain.generate" {
                 handle_window_ai_generate(&mut runtime, &proxy, request)
@@ -4421,6 +5064,30 @@ fn spawn_window_server(
                     request.request_id,
                     request.params,
                 )
+            } else if request.method == "wgpu.world_ui.lab.capture" {
+                handle_world_ui_lab_capture(
+                    &mut runtime,
+                    &proxy,
+                    request.request_id,
+                    request.params,
+                )
+            } else if request.method == "wgpu.world_ui.lab.camera.register" {
+                handle_world_ui_lab_camera_register(&mut runtime, &proxy, request)
+            } else if request.method == "wgpu.world_ui.lab.camera.snapshot" {
+                let status = runtime
+                    .world_ui_lab_camera
+                    .lock()
+                    .ok()
+                    .map(|camera| world_ui_lab_camera_status(&camera));
+                match status {
+                    Some(status) => runtime.accept(request.request_id, status),
+                    None => runtime.reject(
+                        request.request_id,
+                        "world_ui_lab_camera_unavailable",
+                        "camera controller is unavailable",
+                        None,
+                    ),
+                }
             } else {
                 runtime.handle(request)
             };
@@ -4606,6 +5273,8 @@ pub struct WgpuRuntime {
     idempotent_responses: HashMap<String, RpcResponse>,
     resources: HashMap<u64, UiResourceRecord>,
     interaction_traces: Arc<Mutex<InteractionTraceStore>>,
+    world_bridge: WorldInformationBridge,
+    world_ui_lab_camera: Arc<Mutex<WorldUiLabCameraController>>,
 }
 
 impl WgpuRuntime {
@@ -4622,13 +5291,20 @@ impl WgpuRuntime {
             idempotent_responses: HashMap::new(),
             resources: HashMap::new(),
             interaction_traces: Arc::new(Mutex::new(InteractionTraceStore::new())),
+            world_bridge: WorldInformationBridge::new(),
+            world_ui_lab_camera: Arc::new(Mutex::new(WorldUiLabCameraController::default())),
         }
     }
 
-    fn window_control(epoch: u64, interaction_traces: Arc<Mutex<InteractionTraceStore>>) -> Self {
+    fn window_control(
+        epoch: u64,
+        interaction_traces: Arc<Mutex<InteractionTraceStore>>,
+        world_ui_lab_camera: Arc<Mutex<WorldUiLabCameraController>>,
+    ) -> Self {
         let mut runtime = Self::headless(epoch);
         runtime.window_gpu_available = true;
         runtime.interaction_traces = interaction_traces;
+        runtime.world_ui_lab_camera = world_ui_lab_camera;
         runtime
     }
 
@@ -4648,10 +5324,18 @@ impl WgpuRuntime {
             CAPABILITY_UI_SEMANTIC_EVENT.into(),
             CAPABILITY_UI_PROGRAM_SEMANTIC_EVENT.into(),
             CAPABILITY_UI_RENDER_SURFACE.into(),
+            "wgpu.world.info.bridge".into(),
         ];
         if self.window_gpu_available {
             capabilities.push(CAPABILITY_AI_TERRAIN_GENERATION.into());
             capabilities.push(CAPABILITY_DEBUG_INTERACTION.into());
+            if self
+                .world_ui_lab_camera
+                .lock()
+                .is_ok_and(|camera| camera.enabled)
+            {
+                capabilities.push(CAPABILITY_WORLD_UI_LAB_CAMERA.into());
+            }
             if cfg!(debug_assertions) {
                 capabilities.push(CAPABILITY_DEBUG_WINDOW_CAPTURE.into());
             }
@@ -4691,7 +5375,109 @@ impl WgpuRuntime {
     }
 
     pub fn fragments_snapshot(&self) -> HashMap<UiFragmentId, UiFragment> {
-        self.fragments.clone()
+        self.fragments
+            .iter()
+            .map(|(id, fragment)| (id.clone(), self.filter_world_panels(fragment)))
+            .collect()
+    }
+
+    fn filter_world_panels(&self, fragment: &UiFragment) -> UiFragment {
+        let mut filtered = fragment.clone();
+        fn visit(
+            node: &mut neon_ui_schema::UiNode,
+            effects: &[neon_ui_schema::UiEffect],
+            bridge: &WorldInformationBridge,
+        ) {
+            let hidden = effects.iter().any(|effect| {
+                let neon_ui_schema::UiEffect::CameraVisibility { binding } = effect else {
+                    return false;
+                };
+                binding.node_id == node.node_id
+                    && !bridge.camera_is_available(&binding.camera_id, binding.camera_kind)
+            });
+            if hidden {
+                node.visible = false;
+            } else {
+                for child in &mut node.children {
+                    visit(child, effects, bridge);
+                }
+            }
+        }
+        visit(&mut filtered.root, &filtered.effects, &self.world_bridge);
+        filtered
+    }
+
+    fn world_bridge_snapshot(&self) -> serde_json::Value {
+        serde_json::json!({
+            "world": self.world_bridge.world(),
+        })
+    }
+
+    fn configure_world_information(
+        &mut self,
+        request_id: RequestId,
+        params: serde_json::Value,
+    ) -> RpcResponse {
+        let snapshot: WorldInformationSnapshot = match serde_json::from_value(params) {
+            Ok(snapshot) => snapshot,
+            Err(_) => {
+                return self.reject(
+                    request_id,
+                    "invalid_request",
+                    "invalid world information snapshot",
+                    None,
+                );
+            }
+        };
+        match self.world_bridge.configure_world(snapshot.clone()) {
+            Ok(()) => self.accept(
+                request_id,
+                serde_json::json!({
+                    "world_space_id": snapshot.world_space_id,
+                    "revision": snapshot.revision,
+                    "state": "accepted"
+                }),
+            ),
+            Err(error) => self.reject(
+                request_id,
+                "invalid_world_information",
+                &format!("{error:?}"),
+                Some(snapshot.revision),
+            ),
+        }
+    }
+
+    fn submit_world_camera_frame(
+        &mut self,
+        request_id: RequestId,
+        params: serde_json::Value,
+    ) -> RpcResponse {
+        let frame: CameraFrame = match serde_json::from_value(params) {
+            Ok(frame) => frame,
+            Err(_) => {
+                return self.reject(request_id, "invalid_request", "invalid camera frame", None);
+            }
+        };
+        let camera_id = frame.camera_id.clone();
+        let kind = frame.payload.kind();
+        let sequence = frame.sequence;
+        match self.world_bridge.submit_camera_frame(frame) {
+            Ok(()) => self.accept(
+                request_id,
+                serde_json::json!({
+                    "camera_id": camera_id,
+                    "kind": kind,
+                    "sequence": sequence,
+                    "state": "accepted"
+                }),
+            ),
+            Err(error) => self.reject(
+                request_id,
+                "camera_frame_rejected",
+                &format!("{error:?}"),
+                None,
+            ),
+        }
     }
 
     pub fn command_receipt(&self, request_id: &RequestId) -> Option<&CommandReceipt> {
@@ -4818,9 +5604,16 @@ impl WgpuRuntime {
 
         if matches!(
             request.method.as_str(),
-            "wgpu.ui.submit_fragment" | "wgpu.ui.remove_fragment"
+            "wgpu.ui.submit_fragment"
+                | "wgpu.ui.remove_fragment"
+                | "wgpu.world.info.configure"
+                | "wgpu.world.camera.submit_frame"
         ) {
-            if request.client.kind == ClientKind::UiReactClient {
+            if matches!(
+                request.method.as_str(),
+                "wgpu.ui.submit_fragment" | "wgpu.ui.remove_fragment"
+            ) && request.client.kind == ClientKind::UiReactClient
+            {
                 return self.reject(
                     request_id,
                     "renderer_submission_requires_ui_runtime",
@@ -4861,6 +5654,13 @@ impl WgpuRuntime {
             "wgpu.ui.fragment.snapshot" => self.fragment_snapshot(request_id, request.params),
             "wgpu.render.target.capture" => self.target_capture(request_id, request.params),
             "wgpu.render.target.assert" => self.target_assert(request_id, request.params),
+            "wgpu.world.info.snapshot" => self.accept(request_id, self.world_bridge_snapshot()),
+            "wgpu.world.info.configure" => {
+                self.configure_world_information(request_id, request.params)
+            }
+            "wgpu.world.camera.submit_frame" => {
+                self.submit_world_camera_frame(request_id, request.params)
+            }
             "wgpu.resource.inspect" => self.resource_inspect(request_id),
             "wgpu.ui.resource.preload" => self.resource_preload(request_id, request.params),
             "wgpu.resource.wait_ready" => self.resource_wait_ready(request_id, request.params),
@@ -4888,7 +5688,10 @@ impl WgpuRuntime {
         };
         if matches!(
             request.method.as_str(),
-            "wgpu.ui.submit_fragment" | "wgpu.ui.remove_fragment"
+            "wgpu.ui.submit_fragment"
+                | "wgpu.ui.remove_fragment"
+                | "wgpu.world.info.configure"
+                | "wgpu.world.camera.submit_frame"
         ) && response.status == RpcStatus::Accepted
             && let Some(idempotency_key) = request.idempotency_key
         {
@@ -5410,6 +6213,101 @@ mod tests {
         }
     }
 
+    fn registered_camera_controller() -> WorldUiLabCameraController {
+        let mut controller = WorldUiLabCameraController {
+            enabled: true,
+            window_focused: true,
+            surface_focused: true,
+            ..Default::default()
+        };
+        controller
+            .register(WorldUiLabCameraRegistration {
+                udp_endpoint: "127.0.0.1:9".parse().unwrap(),
+                session_id: "test-session".into(),
+                provider_epoch: 1,
+                camera_id: CameraId("world-ui-lab".into()),
+            })
+            .unwrap();
+        controller
+    }
+
+    #[test]
+    fn lab_camera_does_not_move_when_disabled_or_surface_is_unfocused() {
+        let mut disabled = registered_camera_controller();
+        disabled.enabled = false;
+        assert!(
+            disabled
+                .set_key(KeyCode::KeyW, true, 1, Duration::from_secs(1))
+                .is_none()
+        );
+        assert_eq!(disabled.preview_offset, [0.0; 2]);
+        let mut unfocused = registered_camera_controller();
+        unfocused.surface_focused = false;
+        assert!(
+            unfocused
+                .set_key(KeyCode::KeyW, true, 1, Duration::from_secs(1))
+                .is_none()
+        );
+        assert_eq!(unfocused.preview_offset, [0.0; 2]);
+    }
+
+    #[test]
+    fn lab_camera_moves_and_emits_only_after_surface_focus() {
+        let mut controller = registered_camera_controller();
+        let sample = controller
+            .set_key(KeyCode::KeyD, true, 7, Duration::from_nanos(20))
+            .unwrap();
+        assert_eq!(sample.camera_id.0, "world-ui-lab");
+        assert_eq!(sample.producer_epoch, 7);
+        assert_eq!(sample.movement_axes, [1.0, 0.0, 0.0]);
+        assert!(controller.preview_offset[0] > 0.0);
+    }
+
+    #[test]
+    fn lab_camera_focus_loss_clears_axes_and_blocks_samples() {
+        let mut controller = registered_camera_controller();
+        controller.set_key(KeyCode::KeyW, true, 1, Duration::ZERO);
+        controller.window_focused = false;
+        controller.surface_focused = false;
+        controller.clear_axes();
+        assert_eq!(controller.axes, [0.0; 3]);
+        assert!(
+            controller
+                .set_key(KeyCode::KeyW, false, 1, Duration::ZERO)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn lab_camera_sends_compact_json_to_the_registered_loopback_provider() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let mut controller = WorldUiLabCameraController {
+            enabled: true,
+            window_focused: true,
+            surface_focused: true,
+            ..Default::default()
+        };
+        controller
+            .register(WorldUiLabCameraRegistration {
+                udp_endpoint: receiver.local_addr().unwrap(),
+                session_id: "test-session".into(),
+                provider_epoch: 1,
+                camera_id: CameraId("world-ui-lab".into()),
+            })
+            .unwrap();
+        let sample = controller
+            .set_key(KeyCode::KeyW, true, 3, Duration::from_nanos(4))
+            .unwrap();
+        controller.send(&sample);
+        let mut bytes = [0_u8; 1024];
+        let (count, _) = receiver.recv_from(&mut bytes).unwrap();
+        let observed: CameraControlSample = serde_json::from_slice(&bytes[..count]).unwrap();
+        assert_eq!(observed, sample);
+    }
+
     #[test]
     fn pointer_probe_accepts_logical_or_physical_coordinates_and_rejects_invalid_input() {
         assert_eq!(
@@ -5646,7 +6544,8 @@ mod tests {
                 CAPABILITY_UI_HIT_TARGET,
                 CAPABILITY_UI_SEMANTIC_EVENT,
                 CAPABILITY_UI_PROGRAM_SEMANTIC_EVENT,
-                CAPABILITY_UI_RENDER_SURFACE
+                CAPABILITY_UI_RENDER_SURFACE,
+                "wgpu.world.info.bridge"
             ])
         );
         assert_eq!(snapshot.status, RpcStatus::Accepted);
@@ -5658,16 +6557,96 @@ mod tests {
                 CAPABILITY_UI_HIT_TARGET,
                 CAPABILITY_UI_SEMANTIC_EVENT,
                 CAPABILITY_UI_PROGRAM_SEMANTIC_EVENT,
-                CAPABILITY_UI_RENDER_SURFACE
+                CAPABILITY_UI_RENDER_SURFACE,
+                "wgpu.world.info.bridge"
             ])
+        );
+    }
+
+    #[test]
+    fn camera_gated_world_panel_is_hidden_until_a_matching_frame_arrives() {
+        let mut runtime = WgpuRuntime::headless(1);
+        runtime
+            .world_bridge
+            .configure_world(WorldInformationSnapshot {
+                world_space_id: neon_world_bridge::WorldSpaceId("project.world.main".into()),
+                revision: Revision(1),
+                coordinate_system:
+                    neon_world_bridge::CoordinateSystem::RightHandedYUpNegativeZForward,
+                units_per_meter: 1.0,
+                precision_mode: neon_world_bridge::WorldPrecisionMode::CameraRelativeF64,
+            })
+            .unwrap();
+        let mut gated = fragment(1);
+        let marker = UiNode {
+            node_id: UiNodeId("marker".into()),
+            kind: UiNodeKind::Panel,
+            bounds: UiBounds {
+                x: 0.0,
+                y: 0.0,
+                width: 10.0,
+                height: 10.0,
+            },
+            layout: None,
+            visible: true,
+            enabled: true,
+            text_key: None,
+            text: None,
+            image: None,
+            surface: None,
+            style: UiStyle::default(),
+            enter_transition: None,
+            children: Vec::new(),
+        };
+        gated.root.children.push(marker);
+        gated.effects.push(UiEffect::CameraVisibility {
+            binding: neon_ui_schema::UiCameraVisibilityBinding {
+                node_id: UiNodeId("marker".into()),
+                camera_id: neon_world_bridge::CameraId("editor".into()),
+                camera_kind: neon_world_bridge::CameraKind::ThreeDimensional,
+            },
+        });
+        runtime.fragments.insert(gated.fragment_id.clone(), gated);
+        assert!(
+            !runtime.fragments_snapshot()[&UiFragmentId("static-fragment".into())]
+                .root
+                .children[0]
+                .visible
+        );
+
+        runtime
+            .world_bridge
+            .submit_camera_frame(CameraFrame {
+                camera_id: neon_world_bridge::CameraId("editor".into()),
+                world_space_id: neon_world_bridge::WorldSpaceId("project.world.main".into()),
+                producer_epoch: 1,
+                sequence: 1,
+                timestamp_monotonic_ns: 1,
+                payload: neon_world_bridge::CameraFramePayload::ThreeDimensional {
+                    position: [0.0, 0.0, 0.0],
+                    orientation: [0.0, 0.0, 0.0, 1.0],
+                    vertical_fov_radians: 1.0,
+                    near: 0.1,
+                    far: 1000.0,
+                },
+            })
+            .unwrap();
+        assert!(
+            runtime.fragments_snapshot()[&UiFragmentId("static-fragment".into())]
+                .root
+                .children[0]
+                .visible
         );
     }
 
     #[test]
     fn window_control_advertises_gpu_generation_capability_only_there() {
         let headless = WgpuRuntime::headless(1);
-        let window =
-            WgpuRuntime::window_control(1, Arc::new(Mutex::new(InteractionTraceStore::new())));
+        let window = WgpuRuntime::window_control(
+            1,
+            Arc::new(Mutex::new(InteractionTraceStore::new())),
+            Arc::new(Mutex::new(WorldUiLabCameraController::default())),
+        );
         assert!(
             !headless
                 .service_description()
