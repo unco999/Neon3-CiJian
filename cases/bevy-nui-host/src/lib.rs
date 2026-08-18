@@ -22,6 +22,9 @@ use neon_protocol::{
 use neon_ui_schema::{UiInputFrame, UiInputValue, UiProgramRevision};
 use serde_json::json;
 
+#[cfg(windows)]
+mod dx12_consumer;
+
 pub const SCREEN_SURFACE_ID: &str = "case.bevy.screen.ui";
 pub const COLOR_TARGET_ID: &str = "case.bevy.screen.ui.color";
 pub const ID_TARGET_ID: &str = "case.bevy.screen.ui.id";
