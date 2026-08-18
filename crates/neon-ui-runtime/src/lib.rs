@@ -2482,6 +2482,7 @@ pub struct UiRuntime {
     ai_terrain: AiTerrainPanelState,
     showcase_text: String,
     host_adapter: Option<UiHostAdapter>,
+    eventd_endpoint: Option<SocketAddr>,
     interaction_traces: InteractionTraceStore,
 }
 
@@ -2504,6 +2505,7 @@ impl UiRuntime {
             ai_terrain: AiTerrainPanelState::default(),
             showcase_text: String::new(),
             host_adapter: None,
+            eventd_endpoint: None,
             interaction_traces: InteractionTraceStore::default(),
         }
     }
@@ -2514,6 +2516,13 @@ impl UiRuntime {
             status: HealthStatus::Healthy,
             epoch: self.epoch,
         }
+    }
+
+    /// Sets the `neon-eventd` endpoint used to publish directed `emitevent`
+    /// observations. Pass `None` to run without event forwarding.
+    pub fn with_eventd_endpoint(mut self, endpoint: Option<SocketAddr>) -> Self {
+        self.eventd_endpoint = endpoint;
+        self
     }
 
     pub fn service_description(&self) -> ServiceDescription {
@@ -2768,10 +2777,12 @@ impl UiRuntime {
         endpoint: SocketAddr,
         wgpu_endpoint: SocketAddr,
         domain_endpoint: SocketAddr,
+        eventd_endpoint: Option<SocketAddr>,
         epoch: u64,
     ) -> Result<(), TransportError> {
         let server = RpcServer::bind(endpoint)?;
-        let mut runtime = Self::new(epoch, "ui-runtime-forwarder");
+        let mut runtime =
+            Self::new(epoch, "ui-runtime-forwarder").with_eventd_endpoint(eventd_endpoint);
         server.serve_until(|request| {
             let shutdown = request.method == "service.shutdown";
             let request_id = request.request_id.clone();
@@ -3240,7 +3251,8 @@ impl UiRuntime {
                 ))
             })?;
         let mut adapter = UiHostAdapter::activate(config.program, config.input_schema, self.epoch)
-            .map_err(|error| TransportError::Io(std::io::Error::other(error.message)))?;
+            .map_err(|error| TransportError::Io(std::io::Error::other(error.message)))?
+            .with_event_publisher(self.eventd_endpoint, self.client.clone());
         let initial_grids = self
             .cached_fragment
             .as_ref()

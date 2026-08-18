@@ -21,16 +21,29 @@ fn main() {
             .expect("domain endpoint is required")
             .parse()
             .expect("domain endpoint must be a socket address");
-        if let Err(error) =
-            neon_ui_runtime::UiRuntime::serve_forwarder(endpoint, wgpu_endpoint, domain_endpoint, 1)
-        {
+        let eventd_endpoint = args
+            .iter()
+            .position(|argument| argument == "--eventd")
+            .and_then(|index| args.get(index + 1))
+            .map(|endpoint| {
+                endpoint
+                    .parse()
+                    .expect("eventd endpoint must be a socket address")
+            });
+        if let Err(error) = neon_ui_runtime::UiRuntime::serve_forwarder(
+            endpoint,
+            wgpu_endpoint,
+            domain_endpoint,
+            eventd_endpoint,
+            1,
+        ) {
             eprintln!("neon-ui-runtime failed: {error}");
             std::process::exit(1);
         }
         return;
     }
     eprintln!(
-        "usage: neon-ui-runtime --forward-server <ui-loopback-endpoint> <wgpu-loopback-endpoint> <ui-host-loopback-endpoint>"
+        "usage: neon-ui-runtime --forward-server <ui-loopback-endpoint> <wgpu-loopback-endpoint> <ui-host-loopback-endpoint> [--eventd <eventd-loopback-endpoint>]"
     );
     std::process::exit(2);
 }

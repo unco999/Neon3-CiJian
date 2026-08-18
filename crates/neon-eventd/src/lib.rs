@@ -382,6 +382,10 @@ impl EventdCore {
 pub struct Eventd {
     core: std::sync::Arc<std::sync::Mutex<EventdCore>>,
     endpoint: String,
+    /// Immutable service epoch, copied out of `EventdCore` so that
+    /// `service_description`/`debug_snapshot` can read it without re-locking
+    /// the core (which would deadlock when called from `handle_rpc`).
+    epoch: u64,
 }
 
 impl Eventd {
@@ -404,6 +408,7 @@ impl Eventd {
         Self {
             core: std::sync::Arc::new(std::sync::Mutex::new(core)),
             endpoint: "headless://eventd".into(),
+            epoch,
         }
     }
 
@@ -427,7 +432,7 @@ impl Eventd {
     }
 
     pub fn epoch(&self) -> u64 {
-        self.core.lock().expect("eventd core lock").epoch
+        self.epoch
     }
 
     pub fn debug_snapshot(&self) -> DebugSnapshot {
@@ -500,7 +505,18 @@ impl Eventd {
             })),
             "service.describe" => Ok(json!(self.service_description())),
             "service.shutdown" => Ok(json!({"state": "accepted"})),
-            "debug.snapshot.get" => Ok(json!(self.debug_snapshot())),
+            "debug.snapshot.get" => Ok(json!(DebugSnapshot {
+                service: ServiceName(SERVICE_NAME.into()),
+                epoch: guard.epoch,
+                revision: Revision(0),
+                health: HealthStatus::Healthy,
+                capabilities: self.service_description().capabilities,
+                active_jobs: guard
+                    .subscribers
+                    .iter()
+                    .map(|(id, _)| format!("subscriber-{id}"))
+                    .collect(),
+            })),
             "debug.health.check" => Ok(json!(ServiceHealth {
                 service: ServiceName(SERVICE_NAME.into()),
                 status: HealthStatus::Healthy,

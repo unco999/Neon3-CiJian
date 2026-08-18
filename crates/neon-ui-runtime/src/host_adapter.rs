@@ -4,7 +4,9 @@
 //! a domain owner for semantic intents.
 
 use std::collections::{HashMap, HashSet};
+use std::net::SocketAddr;
 
+use neon_protocol::ClientIdentity;
 use neon_ui_schema::{
     UiDataGridInputFrame, UiFragment, UiHostInbound, UiHostPresentationUpdate, UiHostPublication,
     UiInputSchema, UiProgram, UiProgramDragDropEvent, UiProgramInputSnapshot,
@@ -12,7 +14,9 @@ use neon_ui_schema::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::{UiDataGridStore, UiInputStore, UiInputStoreError, UiInputWriter};
+use crate::{
+    UiDataGridStore, UiInputStore, UiInputStoreError, UiInputWriter, UiVariableEventPublisher,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UiHostAdapterError {
@@ -60,6 +64,10 @@ pub struct UiHostAdapter {
     grids: UiDataGridStore,
     renderer_epoch: u64,
     publication_results: HashMap<String, UiHostPublicationResult>,
+    /// Optional directed-event forwarder. When present and the active Flow
+    /// declared `emitevent` variables, `apply_publication` publishes
+    /// `flow.<flow_name>.<variable_key>` observations to `neon-eventd`.
+    publisher: Option<UiVariableEventPublisher>,
 }
 
 impl UiHostAdapter {
@@ -114,11 +122,40 @@ impl UiHostAdapter {
             grids: UiDataGridStore::default(),
             renderer_epoch,
             publication_results: HashMap::new(),
+            publisher: None,
         })
     }
 
     pub fn program(&self) -> &UiProgram {
         &self.program
+    }
+
+    /// Attaches the UI Runtime's directed-event publisher. The event name is
+    /// derived from the active Flow's `flow <name>` declaration and each input
+    /// slot's `emitevent` attribute: only declared variables emit
+    /// `flow.<flow_name>.<variable_key>`, and only when an `neon-eventd`
+    /// endpoint is provided.
+    pub fn with_event_publisher(
+        mut self,
+        eventd_endpoint: Option<SocketAddr>,
+        client: ClientIdentity,
+    ) -> Self {
+        let schema = self.inputs.schema();
+        let flow_name = schema.flow_name.clone();
+        let publisher = UiVariableEventPublisher::new(
+            eventd_endpoint,
+            client,
+            if flow_name.is_empty() {
+                "ui_runtime".to_owned()
+            } else {
+                flow_name.clone()
+            },
+            schema.schema_id.clone(),
+            flow_name,
+            schema.emit_event_keys.clone(),
+        );
+        self.publisher = Some(publisher);
+        self
     }
 
     pub fn input_schema(&self) -> &UiInputSchema {
@@ -228,6 +265,10 @@ impl UiHostAdapter {
 
         self.inputs = candidate_inputs;
         self.grids = candidate_grids;
+        if let Some(publisher) = &self.publisher {
+            // Best-effort directed observation; never rolls back the applied frame.
+            let _ = publisher.publish_variable_changes(&scalar.variable_changes);
+        }
         let result = UiHostPublicationResult {
             snapshot: self.snapshot(),
             changed_slots: scalar.changed_slots,
@@ -992,5 +1033,125 @@ mod tests {
                 .code,
             "ui_host_invalid_drag_drop"
         );
+    }
+
+    #[test]
+    fn apply_publication_publishes_emitevent_to_eventd() {
+        use neon_ipc::{read_json_frame, write_json_frame, DEFAULT_MAX_FRAME_SIZE};
+        use neon_protocol::{ClientKind, EventAck, EventAckStatus, EventFrame, EventId, EventResponse};
+
+        // Stand in for neon-eventd: accept one publish frame and assert it is the
+        // directed `flow.<flow_name>.<variable>` observation.
+        let server = neon_ipc::RpcServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let endpoint = server.local_addr().unwrap();
+        let server_thread = std::thread::spawn(move || {
+            let mut stream = server.accept().unwrap();
+            let frame: EventFrame =
+                read_json_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE).unwrap();
+            let EventFrame::Publish(publish) = frame else {
+                panic!("expected a publish frame");
+            };
+            assert_eq!(publish.name, "flow.test-flow.enabled");
+            assert_eq!(publish.payload["variable_key"], "enabled");
+            assert_eq!(publish.payload["kind"], "bool");
+            assert_eq!(publish.payload["module"], "test-flow");
+            assert_eq!(publish.payload["surface"], "surface.test-flow.inputs");
+            write_json_frame(
+                &mut stream,
+                &EventResponse::Ack(EventAck {
+                    protocol: publish.protocol,
+                    version: publish.version,
+                    request_id: publish.request_id,
+                    status: EventAckStatus::Accepted,
+                    event_id: Some(EventId("evt-1-1".into())),
+                    epoch: Some(1),
+                    sequence: Some(1),
+                    current_sequence: Some(1),
+                    error: None,
+                }),
+                DEFAULT_MAX_FRAME_SIZE,
+            )
+            .unwrap();
+        });
+
+        let revision = revision();
+        let schema = UiInputSchema {
+            schema_id: "surface.test-flow.inputs".into(),
+            version: 1,
+            layout_hash: "layout".into(),
+            slots: vec![UiInputSlot {
+                key: "enabled".into(),
+                kind: UiInputKind::Bool,
+                default_value: UiInputValue::Bool { value: false },
+                update_class: UiInputUpdateClass::ReliableExternal,
+                semantic_label: "enabled".into(),
+                packing: UiInputPacking {
+                    alignment: 4,
+                    lanes: 1,
+                    offset: 0,
+                    representation: neon_ui_schema::UiGpuScalarRepresentation::Bool32,
+                },
+            }],
+            grid_slots: Vec::new(),
+            flow_name: "test-flow".into(),
+            emit_event_keys: vec!["enabled".into()],
+        };
+        let program = UiProgram {
+            revision: revision.clone(),
+            nodes: Vec::new(),
+            node_templates: Vec::new(),
+            literal_texts: Vec::new(),
+            layout_records: Vec::new(),
+            binding_records: Vec::new(),
+            branch_records: Vec::new(),
+            template_records: Vec::new(),
+            data_grid_records: Vec::new(),
+            drag_records: Vec::new(),
+            drop_records: Vec::new(),
+            event_records: Vec::new(),
+            resource_budget: UiResourceBudget {
+                max_nodes: 0,
+                max_bindings: 0,
+                max_instances: 0,
+                max_text_records: 0,
+                max_glyph_instances: 0,
+                max_events: 0,
+                max_clips: 0,
+            },
+            dependency_index: neon_ui_schema::UiDependencyIndex {
+                input_to_bindings: BTreeMap::new(),
+                node_to_source_span: BTreeMap::new(),
+                node_to_dependents: BTreeMap::new(),
+            },
+            layout_hash: "layout".into(),
+        };
+        let mut adapter = UiHostAdapter::activate(program, schema, 7)
+            .unwrap()
+            .with_event_publisher(
+                Some(endpoint),
+                ClientIdentity {
+                    kind: ClientKind::UiRuntime,
+                    instance_id: "host-test".into(),
+                    pid: 1,
+                    origin: "test".into(),
+                },
+            );
+        let publication = UiHostPublication {
+            scalar_frame: neon_ui_schema::UiInputFrame {
+                program_revision: revision,
+                expected_input_revision: Revision(0),
+                request_id: "pub-request".into(),
+                idempotency_key: "pub-key".into(),
+                changes: vec![UiInputChange {
+                    key: "enabled".into(),
+                    value: UiInputValue::Bool { value: true },
+                }],
+            },
+            grid_inputs: Vec::new(),
+            presentation_update: None,
+        };
+        let result = adapter.apply_publication(publication).unwrap();
+        assert_eq!(result.changed_slots, vec!["enabled".to_owned()]);
+        server_thread.join().unwrap();
     }
 }

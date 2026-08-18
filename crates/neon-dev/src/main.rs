@@ -142,10 +142,17 @@ fn run_case(case: &str, show_logs: bool) -> io::Result<()> {
     let wgpu_endpoint = reserve_loopback_endpoint()?;
     let ui_endpoint = reserve_loopback_endpoint()?;
     let host_endpoint = reserve_loopback_endpoint()?;
+    let eventd_endpoint = reserve_loopback_endpoint()?;
     let job = ProcessJob::new()?;
     let mut children = ChildSession::default();
-    let mut manifest =
-        LiveSessionManifest::start(&workspace, case, wgpu_endpoint, ui_endpoint, host_endpoint)?;
+    let mut manifest = LiveSessionManifest::start(
+        &workspace,
+        case,
+        wgpu_endpoint,
+        ui_endpoint,
+        host_endpoint,
+        eventd_endpoint,
+    )?;
 
     let result = run_case_session(
         &workspace,
@@ -154,6 +161,7 @@ fn run_case(case: &str, show_logs: bool) -> io::Result<()> {
         wgpu_endpoint,
         ui_endpoint,
         host_endpoint,
+        eventd_endpoint,
         &job,
         &mut children,
         &mut manifest,
@@ -179,6 +187,7 @@ fn run_case_session(
     wgpu_endpoint: SocketAddr,
     ui_endpoint: SocketAddr,
     host_endpoint: SocketAddr,
+    eventd_endpoint: SocketAddr,
     job: &ProcessJob,
     children: &mut ChildSession,
     manifest: &mut LiveSessionManifest,
@@ -198,6 +207,23 @@ fn run_case_session(
         children.push(projectd);
         wait_for_endpoint(endpoint)?;
     }
+    // The event hub is a UI Runtime baseline capability, not a per-case fixture:
+    // every case starts it so declared `emitevent` variables have a place to go.
+    let eventd_endpoint_text = eventd_endpoint.to_string();
+    let eventd = spawn_service(
+        executable(workspace, "neon-eventd"),
+        &["--server", &eventd_endpoint_text, "1"],
+        show_logs,
+    )?;
+    job.assign(&eventd)?;
+    let eventd_pid = eventd.id();
+    children.push(eventd);
+    manifest.spawned(ManifestService::Eventd, eventd_pid)?;
+    wait_for_endpoint(eventd_endpoint)?;
+    manifest.ready(
+        ManifestService::Eventd,
+        query_process_epoch(eventd_endpoint, "eventd"),
+    )?;
     let wgpu_endpoint_text = wgpu_endpoint.to_string();
     let ui_endpoint_text = ui_endpoint.to_string();
     let projectd_endpoint_text = projectd_endpoint.map(|endpoint| endpoint.to_string());
@@ -275,6 +301,8 @@ fn run_case_session(
                 &ui_endpoint_text,
                 &wgpu_endpoint_text,
                 &host_endpoint_text,
+                "--eventd",
+                &eventd_endpoint_text,
             ],
             show_logs,
         )?
@@ -1380,6 +1408,7 @@ enum ManifestService {
     Wgpu,
     Ui,
     Host,
+    Eventd,
 }
 
 impl ManifestService {
@@ -1388,6 +1417,7 @@ impl ManifestService {
             Self::Wgpu => 0,
             Self::Ui => 1,
             Self::Host => 2,
+            Self::Eventd => 3,
         }
     }
 }
@@ -1400,10 +1430,10 @@ struct LiveSessionManifest {
     stopped_at_unix_ms: Option<u64>,
     failure: Option<String>,
     supervisor_pid: u32,
-    pids: [Option<u32>; 3],
-    endpoints: [SocketAddr; 3],
-    process_epochs: [Option<u64>; 3],
-    service_ready: [bool; 3],
+    pids: [Option<u32>; 4],
+    endpoints: [SocketAddr; 4],
+    process_epochs: [Option<u64>; 4],
+    service_ready: [bool; 4],
     window_viewport: Option<serde_json::Value>,
     session_path: PathBuf,
     latest_path: PathBuf,
@@ -1416,6 +1446,7 @@ impl LiveSessionManifest {
         wgpu_endpoint: SocketAddr,
         ui_endpoint: SocketAddr,
         host_endpoint: SocketAddr,
+        eventd_endpoint: SocketAddr,
     ) -> io::Result<Self> {
         let started_at_unix_ms = unix_time_ms()?;
         let session_id = format!("{started_at_unix_ms}-{}", std::process::id());
@@ -1430,10 +1461,10 @@ impl LiveSessionManifest {
             stopped_at_unix_ms: None,
             failure: None,
             supervisor_pid: std::process::id(),
-            pids: [None; 3],
-            endpoints: [wgpu_endpoint, ui_endpoint, host_endpoint],
-            process_epochs: [None; 3],
-            service_ready: [false; 3],
+            pids: [None; 4],
+            endpoints: [wgpu_endpoint, ui_endpoint, host_endpoint, eventd_endpoint],
+            process_epochs: [None; 4],
+            service_ready: [false; 4],
             window_viewport: None,
         };
         manifest.persist_session()?;
@@ -1543,21 +1574,25 @@ impl LiveSessionManifest {
                 "wgpu": self.pids[0],
                 "ui": self.pids[1],
                 "host": self.pids[2],
+                "eventd": self.pids[3],
             },
             "endpoints": {
                 "wgpu": self.endpoints[0].to_string(),
                 "ui": self.endpoints[1].to_string(),
                 "host": self.endpoints[2].to_string(),
+                "eventd": self.endpoints[3].to_string(),
             },
             "process_epoch": {
                 "wgpu": self.process_epochs[0],
                 "ui": self.process_epochs[1],
                 "host": self.process_epochs[2],
+                "eventd": self.process_epochs[3],
             },
             "services": [
                 {"name": "wgpu-runtime", "pid": self.pids[0], "endpoint": self.endpoints[0].to_string(), "process_epoch": self.process_epochs[0], "state": service_state(0)},
                 {"name": "ui-runtime", "pid": self.pids[1], "endpoint": self.endpoints[1].to_string(), "process_epoch": self.process_epochs[1], "state": service_state(1)},
                 {"name": "ui-host", "pid": self.pids[2], "endpoint": self.endpoints[2].to_string(), "process_epoch": self.process_epochs[2], "state": service_state(2)},
+                {"name": "eventd", "pid": self.pids[3], "endpoint": self.endpoints[3].to_string(), "process_epoch": self.process_epochs[3], "state": service_state(3)},
             ],
             "debug": {
                 "snapshot": {"endpoint": self.endpoints[0].to_string(), "method": "debug.snapshot.get"},
@@ -2456,6 +2491,7 @@ mod tests {
             "127.0.0.1:4101".parse().unwrap(),
             "127.0.0.1:4102".parse().unwrap(),
             "127.0.0.1:4103".parse().unwrap(),
+            "127.0.0.1:4104".parse().unwrap(),
         )
         .unwrap();
         manifest.spawned(ManifestService::Wgpu, 101).unwrap();
@@ -2519,12 +2555,13 @@ mod tests {
             "127.0.0.1:4101".parse().unwrap(),
             "127.0.0.1:4102".parse().unwrap(),
             "127.0.0.1:4103".parse().unwrap(),
+            "127.0.0.1:4104".parse().unwrap(),
         )
         .unwrap();
         let manifest = manifest.value();
         assert_eq!(manifest["kind"], "neon3.session");
         assert_eq!(manifest["window_mode"], "windowed");
-        assert_eq!(manifest["services"].as_array().unwrap().len(), 3);
+        assert_eq!(manifest["services"].as_array().unwrap().len(), 4);
         assert_eq!(
             manifest["debug"]["interaction_get"]["method"],
             "debug.interaction.get"
