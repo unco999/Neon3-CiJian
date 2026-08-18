@@ -1,0 +1,14 @@
+surface character.player.main.status revision 1
+flow character-status
+input health f32:0..100 default 82 emitevent
+input mana f32:0..100 default 64 emitevent
+input level u32 default 12
+surface status-root column w 320 h 96
+  row status-header w 320 h 28
+    text avatar value "[A]"
+    text name value "Astra"
+    text level value "Lv 12"
+  row bars w 320 h 48
+    progress health_bar value health
+    progress mana_bar value mana
+  text status-effect value "Ready"

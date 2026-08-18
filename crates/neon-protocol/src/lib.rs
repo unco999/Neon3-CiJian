@@ -357,6 +357,76 @@ pub struct RenderSurfaceOpen {
     pub depth: bool,
     pub buffer_count: u8,
     pub placement: Option<RenderSurfacePlacement>,
+    #[serde(default)]
+    pub targets: Vec<RenderSurfaceTarget>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RenderSurfaceTargetKind {
+    Color,
+    Id,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RenderSurfaceTarget {
+    pub target_id: String,
+    pub kind: RenderSurfaceTargetKind,
+    pub format: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RenderSurfaceTargetsDescriptor {
+    pub surface_id: String,
+    pub generation: u64,
+    pub size: RenderSurfaceSize,
+    pub color_target_id: String,
+    pub id_target_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostUiPointerClick {
+    pub session_id: String,
+    pub surface_id: String,
+    pub id_target_id: String,
+    pub generation: u64,
+    pub frame_sequence: u64,
+    pub pointer_id: u64,
+    pub sequence: u64,
+    pub pixel: [u32; 2],
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostCameraSnapshot {
+    pub session_id: String,
+    pub camera_id: String,
+    pub revision: Revision,
+    pub position: [f32; 3],
+    pub rotation_xyzw: [f32; 4],
+    pub projection: HostCameraProjection,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum HostCameraProjection {
+    Perspective {
+        fov_y_radians: f32,
+        aspect: f32,
+        near: f32,
+        far: f32,
+    },
+    Orthographic {
+        left: f32,
+        right: f32,
+        bottom: f32,
+        top: f32,
+        near: f32,
+        far: f32,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1090,5 +1160,34 @@ mod tests {
         let mut missing_fence = value;
         missing_fence.as_object_mut().unwrap().remove("fence_value");
         assert!(serde_json::from_value::<RenderFrameReady>(missing_fence).is_err());
+    }
+
+    #[test]
+    fn external_surface_open_round_trips_color_and_id_targets() {
+        let open = RenderSurfaceOpen {
+            session_id: "bevy-session".into(),
+            surface_id: "bevy.screen".into(),
+            kind: RenderSurfaceKind::ScreenUi,
+            size: RenderSurfaceSize { width: 1280, height: 720 },
+            format: "rgba8unorm".into(),
+            depth: false,
+            buffer_count: 1,
+            placement: None,
+            targets: vec![
+                RenderSurfaceTarget {
+                    target_id: "bevy.screen.color".into(),
+                    kind: RenderSurfaceTargetKind::Color,
+                    format: "rgba8unorm".into(),
+                },
+                RenderSurfaceTarget {
+                    target_id: "bevy.screen.id".into(),
+                    kind: RenderSurfaceTargetKind::Id,
+                    format: "r32uint".into(),
+                },
+            ],
+        };
+        let value = serde_json::to_value(&open).unwrap();
+        assert_eq!(value["targets"][1]["kind"], "id");
+        assert_eq!(serde_json::from_value::<RenderSurfaceOpen>(value).unwrap(), open);
     }
 }

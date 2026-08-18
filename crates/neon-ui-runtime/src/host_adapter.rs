@@ -41,7 +41,7 @@ impl From<UiInputStoreError> for UiHostAdapterError {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct UiHostPublicationResult {
     pub snapshot: UiProgramInputSnapshot,
     pub changed_slots: Vec<String>,
@@ -276,6 +276,20 @@ impl UiHostAdapter {
         };
         self.publication_results.insert(key, result.clone());
         Ok(result)
+    }
+
+    /// Applies a host-owned sparse input frame without pretending it was a UI
+    /// interaction. Semantic clicks use `ui.host.inbound`; ECS state updates use
+    /// this separate reliable input path.
+    pub fn apply_external_input(
+        &mut self,
+        frame: neon_ui_schema::UiInputFrame,
+    ) -> Result<UiHostPublicationResult, UiHostAdapterError> {
+        self.apply_publication(UiHostPublication {
+            scalar_frame: frame,
+            grid_inputs: Vec::new(),
+            presentation_update: None,
+        })
     }
 
     pub fn apply_presentation_update(

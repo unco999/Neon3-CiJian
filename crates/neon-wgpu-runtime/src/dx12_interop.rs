@@ -19,7 +19,7 @@ use windows::{
                 D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COMMON, D3D12_TEXTURE_LAYOUT_UNKNOWN,
                 ID3D12Device, ID3D12Fence, ID3D12Resource,
             },
-            Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC},
+            Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R32_UINT, DXGI_SAMPLE_DESC},
         },
         System::Threading::{GetCurrentProcess, OpenProcess, PROCESS_DUP_HANDLE},
     },
@@ -113,11 +113,17 @@ pub fn create_shared_surface(
     adapter: &wgpu::Adapter,
     width: u32,
     height: u32,
+    format: wgpu::TextureFormat,
 ) -> Result<SharedSurface, Error> {
     let adapter_info = adapter_info(adapter)?;
     let hal_device = unsafe { device.as_hal::<wgpu::hal::api::Dx12>() }
         .ok_or(Error::MissingHalDevice)?;
     let raw_device: &ID3D12Device = hal_device.raw_device();
+    let dxgi_format = match format {
+        wgpu::TextureFormat::Rgba8Unorm => DXGI_FORMAT_R8G8B8A8_UNORM,
+        wgpu::TextureFormat::R32Uint => DXGI_FORMAT_R32_UINT,
+        _ => return Err(Error::CreateResource("unsupported shared surface format".into())),
+    };
     let desc = D3D12_RESOURCE_DESC {
         Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
         Alignment: 0,
@@ -125,7 +131,7 @@ pub fn create_shared_surface(
         Height: height,
         DepthOrArraySize: 1,
         MipLevels: 1,
-        Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+        Format: dxgi_format,
         SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
         Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
         Flags: D3D12_RESOURCE_FLAG_NONE,
@@ -169,7 +175,7 @@ pub fn create_shared_surface(
     let hal_texture = unsafe {
         wgpu::hal::dx12::Device::texture_from_raw(
             resource.clone(),
-            wgpu::TextureFormat::Rgba8Unorm,
+            format,
             wgpu::TextureDimension::D2,
             wgpu::Extent3d {
                 width,
@@ -193,7 +199,7 @@ pub fn create_shared_surface(
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8Unorm,
+                format,
                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT
                     | wgpu::TextureUsages::TEXTURE_BINDING,
                 view_formats: &[],

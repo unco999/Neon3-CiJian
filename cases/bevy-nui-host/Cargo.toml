@@ -1,0 +1,15 @@
+[package]
+name = "neon3-bevy-nui-host"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+bevy = "0.19.1"
+bevy_render = "0.19.1"
+neon-ipc = { path = "../../crates/neon-ipc" }
+neon-protocol = { path = "../../crates/neon-protocol" }
+neon-ui-schema = { path = "../../crates/neon-ui-schema" }
+serde_json = "1.0"

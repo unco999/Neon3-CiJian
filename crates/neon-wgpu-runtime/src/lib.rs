@@ -1018,6 +1018,8 @@ struct WindowGpu {
     #[cfg(windows)]
     external_surfaces: HashMap<String, dx12_interop::SharedSurface>,
     #[cfg(windows)]
+    external_id_surfaces: HashMap<String, dx12_interop::SharedSurface>,
+    #[cfg(windows)]
     external_handle_tokens: HashMap<String, (String, String)>,
     config: wgpu::SurfaceConfiguration,
     scale_factor: f64,
@@ -2418,6 +2420,43 @@ impl WindowGpu {
                 .ok_or_else(|| "dx12_queue_unavailable".to_owned())?;
             hal_queue.add_signal_fence(shared.fence.clone(), fence_value);
         }
+        for (surface_id, shared) in self.external_id_surfaces.iter_mut() {
+            let view = shared.texture.create_view(&wgpu::TextureViewDescriptor::default());
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("neon3-external-host-id-surface-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            let fragments = fragments;
+            self.ui.draw_hit_id(
+                &self.device,
+                &self.queue,
+                &mut pass,
+                fragments,
+                [shared.width, shared.height],
+                [shared.width as f32, shared.height as f32],
+                self.started_at.elapsed().as_secs_f32(),
+            );
+            drop(pass);
+            shared.frame_sequence = self
+                .external_surfaces
+                .get(surface_id)
+                .map_or(shared.frame_sequence.saturating_add(1), |color| color.frame_sequence);
+            let hal_queue = unsafe { self.queue.as_hal::<wgpu::hal::api::Dx12>() }
+                .ok_or_else(|| "dx12_queue_unavailable".to_owned())?;
+            hal_queue.add_signal_fence(shared.fence.clone(), shared.frame_sequence);
+        }
         Ok(())
     }
 
@@ -2712,6 +2751,8 @@ impl WindowGpu {
             #[cfg(windows)]
             external_surfaces: HashMap::new(),
             #[cfg(windows)]
+            external_id_surfaces: HashMap::new(),
+            #[cfg(windows)]
             external_handle_tokens: HashMap::new(),
             config,
             scale_factor: window.scale_factor(),
@@ -2833,16 +2874,42 @@ impl WindowGpu {
         if open.buffer_count != 1 {
             return Err("buffer_ring_not_ready".into());
         }
+        let id_target = open.targets.iter().find(|target| {
+            target.kind == neon_protocol::RenderSurfaceTargetKind::Id
+        });
+        if let Some(id_target) = id_target
+            && id_target.format != "r32uint"
+        {
+            return Err("id_target_format_unsupported".into());
+        }
         let shared = dx12_interop::create_shared_surface(
             &self.device,
             &self.adapter,
             open.size.width.max(1),
             open.size.height.max(1),
+            wgpu::TextureFormat::Rgba8Unorm,
         )
         .map_err(|error| error.to_string())?;
         let generation = 1;
         let surface_id = open.surface_id.clone();
         self.external_surfaces.insert(surface_id, shared);
+        if id_target.is_some() {
+            let id_surface = dx12_interop::create_shared_surface(
+                &self.device,
+                &self.adapter,
+                open.size.width.max(1),
+                open.size.height.max(1),
+                wgpu::TextureFormat::R32Uint,
+            )
+            .map_err(|error| error.to_string())?;
+            self.external_id_surfaces.insert(open.surface_id.clone(), id_surface);
+            let id_texture_token = format!("surface:{}:id-texture:g{}", open.surface_id, generation);
+            let id_fence_token = format!("surface:{}:id-fence:g{}", open.surface_id, generation);
+            self.external_handle_tokens.insert(
+                format!("{}:id", open.surface_id),
+                (id_texture_token.clone(), id_fence_token.clone()),
+            );
+        }
         let texture_token = format!("surface:{}:texture:g{}", open.surface_id, generation);
         let fence_token = format!("surface:{}:fence:g{}", open.surface_id, generation);
         self.external_handle_tokens.insert(
@@ -2866,6 +2933,10 @@ impl WindowGpu {
                 "kind": "d3d12_shared_fence",
                 "broker_token": fence_token,
                 "initial_value": 0
+            },
+            "targets": {
+                "color_target_id": open.targets.iter().find(|target| target.kind == neon_protocol::RenderSurfaceTargetKind::Color).map(|target| target.target_id.clone()).unwrap_or_else(|| open.surface_id.clone()),
+                "id_target_id": id_target.map(|target| target.target_id.clone())
             }
         }))
     }
@@ -2885,14 +2956,28 @@ impl WindowGpu {
             .map_err(|error| error.to_string())?;
         let fence_handle = dx12_interop::duplicate_handle_to_process(shared.fence_handle, pid)
             .map_err(|error| error.to_string())?;
-        Ok(json!({
+        let mut result = json!({
             "surface_id": surface_id,
             "pid": pid,
             "texture_token": texture_token,
             "fence_token": fence_token,
             "texture_handle": texture_handle,
             "fence_handle": fence_handle
-        }))
+        });
+        if let Some(id_surface) = self.external_id_surfaces.get(surface_id) {
+            let id_texture_handle = dx12_interop::duplicate_handle_to_process(id_surface.texture_handle, pid)
+                .map_err(|error| error.to_string())?;
+            let id_fence_handle = dx12_interop::duplicate_handle_to_process(id_surface.fence_handle, pid)
+                .map_err(|error| error.to_string())?;
+            let Some((id_texture_token, id_fence_token)) = self.external_handle_tokens.get(&format!("{}:id", surface_id)) else {
+                return Err("id_surface_broker_token_not_found".into());
+            };
+            result["id_texture_token"] = json!(id_texture_token);
+            result["id_fence_token"] = json!(id_fence_token);
+            result["id_texture_handle"] = json!(id_texture_handle);
+            result["id_fence_handle"] = json!(id_fence_handle);
+        }
+        Ok(result)
     }
 
     #[cfg(windows)]
@@ -2906,6 +2991,7 @@ impl WindowGpu {
             "frame_sequence": shared.frame_sequence,
             "buffer_index": 0,
             "fence_value": shared.frame_sequence
+            ,"id_frame_sequence": self.external_id_surfaces.get(surface_id).map(|id| id.frame_sequence)
         }))
     }
 

@@ -2578,6 +2578,7 @@ impl UiRuntime {
             "ui.ai.terrain.snapshot.get" => Some(self.ai_terrain.snapshot()),
             "ui.surface.event" => return self.handle_surface_event(request),
             "ui.input.event" => return self.handle_input_event(request),
+            "ui.input.frame" => return self.handle_external_input_frame(request),
             "ui.intent.dispatch" => return self.handle_intent_dispatch(request),
             _ => None,
         };
@@ -3724,6 +3725,30 @@ impl UiRuntime {
                 )
             }
             Err(code) => self.rejected(request.request_id, code, "UI semantic event was rejected"),
+        }
+    }
+
+    fn handle_external_input_frame(&mut self, request: RpcRequest) -> RpcResponse {
+        let frame = match serde_json::from_value::<UiInputFrame>(request.params) {
+            Ok(frame) => frame,
+            Err(_) => {
+                return self.rejected(
+                    request.request_id,
+                    "invalid_input_frame",
+                    "invalid external UI input frame",
+                );
+            }
+        };
+        let Some(adapter) = self.host_adapter.as_mut() else {
+            return self.rejected(
+                request.request_id,
+                "ui_host_adapter_unavailable",
+                "no active UI host adapter is configured",
+            );
+        };
+        match adapter.apply_external_input(frame) {
+            Ok(result) => self.accepted(request.request_id, json!(result)),
+            Err(error) => self.rejected(request.request_id, error.code, error.message),
         }
     }
 

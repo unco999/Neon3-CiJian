@@ -6,3 +6,4 @@
 *.ttf
 /assets
 *.log
+/cases/bevy-nui-host/target
