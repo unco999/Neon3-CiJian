@@ -3539,6 +3539,7 @@ dependencies = [
  "neon-ipc",
  "neon-protocol",
  "neon-ui-schema",
+ "neon-world-bridge",
  "serde_json",
  "wgpu",
  "wgpu-hal",

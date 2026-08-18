@@ -71,4 +71,22 @@ host synchronization, not gameplay commands and not automatic ECS mutations.
 
 The Bevy `RenderApp` now owns a `Neon3ExternalSurfaceGpu` render resource with
 matching color/id formats and frame identity. Native D3D12 handle import and the
-fullscreen draw remain the next Windows-specific consumer step.
+handle acquisition and color fullscreen overlay are now wired. The Windows helper uses Bevy's own
+`wgpu 29.0.4 / wgpu-hal 29.0.4` types to call `OpenSharedHandle` and wrap the
+resource without copying pixels. The remaining consumer work is fence wait,
+ID target import/readback, and automatic pointer-click submission.
+
+## World and camera synchronization
+
+The case uses the existing Neon3 world bridge instead of a Bevy-specific camera
+protocol:
+
+```text
+startup: wgpu.world.info.configure
+runtime: wgpu.world.camera.submit_frame
+```
+
+Each camera frame carries the world space ID, producer epoch, monotonic sequence,
+position, quaternion orientation, FOV, near plane, and far plane. Neon rejects
+wrong-world and stale frames. A World UI declaration must use the same world space
+and camera identity before it becomes visible.

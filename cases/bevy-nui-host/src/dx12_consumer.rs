@@ -32,6 +32,7 @@ impl fmt::Display for ImportError {
 
 impl std::error::Error for ImportError {}
 
+#[derive(Debug)]
 pub struct ImportedTexture {
     pub texture: wgpu::Texture,
     pub view: wgpu::TextureView,

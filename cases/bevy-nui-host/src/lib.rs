@@ -8,16 +8,23 @@ use std::{net::SocketAddr, sync::{mpsc, Arc, Mutex}, thread};
 
 use bevy::prelude::*;
 use bevy_render::{
+    extract_resource::{ExtractResource, ExtractResourcePlugin},
     render_resource::TextureFormat,
-    renderer::{RenderDevice, RenderQueue},
+    render_resource::{BindGroup, RenderPipeline},
+    renderer::{RenderContext, RenderDevice, RenderQueue, ViewQuery},
+    view::ViewTarget,
     Render, RenderApp,
 };
 use neon_ipc::{EventClient, RpcClient};
 use neon_protocol::{
-    ClientIdentity, ClientKind, HostCameraProjection, HostCameraSnapshot, HostUiPointerClick,
+    ClientIdentity, ClientKind, HostUiPointerClick,
     PROTOCOL_VERSION, RenderSurfaceKind, RenderSurfaceOpen, RenderSurfaceSize, RenderSurfaceTarget,
     EventFilter, EventFrame, EventSubscribe, RenderSurfaceTargetKind,
     RequestId, Revision, RpcRequest, RpcResponse, ServiceName, EVENT_PROTOCOL,
+};
+use neon_world_bridge::{
+    CameraFrame, CameraFramePayload, CameraId, CoordinateSystem, WorldInformationSnapshot,
+    WorldPrecisionMode, WorldSpaceId,
 };
 use neon_ui_schema::{UiInputFrame, UiInputValue, UiProgramRevision};
 use serde_json::json;
@@ -170,6 +177,7 @@ pub struct Neon3Session {
     pub camera_revision: Revision,
     pub connected: bool,
     pub last_error: Option<String>,
+    pub acquire_requested: bool,
 }
 
 #[derive(Resource, Default)]
@@ -190,7 +198,7 @@ pub struct Neon3VariableEvents {
     pub events: Vec<Neon3VariableEvent>,
 }
 
-#[derive(Resource, Clone, Debug)]
+#[derive(Resource, Debug)]
 pub struct Neon3ExternalSurfaceGpu {
     pub surface_id: String,
     pub color_target_id: String,
@@ -201,6 +209,25 @@ pub struct Neon3ExternalSurfaceGpu {
     pub color_format: TextureFormat,
     pub id_format: TextureFormat,
     pub imported: bool,
+    #[cfg(windows)]
+    pub pipeline: Option<Neon3FullscreenPipeline>,
+    #[cfg(windows)]
+    pub imported_color: Option<dx12_consumer::ImportedTexture>,
+}
+
+#[cfg(windows)]
+#[derive(Debug)]
+pub struct Neon3FullscreenPipeline {
+    pub pipeline: RenderPipeline,
+    pub bind_group: BindGroup,
+}
+
+#[derive(Resource, Clone, ExtractResource)]
+pub struct Neon3ExternalSurfaceHandles {
+    pub color_texture_handle: Option<usize>,
+    pub color_fence_handle: Option<usize>,
+    pub id_texture_handle: Option<usize>,
+    pub id_fence_handle: Option<usize>,
 }
 
 #[derive(Resource, Clone)]
@@ -290,6 +317,7 @@ impl Plugin for Neon3BevyPlugin {
             camera_revision: Revision(0),
             connected: false,
             last_error: None,
+            acquire_requested: false,
         })
         .insert_resource(Neon3IntentQueue::default())
         .insert_resource(Neon3VariableEvents::default())
@@ -312,8 +340,15 @@ impl Plugin for Neon3BevyPlugin {
             requests: request_tx,
             responses: Arc::new(Mutex::new(response_rx)),
         })
-        .add_systems(Startup, request_screen_surface)
+        .add_systems(Startup, (request_world_info, request_screen_surface))
         .add_systems(Update, (consume_neon_responses, consume_variable_events, publish_camera_snapshot, flush_intents, flush_character_status));
+        app.insert_resource(Neon3ExternalSurfaceHandles {
+            color_texture_handle: None,
+            color_fence_handle: None,
+            id_texture_handle: None,
+            id_fence_handle: None,
+        });
+        app.add_plugins(ExtractResourcePlugin::<Neon3ExternalSurfaceHandles>::default());
         if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
             render_app.insert_resource(Neon3ExternalSurfaceGpu {
                 surface_id: SCREEN_SURFACE_ID.into(),
@@ -325,6 +360,10 @@ impl Plugin for Neon3BevyPlugin {
                 color_format: TextureFormat::Rgba8Unorm,
                 id_format: TextureFormat::R32Uint,
                 imported: false,
+                #[cfg(windows)]
+                pipeline: None,
+                #[cfg(windows)]
+                imported_color: None,
             });
             render_app.add_systems(Render, neon3_external_surface_render_system);
         }
@@ -332,13 +371,119 @@ impl Plugin for Neon3BevyPlugin {
 }
 
 fn neon3_external_surface_render_system(
-    _surface: Res<Neon3ExternalSurfaceGpu>,
+    mut surface: ResMut<Neon3ExternalSurfaceGpu>,
+    handles: Res<Neon3ExternalSurfaceHandles>,
     _render_device: Res<RenderDevice>,
     _render_queue: Res<RenderQueue>,
+    views: ViewQuery<(&ViewTarget,)>,
+    mut render_context: RenderContext,
 ) {
-    // The native import and fullscreen draw are isolated behind this render
-    // system. The protocol/ECS case can compile before the Windows D3D12
-    // consumer is enabled.
+    if surface.imported {
+        return;
+    }
+    #[cfg(windows)]
+    if let Some(handle) = handles.color_texture_handle {
+        if let Ok(imported) = dx12_consumer::import_texture(
+            _render_device.wgpu_device(),
+            handle,
+            surface.size,
+            wgpu::TextureFormat::Rgba8Unorm,
+        )
+        {
+            let device = _render_device.wgpu_device();
+            let sampler = device.create_sampler(&wgpu::SamplerDescriptor::default());
+            let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("neon3-bevy-external-ui-layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
+            let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("neon3-bevy-external-ui-shader"),
+                source: wgpu::ShaderSource::Wgsl(
+                    "@group(0) @binding(0) var color_tex: texture_2d<f32>;\n@group(0) @binding(1) var color_sampler: sampler;\nstruct Out { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32> };\n@vertex fn vs(@builtin(vertex_index) index: u32) -> Out { var positions = array<vec2<f32>, 3>(vec2<f32>(-1.0, -3.0), vec2<f32>(3.0, 1.0), vec2<f32>(-1.0, 1.0)); var uvs = array<vec2<f32>, 3>(vec2<f32>(0.0, 2.0), vec2<f32>(2.0, 0.0), vec2<f32>(0.0, 0.0)); var out: Out; out.position = vec4<f32>(positions[index], 0.0, 1.0); out.uv = uvs[index]; return out; }\n@fragment fn fs(input: Out) -> @location(0) vec4<f32> { return textureSample(color_tex, color_sampler, input.uv); }".into(),
+                ),
+            });
+            let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("neon3-bevy-external-ui-pipeline-layout"),
+                bind_group_layouts: &[Some(&layout)],
+                immediate_size: 0,
+            });
+            let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("neon3-bevy-external-ui-pipeline"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs"),
+                    buffers: &[],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: surface.color_format,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: Default::default(),
+                depth_stencil: None,
+                multisample: Default::default(),
+                multiview_mask: None,
+                cache: None,
+            });
+            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("neon3-bevy-external-ui-bind-group"),
+                layout: &layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&imported.view) },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&sampler) },
+                ],
+            });
+            surface.pipeline = Some(Neon3FullscreenPipeline {
+                pipeline: RenderPipeline::from(pipeline),
+                bind_group: BindGroup::from(bind_group),
+            });
+            surface.imported_color = Some(imported);
+            surface.imported = true;
+        }
+    }
+    let Some(pipeline) = surface.pipeline.as_ref() else { return; };
+    let (view_target,) = views.into_inner();
+    let post_process = view_target.post_process_write();
+    let mut pass = render_context.begin_tracked_render_pass(wgpu::RenderPassDescriptor {
+        label: Some("neon3-bevy-external-ui-overlay"),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view: post_process.destination,
+            depth_slice: None,
+            resolve_target: None,
+            ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+        })],
+        depth_stencil_attachment: None,
+        timestamp_writes: None,
+        occlusion_query_set: None,
+        multiview_mask: None,
+    });
+    pass.set_render_pipeline(&pipeline.pipeline);
+    pass.set_bind_group(0, &pipeline.bind_group, &[]);
+    pass.draw(0..3, 0..1);
 }
 
 fn eventd_worker(
@@ -440,9 +585,30 @@ fn request_screen_surface(mut session: ResMut<Neon3Session>, transport: Res<Neon
     }
 }
 
+fn request_world_info(session: Res<Neon3Session>, transport: Res<Neon3Transport>) {
+    let request = rpc_request_for(
+        "bevy-world-info",
+        "wgpu.world.info.configure",
+        &session,
+        session.config.wgpu_endpoint,
+        json!(WorldInformationSnapshot {
+            world_space_id: WorldSpaceId("case.bevy.world.main".into()),
+            revision: Revision(1),
+            coordinate_system: CoordinateSystem::RightHandedYUpNegativeZForward,
+            units_per_meter: 1.0,
+            precision_mode: WorldPrecisionMode::CameraRelativeF64,
+        }),
+    );
+    let _ = transport.requests.send(TransportRequest {
+        endpoint: session.config.wgpu_endpoint,
+        request,
+    });
+}
+
 fn consume_neon_responses(
     mut session: ResMut<Neon3Session>,
     transport: Res<Neon3Transport>,
+    mut handles: ResMut<Neon3ExternalSurfaceHandles>,
 ) {
     let Ok(responses) = transport.responses.lock() else {
         session.last_error = Some("neon_response_lock_poisoned".into());
@@ -458,6 +624,29 @@ fn consume_neon_responses(
                         .get("generation")
                         .and_then(serde_json::Value::as_u64)
                         .unwrap_or(session.generation);
+                    if response.request_id.0 == "bevy-surface-open" && !session.acquire_requested {
+                        let request = rpc_request_for(
+                            "bevy-surface-acquire",
+                            "render.surface.acquire",
+                            &session,
+                            session.config.wgpu_endpoint,
+                            json!({
+                                "surface_id": session.surface_id,
+                                "pid": std::process::id()
+                            }),
+                        );
+                        let _ = transport.requests.send(TransportRequest {
+                            endpoint: session.config.wgpu_endpoint,
+                            request,
+                        });
+                        session.acquire_requested = true;
+                    }
+                    if response.request_id.0 == "bevy-surface-acquire" {
+                        handles.color_texture_handle = result.get("texture_handle").and_then(serde_json::Value::as_u64).map(|v| v as usize);
+                        handles.color_fence_handle = result.get("fence_handle").and_then(serde_json::Value::as_u64).map(|v| v as usize);
+                        handles.id_texture_handle = result.get("id_texture_handle").and_then(serde_json::Value::as_u64).map(|v| v as usize);
+                        handles.id_fence_handle = result.get("id_fence_handle").and_then(serde_json::Value::as_u64).map(|v| v as usize);
+                    }
                 }
             }
             Ok(response) => {
@@ -479,24 +668,36 @@ fn publish_camera_snapshot(
     session.camera_revision.0 = session.camera_revision.0.saturating_add(1);
     let request = rpc_request_for(
         format!("bevy-camera-{}", session.camera_revision.0),
-        "host.camera.snapshot",
+        "wgpu.world.camera.submit_frame",
         &session,
         session.config.wgpu_endpoint,
-        json!(HostCameraSnapshot {
-            session_id: session.config.session_id.clone(),
-            camera_id: "bevy.main.camera".into(),
-            revision: session.camera_revision,
-            position: transform.translation.into(),
-            rotation_xyzw: transform.rotation.into(),
-            projection: HostCameraProjection::Perspective {
-                fov_y_radians: 60.0_f32.to_radians(),
-                aspect: session.config.surface_size[0] as f32 / session.config.surface_size[1] as f32,
+        json!(CameraFrame {
+            camera_id: CameraId("bevy.main.camera".into()),
+            world_space_id: WorldSpaceId("case.bevy.world.main".into()),
+            producer_epoch: 1,
+            sequence: session.camera_revision.0,
+            timestamp_monotonic_ns: monotonic_timestamp_ns(),
+            payload: CameraFramePayload::ThreeDimensional {
+                position: [
+                    transform.translation.x as f64,
+                    transform.translation.y as f64,
+                    transform.translation.z as f64,
+                ],
+                orientation: transform.rotation.into(),
+                vertical_fov_radians: 60.0_f32.to_radians(),
                 near: 0.1,
                 far: 1000.0,
             },
         }),
     );
     let _ = transport.requests.send(TransportRequest { endpoint: session.config.wgpu_endpoint, request });
+}
+
+fn monotonic_timestamp_ns() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or_default()
 }
 
 fn flush_intents(

@@ -260,6 +260,15 @@ Bevy 每帧只发布字段变化和摄像机 snapshot。World UI 的 transform/a
   两者分别完成 UI color draw / hit-ID draw，并返回两组 duplicated handles。
 - Bevy `RenderApp` 已注册 `Neon3ExternalSurfaceGpu` RenderWorld resource 和 Render schedule
   consumer 入口，下一步在其 Windows 专用层完成 native handle import/fullscreen draw。
+- Bevy 案例已按 Bevy 0.19.1 实际绑定的 `wgpu 29.0.4 / wgpu-hal 29.0.4` 添加独立 DX12
+  native consumer；它从 duplicated handle 调用 `ID3D12Device::OpenSharedHandle`，再通过
+  Bevy 自己的 HAL 包装成 `wgpu::Texture`，并持有导入资源生命周期。
+- Bevy RenderApp 已创建 fullscreen triangle pipeline、采样器和 bind group，并使用
+  `ViewTarget::post_process_write()` 将导入的 color target overlay 到当前 camera view。
+- Bevy 案例已改用现有 `neon-world-bridge` 正式接口：启动发送
+  `wgpu.world.info.configure`，随后实时发送 `wgpu.world.camera.submit_frame`；不再使用
+  自定义 camera method。World-space、producer epoch、sequence、FOV、near/far 和 camera
+  availability 都由同一套 bridge contract 校验。
 
 尚未实现:
 
@@ -267,3 +276,6 @@ Bevy 每帧只发布字段变化和摄像机 snapshot。World UI 的 transform/a
 - 动态 `String` 变量的 text registry 上传；当前案例的名字是静态 NUI 文本。
 - Neon WGPU Runtime 的第二张真实 `r32uint` shared ID texture 分配和绘制。
 - Bevy RenderGraph 对 color/id 两张 native texture 的实际导入、fence wait 和采样。
+
+当前 native consumer 已完成 import helper、RenderWorld 生命周期和 color fullscreen overlay，
+但尚未完成 shared fence wait、ID target import/readback 与点击自动提交。
