@@ -19,6 +19,7 @@ serde.workspace = true
 wgpu.workspace = true
 winit.workspace = true
 fontdue.workspace = true
+windows.workspace = true
 
 [dev-dependencies]
 neon-projectd = { path = "../neon-projectd" }

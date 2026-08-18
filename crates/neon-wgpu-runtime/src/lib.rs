@@ -22,8 +22,10 @@ use neon_protocol::{
     AiTerrainGenerateCommand, AiTerrainGenerationResult, AssetBytes, AssetRef, ClientIdentity,
     ClientKind, HealthStatus, InteractionId, InteractionSemanticTarget, InteractionTraceError,
     InteractionTraceFilters, InteractionTraceOutcome, InteractionTraceQuery,
-    InteractionTraceRecord, InteractionTraceStage, PROTOCOL_VERSION, RequestId, Revision, RpcError,
-    RpcRequest, RpcResponse, RpcStatus, ServiceDescription, ServiceHealth, ServiceName,
+    InteractionTraceRecord, InteractionTraceStage, PROTOCOL_VERSION, RenderBackend,
+    RenderBackendNegotiation, RenderSurfaceOpen, RenderSurfaceKind, RequestId, Revision, RpcError,
+    RpcRequest, RpcResponse, RpcStatus,
+    ServiceDescription, ServiceHealth, ServiceName,
 };
 #[cfg(test)]
 use neon_ui_schema::UiFragmentSubmission;
@@ -49,6 +51,8 @@ mod gpu_preview;
 mod ui_program_gpu;
 mod ui_renderer;
 mod world_ui_pipeline;
+#[cfg(windows)]
+mod dx12_interop;
 use gpu_preview::HeightmapPreviewConverter;
 pub use ui_program_gpu::GpuUiProgramBackend;
 use ui_renderer::{
@@ -62,6 +66,10 @@ pub const CAPABILITY_UI_HIT_TARGET: &str = "wgpu.ui.hit_target.v1";
 pub const CAPABILITY_UI_SEMANTIC_EVENT: &str = "wgpu.ui.semantic_event.v1";
 pub const CAPABILITY_UI_PROGRAM_SEMANTIC_EVENT: &str = "wgpu.ui.program.semantic_event.v1";
 pub const CAPABILITY_UI_RENDER_SURFACE: &str = "wgpu.ui.render_surface.v1";
+pub const CAPABILITY_EXTERNAL_HOST_BACKEND_MATCH: &str =
+    "wgpu.external_host.backend_match.v1";
+pub const CAPABILITY_EXTERNAL_HOST_D3D12_SURFACE: &str =
+    "wgpu.external_host.d3d12_shared_texture.v1";
 pub const CAPABILITY_AI_TERRAIN_GENERATION: &str = "wgpu.ai.terrain_generation.v1";
 pub const CAPABILITY_DEBUG_INTERACTION: &str = "debug.interaction.v1";
 pub const CAPABILITY_DEBUG_WINDOW_CAPTURE: &str = "debug.window.capture.v1";
@@ -983,6 +991,19 @@ enum WindowCommand {
         registration: WorldUiLabCameraRegistration,
         completed: std::sync::mpsc::Sender<Result<Value, &'static str>>,
     },
+    OpenExternalSurface {
+        open: RenderSurfaceOpen,
+        completed: std::sync::mpsc::Sender<Result<Value, String>>,
+    },
+    AcquireExternalSurface {
+        surface_id: String,
+        pid: u32,
+        completed: std::sync::mpsc::Sender<Result<Value, String>>,
+    },
+    ExternalSurfaceFrameSnapshot {
+        surface_id: String,
+        completed: std::sync::mpsc::Sender<Result<Value, String>>,
+    },
     Shutdown,
 }
 
@@ -991,6 +1012,13 @@ struct WindowGpu {
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
     queue: wgpu::Queue,
+    adapter: wgpu::Adapter,
+    #[cfg(windows)]
+    dx12_adapter: dx12_interop::AdapterInfo,
+    #[cfg(windows)]
+    external_surfaces: HashMap<String, dx12_interop::SharedSurface>,
+    #[cfg(windows)]
+    external_handle_tokens: HashMap<String, (String, String)>,
     config: wgpu::SurfaceConfiguration,
     scale_factor: f64,
     #[cfg(debug_assertions)]
@@ -1449,6 +1477,10 @@ impl WindowedRuntime {
             );
             gpu.hit_target_dirty = false;
         }
+        gpu.encode_external_surfaces(
+            &mut encoder,
+            &self.fragments,
+        )?;
         #[cfg(debug_assertions)]
         gpu.final_target_blitter.copy(
             &gpu.device,
@@ -2346,6 +2378,58 @@ fn write_capture_png(path: &Path, size: [u32; 2], rgba: &[u8]) -> Result<PathBuf
 }
 
 impl WindowGpu {
+    #[cfg(windows)]
+    fn encode_external_surfaces(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        fragments: &HashMap<UiFragmentId, UiFragment>,
+    ) -> Result<(), String> {
+        for shared in self.external_surfaces.values_mut() {
+            let view = shared.texture.create_view(&wgpu::TextureViewDescriptor::default());
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("neon3-external-host-surface-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            self.ui.draw(
+                &self.device,
+                &self.queue,
+                &mut pass,
+                fragments,
+                [shared.width, shared.height],
+                [shared.width as f32, shared.height as f32],
+                self.started_at.elapsed().as_secs_f32(),
+            );
+            drop(pass);
+            shared.frame_sequence = shared.frame_sequence.saturating_add(1);
+            let fence_value = shared.frame_sequence;
+            let hal_queue = unsafe { self.queue.as_hal::<wgpu::hal::api::Dx12>() }
+                .ok_or_else(|| "dx12_queue_unavailable".to_owned())?;
+            hal_queue.add_signal_fence(shared.fence.clone(), fence_value);
+        }
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    fn encode_external_surfaces(
+        &mut self,
+        _encoder: &mut wgpu::CommandEncoder,
+        _fragments: &HashMap<UiFragmentId, UiFragment>,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
     fn render_world_ui_lab_panel(&mut self) {
         let mut encoder = self
             .device
@@ -2499,7 +2583,10 @@ impl WindowGpu {
             force_fallback_adapter: false,
             apply_limit_buckets: false,
         }))
-        .map_err(|error| format!("request adapter: {error}"))?;
+            .map_err(|error| format!("request adapter: {error}"))?;
+        #[cfg(windows)]
+        let dx12_adapter = dx12_interop::adapter_info(&adapter)
+            .map_err(|error| format!("inspect DX12 adapter for external host interop: {error}"))?;
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("neon3-wgpu-runtime-device"),
             required_features: wgpu::Features::empty(),
@@ -2619,6 +2706,13 @@ impl WindowGpu {
             surface,
             device,
             queue,
+            adapter,
+            #[cfg(windows)]
+            dx12_adapter,
+            #[cfg(windows)]
+            external_surfaces: HashMap::new(),
+            #[cfg(windows)]
+            external_handle_tokens: HashMap::new(),
             config,
             scale_factor: window.scale_factor(),
             #[cfg(debug_assertions)]
@@ -2717,6 +2811,117 @@ impl WindowGpu {
             height: generation.size,
             elapsed_ms: generation.elapsed_ms,
         })
+    }
+
+    #[cfg(windows)]
+    fn open_external_surface(&mut self, open: RenderSurfaceOpen) -> Result<Value, String> {
+        if open.session_id.trim().is_empty() || open.surface_id.trim().is_empty() {
+            return Err("invalid_surface_identity".into());
+        }
+        if self.external_surfaces.contains_key(&open.surface_id) {
+            return Err("surface_already_open".into());
+        }
+        if open.kind == RenderSurfaceKind::WorldUi && open.placement.is_none() {
+            return Err("world_ui_placement_required".into());
+        }
+        if open.buffer_count == 0 || open.buffer_count > 3 {
+            return Err("invalid_surface_buffer_count".into());
+        }
+        if open.format != "rgba8unorm" {
+            return Err("format_unsupported".into());
+        }
+        if open.buffer_count != 1 {
+            return Err("buffer_ring_not_ready".into());
+        }
+        let shared = dx12_interop::create_shared_surface(
+            &self.device,
+            &self.adapter,
+            open.size.width.max(1),
+            open.size.height.max(1),
+        )
+        .map_err(|error| error.to_string())?;
+        let generation = 1;
+        let surface_id = open.surface_id.clone();
+        self.external_surfaces.insert(surface_id, shared);
+        let texture_token = format!("surface:{}:texture:g{}", open.surface_id, generation);
+        let fence_token = format!("surface:{}:fence:g{}", open.surface_id, generation);
+        self.external_handle_tokens.insert(
+            open.surface_id.clone(),
+            (texture_token.clone(), fence_token.clone()),
+        );
+        Ok(json!({
+            "session_id": open.session_id,
+            "surface_id": open.surface_id,
+            "generation": generation,
+            "transport": "d3d12_shared_texture_v1",
+            "adapter_luid": self.dx12_adapter.luid,
+            "texture": {
+                "format": open.format,
+                "size": open.size,
+                "mip_levels": 1,
+                "buffer_index": 0,
+                "broker_token": texture_token
+            },
+            "fence": {
+                "kind": "d3d12_shared_fence",
+                "broker_token": fence_token,
+                "initial_value": 0
+            }
+        }))
+    }
+
+    #[cfg(windows)]
+    fn acquire_external_surface(&mut self, surface_id: &str, pid: u32) -> Result<Value, String> {
+        if pid == 0 {
+            return Err("invalid_consumer_pid".into());
+        }
+        let Some(shared) = self.external_surfaces.get(surface_id) else {
+            return Err("surface_not_found".into());
+        };
+        let Some((texture_token, fence_token)) = self.external_handle_tokens.get(surface_id) else {
+            return Err("surface_broker_token_not_found".into());
+        };
+        let texture_handle = dx12_interop::duplicate_handle_to_process(shared.texture_handle, pid)
+            .map_err(|error| error.to_string())?;
+        let fence_handle = dx12_interop::duplicate_handle_to_process(shared.fence_handle, pid)
+            .map_err(|error| error.to_string())?;
+        Ok(json!({
+            "surface_id": surface_id,
+            "pid": pid,
+            "texture_token": texture_token,
+            "fence_token": fence_token,
+            "texture_handle": texture_handle,
+            "fence_handle": fence_handle
+        }))
+    }
+
+    #[cfg(windows)]
+    fn external_surface_frame_snapshot(&self, surface_id: &str) -> Result<Value, String> {
+        let Some(shared) = self.external_surfaces.get(surface_id) else {
+            return Err("surface_not_found".into());
+        };
+        Ok(json!({
+            "surface_id": surface_id,
+            "generation": 1,
+            "frame_sequence": shared.frame_sequence,
+            "buffer_index": 0,
+            "fence_value": shared.frame_sequence
+        }))
+    }
+
+    #[cfg(not(windows))]
+    fn open_external_surface(&mut self, _open: RenderSurfaceOpen) -> Result<Value, String> {
+        Err("backend_not_available".into())
+    }
+
+    #[cfg(not(windows))]
+    fn acquire_external_surface(&mut self, _surface_id: &str, _pid: u32) -> Result<Value, String> {
+        Err("backend_not_available".into())
+    }
+
+    #[cfg(not(windows))]
+    fn external_surface_frame_snapshot(&self, _surface_id: &str) -> Result<Value, String> {
+        Err("backend_not_available".into())
     }
 }
 
@@ -4308,7 +4513,41 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                         }
                         camera.register(registration)?;
                         Ok(world_ui_lab_camera_status(&camera))
-                    });
+                });
+                let _ = completed.send(result);
+            }
+            WindowCommand::OpenExternalSurface { open, completed } => {
+                let result = self
+                    .gpu
+                    .as_mut()
+                    .ok_or_else(|| "window_gpu_unavailable".to_owned())
+                    .and_then(|gpu| gpu.open_external_surface(open));
+                if result.is_ok() {
+                    self.redraw_pending = true;
+                }
+                let _ = completed.send(result);
+            }
+            WindowCommand::AcquireExternalSurface {
+                surface_id,
+                pid,
+                completed,
+            } => {
+                let result = self
+                    .gpu
+                    .as_mut()
+                    .ok_or_else(|| "window_gpu_unavailable".to_owned())
+                    .and_then(|gpu| gpu.acquire_external_surface(&surface_id, pid));
+                let _ = completed.send(result);
+            }
+            WindowCommand::ExternalSurfaceFrameSnapshot {
+                surface_id,
+                completed,
+            } => {
+                let result = self
+                    .gpu
+                    .as_ref()
+                    .ok_or_else(|| "window_gpu_unavailable".to_owned())
+                    .and_then(|gpu| gpu.external_surface_frame_snapshot(&surface_id));
                 let _ = completed.send(result);
             }
             WindowCommand::InputDebugSnapshot { completed } => {
@@ -5303,6 +5542,12 @@ fn spawn_window_server(
             );
             let response = if request.method == "wgpu.ai.terrain.generate" {
                 handle_window_ai_generate(&mut runtime, &proxy, request)
+            } else if request.method == "render.surface.open" {
+                handle_window_external_surface_open(&mut runtime, &proxy, request)
+            } else if request.method == "render.surface.acquire" {
+                handle_window_external_surface_acquire(&mut runtime, &proxy, request)
+            } else if request.method == "render.surface.frame" {
+                handle_window_external_surface_frame(&mut runtime, &proxy, request)
             } else if request.method == "wgpu.ai.model.status" {
                 handle_window_ai_model_status(&mut runtime, &proxy, request.request_id)
             } else if request.method == "debug.snapshot.get" {
@@ -5428,6 +5673,117 @@ fn spawn_window_server(
         }
         let _ = proxy.send_event(WindowCommand::Shutdown);
     });
+}
+
+fn handle_window_external_surface_open(
+    runtime: &mut WgpuRuntime,
+    proxy: &EventLoopProxy<WindowCommand>,
+    request: RpcRequest,
+) -> RpcResponse {
+    if request.client.kind != ClientKind::ExternalHost {
+        return runtime.reject(
+            request.request_id,
+            "external_host_required",
+            "render.surface.open requires an external host client",
+            None,
+        );
+    }
+    let open = match serde_json::from_value::<RenderSurfaceOpen>(request.params) {
+        Ok(open) => open,
+        Err(error) => {
+            return runtime.reject(
+                request.request_id,
+                "invalid_surface_open",
+                &format!("surface open request is invalid: {error}"),
+                None,
+            );
+        }
+    };
+    let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+    if proxy
+        .send_event(WindowCommand::OpenExternalSurface {
+            open,
+            completed: completed_tx,
+        })
+        .is_err()
+    {
+        return runtime.reject(
+            request.request_id,
+            "window_compositor_unavailable",
+            "window compositor is unavailable",
+            None,
+        );
+    }
+    match completed_rx.recv_timeout(Duration::from_secs(5)) {
+        Ok(Ok(result)) => runtime.accept(request.request_id, result),
+        Ok(Err(error)) => runtime.reject(request.request_id, &error, &error, None),
+        Err(_) => runtime.reject(
+            request.request_id,
+            "window_compositor_timeout",
+            "window compositor did not open the external surface",
+            None,
+        ),
+    }
+}
+
+fn handle_window_external_surface_acquire(
+    runtime: &mut WgpuRuntime,
+    proxy: &EventLoopProxy<WindowCommand>,
+    request: RpcRequest,
+) -> RpcResponse {
+    if request.client.kind != ClientKind::ExternalHost {
+        return runtime.reject(request.request_id, "external_host_required", "render.surface.acquire requires an external host client", None);
+    }
+    let surface_id = request.params.get("surface_id").and_then(Value::as_str).unwrap_or_default().to_owned();
+    let pid = request.params.get("pid").and_then(Value::as_u64).unwrap_or_default() as u32;
+    if surface_id.is_empty() || pid == 0 {
+        return runtime.reject(request.request_id, "invalid_surface_acquire", "surface_id and pid are required", None);
+    }
+    let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+    if proxy
+        .send_event(WindowCommand::AcquireExternalSurface {
+            surface_id,
+            pid,
+            completed: completed_tx,
+        })
+        .is_err()
+    {
+        return runtime.reject(request.request_id, "window_compositor_unavailable", "window compositor is unavailable", None);
+    }
+    match completed_rx.recv_timeout(Duration::from_secs(5)) {
+        Ok(Ok(result)) => runtime.accept(request.request_id, result),
+        Ok(Err(error)) => runtime.reject(request.request_id, &error, &error, None),
+        Err(_) => runtime.reject(request.request_id, "window_compositor_timeout", "window compositor did not acquire the external surface", None),
+    }
+}
+
+fn handle_window_external_surface_frame(
+    runtime: &mut WgpuRuntime,
+    proxy: &EventLoopProxy<WindowCommand>,
+    request: RpcRequest,
+) -> RpcResponse {
+    if request.client.kind != ClientKind::ExternalHost {
+        return runtime.reject(request.request_id, "external_host_required", "render.surface.frame requires an external host client", None);
+    }
+    let surface_id = request.params.get("surface_id").and_then(Value::as_str).unwrap_or_default().to_owned();
+    if surface_id.is_empty() {
+        return runtime.reject(request.request_id, "invalid_surface_frame", "surface_id is required", None);
+    }
+    let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+    if proxy
+        .send_event(WindowCommand::ExternalSurfaceFrameSnapshot {
+            surface_id,
+            completed: completed_tx,
+        })
+        .is_err()
+    {
+        return runtime.reject(request.request_id, "window_compositor_unavailable", "window compositor is unavailable", None);
+    }
+    match completed_rx.recv_timeout(Duration::from_secs(5)) {
+        Ok(Ok(result)) => runtime.accept(request.request_id, result),
+        Ok(Err(error)) => runtime.reject(request.request_id, &error, &error, None),
+        Err(_) => runtime.reject(request.request_id, "window_compositor_timeout", "window compositor did not return the external surface frame", None),
+    }
 }
 
 impl WindowedRuntime {
@@ -5622,6 +5978,7 @@ impl WgpuRuntime {
             CAPABILITY_UI_SEMANTIC_EVENT.into(),
             CAPABILITY_UI_PROGRAM_SEMANTIC_EVENT.into(),
             CAPABILITY_UI_RENDER_SURFACE.into(),
+            CAPABILITY_EXTERNAL_HOST_BACKEND_MATCH.into(),
             "wgpu.world.info.bridge".into(),
         ];
         if self.window_gpu_available {
@@ -5939,6 +6296,9 @@ impl WgpuRuntime {
             "service.health" => self.accept(request_id, json!(self.service_health())),
             "service.describe" => self.accept(request_id, json!(self.service_description())),
             "service.shutdown" => self.accept(request_id, json!({"state": "accepted"})),
+            "render.backend.negotiate" => {
+                self.negotiate_external_backend(request_id, request.client, request.params)
+            }
             "wgpu.render.diagnostics" => {
                 self.accept(request_id, diagnostics_value(self.diagnostics()))
             }
@@ -5997,6 +6357,74 @@ impl WgpuRuntime {
                 .insert(idempotency_key, response.clone());
         }
         response
+    }
+
+    fn negotiate_external_backend(
+        &mut self,
+        request_id: RequestId,
+        client: ClientIdentity,
+        params: Value,
+    ) -> RpcResponse {
+        if client.kind != ClientKind::ExternalHost {
+            return self.reject(
+                request_id,
+                "external_host_required",
+                "render.backend.negotiate requires an external host client",
+                None,
+            );
+        }
+        let negotiation = match serde_json::from_value::<RenderBackendNegotiation>(params) {
+            Ok(negotiation) => negotiation,
+            Err(error) => {
+                return self.reject(
+                    request_id,
+                    "invalid_backend_negotiation",
+                    &format!("backend negotiation is invalid: {error}"),
+                    None,
+                );
+            }
+        };
+        if negotiation.session_id.trim().is_empty() {
+            return self.reject(
+                request_id,
+                "invalid_backend_negotiation",
+                "session_id must not be empty",
+                None,
+            );
+        }
+        if negotiation.preferred_backends.is_empty() {
+            return self.reject(
+                request_id,
+                "backend_not_requested",
+                "preferred_backends must contain at least one backend",
+                None,
+            );
+        }
+        if !negotiation
+            .preferred_backends
+            .contains(&RenderBackend::Dx12)
+        {
+            return self.reject(
+                request_id,
+                "backend_not_available",
+                "the first external transport requires a DX12 host backend",
+                None,
+            );
+        }
+        if !cfg!(target_os = "windows") {
+            return self.reject(
+                request_id,
+                "backend_not_available",
+                "the D3D12 external transport is only available on Windows",
+                None,
+            );
+        }
+        self.reject(
+            request_id,
+            "external_gpu_transport_not_ready",
+            "DX12 backend matching is defined, but native shared texture export is not initialized",
+            None,
+        )
     }
 
     fn command_get(&mut self, request_id: RequestId, params: Value) -> RpcResponse {
@@ -6898,31 +7326,82 @@ mod tests {
         let described = describe.result.unwrap();
         assert_eq!(described["epoch"], 7);
         assert_eq!(described["protocol_version"], json!(PROTOCOL_VERSION));
+        let expected_capabilities = json!([
+            CAPABILITY_UI_FRAGMENT,
+            "wgpu.render.diagnostics",
+            CAPABILITY_UI_HIT_TARGET,
+            CAPABILITY_UI_SEMANTIC_EVENT,
+            CAPABILITY_UI_PROGRAM_SEMANTIC_EVENT,
+            CAPABILITY_UI_RENDER_SURFACE,
+            CAPABILITY_EXTERNAL_HOST_BACKEND_MATCH,
+            "wgpu.world.info.bridge"
+        ]);
+        let capabilities = described["capabilities"].as_array().unwrap();
+        for capability in expected_capabilities.as_array().unwrap() {
+            assert!(capabilities.contains(capability));
+        }
         assert_eq!(
-            described["capabilities"],
-            json!([
-                CAPABILITY_UI_FRAGMENT,
-                "wgpu.render.diagnostics",
-                CAPABILITY_UI_HIT_TARGET,
-                CAPABILITY_UI_SEMANTIC_EVENT,
-                CAPABILITY_UI_PROGRAM_SEMANTIC_EVENT,
-                CAPABILITY_UI_RENDER_SURFACE,
-                "wgpu.world.info.bridge"
-            ])
+            capabilities.contains(&json!(CAPABILITY_EXTERNAL_HOST_D3D12_SURFACE)),
+            false
         );
         assert_eq!(snapshot.status, RpcStatus::Accepted);
         assert_eq!(
-            snapshot.result.unwrap()["capabilities"],
-            json!([
-                CAPABILITY_UI_FRAGMENT,
-                "wgpu.render.diagnostics",
-                CAPABILITY_UI_HIT_TARGET,
-                CAPABILITY_UI_SEMANTIC_EVENT,
-                CAPABILITY_UI_PROGRAM_SEMANTIC_EVENT,
-                CAPABILITY_UI_RENDER_SURFACE,
-                "wgpu.world.info.bridge"
-            ])
+            snapshot
+                .result
+                .unwrap()["capabilities"]
+                .as_array()
+                .unwrap()
+                .contains(&json!(CAPABILITY_EXTERNAL_HOST_BACKEND_MATCH)),
+            true
         );
+    }
+
+    #[test]
+    fn external_backend_negotiation_has_a_hard_transport_gate() {
+        let mut runtime = WgpuRuntime::headless(1);
+        let mut request = request(
+            "backend-negotiate",
+            "render.backend.negotiate",
+            json!(neon_protocol::RenderBackendNegotiation {
+                session_id: "host-session-001".into(),
+                preferred_backends: vec![neon_protocol::RenderBackend::Dx12],
+                required_features: vec!["shared_texture".into(), "shared_fence".into()],
+                host: neon_protocol::RenderHostIdentity {
+                    kind: neon_protocol::HostEngineKind::Godot,
+                    pid: 12345,
+                    adapter: neon_protocol::RenderAdapterIdentity {
+                        vendor_id: Some(4318),
+                        device_id: Some(1234),
+                        luid: Some("adapter-luid".into()),
+                        name: Some("test adapter".into()),
+                    },
+                    plugin_version: "test".into(),
+                },
+            }),
+        );
+        request.client.kind = ClientKind::ExternalHost;
+        let response = runtime.handle(request);
+        assert_eq!(response.status, RpcStatus::Rejected);
+        assert_eq!(
+            response.error.unwrap().code,
+            if cfg!(target_os = "windows") {
+                "external_gpu_transport_not_ready"
+            } else {
+                "backend_not_available"
+            }
+        );
+    }
+
+    #[test]
+    fn backend_negotiation_rejects_non_host_clients() {
+        let mut runtime = WgpuRuntime::headless(1);
+        let response = runtime.handle(request(
+            "backend-client-reject",
+            "render.backend.negotiate",
+            json!({}),
+        ));
+        assert_eq!(response.status, RpcStatus::Rejected);
+        assert_eq!(response.error.unwrap().code, "external_host_required");
     }
 
     #[test]

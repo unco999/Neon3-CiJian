@@ -29,8 +29,12 @@ neon-sessiond            可选；服务发现、监督和本地 capability 注�
 - GPU texture、buffer、sampler、bind group、pipeline。
 - render graph、GPU resident tables、最终 UI 和世界画面的合成。
 
-因此 Neon3 **不使用跨进程共享纹理、D3D12 shared texture、GPU handle 导出/导入或
-CPU frame readback 作为正常渲染路径**。所有画面都在同一个 GPU 进程内生成和合成。
+因此 Neon3 不允许业务进程自行创建或管理 GPU 资源，也不允许未经协商的跨进程纹理传输。
+正式渲染仍由 `neon-wgpu-runtime` 在同一个 GPU 进程内生成和合成；但经过明确的 backend/
+adapter matching 后，`neon-wgpu-runtime` 可以向受控 external host consumer 导出只读共享
+surface（例如 Windows D3D12 shared texture + shared fence）。这不是第二个 Neon GPU owner：
+共享资源的创建、状态转换、generation、resize、device-lost 和 release 仍归
+`neon-wgpu-runtime`，宿主只能按协议等待并采样。
 
 ## 2. 最终进程图
 
@@ -93,7 +97,8 @@ React/TS local state -> 推断 brush/water/channel/tool mode
 terrain-runtime -> 创建 wgpu resource、pipeline 或窗口
 resource-runtime -> 直接修改 terrain-runtime 内存
 任何 client -> 直接写项目文件
-任何业务进程 -> 导出 GPU texture 给另一进程进行最终合成
+任何业务进程 -> 未经 backend/adapter matching 导出 GPU texture
+任何 external host -> 修改、销毁或重解释 `neon-wgpu-runtime` 的共享 surface
 ```
 
 允许：
@@ -154,6 +159,11 @@ terrain-runtime
 
 `neon-wgpu-runtime` 接收 `UiFragment`，负责将其放入统一 window shell，并用 Neon2 的
 wgpu UI/text/render graph 绘制最终像素。
+
+受控 external host interop 只允许通过公开 `neon3.rpc`/`neon3.event` contract 建立。宿主
+必须先报告实际 backend、adapter identity、进程 ID 和所需 transport；匹配失败时不得自动
+降级到 PNG、CPU frame 或未经确认的 backend。原生 texture/fence handle 不进入 JSON 或
+event journal，只能由本机 handle broker 按短期 session token 交付。
 
 ## 7. 控制面协议
 

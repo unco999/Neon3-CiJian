@@ -30,6 +30,7 @@ pub enum ClientKind {
     ResourceRuntime,
     Projectd,
     WgpuRuntime,
+    ExternalHost,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -238,6 +239,165 @@ pub struct RpcResponse {
     pub result: Option<Value>,
     pub snapshot: Option<Value>,
     pub error: Option<RpcError>,
+}
+
+/// Engine-independent backend names used during an external host GPU session.
+/// The native resource transport is negotiated separately and never represented
+/// by a raw OS handle in this crate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RenderBackend {
+    Dx12,
+    Vulkan,
+    Metal,
+    Gl,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostEngineKind {
+    Godot,
+    Unity,
+    Bevy,
+    Unreal,
+    Custom,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RenderAdapterIdentity {
+    pub vendor_id: Option<u32>,
+    pub device_id: Option<u32>,
+    pub luid: Option<String>,
+    pub name: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RenderHostIdentity {
+    pub kind: HostEngineKind,
+    pub pid: u32,
+    pub adapter: RenderAdapterIdentity,
+    pub plugin_version: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RenderBackendNegotiation {
+    pub session_id: String,
+    pub preferred_backends: Vec<RenderBackend>,
+    pub required_features: Vec<String>,
+    pub host: RenderHostIdentity,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RenderTransport {
+    D3d12SharedTextureV1,
+    VulkanExternalMemoryV1,
+    MetalSharedSurfaceV1,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RenderBackendSelection {
+    pub session_id: String,
+    pub backend: RenderBackend,
+    pub adapter: RenderAdapterIdentity,
+    pub transport: RenderTransport,
+    pub features: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RenderSessionState {
+    Created,
+    Negotiating,
+    Matched,
+    GpuSessionOpened,
+    SurfaceReady,
+    Streaming,
+    Failed,
+    Released,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RenderSurfaceKind {
+    ScreenUi,
+    WorldUi,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RenderSurfaceSize {
+    pub width: u32,
+    pub height: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RenderSurfacePlacement {
+    pub anchor_id: Option<String>,
+    pub position: Option<[f32; 3]>,
+    pub rotation: Option<[f32; 3]>,
+    pub scale: Option<[f32; 3]>,
+    pub billboard: bool,
+    pub occlusion: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RenderSurfaceOpen {
+    pub session_id: String,
+    pub surface_id: String,
+    pub kind: RenderSurfaceKind,
+    pub size: RenderSurfaceSize,
+    pub format: String,
+    pub depth: bool,
+    pub buffer_count: u8,
+    pub placement: Option<RenderSurfacePlacement>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SharedTextureDescriptor {
+    pub format: String,
+    pub size: RenderSurfaceSize,
+    pub mip_levels: u32,
+    pub buffer_index: u8,
+    pub broker_token: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SharedFenceDescriptor {
+    pub kind: String,
+    pub broker_token: String,
+    pub initial_value: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RenderSurfaceDescriptor {
+    pub session_id: String,
+    pub surface_id: String,
+    pub generation: u64,
+    pub transport: RenderTransport,
+    pub adapter_luid: Option<String>,
+    pub texture: SharedTextureDescriptor,
+    pub fence: SharedFenceDescriptor,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RenderFrameReady {
+    pub session_id: String,
+    pub surface_id: String,
+    pub generation: u64,
+    pub frame_sequence: u64,
+    pub buffer_index: u8,
+    pub fence_value: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -858,5 +1018,77 @@ mod tests {
         assert_eq!(value["capacity"], 4096);
         let decoded: EventRetention = serde_json::from_value(value).unwrap();
         assert_eq!(decoded, retention);
+    }
+
+    #[test]
+    fn external_render_contract_round_trips_without_native_handles() {
+        let negotiation = RenderBackendNegotiation {
+            session_id: "host-session-001".into(),
+            preferred_backends: vec![RenderBackend::Dx12],
+            required_features: vec!["shared_texture".into(), "shared_fence".into()],
+            host: RenderHostIdentity {
+                kind: HostEngineKind::Godot,
+                pid: 12345,
+                adapter: RenderAdapterIdentity {
+                    vendor_id: Some(4318),
+                    device_id: Some(1234),
+                    luid: Some("adapter-luid".into()),
+                    name: Some("test adapter".into()),
+                },
+                plugin_version: "neon3-godot-adapter-1".into(),
+            },
+        };
+        let value = serde_json::to_value(&negotiation).unwrap();
+        assert_eq!(value["preferred_backends"][0], "dx12");
+        assert!(value.get("handle").is_none());
+        assert!(value.get("texture_handle").is_none());
+        assert_eq!(serde_json::from_value::<RenderBackendNegotiation>(value).unwrap(), negotiation);
+
+        let surface = RenderSurfaceDescriptor {
+            session_id: "host-session-001".into(),
+            surface_id: "surface.quest-panel".into(),
+            generation: 2,
+            transport: RenderTransport::D3d12SharedTextureV1,
+            adapter_luid: Some("adapter-luid".into()),
+            texture: SharedTextureDescriptor {
+                format: "rgba8unorm_srgb".into(),
+                size: RenderSurfaceSize {
+                    width: 1280,
+                    height: 720,
+                },
+                mip_levels: 1,
+                buffer_index: 1,
+                broker_token: "broker-token".into(),
+            },
+            fence: SharedFenceDescriptor {
+                kind: "d3d12_shared_fence".into(),
+                broker_token: "broker-fence-token".into(),
+                initial_value: 20,
+            },
+        };
+        let value = serde_json::to_value(&surface).unwrap();
+        assert!(value["texture"].get("broker_token").is_some());
+        assert!(value["texture"].get("handle").is_none());
+        assert_eq!(serde_json::from_value::<RenderSurfaceDescriptor>(value).unwrap(), surface);
+    }
+
+    #[test]
+    fn external_render_frame_requires_generation_and_fence_value() {
+        let frame = RenderFrameReady {
+            session_id: "host-session-001".into(),
+            surface_id: "surface.quest-panel".into(),
+            generation: 3,
+            frame_sequence: 184,
+            buffer_index: 2,
+            fence_value: 527,
+        };
+        let value = serde_json::to_value(&frame).unwrap();
+        assert_eq!(value["generation"], 3);
+        assert_eq!(value["buffer_index"], 2);
+        assert_eq!(value["fence_value"], 527);
+
+        let mut missing_fence = value;
+        missing_fence.as_object_mut().unwrap().remove("fence_value");
+        assert!(serde_json::from_value::<RenderFrameReady>(missing_fence).is_err());
     }
 }
