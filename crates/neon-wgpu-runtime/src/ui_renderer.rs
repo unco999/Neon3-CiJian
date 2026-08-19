@@ -181,6 +181,54 @@ struct VsOut {
 }
 "#;
 
+const TEXT_DEPTH_SHADER: &str = r#"
+struct View { viewport: vec2<f32>, _pad: vec2<f32> }
+@group(0) @binding(0) var<uniform> view: View;
+@group(1) @binding(0) var glyph_atlas: texture_2d<f32>;
+@group(1) @binding(1) var glyph_sampler: sampler;
+struct VsIn {
+    @location(0) rect: vec4<f32>,
+    @location(1) color: vec4<f32>,
+    @location(2) clip: vec4<f32>,
+    @location(3) uv: vec4<f32>,
+    @location(4) depth: f32,
+}
+struct VsOut {
+    @builtin(position) position: vec4<f32>,
+    @location(0) pixel: vec2<f32>,
+    @location(1) clip: vec4<f32>,
+    @location(2) uv: vec2<f32>,
+    @location(3) depth: f32,
+}
+@vertex fn vs_main(@builtin(vertex_index) index: u32, input: VsIn) -> VsOut {
+    var corners = array<vec2<f32>, 6>(
+        vec2<f32>(0.0, 0.0), vec2<f32>(1.0, 0.0), vec2<f32>(0.0, 1.0),
+        vec2<f32>(0.0, 1.0), vec2<f32>(1.0, 0.0), vec2<f32>(1.0, 1.0)
+    );
+    let local = corners[index];
+    let pixel = input.rect.xy + local * input.rect.zw;
+    var output: VsOut;
+    output.position = vec4<f32>(
+        pixel.x / view.viewport.x * 2.0 - 1.0,
+        1.0 - pixel.y / view.viewport.y * 2.0,
+        0.0,
+        1.0
+    );
+    output.pixel = pixel;
+    output.clip = input.clip;
+    output.uv = input.uv.xy + local * input.uv.zw;
+    output.depth = input.depth;
+    return output;
+}
+@fragment fn fs_main(input: VsOut) -> @location(0) f32 {
+    if (input.pixel.x < input.clip.x || input.pixel.y < input.clip.y ||
+        input.pixel.x > input.clip.z || input.pixel.y > input.clip.w) { discard; }
+    let coverage = textureSample(glyph_atlas, glyph_sampler, input.uv).a;
+    if (coverage <= 0.001 || input.depth <= 0.0) { discard; }
+    return input.depth;
+}
+"#;
+
 const IMAGE_SHADER: &str = r#"
 struct View { viewport: vec2<f32>, _pad: vec2<f32> }
 @group(0) @binding(0) var<uniform> view: View;
@@ -778,6 +826,7 @@ pub struct UiWgpuRenderer {
     pipeline: wgpu::RenderPipeline,
     depth_format: Option<wgpu::TextureFormat>,
     depth_pipeline: Option<wgpu::RenderPipeline>,
+    text_depth_pipeline: Option<wgpu::RenderPipeline>,
     view_buffer: wgpu::Buffer,
     view_bind_group: wgpu::BindGroup,
     instance_buffer: wgpu::Buffer,
@@ -814,6 +863,10 @@ pub struct UiWgpuRenderer {
     text_pipeline: wgpu::RenderPipeline,
     text_buffer: wgpu::Buffer,
     text_capacity: usize,
+    depth_text_buffer: wgpu::Buffer,
+    depth_text_capacity: usize,
+    depth_text_count: usize,
+    depth_text_instances: Vec<UiTextInstance>,
     popup_text_buffer: wgpu::Buffer,
     popup_text_capacity: usize,
     _text_texture_layout: wgpu::BindGroupLayout,
@@ -1262,11 +1315,53 @@ impl UiWgpuRenderer {
                 cache: None,
             })
         });
+        let text_depth_pipeline = depth_format.map(|depth_format| {
+            let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("neon3-ui-text-depth-shader"),
+                source: wgpu::ShaderSource::Wgsl(TEXT_DEPTH_SHADER.into()),
+            });
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("neon3-ui-text-depth-pipeline"),
+                layout: Some(&text_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_main"),
+                    buffers: &[Some(wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<UiTextInstance>() as u64,
+                        step_mode: wgpu::VertexStepMode::Instance,
+                        attributes: &[
+                            wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 0, shader_location: 0 },
+                            wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 16, shader_location: 1 },
+                            wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 32, shader_location: 2 },
+                            wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 48, shader_location: 3 },
+                            wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32, offset: 64, shader_location: 4 },
+                        ],
+                    })],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_main"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: depth_format,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            })
+        });
         Self {
             color_format: format,
             pipeline,
             depth_format,
             depth_pipeline,
+            text_depth_pipeline,
             view_buffer,
             view_bind_group,
             instance_buffer: create_instance_buffer(device, 1),
@@ -1303,6 +1398,10 @@ impl UiWgpuRenderer {
             text_pipeline,
             text_buffer: create_text_buffer(device, 1),
             text_capacity: 1,
+            depth_text_buffer: create_text_buffer(device, 1),
+            depth_text_capacity: 1,
+            depth_text_count: 0,
+            depth_text_instances: Vec::new(),
             popup_text_buffer: create_text_buffer(device, 1),
             popup_text_capacity: 1,
             _text_texture_layout: text_texture_layout,
@@ -3871,6 +3970,10 @@ impl UiWgpuRenderer {
             self.text_capacity = texts.len().next_power_of_two();
             self.text_buffer = create_text_buffer(device, self.text_capacity);
         }
+        if texts.len() > self.depth_text_capacity {
+            self.depth_text_capacity = texts.len().next_power_of_two();
+            self.depth_text_buffer = create_text_buffer(device, self.depth_text_capacity);
+        }
         if popup_texts.len() > self.popup_text_capacity {
             self.popup_text_capacity = popup_texts.len().next_power_of_two();
             self.popup_text_buffer = create_text_buffer(device, self.popup_text_capacity);
@@ -3966,6 +4069,12 @@ impl UiWgpuRenderer {
         }
         if !ordered_texts.is_empty() {
             queue.write_buffer(&self.text_buffer, 0, bytemuck::cast_slice(&ordered_texts));
+            queue.write_buffer(&self.depth_text_buffer, 0, bytemuck::cast_slice(&ordered_texts));
+            self.depth_text_count = ordered_texts.len();
+            self.depth_text_instances = ordered_texts.clone();
+        } else {
+            self.depth_text_count = 0;
+            self.depth_text_instances.clear();
             pass.set_bind_group(1, &self.resident_font.as_ref().unwrap().bind_group, &[]);
         }
         for key in group_order {
@@ -4073,7 +4182,12 @@ impl UiWgpuRenderer {
         for instance in &self.instances {
             groups.entry(instance.paint_group_id).or_default().push(*instance);
         }
+        let mut text_groups: HashMap<u32, Vec<UiTextInstance>> = HashMap::new();
+        for text in &self.depth_text_instances {
+            text_groups.entry(text.paint_group_id).or_default().push(*text);
+        }
         let mut group_ids = groups.keys().copied().collect::<Vec<_>>();
+        group_ids.extend(text_groups.keys().copied().filter(|id| !groups.contains_key(id)));
         let group_depth = |group_id: u32| {
             self.plan
                 .iter()
@@ -4086,19 +4200,27 @@ impl UiWgpuRenderer {
                 .partial_cmp(&group_depth(*a))
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        let mut ordered = Vec::new();
+        let text_pipeline = self.text_depth_pipeline.as_ref();
+        let font = self.resident_font.as_ref();
         for group_id in group_ids {
-            if let Some(group) = groups.remove(&group_id) {
-                ordered.extend(group);
+            if let Some(group) = groups.get(&group_id) {
+                queue.write_buffer(&self.instance_buffer, 0, bytemuck::cast_slice(group));
+                pass.set_pipeline(rect_pipeline);
+                pass.set_bind_group(0, &self.view_bind_group, &[]);
+                pass.set_vertex_buffer(0, self.instance_buffer.slice(..));
+                pass.draw(0..6, 0..group.len() as u32);
+            }
+            if let (Some(text_pipeline), Some(font), Some(group)) =
+                (text_pipeline, font, text_groups.get(&group_id))
+            {
+                queue.write_buffer(&self.depth_text_buffer, 0, bytemuck::cast_slice(group));
+                pass.set_pipeline(text_pipeline);
+                pass.set_bind_group(0, &self.view_bind_group, &[]);
+                pass.set_bind_group(1, &font.bind_group, &[]);
+                pass.set_vertex_buffer(0, self.depth_text_buffer.slice(..));
+                pass.draw(0..6, 0..group.len() as u32);
             }
         }
-        queue.write_buffer(&self.instance_buffer, 0, bytemuck::cast_slice(&ordered));
-        pass.set_pipeline(rect_pipeline);
-        pass.set_bind_group(0, &self.view_bind_group, &[]);
-        pass.set_vertex_buffer(0, self.instance_buffer.slice(..));
-        // The caller uploads the color snapshot before opening the depth pass;
-        // keep this pass limited to the same panel instances and ordering.
-        pass.draw(0..6, 0..ordered.len() as u32);
     }
 
     fn refresh_plan(
@@ -4162,11 +4284,26 @@ impl UiWgpuRenderer {
                 paint_group_id: 0,
             });
         }
+        // CameraVisibility marks the actual projected World UI root. The
+        // fragment/layout root is only a structural container and must not
+        // merge multiple world panels into one paint group.
+        let world_group_roots = fragments
+            .iter()
+            .flat_map(|(fragment_id, fragment)| {
+                fragment.effects.iter().filter_map(|effect| {
+                    let neon_ui_schema::UiEffect::CameraVisibility { binding } = effect else {
+                        return None;
+                    };
+                    Some(format!("{}/{}", fragment_id.0, binding.node_id.0))
+                })
+            })
+            .collect::<HashSet<_>>();
         let mut group_ids = HashMap::<String, u32>::new();
         let mut next_group_id = 1_u32;
         for index in 0..self.plan.len() {
             let mut root = index;
-            while let Some(parent_id) = self.plan[root].parent_id.as_deref() {
+            while !world_group_roots.contains(&self.plan[root].id) {
+                let Some(parent_id) = self.plan[root].parent_id.as_deref() else { break };
                 let Some(parent) = self.plan.iter().position(|node| node.id == parent_id) else { break };
                 root = parent;
             }
@@ -5977,10 +6114,12 @@ fn overlay_instance(bounds: UiBounds, clip: UiBounds, color: [f32; 4]) -> UiInst
 fn top_layer_roots(plan: &[PlannedNode], indices: &HashMap<&str, usize>) -> Vec<Option<usize>> {
     let mut roots = vec![None; plan.len()];
     for (index, node) in plan.iter().enumerate() {
-        roots[index] = if matches!(
-            node.target.kind,
-            UiNodeKind::Tooltip | UiNodeKind::Modal | UiNodeKind::Dialog
-        ) {
+        roots[index] = if node.target.world_depth.is_none()
+            && matches!(
+                node.target.kind,
+                UiNodeKind::Tooltip | UiNodeKind::Modal | UiNodeKind::Dialog
+            )
+        {
             Some(index)
         } else {
             node.parent_id
