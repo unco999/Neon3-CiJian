@@ -2218,6 +2218,7 @@ struct HeadlessExternalGpu {
     external_depth_surfaces: HashMap<String, Vec<dx12_interop::SharedSurface>>,
     external_handle_tokens: HashMap<String, (String, String)>,
     next_external_frame_sequence: u64,
+    last_external_render_at: Option<Instant>,
 }
 
 #[cfg(windows)]
@@ -2257,6 +2258,7 @@ impl HeadlessExternalGpu {
             external_depth_surfaces: HashMap::new(),
             external_handle_tokens: HashMap::new(),
             next_external_frame_sequence: 0,
+            last_external_render_at: None,
         })
     }
 
@@ -2351,6 +2353,7 @@ impl HeadlessExternalGpu {
                 {
                     buffer["id_texture_handle"] = json!(dx12_interop::duplicate_handle_to_process(id_surface.texture_handle, pid).map_err(|error| error.to_string())?);
                     buffer["id_fence_handle"] = json!(dx12_interop::duplicate_handle_to_process(id_surface.fence_handle, pid).map_err(|error| error.to_string())?);
+                    buffer["id_consumer_release_fence_handle"] = json!(dx12_interop::duplicate_handle_to_process(id_surface.consumer_fence_handle, pid).map_err(|error| error.to_string())?);
                 }
                 if let Some(depth_surfaces) = self.external_depth_surfaces.get(surface_id)
                     && let Some(depth_surface) = depth_surfaces.get(index)
@@ -2392,6 +2395,16 @@ impl HeadlessExternalGpu {
         if self.external_surfaces.is_empty() {
             return Ok(());
         }
+        // The external UI is consumed by a separate DX12 process. Rendering it
+        // at the display rate creates avoidable fence pressure; 30 Hz is enough
+        // for the current world-anchor case and keeps the ring reusable.
+        if self
+            .last_external_render_at
+            .is_some_and(|last| last.elapsed() < Duration::from_millis(33))
+        {
+            return Ok(());
+        }
+        self.last_external_render_at = Some(Instant::now());
         // The filtered snapshot contains live world-panel bounds derived from
         // the latest camera and anchor, not a new UI program revision.
         self.ui.invalidate_plan();
@@ -2424,7 +2437,14 @@ impl HeadlessExternalGpu {
                         .is_none_or(|depth| unsafe {
                             depth.consumer_fence.GetCompletedValue() >= depth.frame_sequence
                         });
-                    (color_free && depth_free).then_some(index)
+                    let id_free = self
+                        .external_id_surfaces
+                        .get(surface_id)
+                        .and_then(|ring| ring.get(index))
+                        .is_none_or(|id| unsafe {
+                            id.consumer_fence.GetCompletedValue() >= id.frame_sequence
+                        });
+                    (color_free && depth_free && id_free).then_some(index)
                 })
             else {
                 eprintln!(
@@ -2478,6 +2498,42 @@ impl HeadlessExternalGpu {
                 drop(depth_pass);
                 depth_shared.frame_sequence = frame_sequence;
                 hal_queue.add_signal_fence(depth_shared.fence.clone(), frame_sequence);
+            }
+            // Pick-ID pass: emit the same resolved hit bindings into the matched
+            // R32Uint ring buffer so the consumer can read a single pixel to
+            // resolve the hovered/clicked panel. Same buffer index and frame
+            // sequence as color/depth keeps the three targets frame-coherent.
+            if let Some(id_ring) = self.external_id_surfaces.get_mut(surface_id)
+                && let Some(id_shared) = id_ring.get_mut(write_index)
+            {
+                let id_view = id_shared
+                    .texture
+                    .create_view(&wgpu::TextureViewDescriptor::default());
+                let mut id_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("neon3-headless-external-ui-id-pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &id_view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                self.ui.draw_hit_id(
+                    &self.device,
+                    &self.queue,
+                    &mut id_pass,
+                    fragments,
+                    [id_shared.width, id_shared.height],
+                    [id_shared.width as f32, id_shared.height as f32],
+                    0.0,
+                );
+                drop(id_pass);
+                id_shared.frame_sequence = frame_sequence;
+                hal_queue.add_signal_fence(id_shared.fence.clone(), frame_sequence);
             }
             shared.frame_sequence = frame_sequence;
             hal_queue.add_signal_fence(shared.fence.clone(), shared.frame_sequence);

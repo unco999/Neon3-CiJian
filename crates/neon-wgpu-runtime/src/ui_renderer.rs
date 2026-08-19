@@ -176,6 +176,7 @@ struct VsOut {
 }
 @fragment fn fs_main(input: VsOut) -> @location(0) f32 {
     if (outside_clip(input.pixel, input.clip, input.params.w)) { discard; }
+    if (input.depth <= 0.0) { discard; }
     return input.depth;
 }
 "#;
@@ -3674,10 +3675,6 @@ impl UiWgpuRenderer {
             0,
             bytemuck::cast_slice(&self.instances),
         );
-        pass.set_pipeline(&self.pipeline);
-        pass.set_bind_group(0, &self.view_bind_group, &[]);
-        pass.set_vertex_buffer(0, self.instance_buffer.slice(..));
-        pass.draw(0..6, 0..self.instances.len() as u32);
         let images = self
             .sampled
             .iter()
@@ -3707,20 +3704,7 @@ impl UiWgpuRenderer {
                 self.image_capacity = images.len().next_power_of_two();
                 self.image_buffer = create_image_buffer(device, self.image_capacity);
             }
-            pass.set_pipeline(&self.image_pipeline);
-            pass.set_bind_group(0, &self.view_bind_group, &[]);
             queue.write_buffer(&self.image_buffer, 0, bytemuck::cast_slice(&images));
-            pass.set_bind_group(
-                1,
-                &self
-                    .image_atlas
-                    .as_ref()
-                    .expect("resident image atlas")
-                    .bind_group,
-                &[],
-            );
-            pass.set_vertex_buffer(0, self.image_buffer.slice(..));
-            pass.draw(0..6, 0..images.len() as u32);
         }
         let surfaces = self
             .sampled
@@ -3750,16 +3734,6 @@ impl UiWgpuRenderer {
                     ))
             })
             .collect::<Vec<_>>();
-        if !surfaces.is_empty() {
-            pass.set_pipeline(&self.image_pipeline);
-            pass.set_bind_group(0, &self.view_bind_group, &[]);
-            for (key, surface) in &surfaces {
-                queue.write_buffer(&self.image_buffer, 0, bytemuck::bytes_of(surface));
-                pass.set_bind_group(1, &self.resident_render_surfaces[key].bind_group, &[]);
-                pass.set_vertex_buffer(0, self.image_buffer.slice(..));
-                pass.draw(0..6, 0..1);
-            }
-        }
         let dropdown_texts = self.dropdown_option_texts();
         let list_box_texts = self.list_box_option_texts();
         let tab_texts = self.tab_option_texts();
@@ -3890,6 +3864,36 @@ impl UiWgpuRenderer {
         }
         if !texts.is_empty() {
             queue.write_buffer(&self.text_buffer, 0, bytemuck::cast_slice(&texts));
+        }
+        // Color composition uses UI painter order, not camera occlusion depth.
+        // `world_depth` describes the relationship with the host scene; it must
+        // not reorder ordinary 2D panels and their glyphs. Drawing all panel
+        // rects before text preserves the established contract that glyphs sit
+        // above their panel backgrounds and avoids a parent rect covering text.
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &self.view_bind_group, &[]);
+        pass.set_vertex_buffer(0, self.instance_buffer.slice(..));
+        pass.draw(0..6, 0..self.instances.len() as u32);
+
+        if !images.is_empty() {
+            pass.set_pipeline(&self.image_pipeline);
+            pass.set_bind_group(0, &self.view_bind_group, &[]);
+            pass.set_bind_group(1, &self.image_atlas.as_ref().expect("resident image atlas").bind_group, &[]);
+            pass.set_vertex_buffer(0, self.image_buffer.slice(..));
+            pass.draw(0..6, 0..images.len() as u32);
+        }
+        if !surfaces.is_empty() {
+            pass.set_pipeline(&self.image_pipeline);
+            pass.set_bind_group(0, &self.view_bind_group, &[]);
+            for (key, surface) in &surfaces {
+                queue.write_buffer(&self.image_buffer, 0, bytemuck::bytes_of(surface));
+                pass.set_bind_group(1, &self.resident_render_surfaces[key].bind_group, &[]);
+                pass.set_vertex_buffer(0, self.image_buffer.slice(..));
+                pass.draw(0..6, 0..1);
+            }
+        }
+
+        if !texts.is_empty() {
             pass.set_pipeline(&self.text_pipeline);
             pass.set_bind_group(0, &self.view_bind_group, &[]);
             pass.set_bind_group(1, &self.resident_font.as_ref().unwrap().bind_group, &[]);
@@ -3946,20 +3950,14 @@ impl UiWgpuRenderer {
         true
     }
 
-    /// Re-emits the already-composed instances into a depth-only pass, writing
-    /// each instance's normalized occlusion depth to the bound R32Float target.
-    /// Must be called after `draw` so `self.instances` and the instance buffer
-    /// are current. Screen UI (depth 0.0) is naturally "always on top" and world
-    /// panels write their anchor depth; near panels overwrite far ones because
-    /// instances are already sorted far -> near.
+    /// Re-emits the already-composed panel instances into a depth-only pass.
+    /// This target describes UI-to-host-scene occlusion; it is deliberately
+    /// separate from the 2D painter order used by the color pass.
     pub(crate) fn draw_depth<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
-        let Some(pipeline) = &self.depth_pipeline else {
+        let Some(rect_pipeline) = &self.depth_pipeline else {
             return;
         };
-        if self.instances.is_empty() {
-            return;
-        }
-        pass.set_pipeline(pipeline);
+        pass.set_pipeline(rect_pipeline);
         pass.set_bind_group(0, &self.view_bind_group, &[]);
         pass.set_vertex_buffer(0, self.instance_buffer.slice(..));
         pass.draw(0..6, 0..self.instances.len() as u32);
