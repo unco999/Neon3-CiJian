@@ -2493,7 +2493,7 @@ impl HeadlessExternalGpu {
                     occlusion_query_set: None,
                     multiview_mask: None,
                 });
-                self.ui.draw_depth(&mut depth_pass);
+                self.ui.draw_depth(&self.queue, &mut depth_pass);
                 drop(depth_pass);
                 depth_shared.frame_sequence = frame_sequence;
                 hal_queue.add_signal_fence(depth_shared.fence.clone(), frame_sequence);

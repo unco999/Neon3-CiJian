@@ -239,6 +239,7 @@ struct UiInstance {
     /// Normalized occlusion depth (0.0 = near/always-on-top, 1.0 = far). Written
     /// to the optional depth target so the consumer can depth-test the overlay.
     depth: f32,
+    paint_group_id: u32,
 }
 
 #[repr(C)]
@@ -489,6 +490,7 @@ struct UiImageInstance {
     clip: [f32; 4],
     uv: [f32; 4],
     depth: f32,
+    paint_group_id: u32,
 }
 
 #[repr(C)]
@@ -501,6 +503,7 @@ struct UiTextInstance {
     /// Paint-group depth inherited from the owning panel. The color shader
     /// ignores this field; the CPU uses it to keep panel and text together.
     depth: f32,
+    paint_group_id: u32,
 }
 
 struct ResidentImage {
@@ -691,6 +694,7 @@ struct UiVisual {
     /// Normalized occlusion depth inherited from a projected world panel
     /// (`None` for screen UI → rendered as "always on top", depth 0.0).
     world_depth: Option<f32>,
+    paint_group_id: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -707,6 +711,7 @@ struct PlannedNode {
     target: UiVisual,
     transition: Option<UiTransition>,
     instance_index: Option<usize>,
+    paint_group_id: u32,
 }
 
 /// Private bridge from a declaration's fragment-local node key to its current
@@ -3701,6 +3706,7 @@ impl UiWgpuRenderer {
                     ],
                     uv: image.uv,
                     depth: visual.world_depth.unwrap_or(0.0),
+                    paint_group_id: self.plan.iter().zip(self.sampled.iter()).position(|(_, candidate)| std::ptr::eq(candidate, visual)).map(|index| self.plan[index].paint_group_id).unwrap_or(0),
                 })
             })
             .collect::<Vec<_>>();
@@ -3736,6 +3742,7 @@ impl UiWgpuRenderer {
                             ],
                             uv: [0.0, 0.0, 1.0, 1.0],
                             depth: visual.world_depth.unwrap_or(0.0),
+                            paint_group_id: self.plan.iter().zip(self.sampled.iter()).position(|(_, candidate)| std::ptr::eq(candidate, visual)).map(|index| self.plan[index].paint_group_id).unwrap_or(0),
                         },
                     ))
             })
@@ -3877,7 +3884,7 @@ impl UiWgpuRenderer {
         // still covers a farther group's text.
         let mut rect_groups: Vec<(u32, Vec<UiInstance>)> = Vec::new();
         for instance in &self.instances {
-            let key = instance.depth.to_bits();
+            let key = instance.paint_group_id;
             if let Some((_, group)) = rect_groups.iter_mut().find(|(group_key, _)| *group_key == key) {
                 group.push(*instance);
             } else {
@@ -3886,7 +3893,7 @@ impl UiWgpuRenderer {
         }
         let mut text_groups: Vec<(u32, Vec<UiTextInstance>)> = Vec::new();
         for text in &texts {
-            let key = text.depth.to_bits();
+            let key = text.paint_group_id;
             if let Some((_, group)) = text_groups.iter_mut().find(|(group_key, _)| *group_key == key) {
                 group.push(*text);
             } else {
@@ -3895,57 +3902,98 @@ impl UiWgpuRenderer {
         }
         let mut image_groups: Vec<(u32, Vec<UiImageInstance>)> = Vec::new();
         for image in &images {
-            let key = image.depth.to_bits();
+            let key = image.paint_group_id;
             if let Some((_, group)) = image_groups.iter_mut().find(|(group_key, _)| *group_key == key) {
                 group.push(*image);
             } else {
                 image_groups.push((key, vec![*image]));
             }
         }
-        let surface_groups = surfaces
-            .iter()
-            .map(|(surface_id, surface)| (surface.depth.to_bits(), surface_id, *surface))
-            .collect::<Vec<_>>();
+        let mut surface_groups: HashMap<u32, Vec<(String, UiImageInstance)>> = HashMap::new();
+        for (surface_id, surface) in &surfaces {
+            surface_groups
+                .entry(surface.paint_group_id)
+                .or_default()
+                .push((surface_id.clone(), *surface));
+        }
         let mut depth_keys = rect_groups
             .iter()
             .map(|(key, _)| *key)
             .chain(image_groups.iter().map(|(key, _)| *key))
-            .chain(surface_groups.iter().map(|(key, _, _)| *key))
+            .chain(surface_groups.keys().copied())
             .chain(text_groups.iter().map(|(key, _)| *key))
             .collect::<Vec<_>>();
-        depth_keys.sort_by(|a, b| f32::from_bits(*b).partial_cmp(&f32::from_bits(*a)).unwrap_or(std::cmp::Ordering::Equal));
+        let group_depth = |group_id: u32| {
+            self.plan
+                .iter()
+                .find(|node| node.paint_group_id == group_id)
+                .and_then(|node| node.target.world_depth)
+                .unwrap_or(0.0)
+        };
+        depth_keys.sort_by(|a, b| group_depth(*b).partial_cmp(&group_depth(*a)).unwrap_or(std::cmp::Ordering::Equal));
         depth_keys.dedup();
+        let mut ordered_rects = Vec::new();
+        let mut ordered_images = Vec::new();
+        let mut ordered_texts = Vec::new();
+        let mut rect_ranges = HashMap::new();
+        let mut image_ranges = HashMap::new();
+        let mut text_ranges = HashMap::new();
+        let group_order = depth_keys.clone();
         for key in depth_keys {
             if let Some((_, group)) = rect_groups.iter().find(|(group_key, _)| *group_key == key) {
-                queue.write_buffer(&self.instance_buffer, 0, bytemuck::cast_slice(group));
-                pass.set_pipeline(&self.pipeline);
-                pass.set_bind_group(0, &self.view_bind_group, &[]);
-                pass.set_vertex_buffer(0, self.instance_buffer.slice(..));
-                pass.draw(0..6, 0..group.len() as u32);
+                let start = ordered_rects.len() as u32;
+                ordered_rects.extend_from_slice(group);
+                rect_ranges.insert(key, (start, group.len() as u32));
             }
             if let Some((_, group)) = image_groups.iter().find(|(group_key, _)| *group_key == key) {
-                queue.write_buffer(&self.image_buffer, 0, bytemuck::cast_slice(group));
-                pass.set_pipeline(&self.image_pipeline);
-                pass.set_bind_group(0, &self.view_bind_group, &[]);
-                pass.set_bind_group(1, &self.image_atlas.as_ref().expect("resident image atlas").bind_group, &[]);
-                pass.set_vertex_buffer(0, self.image_buffer.slice(..));
-                pass.draw(0..6, 0..group.len() as u32);
-            }
-            for (_, surface_id, surface) in surface_groups.iter().filter(|(group_key, _, _)| *group_key == key) {
-                queue.write_buffer(&self.image_buffer, 0, bytemuck::bytes_of(surface));
-                pass.set_pipeline(&self.image_pipeline);
-                pass.set_bind_group(0, &self.view_bind_group, &[]);
-                pass.set_bind_group(1, &self.resident_render_surfaces[*surface_id].bind_group, &[]);
-                pass.set_vertex_buffer(0, self.image_buffer.slice(..));
-                pass.draw(0..6, 0..1);
+                let start = ordered_images.len() as u32;
+                ordered_images.extend_from_slice(group);
+                image_ranges.insert(key, (start, group.len() as u32));
             }
             if let Some((_, group)) = text_groups.iter().find(|(group_key, _)| *group_key == key) {
-                queue.write_buffer(&self.text_buffer, 0, bytemuck::cast_slice(group));
-                pass.set_pipeline(&self.text_pipeline);
+                let start = ordered_texts.len() as u32;
+                ordered_texts.extend_from_slice(group);
+                text_ranges.insert(key, (start, group.len() as u32));
+            }
+        }
+
+        queue.write_buffer(&self.instance_buffer, 0, bytemuck::cast_slice(&ordered_rects));
+        pass.set_bind_group(0, &self.view_bind_group, &[]);
+        pass.set_vertex_buffer(0, self.instance_buffer.slice(..));
+        if !ordered_images.is_empty() {
+            queue.write_buffer(&self.image_buffer, 0, bytemuck::cast_slice(&ordered_images));
+            pass.set_bind_group(1, &self.image_atlas.as_ref().expect("resident image atlas").bind_group, &[]);
+        }
+        if !ordered_texts.is_empty() {
+            queue.write_buffer(&self.text_buffer, 0, bytemuck::cast_slice(&ordered_texts));
+            pass.set_bind_group(1, &self.resident_font.as_ref().unwrap().bind_group, &[]);
+        }
+        for key in group_order {
+            if let Some((start, count)) = rect_ranges.get(&key) {
+                pass.set_pipeline(&self.pipeline);
+                pass.set_vertex_buffer(0, self.instance_buffer.slice(..));
+                pass.draw(0..6, *start..*start + *count);
+            }
+            if let Some((start, count)) = image_ranges.get(&key) {
+                pass.set_pipeline(&self.image_pipeline);
+                pass.set_vertex_buffer(0, self.image_buffer.slice(..));
+                pass.draw(0..6, *start..*start + *count);
+            }
+            if let Some(group) = surface_groups.get(&key) {
+                pass.set_pipeline(&self.image_pipeline);
                 pass.set_bind_group(0, &self.view_bind_group, &[]);
+                pass.set_vertex_buffer(0, self.image_buffer.slice(..));
+                for (surface_id, surface) in group {
+                    queue.write_buffer(&self.image_buffer, 0, bytemuck::bytes_of(surface));
+                    pass.set_bind_group(1, &self.resident_render_surfaces[surface_id].bind_group, &[]);
+                    pass.draw(0..6, 0..1);
+                }
+            }
+            if let Some((start, count)) = text_ranges.get(&key) {
+                pass.set_pipeline(&self.text_pipeline);
                 pass.set_bind_group(1, &self.resident_font.as_ref().unwrap().bind_group, &[]);
                 pass.set_vertex_buffer(0, self.text_buffer.slice(..));
-                pass.draw(0..6, 0..group.len() as u32);
+                pass.draw(0..6, *start..*start + *count);
             }
         }
 
@@ -4010,14 +4058,47 @@ impl UiWgpuRenderer {
     /// Re-emits the already-composed panel instances into a depth-only pass.
     /// This target describes UI-to-host-scene occlusion; it is deliberately
     /// separate from the 2D painter order used by the color pass.
-    pub(crate) fn draw_depth<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
+    pub(crate) fn draw_depth<'a>(
+        &'a self,
+        queue: &wgpu::Queue,
+        pass: &mut wgpu::RenderPass<'a>,
+    ) {
         let Some(rect_pipeline) = &self.depth_pipeline else {
             return;
         };
+        // The exported convention is 0.0 = near/always-on-top and 1.0 = far.
+        // R32Float has no depth test of its own, so emit complete groups far to
+        // near; the later near group overwrites the earlier far value.
+        let mut groups: HashMap<u32, Vec<UiInstance>> = HashMap::new();
+        for instance in &self.instances {
+            groups.entry(instance.paint_group_id).or_default().push(*instance);
+        }
+        let mut group_ids = groups.keys().copied().collect::<Vec<_>>();
+        let group_depth = |group_id: u32| {
+            self.plan
+                .iter()
+                .find(|node| node.paint_group_id == group_id)
+                .and_then(|node| node.target.world_depth)
+                .unwrap_or(0.0)
+        };
+        group_ids.sort_by(|a, b| {
+            group_depth(*b)
+                .partial_cmp(&group_depth(*a))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let mut ordered = Vec::new();
+        for group_id in group_ids {
+            if let Some(group) = groups.remove(&group_id) {
+                ordered.extend(group);
+            }
+        }
+        queue.write_buffer(&self.instance_buffer, 0, bytemuck::cast_slice(&ordered));
         pass.set_pipeline(rect_pipeline);
         pass.set_bind_group(0, &self.view_bind_group, &[]);
         pass.set_vertex_buffer(0, self.instance_buffer.slice(..));
-        pass.draw(0..6, 0..self.instances.len() as u32);
+        // The caller uploads the color snapshot before opening the depth pass;
+        // keep this pass limited to the same panel instances and ordering.
+        pass.draw(0..6, 0..ordered.len() as u32);
     }
 
     fn refresh_plan(
@@ -4078,7 +4159,26 @@ impl UiWgpuRenderer {
                 target,
                 transition,
                 instance_index,
+                paint_group_id: 0,
             });
+        }
+        let mut group_ids = HashMap::<String, u32>::new();
+        let mut next_group_id = 1_u32;
+        for index in 0..self.plan.len() {
+            let mut root = index;
+            while let Some(parent_id) = self.plan[root].parent_id.as_deref() {
+                let Some(parent) = self.plan.iter().position(|node| node.id == parent_id) else { break };
+                root = parent;
+            }
+            let root_id = self.plan[root].id.clone();
+            let group_id = *group_ids.entry(root_id).or_insert_with(|| {
+                let id = next_group_id;
+                next_group_id = next_group_id.saturating_add(1);
+                id
+            });
+            self.plan[index].paint_group_id = group_id;
+            self.plan[index].target.paint_group_id = group_id;
+            self.sampled[index].paint_group_id = group_id;
         }
         for fragment in fragments.values() {
             for (node_key, plan_path) in collect_node_paths(&fragment.fragment_id.0, &fragment.root)
@@ -4445,6 +4545,7 @@ impl UiWgpuRenderer {
                         params: [0.0, 4.0, visual.style.opacity, visual.clip_radius],
                         clip,
                         depth: 0.0,
+                        paint_group_id: 0,
                     },
                     UiInstance {
                         rect: [thumb.x, thumb.y, thumb.width, thumb.height],
@@ -4453,6 +4554,7 @@ impl UiWgpuRenderer {
                         params: [0.0, 4.0, visual.style.opacity, visual.clip_radius],
                         clip,
                         depth: 0.0,
+                        paint_group_id: 0,
                     },
                 ])
             })
@@ -4566,6 +4668,7 @@ impl UiWgpuRenderer {
                 visual.clip.y + visual.clip.height,
             ],
             depth: visual.world_depth.unwrap_or(0.0),
+            paint_group_id: visual.paint_group_id,
         }
     }
 
@@ -4625,6 +4728,7 @@ impl UiWgpuRenderer {
                     preview.clip.y + preview.clip.height,
                 ],
                 depth: 0.0,
+                paint_group_id: visual.paint_group_id,
             });
         }
         instances
@@ -4710,6 +4814,7 @@ impl UiWgpuRenderer {
             params: [1.0, 4.0, 1.0, 0.0],
             clip,
             depth: 0.0,
+            paint_group_id: 0,
         }];
         for (row, option) in rows.into_iter().zip(options) {
             instances.push(UiInstance {
@@ -4723,6 +4828,7 @@ impl UiWgpuRenderer {
                 params: [1.0, 2.0, 1.0, 0.0],
                 clip,
                 depth: 0.0,
+                paint_group_id: 0,
             });
         }
         instances
@@ -5032,6 +5138,7 @@ fn component_chrome_instances(visual: &UiVisual) -> Vec<UiInstance> {
         params: [1.0, radius, visual.style.opacity, visual.clip_radius],
         clip,
         depth: 0.0,
+        paint_group_id: 0,
     };
     let selected = matches!(
         &visual.presentation,
@@ -5168,6 +5275,7 @@ fn component_chrome_instances(visual: &UiVisual) -> Vec<UiInstance> {
                     params: [0.0, 3.0, visual.style.opacity, visual.clip_radius],
                     clip,
                     depth: 0.0,
+                    paint_group_id: 0,
                 },
             ]
         }
@@ -5826,6 +5934,7 @@ fn layout_text(
                 clip,
                 uv: glyph.uv,
                 depth: visual.world_depth.unwrap_or(0.0),
+                paint_group_id: visual.paint_group_id,
             });
             x += glyph.advance * text_scale;
         }
@@ -5861,6 +5970,7 @@ fn overlay_instance(bounds: UiBounds, clip: UiBounds, color: [f32; 4]) -> UiInst
         params: [0.0, 0.0, 1.0, 0.0],
         clip: [clip.x, clip.y, clip.x + clip.width, clip.y + clip.height],
         depth: 0.0,
+        paint_group_id: 0,
     }
 }
 
@@ -6143,6 +6253,7 @@ fn append_data_grid_frames(
                 scroll: false,
                 declared_scroll_offset: [0.0; 2],
                 world_depth: None,
+                paint_group_id: 0,
             };
             let mut sticky_header = vec![(
                 format!("{grid_path}/data-grid-header"),
@@ -6218,6 +6329,7 @@ fn append_data_grid_frames(
                     scroll: false,
                     declared_scroll_offset: [0.0; 2],
                     world_depth: None,
+                    paint_group_id: grid.paint_group_id,
                 };
                 let row_path = format!("{grid_path}/data-grid-row-{}", row.stable_row_key);
                 out.push((row_path.clone(), Some(grid_path.clone()), row_visual, None));
@@ -6615,7 +6727,8 @@ fn flatten_node(
                 presentation: None,
                 scroll: node_layout.clip == UiClipPolicy::Scroll,
                 declared_scroll_offset: node_layout.scroll_offset,
-                world_depth: node.world_depth.or(inherited_depth),
+        world_depth: node.world_depth.or(inherited_depth),
+        paint_group_id: 0,
             },
             node.enter_transition.clone(),
         ));
@@ -6988,6 +7101,7 @@ fn transition_source(target: &UiVisual, transition: &UiTransition) -> UiVisual {
         scroll: target.scroll,
         declared_scroll_offset: target.declared_scroll_offset,
         world_depth: target.world_depth,
+        paint_group_id: target.paint_group_id,
     }
 }
 
@@ -7033,6 +7147,7 @@ fn sample_transition(active: &ActiveTransition, time_seconds: f32) -> UiVisual {
         scroll: active.target.scroll,
         declared_scroll_offset: active.target.declared_scroll_offset,
         world_depth: active.target.world_depth,
+        paint_group_id: active.target.paint_group_id,
     }
 }
 
