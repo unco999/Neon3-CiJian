@@ -3926,8 +3926,8 @@ impl UiWgpuRenderer {
         let group_depth = |group_id: u32| {
             self.plan
                 .iter()
-                .find(|node| node.paint_group_id == group_id)
-                .and_then(|node| node.target.world_depth)
+                .filter(|node| node.paint_group_id == group_id)
+                .find_map(|node| node.target.world_depth)
                 .unwrap_or(0.0)
         };
         depth_keys.sort_by(|a, b| group_depth(*b).partial_cmp(&group_depth(*a)).unwrap_or(std::cmp::Ordering::Equal));
@@ -4077,8 +4077,8 @@ impl UiWgpuRenderer {
         let group_depth = |group_id: u32| {
             self.plan
                 .iter()
-                .find(|node| node.paint_group_id == group_id)
-                .and_then(|node| node.target.world_depth)
+                .filter(|node| node.paint_group_id == group_id)
+                .find_map(|node| node.target.world_depth)
                 .unwrap_or(0.0)
         };
         group_ids.sort_by(|a, b| {
