@@ -37,6 +37,7 @@ struct VsIn {
     @location(2) border: vec4<f32>,
     @location(3) params: vec4<f32>,
     @location(4) clip: vec4<f32>,
+    @location(5) depth: f32,
 }
 
 struct VsOut {
@@ -59,7 +60,7 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32, input: VsIn) -> VsOut {
     let local = corners[vertex_index];
     let pixel = input.rect.xy + local * input.rect.zw;
     var output: VsOut;
-    output.position = vec4<f32>(pixel.x / view.viewport.x * 2.0 - 1.0, 1.0 - pixel.y / view.viewport.y * 2.0, 0.0, 1.0);
+    output.position = vec4<f32>(pixel.x / view.viewport.x * 2.0 - 1.0, 1.0 - pixel.y / view.viewport.y * 2.0, input.depth, 1.0);
     output.local = local;
     output.size = input.rect.zw;
     output.fill = input.fill;
@@ -89,7 +90,12 @@ fn fs_main(input: VsOut) -> @location(0) vec4<f32> {
             edge_distance
         );
         let color = mix(input.fill, input.border, border_alpha);
-        return vec4<f32>(srgb_to_linear(color.rgb), color.a * input.params.z * shape_alpha);
+        let alpha = color.a * input.params.z * shape_alpha;
+        // A transparent structural container must not populate the color depth
+        // attachment. Otherwise its near depth rejects all visible World UI
+        // children while contributing no color itself.
+        if (alpha <= 0.001) { discard; }
+        return vec4<f32>(srgb_to_linear(color.rgb), alpha);
     }
     let radius = min(input.params.y, min(input.size.x, input.size.y) * 0.5);
     let point = input.local * input.size - input.size * 0.5;
@@ -98,7 +104,9 @@ fn fs_main(input: VsOut) -> @location(0) vec4<f32> {
     let shape_alpha = 1.0 - smoothstep(0.0, 1.0, corner_distance);
     let border_alpha = 1.0 - smoothstep(-input.params.x - 1.0, -input.params.x + 1.0, corner_distance);
     let color = mix(input.fill, input.border, border_alpha);
-    return vec4<f32>(srgb_to_linear(color.rgb), color.a * input.params.z * shape_alpha);
+    let alpha = color.a * input.params.z * shape_alpha;
+    if (alpha <= 0.001) { discard; }
+    return vec4<f32>(srgb_to_linear(color.rgb), alpha);
 }
 "#;
 
@@ -189,17 +197,19 @@ struct View { viewport: vec2<f32>, _pad: vec2<f32> }
 fn srgb_to_linear(value: vec3<f32>) -> vec3<f32> {
  let low = value / 12.92; let high = pow((value + vec3<f32>(0.055)) / 1.055, vec3<f32>(2.4)); return select(low, high, value > vec3<f32>(0.04045));
 }
-struct VsIn { @location(0) rect: vec4<f32>, @location(1) tint: vec4<f32>, @location(2) clip: vec4<f32>, @location(3) uv: vec4<f32> }
+struct VsIn { @location(0) rect: vec4<f32>, @location(1) tint: vec4<f32>, @location(2) clip: vec4<f32>, @location(3) uv: vec4<f32>, @location(4) depth: f32 }
 struct VsOut { @builtin(position) position: vec4<f32>, @location(0) local: vec2<f32>, @location(1) tint: vec4<f32>, @location(2) clip: vec4<f32>, @location(3) pixel: vec2<f32>, @location(4) uv: vec2<f32> }
 @vertex fn vs_main(@builtin(vertex_index) index: u32, input: VsIn) -> VsOut {
  var corners = array<vec2<f32>, 6>(vec2<f32>(0.0,0.0),vec2<f32>(1.0,0.0),vec2<f32>(0.0,1.0),vec2<f32>(0.0,1.0),vec2<f32>(1.0,0.0),vec2<f32>(1.0,1.0));
  let local = corners[index]; let pixel = input.rect.xy + local * input.rect.zw; var output: VsOut;
-  output.position = vec4<f32>(pixel.x / view.viewport.x * 2.0 - 1.0, 1.0 - pixel.y / view.viewport.y * 2.0, 0.0, 1.0); output.local = local; output.tint = input.tint; output.clip = input.clip; output.pixel = pixel; output.uv = input.uv.xy + local * input.uv.zw; return output;
+   output.position = vec4<f32>(pixel.x / view.viewport.x * 2.0 - 1.0, 1.0 - pixel.y / view.viewport.y * 2.0, input.depth, 1.0); output.local = local; output.tint = input.tint; output.clip = input.clip; output.pixel = pixel; output.uv = input.uv.xy + local * input.uv.zw; return output;
 }
 @fragment fn fs_main(input: VsOut) -> @location(0) vec4<f32> {
  if (input.pixel.x < input.clip.x || input.pixel.y < input.clip.y || input.pixel.x > input.clip.z || input.pixel.y > input.clip.w) { discard; }
    let sample = textureSample(image_texture, image_sampler, input.uv);
-  return vec4<f32>(sample.rgb * srgb_to_linear(input.tint.rgb), sample.a * input.tint.a);
+  let alpha = sample.a * input.tint.a;
+  if (alpha <= 0.001) { discard; }
+  return vec4<f32>(sample.rgb * srgb_to_linear(input.tint.rgb), alpha);
 }
 "#;
 
@@ -211,12 +221,12 @@ struct View { viewport: vec2<f32>, _pad: vec2<f32> }
 fn srgb_to_linear(value: vec3<f32>) -> vec3<f32> {
  let low = value / 12.92; let high = pow((value + vec3<f32>(0.055)) / 1.055, vec3<f32>(2.4)); return select(low, high, value > vec3<f32>(0.04045));
 }
-struct VsIn { @location(0) rect: vec4<f32>, @location(1) color: vec4<f32>, @location(2) clip: vec4<f32>, @location(3) uv: vec4<f32> }
+struct VsIn { @location(0) rect: vec4<f32>, @location(1) color: vec4<f32>, @location(2) clip: vec4<f32>, @location(3) uv: vec4<f32>, @location(4) depth: f32 }
 struct VsOut { @builtin(position) position: vec4<f32>, @location(0) local: vec2<f32>, @location(1) color: vec4<f32>, @location(2) clip: vec4<f32>, @location(3) pixel: vec2<f32>, @location(4) uv: vec2<f32> }
 @vertex fn vs_main(@builtin(vertex_index) index: u32, input: VsIn) -> VsOut {
  var corners = array<vec2<f32>, 6>(vec2<f32>(0.0,0.0),vec2<f32>(1.0,0.0),vec2<f32>(0.0,1.0),vec2<f32>(0.0,1.0),vec2<f32>(1.0,0.0),vec2<f32>(1.0,1.0));
  let local = corners[index]; let pixel = input.rect.xy + local * input.rect.zw; var output: VsOut;
- output.position=vec4<f32>(pixel.x/view.viewport.x*2.0-1.0,1.0-pixel.y/view.viewport.y*2.0,0.0,1.0); output.local=local; output.color=input.color; output.clip=input.clip; output.pixel=pixel; output.uv=input.uv.xy + local * input.uv.zw; return output;
+  output.position=vec4<f32>(pixel.x/view.viewport.x*2.0-1.0,1.0-pixel.y/view.viewport.y*2.0,input.depth,1.0); output.local=local; output.color=input.color; output.clip=input.clip; output.pixel=pixel; output.uv=input.uv.xy + local * input.uv.zw; return output;
 }
 @fragment fn fs_main(input: VsOut) -> @location(0) vec4<f32> {
  if (input.pixel.x < input.clip.x || input.pixel.y < input.clip.y || input.pixel.x > input.clip.z || input.pixel.y > input.clip.w) { discard; }
@@ -931,6 +941,11 @@ impl UiWgpuRenderer {
                             offset: 64,
                             shader_location: 4,
                         },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32,
+                            offset: 80,
+                            shader_location: 5,
+                        },
                     ],
                 })],
                 compilation_options: Default::default(),
@@ -946,7 +961,16 @@ impl UiWgpuRenderer {
                 compilation_options: Default::default(),
             }),
             primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
+            depth_stencil: depth_format.map(|_| wgpu::DepthStencilState {
+                // This is the GPU depth attachment for the color pass. The
+                // exported occlusion target is a separate R32Float color
+                // target and must never be used as a depth-stencil format.
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
             multisample: wgpu::MultisampleState::default(),
             multiview_mask: None,
             cache: None,
@@ -1095,6 +1119,11 @@ impl UiWgpuRenderer {
                             offset: 48,
                             shader_location: 3,
                         },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32,
+                            offset: 64,
+                            shader_location: 4,
+                        },
                     ],
                 })],
                 compilation_options: Default::default(),
@@ -1110,7 +1139,13 @@ impl UiWgpuRenderer {
                 compilation_options: Default::default(),
             }),
             primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
+            depth_stencil: depth_format.map(|_| wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
             multisample: wgpu::MultisampleState::default(),
             multiview_mask: None,
             cache: None,
@@ -1176,6 +1211,11 @@ impl UiWgpuRenderer {
                             offset: 48,
                             shader_location: 3,
                         },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32,
+                            offset: 64,
+                            shader_location: 4,
+                        },
                     ],
                 })],
                 compilation_options: Default::default(),
@@ -1191,7 +1231,13 @@ impl UiWgpuRenderer {
                 compilation_options: Default::default(),
             }),
             primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
+            depth_stencil: depth_format.map(|_| wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
             multisample: wgpu::MultisampleState::default(),
             multiview_mask: None,
             cache: None,

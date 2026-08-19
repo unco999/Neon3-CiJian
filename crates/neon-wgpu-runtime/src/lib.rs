@@ -2216,6 +2216,7 @@ struct HeadlessExternalGpu {
     external_surfaces: HashMap<String, Vec<dx12_interop::SharedSurface>>,
     external_id_surfaces: HashMap<String, Vec<dx12_interop::SharedSurface>>,
     external_depth_surfaces: HashMap<String, Vec<dx12_interop::SharedSurface>>,
+    color_depth_targets: HashMap<String, Vec<wgpu::Texture>>,
     external_handle_tokens: HashMap<String, (String, String)>,
     next_external_frame_sequence: u64,
     last_external_render_at: Option<Instant>,
@@ -2256,6 +2257,7 @@ impl HeadlessExternalGpu {
             external_surfaces: HashMap::new(),
             external_id_surfaces: HashMap::new(),
             external_depth_surfaces: HashMap::new(),
+            color_depth_targets: HashMap::new(),
             external_handle_tokens: HashMap::new(),
             next_external_frame_sequence: 0,
             last_external_render_at: None,
@@ -2283,6 +2285,10 @@ impl HeadlessExternalGpu {
             );
         }
         self.external_surfaces.insert(open.surface_id.clone(), surfaces);
+        let color_depth_targets = (0..open.buffer_count)
+            .map(|_| create_color_depth_target(&self.device, open.size.width, open.size.height))
+            .collect::<Vec<_>>();
+        self.color_depth_targets.insert(open.surface_id.clone(), color_depth_targets);
         let generation = 1;
         let texture_token = format!("surface:{}:texture:g{}", open.surface_id, generation);
         let fence_token = format!("surface:{}:fence:g{}", open.surface_id, generation);
@@ -2455,6 +2461,11 @@ impl HeadlessExternalGpu {
             let hal_queue = unsafe { self.queue.as_hal::<wgpu::hal::api::Dx12>() }
                 .ok_or("dx12_queue_unavailable")?;
             let view = shared.texture.create_view(&wgpu::TextureViewDescriptor::default());
+            let color_depth_view = self
+                .color_depth_targets
+                .get(surface_id)
+                .and_then(|targets| targets.get(write_index))
+                .map(|target| target.create_view(&wgpu::TextureViewDescriptor::default()));
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("neon3-headless-external-ui-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -2463,7 +2474,16 @@ impl HeadlessExternalGpu {
                     resolve_target: None,
                     ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store },
                 })],
-                depth_stencil_attachment: None,
+                depth_stencil_attachment: color_depth_view.as_ref().map(|view| {
+                    wgpu::RenderPassDepthStencilAttachment {
+                        view,
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(1.0),
+                            store: wgpu::StoreOp::Store,
+                        }),
+                        stencil_ops: None,
+                    }
+                }),
                 timestamp_writes: None,
                 occlusion_query_set: None,
                 multiview_mask: None,
@@ -3473,6 +3493,27 @@ fn create_hit_target(
     });
     let view = target.create_view(&wgpu::TextureViewDescriptor::default());
     (target, view)
+}
+
+fn create_color_depth_target(
+    device: &wgpu::Device,
+    width: u32,
+    height: u32,
+) -> wgpu::Texture {
+    device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("neon3-ui-color-depth"),
+        size: wgpu::Extent3d {
+            width: width.max(1),
+            height: height.max(1),
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Depth32Float,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    })
 }
 
 fn world_ui_lab_fragment() -> HashMap<UiFragmentId, UiFragment> {
