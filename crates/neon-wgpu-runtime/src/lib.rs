@@ -2395,12 +2395,11 @@ impl HeadlessExternalGpu {
         if self.external_surfaces.is_empty() {
             return Ok(());
         }
-        // The external UI is consumed by a separate DX12 process. Rendering it
-        // at the display rate creates avoidable fence pressure; 30 Hz is enough
-        // for the current world-anchor case and keeps the ring reusable.
+        // Keep the external UI responsive to camera and anchor motion. The
+        // consumer ring still provides back-pressure when a buffer is busy.
         if self
             .last_external_render_at
-            .is_some_and(|last| last.elapsed() < Duration::from_millis(33))
+            .is_some_and(|last| last.elapsed() < Duration::from_millis(16))
         {
             return Ok(());
         }

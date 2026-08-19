@@ -488,6 +488,7 @@ struct UiImageInstance {
     tint: [f32; 4],
     clip: [f32; 4],
     uv: [f32; 4],
+    depth: f32,
 }
 
 #[repr(C)]
@@ -497,6 +498,9 @@ struct UiTextInstance {
     color: [f32; 4],
     clip: [f32; 4],
     uv: [f32; 4],
+    /// Paint-group depth inherited from the owning panel. The color shader
+    /// ignores this field; the CPU uses it to keep panel and text together.
+    depth: f32,
 }
 
 struct ResidentImage {
@@ -3696,6 +3700,7 @@ impl UiWgpuRenderer {
                         visual.clip.y + visual.clip.height,
                     ],
                     uv: image.uv,
+                    depth: visual.world_depth.unwrap_or(0.0),
                 })
             })
             .collect::<Vec<_>>();
@@ -3730,6 +3735,7 @@ impl UiWgpuRenderer {
                                 visual.clip.y + visual.clip.height,
                             ],
                             uv: [0.0, 0.0, 1.0, 1.0],
+                            depth: visual.world_depth.unwrap_or(0.0),
                         },
                     ))
             })
@@ -3865,41 +3871,92 @@ impl UiWgpuRenderer {
         if !texts.is_empty() {
             queue.write_buffer(&self.text_buffer, 0, bytemuck::cast_slice(&texts));
         }
-        // Color composition uses UI painter order, not camera occlusion depth.
-        // `world_depth` describes the relationship with the host scene; it must
-        // not reorder ordinary 2D panels and their glyphs. Drawing all panel
-        // rects before text preserves the established contract that glyphs sit
-        // above their panel backgrounds and avoids a parent rect covering text.
-        pass.set_pipeline(&self.pipeline);
-        pass.set_bind_group(0, &self.view_bind_group, &[]);
-        pass.set_vertex_buffer(0, self.instance_buffer.slice(..));
-        pass.draw(0..6, 0..self.instances.len() as u32);
-
-        if !images.is_empty() {
-            pass.set_pipeline(&self.image_pipeline);
-            pass.set_bind_group(0, &self.view_bind_group, &[]);
-            pass.set_bind_group(1, &self.image_atlas.as_ref().expect("resident image atlas").bind_group, &[]);
-            pass.set_vertex_buffer(0, self.image_buffer.slice(..));
-            pass.draw(0..6, 0..images.len() as u32);
+        // Treat equal world depth as one paint group. Groups are emitted far
+        // to near; within a group the panel batch is emitted before its text
+        // batch, so text stays above its owning panel while a nearer panel
+        // still covers a farther group's text.
+        let mut rect_groups: Vec<(u32, Vec<UiInstance>)> = Vec::new();
+        for instance in &self.instances {
+            let key = instance.depth.to_bits();
+            if let Some((_, group)) = rect_groups.iter_mut().find(|(group_key, _)| *group_key == key) {
+                group.push(*instance);
+            } else {
+                rect_groups.push((key, vec![*instance]));
+            }
         }
-        if !surfaces.is_empty() {
-            pass.set_pipeline(&self.image_pipeline);
-            pass.set_bind_group(0, &self.view_bind_group, &[]);
-            for (key, surface) in &surfaces {
+        let mut text_groups: Vec<(u32, Vec<UiTextInstance>)> = Vec::new();
+        for text in &texts {
+            let key = text.depth.to_bits();
+            if let Some((_, group)) = text_groups.iter_mut().find(|(group_key, _)| *group_key == key) {
+                group.push(*text);
+            } else {
+                text_groups.push((key, vec![*text]));
+            }
+        }
+        let mut image_groups: Vec<(u32, Vec<UiImageInstance>)> = Vec::new();
+        for image in &images {
+            let key = image.depth.to_bits();
+            if let Some((_, group)) = image_groups.iter_mut().find(|(group_key, _)| *group_key == key) {
+                group.push(*image);
+            } else {
+                image_groups.push((key, vec![*image]));
+            }
+        }
+        let surface_groups = surfaces
+            .iter()
+            .map(|(surface_id, surface)| (surface.depth.to_bits(), surface_id, *surface))
+            .collect::<Vec<_>>();
+        let mut depth_keys = rect_groups
+            .iter()
+            .map(|(key, _)| *key)
+            .chain(image_groups.iter().map(|(key, _)| *key))
+            .chain(surface_groups.iter().map(|(key, _, _)| *key))
+            .chain(text_groups.iter().map(|(key, _)| *key))
+            .collect::<Vec<_>>();
+        depth_keys.sort_by(|a, b| f32::from_bits(*b).partial_cmp(&f32::from_bits(*a)).unwrap_or(std::cmp::Ordering::Equal));
+        depth_keys.dedup();
+        for key in depth_keys {
+            if let Some((_, group)) = rect_groups.iter().find(|(group_key, _)| *group_key == key) {
+                queue.write_buffer(&self.instance_buffer, 0, bytemuck::cast_slice(group));
+                pass.set_pipeline(&self.pipeline);
+                pass.set_bind_group(0, &self.view_bind_group, &[]);
+                pass.set_vertex_buffer(0, self.instance_buffer.slice(..));
+                pass.draw(0..6, 0..group.len() as u32);
+            }
+            if let Some((_, group)) = image_groups.iter().find(|(group_key, _)| *group_key == key) {
+                queue.write_buffer(&self.image_buffer, 0, bytemuck::cast_slice(group));
+                pass.set_pipeline(&self.image_pipeline);
+                pass.set_bind_group(0, &self.view_bind_group, &[]);
+                pass.set_bind_group(1, &self.image_atlas.as_ref().expect("resident image atlas").bind_group, &[]);
+                pass.set_vertex_buffer(0, self.image_buffer.slice(..));
+                pass.draw(0..6, 0..group.len() as u32);
+            }
+            for (_, surface_id, surface) in surface_groups.iter().filter(|(group_key, _, _)| *group_key == key) {
                 queue.write_buffer(&self.image_buffer, 0, bytemuck::bytes_of(surface));
-                pass.set_bind_group(1, &self.resident_render_surfaces[key].bind_group, &[]);
+                pass.set_pipeline(&self.image_pipeline);
+                pass.set_bind_group(0, &self.view_bind_group, &[]);
+                pass.set_bind_group(1, &self.resident_render_surfaces[*surface_id].bind_group, &[]);
                 pass.set_vertex_buffer(0, self.image_buffer.slice(..));
                 pass.draw(0..6, 0..1);
             }
+            if let Some((_, group)) = text_groups.iter().find(|(group_key, _)| *group_key == key) {
+                queue.write_buffer(&self.text_buffer, 0, bytemuck::cast_slice(group));
+                pass.set_pipeline(&self.text_pipeline);
+                pass.set_bind_group(0, &self.view_bind_group, &[]);
+                pass.set_bind_group(1, &self.resident_font.as_ref().unwrap().bind_group, &[]);
+                pass.set_vertex_buffer(0, self.text_buffer.slice(..));
+                pass.draw(0..6, 0..group.len() as u32);
+            }
         }
 
-        if !texts.is_empty() {
-            pass.set_pipeline(&self.text_pipeline);
-            pass.set_bind_group(0, &self.view_bind_group, &[]);
-            pass.set_bind_group(1, &self.resident_font.as_ref().unwrap().bind_group, &[]);
-            pass.set_vertex_buffer(0, self.text_buffer.slice(..));
-            pass.draw(0..6, 0..texts.len() as u32);
-        }
+        // Group draws use the shared instance buffer as a small upload scratch
+        // area. Restore the complete snapshot because draw_depth() follows
+        // this pass and needs the original instance indexing.
+        queue.write_buffer(
+            &self.instance_buffer,
+            0,
+            bytemuck::cast_slice(&self.instances),
+        );
         if !popup_instances.is_empty() {
             queue.write_buffer(
                 &self.popup_instance_buffer,
@@ -5768,6 +5825,7 @@ fn layout_text(
                 color: [0.86, 0.95, 0.98, visual.style.opacity],
                 clip,
                 uv: glyph.uv,
+                depth: visual.world_depth.unwrap_or(0.0),
             });
             x += glyph.advance * text_scale;
         }
