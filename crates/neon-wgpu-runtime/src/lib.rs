@@ -6563,6 +6563,7 @@ impl WgpuRuntime {
             effects: &[neon_ui_schema::UiEffect],
             bridge: &WorldInformationBridge,
             viewport: [u32; 2],
+            depths: &mut HashMap<String, f32>,
         ) {
             let binding = effects.iter().find_map(|effect| {
                 let neon_ui_schema::UiEffect::CameraVisibility { binding } = effect else {
@@ -6604,6 +6605,7 @@ impl WgpuRuntime {
                         viewport,
                     );
                     if let Some(([_x, _y], depth)) = projected {
+                        depths.insert(node.node_id.0.clone(), depth);
                         let scale = (6.0 / depth).clamp(0.5, 2.0);
                         node.bounds.width *= scale;
                         node.bounds.height *= scale;
@@ -6628,16 +6630,30 @@ impl WgpuRuntime {
                     node.bounds.y = y - node.bounds.height;
                 }
                 for child in &mut node.children {
-                    visit(child, effects, bridge, viewport);
+                    visit(child, effects, bridge, viewport, depths);
                 }
             }
         }
+        let mut depths: HashMap<String, f32> = HashMap::new();
         visit(
             &mut filtered.root,
             &filtered.effects,
             &self.world_bridge,
             self.viewport,
+            &mut depths,
         );
+        // Draw order: world panels are otherwise emitted in tree order, which
+        // lets a far panel (drawn later) cover a near one. Sort direct children
+        // by camera depth far -> near so near panels draw last and stay on top.
+        if has_world_panel {
+            filtered.root.children.sort_by(|a, b| {
+                let depth_a = depths.get(&a.node_id.0).copied().unwrap_or(f32::MAX);
+                let depth_b = depths.get(&b.node_id.0).copied().unwrap_or(f32::MAX);
+                depth_b
+                    .partial_cmp(&depth_a)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
         // The world bridge has already applied the camera gate and anchor
         // projection above. Leaving this effect in the renderer snapshot makes
         // UiWgpuRenderer apply a second, unrelated camera-availability gate.
@@ -8312,9 +8328,10 @@ mod tests {
             .root
             .children[0]
             .bounds;
-        // viewport [1280, 720]: center (640, 360). bounds.x = 640 - 5, y = 360 - 10.
-        assert!((bounds.x - 635.0).abs() < 0.5, "x was {}", bounds.x);
-        assert!((bounds.y - 350.0).abs() < 0.5, "y was {}", bounds.y);
+        // viewport [1280, 720]: center (640, 360). depth 2 → scale (6/2).clamp = 2.0,
+        // so width 20, height 20 → bounds.x = 640 - 10, y = 360 - 20.
+        assert!((bounds.x - 630.0).abs() < 0.5, "x was {}", bounds.x);
+        assert!((bounds.y - 340.0).abs() < 0.5, "y was {}", bounds.y);
     }
 
     #[test]
