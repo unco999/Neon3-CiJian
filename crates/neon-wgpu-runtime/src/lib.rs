@@ -6652,7 +6652,12 @@ impl WgpuRuntime {
             let layout = filtered.root.layout.get_or_insert_default();
             layout.mode = neon_ui_schema::UiLayoutMode::Overlay;
             layout.clip = neon_ui_schema::UiClipPolicy::None;
-            filtered.root.style.opacity = 0.0;
+            // The root is structurally transparent because it has no fill. Do
+            // not set opacity to zero here: UiWgpuRenderer propagates parent
+            // opacity to descendants, which would hide every world panel.
+            filtered.root.style.opacity = 1.0;
+            filtered.root.style.background_color[3] = 0.0;
+            filtered.root.style.border_color[3] = 0.0;
         }
         filtered
     }
