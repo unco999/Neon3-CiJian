@@ -12,7 +12,7 @@ use neon_ui_schema::{
     UiDropPlacement, UiEasing, UiFragment, UiFragmentRevision, UiIntent, UiJustifyContent,
     UiLayout, UiLayoutMode, UiNode, UiNodeKind, UiSemanticPayloadValue, UiStyle, UiTransition,
 };
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 const SHADER: &str = r#"
 struct View { viewport: vec2<f32>, _pad: vec2<f32> }
@@ -177,54 +177,6 @@ struct VsOut {
 @fragment fn fs_main(input: VsOut) -> @location(0) f32 {
     if (outside_clip(input.pixel, input.clip, input.params.w)) { discard; }
     if (input.depth <= 0.0) { discard; }
-    return input.depth;
-}
-"#;
-
-const TEXT_DEPTH_SHADER: &str = r#"
-struct View { viewport: vec2<f32>, _pad: vec2<f32> }
-@group(0) @binding(0) var<uniform> view: View;
-@group(1) @binding(0) var glyph_atlas: texture_2d<f32>;
-@group(1) @binding(1) var glyph_sampler: sampler;
-struct VsIn {
-    @location(0) rect: vec4<f32>,
-    @location(1) color: vec4<f32>,
-    @location(2) clip: vec4<f32>,
-    @location(3) uv: vec4<f32>,
-    @location(4) depth: f32,
-}
-struct VsOut {
-    @builtin(position) position: vec4<f32>,
-    @location(0) pixel: vec2<f32>,
-    @location(1) clip: vec4<f32>,
-    @location(2) uv: vec2<f32>,
-    @location(3) depth: f32,
-}
-@vertex fn vs_main(@builtin(vertex_index) index: u32, input: VsIn) -> VsOut {
-    var corners = array<vec2<f32>, 6>(
-        vec2<f32>(0.0, 0.0), vec2<f32>(1.0, 0.0), vec2<f32>(0.0, 1.0),
-        vec2<f32>(0.0, 1.0), vec2<f32>(1.0, 0.0), vec2<f32>(1.0, 1.0)
-    );
-    let local = corners[index];
-    let pixel = input.rect.xy + local * input.rect.zw;
-    var output: VsOut;
-    output.position = vec4<f32>(
-        pixel.x / view.viewport.x * 2.0 - 1.0,
-        1.0 - pixel.y / view.viewport.y * 2.0,
-        0.0,
-        1.0
-    );
-    output.pixel = pixel;
-    output.clip = input.clip;
-    output.uv = input.uv.xy + local * input.uv.zw;
-    output.depth = input.depth;
-    return output;
-}
-@fragment fn fs_main(input: VsOut) -> @location(0) f32 {
-    if (input.pixel.x < input.clip.x || input.pixel.y < input.clip.y ||
-        input.pixel.x > input.clip.z || input.pixel.y > input.clip.w) { discard; }
-    let coverage = textureSample(glyph_atlas, glyph_sampler, input.uv).a;
-    if (coverage <= 0.001 || input.depth <= 0.0) { discard; }
     return input.depth;
 }
 "#;
@@ -826,7 +778,6 @@ pub struct UiWgpuRenderer {
     pipeline: wgpu::RenderPipeline,
     depth_format: Option<wgpu::TextureFormat>,
     depth_pipeline: Option<wgpu::RenderPipeline>,
-    text_depth_pipeline: Option<wgpu::RenderPipeline>,
     view_buffer: wgpu::Buffer,
     view_bind_group: wgpu::BindGroup,
     instance_buffer: wgpu::Buffer,
@@ -863,10 +814,6 @@ pub struct UiWgpuRenderer {
     text_pipeline: wgpu::RenderPipeline,
     text_buffer: wgpu::Buffer,
     text_capacity: usize,
-    depth_text_buffer: wgpu::Buffer,
-    depth_text_capacity: usize,
-    depth_text_count: usize,
-    depth_text_instances: Vec<UiTextInstance>,
     popup_text_buffer: wgpu::Buffer,
     popup_text_capacity: usize,
     _text_texture_layout: wgpu::BindGroupLayout,
@@ -1315,53 +1262,11 @@ impl UiWgpuRenderer {
                 cache: None,
             })
         });
-        let text_depth_pipeline = depth_format.map(|depth_format| {
-            let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("neon3-ui-text-depth-shader"),
-                source: wgpu::ShaderSource::Wgsl(TEXT_DEPTH_SHADER.into()),
-            });
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("neon3-ui-text-depth-pipeline"),
-                layout: Some(&text_layout),
-                vertex: wgpu::VertexState {
-                    module: &shader,
-                    entry_point: Some("vs_main"),
-                    buffers: &[Some(wgpu::VertexBufferLayout {
-                        array_stride: std::mem::size_of::<UiTextInstance>() as u64,
-                        step_mode: wgpu::VertexStepMode::Instance,
-                        attributes: &[
-                            wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 0, shader_location: 0 },
-                            wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 16, shader_location: 1 },
-                            wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 32, shader_location: 2 },
-                            wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 48, shader_location: 3 },
-                            wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32, offset: 64, shader_location: 4 },
-                        ],
-                    })],
-                    compilation_options: Default::default(),
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &shader,
-                    entry_point: Some("fs_main"),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: depth_format,
-                        blend: None,
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                    compilation_options: Default::default(),
-                }),
-                primitive: wgpu::PrimitiveState::default(),
-                depth_stencil: None,
-                multisample: wgpu::MultisampleState::default(),
-                multiview_mask: None,
-                cache: None,
-            })
-        });
         Self {
             color_format: format,
             pipeline,
             depth_format,
             depth_pipeline,
-            text_depth_pipeline,
             view_buffer,
             view_bind_group,
             instance_buffer: create_instance_buffer(device, 1),
@@ -1398,10 +1303,6 @@ impl UiWgpuRenderer {
             text_pipeline,
             text_buffer: create_text_buffer(device, 1),
             text_capacity: 1,
-            depth_text_buffer: create_text_buffer(device, 1),
-            depth_text_capacity: 1,
-            depth_text_count: 0,
-            depth_text_instances: Vec::new(),
             popup_text_buffer: create_text_buffer(device, 1),
             popup_text_capacity: 1,
             _text_texture_layout: text_texture_layout,
@@ -3805,7 +3706,13 @@ impl UiWgpuRenderer {
                     ],
                     uv: image.uv,
                     depth: visual.world_depth.unwrap_or(0.0),
-                    paint_group_id: self.plan.iter().zip(self.sampled.iter()).position(|(_, candidate)| std::ptr::eq(candidate, visual)).map(|index| self.plan[index].paint_group_id).unwrap_or(0),
+                    paint_group_id: self
+                        .plan
+                        .iter()
+                        .zip(self.sampled.iter())
+                        .position(|(_, candidate)| std::ptr::eq(candidate, visual))
+                        .map(|index| self.plan[index].paint_group_id)
+                        .unwrap_or(0),
                 })
             })
             .collect::<Vec<_>>();
@@ -3841,7 +3748,13 @@ impl UiWgpuRenderer {
                             ],
                             uv: [0.0, 0.0, 1.0, 1.0],
                             depth: visual.world_depth.unwrap_or(0.0),
-                            paint_group_id: self.plan.iter().zip(self.sampled.iter()).position(|(_, candidate)| std::ptr::eq(candidate, visual)).map(|index| self.plan[index].paint_group_id).unwrap_or(0),
+                            paint_group_id: self
+                                .plan
+                                .iter()
+                                .zip(self.sampled.iter())
+                                .position(|(_, candidate)| std::ptr::eq(candidate, visual))
+                                .map(|index| self.plan[index].paint_group_id)
+                                .unwrap_or(0),
                         },
                     ))
             })
@@ -3970,10 +3883,6 @@ impl UiWgpuRenderer {
             self.text_capacity = texts.len().next_power_of_two();
             self.text_buffer = create_text_buffer(device, self.text_capacity);
         }
-        if texts.len() > self.depth_text_capacity {
-            self.depth_text_capacity = texts.len().next_power_of_two();
-            self.depth_text_buffer = create_text_buffer(device, self.depth_text_capacity);
-        }
         if popup_texts.len() > self.popup_text_capacity {
             self.popup_text_capacity = popup_texts.len().next_power_of_two();
             self.popup_text_buffer = create_text_buffer(device, self.popup_text_capacity);
@@ -3988,7 +3897,10 @@ impl UiWgpuRenderer {
         let mut rect_groups: Vec<(u32, Vec<UiInstance>)> = Vec::new();
         for instance in &self.instances {
             let key = instance.paint_group_id;
-            if let Some((_, group)) = rect_groups.iter_mut().find(|(group_key, _)| *group_key == key) {
+            if let Some((_, group)) = rect_groups
+                .iter_mut()
+                .find(|(group_key, _)| *group_key == key)
+            {
                 group.push(*instance);
             } else {
                 rect_groups.push((key, vec![*instance]));
@@ -3997,7 +3909,10 @@ impl UiWgpuRenderer {
         let mut text_groups: Vec<(u32, Vec<UiTextInstance>)> = Vec::new();
         for text in &texts {
             let key = text.paint_group_id;
-            if let Some((_, group)) = text_groups.iter_mut().find(|(group_key, _)| *group_key == key) {
+            if let Some((_, group)) = text_groups
+                .iter_mut()
+                .find(|(group_key, _)| *group_key == key)
+            {
                 group.push(*text);
             } else {
                 text_groups.push((key, vec![*text]));
@@ -4006,7 +3921,10 @@ impl UiWgpuRenderer {
         let mut image_groups: Vec<(u32, Vec<UiImageInstance>)> = Vec::new();
         for image in &images {
             let key = image.paint_group_id;
-            if let Some((_, group)) = image_groups.iter_mut().find(|(group_key, _)| *group_key == key) {
+            if let Some((_, group)) = image_groups
+                .iter_mut()
+                .find(|(group_key, _)| *group_key == key)
+            {
                 group.push(*image);
             } else {
                 image_groups.push((key, vec![*image]));
@@ -4033,7 +3951,11 @@ impl UiWgpuRenderer {
                 .find_map(|node| node.target.world_depth)
                 .unwrap_or(0.0)
         };
-        depth_keys.sort_by(|a, b| group_depth(*b).partial_cmp(&group_depth(*a)).unwrap_or(std::cmp::Ordering::Equal));
+        depth_keys.sort_by(|a, b| {
+            group_depth(*b)
+                .partial_cmp(&group_depth(*a))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         depth_keys.dedup();
         let mut ordered_rects = Vec::new();
         let mut ordered_images = Vec::new();
@@ -4060,22 +3982,27 @@ impl UiWgpuRenderer {
             }
         }
 
-        queue.write_buffer(&self.instance_buffer, 0, bytemuck::cast_slice(&ordered_rects));
+        queue.write_buffer(
+            &self.instance_buffer,
+            0,
+            bytemuck::cast_slice(&ordered_rects),
+        );
         pass.set_bind_group(0, &self.view_bind_group, &[]);
         pass.set_vertex_buffer(0, self.instance_buffer.slice(..));
         if !ordered_images.is_empty() {
             queue.write_buffer(&self.image_buffer, 0, bytemuck::cast_slice(&ordered_images));
-            pass.set_bind_group(1, &self.image_atlas.as_ref().expect("resident image atlas").bind_group, &[]);
+            pass.set_bind_group(
+                1,
+                &self
+                    .image_atlas
+                    .as_ref()
+                    .expect("resident image atlas")
+                    .bind_group,
+                &[],
+            );
         }
         if !ordered_texts.is_empty() {
             queue.write_buffer(&self.text_buffer, 0, bytemuck::cast_slice(&ordered_texts));
-            queue.write_buffer(&self.depth_text_buffer, 0, bytemuck::cast_slice(&ordered_texts));
-            self.depth_text_count = ordered_texts.len();
-            self.depth_text_instances = ordered_texts.clone();
-        } else {
-            self.depth_text_count = 0;
-            self.depth_text_instances.clear();
-            pass.set_bind_group(1, &self.resident_font.as_ref().unwrap().bind_group, &[]);
         }
         for key in group_order {
             if let Some((start, count)) = rect_ranges.get(&key) {
@@ -4094,7 +4021,11 @@ impl UiWgpuRenderer {
                 pass.set_vertex_buffer(0, self.image_buffer.slice(..));
                 for (surface_id, surface) in group {
                     queue.write_buffer(&self.image_buffer, 0, bytemuck::bytes_of(surface));
-                    pass.set_bind_group(1, &self.resident_render_surfaces[surface_id].bind_group, &[]);
+                    pass.set_bind_group(
+                        1,
+                        &self.resident_render_surfaces[surface_id].bind_group,
+                        &[],
+                    );
                     pass.draw(0..6, 0..1);
                 }
             }
@@ -4166,12 +4097,10 @@ impl UiWgpuRenderer {
 
     /// Re-emits the already-composed panel instances into a depth-only pass.
     /// This target describes UI-to-host-scene occlusion; it is deliberately
-    /// separate from the 2D painter order used by the color pass.
-    pub(crate) fn draw_depth<'a>(
-        &'a self,
-        queue: &wgpu::Queue,
-        pass: &mut wgpu::RenderPass<'a>,
-    ) {
+    /// separate from the 2D painter order used by the color pass. Text glyphs do
+    /// not write independent sparse depth: their occlusion belongs to the owning
+    /// panel surface, so a far panel's text cannot survive over a nearer panel.
+    pub(crate) fn draw_depth<'a>(&'a self, queue: &wgpu::Queue, pass: &mut wgpu::RenderPass<'a>) {
         let Some(rect_pipeline) = &self.depth_pipeline else {
             return;
         };
@@ -4180,14 +4109,12 @@ impl UiWgpuRenderer {
         // near; the later near group overwrites the earlier far value.
         let mut groups: HashMap<u32, Vec<UiInstance>> = HashMap::new();
         for instance in &self.instances {
-            groups.entry(instance.paint_group_id).or_default().push(*instance);
-        }
-        let mut text_groups: HashMap<u32, Vec<UiTextInstance>> = HashMap::new();
-        for text in &self.depth_text_instances {
-            text_groups.entry(text.paint_group_id).or_default().push(*text);
+            groups
+                .entry(instance.paint_group_id)
+                .or_default()
+                .push(*instance);
         }
         let mut group_ids = groups.keys().copied().collect::<Vec<_>>();
-        group_ids.extend(text_groups.keys().copied().filter(|id| !groups.contains_key(id)));
         let group_depth = |group_id: u32| {
             self.plan
                 .iter()
@@ -4200,24 +4127,12 @@ impl UiWgpuRenderer {
                 .partial_cmp(&group_depth(*a))
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        let text_pipeline = self.text_depth_pipeline.as_ref();
-        let font = self.resident_font.as_ref();
         for group_id in group_ids {
             if let Some(group) = groups.get(&group_id) {
                 queue.write_buffer(&self.instance_buffer, 0, bytemuck::cast_slice(group));
                 pass.set_pipeline(rect_pipeline);
                 pass.set_bind_group(0, &self.view_bind_group, &[]);
                 pass.set_vertex_buffer(0, self.instance_buffer.slice(..));
-                pass.draw(0..6, 0..group.len() as u32);
-            }
-            if let (Some(text_pipeline), Some(font), Some(group)) =
-                (text_pipeline, font, text_groups.get(&group_id))
-            {
-                queue.write_buffer(&self.depth_text_buffer, 0, bytemuck::cast_slice(group));
-                pass.set_pipeline(text_pipeline);
-                pass.set_bind_group(0, &self.view_bind_group, &[]);
-                pass.set_bind_group(1, &font.bind_group, &[]);
-                pass.set_vertex_buffer(0, self.depth_text_buffer.slice(..));
                 pass.draw(0..6, 0..group.len() as u32);
             }
         }
@@ -4303,8 +4218,12 @@ impl UiWgpuRenderer {
         for index in 0..self.plan.len() {
             let mut root = index;
             while !world_group_roots.contains(&self.plan[root].id) {
-                let Some(parent_id) = self.plan[root].parent_id.as_deref() else { break };
-                let Some(parent) = self.plan.iter().position(|node| node.id == parent_id) else { break };
+                let Some(parent_id) = self.plan[root].parent_id.as_deref() else {
+                    break;
+                };
+                let Some(parent) = self.plan.iter().position(|node| node.id == parent_id) else {
+                    break;
+                };
                 root = parent;
             }
             let root_id = self.plan[root].id.clone();
@@ -6041,7 +5960,10 @@ fn layout_text(
     let top = visual.bounds.y + ((visual.bounds.height - block_height).max(0.0) * 0.5);
     let mut result = Vec::new();
     for (line_index, glyphs) in lines.into_iter().enumerate() {
-        let advance = glyphs.iter().map(|glyph| glyph.advance * text_scale).sum::<f32>();
+        let advance = glyphs
+            .iter()
+            .map(|glyph| glyph.advance * text_scale)
+            .sum::<f32>();
         let mut x = if visual.kind == UiNodeKind::Button {
             visual.bounds.x + ((visual.bounds.width - advance).max(0.0) * 0.5)
         } else {
@@ -6057,8 +5979,8 @@ fn layout_text(
                     10.0 * text_scale
                 }
         };
-        let baseline = top + font.ascent * text_scale
-            + line_index as f32 * font.line_height * text_scale;
+        let baseline =
+            top + font.ascent * text_scale + line_index as f32 * font.line_height * text_scale;
         for glyph in glyphs {
             result.push(UiTextInstance {
                 rect: [
@@ -6118,8 +6040,7 @@ fn top_layer_roots(plan: &[PlannedNode], indices: &HashMap<&str, usize>) -> Vec<
             && matches!(
                 node.target.kind,
                 UiNodeKind::Tooltip | UiNodeKind::Modal | UiNodeKind::Dialog
-            )
-        {
+            ) {
             Some(index)
         } else {
             node.parent_id
@@ -6866,8 +6787,8 @@ fn flatten_node(
                 presentation: None,
                 scroll: node_layout.clip == UiClipPolicy::Scroll,
                 declared_scroll_offset: node_layout.scroll_offset,
-        world_depth: node.world_depth.or(inherited_depth),
-        paint_group_id: 0,
+                world_depth: node.world_depth.or(inherited_depth),
+                paint_group_id: 0,
             },
             node.enter_transition.clone(),
         ));
@@ -7453,7 +7374,7 @@ mod tests {
         ServiceName,
     };
     use neon_ui_runtime::{
-        UiRuntime, demo_domain::DemoDragDropDomain, lower_nui_flow_effects, parse_nui_flow,
+        demo_domain::DemoDragDropDomain, lower_nui_flow_effects, parse_nui_flow, UiRuntime,
     };
     use neon_ui_schema::{
         TextRef, UiAlignItems, UiCommand, UiDropPlacement, UiEffect, UiFragmentId,
@@ -9047,11 +8968,9 @@ mod tests {
         assert!(nonblank(&accepted_pixels));
         assert!(!renderer.data_grid_scroll_holds.contains_key("f/grid"));
         assert_eq!(renderer.scroll_offsets["f/grid"][1], desired_offset);
-        assert!(
-            body_rows(&renderer)
-                .iter()
-                .all(|path| !initial_rows.contains(path))
-        );
+        assert!(body_rows(&renderer)
+            .iter()
+            .all(|path| !initial_rows.contains(path)));
 
         let rollback = fragments_at(4, 0);
         renderer.scroll_offsets.insert("f/grid".into(), [0.0; 2]);
@@ -9494,18 +9413,18 @@ mod tests {
                 .unwrap()
                 .2
         };
-        assert!(
-            !component_chrome_instances(visual("grid/assets/data-grid-row-asset-42/cell-state"))
-                .is_empty()
-        );
-        assert!(
-            !component_chrome_instances(visual("grid/assets/data-grid-row-asset-42/cell-owner"))
-                .is_empty()
-        );
-        assert!(
-            !component_chrome_instances(visual("grid/assets/data-grid-row-asset-42/cell-notes"))
-                .is_empty()
-        );
+        assert!(!component_chrome_instances(visual(
+            "grid/assets/data-grid-row-asset-42/cell-state"
+        ))
+        .is_empty());
+        assert!(!component_chrome_instances(visual(
+            "grid/assets/data-grid-row-asset-42/cell-owner"
+        ))
+        .is_empty());
+        assert!(!component_chrome_instances(visual(
+            "grid/assets/data-grid-row-asset-42/cell-notes"
+        ))
+        .is_empty());
     }
 
     #[test]
@@ -10809,11 +10728,9 @@ mod tests {
         assert!((shrunk[0].width - 150.0).abs() < 0.001);
         assert_eq!(shrunk[1].width, 250.0);
         assert_eq!(shrunk[2].width, 100.0);
-        assert!(
-            shrunk
-                .iter()
-                .all(|pane| pane.x + pane.width <= bounds.width + 0.001)
-        );
+        assert!(shrunk
+            .iter()
+            .all(|pane| pane.x + pane.width <= bounds.width + 0.001));
     }
 
     #[test]
@@ -11303,11 +11220,9 @@ mod tests {
                 .unwrap()
                 .2
         };
-        assert!(
-            flattened
-                .iter()
-                .all(|(path, _, _, _)| path != "component-gallery-drop/equipment-item-template")
-        );
+        assert!(flattened
+            .iter()
+            .all(|(path, _, _, _)| path != "component-gallery-drop/equipment-item-template"));
         let target = visual("equipment-zone").bounds;
         let instance = visual(instance_key).bounds;
         let label = visual(label_key);
