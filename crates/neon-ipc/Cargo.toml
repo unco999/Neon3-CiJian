@@ -3,8 +3,12 @@ name = "neon-ipc"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "Length-prefixed JSON RPC and event transport over loopback TCP for Neon3"
+repository = "https://github.com/unco999/Neon3-CiJian"
+readme = "README.md"
+keywords = ["neon3", "rpc", "ipc", "game-engine"]
 
 [dependencies]
-neon-protocol = { path = "../neon-protocol" }
+neon-protocol = { version = "0.1.0", path = "../neon-protocol" }
 serde_json.workspace = true
 serde.workspace = true

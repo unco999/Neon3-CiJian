@@ -1,0 +1,105 @@
+# Unified declarative component gallery. Every control uses a typed input binding
+# and a semantic intent; no renderer identity or domain-specific rule is present.
+version 1
+surface surface.component-gallery revision 1
+flow component-gallery
+budget nodes=200 bindings=132 instances=144 text=200 glyphs=16384 events=76 clips=84
+input controls_enabled bool default true
+input feature_enabled bool default true emitevent
+input radio_selected bool default false
+input slider_value f32:0..1 default 0.5
+input drag_value i32:0..24 default 12
+input combo_choice enum:alpha|beta|gamma default beta
+input dropdown_choice enum:alpha|beta|gamma default beta
+input tabs_choice enum:alpha|beta|gamma default beta
+input list_choice enum:alpha|beta|gamma default beta
+input item_selected bool default true
+input scroll_position f32:0..1 default 0.35
+input dialog_visible bool default false
+input gallery_text text default text:empty
+input progress_value f32:0..1 default 0.68
+input asset_window grid default grid:empty
+resource gallery-image image
+resource world-ui-lab.preview render_surface
+drag compass-drag source backpack-compass axis both snap 0 threshold 3 within surface
+drag potion-drag source backpack-potion axis both snap 0 threshold 3 within surface
+drag gem-drag source backpack-gem axis both snap 0 threshold 3 within surface
+drop equipment-compass-drop target equipment-zone accepts compass-drag placement into present equipment-item-template emit inventory.item.equip
+drop crafting-potion-drop target crafting-zone accepts potion-drag placement into present crafting-item-template emit inventory.item.craft
+drop discard-gem-drop target discard-zone accepts gem-drag placement into present discarded-item-template emit inventory.item.discard
+surface component-gallery overlay minw 2048 h 1080 align stretch clip scroll fill #17201E
+  panel gallery-layout row minw 2048 gap 12 pad 16 align stretch fill #17201E
+    scroll gallery-controls column minw 360 maxw 430 grow 1 shrink 0 gap 6 pad 10 align stretch fill #1D2A28
+      text gallery-title h 28 value "Component Gallery"
+      button action-button h 30 checked $feature_enabled enabled $controls_enabled value "Toggle feature" event gallery.button.activate
+      input gallery-text h 32 enabled $controls_enabled value $gallery_text event gallery.text.commit
+      text status-gallery_text h 18 value "Text input: empty"
+      progress_bar gallery-progress h 24 numeric $progress_value enabled $controls_enabled value "Progress"
+      text status-progress_value h 18 value "progress_value: 0.68"
+      panel image-preview column h 126 gap 6 pad 8 align stretch fill #243634 line #46766D
+        text image-preview-title h 18 value "Image preview"
+        image gallery-image h 88 resource gallery-image fill #315360 line #76B7BE
+      checkbox feature-toggle h 30 checked $feature_enabled enabled $controls_enabled value "Enable feature" event gallery.checkbox.toggle
+      text status-feature_enabled h 18 value "feature_enabled: true"
+      radio_button mode-radio h 30 selected $radio_selected enabled $controls_enabled value "Select mode" event gallery.radio.select
+      text status-radio_selected h 18 value "radio_selected: false"
+      slider exposure-slider h 30 numeric $slider_value enabled $controls_enabled value "Exposure" event gallery.slider.commit
+      text status-slider_value h 18 value "slider_value: 0.5"
+      drag_value count-drag h 30 numeric $drag_value enabled $controls_enabled value "Item count" event gallery.drag_value.commit
+      text status-drag_value h 18 value "Current count: 12"
+      combo mode-combo h 32 state $combo_choice enabled $controls_enabled value "Mode selector" event gallery.combo.select
+      text status-combo_choice h 18 value "combo_choice: beta"
+      dropdown mode-dropdown h 32 state $dropdown_choice enabled $controls_enabled value "Mode menu" event gallery.dropdown.select
+      text status-dropdown_choice h 18 value "dropdown_choice: beta"
+      tabs mode-tabs h 32 state $tabs_choice enabled $controls_enabled value "Mode tabs" event gallery.tabs.select
+      text status-tabs_choice h 18 value "Selected mode: beta"
+      selectable item-selectable h 30 selected $item_selected enabled $controls_enabled value "Selectable item" event gallery.selectable.select
+      text status-item_selected h 18 value "item_selected: true"
+      list_box item-list h 90 state $list_choice enabled $controls_enabled value "Available modes" event gallery.list_box.select
+      text status-list_choice h 18 value "Selected mode: beta"
+      scrollbar gallery-scroll h 20 scroll $scroll_position enabled $controls_enabled value "Scrollbar" event gallery.scrollbar.commit
+        tooltip gallery-scroll-tooltip x 0 y 26 w 184 h 34 fill #25363B value "Tooltip: local overlay"
+      text status-scroll_position h 18 value "scroll_position: 0.35"
+      panel control-reference h 132 column pad 8 gap 6 fill #243634 line #46766D
+        text control-reference-title value "Control notes"
+        text control-reference-body value "Bound state, semantic events, and local presentation stay visible in this scroll rail."
+      checkbox dialog-toggle h 30 checked $dialog_visible enabled $controls_enabled value "Open dialog" event gallery.dialog.toggle
+    data_grid asset-grid minw 720 grow 2 shrink 0 source $asset_window capacity 80 row_height 24 overscan 20 columns "name:220:edit:64:virtual_list.name.commit,status:150:dropdown:draft|ready|archived:virtual_list.status.set,owner:130:select:virtual_list.owner.toggle,notes:260:edit:128:virtual_list.notes.commit"
+    scroll field-pack column minw 720 maxw 860 grow 1 shrink 0 pad 12 gap 10 align stretch fill #202A32 line #4E8391
+      panel pack-header row h 42 pad 8 gap 8 align center fill #293943
+        text pack-title value "Field Pack / 18.4 kg"
+        text pack-budget value "Capacity 12 / 16"
+      panel world-ui-lab-preview column h 238 shrink 0 pad 8 gap 6 align stretch fill #172531 line #4EA6BE
+        text world-ui-lab-preview-title h 20 value "World UI Lab Preview"
+        text world-ui-lab-preview-description h 18 value "Normal UI surface sampled by the world-space panel pass."
+        render world-ui-lab.preview h 180
+      panel backpack-items column w 636 h 196 shrink 0 pad 8 gap 8 clip none fill #18252D line #38616E
+        text backpack-heading h 22 value "Backpack items"
+        panel backpack-compass row w 620 h 42 shrink 0 pad 8 gap 8 align center fill #315360 line #76B7BE
+          text backpack-compass-name value "Brass compass"
+          text backpack-compass-meta value "Navigation / 0.2 kg"
+        panel backpack-potion row w 620 h 42 shrink 0 pad 8 gap 8 align center fill #47365A line #B48DCE
+          text backpack-potion-name value "Restoration potion"
+          text backpack-potion-meta value "Consumable / 0.6 kg"
+        panel backpack-gem row w 620 h 42 shrink 0 pad 8 gap 8 align center fill #4C4030 line #D6AA62
+          text backpack-gem-name value "Sunstone gem"
+          text backpack-gem-meta value "Crafting / 1.1 kg"
+      panel equipment-zone column h 126 pad 10 gap 6 fill #243E47 line #67B6C5
+        text equipment-heading value "Equipment bay"
+        text equipment-hint value "Compass accepts navigation gear"
+        template equipment-item-template h 44 capacity 2 key item_key overflow_summary
+          text equipment-item-template-label value "Equipped item"
+      panel crafting-zone column h 126 pad 10 gap 6 fill #3D3348 line #B48DCE
+        text crafting-heading value "Crafting satchel"
+        text crafting-hint value "Potion accepts blend ingredients"
+        template crafting-item-template h 44 capacity 2 key item_key overflow_summary
+          text crafting-item-template-label value "Crafted item"
+      panel discard-zone column grow 1 pad 10 gap 6 fill #46362E line #D8A65E
+        text discard-heading value "Drop zone"
+        text discard-hint value "Gem accepts salvage items"
+        template discarded-item-template h 44 capacity 2 key item_key overflow_summary
+          text discarded-item-template-label value "Discarded item"
+  dialog gallery-dialog x 692 y 310 column w 296 h 184 pad 14 gap 10 align stretch visible $dialog_visible fill #263334 line #66B7A0
+    text dialog-title h 26 value "Dialog example"
+    text dialog-body h 48 value "This dialog blocks the gallery behind it."
+    checkbox dialog-close h 32 checked $dialog_visible value "Close dialog" event gallery.dialog.toggle

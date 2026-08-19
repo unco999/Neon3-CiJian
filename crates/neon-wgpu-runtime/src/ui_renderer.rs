@@ -3784,6 +3784,13 @@ impl UiWgpuRenderer {
         self.last_panel_instance_count
     }
 
+    /// World-anchor projection changes node bounds without changing the UI
+    /// program revision. External-surface rendering must rebuild the layout
+    /// plan before consuming that projected snapshot.
+    pub(crate) fn invalidate_plan(&mut self) {
+        self.plan_revisions.clear();
+    }
+
     fn update_viewport(&mut self, physical_size: [u32; 2], logical_size: [f32; 2]) -> bool {
         let physical_size = [physical_size[0].max(1), physical_size[1].max(1)];
         let logical_size = normalize_logical_viewport(logical_size, physical_size);
@@ -5536,6 +5543,11 @@ fn layout_text(
     horizontal_scroll: Option<f32>,
 ) -> Option<Vec<UiTextInstance>> {
     let clip = text_clip(visual)?;
+    let text_scale = if visual.bounds.height > 0.0 && visual.bounds.height <= 40.0 {
+        (visual.bounds.height / 28.0).clamp(0.5, 2.0)
+    } else {
+        1.0
+    };
     let mut lines = Vec::<Vec<AtlasGlyph>>::new();
     let mut line = Vec::<AtlasGlyph>::new();
     let mut line_width = 0.0;
@@ -5546,51 +5558,52 @@ fn layout_text(
             continue;
         }
         let glyph = ensure_glyph(device, queue, font, ch).ok()?;
-        if !line.is_empty() && line_width + glyph.advance > visual.bounds.width {
+        if !line.is_empty() && line_width + glyph.advance * text_scale > visual.bounds.width {
             lines.push(std::mem::take(&mut line));
             line_width = 0.0;
         }
-        line_width += glyph.advance;
+        line_width += glyph.advance * text_scale;
         line.push(glyph);
     }
     if !line.is_empty() || lines.is_empty() {
         lines.push(line);
     }
 
-    let block_height = font.line_height * lines.len() as f32;
+    let block_height = font.line_height * text_scale * lines.len() as f32;
     let top = visual.bounds.y + ((visual.bounds.height - block_height).max(0.0) * 0.5);
     let mut result = Vec::new();
     for (line_index, glyphs) in lines.into_iter().enumerate() {
-        let advance = glyphs.iter().map(|glyph| glyph.advance).sum::<f32>();
+        let advance = glyphs.iter().map(|glyph| glyph.advance * text_scale).sum::<f32>();
         let mut x = if visual.kind == UiNodeKind::Button {
             visual.bounds.x + ((visual.bounds.width - advance).max(0.0) * 0.5)
         } else {
             visual.bounds.x
                 + if visual.kind == UiNodeKind::TextInput {
-                    TEXT_INPUT_INSET - horizontal_scroll.unwrap_or(0.0)
+                    TEXT_INPUT_INSET * text_scale - horizontal_scroll.unwrap_or(0.0)
                 } else if matches!(
                     visual.kind,
                     UiNodeKind::Checkbox | UiNodeKind::RadioButton | UiNodeKind::Selectable
                 ) {
-                    30.0
+                    30.0 * text_scale
                 } else {
-                    10.0
+                    10.0 * text_scale
                 }
         };
-        let baseline = top + font.ascent + line_index as f32 * font.line_height;
+        let baseline = top + font.ascent * text_scale
+            + line_index as f32 * font.line_height * text_scale;
         for glyph in glyphs {
             result.push(UiTextInstance {
                 rect: [
-                    x + glyph.xmin,
-                    baseline + glyph.plane_min_y,
-                    glyph.width,
-                    glyph.height,
+                    x + glyph.xmin * text_scale,
+                    baseline + glyph.plane_min_y * text_scale,
+                    glyph.width * text_scale,
+                    glyph.height * text_scale,
                 ],
                 color: [0.86, 0.95, 0.98, visual.style.opacity],
                 clip,
                 uv: glyph.uv,
             });
-            x += glyph.advance;
+            x += glyph.advance * text_scale;
         }
     }
     Some(result)

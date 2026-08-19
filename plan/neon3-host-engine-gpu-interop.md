@@ -108,8 +108,10 @@ resident_render_surfaces
 wgpu.render.target.capture
 ```
 
-`world_ui_pipeline.rs` 已经可以把 UI texture 作为纹理面片投影到 3D 世界，并参与 depth test。
-这说明普通 UI surface 到 World UI surface 的 GPU 合成基础已经存在。
+`world_ui_pipeline.rs` 已能把 UI texture 作为纹理面片投影到 3D 世界并参与 depth test，但
+它只作为内部 lab/未来模式。外部宿主的正式 World UI 路径是：宿主提交 world anchor
+（`wgpu.world.ui.anchor.submit`），Neon 用 world info + camera frame 投影到屏幕坐标，在
+自己的 fullscreen composition 里渲染，而不是把画布挂到宿主 Entity 上。
 
 ### 3.2 UI IR
 
@@ -239,21 +241,26 @@ backend。宿主如果想接受候选后端，必须在请求中明确声明允�
 }
 ```
 
-World UI 使用相同接口，只增加 placement:
+World UI 不申请独立的 world surface，也不使用 placement 描述。宿主通过
+`wgpu.world.ui.anchor.submit` 持续提交 world anchor：
 
 ```json
 {
-  "kind": "world_ui",
-  "placement": {
+  "method": "wgpu.world.ui.anchor.submit",
+  "params": {
     "anchor_id": "npc.blacksmith",
+    "world_space_id": "project.world.main",
+    "producer_epoch": 1,
+    "sequence": 42,
+    "timestamp_monotonic_ns": 123456,
     "position": [0.0, 1.8, 0.0],
-    "rotation": [0.0, 0.0, 0.0],
-    "scale": [1.0, 1.0, 1.0],
-    "billboard": true,
-    "occlusion": "depth_test"
+    "billboard": true
   }
 }
 ```
+
+Neon 结合 world info + camera frame 把 anchor 投影成屏幕坐标，在自己的 fullscreen
+composition 里渲染 NUI。
 
 普通 UI 与 World UI 共享:
 
@@ -481,17 +488,19 @@ UiProgram/UiFragment
 World UI:
 
 ```text
-UiProgram/UiFragment
+Host world entity + world-space position
+  -> wgpu.world.ui.anchor.submit
+  -> Neon 结合 world info + camera frame
+  -> fullscreen projection（屏幕坐标）
   -> Neon UI renderer
-  -> surface texture
-  -> world placement descriptor
-  -> world_ui_pipeline
-  -> depth-tested 3D composition
+  -> screen surface texture（fullscreen composition）
 ```
 
 外部引擎如果只需要展示 Neon UI，可直接采样共享 surface。
-外部引擎如果需要 Neon 把 UI 放进自己的世界，则它提供 camera/anchor/transform snapshot，
-Neon 按协议输出对应 surface；双方不交换私有 renderer object。
+外部引擎如果需要 Neon 把 UI 放进自己的世界，则它提供 world info、camera frame 与
+world anchor（`wgpu.world.ui.anchor.submit`）；Neon 在自己的 fullscreen composition 里
+把这些 anchor 投影成屏幕坐标再渲染 NUI，不交换私有 renderer object，也不把画布挂到
+宿主的 Entity 上。`world_ui_pipeline` 的 3D Quad 仅作为内部 lab/未来模式。
 
 ## 12. eventd 与 GPU session
 
@@ -537,7 +546,7 @@ Host -> broker: native handle acquire
 5. Godot 直接采样 Neon texture，无 PNG、无 CPU readback、无二次像素上传。
 6. Neon signal fence 后，Godot 按 frame sequence 正确等待和采样。
 7. 普通 screen UI 能显示。
-8. 同一 texture 作为 World UI quad 能显示并通过 depth test。
+8. World UI 通过 anchor 投影到屏幕坐标后，在 fullscreen composition 中正确显示。
 9. resize/device-lost/generation replacement 能恢复。
 10. eventd 能回放完整 session 生命周期。
 

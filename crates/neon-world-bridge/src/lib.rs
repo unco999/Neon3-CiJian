@@ -16,6 +16,13 @@ pub struct WorldSpaceId(pub String);
 #[serde(transparent)]
 pub struct CameraId(pub String);
 
+/// Stable host-side identity for a world-space UI anchor. The host owns the
+/// identity (for example a gameplay object id such as `player.main`); Neon only
+/// samples the latest world-space position for screen projection.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct WorldAnchorId(pub String);
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CameraKind {
@@ -143,6 +150,8 @@ pub enum WorldBridgeError {
     InvalidCameraControlSample,
     WorldSpaceMismatch,
     StaleCameraFrame,
+    InvalidWorldAnchor,
+    StaleWorldAnchor,
 }
 
 /// Latest-value input from an optional camera-control provider. Transport
@@ -202,6 +211,35 @@ impl CameraControlFocus {
     }
 }
 
+/// Latest-value world-space position of a host-owned UI anchor.
+///
+/// The anchor carries only identity and a world-space point. It never carries a
+/// renderer-local matrix, screen coordinate, UI node, or GPU resource. The sole
+/// renderer owner projects it to screen space using the matching camera frame.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorldUiAnchor {
+    pub anchor_id: WorldAnchorId,
+    pub world_space_id: WorldSpaceId,
+    pub producer_epoch: u64,
+    pub sequence: u64,
+    pub timestamp_monotonic_ns: u64,
+    /// World-space anchor point. Position zero is valid.
+    pub position: [f64; 3],
+    /// Whether the host requests a billboard-style facing presentation. Neon
+    /// renders the UI in its own fullscreen composition regardless; this flag is
+    /// a presentation hint, never a 3D quad or texture request.
+    pub billboard: bool,
+}
+
+impl WorldUiAnchor {
+    fn is_valid(&self) -> bool {
+        !self.anchor_id.0.trim().is_empty()
+            && self.sequence != 0
+            && self.position.iter().all(|value| value.is_finite())
+    }
+}
+
 /// Latest-value world state for a single renderer session.
 ///
 /// Position zero is valid. A camera is missing only before its first valid
@@ -210,6 +248,7 @@ impl CameraControlFocus {
 pub struct WorldInformationBridge {
     world: Option<WorldInformationSnapshot>,
     cameras: BTreeMap<CameraId, CameraFrame>,
+    anchors: BTreeMap<WorldAnchorId, WorldUiAnchor>,
 }
 
 impl WorldInformationBridge {
@@ -228,6 +267,7 @@ impl WorldInformationBridge {
         snapshot.validate()?;
         self.world = Some(snapshot);
         self.cameras.clear();
+        self.anchors.clear();
         Ok(())
     }
 
@@ -250,6 +290,43 @@ impl WorldInformationBridge {
         }
         self.cameras.insert(frame.camera_id.clone(), frame);
         Ok(())
+    }
+
+    /// Stores the latest world-space position for a host-owned UI anchor. It
+    /// applies the same world-space matching and monotonic-sequence checks as
+    /// camera frames, so a stale or wrong-world anchor never reaches rendering.
+    pub fn submit_anchor(&mut self, anchor: WorldUiAnchor) -> Result<(), WorldBridgeError> {
+        let Some(world) = self.world.as_ref() else {
+            return Err(WorldBridgeError::WorldSpaceMismatch);
+        };
+        if anchor.world_space_id != world.world_space_id {
+            return Err(WorldBridgeError::WorldSpaceMismatch);
+        }
+        if !anchor.is_valid() {
+            return Err(WorldBridgeError::InvalidWorldAnchor);
+        }
+        if let Some(previous) = self.anchors.get(&anchor.anchor_id)
+            && (previous.producer_epoch > anchor.producer_epoch
+                || (previous.producer_epoch == anchor.producer_epoch
+                    && previous.sequence >= anchor.sequence))
+        {
+            return Err(WorldBridgeError::StaleWorldAnchor);
+        }
+        self.anchors.insert(anchor.anchor_id.clone(), anchor);
+        Ok(())
+    }
+
+    pub fn anchor(&self, anchor_id: &WorldAnchorId) -> Option<&WorldUiAnchor> {
+        self.anchors.get(anchor_id)
+    }
+
+    pub fn anchors(&self) -> &BTreeMap<WorldAnchorId, WorldUiAnchor> {
+        &self.anchors
+    }
+
+    /// Latest valid camera frame for a camera id, regardless of kind.
+    pub fn camera(&self, camera_id: &CameraId) -> Option<&CameraFrame> {
+        self.cameras.get(camera_id)
     }
 
     pub fn camera_availability(
@@ -366,6 +443,71 @@ mod tests {
                 ..focused
             }
             .accepts(&sample)
+        );
+    }
+
+    #[test]
+    fn anchor_at_position_is_stored_and_queryable() {
+        let mut bridge = WorldInformationBridge::new();
+        bridge.configure_world(world()).unwrap();
+        let anchor_id = WorldAnchorId("player.main".into());
+        assert!(bridge.anchor(&anchor_id).is_none());
+        bridge
+            .submit_anchor(WorldUiAnchor {
+                anchor_id: anchor_id.clone(),
+                world_space_id: WorldSpaceId("project.world.main".into()),
+                producer_epoch: 1,
+                sequence: 1,
+                timestamp_monotonic_ns: 1,
+                position: [1.0, 2.0, 3.0],
+                billboard: true,
+            })
+            .unwrap();
+        let stored = bridge.anchor(&anchor_id).expect("anchor stored");
+        assert_eq!(stored.position, [1.0, 2.0, 3.0]);
+        assert!(stored.billboard);
+    }
+
+    #[test]
+    fn bridge_rejects_stale_and_wrong_world_anchors() {
+        let mut bridge = WorldInformationBridge::new();
+        bridge.configure_world(world()).unwrap();
+        let anchor_id = WorldAnchorId("player.main".into());
+        let base = WorldUiAnchor {
+            anchor_id: anchor_id.clone(),
+            world_space_id: WorldSpaceId("project.world.main".into()),
+            producer_epoch: 1,
+            sequence: 1,
+            timestamp_monotonic_ns: 1,
+            position: [0.0, 0.0, 0.0],
+            billboard: true,
+        };
+        bridge.submit_anchor(base.clone()).unwrap();
+        // Wrong world space is rejected.
+        assert_eq!(
+            bridge.submit_anchor(WorldUiAnchor {
+                world_space_id: WorldSpaceId("wrong".into()),
+                sequence: 2,
+                ..base.clone()
+            }),
+            Err(WorldBridgeError::WorldSpaceMismatch)
+        );
+        // A stale (non-increasing) sequence is rejected.
+        assert_eq!(
+            bridge.submit_anchor(WorldUiAnchor {
+                sequence: 1,
+                ..base.clone()
+            }),
+            Err(WorldBridgeError::StaleWorldAnchor)
+        );
+        // A non-finite position is rejected.
+        assert_eq!(
+            bridge.submit_anchor(WorldUiAnchor {
+                sequence: 2,
+                position: [f64::NAN, 0.0, 0.0],
+                ..base
+            }),
+            Err(WorldBridgeError::InvalidWorldAnchor)
         );
     }
 }

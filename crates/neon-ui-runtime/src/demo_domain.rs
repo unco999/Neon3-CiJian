@@ -399,7 +399,7 @@ pub fn component_gallery_program(
     image_asset: AssetRef,
 ) -> Result<(neon_ui_schema::NuiFlowDocument, neon_ui_schema::UiProgram), String> {
     let mut document = parse_nui_flow(include_str!(
-        "../../../tests/fixtures/ui/imgui-component-gallery.nui"
+        "../tests/fixtures/ui/imgui-component-gallery.nui"
     ))
     .map_err(|error| format!("component gallery fixture is invalid: {error:?}"))?;
     let bindings = std::collections::HashMap::from([("gallery-image".into(), image_asset)]);
@@ -651,7 +651,7 @@ struct VirtualListRowState {
 
 fn drag_drop_adapter_config() -> Result<UiHostAdapterConfig, &'static str> {
     let document = parse_nui_flow(include_str!(
-        "../../../tests/fixtures/ui/kanban-reparent-workbench.nui"
+        "../tests/fixtures/ui/kanban-reparent-workbench.nui"
     ))
     .map_err(|_| "drag/drop demo Flow is invalid")?;
     let program = compile_nui_flow_program(
@@ -1459,7 +1459,7 @@ mod tests {
 
     fn fragment() -> UiFragment {
         let document = parse_nui_flow(include_str!(
-            "../../../tests/fixtures/ui/kanban-reparent-workbench.nui"
+            "../tests/fixtures/ui/kanban-reparent-workbench.nui"
         ))
         .unwrap();
         let effects = lower_nui_flow_effects(&document);

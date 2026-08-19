@@ -3,6 +3,10 @@ name = "neon-protocol"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "Versioned control-plane protocol types for the Neon3 multi-process engine"
+repository = "https://github.com/unco999/Neon3-CiJian"
+readme = "README.md"
+keywords = ["neon3", "rpc", "protocol", "game-engine"]
 
 [dependencies]
 serde.workspace = true

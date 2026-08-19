@@ -1,0 +1,4 @@
+input asset_window grid default grid:empty
+surface virtual-list-demo column w 640 h 320 gap 8 pad 12 align stretch fill #17201E
+  text virtual-list-title h 24 value "10,000 Row Virtual List"
+  data_grid virtual-list h 252 source $asset_window capacity 24 row_height 24 overscan 6 columns "id:100:text,name:220:edit:64:virtual_list.name.commit,status:180:dropdown:draft|ready|archived:virtual_list.status.set,owner:160:select:virtual_list.owner.toggle,notes:260:edit:128:virtual_list.notes.commit"

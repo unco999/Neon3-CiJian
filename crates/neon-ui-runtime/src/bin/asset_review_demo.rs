@@ -8,7 +8,7 @@ use neon_ui_runtime::{lower_nui_flow_effects, parse_nui_flow};
 use neon_ui_schema::{TextRef, UiCommand, UiFragment, UiFragmentId, UiFragmentSubmission, UiNode};
 use serde_json::json;
 
-const SOURCE: &str = include_str!("../../../../tests/fixtures/ui/asset-review-workbench.nui");
+const SOURCE: &str = include_str!("../../tests/fixtures/ui/asset-review-workbench.nui");
 
 fn main() {
     let endpoint = std::env::args()

@@ -19,7 +19,7 @@ use neon_ui_schema::{
     UiLayout, UiLayoutMode, UiNode, UiNodeId, UiNodeKind, UiProgram, UiProgramEventDeclaration,
     UiProgramRevision, UiResourceBudget, UiSourceSpan, UiStyle, UiSurfaceId, UiTemplateDeclaration,
 };
-use neon_world_bridge::{CameraId, CameraKind};
+use neon_world_bridge::{CameraId, CameraKind, WorldAnchorId};
 use serde_json::json;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -279,6 +279,7 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
                 node_key: node.node.node_id.0.clone(),
                 camera_id: world_panel.camera_id.clone(),
                 camera_kind: world_panel.camera_kind,
+                anchor_id: world_panel.anchor_id.clone(),
             });
         }
         stack.push((indent, node));
@@ -631,6 +632,7 @@ pub fn lower_nui_flow_effects(document: &NuiFlowDocument) -> Vec<UiEffect> {
                     node_id: UiNodeId(panel.node_key.clone()),
                     camera_id: panel.camera_id.clone(),
                     camera_kind: panel.camera_kind,
+                    anchor_id: panel.anchor_id.clone(),
                 },
             }),
     );
@@ -1683,6 +1685,7 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
     let mut data_grid_source = None;
     let mut image_resource = None;
     let mut world_camera = None;
+    let mut world_anchor = None;
     let mut used = HashSet::new();
     let mut index = key_index + 1;
     while index < parts.len() {
@@ -1745,6 +1748,26 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
                     ));
                 }
                 world_camera = Some((CameraId(id.into()), kind));
+            }
+            "anchor" if is_world_panel => {
+                let value = *parts.get(index + 1).ok_or_else(|| {
+                    error(
+                        "nui_flow_missing_value",
+                        "anchor requires a host anchor ID",
+                        line,
+                        1,
+                    )
+                })?;
+                index += 1;
+                if !valid_key(value) {
+                    return Err(error(
+                        "nui_flow_invalid_world_anchor",
+                        "world anchor ID is invalid",
+                        line,
+                        1,
+                    ));
+                }
+                world_anchor = Some(WorldAnchorId(value.into()));
             }
             "when" if component == "branch" => {
                 let value = *parts.get(index + 1).ok_or_else(|| {
@@ -2058,6 +2081,7 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
             node_key: node.node_id.0.clone(),
             camera_id,
             camera_kind,
+            anchor_id: world_anchor,
         })
     } else {
         None
@@ -3583,7 +3607,7 @@ panel workspace row gap 8
 
     #[test]
     fn complex_asset_review_fixture_uses_bounded_declarative_ui_features() {
-        let source = include_str!("../../../tests/fixtures/ui/asset-review-workbench.nui");
+        let source = include_str!("../tests/fixtures/ui/asset-review-workbench.nui");
         let document = parse_nui_flow(source).unwrap();
 
         assert_eq!(document.input_schema.slots.len(), 12);
@@ -3609,7 +3633,7 @@ panel workspace row gap 8
     #[test]
     fn flow_drag_and_drop_lower_to_generic_effect_bindings() {
         let document = parse_nui_flow(include_str!(
-            "../../../tests/fixtures/ui/kanban-reparent-workbench.nui"
+            "../tests/fixtures/ui/kanban-reparent-workbench.nui"
         ))
         .unwrap();
         let effects = lower_nui_flow_effects(&document);

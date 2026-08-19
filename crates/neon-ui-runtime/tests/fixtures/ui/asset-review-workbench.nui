@@ -1,0 +1,71 @@
+# Complex NUI Flow example. All business facts and text are domain-provided inputs.
+version 1
+surface surface.editor.asset-review revision 1
+budget nodes=128 bindings=64 instances=64 text=64 glyphs=4096 events=32 clips=24
+input workspace_title text default text:empty
+input selected_asset_title text default text:empty
+input selected_asset_summary text default text:empty
+input activity_summary text default text:empty
+input can_publish bool default false
+input can_revert bool default false
+input inspector_visible bool default true
+input workspace_state enum:loading|ready|error default loading
+input publish_status enum:idle|pending|accepted|rejected default idle
+input active_tab enum:overview|assets|history default overview
+input asset_count u32 default 0
+input activity_count u32 default 0
+machine asset_review initial loading
+state asset_review ready
+state asset_review publishing
+state asset_review reverting
+state asset_review accepted
+state asset_review error
+sync asset_review when $workspace_state=ready -> ready
+sync asset_review when $workspace_state=error -> error
+sync asset_review when $publish_status=accepted -> accepted
+sync asset_review when $publish_status=rejected -> error
+on asset_review asset.review.publish when $can_publish -> publishing emit asset.review.publish
+on asset_review asset.review.revert when $can_revert -> reverting emit asset.review.revert
+on asset_review asset.review.retry -> loading emit asset.review.retry
+machine inspector_drag initial resting
+state inspector_drag dragging
+state inspector_drag accepted
+on inspector_drag ui.drag.begin -> dragging
+on inspector_drag ui.drag.end -> accepted emit asset.review.inspector.position.accept
+drag inspector-drag source inspector axis both snap 8 threshold 3 within parent
+surface asset-review-workbench column w 1440 h 900 gap 8 pad 12 align stretch fill #101820
+  panel command-bar row h 44 gap 8 pad 8 fill #203040 line #3F6A83
+    text workspace-title value $workspace_title
+    button publish value "Publish review" enabled $can_publish event asset.review.publish
+    button revert value "Revert selection" enabled $can_revert event asset.review.revert
+  panel content-row row grow 1 gap 8 align stretch
+    panel navigation column w 220 gap 6 pad 8 align stretch fill #1C2C3A line #3F6A83
+      button overview-tab value "Overview" event asset.review.tab.select
+      button assets-tab value "Assets" event asset.review.tab.select
+      button history-tab value "History" event asset.review.tab.select
+      branch loading-navigation h 24 when $workspace_state=loading
+        text loading-navigation-label value "Loading review workspace"
+      branch error-navigation h 24 when $workspace_state=error
+        text error-navigation-label value "Workspace state unavailable"
+    panel review-stage column grow 1 gap 8 pad 8 align stretch fill #132331 line #3F6A83
+      render asset-preview-surface h 500
+      branch ready-review h 180 in asset_review.ready
+        panel ready-content column h 180 gap 6 pad 8 align stretch fill #182936
+          text selected-asset-title value $selected_asset_title
+          text selected-asset-summary value $selected_asset_summary
+          repeat activity-rows h 72 capacity 6 key row_key overflow_summary
+            text activity-row value "Activity entry"
+      branch publishing-review h 40 in asset_review.publishing
+        panel publishing-banner h 32 pad 6 fill #38556A line #6DA6C7
+          text publishing-label value "Publishing review"
+      branch accepted-review h 40 in asset_review.accepted
+        panel accepted-banner h 32 pad 6 fill #2D6A4F line #79D8A5
+          text accepted-label value "Review accepted"
+    panel inspector column w 340 gap 8 pad 8 align stretch fill #223442 line #3F6A83 visible $inspector_visible
+      text inspector-heading value "Asset inspector"
+      template asset-row h 40 capacity 12 key row_key overflow_summary
+        panel asset-row-panel row h 32 gap 8 pad 4 align stretch fill #2A4050
+          text asset-row-label value "Asset row"
+          button asset-row-open value "Open" event asset.review.asset.open
+      repeat diagnostics-rows h 72 capacity 4 key row_key overflow_summary
+        text diagnostics-row value $activity_summary

@@ -16,7 +16,8 @@ use windows::{
             Direct3D12::{
                 D3D12_FENCE_FLAG_SHARED, D3D12_HEAP_FLAG_SHARED, D3D12_HEAP_PROPERTIES,
                 D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_DESC, D3D12_RESOURCE_DIMENSION_TEXTURE2D,
-                D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COMMON, D3D12_TEXTURE_LAYOUT_UNKNOWN,
+                D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_COMMON,
+                D3D12_TEXTURE_LAYOUT_UNKNOWN,
                 ID3D12Device, ID3D12Fence, ID3D12Resource,
             },
             Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R32_UINT, DXGI_SAMPLE_DESC},
@@ -134,7 +135,10 @@ pub fn create_shared_surface(
         Format: dxgi_format,
         SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
         Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
-        Flags: D3D12_RESOURCE_FLAG_NONE,
+        // Both color and ID shared surfaces are cleared and rendered by the
+        // Neon owner before Bevy samples them. D3D12 requires this capability
+        // to be declared when the resource is created.
+        Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
     };
     let heap = D3D12_HEAP_PROPERTIES {
         Type: D3D12_HEAP_TYPE_DEFAULT,

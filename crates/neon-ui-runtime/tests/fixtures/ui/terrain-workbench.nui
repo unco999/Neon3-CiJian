@@ -1,0 +1,38 @@
+# Canonical NUI Flow terrain workbench. Domain snapshots supply all values.
+version 1
+surface surface.editor.terrain-workbench revision 1
+budget nodes=64 bindings=32 instances=32 text=32 glyphs=2048 events=16 clips=64
+input project_title text default text:empty
+input inspector_title text default text:empty
+input diagnostic_text text default text:empty
+input terrain_name text default text:empty
+input can_commit bool default false
+input tool_enabled bool default true
+input workbench_state enum:loading|ready|error default loading
+input selected_tool enum:select|sculpt|water default select
+input material_count u32 default 0
+input diagnostics_visible bool default true
+surface terrain-workbench column w 1440 h 900 gap 8 pad 12
+  panel top-bar row h 44 gap 8
+    text project-title value $project_title
+    input terrain-name value $terrain_name enabled $can_commit event terrain.name.commit
+    button commit-terrain value "Commit" enabled $can_commit event terrain.commit
+  panel editor-row row grow 1 gap 8
+    panel tool-rail column w 160 gap 4
+      button tool-select value "Select" enabled $tool_enabled event terrain.tool.select
+      button tool-sculpt value "Sculpt" enabled $tool_enabled event terrain.tool.select
+      button tool-water value "Water" enabled $tool_enabled event terrain.tool.select
+    render terrain-render-surface grow 1
+    panel inspector column w 320 gap 6
+      text inspector-heading value $inspector_title
+      branch loading-state when $workbench_state=loading
+        text loading-message value "Loading terrain state"
+      branch ready-state when $workbench_state=ready
+        repeat material-rows capacity 8 key row_key overflow_summary
+          text material-row value "Material row"
+      branch error-state when $workbench_state=error
+        text error-message value "Terrain state unavailable"
+  panel diagnostics visible $diagnostics_visible h 96
+    text diagnostics-body value $diagnostic_text
+    repeat diagnostic-rows capacity 4 key row_key overflow_summary
+      text diagnostic-row value "Diagnostic row"

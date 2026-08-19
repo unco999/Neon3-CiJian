@@ -10,6 +10,7 @@ members = [
     "crates/neon-wgpu-runtime",
     "crates/neon-wgpu-ai",
     "crates/neon-ui-runtime",
+    "crates/neon-ui",
     "crates/neon-cli",
     "crates/neon-dev",
 ]

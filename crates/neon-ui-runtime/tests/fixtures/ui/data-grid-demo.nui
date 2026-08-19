@@ -1,0 +1,4 @@
+input asset_window grid default grid:empty
+surface data-grid-demo column w 440 h 220 gap 8 pad 12 align stretch fill #17201E
+  text data-grid-title h 24 value "Asset DataGrid"
+  data_grid asset-grid h 156 source $asset_window capacity 3 row_height 28 overscan 1 columns "name:240:edit:80:asset.name.edit,status:140:dropdown:ready|review:asset.status.select"

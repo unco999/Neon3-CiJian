@@ -40,6 +40,7 @@ use neon_ui_schema::{
     UiInputValueSource, UiInspectorState, UiInspectorTab, UiIntent, UiIrDocument, UiNode, UiNodeId,
     UiNodeKind, UiProgram, UiProgramDragDropEvent, UiProgramLayoutRecord, UiProgramLiteralText,
     UiProgramNode, UiProgramResourceKind, UiProgramRevision, UiProgramSemanticEvent,
+    UiProgramCapability, UiProgramCapabilityOwner, UiProgramCapabilityStatus,
     UiProgramSemanticEventKind, UiProgramSemanticEventResult, UiProgramSemanticEventStatus,
     UiRepeatFrame, UiResolvedInputValue, UiResolvedInputs, UiSchemaError, UiSemanticEvent,
     UiSemanticInteractionMetadata, UiSemanticPayloadValue, UiStyle, UiSurfaceEvent,
@@ -2788,10 +2789,18 @@ impl UiRuntime {
             let shutdown = request.method == "service.shutdown";
             let request_id = request.request_id.clone();
             let response = if request.method == "ui.fragment.submit" {
+                eprintln!("[neon-ui-runtime] received ui.fragment.submit request={}", request.request_id.0);
                 runtime
                     .forward_fragment(wgpu_endpoint, request)
                     .unwrap_or_else(|error| {
                         runtime.rejected(request_id, "service_unavailable", &error.to_string())
+                    })
+            } else if request.method == "ui.flow.submit" {
+                eprintln!("[neon-ui-runtime] received ui.flow.submit request={}", request.request_id.0);
+                runtime
+                    .forward_flow_source(wgpu_endpoint, request)
+                    .unwrap_or_else(|error| {
+                        runtime.rejected(request_id, "ui_flow_submit_failed", &error.to_string())
                     })
             } else if request.method == "ui.host.inbound" {
                 runtime
@@ -2816,6 +2825,92 @@ impl UiRuntime {
             };
             (response, !shutdown)
         })
+    }
+
+    /// Accepts NUI Flow source at runtime. Parsing, lowering, program
+    /// activation, and fragment submission remain UI Runtime responsibilities;
+    /// external hosts do not need to compile NUI or run a domain controller just
+    /// to display a declarative UI.
+    pub fn forward_flow_source(
+        &mut self,
+        wgpu_endpoint: SocketAddr,
+        request: RpcRequest,
+    ) -> Result<RpcResponse, TransportError> {
+        let source = request
+            .params
+            .get("source")
+            .and_then(Value::as_str)
+            .filter(|source| !source.trim().is_empty())
+            .ok_or_else(|| TransportError::Io(std::io::Error::other("NUI source is required")))?;
+        let document = parse_nui_flow(source)
+            .map_err(|error| TransportError::Io(std::io::Error::other(format!("NUI parse failed: {error:?}"))))?;
+        let revision = UiProgramRevision {
+            program_id: document.ir.surface_id.0.clone(),
+            revision: Revision(1),
+            schema_version: neon_ui_schema::UI_PROGRAM_SCHEMA_VERSION,
+            capabilities: [
+                neon_ui_schema::UI_PROGRAM_CAPABILITY_NAME,
+                neon_ui_schema::UI_PROGRAM_TEXT_REGISTRY_CAPABILITY_NAME,
+                neon_ui_schema::UI_PROGRAM_BOUNDED_STRUCTURE_CAPABILITY_NAME,
+                neon_ui_schema::UI_PROGRAM_SEMANTIC_EVENT_CAPABILITY_NAME,
+            ]
+            .into_iter()
+            .map(|name| UiProgramCapability {
+                name: name.into(),
+                version: 1,
+                owner: UiProgramCapabilityOwner::SharedContract,
+                status: UiProgramCapabilityStatus::Supported,
+            })
+            .collect(),
+        };
+        let program = compile_nui_flow_program(&document, revision)
+            .map_err(|error| TransportError::Io(std::io::Error::other(format!("NUI compile failed: {error:?}"))))?;
+        // Re-submitting the same flow advances the fragment revision so the
+        // renderer accepts the replacement instead of treating it as stale.
+        let fragment_revision = self
+            .cached_fragment
+            .as_ref()
+            .map_or(Revision(1), |current| Revision(current.revision.0 + 1));
+        let fragment = UiFragment {
+            fragment_id: UiFragmentId(document.ir.surface_id.0.clone()),
+            revision: fragment_revision,
+            root: document.ir.root.clone(),
+            effects: lower_nui_flow_effects(&document),
+        };
+        let adapter = UiHostAdapter::activate(
+            program.clone(),
+            document.input_schema.clone(),
+            self.epoch,
+        )
+        .map_err(|error| TransportError::Io(std::io::Error::other(error.message)))?
+        .with_event_publisher(self.eventd_endpoint, self.client.clone());
+        self.host_adapter = Some(adapter);
+        let forwarded = RpcRequest {
+            protocol: "neon3.rpc".into(),
+            version: PROTOCOL_VERSION,
+            request_id: request.request_id.clone(),
+            client: self.client.clone(),
+            target: ServiceName("ui-runtime".into()),
+            method: "ui.fragment.submit".into(),
+            params: json!(UiCommand::SubmitFragment {
+                submission: UiFragmentSubmission::new(fragment)
+            }),
+            expected_revision: None,
+            idempotency_key: request.idempotency_key.clone(),
+        };
+        let response = self.forward_fragment(wgpu_endpoint, forwarded)?;
+        if response.status == RpcStatus::Accepted {
+            let mut enriched = response;
+            enriched.result = Some(json!({
+                "state": "accepted",
+                "program_revision": program.revision,
+                "input_schema": document.input_schema,
+                "surface_id": document.ir.surface_id,
+                "renderer": enriched.result,
+            }));
+            return Ok(enriched);
+        }
+        Ok(response)
     }
 
     fn handle_interaction_get(&mut self, request: RpcRequest) -> RpcResponse {

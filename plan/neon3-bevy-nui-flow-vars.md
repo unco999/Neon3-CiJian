@@ -215,7 +215,6 @@ Bevy 案例拥有一个 `player.main` entity:
 ```text
 SceneRoot(character.glb)
 Neon3HostObject { object_id: "player.main" }
-Neon3WorldUi { surface_id: "character.player.main.status" }
 CharacterStatusVars { health, mana, level, name }
 ```
 
@@ -228,8 +227,11 @@ mana bar
 status effect
 ```
 
-Bevy 每帧只发布字段变化和摄像机 snapshot。World UI 的 transform/anchor metadata 由宿主
-提供，surface texture 由 Neon 渲染，Bevy 负责在自己的 3D world 中消费 surface。
+Bevy 每帧发布字段变化、摄像机 frame 与 world anchor。World UI 不申请独立 surface，
+也不把画布挂到 Bevy Entity 上：Bevy 通过 `wgpu.world.ui.anchor.submit` 持续发送
+`player.main` 的 world-space 坐标，Neon 用 world info + camera frame 把它投影成屏幕
+坐标，在自己的 fullscreen composition 里渲染 NUI。`world_ui_pipeline` 的 3D Quad 仅
+保留为内部 lab/未来模式，不作为外部宿主正式路径。
 
 ## 9. 验收标准
 

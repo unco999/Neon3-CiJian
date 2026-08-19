@@ -980,6 +980,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "neon-ui"
+version = "0.1.0"
+dependencies = [
+ "neon-ipc",
+ "neon-ui-runtime",
+ "neon-ui-schema",
+]
+
+[[package]]
 name = "neon-ui-runtime"
 version = "0.1.0"
 dependencies = [

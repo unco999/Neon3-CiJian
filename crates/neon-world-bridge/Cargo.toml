@@ -3,7 +3,11 @@ name = "neon-world-bridge"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "Renderer-neutral world and camera synchronization contract for Neon3"
+repository = "https://github.com/unco999/Neon3-CiJian"
+readme = "README.md"
+keywords = ["neon3", "world", "camera", "game-engine"]
 
 [dependencies]
-neon-protocol = { path = "../neon-protocol" }
+neon-protocol = { version = "0.1.0", path = "../neon-protocol" }
 serde.workspace = true

@@ -23,7 +23,8 @@ use neon_protocol::{
     ClientKind, HealthStatus, InteractionId, InteractionSemanticTarget, InteractionTraceError,
     InteractionTraceFilters, InteractionTraceOutcome, InteractionTraceQuery,
     InteractionTraceRecord, InteractionTraceStage, PROTOCOL_VERSION, RenderBackend,
-    RenderBackendNegotiation, RenderSurfaceOpen, RenderSurfaceKind, RequestId, Revision, RpcError,
+    RenderBackendNegotiation, RenderSurfaceOpen, RenderSurfaceKind, RenderSurfaceTargetKind,
+    RequestId, Revision, RpcError,
     RpcRequest, RpcResponse, RpcStatus,
     ServiceDescription, ServiceHealth, ServiceName,
 };
@@ -35,7 +36,8 @@ use neon_ui_schema::{
     UiWindowRequest,
 };
 use neon_world_bridge::{
-    CameraControlSample, CameraFrame, CameraId, WorldInformationBridge, WorldInformationSnapshot,
+    CameraControlSample, CameraFrame, CameraFramePayload, CameraId, WorldInformationBridge,
+    WorldInformationSnapshot, WorldUiAnchor,
 };
 use serde_json::{Value, json};
 use winit::{
@@ -1197,9 +1199,15 @@ impl WindowedRuntime {
                     .with_inner_size(PhysicalSize::new(1280, 800)),
             )
             .map_err(|error| format!("create window: {error}"))?;
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_with_display_handle(
-            Box::new(event_loop.owned_display_handle()),
-        ));
+        // External host interop (DX12 shared texture/fence) requires the DX12
+        // backend; forcing it avoids wgpu silently selecting Vulkan/GL and then
+        // failing `as_hal::<Dx12>()` at surface creation.
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::DX12,
+            ..wgpu::InstanceDescriptor::new_with_display_handle(
+                Box::new(event_loop.owned_display_handle()),
+            )
+        });
         let gpu = WindowGpu::new(&window, instance, self.world_ui_lab_camera.clone())?;
         if let Ok(mut camera) = self.world_ui_lab_camera.lock() {
             camera.window_focused = window.has_focus();
@@ -2199,6 +2207,194 @@ impl WindowedRuntime {
     }
 }
 
+#[cfg(windows)]
+struct HeadlessExternalGpu {
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    adapter: wgpu::Adapter,
+    ui: UiWgpuRenderer,
+    external_surfaces: HashMap<String, dx12_interop::SharedSurface>,
+    external_id_surfaces: HashMap<String, dx12_interop::SharedSurface>,
+    external_handle_tokens: HashMap<String, (String, String)>,
+}
+
+#[cfg(windows)]
+impl HeadlessExternalGpu {
+    fn new() -> Result<Self, String> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::DX12,
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
+        });
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+            apply_limit_buckets: false,
+        }))
+        .map_err(|error| format!("headless external adapter: {error}"))?;
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("neon3-headless-external-device"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::default(),
+            experimental_features: wgpu::ExperimentalFeatures::default(),
+            memory_hints: wgpu::MemoryHints::Performance,
+            trace: wgpu::Trace::Off,
+        }))
+        .map_err(|error| format!("headless external device: {error}"))?;
+        Ok(Self {
+            ui: UiWgpuRenderer::new(&device, wgpu::TextureFormat::Rgba8Unorm),
+            device,
+            queue,
+            adapter,
+            external_surfaces: HashMap::new(),
+            external_id_surfaces: HashMap::new(),
+            external_handle_tokens: HashMap::new(),
+        })
+    }
+
+    fn open(&mut self, open: RenderSurfaceOpen) -> Result<Value, String> {
+        if open.format != "rgba8unorm" || open.buffer_count != 1 {
+            return Err("headless_external_surface_format_or_buffer_unsupported".into());
+        }
+        if self.external_surfaces.contains_key(&open.surface_id) {
+            return Err("surface_already_open".into());
+        }
+        let shared = dx12_interop::create_shared_surface(
+            &self.device,
+            &self.adapter,
+            open.size.width.max(1),
+            open.size.height.max(1),
+            wgpu::TextureFormat::Rgba8Unorm,
+        )
+        .map_err(|error| error.to_string())?;
+        self.external_surfaces.insert(open.surface_id.clone(), shared);
+        let generation = 1;
+        let texture_token = format!("surface:{}:texture:g{}", open.surface_id, generation);
+        let fence_token = format!("surface:{}:fence:g{}", open.surface_id, generation);
+        self.external_handle_tokens.insert(
+            open.surface_id.clone(),
+            (texture_token.clone(), fence_token.clone()),
+        );
+        if open.targets.iter().any(|target| target.kind == RenderSurfaceTargetKind::Id) {
+            let id_surface = dx12_interop::create_shared_surface(
+                &self.device,
+                &self.adapter,
+                open.size.width.max(1),
+                open.size.height.max(1),
+                wgpu::TextureFormat::R32Uint,
+            )
+            .map_err(|error| error.to_string())?;
+            self.external_id_surfaces.insert(open.surface_id.clone(), id_surface);
+        }
+        Ok(json!({
+            "surface_id": open.surface_id,
+            "generation": generation,
+            "transport": "d3d12_shared_texture_v1",
+            "texture_token": texture_token,
+            "fence_token": fence_token
+        }))
+    }
+
+    fn acquire(&self, surface_id: &str, pid: u32) -> Result<Value, String> {
+        let shared = self.external_surfaces.get(surface_id).ok_or("surface_not_found")?;
+        let (texture_token, fence_token) = self
+            .external_handle_tokens
+            .get(surface_id)
+            .ok_or("surface_broker_token_not_found")?;
+        let mut result = json!({
+            "surface_id": surface_id,
+            "texture_token": texture_token,
+            "fence_token": fence_token,
+            "texture_handle": dx12_interop::duplicate_handle_to_process(shared.texture_handle, pid).map_err(|error| error.to_string())?,
+            "fence_handle": dx12_interop::duplicate_handle_to_process(shared.fence_handle, pid).map_err(|error| error.to_string())?
+        });
+        if let Some(id_surface) = self.external_id_surfaces.get(surface_id) {
+            result["id_texture_handle"] = json!(dx12_interop::duplicate_handle_to_process(id_surface.texture_handle, pid).map_err(|error| error.to_string())?);
+            result["id_fence_handle"] = json!(dx12_interop::duplicate_handle_to_process(id_surface.fence_handle, pid).map_err(|error| error.to_string())?);
+        }
+        Ok(result)
+    }
+
+    fn render(&mut self, fragments: &HashMap<UiFragmentId, UiFragment>) -> Result<(), String> {
+        if self.external_surfaces.is_empty() {
+            return Ok(());
+        }
+        // The filtered snapshot contains live world-panel bounds derived from
+        // the latest camera and anchor, not a new UI program revision.
+        self.ui.invalidate_plan();
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("neon3-headless-external-ui"),
+        });
+        for shared in self.external_surfaces.values_mut() {
+            let view = shared.texture.create_view(&wgpu::TextureViewDescriptor::default());
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("neon3-headless-external-ui-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            self.ui.draw(&self.device, &self.queue, &mut pass, fragments, [shared.width, shared.height], [shared.width as f32, shared.height as f32], 0.0);
+            drop(pass);
+            shared.frame_sequence = shared.frame_sequence.saturating_add(1);
+            let hal_queue = unsafe { self.queue.as_hal::<wgpu::hal::api::Dx12>() }.ok_or("dx12_queue_unavailable")?;
+            hal_queue.add_signal_fence(shared.fence.clone(), shared.frame_sequence);
+        }
+        self.queue.submit(Some(encoder.finish()));
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+pub fn spawn_headless_external_server(endpoint: SocketAddr) -> std::thread::JoinHandle<Result<(), String>> {
+    std::thread::Builder::new()
+        .name("neon3-headless-external-gpu".into())
+        .spawn(move || {
+            let server = neon_ipc::RpcServer::bind(endpoint).map_err(|error| error.to_string())?;
+            let mut runtime = WgpuRuntime::headless(1);
+            let mut gpu = HeadlessExternalGpu::new()?;
+            server
+                .serve_until(|request| {
+                    let shutdown = request.method == "service.shutdown";
+                    let render_after_request = request.method != "wgpu.world.camera.submit_frame";
+                    let response = match request.method.as_str() {
+                        "render.surface.open" => {
+                            let request_id = request.request_id;
+                            match serde_json::from_value(request.params)
+                                .map_err(|_| "invalid_surface_open".to_string())
+                                .and_then(|open| gpu.open(open))
+                            {
+                                Ok(result) => runtime.accept(request_id, result),
+                                Err(error) => runtime.reject(request_id, "external_surface_open_failed", &error, None),
+                            }
+                        }
+                        "render.surface.acquire" => {
+                            let request_id = request.request_id;
+                            let surface_id = request.params.get("surface_id").and_then(Value::as_str).unwrap_or_default();
+                            let pid = request.params.get("pid").and_then(Value::as_u64).unwrap_or_default() as u32;
+                            match gpu.acquire(surface_id, pid) {
+                                Ok(result) => runtime.accept(request_id, result),
+                                Err(error) => runtime.reject(request_id, "external_surface_acquire_failed", &error, None),
+                            }
+                        }
+                        _ => runtime.handle(request),
+                    };
+                    if response.status == RpcStatus::Accepted && render_after_request {
+                        let _ = gpu.render(&runtime.fragments_snapshot());
+                    }
+                    (response, !shutdown)
+                })
+                .map_err(|error| error.to_string())
+        })
+        .expect("start headless external GPU server")
+}
+
 /// Finalizes a captured pointer using the normal release semantics. Both OS
 /// release and debug activation use this so tests cannot bypass control state.
 struct ReleasedBinding {
@@ -2387,6 +2583,13 @@ impl WindowGpu {
         fragments: &HashMap<UiFragmentId, UiFragment>,
     ) -> Result<(), String> {
         for shared in self.external_surfaces.values_mut() {
+            eprintln!(
+                "[neon-wgpu-runtime] export color surface size={}x{} fragments={} previous_frame={}",
+                shared.width,
+                shared.height,
+                fragments.len(),
+                shared.frame_sequence
+            );
             let view = shared.texture.create_view(&wgpu::TextureViewDescriptor::default());
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("neon3-external-host-surface-pass"),
@@ -2856,6 +3059,14 @@ impl WindowGpu {
 
     #[cfg(windows)]
     fn open_external_surface(&mut self, open: RenderSurfaceOpen) -> Result<Value, String> {
+        eprintln!(
+            "[neon-wgpu-runtime] render.surface.open surface={} kind={:?} size={}x{} targets={}",
+            open.surface_id,
+            open.kind,
+            open.size.width,
+            open.size.height,
+            open.targets.len()
+        );
         if open.session_id.trim().is_empty() || open.surface_id.trim().is_empty() {
             return Err("invalid_surface_identity".into());
         }
@@ -2943,6 +3154,10 @@ impl WindowGpu {
 
     #[cfg(windows)]
     fn acquire_external_surface(&mut self, surface_id: &str, pid: u32) -> Result<Value, String> {
+        eprintln!(
+            "[neon-wgpu-runtime] render.surface.acquire surface={} consumer_pid={}",
+            surface_id, pid
+        );
         if pid == 0 {
             return Err("invalid_consumer_pid".into());
         }
@@ -5521,6 +5736,82 @@ fn world_ui_lab_camera(size: [u32; 2], state: WorldUiCameraState) -> WorldUiCame
     WorldUiCamera::perspective(size, state)
 }
 
+/// Projects a world-space point to a fullscreen pixel using a 3D camera frame.
+///
+/// The camera looks along -Z (right-handed Y-up), matching Bevy and the
+/// `RightHandedYUpNegativeZForward` coordinate system. `orientation` is a unit
+/// quaternion in `(x, y, z, w)` order. Returns `None` when the point is behind
+/// the camera, outside the near/far range, or outside the view frustum.
+fn project_world_point_to_screen(
+    anchor_position: [f64; 3],
+    camera_position: [f64; 3],
+    orientation: [f32; 4],
+    vertical_fov_radians: f32,
+    near: f32,
+    far: f32,
+    viewport: [u32; 2],
+) -> Option<[f32; 2]> {
+    project_world_point_to_screen_with_depth(
+        anchor_position,
+        camera_position,
+        orientation,
+        vertical_fov_radians,
+        near,
+        far,
+        viewport,
+    )
+    .map(|(screen, _)| screen)
+}
+
+fn project_world_point_to_screen_with_depth(
+    anchor_position: [f64; 3],
+    camera_position: [f64; 3],
+    orientation: [f32; 4],
+    vertical_fov_radians: f32,
+    near: f32,
+    far: f32,
+    viewport: [u32; 2],
+) -> Option<([f32; 2], f32)> {
+    let [qx, qy, qz, qw] = orientation;
+    let norm = (qx * qx + qy * qy + qz * qz + qw * qw).sqrt();
+    if norm <= 0.0 {
+        return None;
+    }
+    let (qx, qy, qz, qw) = (qx / norm, qy / norm, qz / norm, qw / norm);
+    // Rotation matrix `world = R * local`, row-major.
+    let r00 = 1.0 - 2.0 * (qy * qy + qz * qz);
+    let r01 = 2.0 * (qx * qy - qw * qz);
+    let r02 = 2.0 * (qx * qz + qw * qy);
+    let r10 = 2.0 * (qx * qy + qw * qz);
+    let r11 = 1.0 - 2.0 * (qx * qx + qz * qz);
+    let r12 = 2.0 * (qy * qz - qw * qx);
+    let r20 = 2.0 * (qx * qz - qw * qy);
+    let r21 = 2.0 * (qy * qz + qw * qx);
+    let r22 = 1.0 - 2.0 * (qx * qx + qy * qy);
+    let dx = (anchor_position[0] - camera_position[0]) as f32;
+    let dy = (anchor_position[1] - camera_position[1]) as f32;
+    let dz = (anchor_position[2] - camera_position[2]) as f32;
+    // Camera-local = R^T * (p - c).
+    let lx = r00 * dx + r10 * dy + r20 * dz;
+    let ly = r01 * dx + r11 * dy + r21 * dz;
+    let lz = r02 * dx + r12 * dy + r22 * dz;
+    // The camera looks along -Z, so a visible point has a negative local z.
+    let depth = -lz;
+    if depth < near || depth > far {
+        return None;
+    }
+    let focal = 1.0 / (vertical_fov_radians * 0.5).tan();
+    let aspect = viewport[0].max(1) as f32 / viewport[1].max(1) as f32;
+    let ndc_x = lx * focal / (aspect * depth);
+    let ndc_y = ly * focal / depth;
+    if ndc_x.abs() > 1.0 || ndc_y.abs() > 1.0 {
+        return None;
+    }
+    let screen_x = (ndc_x * 0.5 + 0.5) * viewport[0] as f32;
+    let screen_y = (1.0 - (ndc_y * 0.5 + 0.5)) * viewport[1] as f32;
+    Some(([screen_x, screen_y], depth))
+}
+
 fn handle_world_ui_lab_camera_register(
     runtime: &mut WgpuRuntime,
     proxy: &EventLoopProxy<WindowCommand>,
@@ -5624,6 +5915,7 @@ fn spawn_window_server(
                     | "wgpu.ui.remove_fragment"
                     | "wgpu.world.info.configure"
                     | "wgpu.world.camera.submit_frame"
+                    | "wgpu.world.ui.anchor.submit"
                     | "wgpu.world_ui.lab.camera.register"
             );
             let response = if request.method == "wgpu.ai.terrain.generate" {
@@ -6015,6 +6307,7 @@ pub struct WgpuRuntime {
     interaction_traces: Arc<Mutex<InteractionTraceStore>>,
     world_bridge: WorldInformationBridge,
     world_ui_lab_camera: Arc<Mutex<WorldUiLabCameraController>>,
+    viewport: [u32; 2],
 }
 
 impl WgpuRuntime {
@@ -6033,6 +6326,10 @@ impl WgpuRuntime {
             interaction_traces: Arc::new(Mutex::new(InteractionTraceStore::new())),
             world_bridge: WorldInformationBridge::new(),
             world_ui_lab_camera: Arc::new(Mutex::new(WorldUiLabCameraController::default())),
+            // The external host surface is 1280x720. World anchors must be
+            // projected in the shared-texture viewport, not the window lab's
+            // historical 1280x800 viewport.
+            viewport: [1280, 720],
         }
     }
 
@@ -6118,33 +6415,137 @@ impl WgpuRuntime {
     pub fn fragments_snapshot(&self) -> HashMap<UiFragmentId, UiFragment> {
         self.fragments
             .iter()
-            .map(|(id, fragment)| (id.clone(), self.filter_world_panels(fragment)))
+            .map(|(id, fragment)| {
+                (id.clone(), self.filter_world_panels(fragment))
+            })
             .collect()
     }
 
     fn filter_world_panels(&self, fragment: &UiFragment) -> UiFragment {
         let mut filtered = fragment.clone();
+        let has_world_panel = filtered.effects.iter().any(|effect| {
+            matches!(effect, neon_ui_schema::UiEffect::CameraVisibility { .. })
+        });
+        fn scale_world_subtree(node: &mut neon_ui_schema::UiNode, scale: f32, include_position: bool) {
+            if include_position {
+                node.bounds.x *= scale;
+                node.bounds.y *= scale;
+            }
+            node.bounds.width *= scale;
+            node.bounds.height *= scale;
+            if let Some(layout) = &mut node.layout {
+                for value in &mut layout.padding {
+                    *value *= scale;
+                }
+                for value in &mut layout.margin {
+                    *value *= scale;
+                }
+                layout.gap *= scale;
+                layout.flex_basis = layout.flex_basis.map(|value| value * scale);
+                layout.min_size = layout.min_size.map(|value| [value[0] * scale, value[1] * scale]);
+                layout.max_size = layout.max_size.map(|value| [value[0] * scale, value[1] * scale]);
+                layout.preferred_size = layout.preferred_size.map(|value| [value[0] * scale, value[1] * scale]);
+            }
+            for child in &mut node.children {
+                scale_world_subtree(child, scale, true);
+            }
+        }
         fn visit(
             node: &mut neon_ui_schema::UiNode,
             effects: &[neon_ui_schema::UiEffect],
             bridge: &WorldInformationBridge,
+            viewport: [u32; 2],
         ) {
-            let hidden = effects.iter().any(|effect| {
+            let binding = effects.iter().find_map(|effect| {
                 let neon_ui_schema::UiEffect::CameraVisibility { binding } = effect else {
-                    return false;
+                    return None;
                 };
-                binding.node_id == node.node_id
-                    && !bridge.camera_is_available(&binding.camera_id, binding.camera_kind)
+                (binding.node_id == node.node_id).then_some(binding)
             });
+            let mut projected = None;
+            let mut hidden = false;
+            if let Some(binding) = binding {
+                if !bridge.camera_is_available(&binding.camera_id, binding.camera_kind) {
+                    hidden = true;
+                } else if let Some(anchor_id) = &binding.anchor_id {
+                    let Some(anchor) = bridge.anchor(anchor_id) else {
+                        node.visible = false;
+                        return;
+                    };
+                    let Some(frame) = bridge.camera(&binding.camera_id) else {
+                        node.visible = false;
+                        return;
+                    };
+                    let CameraFramePayload::ThreeDimensional {
+                        position,
+                        orientation,
+                        vertical_fov_radians,
+                        near,
+                        far,
+                    } = frame.payload else {
+                        node.visible = false;
+                        return;
+                    };
+                    projected = project_world_point_to_screen_with_depth(
+                        anchor.position,
+                        position,
+                        orientation,
+                        vertical_fov_radians,
+                        near,
+                        far,
+                        viewport,
+                    );
+                    if let Some(([_x, _y], depth)) = projected {
+                        let scale = (6.0 / depth).clamp(0.5, 2.0);
+                        node.bounds.width *= scale;
+                        node.bounds.height *= scale;
+                        if let Some(layout) = &mut node.layout {
+                            layout.clip = neon_ui_schema::UiClipPolicy::None;
+                            for value in &mut layout.padding { *value *= scale; }
+                            layout.gap *= scale;
+                        }
+                        for child in &mut node.children {
+                            scale_world_subtree(child, scale, true);
+                        }
+                    } else {
+                        hidden = true;
+                    }
+                }
+            }
             if hidden {
                 node.visible = false;
             } else {
+                if let Some(([x, y], _)) = projected {
+                    node.bounds.x = x - node.bounds.width * 0.5;
+                    node.bounds.y = y - node.bounds.height;
+                }
                 for child in &mut node.children {
-                    visit(child, effects, bridge);
+                    visit(child, effects, bridge, viewport);
                 }
             }
         }
-        visit(&mut filtered.root, &filtered.effects, &self.world_bridge);
+        visit(
+            &mut filtered.root,
+            &filtered.effects,
+            &self.world_bridge,
+            self.viewport,
+        );
+        // The world bridge has already applied the camera gate and anchor
+        // projection above. Leaving this effect in the renderer snapshot makes
+        // UiWgpuRenderer apply a second, unrelated camera-availability gate.
+        filtered.effects.retain(|effect| {
+            !matches!(effect, neon_ui_schema::UiEffect::CameraVisibility { .. })
+        });
+        if has_world_panel {
+            // World panels use renderer-projected coordinates, so their root
+            // must not reflow them as ordinary column children. The root is a
+            // transparent layout container rather than a visible full-screen
+            // panel in the exported texture.
+            let layout = filtered.root.layout.get_or_insert_default();
+            layout.mode = neon_ui_schema::UiLayoutMode::Overlay;
+            layout.clip = neon_ui_schema::UiClipPolicy::None;
+            filtered.root.style.opacity = 0.0;
+        }
         filtered
     }
 
@@ -6219,6 +6620,69 @@ impl WgpuRuntime {
                 None,
             ),
         }
+    }
+
+    fn submit_world_ui_anchor(
+        &mut self,
+        request_id: RequestId,
+        params: serde_json::Value,
+    ) -> RpcResponse {
+        let anchor: WorldUiAnchor = match serde_json::from_value(params) {
+            Ok(anchor) => anchor,
+            Err(_) => {
+                return self.reject(request_id, "invalid_request", "invalid world UI anchor", None);
+            }
+        };
+        let anchor_id = anchor.anchor_id.clone();
+        let sequence = anchor.sequence;
+        match self.world_bridge.submit_anchor(anchor) {
+            Ok(()) => self.accept(
+                request_id,
+                serde_json::json!({
+                    "anchor_id": anchor_id,
+                    "sequence": sequence,
+                    "state": "accepted"
+                }),
+            ),
+            Err(error) => self.reject(
+                request_id,
+                "world_anchor_rejected",
+                &format!("{error:?}"),
+                None,
+            ),
+        }
+    }
+
+    /// Projects a host-owned world-space anchor to a fullscreen pixel using the
+    /// matching 3D camera frame. Returns `None` when the anchor is behind the
+    /// camera, outside the near/far range, or outside the view frustum.
+    ///
+    /// The camera looks along -Z (right-handed Y-up), matching Bevy and the
+    /// `RightHandedYUpNegativeZForward` coordinate system.
+    pub(crate) fn project_world_anchor_to_screen(
+        anchor: &WorldUiAnchor,
+        frame: &CameraFrame,
+        viewport: [u32; 2],
+    ) -> Option<[f32; 2]> {
+        let neon_world_bridge::CameraFramePayload::ThreeDimensional {
+            position,
+            orientation,
+            vertical_fov_radians,
+            near,
+            far,
+        } = frame.payload
+        else {
+            return None;
+        };
+        project_world_point_to_screen(
+            anchor.position,
+            position,
+            orientation,
+            vertical_fov_radians,
+            near,
+            far,
+            viewport,
+        )
     }
 
     pub fn command_receipt(&self, request_id: &RequestId) -> Option<&CommandReceipt> {
@@ -6405,6 +6869,9 @@ impl WgpuRuntime {
             "wgpu.world.camera.submit_frame" => {
                 self.submit_world_camera_frame(request_id, request.params)
             }
+            "wgpu.world.ui.anchor.submit" => {
+                self.submit_world_ui_anchor(request_id, request.params)
+            }
             "wgpu.resource.inspect" => self.resource_inspect(request_id),
             "wgpu.ui.resource.preload" => self.resource_preload(request_id, request.params),
             "wgpu.resource.wait_ready" => self.resource_wait_ready(request_id, request.params),
@@ -6436,6 +6903,7 @@ impl WgpuRuntime {
                 | "wgpu.ui.remove_fragment"
                 | "wgpu.world.info.configure"
                 | "wgpu.world.camera.submit_frame"
+                | "wgpu.world.ui.anchor.submit"
         ) && response.status == RpcStatus::Accepted
             && let Some(idempotency_key) = request.idempotency_key
         {
@@ -7531,6 +7999,7 @@ mod tests {
                 node_id: UiNodeId("marker".into()),
                 camera_id: neon_world_bridge::CameraId("editor".into()),
                 camera_kind: neon_world_bridge::CameraKind::ThreeDimensional,
+                anchor_id: None,
             },
         });
         runtime.fragments.insert(gated.fragment_id.clone(), gated);
@@ -7564,6 +8033,175 @@ mod tests {
                 .children[0]
                 .visible
         );
+    }
+
+    #[test]
+    fn world_anchor_projects_to_screen_center_when_dead_ahead() {
+        let screen = project_world_point_to_screen(
+            [0.0, 0.0, -2.0],
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+            std::f32::consts::FRAC_PI_2,
+            0.1,
+            1000.0,
+            [640, 360],
+        )
+        .expect("anchor is dead ahead");
+        assert!((screen[0] - 320.0).abs() < 0.01);
+        assert!((screen[1] - 180.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn world_anchor_behind_camera_is_not_projected() {
+        assert!(
+            project_world_point_to_screen(
+                [0.0, 0.0, 2.0],
+                [0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+                std::f32::consts::FRAC_PI_2,
+                0.1,
+                1000.0,
+                [640, 360],
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn world_anchor_outside_the_frustum_is_not_projected() {
+        assert!(
+            project_world_point_to_screen(
+                [10.0, 0.0, -2.0],
+                [0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+                std::f32::consts::FRAC_PI_2,
+                0.1,
+                1000.0,
+                [640, 360],
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn world_anchor_submit_is_stored_and_queryable() {
+        let mut runtime = WgpuRuntime::headless(1);
+        runtime
+            .world_bridge
+            .configure_world(WorldInformationSnapshot {
+                world_space_id: neon_world_bridge::WorldSpaceId("project.world.main".into()),
+                revision: Revision(1),
+                coordinate_system:
+                    neon_world_bridge::CoordinateSystem::RightHandedYUpNegativeZForward,
+                units_per_meter: 1.0,
+                precision_mode: neon_world_bridge::WorldPrecisionMode::CameraRelativeF64,
+            })
+            .unwrap();
+        let response = runtime.handle(request(
+            "anchor-submit",
+            "wgpu.world.ui.anchor.submit",
+            json!(WorldUiAnchor {
+                anchor_id: neon_world_bridge::WorldAnchorId("player.main".into()),
+                world_space_id: neon_world_bridge::WorldSpaceId("project.world.main".into()),
+                producer_epoch: 1,
+                sequence: 1,
+                timestamp_monotonic_ns: 1,
+                position: [1.0, 2.0, 3.0],
+                billboard: true,
+            }),
+        ));
+        assert_eq!(response.status, RpcStatus::Accepted);
+        let stored = runtime
+            .world_bridge
+            .anchor(&neon_world_bridge::WorldAnchorId("player.main".into()))
+            .expect("anchor stored");
+        assert_eq!(stored.position, [1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn world_panel_is_placed_at_the_projected_anchor_position() {
+        let mut runtime = WgpuRuntime::headless(1);
+        runtime
+            .world_bridge
+            .configure_world(WorldInformationSnapshot {
+                world_space_id: neon_world_bridge::WorldSpaceId("project.world.main".into()),
+                revision: Revision(1),
+                coordinate_system:
+                    neon_world_bridge::CoordinateSystem::RightHandedYUpNegativeZForward,
+                units_per_meter: 1.0,
+                precision_mode: neon_world_bridge::WorldPrecisionMode::CameraRelativeF64,
+            })
+            .unwrap();
+        // Camera at origin looking -Z, 90° vertical FOV.
+        runtime
+            .world_bridge
+            .submit_camera_frame(CameraFrame {
+                camera_id: neon_world_bridge::CameraId("editor".into()),
+                world_space_id: neon_world_bridge::WorldSpaceId("project.world.main".into()),
+                producer_epoch: 1,
+                sequence: 1,
+                timestamp_monotonic_ns: 1,
+                payload: neon_world_bridge::CameraFramePayload::ThreeDimensional {
+                    position: [0.0, 0.0, 0.0],
+                    orientation: [0.0, 0.0, 0.0, 1.0],
+                    vertical_fov_radians: std::f32::consts::FRAC_PI_2,
+                    near: 0.1,
+                    far: 1000.0,
+                },
+            })
+            .unwrap();
+        // Anchor dead ahead at (0, 0, -2) → screen center.
+        runtime
+            .world_bridge
+            .submit_anchor(WorldUiAnchor {
+                anchor_id: neon_world_bridge::WorldAnchorId("player.main".into()),
+                world_space_id: neon_world_bridge::WorldSpaceId("project.world.main".into()),
+                producer_epoch: 1,
+                sequence: 1,
+                timestamp_monotonic_ns: 1,
+                position: [0.0, 0.0, -2.0],
+                billboard: true,
+            })
+            .unwrap();
+        let mut gated = fragment(1);
+        let marker = UiNode {
+            node_id: UiNodeId("status-root".into()),
+            kind: UiNodeKind::Panel,
+            bounds: UiBounds {
+                x: 0.0,
+                y: 0.0,
+                width: 10.0,
+                height: 10.0,
+            },
+            layout: None,
+            visible: true,
+            enabled: true,
+            text_key: None,
+            text: None,
+            image: None,
+            surface: None,
+            style: UiStyle::default(),
+            enter_transition: None,
+            children: Vec::new(),
+        };
+        gated.root.children.push(marker);
+        gated.effects.push(UiEffect::CameraVisibility {
+            binding: neon_ui_schema::UiCameraVisibilityBinding {
+                node_id: UiNodeId("status-root".into()),
+                camera_id: neon_world_bridge::CameraId("editor".into()),
+                camera_kind: neon_world_bridge::CameraKind::ThreeDimensional,
+                anchor_id: Some(neon_world_bridge::WorldAnchorId("player.main".into())),
+            },
+        });
+        runtime.fragments.insert(gated.fragment_id.clone(), gated);
+        let snapshot = runtime.fragments_snapshot();
+        let bounds = &snapshot[&UiFragmentId("static-fragment".into())]
+            .root
+            .children[0]
+            .bounds;
+        // viewport [1280, 720]: center (640, 360). bounds.x = 640 - 5, y = 360 - 10.
+        assert!((bounds.x - 635.0).abs() < 0.5, "x was {}", bounds.x);
+        assert!((bounds.y - 350.0).abs() < 0.5, "y was {}", bounds.y);
     }
 
     #[test]

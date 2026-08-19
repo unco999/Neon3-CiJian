@@ -328,7 +328,7 @@ mod tests {
     #[test]
     fn state_machine_synchronizes_and_emits_only_declared_intents() {
         let document = crate::parse_nui_flow(include_str!(
-            "../../../tests/fixtures/ui/asset-review-workbench.nui"
+            "../tests/fixtures/ui/asset-review-workbench.nui"
         ))
         .unwrap();
         let mut runtime = NuiFlowStateMachineRuntime::new(&document);
@@ -419,7 +419,7 @@ mod tests {
     #[test]
     fn drag_controller_snaps_motion_and_drives_accepted_state() {
         let document = crate::parse_nui_flow(include_str!(
-            "../../../tests/fixtures/ui/asset-review-workbench.nui"
+            "../tests/fixtures/ui/asset-review-workbench.nui"
         ))
         .unwrap();
         let mut drag = NuiFlowDragController::default();
@@ -444,7 +444,7 @@ mod tests {
     #[test]
     fn drop_target_proposes_reparent_without_mutating_the_flow_tree() {
         let document = crate::parse_nui_flow(include_str!(
-            "../../../tests/fixtures/ui/kanban-reparent-workbench.nui"
+            "../tests/fixtures/ui/kanban-reparent-workbench.nui"
         ))
         .unwrap();
         let original_parent = document.ir.root.children[1].children[0].children[1]
@@ -475,7 +475,7 @@ mod tests {
     #[test]
     fn complex_kanban_declares_multiple_drag_paths_and_no_blocked_drop_path() {
         let document = crate::parse_nui_flow(include_str!(
-            "../../../tests/fixtures/ui/kanban-reparent-workbench.nui"
+            "../tests/fixtures/ui/kanban-reparent-workbench.nui"
         ))
         .unwrap();
         let mut drag = NuiFlowDragController::default();

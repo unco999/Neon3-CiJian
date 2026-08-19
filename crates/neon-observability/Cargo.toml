@@ -3,8 +3,12 @@ name = "neon-observability"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "Command journal, receipts, and debug snapshots for Neon3 services"
+repository = "https://github.com/unco999/Neon3-CiJian"
+readme = "README.md"
+keywords = ["neon3", "observability", "debug", "game-engine"]
 
 [dependencies]
-neon-protocol = { path = "../neon-protocol" }
+neon-protocol = { version = "0.1.0", path = "../neon-protocol" }
 serde.workspace = true
 serde_json.workspace = true
