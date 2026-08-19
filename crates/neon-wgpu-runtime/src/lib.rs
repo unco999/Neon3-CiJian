@@ -2416,10 +2416,6 @@ impl HeadlessExternalGpu {
             self.ui.draw(&self.device, &self.queue, &mut pass, fragments, [shared.width, shared.height], [shared.width as f32, shared.height as f32], 0.0);
             drop(pass);
             shared.frame_sequence = frame_sequence;
-            eprintln!(
-                "[neon-wgpu-runtime] shared UI produce buffer={} frame={}",
-                write_index, frame_sequence
-            );
             hal_queue.add_signal_fence(shared.fence.clone(), shared.frame_sequence);
         }
         self.queue.submit(Some(encoder.finish()));
@@ -2433,40 +2429,76 @@ pub fn spawn_headless_external_server(endpoint: SocketAddr) -> std::thread::Join
         .name("neon3-headless-external-gpu".into())
         .spawn(move || {
             let server = neon_ipc::RpcServer::bind(endpoint).map_err(|error| error.to_string())?;
-            let mut runtime = WgpuRuntime::headless(1);
-            let mut gpu = HeadlessExternalGpu::new()?;
-            server
+            let runtime = Arc::new(Mutex::new(WgpuRuntime::headless(1)));
+            let gpu = Arc::new(Mutex::new(HeadlessExternalGpu::new()?));
+
+            // Continuous render loop. Rendering only on RPC requests stalls after
+            // a startup burst: the consumer releases ring buffers on its own frame
+            // schedule, so on-demand rendering fills the ring and drops the frames
+            // that actually carry camera/anchor state, then goes idle with no new
+            // request to recover. A dedicated loop keeps the shared surface fresh
+            // by re-rendering the latest snapshot every ~16 ms and simply dropping
+            // a frame when the consumer has not yet released a buffer.
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let render_runtime = Arc::clone(&runtime);
+            let render_gpu = Arc::clone(&gpu);
+            let render_stop = Arc::clone(&stop);
+            let render_thread = std::thread::Builder::new()
+                .name("neon3-headless-external-render".into())
+                .spawn(move || {
+                    while !render_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        std::thread::sleep(Duration::from_millis(16));
+                        let fragments = match render_runtime.lock() {
+                            Ok(runtime) => runtime.fragments_snapshot(),
+                            Err(_) => break,
+                        };
+                        match render_gpu.lock() {
+                            Ok(mut gpu) => {
+                                if let Err(error) = gpu.render(&fragments) {
+                                    eprintln!("[neon-wgpu-runtime] render error: {error}");
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                })
+                .expect("start headless external render thread");
+
+            let result = server
                 .serve_until(|request| {
                     let shutdown = request.method == "service.shutdown";
-                    let render_after_request = request.method != "wgpu.world.camera.submit_frame";
                     let response = match request.method.as_str() {
                         "render.surface.open" => {
                             let request_id = request.request_id;
                             match serde_json::from_value(request.params)
                                 .map_err(|_| "invalid_surface_open".to_string())
-                                .and_then(|open| gpu.open(open))
+                                .and_then(|open| gpu.lock().expect("gpu lock").open(open))
                             {
-                                Ok(result) => runtime.accept(request_id, result),
-                                Err(error) => runtime.reject(request_id, "external_surface_open_failed", &error, None),
+                                Ok(result) => runtime.lock().expect("runtime lock").accept(request_id, result),
+                                Err(error) => runtime.lock().expect("runtime lock").reject(request_id, "external_surface_open_failed", &error, None),
                             }
                         }
                         "render.surface.acquire" => {
                             let request_id = request.request_id;
                             let surface_id = request.params.get("surface_id").and_then(Value::as_str).unwrap_or_default();
                             let pid = request.params.get("pid").and_then(Value::as_u64).unwrap_or_default() as u32;
-                            match gpu.acquire(surface_id, pid) {
-                                Ok(result) => runtime.accept(request_id, result),
-                                Err(error) => runtime.reject(request_id, "external_surface_acquire_failed", &error, None),
+                            match gpu.lock().expect("gpu lock").acquire(surface_id, pid) {
+                                Ok(result) => runtime.lock().expect("runtime lock").accept(request_id, result),
+                                Err(error) => runtime.lock().expect("runtime lock").reject(request_id, "external_surface_acquire_failed", &error, None),
                             }
                         }
-                        _ => runtime.handle(request),
+                        _ => runtime.lock().expect("runtime lock").handle(request),
                     };
-                    if response.status == RpcStatus::Accepted && render_after_request {
-                        let _ = gpu.render(&runtime.fragments_snapshot());
+                    if shutdown {
+                        stop.store(true, std::sync::atomic::Ordering::Relaxed);
                     }
                     (response, !shutdown)
                 })
-                .map_err(|error| error.to_string())
+                .map_err(|error| error.to_string());
+
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            let _ = render_thread.join();
+            result
         })
         .expect("start headless external GPU server")
 }

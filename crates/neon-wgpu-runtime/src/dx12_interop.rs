@@ -73,6 +73,13 @@ pub struct SharedSurface {
     pub frame_sequence: u64,
 }
 
+// `HANDLE` wraps a raw pointer and is therefore not auto-`Send`/`Sync`, but it
+// is just a process-scoped kernel handle value (safe to move between threads in
+// the same process). The owning `HeadlessExternalGpu` serializes access through
+// a `Mutex`, so this is sound.
+unsafe impl Send for SharedSurface {}
+unsafe impl Sync for SharedSurface {}
+
 pub fn duplicate_handle_to_process(handle: HANDLE, target_pid: u32) -> Result<usize, Error> {
     let target = unsafe { OpenProcess(PROCESS_DUP_HANDLE, false, target_pid) }
         .map_err(|error| Error::CreateSharedHandle(format!("open target process: {error}")))?;
