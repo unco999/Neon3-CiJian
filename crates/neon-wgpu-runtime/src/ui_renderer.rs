@@ -3,6 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::time::Instant;
 
 use bytemuck::{Pod, Zeroable};
 use neon_protocol::{AssetBytes, AssetRef};
@@ -184,7 +185,9 @@ struct VsOut {
 }
 @fragment fn fs_main(input: VsOut) -> @location(0) f32 {
     if (outside_clip(input.pixel, input.clip, input.params.w)) { discard; }
-    if (input.depth <= 0.0) { discard; }
+    // Zero is a valid topmost depth for screen UI. The external target is a
+    // color target, so screen groups can overwrite world depth at overlap.
+    if (input.depth < 0.0) { discard; }
     return input.depth;
 }
 "#;
@@ -237,6 +240,7 @@ struct VsOut { @builtin(position) position: vec4<f32>, @location(0) local: vec2<
 "#;
 
 const BUILTIN_UI_FONT: &[u8] = include_bytes!("../../../assets/fonts/SarasaUiSC-Light.ttf");
+const EXTERNAL_WORLD_DEPTH_MIN: f32 = 0.001;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
@@ -246,8 +250,7 @@ struct UiInstance {
     border: [f32; 4],
     params: [f32; 4],
     clip: [f32; 4],
-    /// Normalized occlusion depth (0.0 = near/always-on-top, 1.0 = far). Written
-    /// to the optional depth target so the consumer can depth-test the overlay.
+    /// Normalized color-pass depth (0.0 = near/always-on-top, 1.0 = far).
     depth: f32,
     paint_group_id: u32,
 }
@@ -701,8 +704,8 @@ struct UiVisual {
     presentation: Option<UiControlPresentation>,
     scroll: bool,
     declared_scroll_offset: [f32; 2],
-    /// Normalized occlusion depth inherited from a projected world panel
-    /// (`None` for screen UI → rendered as "always on top", depth 0.0).
+    /// Normalized occlusion depth inherited from a projected world panel.
+    /// Screen UI has `None` and is omitted from the external depth pass.
     world_depth: Option<f32>,
     paint_group_id: u32,
 }
@@ -783,6 +786,32 @@ struct CachedDataGridTextDisplay {
     text: String,
 }
 
+/// Per-draw stage timings collected on the last color pass. Diagnostics only;
+/// collecting these never alters rendering behavior or draw order.
+#[derive(Default, Clone, Copy)]
+pub(crate) struct UiDrawStageTimings {
+    pub refresh_plan_ms: f32,
+    pub compose_visuals_ms: f32,
+    pub text_layout_ms: f32,
+    pub group_sort_ms: f32,
+    pub buffer_upload_ms: f32,
+}
+
+/// Which subset of the combined plan a pass should emit. The plan itself is
+/// always the full combined Flow (screen UI + projected world panels); only the
+/// instance emission is filtered so a single renderer can feed both the world
+/// target (color + occlusion depth) and the screen target (color only) from the
+/// same buffer index / frame sequence.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum UiDrawMode {
+    /// Every node (used by the unified ID pass).
+    All,
+    /// Only projected world panels and their descendants.
+    World,
+    /// Only ordinary screen UI (nodes without a world depth).
+    Screen,
+}
+
 pub struct UiWgpuRenderer {
     color_format: wgpu::TextureFormat,
     pipeline: wgpu::RenderPipeline,
@@ -792,6 +821,8 @@ pub struct UiWgpuRenderer {
     view_bind_group: wgpu::BindGroup,
     instance_buffer: wgpu::Buffer,
     instance_capacity: usize,
+    depth_instance_buffer: wgpu::Buffer,
+    depth_instance_capacity: usize,
     popup_instance_buffer: wgpu::Buffer,
     popup_instance_capacity: usize,
     plan_revisions: HashMap<neon_ui_schema::UiFragmentId, neon_protocol::Revision>,
@@ -847,6 +878,7 @@ pub struct UiWgpuRenderer {
     data_grid_scroll_holds: HashMap<String, DataGridScrollHold>,
     data_grid_text_display_cache: HashMap<DataGridCellIdentity, CachedDataGridTextDisplay>,
     available_cameras: HashSet<(neon_world_bridge::CameraId, neon_world_bridge::CameraKind)>,
+    last_stage_timings: UiDrawStageTimings,
 }
 
 impl UiWgpuRenderer {
@@ -1317,6 +1349,8 @@ impl UiWgpuRenderer {
             view_bind_group,
             instance_buffer: create_instance_buffer(device, 1),
             instance_capacity: 1,
+            depth_instance_buffer: create_instance_buffer(device, 1),
+            depth_instance_capacity: 1,
             popup_instance_buffer: create_instance_buffer(device, 1),
             popup_instance_capacity: 1,
             plan_revisions: HashMap::new(),
@@ -1371,6 +1405,7 @@ impl UiWgpuRenderer {
             data_grid_scroll_holds: HashMap::new(),
             data_grid_text_display_cache: HashMap::new(),
             available_cameras: HashSet::new(),
+            last_stage_timings: UiDrawStageTimings::default(),
         }
     }
 
@@ -3616,7 +3651,16 @@ impl UiWgpuRenderer {
         viewport_physical_size: [u32; 2],
         viewport_logical_size: [f32; 2],
         time_seconds: f32,
+        mode: UiDrawMode,
     ) {
+        /// Whether a sampled visual belongs to the requested emission subset.
+        fn sampled_in_mode(visual: &UiVisual, mode: UiDrawMode) -> bool {
+            match mode {
+                UiDrawMode::All => true,
+                UiDrawMode::World => visual.world_depth.is_some(),
+                UiDrawMode::Screen => visual.world_depth.is_none(),
+            }
+        }
         self.ensure_builtin_font(device, queue);
         self.update_viewport(viewport_physical_size, viewport_logical_size);
         if self.view_buffer_viewport_revision != self.viewport_revision {
@@ -3630,9 +3674,14 @@ impl UiWgpuRenderer {
             );
             self.view_buffer_viewport_revision = self.viewport_revision;
         }
+        let stage = Instant::now();
         self.refresh_plan(fragments, viewport_logical_size);
+        let refresh_plan_ms = stage.elapsed().as_secs_f32() * 1000.0;
         self.instances.clear();
+        let stage = Instant::now();
         let top_layer = self.compose_sampled_visuals(time_seconds);
+        let compose_visuals_ms = stage.elapsed().as_secs_f32() * 1000.0;
+        let mut buffer_upload_ms = 0.0_f32;
         let plan_index = self
             .plan
             .iter()
@@ -3646,6 +3695,7 @@ impl UiWgpuRenderer {
             for index in 0..self.plan.len() {
                 if self.plan[index].instance_index.is_none()
                     || top_layer[index].is_some()
+                    || !sampled_in_mode(&self.sampled[index], mode)
                     || self.drag_offset_for_node(index, &plan_index).is_some() != dragged_layer
                 {
                     continue;
@@ -3660,11 +3710,18 @@ impl UiWgpuRenderer {
         // CPU first-press handling must be ready as soon as the visible frame is
         // drawn; asynchronous GPU hit readback is only supplemental.
         self.refresh_hit_bindings(fragments);
-        // Reuse the dropdown popup resource path for declarative top-level layers.
-        // Modal backdrops are inserted immediately before their own subtree.
-        let mut popup_instances = self.dropdown_popup_instances();
+        // Dropdown/modal/tooltip chrome is screen-UI presentation; the world
+        // target never carries it. World panels are only emitted through the
+        // ordinary instance loop above, so a World pass emits zero popups.
+        let mut popup_instances = if mode == UiDrawMode::World {
+            Vec::new()
+        } else {
+            self.dropdown_popup_instances()
+        };
         for index in 0..self.plan.len() {
-            if self.plan[index].target.scroll {
+            if self.plan[index].target.scroll
+                && sampled_in_mode(&self.sampled[index], mode)
+            {
                 popup_instances.extend(
                     self.scroll_chrome_instances(&self.sampled[index], &self.plan[index].id),
                 );
@@ -3675,6 +3732,10 @@ impl UiWgpuRenderer {
                 continue;
             };
             if self.plan[root].target.kind == UiNodeKind::Tooltip && !self.tooltip_hovered(root) {
+                continue;
+            }
+            if mode == UiDrawMode::World {
+                // Modal/dialog backdrops and popup chrome belong to screen UI.
                 continue;
             }
             if root == index
@@ -3699,7 +3760,9 @@ impl UiWgpuRenderer {
                     [0.0, 0.0, 0.0, 0.45],
                 ));
             }
-            if self.plan[index].instance_index.is_some() {
+            if self.plan[index].instance_index.is_some()
+                && sampled_in_mode(&self.sampled[index], mode)
+            {
                 popup_instances.push(self.instance(
                     &self.sampled[index],
                     &self.plan[index].id,
@@ -3717,6 +3780,10 @@ impl UiWgpuRenderer {
             self.instance_capacity = self.instances.len().next_power_of_two();
             self.instance_buffer = create_instance_buffer(device, self.instance_capacity);
         }
+        if self.instance_capacity > self.depth_instance_capacity {
+            self.depth_instance_capacity = self.instance_capacity;
+            self.depth_instance_buffer = create_instance_buffer(device, self.depth_instance_capacity);
+        }
         if popup_instances.len() > self.popup_instance_capacity {
             self.popup_instance_capacity = popup_instances.len().next_power_of_two();
             self.popup_instance_buffer =
@@ -3725,15 +3792,20 @@ impl UiWgpuRenderer {
         // The instance vector is rebuilt from the current plan on every draw.
         // Upload it as a complete snapshot so a composition update cannot draw
         // a newly sized DataGrid from stale buffer contents.
+        let stage = Instant::now();
         queue.write_buffer(
             &self.instance_buffer,
             0,
             bytemuck::cast_slice(&self.instances),
         );
+        buffer_upload_ms += stage.elapsed().as_secs_f32() * 1000.0;
         let images = self
             .sampled
             .iter()
             .filter_map(|visual| {
+                if !sampled_in_mode(visual, mode) {
+                    return None;
+                }
                 let asset = visual.image.as_ref()?;
                 let key = (asset.project_id.clone(), asset.asset_id, asset.revision.0);
                 self.resident_images.get(&key).map(|image| UiImageInstance {
@@ -3767,12 +3839,17 @@ impl UiWgpuRenderer {
                 self.image_capacity = images.len().next_power_of_two();
                 self.image_buffer = create_image_buffer(device, self.image_capacity);
             }
+            let stage = Instant::now();
             queue.write_buffer(&self.image_buffer, 0, bytemuck::cast_slice(&images));
+            buffer_upload_ms += stage.elapsed().as_secs_f32() * 1000.0;
         }
         let surfaces = self
             .sampled
             .iter()
             .filter_map(|visual| {
+                if !sampled_in_mode(visual, mode) {
+                    return None;
+                }
                 let surface = visual.surface.as_ref()?;
                 self.resident_render_surfaces
                     .contains_key(&surface.target_id)
@@ -3817,6 +3894,7 @@ impl UiWgpuRenderer {
                 })
             })
             .collect::<Vec<_>>();
+        let stage = Instant::now();
         let (texts, popup_texts) = self
             .resident_font
             .as_mut()
@@ -3827,6 +3905,9 @@ impl UiWgpuRenderer {
                     .enumerate()
                     .filter_map(|(index, visual)| {
                         if top_layer[index].is_some() {
+                            return None;
+                        }
+                        if !sampled_in_mode(visual, mode) {
                             return None;
                         }
                         let local_text = Some(&self.editing)
@@ -3870,27 +3951,34 @@ impl UiWgpuRenderer {
                     .flatten()
                     .collect::<Vec<_>>();
                 let mut texts = texts;
-                for (visual, text) in &list_box_texts {
-                    if let Some(instances) = layout_text(device, queue, font, visual, text, None) {
-                        texts.extend(instances);
+                if mode != UiDrawMode::World {
+                    for (visual, text) in &list_box_texts {
+                        if let Some(instances) = layout_text(device, queue, font, visual, text, None) {
+                            texts.extend(instances);
+                        }
+                    }
+                    for (visual, text) in &tab_texts {
+                        if let Some(instances) = layout_text(device, queue, font, visual, text, None) {
+                            texts.extend(instances);
+                        }
+                    }
+                    for (visual, text) in &drag_value_texts {
+                        if let Some(instances) = layout_text(device, queue, font, visual, text, None) {
+                            texts.extend(instances);
+                        }
                     }
                 }
-                for (visual, text) in &tab_texts {
-                    if let Some(instances) = layout_text(device, queue, font, visual, text, None) {
-                        texts.extend(instances);
-                    }
-                }
-                for (visual, text) in &drag_value_texts {
-                    if let Some(instances) = layout_text(device, queue, font, visual, text, None) {
-                        texts.extend(instances);
-                    }
-                }
-                let mut popup_texts = dropdown_texts
-                    .iter()
-                    .flat_map(|(visual, text)| {
-                        layout_text(device, queue, font, visual, text, None).unwrap_or_default()
-                    })
-                    .collect::<Vec<_>>();
+                let mut popup_texts = if mode == UiDrawMode::World {
+                    Vec::new()
+                } else {
+                    dropdown_texts
+                        .iter()
+                        .flat_map(|(visual, text)| {
+                            layout_text(device, queue, font, visual, text, None).unwrap_or_default()
+                        })
+                        .collect::<Vec<_>>()
+                };
+                if mode != UiDrawMode::World {
                 for (index, visual) in self.sampled.iter().enumerate() {
                     if top_layer[index].is_none() {
                         continue;
@@ -3925,6 +4013,7 @@ impl UiWgpuRenderer {
                 (texts, popup_texts)
             })
             .unwrap_or_default();
+        let text_layout_ms = stage.elapsed().as_secs_f32() * 1000.0;
         if texts.len() > self.text_capacity {
             self.text_capacity = texts.len().next_power_of_two();
             self.text_buffer = create_text_buffer(device, self.text_capacity);
@@ -3933,13 +4022,16 @@ impl UiWgpuRenderer {
             self.popup_text_capacity = popup_texts.len().next_power_of_two();
             self.popup_text_buffer = create_text_buffer(device, self.popup_text_capacity);
         }
+        let stage = Instant::now();
         if !texts.is_empty() {
             queue.write_buffer(&self.text_buffer, 0, bytemuck::cast_slice(&texts));
         }
+        buffer_upload_ms += stage.elapsed().as_secs_f32() * 1000.0;
         // Treat equal world depth as one paint group. Groups are emitted far
         // to near; within a group the panel batch is emitted before its text
         // batch, so text stays above its owning panel while a nearer panel
         // still covers a farther group's text.
+        let stage = Instant::now();
         let mut rect_groups: Vec<(u32, Vec<UiInstance>)> = Vec::new();
         for instance in &self.instances {
             let key = instance.paint_group_id;
@@ -3995,12 +4087,19 @@ impl UiWgpuRenderer {
                 .iter()
                 .filter(|node| node.paint_group_id == group_id)
                 .find_map(|node| node.target.world_depth)
-                .unwrap_or(0.0)
         };
         depth_keys.sort_by(|a, b| {
-            group_depth(*b)
-                .partial_cmp(&group_depth(*a))
-                .unwrap_or(std::cmp::Ordering::Equal)
+            match (group_depth(*a), group_depth(*b)) {
+                // World groups are painted far-to-near. Fixed screen UI is
+                // always painted after every world group, independently of
+                // its color-pass position.z value.
+                (Some(a), Some(b)) => b
+                    .partial_cmp(&a)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => std::cmp::Ordering::Equal,
+            }
         });
         depth_keys.dedup();
         let mut ordered_rects = Vec::new();
@@ -4027,7 +4126,26 @@ impl UiWgpuRenderer {
                 text_ranges.insert(key, (start, group.len() as u32));
             }
         }
+        let group_sort_ms = stage.elapsed().as_secs_f32() * 1000.0;
 
+        let stage = Instant::now();
+        // The sorted ranges are the actual upload payload. Keep this guard
+        // beside the write so later plan expansion cannot overrun a stale
+        // capacity calculated from the unsorted snapshot.
+        if ordered_rects.len() > self.instance_capacity {
+            self.instance_capacity = ordered_rects.len().next_power_of_two();
+            self.instance_buffer = create_instance_buffer(device, self.instance_capacity);
+            self.depth_instance_capacity = self.instance_capacity;
+            self.depth_instance_buffer = create_instance_buffer(device, self.depth_instance_capacity);
+        }
+        if ordered_images.len() > self.image_capacity {
+            self.image_capacity = ordered_images.len().next_power_of_two();
+            self.image_buffer = create_image_buffer(device, self.image_capacity);
+        }
+        if ordered_texts.len() > self.text_capacity {
+            self.text_capacity = ordered_texts.len().next_power_of_two();
+            self.text_buffer = create_text_buffer(device, self.text_capacity);
+        }
         queue.write_buffer(
             &self.instance_buffer,
             0,
@@ -4050,6 +4168,7 @@ impl UiWgpuRenderer {
         if !ordered_texts.is_empty() {
             queue.write_buffer(&self.text_buffer, 0, bytemuck::cast_slice(&ordered_texts));
         }
+        buffer_upload_ms += stage.elapsed().as_secs_f32() * 1000.0;
         for key in group_order {
             if let Some((start, count)) = rect_ranges.get(&key) {
                 pass.set_pipeline(&self.pipeline);
@@ -4083,9 +4202,9 @@ impl UiWgpuRenderer {
             }
         }
 
-        // Group draws use the shared instance buffer as a small upload scratch
-        // area. Restore the complete snapshot because draw_depth() follows
-        // this pass and needs the original instance indexing.
+        // Restore the complete color snapshot. External depth uses its own
+        // buffer, so its later upload cannot mutate color-pass instances.
+        let stage = Instant::now();
         queue.write_buffer(
             &self.instance_buffer,
             0,
@@ -4114,6 +4233,18 @@ impl UiWgpuRenderer {
             pass.set_vertex_buffer(0, self.popup_text_buffer.slice(..));
             pass.draw(0..6, 0..popup_texts.len() as u32);
         }
+        buffer_upload_ms += stage.elapsed().as_secs_f32() * 1000.0;
+        self.last_stage_timings = UiDrawStageTimings {
+            refresh_plan_ms,
+            compose_visuals_ms,
+            text_layout_ms,
+            group_sort_ms,
+            buffer_upload_ms,
+        };
+    }
+
+    pub(crate) fn last_stage_timings(&self) -> UiDrawStageTimings {
+        self.last_stage_timings
     }
 
     pub(crate) fn last_panel_instance_count(&self) -> usize {
@@ -4166,19 +4297,39 @@ impl UiWgpuRenderer {
                 .iter()
                 .filter(|node| node.paint_group_id == group_id)
                 .find_map(|node| node.target.world_depth)
-                .unwrap_or(0.0)
         };
+        // World groups are written first, screen groups last. Screen depth 0
+        // therefore overwrites a world depth at overlap and keeps screen UI on
+        // top without leaving the normalized [0, 1] range.
+        let group_depth_value = |group_id: u32| group_depth(group_id).unwrap_or(0.0);
         group_ids.sort_by(|a, b| {
-            group_depth(*b)
-                .partial_cmp(&group_depth(*a))
-                .unwrap_or(std::cmp::Ordering::Equal)
+            match (group_depth(*a), group_depth(*b)) {
+                (Some(a), Some(b)) => b
+                    .partial_cmp(&a)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => std::cmp::Ordering::Equal,
+            }
         });
         for group_id in group_ids {
             if let Some(group) = groups.get(&group_id) {
-                queue.write_buffer(&self.instance_buffer, 0, bytemuck::cast_slice(group));
+                let external_depth = group_depth_value(group_id).max(EXTERNAL_WORLD_DEPTH_MIN);
+                let depth_instances = group
+                    .iter()
+                    .map(|instance| UiInstance {
+                        depth: external_depth,
+                        ..*instance
+                    })
+                    .collect::<Vec<_>>();
+                queue.write_buffer(
+                    &self.depth_instance_buffer,
+                    0,
+                    bytemuck::cast_slice(&depth_instances),
+                );
                 pass.set_pipeline(rect_pipeline);
                 pass.set_bind_group(0, &self.view_bind_group, &[]);
-                pass.set_vertex_buffer(0, self.instance_buffer.slice(..));
+                pass.set_vertex_buffer(0, self.depth_instance_buffer.slice(..));
                 pass.draw(0..6, 0..group.len() as u32);
             }
         }
@@ -4456,7 +4607,9 @@ impl UiWgpuRenderer {
                     })
                 })
             });
-            if (!is_interactive_control(&kind) && !has_drag_binding)
+            if (!is_interactive_control(&kind)
+                && !has_drag_binding
+                && !declarations.contains_key(&node_path))
                 || !enabled
                 || opacity <= 0.0
                 || (is_data_grid_cell_path(&node_path) && !declarations.contains_key(&node_path))
@@ -7619,6 +7772,7 @@ mod tests {
             scroll: false,
             declared_scroll_offset: [0.0; 2],
             world_depth: None,
+            paint_group_id: 0,
         };
         let target_a = UiVisual {
             bounds: UiBounds {
@@ -7646,6 +7800,7 @@ mod tests {
                 target: source.clone(),
                 transition: None,
                 instance_index: None,
+                paint_group_id: 0,
             },
             PlannedNode {
                 id: "fixture/target-a".into(),
@@ -7653,6 +7808,7 @@ mod tests {
                 target: target_a.clone(),
                 transition: None,
                 instance_index: None,
+                paint_group_id: 0,
             },
             PlannedNode {
                 id: "fixture/target-b".into(),
@@ -7660,6 +7816,7 @@ mod tests {
                 target: target_b.clone(),
                 transition: None,
                 instance_index: None,
+                paint_group_id: 0,
             },
         ];
         renderer.sampled = vec![source, target_a, target_b];
@@ -7845,6 +8002,7 @@ mod tests {
             scroll: false,
             declared_scroll_offset: [0.0; 2],
             world_depth: None,
+            paint_group_id: 0,
         };
         let node_path = "grid/assets/data-grid-row-asset-42/cell-name".to_owned();
         let mut renderer = UiWgpuRenderer::new(&device, wgpu::TextureFormat::Rgba8Unorm);
@@ -7854,6 +8012,7 @@ mod tests {
             target: visual.clone(),
             transition: None,
             instance_index: None,
+            paint_group_id: 0,
         });
         visual.bounds = visible;
         renderer.sampled.push(visual);
@@ -7930,9 +8089,11 @@ mod tests {
                 scroll: false,
                 declared_scroll_offset: [0.0; 2],
                 world_depth: None,
+                paint_group_id: 0,
             },
             transition: None,
             instance_index: None,
+            paint_group_id: 0,
         });
         renderer.hit_bindings.insert(
             1,
@@ -8014,9 +8175,11 @@ mod tests {
                 scroll: false,
                 declared_scroll_offset: [0.0; 2],
                 world_depth: None,
+                paint_group_id: 0,
             },
             transition: None,
             instance_index: None,
+            paint_group_id: 0,
         });
         renderer.hit_bindings.insert(
             1,
@@ -8187,9 +8350,11 @@ mod tests {
                 scroll: false,
                 declared_scroll_offset: [0.0; 2],
                 world_depth: None,
+                paint_group_id: 0,
             },
             transition: None,
             instance_index: None,
+            paint_group_id: 0,
         });
         renderer.hit_bindings.insert(
             1,
@@ -8264,6 +8429,7 @@ mod tests {
             scroll: false,
             declared_scroll_offset: [0.0; 2],
             world_depth: None,
+            paint_group_id: 0,
         };
         let mut renderer = UiWgpuRenderer::new(&device, wgpu::TextureFormat::Rgba8Unorm);
         renderer.plan.push(PlannedNode {
@@ -8272,6 +8438,7 @@ mod tests {
             target: visual.clone(),
             transition: None,
             instance_index: None,
+            paint_group_id: 0,
         });
         renderer.sampled.push(visual);
         renderer.hit_bindings.insert(
@@ -8362,6 +8529,7 @@ mod tests {
             scroll: false,
             declared_scroll_offset: [0.0; 2],
             world_depth: None,
+            paint_group_id: 0,
         };
         renderer.plan.push(PlannedNode {
             id: "gallery/slider".into(),
@@ -8369,6 +8537,7 @@ mod tests {
             target: visual,
             transition: None,
             instance_index: None,
+            paint_group_id: 0,
         });
         renderer.hit_bindings.insert(
             1,
@@ -8423,6 +8592,7 @@ mod tests {
             scroll: true,
             declared_scroll_offset: [0.0; 2],
             world_depth: None,
+            paint_group_id: 0,
         };
         let child = UiVisual {
             bounds: UiBounds {
@@ -8441,6 +8611,7 @@ mod tests {
                 target: scroll,
                 transition: None,
                 instance_index: None,
+                paint_group_id: 0,
             },
             PlannedNode {
                 id: "f/content".into(),
@@ -8448,6 +8619,7 @@ mod tests {
                 target: child,
                 transition: None,
                 instance_index: None,
+                paint_group_id: 0,
             },
         ];
         renderer.update_scroll_metrics();
@@ -8497,6 +8669,8 @@ mod tests {
             presentation: None,
             scroll: true,
             declared_scroll_offset: [20.0, 30.0],
+            world_depth: None,
+            paint_group_id: 0,
         };
         let child = UiVisual {
             bounds: UiBounds {
@@ -8515,6 +8689,7 @@ mod tests {
                 target: scroll,
                 transition: None,
                 instance_index: None,
+                paint_group_id: 0,
             },
             PlannedNode {
                 id: "f/content".into(),
@@ -8522,6 +8697,7 @@ mod tests {
                 target: child,
                 transition: None,
                 instance_index: None,
+                paint_group_id: 0,
             },
         ];
         renderer.update_scroll_metrics();
@@ -8675,6 +8851,7 @@ mod tests {
                 style: UiStyle::default(),
                 enter_transition: None,
                 children: Vec::new(),
+                world_depth: None,
             })
             .collect();
         root.children.push(UiNode {
@@ -8843,6 +9020,7 @@ mod tests {
                 },
                 enter_transition: None,
                 children: Vec::new(),
+                world_depth: None,
             };
             let fragment = UiFragment {
                 fragment_id: UiFragmentId("f".into()),
@@ -10112,6 +10290,7 @@ mod tests {
                 },
             }),
             children: Vec::new(),
+            world_depth: None,
         }
     }
 
@@ -10616,7 +10795,6 @@ mod tests {
             style: UiStyle::default(),
             enter_transition: None,
             world_depth: None,
-            world_depth: None,
             children: Vec::new(),
         });
         let fragments = HashMap::from([(
@@ -10687,6 +10865,7 @@ mod tests {
                 style: UiStyle::default(),
                 enter_transition: None,
                 children: Vec::new(),
+                world_depth: None,
             });
         }
         let fragments = HashMap::from([(
@@ -10846,7 +11025,6 @@ mod tests {
                 ..UiStyle::default()
             },
             enter_transition: None,
-            world_depth: None,
             world_depth: None,
             children: Vec::new(),
         };
@@ -12328,6 +12506,7 @@ mod tests {
             },
             enter_transition: None,
             children: Vec::new(),
+            world_depth: None,
         };
         let fragment = UiFragment {
             fragment_id: UiFragmentId("bundled-cjk-text".into()),
@@ -12385,6 +12564,7 @@ mod tests {
             },
             enter_transition: None,
             children: Vec::new(),
+            world_depth: None,
         };
         let root = UiNode {
             node_id: UiNodeId("clip-root".into()),
@@ -12414,6 +12594,7 @@ mod tests {
             },
             enter_transition: None,
             children: vec![label],
+            world_depth: None,
         };
         let pixels = render_offscreen_for_test(
             &device,
@@ -12489,6 +12670,7 @@ mod tests {
                 style: UiStyle::default(),
                 enter_transition: None,
                 children: Vec::new(),
+                world_depth: None,
             },
             UiNode {
                 node_id: UiNodeId("second".into()),
@@ -12509,6 +12691,7 @@ mod tests {
                 style: UiStyle::default(),
                 enter_transition: None,
                 children: Vec::new(),
+                world_depth: None,
             },
         ];
         let fragments = HashMap::from([(
@@ -12551,6 +12734,7 @@ mod tests {
             scroll: false,
             declared_scroll_offset: [0.0; 2],
             world_depth: None,
+            paint_group_id: 0,
         };
         let transition = node().enter_transition.unwrap();
         let active = ActiveTransition {
@@ -12592,6 +12776,7 @@ mod tests {
             scroll: false,
             declared_scroll_offset: [0.0; 2],
             world_depth: None,
+            paint_group_id: 0,
         };
         let target = UiVisual {
             bounds: UiBounds {
@@ -12616,6 +12801,8 @@ mod tests {
             presentation: None,
             scroll: false,
             declared_scroll_offset: [0.0; 2],
+            world_depth: None,
+            paint_group_id: 0,
         };
         let active = ActiveTransition {
             from: original,
@@ -12661,6 +12848,8 @@ mod tests {
             presentation: None,
             scroll: false,
             declared_scroll_offset: [0.0; 2],
+            world_depth: None,
+            paint_group_id: 0,
         };
         UiWgpuRenderer::sample(
             &mut renderer.current,

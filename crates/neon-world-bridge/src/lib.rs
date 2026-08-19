@@ -154,6 +154,27 @@ pub enum WorldBridgeError {
     StaleWorldAnchor,
 }
 
+/// One latest-value anchor snapshot from a host frame.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorldUiAnchorBatch {
+    pub world_space_id: WorldSpaceId,
+    pub producer_epoch: u64,
+    pub sequence: u64,
+    pub timestamp_monotonic_ns: u64,
+    pub anchors: Vec<WorldUiAnchorSample>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorldUiAnchorSample {
+    pub anchor_id: WorldAnchorId,
+    pub position: [f64; 3],
+    pub billboard: bool,
+    #[serde(default = "default_anchor_occlusion")]
+    pub occlusion: String,
+}
+
 /// Latest-value input from an optional camera-control provider. Transport
 /// adapters (including UDP) must validate this contract before WGPU consumes it.
 /// It contains semantic camera axes only: no UI node, pointer position, endpoint,
@@ -323,6 +344,40 @@ impl WorldInformationBridge {
             return Err(WorldBridgeError::StaleWorldAnchor);
         }
         self.anchors.insert(anchor.anchor_id.clone(), anchor);
+        Ok(())
+    }
+
+    /// Applies one host frame atomically at the contract boundary. Individual
+    /// anchors retain their stable identities while the frame sequence provides
+    /// one latest-value ordering point for backpressure and diagnostics.
+    pub fn submit_anchor_batch(&mut self, batch: WorldUiAnchorBatch) -> Result<(), WorldBridgeError> {
+        let Some(world) = self.world.as_ref() else {
+            return Err(WorldBridgeError::WorldSpaceMismatch);
+        };
+        if batch.world_space_id != world.world_space_id
+            || batch.sequence == 0
+            || batch.timestamp_monotonic_ns == 0
+            || batch.anchors.iter().any(|anchor| {
+                anchor.anchor_id.0.trim().is_empty()
+                    || !anchor.position.iter().all(|value| value.is_finite())
+            })
+        {
+            return Err(WorldBridgeError::InvalidWorldAnchor);
+        }
+        let mut candidate = self.clone();
+        for sample in batch.anchors {
+            candidate.submit_anchor(WorldUiAnchor {
+                anchor_id: sample.anchor_id,
+                world_space_id: batch.world_space_id.clone(),
+                producer_epoch: batch.producer_epoch,
+                sequence: batch.sequence,
+                timestamp_monotonic_ns: batch.timestamp_monotonic_ns,
+                position: sample.position,
+                billboard: sample.billboard,
+                occlusion: sample.occlusion,
+            })?;
+        }
+        *self = candidate;
         Ok(())
     }
 
@@ -521,5 +576,36 @@ mod tests {
             }),
             Err(WorldBridgeError::InvalidWorldAnchor)
         );
+    }
+
+    #[test]
+    fn anchor_batch_is_applied_as_one_latest_value_frame() {
+        let mut bridge = WorldInformationBridge::new();
+        bridge.configure_world(world()).unwrap();
+        bridge
+            .submit_anchor_batch(WorldUiAnchorBatch {
+                world_space_id: WorldSpaceId("project.world.main".into()),
+                producer_epoch: 4,
+                sequence: 2,
+                timestamp_monotonic_ns: 20,
+                anchors: vec![
+                    WorldUiAnchorSample {
+                        anchor_id: WorldAnchorId("monster.m0".into()),
+                        position: [1.0, 2.0, 3.0],
+                        billboard: true,
+                        occlusion: "depth_tested".into(),
+                    },
+                    WorldUiAnchorSample {
+                        anchor_id: WorldAnchorId("monster.m1".into()),
+                        position: [4.0, 5.0, 6.0],
+                        billboard: false,
+                        occlusion: "always_visible".into(),
+                    },
+                ],
+            })
+            .unwrap();
+        assert_eq!(bridge.anchors().len(), 2);
+        assert_eq!(bridge.anchor(&WorldAnchorId("monster.m0".into())).unwrap().producer_epoch, 4);
+        assert_eq!(bridge.anchor(&WorldAnchorId("monster.m1".into())).unwrap().sequence, 2);
     }
 }

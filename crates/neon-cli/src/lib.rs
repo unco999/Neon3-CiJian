@@ -635,6 +635,7 @@ pub fn detail_fragment(revision: Revision, detail_visible: bool) -> UiFragment {
             surface: None,
             style: UiStyle::default(),
             enter_transition: None,
+            world_depth: None,
             children: vec![
                 UiNode {
                     node_id: UiNodeId("title".into()),
@@ -656,6 +657,7 @@ pub fn detail_fragment(revision: Revision, detail_visible: bool) -> UiFragment {
                     surface: None,
                     style: UiStyle::default(),
                     enter_transition: None,
+                    world_depth: None,
                     children: Vec::new(),
                 },
                 UiNode {
@@ -678,6 +680,7 @@ pub fn detail_fragment(revision: Revision, detail_visible: bool) -> UiFragment {
                     surface: None,
                     style: UiStyle::default(),
                     enter_transition: None,
+                    world_depth: None,
                     children: Vec::new(),
                 },
                 UiNode {
@@ -700,6 +703,7 @@ pub fn detail_fragment(revision: Revision, detail_visible: bool) -> UiFragment {
                     surface: None,
                     style: UiStyle::default(),
                     enter_transition: None,
+                    world_depth: None,
                     children: Vec::new(),
                 },
             ],
@@ -735,6 +739,7 @@ pub fn static_fragment(revision: Revision) -> UiFragment {
             surface: None,
             style: UiStyle::default(),
             enter_transition: None,
+            world_depth: None,
             children: Vec::new(),
         },
         effects: vec![UiEffect::SemanticAction {

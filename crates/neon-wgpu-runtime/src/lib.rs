@@ -32,12 +32,12 @@ use neon_protocol::{
 use neon_ui_schema::UiFragmentSubmission;
 use neon_ui_schema::{
     TextRef, UiBounds, UiCommand, UiDataGridWindowRequest, UiFragment, UiFragmentId, UiHostInbound,
-    UiNode, UiNodeId, UiNodeKind, UiSemanticEvent, UiStyle, UiTransition, UiTransitionState,
-    UiWindowRequest,
+    UiNode, UiNodeId, UiNodeKind, UiPointerEvent, UiPointerEventType, UiSemanticEvent, UiStyle,
+    UiSemanticEventType, UiTransition, UiTransitionState, UiWindowRequest,
 };
 use neon_world_bridge::{
     CameraControlSample, CameraFrame, CameraFramePayload, CameraId, WorldInformationBridge,
-    WorldInformationSnapshot, WorldUiAnchor,
+    WorldInformationSnapshot, WorldUiAnchor, WorldUiAnchorBatch,
 };
 use serde_json::{Value, json};
 use winit::{
@@ -1006,6 +1006,10 @@ enum WindowCommand {
         surface_id: String,
         completed: std::sync::mpsc::Sender<Result<Value, String>>,
     },
+    ExternalPointerEvent {
+        event: UiPointerEvent,
+        completed: std::sync::mpsc::Sender<Result<Value, String>>,
+    },
     Shutdown,
 }
 
@@ -1100,6 +1104,102 @@ impl WindowedRuntime {
                 gpu.logical_viewport_size(),
                 gpu.started_at.elapsed().as_secs_f32(),
             );
+        }
+    }
+
+    fn external_pointer_event(&mut self, event: UiPointerEvent) -> Result<Value, String> {
+        let Some(gpu) = self.gpu.as_mut() else {
+            return Err("window_gpu_unavailable".into());
+        };
+        if event.generation != gpu.hit_target_generation {
+            return Err("ui_pointer_generation_stale".into());
+        }
+        let pointer = event.pixel;
+        gpu.ui.set_pointer_position(pointer);
+        gpu.ui.prepare_interaction(
+            &self.fragments,
+            gpu.physical_viewport_size(),
+            gpu.logical_viewport_size(),
+            gpu.started_at.elapsed().as_secs_f32(),
+        );
+        match event.event_type {
+            UiPointerEventType::Enter | UiPointerEventType::Move => {
+                gpu.input.set_hover_id(gpu.ui.hit_id_at_pointer());
+                gpu.pending_hit_pixel = Some([
+                    pointer[0].max(0.0).min(gpu.config.width.saturating_sub(1) as f32) as u32,
+                    pointer[1].max(0.0).min(gpu.config.height.saturating_sub(1) as f32) as u32,
+                ]);
+                self.redraw_pending = true;
+                Ok(json!({"state": "observed"}))
+            }
+            UiPointerEventType::Down => {
+                if !matches!(event.button, Some(neon_ui_schema::UiPointerButton::Primary)) {
+                    return Err("ui_pointer_button_unsupported".into());
+                }
+                gpu.input.set_hover_id(gpu.ui.hit_id_at_pointer());
+                gpu.input
+                    .pointer_down()
+                    .map_err(|_| "press_without_semantic_hit".to_owned())?;
+                gpu.captured_binding = gpu
+                    .input
+                    .capture_id
+                    .and_then(|hit_id| gpu.ui.hit_binding(hit_id));
+                if gpu.captured_binding.is_none() {
+                    let _ = gpu.input.pointer_up(false);
+                    return Err("press_without_semantic_binding".into());
+                }
+                if let Some(binding) = gpu.captured_binding.clone() {
+                    gpu.ui.press_hovered(gpu.started_at.elapsed().as_secs_f32());
+                    gpu.pending_control_value = binding.control_value.clone();
+                }
+                self.redraw_pending = true;
+                Ok(json!({"state": "captured"}))
+            }
+            UiPointerEventType::Up => {
+                let Some(released) = release_captured_binding(gpu) else {
+                    return Ok(json!({"state": "released"}));
+                };
+                let Some(intent) = released.binding.intent.clone() else {
+                    return Ok(json!({"state": "released"}));
+                };
+                let semantic_event = UiSemanticEvent {
+                    event: UiSemanticEventType::PointerClick,
+                    event_id: format!("wgpu-pointer-click-{}", released.sequence),
+                    renderer_epoch: self.epoch,
+                    composition_revision: self.applied_composition_revision,
+                    fragment: released.binding.fragment,
+                    intent,
+                    pointer: Some(neon_ui_schema::UiPointerMetadata {
+                        id: event.pointer_id,
+                        sequence: released.sequence,
+                    }),
+                    focus: None,
+                    data_grid_cell: released.binding.data_grid_cell,
+                    text: None,
+                    control_value: released.control_value,
+                    drag_drop: None,
+                };
+                self.redraw_pending = true;
+                Ok(json!({"semantic_event": semantic_event}))
+            }
+            UiPointerEventType::Wheel => {
+                let delta = match event.delta_mode {
+                    neon_ui_schema::UiPointerDeltaMode::Line => {
+                        [event.delta[0] * 24.0, event.delta[1] * 24.0]
+                    }
+                    _ => event.delta,
+                };
+                if gpu.ui.scroll_wheel_at_pointer(delta) {
+                    self.redraw_pending = true;
+                }
+                Ok(json!({"state": "scrolled"}))
+            }
+            UiPointerEventType::Leave | UiPointerEventType::Cancel => {
+                gpu.captured_binding = None;
+                gpu.pending_control_value = None;
+                gpu.input.cancel();
+                Ok(json!({"state": "cancelled"}))
+            }
         }
     }
 
@@ -2208,18 +2308,45 @@ impl WindowedRuntime {
 }
 
 #[cfg(windows)]
+#[derive(Default, Clone)]
+struct ExternalFrameTiming {
+    frame_sequence: u64,
+    snapshot_ms: f32,
+    invalidate_plan_ms: f32,
+    refresh_plan_ms: f32,
+    compose_visuals_ms: f32,
+    text_layout_ms: f32,
+    group_sort_ms: f32,
+    buffer_upload_ms: f32,
+    color_pass_ms: f32,
+    external_depth_pass_ms: f32,
+    hit_pass_ms: f32,
+    dropped: bool,
+    skipped_static: bool,
+    skipped_throttled: bool,
+}
+
+#[cfg(windows)]
 struct HeadlessExternalGpu {
     device: wgpu::Device,
     queue: wgpu::Queue,
     adapter: wgpu::Adapter,
     ui: UiWgpuRenderer,
+    input: LocalInputState,
+    captured_binding: Option<UiHitBinding>,
+    pending_control_value: Option<neon_ui_schema::UiSemanticPayloadValue>,
+    next_semantic_sequence: u64,
     external_surfaces: HashMap<String, Vec<dx12_interop::SharedSurface>>,
     external_id_surfaces: HashMap<String, Vec<dx12_interop::SharedSurface>>,
     external_depth_surfaces: HashMap<String, Vec<dx12_interop::SharedSurface>>,
+    surface_kinds: HashMap<String, RenderSurfaceKind>,
     color_depth_targets: HashMap<String, Vec<wgpu::Texture>>,
     external_handle_tokens: HashMap<String, (String, String)>,
     next_external_frame_sequence: u64,
     last_external_render_at: Option<Instant>,
+    last_rendered_fragments: Option<HashMap<RenderSurfaceKind, HashMap<UiFragmentId, UiFragment>>>,
+    last_rendered_all_surfaces: bool,
+    frame_timings: VecDeque<ExternalFrameTiming>,
 }
 
 #[cfg(windows)]
@@ -2251,17 +2378,119 @@ impl HeadlessExternalGpu {
                 wgpu::TextureFormat::Rgba8Unorm,
                 wgpu::TextureFormat::R32Float,
             ),
+            input: LocalInputState::default(),
+            captured_binding: None,
+            pending_control_value: None,
+            next_semantic_sequence: 0,
             device,
             queue,
             adapter,
             external_surfaces: HashMap::new(),
             external_id_surfaces: HashMap::new(),
             external_depth_surfaces: HashMap::new(),
+            surface_kinds: HashMap::new(),
             color_depth_targets: HashMap::new(),
             external_handle_tokens: HashMap::new(),
             next_external_frame_sequence: 0,
             last_external_render_at: None,
+            last_rendered_fragments: None,
+            last_rendered_all_surfaces: false,
+            frame_timings: VecDeque::new(),
         })
+    }
+
+    fn pointer_event(
+        &mut self,
+        event: UiPointerEvent,
+        fragments: &HashMap<UiFragmentId, UiFragment>,
+    ) -> Result<Value, String> {
+        if event.generation != 1 {
+            return Err("ui_pointer_generation_stale".into());
+        }
+        self.ui.set_pointer_position(event.pixel);
+        self.ui.prepare_interaction(fragments, [1280, 720], [1280.0, 720.0], 0.0);
+        if matches!(&event.event_type, UiPointerEventType::Down | UiPointerEventType::Up) {
+            eprintln!(
+                "[neon-wgpu-runtime] external pointer {:?} sequence={} hover={:?} capture={:?}",
+                event.event_type,
+                event.sequence,
+                self.ui.hit_id_at_pointer(),
+                self.input.capture_id,
+            );
+        }
+        match event.event_type {
+            UiPointerEventType::Enter | UiPointerEventType::Move => {
+                self.input.set_hover_id(self.ui.hit_id_at_pointer());
+                Ok(json!({"state": "observed"}))
+            }
+            UiPointerEventType::Down => {
+                if !matches!(event.button, Some(neon_ui_schema::UiPointerButton::Primary)) {
+                    return Err("ui_pointer_button_unsupported".into());
+                }
+                self.input.set_hover_id(self.ui.hit_id_at_pointer());
+                self.input
+                    .pointer_down()
+                    .map_err(|_| "press_without_semantic_hit".to_owned())?;
+                self.captured_binding = self
+                    .input
+                    .capture_id
+                    .and_then(|hit_id| self.ui.hit_binding(hit_id));
+                if self.captured_binding.is_none() {
+                    let _ = self.input.pointer_up(false);
+                    return Err("press_without_semantic_binding".into());
+                }
+                if let Some(binding) = self.captured_binding.clone() {
+                    self.pending_control_value = binding.control_value.clone();
+                    self.ui.press_hovered(0.0);
+                }
+                Ok(json!({"state": "captured"}))
+            }
+            UiPointerEventType::Up => {
+                let capture_id = self.input.capture_id;
+                let binding = self.captured_binding.take().or_else(|| {
+                    capture_id.and_then(|hit_id| self.ui.hit_binding(hit_id))
+                });
+                let control_value = self.pending_control_value.take();
+                if self.input.pointer_up(binding.is_some() || capture_id.is_some()).is_err() {
+                    return Err("pointer_release_rejected".into());
+                }
+                let Some(binding) = binding else {
+                    return Ok(json!({"state": "released"}));
+                };
+                let Some(intent) = binding.intent else {
+                    return Ok(json!({"state": "released"}));
+                };
+                self.next_semantic_sequence = self.next_semantic_sequence.saturating_add(1);
+                Ok(json!({"semantic_event": UiSemanticEvent {
+                    event: UiSemanticEventType::PointerClick,
+                    event_id: format!("wgpu-pointer-click-{}", self.next_semantic_sequence),
+                    renderer_epoch: 1,
+                    composition_revision: binding.fragment.revision,
+                    fragment: binding.fragment,
+                    intent,
+                    pointer: Some(neon_ui_schema::UiPointerMetadata { id: event.pointer_id, sequence: self.next_semantic_sequence }),
+                    focus: None,
+                    data_grid_cell: binding.data_grid_cell,
+                    text: None,
+                    control_value: control_value.or(binding.control_value),
+                    drag_drop: None,
+                }}))
+            }
+            UiPointerEventType::Wheel => {
+                let delta = match event.delta_mode {
+                    neon_ui_schema::UiPointerDeltaMode::Line => [event.delta[0] * 24.0, event.delta[1] * 24.0],
+                    _ => event.delta,
+                };
+                self.ui.scroll_wheel_at_pointer(delta);
+                Ok(json!({"state": "scrolled"}))
+            }
+            UiPointerEventType::Leave | UiPointerEventType::Cancel => {
+                self.captured_binding = None;
+                self.pending_control_value = None;
+                self.input.cancel();
+                Ok(json!({"state": "cancelled"}))
+            }
+        }
     }
 
     fn open(&mut self, open: RenderSurfaceOpen) -> Result<Value, String> {
@@ -2285,6 +2514,9 @@ impl HeadlessExternalGpu {
             );
         }
         self.external_surfaces.insert(open.surface_id.clone(), surfaces);
+        self.surface_kinds.insert(open.surface_id.clone(), open.kind);
+        self.last_rendered_all_surfaces = false;
+        self.last_rendered_fragments = None;
         let color_depth_targets = (0..open.buffer_count)
             .map(|_| create_color_depth_target(&self.device, open.size.width, open.size.height))
             .collect::<Vec<_>>();
@@ -2331,6 +2563,7 @@ impl HeadlessExternalGpu {
         Ok(json!({
             "surface_id": open.surface_id,
             "generation": generation,
+            "producer_epoch": 1,
             "buffer_count": open.buffer_count,
             "transport": "d3d12_shared_texture_v1",
             "texture_token": texture_token,
@@ -2397,8 +2630,24 @@ impl HeadlessExternalGpu {
         Ok(result)
     }
 
-    fn render(&mut self, fragments: &HashMap<UiFragmentId, UiFragment>) -> Result<(), String> {
+    fn render(&mut self, snapshots: &HashMap<RenderSurfaceKind, HashMap<UiFragmentId, UiFragment>>, snapshot_ms: f32) -> Result<(), String> {
         if self.external_surfaces.is_empty() {
+            return Ok(());
+        }
+        let mut timing = ExternalFrameTiming::default();
+        timing.snapshot_ms = snapshot_ms;
+        // A static resolved snapshot does not need another layout, text upload,
+        // color pass, depth pass, or ID pass. The consumer keeps sampling the
+        // last complete buffer from the ring.
+        if self.last_rendered_all_surfaces
+            && self
+                .last_rendered_fragments
+                .as_ref()
+                .is_some_and(|previous| previous == snapshots)
+        {
+            timing.skipped_static = true;
+            timing.frame_sequence = self.next_external_frame_sequence;
+            self.push_frame_timing(timing);
             return Ok(());
         }
         // Keep the external UI responsive to camera and anchor motion. The
@@ -2407,17 +2656,52 @@ impl HeadlessExternalGpu {
             .last_external_render_at
             .is_some_and(|last| last.elapsed() < Duration::from_millis(16))
         {
+            timing.skipped_throttled = true;
+            timing.frame_sequence = self.next_external_frame_sequence;
+            self.push_frame_timing(timing);
             return Ok(());
         }
         self.last_external_render_at = Some(Instant::now());
         // The filtered snapshot contains live world-panel bounds derived from
         // the latest camera and anchor, not a new UI program revision.
+        let stage = Instant::now();
         self.ui.invalidate_plan();
+        timing.invalidate_plan_ms = stage.elapsed().as_secs_f32() * 1000.0;
         self.next_external_frame_sequence = self.next_external_frame_sequence.saturating_add(1);
         let frame_sequence = self.next_external_frame_sequence;
+        timing.frame_sequence = frame_sequence;
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("neon3-headless-external-ui"),
         });
+        // A combined Flow is published as one atomic frame. Every external
+        // target must use the same ring slot, otherwise screen and world UI can
+        // visibly come from different camera/layout revisions.
+        let write_index = self.external_surfaces.values().next().and_then(|ring| {
+            ring.iter().enumerate().find_map(|(index, _shared)| {
+                let color_free = self.external_surfaces.values().all(|ring| {
+                    ring.get(index).is_some_and(|color| unsafe {
+                        color.consumer_fence.GetCompletedValue() >= color.frame_sequence
+                    })
+                });
+                let depth_free = self.external_depth_surfaces.values().all(|ring| {
+                    ring.get(index).is_none_or(|depth| unsafe {
+                        depth.consumer_fence.GetCompletedValue() >= depth.frame_sequence
+                    })
+                });
+                let id_free = self.external_id_surfaces.values().all(|ring| {
+                    ring.get(index).is_none_or(|id| unsafe {
+                        id.consumer_fence.GetCompletedValue() >= id.frame_sequence
+                    })
+                });
+                (color_free && depth_free && id_free).then_some(index)
+            })
+        });
+        let Some(write_index) = write_index else {
+            timing.dropped = true;
+            self.push_frame_timing(timing);
+            return Ok(());
+        };
+        let mut rendered_all_surfaces = true;
         for (surface_id, shared_ring) in self.external_surfaces.iter_mut() {
             // Acquire a buffer the consumer has actually released. The consumer
             // signals its per-buffer release fence once it has finished sampling
@@ -2430,33 +2714,11 @@ impl HeadlessExternalGpu {
             // (the producer blocks on buffer 0's release while the consumer
             // keeps releasing only buffer 2). Dropping the frame keeps the
             // overlay alive and simply shows the last completed frame.
-            let Some(write_index) = shared_ring
-                .iter()
-                .enumerate()
-                .find_map(|(index, shared)| {
-                    let color_free = unsafe { shared.consumer_fence.GetCompletedValue() } >= shared.frame_sequence;
-                    let depth_free = self
-                        .external_depth_surfaces
-                        .get(surface_id)
-                        .and_then(|ring| ring.get(index))
-                        .is_none_or(|depth| unsafe {
-                            depth.consumer_fence.GetCompletedValue() >= depth.frame_sequence
-                        });
-                    let id_free = self
-                        .external_id_surfaces
-                        .get(surface_id)
-                        .and_then(|ring| ring.get(index))
-                        .is_none_or(|id| unsafe {
-                            id.consumer_fence.GetCompletedValue() >= id.frame_sequence
-                        });
-                    (color_free && depth_free && id_free).then_some(index)
-                })
-            else {
-                eprintln!(
-                    "[neon-wgpu-runtime] shared UI drop frame={frame_sequence} (no free buffer)"
-                );
+            if shared_ring.get(write_index).is_none() {
+                rendered_all_surfaces = false;
+                timing.dropped = true;
                 continue;
-            };
+            }
             let shared = &mut shared_ring[write_index];
             let hal_queue = unsafe { self.queue.as_hal::<wgpu::hal::api::Dx12>() }
                 .ok_or("dx12_queue_unavailable")?;
@@ -2488,7 +2750,11 @@ impl HeadlessExternalGpu {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
+            let stage = Instant::now();
+            let kind = self.surface_kinds.get(surface_id).copied().unwrap_or(RenderSurfaceKind::ScreenUi);
+            let fragments = snapshots.get(&kind).unwrap_or_else(|| snapshots.values().next().expect("surface snapshot"));
             self.ui.draw(&self.device, &self.queue, &mut pass, fragments, [shared.width, shared.height], [shared.width as f32, shared.height as f32], 0.0);
+            timing.color_pass_ms += stage.elapsed().as_secs_f32() * 1000.0;
             drop(pass);
             // Occlusion depth pass: re-emit the same instances into the matched
             // R32Float ring buffer so the consumer can depth-test the overlay
@@ -2513,7 +2779,9 @@ impl HeadlessExternalGpu {
                     occlusion_query_set: None,
                     multiview_mask: None,
                 });
+                let stage = Instant::now();
                 self.ui.draw_depth(&self.queue, &mut depth_pass);
+                timing.external_depth_pass_ms += stage.elapsed().as_secs_f32() * 1000.0;
                 drop(depth_pass);
                 depth_shared.frame_sequence = frame_sequence;
                 hal_queue.add_signal_fence(depth_shared.fence.clone(), frame_sequence);
@@ -2541,6 +2809,7 @@ impl HeadlessExternalGpu {
                     occlusion_query_set: None,
                     multiview_mask: None,
                 });
+                let stage = Instant::now();
                 self.ui.draw_hit_id(
                     &self.device,
                     &self.queue,
@@ -2550,6 +2819,7 @@ impl HeadlessExternalGpu {
                     [id_shared.width as f32, id_shared.height as f32],
                     0.0,
                 );
+                timing.hit_pass_ms += stage.elapsed().as_secs_f32() * 1000.0;
                 drop(id_pass);
                 id_shared.frame_sequence = frame_sequence;
                 hal_queue.add_signal_fence(id_shared.fence.clone(), frame_sequence);
@@ -2558,7 +2828,54 @@ impl HeadlessExternalGpu {
             hal_queue.add_signal_fence(shared.fence.clone(), shared.frame_sequence);
         }
         self.queue.submit(Some(encoder.finish()));
+        let stage_timings = self.ui.last_stage_timings();
+        timing.refresh_plan_ms = stage_timings.refresh_plan_ms;
+        timing.compose_visuals_ms = stage_timings.compose_visuals_ms;
+        timing.text_layout_ms = stage_timings.text_layout_ms;
+        timing.group_sort_ms = stage_timings.group_sort_ms;
+        timing.buffer_upload_ms = stage_timings.buffer_upload_ms;
+        self.last_rendered_fragments = Some(snapshots.clone());
+        self.last_rendered_all_surfaces = rendered_all_surfaces;
+        self.push_frame_timing(timing);
         Ok(())
+    }
+
+    fn push_frame_timing(&mut self, timing: ExternalFrameTiming) {
+        const TIMING_CAPACITY: usize = 256;
+        if self.frame_timings.len() >= TIMING_CAPACITY {
+            self.frame_timings.pop_front();
+        }
+        self.frame_timings.push_back(timing);
+    }
+
+    fn diagnostics(&self) -> Value {
+        let timings = self
+            .frame_timings
+            .iter()
+            .map(|timing| {
+                json!({
+                    "frame_sequence": timing.frame_sequence,
+                    "snapshot_ms": timing.snapshot_ms,
+                    "invalidate_plan_ms": timing.invalidate_plan_ms,
+                    "refresh_plan_ms": timing.refresh_plan_ms,
+                    "compose_visuals_ms": timing.compose_visuals_ms,
+                    "text_layout_ms": timing.text_layout_ms,
+                    "group_sort_ms": timing.group_sort_ms,
+                    "buffer_upload_ms": timing.buffer_upload_ms,
+                    "color_pass_ms": timing.color_pass_ms,
+                    "external_depth_pass_ms": timing.external_depth_pass_ms,
+                    "hit_pass_ms": timing.hit_pass_ms,
+                    "dropped": timing.dropped,
+                    "skipped_static": timing.skipped_static,
+                    "skipped_throttled": timing.skipped_throttled,
+                })
+            })
+            .collect::<Vec<_>>();
+        json!({
+            "frame_sequence": self.next_external_frame_sequence,
+            "last_rendered_all_surfaces": self.last_rendered_all_surfaces,
+            "frames": timings,
+        })
     }
 }
 
@@ -2587,13 +2904,15 @@ pub fn spawn_headless_external_server(endpoint: SocketAddr) -> std::thread::Join
                 .spawn(move || {
                     while !render_stop.load(std::sync::atomic::Ordering::Relaxed) {
                         std::thread::sleep(Duration::from_millis(16));
-                        let fragments = match render_runtime.lock() {
-                            Ok(runtime) => runtime.fragments_snapshot(),
+                        let snapshot_start = Instant::now();
+                         let snapshots = match render_runtime.lock() {
+                             Ok(runtime) => runtime.external_surface_snapshots(),
                             Err(_) => break,
                         };
+                        let snapshot_ms = snapshot_start.elapsed().as_secs_f32() * 1000.0;
                         match render_gpu.lock() {
                             Ok(mut gpu) => {
-                                if let Err(error) = gpu.render(&fragments) {
+                                 if let Err(error) = gpu.render(&snapshots, snapshot_ms) {
                                     eprintln!("[neon-wgpu-runtime] render error: {error}");
                                 }
                             }
@@ -2624,6 +2943,34 @@ pub fn spawn_headless_external_server(endpoint: SocketAddr) -> std::thread::Join
                             match gpu.lock().expect("gpu lock").acquire(surface_id, pid) {
                                 Ok(result) => runtime.lock().expect("runtime lock").accept(request_id, result),
                                 Err(error) => runtime.lock().expect("runtime lock").reject(request_id, "external_surface_acquire_failed", &error, None),
+                            }
+                        }
+                        "render.diagnostics" => {
+                            let request_id = request.request_id;
+                            let result = gpu.lock().expect("gpu lock").diagnostics();
+                            runtime.lock().expect("runtime lock").accept(request_id, result)
+                        }
+                        "ui.host.pointer_event" => {
+                            let request_id = request.request_id;
+                            let event = request
+                                .params
+                                .get("event")
+                                .cloned()
+                                .unwrap_or(request.params);
+                            match serde_json::from_value::<UiPointerEvent>(event)
+                                .map_err(|error| format!("invalid_pointer_event: {error}"))
+                                .and_then(|event| {
+                                    let fragments = runtime
+                                        .lock()
+                                        .expect("runtime lock")
+                                        .fragments_snapshot();
+                                    gpu.lock()
+                                        .expect("gpu lock")
+                                        .pointer_event(event, &fragments)
+                                })
+                            {
+                                Ok(result) => runtime.lock().expect("runtime lock").accept(request_id, result),
+                                Err(error) => runtime.lock().expect("runtime lock").reject(request_id, "pointer_event_rejected", &error, None),
                             }
                         }
                         _ => runtime.lock().expect("runtime lock").handle(request),
@@ -5121,6 +5468,10 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                     .and_then(|gpu| gpu.external_surface_frame_snapshot(&surface_id));
                 let _ = completed.send(result);
             }
+            WindowCommand::ExternalPointerEvent { event, completed } => {
+                let result = self.external_pointer_event(event);
+                let _ = completed.send(result);
+            }
             WindowCommand::InputDebugSnapshot { completed } => {
                 let _ = completed.send(self.input_debug_snapshot());
             }
@@ -6186,6 +6537,7 @@ fn spawn_window_server(
                     | "wgpu.world.info.configure"
                     | "wgpu.world.camera.submit_frame"
                     | "wgpu.world.ui.anchor.submit"
+                    | "wgpu.world.ui.anchor.submit_batch"
                     | "wgpu.world_ui.lab.camera.register"
             );
             let response = if request.method == "wgpu.ai.terrain.generate" {
@@ -6196,6 +6548,8 @@ fn spawn_window_server(
                 handle_window_external_surface_acquire(&mut runtime, &proxy, request)
             } else if request.method == "render.surface.frame" {
                 handle_window_external_surface_frame(&mut runtime, &proxy, request)
+            } else if request.method == "ui.host.pointer_event" {
+                handle_window_external_pointer(&mut runtime, &proxy, request)
             } else if request.method == "wgpu.ai.model.status" {
                 handle_window_ai_model_status(&mut runtime, &proxy, request.request_id)
             } else if request.method == "debug.snapshot.get" {
@@ -6434,6 +6788,55 @@ fn handle_window_external_surface_frame(
     }
 }
 
+fn handle_window_external_pointer(
+    runtime: &mut WgpuRuntime,
+    proxy: &EventLoopProxy<WindowCommand>,
+    request: RpcRequest,
+) -> RpcResponse {
+    let event = match serde_json::from_value::<UiPointerEvent>(
+        request
+            .params
+            .get("event")
+            .cloned()
+            .unwrap_or(request.params.clone()),
+    ) {
+        Ok(event) => event,
+        Err(error) => {
+            return runtime.reject(
+                request.request_id,
+                "invalid_pointer_event",
+                &format!("pointer event is invalid: {error}"),
+                None,
+            );
+        }
+    };
+    let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+    if proxy
+        .send_event(WindowCommand::ExternalPointerEvent {
+            event,
+            completed: completed_tx,
+        })
+        .is_err()
+    {
+        return runtime.reject(
+            request.request_id,
+            "window_compositor_unavailable",
+            "window compositor is unavailable",
+            None,
+        );
+    }
+    match completed_rx.recv_timeout(Duration::from_secs(5)) {
+        Ok(Ok(result)) => runtime.accept(request.request_id, result),
+        Ok(Err(error)) => runtime.reject(request.request_id, &error, &error, None),
+        Err(_) => runtime.reject(
+            request.request_id,
+            "window_compositor_timeout",
+            "window compositor did not process the pointer event",
+            None,
+        ),
+    }
+}
+
 impl WindowedRuntime {
     fn demo_fragments(&self) -> HashMap<UiFragmentId, UiFragment> {
         let root = UiNode {
@@ -6636,6 +7039,7 @@ impl WgpuRuntime {
             CAPABILITY_UI_RENDER_SURFACE.into(),
             CAPABILITY_EXTERNAL_HOST_BACKEND_MATCH.into(),
             "wgpu.world.info.bridge".into(),
+            "wgpu.world.ui.anchor.batch.v1".into(),
         ];
         if self.window_gpu_available {
             capabilities.push(CAPABILITY_AI_TERRAIN_GENERATION.into());
@@ -6692,6 +7096,25 @@ impl WgpuRuntime {
                 (id.clone(), self.filter_world_panels(fragment))
             })
             .collect()
+    }
+
+    pub fn external_surface_snapshots(
+        &self,
+    ) -> HashMap<RenderSurfaceKind, HashMap<UiFragmentId, UiFragment>> {
+        let combined = self.fragments_snapshot();
+        [
+            (RenderSurfaceKind::ScreenUi, combined.iter().map(|(id, fragment)| {
+                let mut fragment = fragment.clone();
+                retain_surface_nodes(&mut fragment.root, &fragment.effects, RenderSurfaceKind::ScreenUi);
+                fragment.effects.retain(|effect| !matches!(effect, neon_ui_schema::UiEffect::CameraVisibility { .. }));
+                (id.clone(), fragment)
+            }).collect()),
+            (RenderSurfaceKind::WorldUi, combined.iter().map(|(id, fragment)| {
+                let mut fragment = fragment.clone();
+                retain_surface_nodes(&mut fragment.root, &fragment.effects, RenderSurfaceKind::WorldUi);
+                (id.clone(), self.filter_world_panels(&fragment))
+            }).collect()),
+        ].into_iter().collect()
     }
 
     fn filter_world_panels(&self, fragment: &UiFragment) -> UiFragment {
@@ -6958,6 +7381,33 @@ impl WgpuRuntime {
         }
     }
 
+    fn submit_world_ui_anchor_batch(
+        &mut self,
+        request_id: RequestId,
+        params: serde_json::Value,
+    ) -> RpcResponse {
+        let batch: WorldUiAnchorBatch = match serde_json::from_value(params) {
+            Ok(batch) => batch,
+            Err(_) => {
+                return self.reject(request_id, "invalid_request", "invalid world UI anchor batch", None);
+            }
+        };
+        let sequence = batch.sequence;
+        let count = batch.anchors.len();
+        match self.world_bridge.submit_anchor_batch(batch) {
+            Ok(()) => self.accept(
+                request_id,
+                serde_json::json!({"sequence": sequence, "anchor_count": count, "state": "accepted"}),
+            ),
+            Err(error) => self.reject(
+                request_id,
+                "world_anchor_batch_rejected",
+                &format!("{error:?}"),
+                None,
+            ),
+        }
+    }
+
     /// Projects a host-owned world-space anchor to a fullscreen pixel using the
     /// matching 3D camera frame. Returns `None` when the anchor is behind the
     /// camera, outside the near/far range, or outside the view frustum.
@@ -7177,6 +7627,9 @@ impl WgpuRuntime {
             "wgpu.world.ui.anchor.submit" => {
                 self.submit_world_ui_anchor(request_id, request.params)
             }
+            "wgpu.world.ui.anchor.submit_batch" => {
+                self.submit_world_ui_anchor_batch(request_id, request.params)
+            }
             "wgpu.resource.inspect" => self.resource_inspect(request_id),
             "wgpu.ui.resource.preload" => self.resource_preload(request_id, request.params),
             "wgpu.resource.wait_ready" => self.resource_wait_ready(request_id, request.params),
@@ -7209,6 +7662,7 @@ impl WgpuRuntime {
                 | "wgpu.world.info.configure"
                 | "wgpu.world.camera.submit_frame"
                 | "wgpu.world.ui.anchor.submit"
+                | "wgpu.world.ui.anchor.submit_batch"
         ) && response.status == RpcStatus::Accepted
             && let Some(idempotency_key) = request.idempotency_key
         {
@@ -7749,6 +8203,30 @@ impl WgpuRuntime {
                 error_code,
             },
         );
+    }
+}
+
+fn retain_surface_nodes(
+    node: &mut neon_ui_schema::UiNode,
+    effects: &[neon_ui_schema::UiEffect],
+    kind: RenderSurfaceKind,
+) -> bool {
+    let is_world = effects.iter().any(|effect| {
+        matches!(effect, neon_ui_schema::UiEffect::CameraVisibility { binding } if binding.node_id == node.node_id)
+    });
+    node.children.retain_mut(|child| retain_surface_nodes(child, effects, kind));
+    let has_world_child = !node.children.is_empty();
+    match kind {
+        RenderSurfaceKind::WorldUi => {
+            let keep = is_world || has_world_child;
+            node.visible &= keep;
+            keep
+        }
+        RenderSurfaceKind::ScreenUi => {
+            let keep = !is_world;
+            node.visible &= keep;
+            keep
+        }
     }
 }
 
@@ -9023,7 +9501,6 @@ mod tests {
             },
             enter_transition: None,
             world_depth: None,
-            world_depth: None,
             children: Vec::new(),
         };
         let fragments = HashMap::from([(
@@ -9364,6 +9841,7 @@ mod tests {
             },
             enter_transition: None,
             children: Vec::new(),
+            world_depth: None,
         };
         let fragments = HashMap::from([(
             UiFragmentId("srgb-acceptance".into()),
@@ -9490,6 +9968,7 @@ mod tests {
                 },
                 enter_transition: None,
                 children: Vec::new(),
+                world_depth: None,
             },
         ];
         let pixels = ui_renderer::render_hit_ids_for_test(
@@ -9586,6 +10065,7 @@ mod tests {
             style: UiStyle::default(),
             enter_transition: None,
             children: vec![child],
+            world_depth: None,
         };
         let root = UiNode {
             node_id: UiNodeId("clip-root".into()),
@@ -9606,6 +10086,7 @@ mod tests {
             style: UiStyle::default(),
             enter_transition: None,
             children: vec![clipper],
+            world_depth: None,
         };
         let pixels = ui_renderer::render_hit_ids_for_test(
             &device,

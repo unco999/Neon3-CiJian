@@ -10,7 +10,7 @@ use neon_protocol::ClientIdentity;
 use neon_ui_schema::{
     UiDataGridInputFrame, UiFragment, UiHostInbound, UiHostPresentationUpdate, UiHostPublication,
     UiInputSchema, UiProgram, UiProgramDragDropEvent, UiProgramInputSnapshot,
-    UiProgramSemanticEvent, UiRepeatFrame, UiWindowRequest,
+    UiProgramSemanticEvent, UiPointerEvent, UiRepeatFrame, UiWindowRequest,
 };
 use serde::{Deserialize, Serialize};
 
@@ -55,6 +55,7 @@ pub enum UiHostInboundResult {
     SemanticIntent(UiProgramSemanticEvent),
     DragDrop(UiProgramDragDropEvent),
     DataGridCell(neon_ui_schema::UiSemanticEvent),
+    PointerEvent(UiPointerEvent),
 }
 
 /// Owns the active program's resolved inputs and bounded grid windows.
@@ -66,6 +67,7 @@ pub struct UiHostAdapter {
     repeats: UiRepeatStore,
     renderer_epoch: u64,
     publication_results: HashMap<String, UiHostPublicationResult>,
+    pointer_sequences: HashMap<u64, u64>,
     /// Optional directed-event forwarder. When present and the active Flow
     /// declared `emitevent` variables, `apply_publication` publishes
     /// `flow.<flow_name>.<variable_key>` observations to `neon-eventd`.
@@ -125,6 +127,7 @@ impl UiHostAdapter {
             repeats: UiRepeatStore::default(),
             renderer_epoch,
             publication_results: HashMap::new(),
+            pointer_sequences: HashMap::new(),
             publisher: None,
         })
     }
@@ -364,7 +367,7 @@ impl UiHostAdapter {
     }
 
     pub fn validate_inbound(
-        &self,
+        &mut self,
         inbound: UiHostInbound,
     ) -> Result<UiHostInboundResult, UiHostAdapterError> {
         match inbound {
@@ -423,7 +426,49 @@ impl UiHostAdapter {
                 }
                 Ok(UiHostInboundResult::DataGridCell(event))
             }
+            UiHostInbound::PointerEvent { event } => {
+                self.validate_pointer_event(&event)?;
+                Ok(UiHostInboundResult::PointerEvent(event))
+            }
         }
+    }
+
+    fn validate_pointer_event(&mut self, event: &UiPointerEvent) -> Result<(), UiHostAdapterError> {
+        if event.surface_id.0.trim().is_empty() {
+            return Err(UiHostAdapterError {
+                code: "ui_host_invalid_pointer_event",
+                message: "pointer event surface_id is required",
+            });
+        }
+        if event.generation != self.renderer_epoch {
+            return Err(UiHostAdapterError {
+                code: "ui_host_surface_generation_stale",
+                message: "pointer event surface generation is not active",
+            });
+        }
+        if event.sequence == 0
+            || event.timestamp_monotonic_ns == 0
+            || !event.pixel.iter().all(|value| value.is_finite() && *value >= 0.0)
+            || !event.delta.iter().all(|value| value.is_finite())
+        {
+            return Err(UiHostAdapterError {
+                code: "ui_host_invalid_pointer_event",
+                message: "pointer event has invalid coordinates or timing",
+            });
+        }
+        if self
+            .pointer_sequences
+            .get(&event.pointer_id)
+            .is_some_and(|last| event.sequence <= *last)
+        {
+            return Err(UiHostAdapterError {
+                code: "ui_host_pointer_sequence_stale",
+                message: "pointer event sequence is stale or duplicated",
+            });
+        }
+        self.pointer_sequences
+            .insert(event.pointer_id, event.sequence);
+        Ok(())
     }
 
     fn validate_window_request(&self, request: &UiWindowRequest) -> Result<(), UiHostAdapterError> {
@@ -991,7 +1036,7 @@ mod tests {
 
     #[test]
     fn inbound_semantic_intent_is_validated_without_domain_dispatch() {
-        let adapter = adapter();
+        let mut adapter = adapter();
         let event = UiProgramSemanticEvent {
             event_id: "event".into(),
             kind: UiProgramSemanticEventKind::Activate,
@@ -1013,6 +1058,37 @@ mod tests {
             adapter.validate_inbound(UiHostInbound::SemanticIntent { event }),
             Ok(UiHostInboundResult::SemanticIntent(_))
         ));
+    }
+
+    #[test]
+    fn inbound_pointer_event_enforces_generation_and_sequence() {
+        let mut adapter = adapter();
+        let event = neon_ui_schema::UiPointerEvent {
+            event_type: neon_ui_schema::UiPointerEventType::Move,
+            surface_id: neon_ui_schema::UiSurfaceId("case.bevy.screen.ui".into()),
+            pixel: [640.0, 360.0],
+            delta: [1.0, 0.0],
+            delta_mode: neon_ui_schema::UiPointerDeltaMode::Pixel,
+            button: None,
+            buttons: Vec::new(),
+            modifiers: vec!["shift".into()],
+            pointer_id: 0,
+            sequence: 1,
+            generation: 7,
+            frame_sequence: 9,
+            timestamp_monotonic_ns: 10,
+        };
+        assert!(matches!(
+            adapter.validate_inbound(UiHostInbound::PointerEvent { event: event.clone() }),
+            Ok(UiHostInboundResult::PointerEvent(_))
+        ));
+        assert_eq!(
+            adapter
+                .validate_inbound(UiHostInbound::PointerEvent { event })
+                .unwrap_err()
+                .code,
+            "ui_host_pointer_sequence_stale"
+        );
     }
 
     #[test]

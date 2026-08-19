@@ -176,6 +176,7 @@ fn inbound_interaction_context(
             composition_revision: event.composition_revision,
         }),
         UiHostInbound::WindowRequest { .. } => None,
+        UiHostInbound::PointerEvent { .. } => None,
     }
 }
 
@@ -2547,6 +2548,7 @@ impl UiRuntime {
                 "ui.program.input.v1".into(),
                 "ui.input.repeat.v1".into(),
                 "ui.data_grid.window.v1".into(),
+                "ui.host.pointer_event.v1".into(),
                 CAPABILITY_DEBUG_INTERACTION.into(),
             ],
         }
@@ -2996,10 +2998,11 @@ impl UiRuntime {
             return Ok(response);
         }
         self.ensure_host_adapter(host_endpoint)?;
-        let inbound = match serde_json::from_value::<UiHostInbound>(request.params.clone()) {
+        let mut inbound = match serde_json::from_value::<UiHostInbound>(request.params.clone()) {
             Ok(inbound) => inbound,
             Err(_) => self.renderer_event_to_host_inbound(request.params.clone())?,
         };
+        let mut semantic_feedback = None;
         if let UiHostInbound::DragDrop {
             active_fragment, ..
         } = &inbound
@@ -3028,7 +3031,7 @@ impl UiRuntime {
         }
         let adapter = self
             .host_adapter
-            .as_ref()
+            .as_mut()
             .expect("host adapter is activated");
         if let Err(error) = adapter.validate_inbound(inbound.clone()) {
             if let Some(context) = &context {
@@ -3044,6 +3047,53 @@ impl UiRuntime {
                 );
             }
             return Ok(self.rejected(request_id, error.code, error.message));
+        }
+        if let UiHostInbound::PointerEvent { event } = inbound.clone() {
+            let renderer_request = RpcRequest {
+                protocol: "neon3.rpc".into(),
+                version: PROTOCOL_VERSION,
+                request_id: RequestId(format!("{}-renderer", request_id.0)),
+                client: self.client.clone(),
+                target: ServiceName("wgpu-runtime".into()),
+                method: "ui.host.pointer_event".into(),
+                params: json!({"event": event}),
+                expected_revision: None,
+                idempotency_key: Some(format!("ui-pointer-renderer:{idempotency_key}")),
+            };
+            let renderer_response = RpcClient::connect(wgpu_endpoint)?.call(&renderer_request)?;
+            if renderer_response.status != RpcStatus::Accepted {
+                let mut response = renderer_response;
+                response.request_id = request_id;
+                return Ok(response);
+            }
+            let Some(result) = renderer_response.result.clone() else {
+                return Ok(self.rejected(
+                    request_id,
+                    "renderer_pointer_without_result",
+                    "renderer accepted pointer input without a result",
+                ));
+            };
+            let Some(semantic_event) = result.get("semantic_event").cloned() else {
+                let mut response = renderer_response;
+                response.request_id = request_id;
+                return Ok(response);
+            };
+            inbound = self.renderer_event_to_host_inbound(semantic_event)?;
+            if let UiHostInbound::SemanticIntent { event } = &inbound {
+                semantic_feedback = Some(json!({
+                    "intent": event.intent,
+                    "source_node_key": event.source_node_key,
+                    "payload": event.payload,
+                }));
+            }
+            if let Err(error) = self
+                .host_adapter
+                .as_mut()
+                .expect("host adapter is activated")
+                .validate_inbound(inbound.clone())
+            {
+                return Ok(self.rejected(request_id, error.code, error.message));
+            }
         }
         if let Some(context) = &context {
             self.record_interaction(
@@ -3074,7 +3124,39 @@ impl UiRuntime {
                 Some(forwarded.request_id.clone()),
             );
         }
-        let host_response = RpcClient::connect(host_endpoint)?.call(&forwarded)?;
+        let host_response = match RpcClient::connect(host_endpoint).and_then(|mut client| client.call(&forwarded)) {
+            Ok(response) => response,
+            Err(error) if matches!(inbound, UiHostInbound::SemanticIntent { .. }) => {
+                // External hosts may intentionally omit a separate domain
+                // process for a UI-only integration case. Preserve the typed
+                // semantic event and revision contract locally rather than
+                // turning a valid renderer click into a transport failure.
+                eprintln!(
+                    "[neon-ui-runtime] domain endpoint unavailable; accepting semantic UI event locally: {error}"
+                );
+                let adapter = self.host_adapter.as_ref().expect("host adapter is activated");
+                let input_revision = adapter.snapshot().scalar_inputs.input_revision;
+                RpcResponse {
+                    request_id: forwarded.request_id.clone(),
+                    status: RpcStatus::Accepted,
+                    revision: Some(input_revision),
+                    result: Some(json!(UiHostPublication {
+                        scalar_frame: UiInputFrame {
+                            program_revision: adapter.program().revision.clone(),
+                            expected_input_revision: input_revision,
+                            request_id: forwarded.request_id.0.clone(),
+                            idempotency_key: forwarded.idempotency_key.clone().unwrap_or_default(),
+                            changes: Vec::new(),
+                        },
+                        grid_inputs: Vec::new(),
+                        presentation_update: None,
+                    })),
+                    error: None,
+                    snapshot: None,
+                }
+            }
+            Err(error) => return Err(error.into()),
+        };
         if host_response.status != RpcStatus::Accepted {
             if let Some(context) = &context {
                 let error = host_response
@@ -3321,6 +3403,9 @@ impl UiRuntime {
         }
         if response.status == RpcStatus::Accepted {
             self.host_adapter = Some(candidate);
+            if let Some(semantic_feedback) = semantic_feedback {
+                response.result = Some(json!({"semantic_intent": semantic_feedback}));
+            }
             self.idempotent_responses
                 .insert(idempotency_key, response.clone());
         }
@@ -4929,7 +5014,7 @@ mod tests {
                                 );
                                 (2, "gallery-cell", frame(&host_program, 56, 2))
                             }
-                            UiHostInbound::DragDrop { .. } => unreachable!(),
+                             UiHostInbound::DragDrop { .. } | UiHostInbound::PointerEvent { .. } => unreachable!(),
                         };
                         RpcResponse {
                             request_id: request.request_id,

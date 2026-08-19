@@ -1043,6 +1043,67 @@ pub struct UiPointerMetadata {
     pub sequence: u64,
 }
 
+/// Raw host input. Coordinates are surface-local logical pixels; the renderer
+/// owns hit testing and turns this into semantic events.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UiPointerEventType {
+    Enter,
+    Leave,
+    Move,
+    Down,
+    Up,
+    Wheel,
+    Cancel,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UiPointerDeltaMode {
+    Pixel,
+    Line,
+    Page,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UiPointerButton {
+    Primary,
+    Secondary,
+    Auxiliary,
+    Back,
+    Forward,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiPointerEvent {
+    pub event_type: UiPointerEventType,
+    pub surface_id: UiSurfaceId,
+    pub pixel: [f32; 2],
+    pub delta: [f32; 2],
+    pub delta_mode: UiPointerDeltaMode,
+    pub button: Option<UiPointerButton>,
+    pub buttons: Vec<UiPointerButton>,
+    pub modifiers: Vec<String>,
+    pub pointer_id: u64,
+    pub sequence: u64,
+    pub generation: u64,
+    pub frame_sequence: u64,
+    pub timestamp_monotonic_ns: u64,
+}
+
+impl UiPointerEvent {
+    pub fn validate(&self, expected_surface: &UiSurfaceId, expected_generation: u64) -> bool {
+        self.surface_id == *expected_surface
+            && self.generation == expected_generation
+            && self.sequence > 0
+            && self.pixel.iter().all(|value| value.is_finite() && *value >= 0.0)
+            && self.delta.iter().all(|value| value.is_finite())
+            && self.timestamp_monotonic_ns > 0
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UiFocusMetadata {
@@ -1656,6 +1717,11 @@ pub enum UiHostInbound {
     /// This preserves the cell target and typed payload for a generic host.
     DataGridCell {
         event: UiSemanticEvent,
+    },
+    /// Raw host pointer input. Hit testing and semantic derivation remain
+    /// renderer-owned; this event carries no renderer-local target identity.
+    PointerEvent {
+        event: UiPointerEvent,
     },
 }
 
@@ -2813,6 +2879,7 @@ mod tests {
             surface: None,
             style: UiStyle::default(),
             enter_transition: None,
+            world_depth: None,
             children: vec![
                 UiNode {
                     node_id: UiNodeId("a".into()),
@@ -2835,6 +2902,7 @@ mod tests {
                     surface: None,
                     style: UiStyle::default(),
                     enter_transition: None,
+                    world_depth: None,
                     children: Vec::new(),
                 },
                 UiNode {
@@ -2855,6 +2923,7 @@ mod tests {
                     surface: None,
                     style: UiStyle::default(),
                     enter_transition: None,
+                    world_depth: None,
                     children: Vec::new(),
                 },
             ],

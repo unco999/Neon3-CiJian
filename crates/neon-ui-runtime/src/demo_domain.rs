@@ -366,7 +366,8 @@ impl DemoInputDomain {
                             }
                         }
                     }
-                    Err(_) => rejected(request, Some(domain.snapshot().inputs.input_revision), "invalid_request", "a typed UI host inbound request is required"),
+                     Ok(UiHostInbound::PointerEvent { .. }) => rejected(request, Some(domain.snapshot().inputs.input_revision), "pointer_requires_renderer", "raw pointer input must be resolved by the renderer"),
+                     Err(_) => rejected(request, Some(domain.snapshot().inputs.input_revision), "invalid_request", "a typed UI host inbound request is required"),
                 }
             } else if request.method != "ui.program.event" {
                 rejected(request, Some(domain.snapshot().inputs.input_revision), "unsupported_method", "method is not supported")
