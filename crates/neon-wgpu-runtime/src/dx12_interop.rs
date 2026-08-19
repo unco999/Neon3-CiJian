@@ -20,7 +20,7 @@ use windows::{
                 D3D12_TEXTURE_LAYOUT_UNKNOWN,
                 ID3D12Device, ID3D12Fence, ID3D12Resource,
             },
-            Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R32_UINT, DXGI_SAMPLE_DESC},
+            Dxgi::Common::{DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R32_UINT, DXGI_SAMPLE_DESC},
         },
         System::Threading::{GetCurrentProcess, OpenProcess, PROCESS_DUP_HANDLE},
     },
@@ -132,6 +132,7 @@ pub fn create_shared_surface(
     let dxgi_format = match format {
         wgpu::TextureFormat::Rgba8Unorm => DXGI_FORMAT_R8G8B8A8_UNORM,
         wgpu::TextureFormat::R32Uint => DXGI_FORMAT_R32_UINT,
+        wgpu::TextureFormat::R32Float => DXGI_FORMAT_R32_FLOAT,
         _ => return Err(Error::CreateResource("unsupported shared surface format".into())),
     };
     let desc = D3D12_RESOURCE_DESC {

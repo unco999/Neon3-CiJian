@@ -645,6 +645,13 @@ pub struct UiNode {
     pub style: UiStyle,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enter_transition: Option<UiTransition>,
+    /// Normalized world-space occlusion depth for a projected world panel
+    /// (`0.0` = near plane / always on top, `1.0` = far plane). `None` for
+    /// ordinary screen UI. Populated by the wgpu runtime when a
+    /// `CameraVisibility` effect is projected to an anchor; inherited by the
+    /// panel's descendants so every glyph/bar shares its anchor depth.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub world_depth: Option<f32>,
     pub children: Vec<UiNode>,
 }
 

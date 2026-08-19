@@ -1664,6 +1664,7 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
         surface: None,
         style: UiStyle::default(),
         enter_transition: None,
+        world_depth: None,
         children: Vec::new(),
     };
     if is_render_surface {
@@ -3130,6 +3131,7 @@ fn insert_node(
         surface: None,
         style: UiStyle::default(),
         enter_transition: None,
+        world_depth: None,
         children: Vec::new(),
     });
     Ok(())

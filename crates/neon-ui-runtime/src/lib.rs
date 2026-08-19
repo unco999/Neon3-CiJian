@@ -4046,6 +4046,7 @@ impl UiRuntime {
                         ..UiTransitionState::default()
                     },
                 }),
+                world_depth: None,
                 children: vec![UiNode {
                     node_id: UiNodeId("title-label".into()),
                     kind: UiNodeKind::Label,
@@ -4076,6 +4077,7 @@ impl UiRuntime {
                             ..UiTransitionState::default()
                         },
                     }),
+                    world_depth: None,
                     children: Vec::new(),
                 }],
             },
@@ -6179,6 +6181,7 @@ mod tests {
                 surface: None,
                 style: UiStyle::default(),
                 enter_transition: None,
+                world_depth: None,
                 children: vec![UiNode {
                     node_id: UiNodeId("commit".into()),
                     kind: UiNodeKind::Button,
@@ -6197,6 +6200,7 @@ mod tests {
                     surface: None,
                     style: UiStyle::default(),
                     enter_transition: None,
+                    world_depth: None,
                     children: Vec::new(),
                 }],
             },
@@ -6297,6 +6301,7 @@ mod tests {
             surface: None,
             style: UiStyle::default(),
             enter_transition: None,
+            world_depth: None,
             children: Vec::new(),
         });
         document.data_grids.push(UiDataGridDeclaration {
@@ -6628,6 +6633,7 @@ mod tests {
             surface: None,
             style: UiStyle::default(),
             enter_transition: None,
+            world_depth: None,
             children: Vec::new(),
         });
         document.data_grids.push(UiDataGridDeclaration {
@@ -6837,6 +6843,7 @@ mod tests {
             surface: None,
             style: UiStyle::default(),
             enter_transition: None,
+            world_depth: None,
             children: Vec::new(),
         });
         assert_eq!(
@@ -6889,6 +6896,7 @@ mod tests {
             surface: None,
             style: UiStyle::default(),
             enter_transition: None,
+            world_depth: None,
             children: Vec::new(),
         });
         document.templates.push(UiTemplateDeclaration {

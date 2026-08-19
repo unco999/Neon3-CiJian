@@ -2215,6 +2215,7 @@ struct HeadlessExternalGpu {
     ui: UiWgpuRenderer,
     external_surfaces: HashMap<String, Vec<dx12_interop::SharedSurface>>,
     external_id_surfaces: HashMap<String, Vec<dx12_interop::SharedSurface>>,
+    external_depth_surfaces: HashMap<String, Vec<dx12_interop::SharedSurface>>,
     external_handle_tokens: HashMap<String, (String, String)>,
     next_external_frame_sequence: u64,
 }
@@ -2243,12 +2244,17 @@ impl HeadlessExternalGpu {
         }))
         .map_err(|error| format!("headless external device: {error}"))?;
         Ok(Self {
-            ui: UiWgpuRenderer::new(&device, wgpu::TextureFormat::Rgba8Unorm),
+            ui: UiWgpuRenderer::new_with_depth(
+                &device,
+                wgpu::TextureFormat::Rgba8Unorm,
+                wgpu::TextureFormat::R32Float,
+            ),
             device,
             queue,
             adapter,
             external_surfaces: HashMap::new(),
             external_id_surfaces: HashMap::new(),
+            external_depth_surfaces: HashMap::new(),
             external_handle_tokens: HashMap::new(),
             next_external_frame_sequence: 0,
         })
@@ -2298,6 +2304,22 @@ impl HeadlessExternalGpu {
             }
             self.external_id_surfaces.insert(open.surface_id.clone(), id_surfaces);
         }
+        if open.depth {
+            let mut depth_surfaces = Vec::with_capacity(open.buffer_count as usize);
+            for _ in 0..open.buffer_count {
+                depth_surfaces.push(
+                    dx12_interop::create_shared_surface(
+                        &self.device,
+                        &self.adapter,
+                        open.size.width.max(1),
+                        open.size.height.max(1),
+                        wgpu::TextureFormat::R32Float,
+                    )
+                    .map_err(|error| error.to_string())?,
+                );
+            }
+            self.external_depth_surfaces.insert(open.surface_id.clone(), depth_surfaces);
+        }
         Ok(json!({
             "surface_id": open.surface_id,
             "generation": generation,
@@ -2329,6 +2351,13 @@ impl HeadlessExternalGpu {
                 {
                     buffer["id_texture_handle"] = json!(dx12_interop::duplicate_handle_to_process(id_surface.texture_handle, pid).map_err(|error| error.to_string())?);
                     buffer["id_fence_handle"] = json!(dx12_interop::duplicate_handle_to_process(id_surface.fence_handle, pid).map_err(|error| error.to_string())?);
+                }
+                if let Some(depth_surfaces) = self.external_depth_surfaces.get(surface_id)
+                    && let Some(depth_surface) = depth_surfaces.get(index)
+                {
+                    buffer["depth_texture_handle"] = json!(dx12_interop::duplicate_handle_to_process(depth_surface.texture_handle, pid).map_err(|error| error.to_string())?);
+                    buffer["depth_fence_handle"] = json!(dx12_interop::duplicate_handle_to_process(depth_surface.fence_handle, pid).map_err(|error| error.to_string())?);
+                    buffer["depth_consumer_release_fence_handle"] = json!(dx12_interop::duplicate_handle_to_process(depth_surface.consumer_fence_handle, pid).map_err(|error| error.to_string())?);
                 }
                 Ok(buffer)
             })
@@ -2371,7 +2400,7 @@ impl HeadlessExternalGpu {
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("neon3-headless-external-ui"),
         });
-        for shared_ring in self.external_surfaces.values_mut() {
+        for (surface_id, shared_ring) in self.external_surfaces.iter_mut() {
             // Acquire a buffer the consumer has actually released. The consumer
             // signals its per-buffer release fence once it has finished sampling
             // that buffer, so a buffer is reusable when the fence value has
@@ -2387,8 +2416,15 @@ impl HeadlessExternalGpu {
                 .iter()
                 .enumerate()
                 .find_map(|(index, shared)| {
-                    (unsafe { shared.consumer_fence.GetCompletedValue() } >= shared.frame_sequence)
-                        .then_some(index)
+                    let color_free = unsafe { shared.consumer_fence.GetCompletedValue() } >= shared.frame_sequence;
+                    let depth_free = self
+                        .external_depth_surfaces
+                        .get(surface_id)
+                        .and_then(|ring| ring.get(index))
+                        .is_none_or(|depth| unsafe {
+                            depth.consumer_fence.GetCompletedValue() >= depth.frame_sequence
+                        });
+                    (color_free && depth_free).then_some(index)
                 })
             else {
                 eprintln!(
@@ -2415,6 +2451,34 @@ impl HeadlessExternalGpu {
             });
             self.ui.draw(&self.device, &self.queue, &mut pass, fragments, [shared.width, shared.height], [shared.width as f32, shared.height as f32], 0.0);
             drop(pass);
+            // Occlusion depth pass: re-emit the same instances into the matched
+            // R32Float ring buffer so the consumer can depth-test the overlay
+            // against its scene depth. Uses the same buffer index as the color
+            // ring so both stay frame-coherent.
+            if let Some(depth_ring) = self.external_depth_surfaces.get_mut(surface_id)
+                && let Some(depth_shared) = depth_ring.get_mut(write_index)
+            {
+                let depth_view = depth_shared
+                    .texture
+                    .create_view(&wgpu::TextureViewDescriptor::default());
+                let mut depth_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("neon3-headless-external-ui-depth-pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &depth_view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                self.ui.draw_depth(&mut depth_pass);
+                drop(depth_pass);
+                depth_shared.frame_sequence = frame_sequence;
+                hal_queue.add_signal_fence(depth_shared.fence.clone(), frame_sequence);
+            }
             shared.frame_sequence = frame_sequence;
             hal_queue.add_signal_fence(shared.fence.clone(), shared.frame_sequence);
         }
@@ -3383,6 +3447,7 @@ fn world_ui_lab_fragment() -> HashMap<UiFragmentId, UiFragment> {
             opacity: 1.0,
         },
         enter_transition: None,
+        world_depth: None,
         children: Vec::new(),
     };
     let root = UiNode {
@@ -3409,6 +3474,7 @@ fn world_ui_lab_fragment() -> HashMap<UiFragmentId, UiFragment> {
             opacity: 1.0,
         },
         enter_transition: None,
+        world_depth: None,
         children: vec![
             label(
                 "callsign",
@@ -6312,6 +6378,7 @@ impl WindowedRuntime {
                     ..UiTransitionState::default()
                 },
             }),
+            world_depth: None,
             children: vec![
                 UiNode {
                     node_id: neon_ui_schema::UiNodeId("demo-title".into()),
@@ -6345,6 +6412,7 @@ impl WindowedRuntime {
                             ..UiTransitionState::default()
                         },
                     }),
+                    world_depth: None,
                     children: Vec::new(),
                 },
                 UiNode {
@@ -6385,6 +6453,7 @@ impl WindowedRuntime {
                             ..UiTransitionState::default()
                         },
                     }),
+                    world_depth: None,
                     children: Vec::new(),
                 },
             ],
@@ -6606,6 +6675,17 @@ impl WgpuRuntime {
                     );
                     if let Some(([_x, _y], depth)) = projected {
                         depths.insert(node.node_id.0.clone(), depth);
+                        // Normalized occlusion depth, shared convention with the
+                        // Bevy composite: 0.0 = near plane (never occluded),
+                        // 1.0 = far plane. Depth-tested panels expose their real
+                        // depth; always-visible panels pin to 0.0 so scene
+                        // geometry can never discard them.
+                        let occlusion_depth = if anchor.occlusion == "depth_tested" {
+                            ((depth - near) / (far - near)).clamp(0.0, 1.0)
+                        } else {
+                            0.0
+                        };
+                        node.world_depth = Some(occlusion_depth);
                         let scale = (6.0 / depth).clamp(0.5, 2.0);
                         node.bounds.width *= scale;
                         node.bounds.height *= scale;
@@ -7978,6 +8058,7 @@ mod tests {
                 surface: None,
                 style: UiStyle::default(),
                 enter_transition: None,
+                world_depth: None,
                 children: Vec::new(),
             },
             effects: vec![UiEffect::SemanticAction {
@@ -8120,6 +8201,7 @@ mod tests {
             surface: None,
             style: UiStyle::default(),
             enter_transition: None,
+            world_depth: None,
             children: Vec::new(),
         };
         gated.root.children.push(marker);
@@ -8237,6 +8319,7 @@ mod tests {
                 timestamp_monotonic_ns: 1,
                 position: [1.0, 2.0, 3.0],
                 billboard: true,
+                occlusion: "always_visible".into(),
             }),
         ));
         assert_eq!(response.status, RpcStatus::Accepted);
@@ -8290,6 +8373,7 @@ mod tests {
                 timestamp_monotonic_ns: 1,
                 position: [0.0, 0.0, -2.0],
                 billboard: true,
+                occlusion: "depth_tested".into(),
             })
             .unwrap();
         let mut gated = fragment(1);
@@ -8311,6 +8395,7 @@ mod tests {
             surface: None,
             style: UiStyle::default(),
             enter_transition: None,
+            world_depth: None,
             children: Vec::new(),
         };
         gated.root.children.push(marker);
@@ -8841,6 +8926,8 @@ mod tests {
                 ..UiStyle::default()
             },
             enter_transition: None,
+            world_depth: None,
+            world_depth: None,
             children: Vec::new(),
         };
         let fragments = HashMap::from([(
@@ -9044,6 +9131,7 @@ mod tests {
                 ..UiStyle::default()
             },
             enter_transition: None,
+            world_depth: None,
             children: Vec::new(),
         };
         let fragments = HashMap::from([(
@@ -9239,6 +9327,7 @@ mod tests {
                     ..UiStyle::default()
                 },
                 enter_transition: None,
+                world_depth: None,
                 children: Vec::new(),
             },
             UiNode {
@@ -9259,6 +9348,7 @@ mod tests {
                 surface: None,
                 style: UiStyle::default(),
                 enter_transition: None,
+                world_depth: None,
                 children: Vec::new(),
             },
             UiNode {
@@ -9279,6 +9369,7 @@ mod tests {
                 surface: None,
                 style: UiStyle::default(),
                 enter_transition: None,
+                world_depth: None,
                 children: Vec::new(),
             },
             UiNode {
@@ -9374,6 +9465,7 @@ mod tests {
             surface: None,
             style: UiStyle::default(),
             enter_transition: None,
+            world_depth: None,
             children: Vec::new(),
         };
         let clipper = UiNode {

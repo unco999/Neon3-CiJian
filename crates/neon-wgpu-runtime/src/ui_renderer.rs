@@ -134,6 +134,52 @@ const HIT_CLEAR_SHADER: &str = r#"
 @fragment fn fs_main() -> @location(0) u32 { return 0xffffffffu; }
 "#;
 
+const DEPTH_SHADER: &str = r#"
+struct View { viewport: vec2<f32>, _pad: vec2<f32> }
+@group(0) @binding(0) var<uniform> view: View;
+fn outside_clip(pixel: vec2<f32>, clip: vec4<f32>, radius: f32) -> bool {
+    if (pixel.x < clip.x || pixel.y < clip.y || pixel.x > clip.z || pixel.y > clip.w) { return true; }
+    if (radius <= 0.0) { return false; }
+    let size = clip.zw - clip.xy; let r = min(radius, min(size.x, size.y) * 0.5);
+    let point = pixel - (clip.xy + size * 0.5); let extent = max(size * 0.5 - vec2<f32>(r), vec2<f32>(0.0));
+    return length(max(abs(point) - extent, vec2<f32>(0.0))) > r;
+}
+struct VsIn {
+    @location(0) rect: vec4<f32>,
+    @location(1) fill: vec4<f32>,
+    @location(2) border: vec4<f32>,
+    @location(3) params: vec4<f32>,
+    @location(4) clip: vec4<f32>,
+    @location(5) depth: f32,
+}
+struct VsOut {
+    @builtin(position) position: vec4<f32>,
+    @location(0) clip: vec4<f32>,
+    @location(1) params: vec4<f32>,
+    @location(2) pixel: vec2<f32>,
+    @location(3) depth: f32,
+}
+@vertex fn vs_main(@builtin(vertex_index) vertex_index: u32, input: VsIn) -> VsOut {
+    var corners = array<vec2<f32>, 6>(
+        vec2<f32>(0.0, 0.0), vec2<f32>(1.0, 0.0), vec2<f32>(0.0, 1.0),
+        vec2<f32>(0.0, 1.0), vec2<f32>(1.0, 0.0), vec2<f32>(1.0, 1.0)
+    );
+    let local = corners[vertex_index];
+    let pixel = input.rect.xy + local * input.rect.zw;
+    var output: VsOut;
+    output.position = vec4<f32>(pixel.x / view.viewport.x * 2.0 - 1.0, 1.0 - pixel.y / view.viewport.y * 2.0, 0.0, 1.0);
+    output.clip = input.clip;
+    output.params = input.params;
+    output.pixel = pixel;
+    output.depth = input.depth;
+    return output;
+}
+@fragment fn fs_main(input: VsOut) -> @location(0) f32 {
+    if (outside_clip(input.pixel, input.clip, input.params.w)) { discard; }
+    return input.depth;
+}
+"#;
+
 const IMAGE_SHADER: &str = r#"
 struct View { viewport: vec2<f32>, _pad: vec2<f32> }
 @group(0) @binding(0) var<uniform> view: View;
@@ -189,6 +235,9 @@ struct UiInstance {
     border: [f32; 4],
     params: [f32; 4],
     clip: [f32; 4],
+    /// Normalized occlusion depth (0.0 = near/always-on-top, 1.0 = far). Written
+    /// to the optional depth target so the consumer can depth-test the overlay.
+    depth: f32,
 }
 
 #[repr(C)]
@@ -634,6 +683,9 @@ struct UiVisual {
     presentation: Option<UiControlPresentation>,
     scroll: bool,
     declared_scroll_offset: [f32; 2],
+    /// Normalized occlusion depth inherited from a projected world panel
+    /// (`None` for screen UI → rendered as "always on top", depth 0.0).
+    world_depth: Option<f32>,
 }
 
 #[derive(Clone, Debug)]
@@ -714,6 +766,8 @@ struct CachedDataGridTextDisplay {
 pub struct UiWgpuRenderer {
     color_format: wgpu::TextureFormat,
     pipeline: wgpu::RenderPipeline,
+    depth_format: Option<wgpu::TextureFormat>,
+    depth_pipeline: Option<wgpu::RenderPipeline>,
     view_buffer: wgpu::Buffer,
     view_bind_group: wgpu::BindGroup,
     instance_buffer: wgpu::Buffer,
@@ -777,6 +831,25 @@ pub struct UiWgpuRenderer {
 
 impl UiWgpuRenderer {
     pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
+        Self::new_internal(device, format, None)
+    }
+
+    /// Renderer that also emits a per-pixel occlusion depth target (R32Float).
+    /// `draw` writes color as usual; `draw_depth` re-emits the same instances
+    /// with their normalized depth into a separate depth pass.
+    pub(crate) fn new_with_depth(
+        device: &wgpu::Device,
+        format: wgpu::TextureFormat,
+        depth_format: wgpu::TextureFormat,
+    ) -> Self {
+        Self::new_internal(device, format, Some(depth_format))
+    }
+
+    fn new_internal(
+        device: &wgpu::Device,
+        format: wgpu::TextureFormat,
+        depth_format: Option<wgpu::TextureFormat>,
+    ) -> Self {
         let view_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("neon3-ui-view-layout"),
             entries: &[wgpu::BindGroupLayoutEntry {
@@ -1113,9 +1186,77 @@ impl UiWgpuRenderer {
             multiview_mask: None,
             cache: None,
         });
+        let depth_pipeline = depth_format.map(|depth_format| {
+            let depth_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("neon3-ui-depth-shader"),
+                source: wgpu::ShaderSource::Wgsl(DEPTH_SHADER.into()),
+            });
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("neon3-ui-depth-pipeline"),
+                layout: Some(&layout),
+                vertex: wgpu::VertexState {
+                    module: &depth_shader,
+                    entry_point: Some("vs_main"),
+                    buffers: &[Some(wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<UiInstance>() as u64,
+                        step_mode: wgpu::VertexStepMode::Instance,
+                        attributes: &[
+                            wgpu::VertexAttribute {
+                                format: wgpu::VertexFormat::Float32x4,
+                                offset: 0,
+                                shader_location: 0,
+                            },
+                            wgpu::VertexAttribute {
+                                format: wgpu::VertexFormat::Float32x4,
+                                offset: 16,
+                                shader_location: 1,
+                            },
+                            wgpu::VertexAttribute {
+                                format: wgpu::VertexFormat::Float32x4,
+                                offset: 32,
+                                shader_location: 2,
+                            },
+                            wgpu::VertexAttribute {
+                                format: wgpu::VertexFormat::Float32x4,
+                                offset: 48,
+                                shader_location: 3,
+                            },
+                            wgpu::VertexAttribute {
+                                format: wgpu::VertexFormat::Float32x4,
+                                offset: 64,
+                                shader_location: 4,
+                            },
+                            wgpu::VertexAttribute {
+                                format: wgpu::VertexFormat::Float32,
+                                offset: 80,
+                                shader_location: 5,
+                            },
+                        ],
+                    })],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &depth_shader,
+                    entry_point: Some("fs_main"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: depth_format,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            })
+        });
         Self {
             color_format: format,
             pipeline,
+            depth_format,
+            depth_pipeline,
             view_buffer,
             view_bind_group,
             instance_buffer: create_instance_buffer(device, 1),
@@ -3805,6 +3946,25 @@ impl UiWgpuRenderer {
         true
     }
 
+    /// Re-emits the already-composed instances into a depth-only pass, writing
+    /// each instance's normalized occlusion depth to the bound R32Float target.
+    /// Must be called after `draw` so `self.instances` and the instance buffer
+    /// are current. Screen UI (depth 0.0) is naturally "always on top" and world
+    /// panels write their anchor depth; near panels overwrite far ones because
+    /// instances are already sorted far -> near.
+    pub(crate) fn draw_depth<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
+        let Some(pipeline) = &self.depth_pipeline else {
+            return;
+        };
+        if self.instances.is_empty() {
+            return;
+        }
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, &self.view_bind_group, &[]);
+        pass.set_vertex_buffer(0, self.instance_buffer.slice(..));
+        pass.draw(0..6, 0..self.instances.len() as u32);
+    }
+
     fn refresh_plan(
         &mut self,
         fragments: &HashMap<neon_ui_schema::UiFragmentId, UiFragment>,
@@ -4229,6 +4389,7 @@ impl UiWgpuRenderer {
                         border: [0.18, 0.29, 0.26, 0.82],
                         params: [0.0, 4.0, visual.style.opacity, visual.clip_radius],
                         clip,
+                        depth: 0.0,
                     },
                     UiInstance {
                         rect: [thumb.x, thumb.y, thumb.width, thumb.height],
@@ -4236,6 +4397,7 @@ impl UiWgpuRenderer {
                         border: [0.34, 0.80, 0.64, 0.95],
                         params: [0.0, 4.0, visual.style.opacity, visual.clip_radius],
                         clip,
+                        depth: 0.0,
                     },
                 ])
             })
@@ -4348,6 +4510,7 @@ impl UiWgpuRenderer {
                 visual.clip.x + visual.clip.width,
                 visual.clip.y + visual.clip.height,
             ],
+            depth: visual.world_depth.unwrap_or(0.0),
         }
     }
 
@@ -4406,6 +4569,7 @@ impl UiWgpuRenderer {
                     preview.clip.x + preview.clip.width,
                     preview.clip.y + preview.clip.height,
                 ],
+                depth: 0.0,
             });
         }
         instances
@@ -4490,6 +4654,7 @@ impl UiWgpuRenderer {
             border: [0.42, 0.68, 0.57, 0.96],
             params: [1.0, 4.0, 1.0, 0.0],
             clip,
+            depth: 0.0,
         }];
         for (row, option) in rows.into_iter().zip(options) {
             instances.push(UiInstance {
@@ -4502,6 +4667,7 @@ impl UiWgpuRenderer {
                 border: [0.22, 0.40, 0.34, 0.84],
                 params: [1.0, 2.0, 1.0, 0.0],
                 clip,
+                depth: 0.0,
             });
         }
         instances
@@ -4810,6 +4976,7 @@ fn component_chrome_instances(visual: &UiVisual) -> Vec<UiInstance> {
         border,
         params: [1.0, radius, visual.style.opacity, visual.clip_radius],
         clip,
+        depth: 0.0,
     };
     let selected = matches!(
         &visual.presentation,
@@ -4945,6 +5112,7 @@ fn component_chrome_instances(visual: &UiVisual) -> Vec<UiInstance> {
                     border: [0.18, 0.52, 0.90, 0.92],
                     params: [0.0, 3.0, visual.style.opacity, visual.clip_radius],
                     clip,
+                    depth: 0.0,
                 },
             ]
         }
@@ -5636,6 +5804,7 @@ fn overlay_instance(bounds: UiBounds, clip: UiBounds, color: [f32; 4]) -> UiInst
         border: [0.0; 4],
         params: [0.0, 0.0, 1.0, 0.0],
         clip: [clip.x, clip.y, clip.x + clip.width, clip.y + clip.height],
+        depth: 0.0,
     }
 }
 
@@ -5716,6 +5885,7 @@ fn flatten_fragments_with_data_grid_display_cache(
             Some(viewport_logical_size),
             false,
             &hidden_world_nodes,
+            None,
         );
     }
     append_data_grid_frames(&mut result, fragments, data_grid_text_display_cache);
@@ -5916,6 +6086,7 @@ fn append_data_grid_frames(
                 presentation: None,
                 scroll: false,
                 declared_scroll_offset: [0.0; 2],
+                world_depth: None,
             };
             let mut sticky_header = vec![(
                 format!("{grid_path}/data-grid-header"),
@@ -5990,6 +6161,7 @@ fn append_data_grid_frames(
                     presentation: None,
                     scroll: false,
                     declared_scroll_offset: [0.0; 2],
+                    world_depth: None,
                 };
                 let row_path = format!("{grid_path}/data-grid-row-{}", row.stable_row_key);
                 out.push((row_path.clone(), Some(grid_path.clone()), row_visual, None));
@@ -6321,6 +6493,7 @@ fn flatten_node(
     assigned_size: Option<[f32; 2]>,
     inherited_top_layer: bool,
     hidden_world_nodes: &HashSet<&str>,
+    inherited_depth: Option<f32>,
 ) {
     let node_layout = node.layout.unwrap_or_default();
     let bounds = UiBounds {
@@ -6386,6 +6559,7 @@ fn flatten_node(
                 presentation: None,
                 scroll: node_layout.clip == UiClipPolicy::Scroll,
                 declared_scroll_offset: node_layout.scroll_offset,
+                world_depth: node.world_depth.or(inherited_depth),
             },
             node.enter_transition.clone(),
         ));
@@ -6425,6 +6599,7 @@ fn flatten_node(
             Some([child_bounds.width, child_bounds.height]),
             top_layer,
             hidden_world_nodes,
+            node.world_depth.or(inherited_depth),
         );
     }
 }
@@ -6756,6 +6931,7 @@ fn transition_source(target: &UiVisual, transition: &UiTransition) -> UiVisual {
         presentation: target.presentation.clone(),
         scroll: target.scroll,
         declared_scroll_offset: target.declared_scroll_offset,
+        world_depth: target.world_depth,
     }
 }
 
@@ -6800,6 +6976,7 @@ fn sample_transition(active: &ActiveTransition, time_seconds: f32) -> UiVisual {
         presentation: active.target.presentation.clone(),
         scroll: active.target.scroll,
         declared_scroll_offset: active.target.declared_scroll_offset,
+        world_depth: active.target.world_depth,
     }
 }
 
@@ -7164,6 +7341,7 @@ mod tests {
             presentation: None,
             scroll: false,
             declared_scroll_offset: [0.0; 2],
+            world_depth: None,
         };
         let target_a = UiVisual {
             bounds: UiBounds {
@@ -7389,6 +7567,7 @@ mod tests {
             presentation: None,
             scroll: false,
             declared_scroll_offset: [0.0; 2],
+            world_depth: None,
         };
         let node_path = "grid/assets/data-grid-row-asset-42/cell-name".to_owned();
         let mut renderer = UiWgpuRenderer::new(&device, wgpu::TextureFormat::Rgba8Unorm);
@@ -7473,6 +7652,7 @@ mod tests {
                 presentation: None,
                 scroll: false,
                 declared_scroll_offset: [0.0; 2],
+                world_depth: None,
             },
             transition: None,
             instance_index: None,
@@ -7556,6 +7736,7 @@ mod tests {
                 presentation: None,
                 scroll: false,
                 declared_scroll_offset: [0.0; 2],
+                world_depth: None,
             },
             transition: None,
             instance_index: None,
@@ -7728,6 +7909,7 @@ mod tests {
                 }),
                 scroll: false,
                 declared_scroll_offset: [0.0; 2],
+                world_depth: None,
             },
             transition: None,
             instance_index: None,
@@ -7804,6 +7986,7 @@ mod tests {
             }),
             scroll: false,
             declared_scroll_offset: [0.0; 2],
+            world_depth: None,
         };
         let mut renderer = UiWgpuRenderer::new(&device, wgpu::TextureFormat::Rgba8Unorm);
         renderer.plan.push(PlannedNode {
@@ -7901,6 +8084,7 @@ mod tests {
             presentation: None,
             scroll: false,
             declared_scroll_offset: [0.0; 2],
+            world_depth: None,
         };
         renderer.plan.push(PlannedNode {
             id: "gallery/slider".into(),
@@ -7961,6 +8145,7 @@ mod tests {
             presentation: None,
             scroll: true,
             declared_scroll_offset: [0.0; 2],
+            world_depth: None,
         };
         let child = UiVisual {
             bounds: UiBounds {
@@ -8133,6 +8318,7 @@ mod tests {
                 opacity: 1.0,
             },
             enter_transition: None,
+            world_depth: None,
             children: Vec::new(),
         });
         let pixels = render_offscreen_for_test(
@@ -8232,6 +8418,7 @@ mod tests {
             surface: None,
             style: UiStyle::default(),
             enter_transition: None,
+            world_depth: None,
             children: Vec::new(),
         });
         root.children.push(UiNode {
@@ -8252,6 +8439,7 @@ mod tests {
             surface: None,
             style: UiStyle::default(),
             enter_transition: None,
+            world_depth: None,
             children: Vec::new(),
         });
         let pixels = render_hit_ids_for_test(
@@ -8686,6 +8874,7 @@ mod tests {
                 opacity: 1.0,
             },
             enter_transition: None,
+            world_depth: None,
             children: Vec::new(),
         };
         let cell = |id| neon_ui_schema::UiDataGridCell {
@@ -8866,6 +9055,7 @@ mod tests {
             surface: None,
             style: UiStyle::default(),
             enter_transition: None,
+            world_depth: None,
             children: Vec::new(),
         };
         let cell = |id, presentation_override| neon_ui_schema::UiDataGridCell {
@@ -9028,6 +9218,7 @@ mod tests {
             surface: None,
             style: UiStyle::default(),
             enter_transition: None,
+            world_depth: None,
             children: Vec::new(),
         };
         let declaration = neon_ui_schema::UiDataGridDeclaration {
@@ -9186,6 +9377,7 @@ mod tests {
             surface: None,
             style: UiStyle::default(),
             enter_transition: None,
+            world_depth: None,
             children: Vec::new(),
         };
         let declaration = neon_ui_schema::UiDataGridDeclaration {
@@ -9415,6 +9607,7 @@ mod tests {
             surface: None,
             style: UiStyle::default(),
             enter_transition: None,
+            world_depth: None,
             children: Vec::new(),
         };
         let declaration = neon_ui_schema::UiDataGridDeclaration {
@@ -10147,6 +10340,8 @@ mod tests {
             surface: None,
             style: UiStyle::default(),
             enter_transition: None,
+            world_depth: None,
+            world_depth: None,
             children: Vec::new(),
         });
         let fragments = HashMap::from([(
@@ -10378,6 +10573,8 @@ mod tests {
                 ..UiStyle::default()
             },
             enter_transition: None,
+            world_depth: None,
+            world_depth: None,
             children: Vec::new(),
         };
         let mut fragment = UiFragment {
@@ -10429,6 +10626,7 @@ mod tests {
                 ..UiStyle::default()
             },
             enter_transition: None,
+            world_depth: None,
             children: Vec::new(),
         };
         let fragments = HashMap::from([(
@@ -11801,6 +11999,7 @@ mod tests {
                 opacity: 1.0,
             },
             enter_transition: None,
+            world_depth: None,
             children: Vec::new(),
         };
         let fragment = UiFragment {
@@ -12080,6 +12279,7 @@ mod tests {
             presentation: None,
             scroll: false,
             declared_scroll_offset: [0.0; 2],
+            world_depth: None,
         };
         let transition = node().enter_transition.unwrap();
         let active = ActiveTransition {
@@ -12120,6 +12320,7 @@ mod tests {
             presentation: None,
             scroll: false,
             declared_scroll_offset: [0.0; 2],
+            world_depth: None,
         };
         let target = UiVisual {
             bounds: UiBounds {

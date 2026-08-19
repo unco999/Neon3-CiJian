@@ -230,6 +230,16 @@ pub struct WorldUiAnchor {
     /// renders the UI in its own fullscreen composition regardless; this flag is
     /// a presentation hint, never a 3D quad or texture request.
     pub billboard: bool,
+    /// Scene-occlusion policy: `"always_visible"` (default, never depth-tested)
+    /// or `"depth_tested"` (occluded by nearer scene geometry during composite).
+    /// Drives the normalized depth written to the UI depth target.
+    #[serde(default = "default_anchor_occlusion")]
+    pub occlusion: String,
+}
+
+/// Default anchor occlusion: on top of scene geometry, never depth-tested.
+pub fn default_anchor_occlusion() -> String {
+    "always_visible".to_owned()
 }
 
 impl WorldUiAnchor {
@@ -461,6 +471,7 @@ mod tests {
                 timestamp_monotonic_ns: 1,
                 position: [1.0, 2.0, 3.0],
                 billboard: true,
+                occlusion: "always_visible".into(),
             })
             .unwrap();
         let stored = bridge.anchor(&anchor_id).expect("anchor stored");
@@ -481,6 +492,7 @@ mod tests {
             timestamp_monotonic_ns: 1,
             position: [0.0, 0.0, 0.0],
             billboard: true,
+            occlusion: "always_visible".into(),
         };
         bridge.submit_anchor(base.clone()).unwrap();
         // Wrong world space is rejected.
