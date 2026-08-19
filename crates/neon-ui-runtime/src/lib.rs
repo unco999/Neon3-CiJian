@@ -49,7 +49,11 @@ use neon_ui_schema::{
     UiTextRegistryDebugSnapshot, UiTextRegistryEntryMetadata, UiTextRegistrySnapshot,
     UiTextSourceCategory, UiTransition, UiTransitionState,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+
+#[cfg(test)]
+use neon_ui_schema::UiRepeatRow;
 
 pub mod debug;
 pub mod demo_domain;
@@ -1671,7 +1675,7 @@ impl UiDataGridStore {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct UiRepeatApplyResult {
     pub accepted_rows: u32,
     pub overflow_rows: u32,
@@ -2541,6 +2545,7 @@ impl UiRuntime {
                 "ui.ai.terrain.panel.v1".into(),
                 "ui.text_input.commit.v1".into(),
                 "ui.program.input.v1".into(),
+                "ui.input.repeat.v1".into(),
                 "ui.data_grid.window.v1".into(),
                 CAPABILITY_DEBUG_INTERACTION.into(),
             ],
@@ -2580,6 +2585,7 @@ impl UiRuntime {
             "ui.surface.event" => return self.handle_surface_event(request),
             "ui.input.event" => return self.handle_input_event(request),
             "ui.input.frame" => return self.handle_external_input_frame(request),
+            "ui.input.repeat" => return self.handle_repeat_input(request),
             "ui.intent.dispatch" => return self.handle_intent_dispatch(request),
             _ => None,
         };
@@ -3842,6 +3848,30 @@ impl UiRuntime {
             );
         };
         match adapter.apply_external_input(frame) {
+            Ok(result) => self.accepted(request.request_id, json!(result)),
+            Err(error) => self.rejected(request.request_id, error.code, error.message),
+        }
+    }
+
+    fn handle_repeat_input(&mut self, request: RpcRequest) -> RpcResponse {
+        let frame = match serde_json::from_value::<UiRepeatFrame>(request.params) {
+            Ok(frame) => frame,
+            Err(_) => {
+                return self.rejected(
+                    request.request_id,
+                    "invalid_repeat_frame",
+                    "invalid external UI repeat frame",
+                );
+            }
+        };
+        let Some(adapter) = self.host_adapter.as_mut() else {
+            return self.rejected(
+                request.request_id,
+                "ui_host_adapter_unavailable",
+                "no active UI host adapter is configured",
+            );
+        };
+        match adapter.apply_repeat(frame) {
             Ok(result) => self.accepted(request.request_id, json!(result)),
             Err(error) => self.rejected(request.request_id, error.code, error.message),
         }
@@ -6830,6 +6860,165 @@ mod tests {
             .unwrap_err()
             .code,
             "ui_program_invalid_schema"
+        );
+    }
+
+    #[test]
+    fn repeat_input_rpc_applies_batched_instances_through_host_adapter() {
+        use neon_ui_schema::{UiInputKind, UiTemplateDeclaration};
+
+        // Build a program with a typed "nameplate" template whose row schema is
+        // the shape a `NeonWorldUi<V>` instance submits: a stable key plus its
+        // typed variable fields (health/level here).
+        let mut document = compiler_document();
+        document.root.children.push(UiNode {
+            node_id: UiNodeId("nameplate".into()),
+            kind: UiNodeKind::Panel,
+            bounds: UiBounds {
+                x: 0.0,
+                y: 0.0,
+                width: 20.0,
+                height: 10.0,
+            },
+            layout: None,
+            visible: false,
+            enabled: false,
+            text_key: None,
+            text: None,
+            image: None,
+            surface: None,
+            style: UiStyle::default(),
+            enter_transition: None,
+            children: Vec::new(),
+        });
+        document.templates.push(UiTemplateDeclaration {
+            template_key: "nameplate".into(),
+            root_node_key: "nameplate".into(),
+            max_instances: 4,
+            row_schema: BTreeMap::from([
+                ("row_key".into(), UiInputKind::U32),
+                ("health".into(), UiInputKind::F32),
+                ("level".into(), UiInputKind::U32),
+            ]),
+            instance_key_field: "row_key".into(),
+            overflow_summary: false,
+        });
+        document.resource_budget.max_nodes = 3;
+        document.resource_budget.max_instances = 4;
+
+        let revision = compiler_program_revision();
+        let program = compile_ui_program(&document, revision.clone(), &compiler_schema(true))
+            .unwrap();
+        assert_eq!(program.template_records.len(), 1);
+
+        let mut runtime = UiRuntime::new(7, "repeat-input");
+        runtime.host_adapter =
+            Some(UiHostAdapter::activate(program.clone(), compiler_schema(true), 7).unwrap());
+
+        let frame = UiRepeatFrame {
+            template_key: "nameplate".into(),
+            list_revision: Revision(1),
+            rows: vec![
+                UiRepeatRow {
+                    stable_row_key: "npc.blacksmith".into(),
+                    values: BTreeMap::from([
+                        ("row_key".into(), UiInputValue::U32 { value: 1 }),
+                        ("health".into(), UiInputValue::F32 { value: 82.0 }),
+                        ("level".into(), UiInputValue::U32 { value: 12 }),
+                    ]),
+                    semantic_payload: BTreeMap::new(),
+                },
+                UiRepeatRow {
+                    stable_row_key: "npc.merchant".into(),
+                    values: BTreeMap::from([
+                        ("row_key".into(), UiInputValue::U32 { value: 2 }),
+                        ("health".into(), UiInputValue::F32 { value: 100.0 }),
+                        ("level".into(), UiInputValue::U32 { value: 20 }),
+                    ]),
+                    semantic_payload: BTreeMap::new(),
+                },
+            ],
+            expected_program_revision: revision,
+        };
+
+        let response = runtime.handle_service_request(RpcRequest {
+            protocol: "neon3.rpc".into(),
+            version: PROTOCOL_VERSION,
+            request_id: RequestId("bevy-repeat-1".into()),
+            client: runtime.client.clone(),
+            target: ServiceName(SERVICE_NAME.into()),
+            method: "ui.input.repeat".into(),
+            params: json!(frame),
+            expected_revision: None,
+            idempotency_key: Some("bevy-repeat-1".into()),
+        });
+
+        assert_eq!(response.status, RpcStatus::Accepted);
+        let result = response.result.expect("repeat input returns a result");
+        assert_eq!(result["accepted_rows"], 2);
+        assert_eq!(result["overflow_rows"], 0);
+        assert!(
+            runtime
+                .host_adapter
+                .as_ref()
+                .unwrap()
+                .repeat_frame("nameplate")
+                .is_some()
+        );
+
+        // A stale list revision must be rejected instead of silently applied.
+        let stale = UiRepeatFrame {
+            template_key: "nameplate".into(),
+            list_revision: Revision(1),
+            rows: Vec::new(),
+            expected_program_revision: program.revision.clone(),
+        };
+        let rejected = runtime.handle_service_request(RpcRequest {
+            protocol: "neon3.rpc".into(),
+            version: PROTOCOL_VERSION,
+            request_id: RequestId("bevy-repeat-2".into()),
+            client: runtime.client.clone(),
+            target: ServiceName(SERVICE_NAME.into()),
+            method: "ui.input.repeat".into(),
+            params: json!(stale),
+            expected_revision: None,
+            idempotency_key: Some("bevy-repeat-2".into()),
+        });
+        assert_eq!(rejected.status, RpcStatus::Rejected);
+        assert_eq!(
+            rejected.error.expect("rejection carries an error").code,
+            "ui_program_stale_input_revision"
+        );
+
+        // A row with a missing/wrong-typed field must be rejected.
+        let malformed = UiRepeatFrame {
+            template_key: "nameplate".into(),
+            list_revision: Revision(2),
+            rows: vec![UiRepeatRow {
+                stable_row_key: "npc.guard".into(),
+                values: BTreeMap::from([(
+                    "row_key".into(),
+                    UiInputValue::F32 { value: 3.0 },
+                )]),
+                semantic_payload: BTreeMap::new(),
+            }],
+            expected_program_revision: program.revision.clone(),
+        };
+        let rejected = runtime.handle_service_request(RpcRequest {
+            protocol: "neon3.rpc".into(),
+            version: PROTOCOL_VERSION,
+            request_id: RequestId("bevy-repeat-3".into()),
+            client: runtime.client.clone(),
+            target: ServiceName(SERVICE_NAME.into()),
+            method: "ui.input.repeat".into(),
+            params: json!(malformed),
+            expected_revision: None,
+            idempotency_key: Some("bevy-repeat-3".into()),
+        });
+        assert_eq!(rejected.status, RpcStatus::Rejected);
+        assert_eq!(
+            rejected.error.expect("rejection carries an error").code,
+            "ui_program_input_type_mismatch"
         );
     }
 }

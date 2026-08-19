@@ -10,12 +10,13 @@ use neon_protocol::ClientIdentity;
 use neon_ui_schema::{
     UiDataGridInputFrame, UiFragment, UiHostInbound, UiHostPresentationUpdate, UiHostPublication,
     UiInputSchema, UiProgram, UiProgramDragDropEvent, UiProgramInputSnapshot,
-    UiProgramSemanticEvent, UiWindowRequest,
+    UiProgramSemanticEvent, UiRepeatFrame, UiWindowRequest,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    UiDataGridStore, UiInputStore, UiInputStoreError, UiInputWriter, UiVariableEventPublisher,
+    UiDataGridStore, UiInputStore, UiInputStoreError, UiInputWriter, UiRepeatApplyResult,
+    UiRepeatStore, UiVariableEventPublisher,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -62,6 +63,7 @@ pub struct UiHostAdapter {
     program: UiProgram,
     inputs: UiInputStore,
     grids: UiDataGridStore,
+    repeats: UiRepeatStore,
     renderer_epoch: u64,
     publication_results: HashMap<String, UiHostPublicationResult>,
     /// Optional directed-event forwarder. When present and the active Flow
@@ -120,6 +122,7 @@ impl UiHostAdapter {
             program,
             inputs,
             grids: UiDataGridStore::default(),
+            repeats: UiRepeatStore::default(),
             renderer_epoch,
             publication_results: HashMap::new(),
             publisher: None,
@@ -290,6 +293,28 @@ impl UiHostAdapter {
             grid_inputs: Vec::new(),
             presentation_update: None,
         })
+    }
+
+    /// Returns the currently accepted repeat frame for a declared template, if any.
+    pub fn repeat_frame(&self, template_key: &str) -> Option<&UiRepeatFrame> {
+        self.repeats.frame(template_key)
+    }
+
+    /// Applies a host-owned batched instance frame (one `UiRepeatFrame` = N
+    /// template rows) through the bounded repeat store. This is the authoritative
+    /// input path for world-UI instances; each row is keyed by a stable anchor
+    /// and validated against the template's declared `row_schema`.
+    pub fn apply_repeat(
+        &mut self,
+        frame: UiRepeatFrame,
+    ) -> Result<UiRepeatApplyResult, UiHostAdapterError> {
+        let mut repeats = self.repeats.clone();
+        let result = repeats.apply(&self.program, frame).map_err(|error| UiHostAdapterError {
+            code: error.code,
+            message: "repeat input publication was rejected",
+        })?;
+        self.repeats = repeats;
+        Ok(result)
     }
 
     pub fn apply_presentation_update(

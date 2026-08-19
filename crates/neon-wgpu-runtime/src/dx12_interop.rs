@@ -65,6 +65,8 @@ pub struct SharedSurface {
     pub texture_handle: HANDLE,
     pub fence: ID3D12Fence,
     pub fence_handle: HANDLE,
+    pub consumer_fence: ID3D12Fence,
+    pub consumer_fence_handle: HANDLE,
     pub adapter: AdapterInfo,
     pub width: u32,
     pub height: u32,
@@ -176,6 +178,16 @@ pub fn create_shared_surface(
             .CreateSharedHandle(&fence, None, GENERIC_ALL.0, PCWSTR::null())
             .map_err(|error| Error::CreateSharedHandle(error.to_string()))?
     };
+    let consumer_fence: ID3D12Fence = unsafe {
+        raw_device
+            .CreateFence(0, D3D12_FENCE_FLAG_SHARED)
+            .map_err(|error| Error::CreateFence(error.to_string()))?
+    };
+    let consumer_fence_handle = unsafe {
+        raw_device
+            .CreateSharedHandle(&consumer_fence, None, GENERIC_ALL.0, PCWSTR::null())
+            .map_err(|error| Error::CreateSharedHandle(error.to_string()))?
+    };
     let hal_texture = unsafe {
         wgpu::hal::dx12::Device::texture_from_raw(
             resource.clone(),
@@ -216,6 +228,8 @@ pub fn create_shared_surface(
         texture_handle,
         fence,
         fence_handle,
+        consumer_fence,
+        consumer_fence_handle,
         adapter: adapter_info,
         width,
         height,

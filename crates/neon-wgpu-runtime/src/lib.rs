@@ -2213,9 +2213,10 @@ struct HeadlessExternalGpu {
     queue: wgpu::Queue,
     adapter: wgpu::Adapter,
     ui: UiWgpuRenderer,
-    external_surfaces: HashMap<String, dx12_interop::SharedSurface>,
-    external_id_surfaces: HashMap<String, dx12_interop::SharedSurface>,
+    external_surfaces: HashMap<String, Vec<dx12_interop::SharedSurface>>,
+    external_id_surfaces: HashMap<String, Vec<dx12_interop::SharedSurface>>,
     external_handle_tokens: HashMap<String, (String, String)>,
+    next_external_frame_sequence: u64,
 }
 
 #[cfg(windows)]
@@ -2249,25 +2250,31 @@ impl HeadlessExternalGpu {
             external_surfaces: HashMap::new(),
             external_id_surfaces: HashMap::new(),
             external_handle_tokens: HashMap::new(),
+            next_external_frame_sequence: 0,
         })
     }
 
     fn open(&mut self, open: RenderSurfaceOpen) -> Result<Value, String> {
-        if open.format != "rgba8unorm" || open.buffer_count != 1 {
+        if open.format != "rgba8unorm" || !(2..=3).contains(&open.buffer_count) {
             return Err("headless_external_surface_format_or_buffer_unsupported".into());
         }
         if self.external_surfaces.contains_key(&open.surface_id) {
             return Err("surface_already_open".into());
         }
-        let shared = dx12_interop::create_shared_surface(
-            &self.device,
-            &self.adapter,
-            open.size.width.max(1),
-            open.size.height.max(1),
-            wgpu::TextureFormat::Rgba8Unorm,
-        )
-        .map_err(|error| error.to_string())?;
-        self.external_surfaces.insert(open.surface_id.clone(), shared);
+        let mut surfaces = Vec::with_capacity(open.buffer_count as usize);
+        for _ in 0..open.buffer_count {
+            surfaces.push(
+                dx12_interop::create_shared_surface(
+                    &self.device,
+                    &self.adapter,
+                    open.size.width.max(1),
+                    open.size.height.max(1),
+                    wgpu::TextureFormat::Rgba8Unorm,
+                )
+                .map_err(|error| error.to_string())?,
+            );
+        }
+        self.external_surfaces.insert(open.surface_id.clone(), surfaces);
         let generation = 1;
         let texture_token = format!("surface:{}:texture:g{}", open.surface_id, generation);
         let fence_token = format!("surface:{}:fence:g{}", open.surface_id, generation);
@@ -2276,19 +2283,25 @@ impl HeadlessExternalGpu {
             (texture_token.clone(), fence_token.clone()),
         );
         if open.targets.iter().any(|target| target.kind == RenderSurfaceTargetKind::Id) {
-            let id_surface = dx12_interop::create_shared_surface(
-                &self.device,
-                &self.adapter,
-                open.size.width.max(1),
-                open.size.height.max(1),
-                wgpu::TextureFormat::R32Uint,
-            )
-            .map_err(|error| error.to_string())?;
-            self.external_id_surfaces.insert(open.surface_id.clone(), id_surface);
+            let mut id_surfaces = Vec::with_capacity(open.buffer_count as usize);
+            for _ in 0..open.buffer_count {
+                id_surfaces.push(
+                    dx12_interop::create_shared_surface(
+                        &self.device,
+                        &self.adapter,
+                        open.size.width.max(1),
+                        open.size.height.max(1),
+                        wgpu::TextureFormat::R32Uint,
+                    )
+                    .map_err(|error| error.to_string())?,
+                );
+            }
+            self.external_id_surfaces.insert(open.surface_id.clone(), id_surfaces);
         }
         Ok(json!({
             "surface_id": open.surface_id,
             "generation": generation,
+            "buffer_count": open.buffer_count,
             "transport": "d3d12_shared_texture_v1",
             "texture_token": texture_token,
             "fence_token": fence_token
@@ -2301,16 +2314,47 @@ impl HeadlessExternalGpu {
             .external_handle_tokens
             .get(surface_id)
             .ok_or("surface_broker_token_not_found")?;
+        let buffers = shared
+            .iter()
+            .enumerate()
+            .map(|(index, shared)| {
+                let mut buffer = json!({
+                    "buffer_index": index,
+                    "color_texture_handle": dx12_interop::duplicate_handle_to_process(shared.texture_handle, pid).map_err(|error| error.to_string())?,
+                    "color_fence_handle": dx12_interop::duplicate_handle_to_process(shared.fence_handle, pid).map_err(|error| error.to_string())?,
+                    "consumer_release_fence_handle": dx12_interop::duplicate_handle_to_process(shared.consumer_fence_handle, pid).map_err(|error| error.to_string())?
+                });
+                if let Some(id_surfaces) = self.external_id_surfaces.get(surface_id)
+                    && let Some(id_surface) = id_surfaces.get(index)
+                {
+                    buffer["id_texture_handle"] = json!(dx12_interop::duplicate_handle_to_process(id_surface.texture_handle, pid).map_err(|error| error.to_string())?);
+                    buffer["id_fence_handle"] = json!(dx12_interop::duplicate_handle_to_process(id_surface.fence_handle, pid).map_err(|error| error.to_string())?);
+                }
+                Ok(buffer)
+            })
+            .collect::<Result<Vec<_>, String>>()?;
         let mut result = json!({
             "surface_id": surface_id,
             "texture_token": texture_token,
             "fence_token": fence_token,
-            "texture_handle": dx12_interop::duplicate_handle_to_process(shared.texture_handle, pid).map_err(|error| error.to_string())?,
-            "fence_handle": dx12_interop::duplicate_handle_to_process(shared.fence_handle, pid).map_err(|error| error.to_string())?
+            "buffers": buffers
         });
-        if let Some(id_surface) = self.external_id_surfaces.get(surface_id) {
-            result["id_texture_handle"] = json!(dx12_interop::duplicate_handle_to_process(id_surface.texture_handle, pid).map_err(|error| error.to_string())?);
-            result["id_fence_handle"] = json!(dx12_interop::duplicate_handle_to_process(id_surface.fence_handle, pid).map_err(|error| error.to_string())?);
+        // Transitional compatibility for consumers that have not yet upgraded
+        // to the ring response. Remove once the three-buffer consumer lands.
+        if let Some((texture, fence, id_texture, id_fence)) = result["buffers"]
+            .as_array()
+            .and_then(|buffers| buffers.first())
+            .map(|first| (
+                first["color_texture_handle"].clone(),
+                first["color_fence_handle"].clone(),
+                first["id_texture_handle"].clone(),
+                first["id_fence_handle"].clone(),
+            ))
+        {
+            result["texture_handle"] = texture;
+            result["fence_handle"] = fence;
+            result["id_texture_handle"] = id_texture;
+            result["id_fence_handle"] = id_fence;
         }
         Ok(result)
     }
@@ -2322,10 +2366,39 @@ impl HeadlessExternalGpu {
         // The filtered snapshot contains live world-panel bounds derived from
         // the latest camera and anchor, not a new UI program revision.
         self.ui.invalidate_plan();
+        self.next_external_frame_sequence = self.next_external_frame_sequence.saturating_add(1);
+        let frame_sequence = self.next_external_frame_sequence;
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("neon3-headless-external-ui"),
         });
-        for shared in self.external_surfaces.values_mut() {
+        for shared_ring in self.external_surfaces.values_mut() {
+            // Acquire a buffer the consumer has actually released. The consumer
+            // signals its per-buffer release fence once it has finished sampling
+            // that buffer, so a buffer is reusable when the fence value has
+            // reached (or passed) the frame sequence last written to it.
+            //
+            // This is a CPU read of a GPU-signaled fence. It deliberately does
+            // NOT GPU-wait on the oldest buffer: the consumer only samples the
+            // newest buffer, so waiting on `min(frame_sequence)` can deadlock
+            // (the producer blocks on buffer 0's release while the consumer
+            // keeps releasing only buffer 2). Dropping the frame keeps the
+            // overlay alive and simply shows the last completed frame.
+            let Some(write_index) = shared_ring
+                .iter()
+                .enumerate()
+                .find_map(|(index, shared)| {
+                    (unsafe { shared.consumer_fence.GetCompletedValue() } >= shared.frame_sequence)
+                        .then_some(index)
+                })
+            else {
+                eprintln!(
+                    "[neon-wgpu-runtime] shared UI drop frame={frame_sequence} (no free buffer)"
+                );
+                continue;
+            };
+            let shared = &mut shared_ring[write_index];
+            let hal_queue = unsafe { self.queue.as_hal::<wgpu::hal::api::Dx12>() }
+                .ok_or("dx12_queue_unavailable")?;
             let view = shared.texture.create_view(&wgpu::TextureViewDescriptor::default());
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("neon3-headless-external-ui-pass"),
@@ -2342,8 +2415,11 @@ impl HeadlessExternalGpu {
             });
             self.ui.draw(&self.device, &self.queue, &mut pass, fragments, [shared.width, shared.height], [shared.width as f32, shared.height as f32], 0.0);
             drop(pass);
-            shared.frame_sequence = shared.frame_sequence.saturating_add(1);
-            let hal_queue = unsafe { self.queue.as_hal::<wgpu::hal::api::Dx12>() }.ok_or("dx12_queue_unavailable")?;
+            shared.frame_sequence = frame_sequence;
+            eprintln!(
+                "[neon-wgpu-runtime] shared UI produce buffer={} frame={}",
+                write_index, frame_sequence
+            );
             hal_queue.add_signal_fence(shared.fence.clone(), shared.frame_sequence);
         }
         self.queue.submit(Some(encoder.finish()));

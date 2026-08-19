@@ -23,7 +23,7 @@ world position，要经摄像机正确映射、视锥外剔除、与 screen UI �
 
 | 需求点 | 现状 | 结论 |
 | --- | --- | --- |
-| 泛型 world UI 组件绑定 `.nui` + 变量 | 已有 `nui_flow_vars!` 宏 + `NuiFlowVars` trait，但只用于单一 `CharacterStatusVars` | 需扩展为泛型 `NeonWorldUi<V>` 组件 + trait 加回写方法 |
+| 泛型 world UI 组件绑定 `.nui` + 变量 | `NeonWorldUi<V>`、`NuiFlowVars::row_snapshot/apply_changes`、可见 row helper 已接入 host；Mei 已实际挂载 `NeonWorldUi<CharacterStatusVars>` | 仍需把多个组件聚合为正式 `ui.input.repeat` frame，并让 renderer 消费 repeat rows |
 | 1000 实例合并渲染 | `world_ui_pipeline.rs` 已有深度测试 quad 管线 + `MAX_WORLD_UI_QUADS`（当前 lab 模式） | 升级为正式路径 |
 | 每实例不同 world position | `WorldUiAnchor` + `project_world_point_to_screen*` 已存在 | 复用 |
 | 每实例变量通信（难点） | `UiTemplateDeclaration` + `UiRepeatFrame`/`UiRepeatRow` 已存在（批量 per-instance 输入） | 复用，把实例映射为 template row |
@@ -103,7 +103,7 @@ pub struct UiRepeatFrame {
 
 ### 1.2 关键缺口（本方案要补的）
 
-1. **没有泛型 world UI 组件**：`CharacterStatusVars` 是硬编码单一案例，无 `NeonWorldUi<V>`。
+1. **泛型组件的批量运行链尚未完整**：host 已有 `NeonWorldUi<V>` 和 typed row/writeback，但当前 Mei 案例仍保留旧 `CharacterStatusBridge` 标量 frame；需迁移为 repeat frame 并接 renderer 实例消费。
 2. **没有「UI → Bevy 变量回写」方向**：现有变量只单向 `Bevy → UI`；点击导致的变量变化没有
    权威回流通道（eventd 观测不算权威）。
 3. **world UI 与 screen UI 仍是两套 pass**，未合成一张带深度的统一纹理导出。
