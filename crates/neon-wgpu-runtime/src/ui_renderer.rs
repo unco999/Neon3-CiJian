@@ -240,7 +240,6 @@ struct VsOut { @builtin(position) position: vec4<f32>, @location(0) local: vec2<
 "#;
 
 const BUILTIN_UI_FONT: &[u8] = include_bytes!("../../../assets/fonts/SarasaUiSC-Light.ttf");
-const EXTERNAL_WORLD_DEPTH_MIN: f32 = 0.001;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
@@ -3774,7 +3773,9 @@ impl UiWgpuRenderer {
             }
         }
         self.pointer_visual_dirty = false;
-        self.append_text_input_overlays();
+        if mode != UiDrawMode::World {
+            self.append_text_input_overlays();
+        }
         self.last_panel_instance_count = self.instances.len();
         if self.instances.len() > self.instance_capacity {
             self.instance_capacity = self.instances.len().next_power_of_two();
@@ -3979,35 +3980,36 @@ impl UiWgpuRenderer {
                         .collect::<Vec<_>>()
                 };
                 if mode != UiDrawMode::World {
-                for (index, visual) in self.sampled.iter().enumerate() {
-                    if top_layer[index].is_none() {
-                        continue;
-                    }
-                    if !visible_top_layer[index] {
-                        continue;
-                    }
-                    if let Some(text) = visual.text.as_ref().and_then(text_ref_value)
-                        && matches!(
-                            visual.kind,
-                            UiNodeKind::Label
-                                | UiNodeKind::Button
-                                | UiNodeKind::TextInput
-                                | UiNodeKind::Checkbox
-                                | UiNodeKind::RadioButton
-                                | UiNodeKind::Slider
-                                | UiNodeKind::DragValue
-                                | UiNodeKind::Combo
-                                | UiNodeKind::Dropdown
-                                | UiNodeKind::Tabs
-                                | UiNodeKind::Selectable
-                                | UiNodeKind::Scrollbar
-                                | UiNodeKind::ProgressBar
-                                | UiNodeKind::Tooltip
-                        )
-                        && let Some(instances) =
-                            layout_text(device, queue, font, visual, text, None)
-                    {
-                        popup_texts.extend(instances);
+                    for (index, visual) in self.sampled.iter().enumerate() {
+                        if top_layer[index].is_none() {
+                            continue;
+                        }
+                        if !visible_top_layer[index] {
+                            continue;
+                        }
+                        if let Some(text) = visual.text.as_ref().and_then(text_ref_value)
+                            && matches!(
+                                visual.kind,
+                                UiNodeKind::Label
+                                    | UiNodeKind::Button
+                                    | UiNodeKind::TextInput
+                                    | UiNodeKind::Checkbox
+                                    | UiNodeKind::RadioButton
+                                    | UiNodeKind::Slider
+                                    | UiNodeKind::DragValue
+                                    | UiNodeKind::Combo
+                                    | UiNodeKind::Dropdown
+                                    | UiNodeKind::Tabs
+                                    | UiNodeKind::Selectable
+                                    | UiNodeKind::Scrollbar
+                                    | UiNodeKind::ProgressBar
+                                    | UiNodeKind::Tooltip
+                            )
+                            && let Some(instances) =
+                                layout_text(device, queue, font, visual, text, None)
+                        {
+                            popup_texts.extend(instances);
+                        }
                     }
                 }
                 (texts, popup_texts)
@@ -4282,8 +4284,12 @@ impl UiWgpuRenderer {
             return;
         };
         // The exported convention is 0.0 = near/always-on-top and 1.0 = far.
-        // R32Float has no depth test of its own, so emit complete groups far to
-        // near; the later near group overwrites the earlier far value.
+        // This target only ever carries projected world panels (the screen
+        // surface has no depth ring), so the raw normalized world depth is
+        // written unchanged -- no reserved marker value is needed to keep
+        // screen UI on top anymore. R32Float has no depth test of its own, so
+        // emit complete groups far to near; the later near group overwrites
+        // the earlier far value.
         let mut groups: HashMap<u32, Vec<UiInstance>> = HashMap::new();
         for instance in &self.instances {
             groups
@@ -4298,9 +4304,6 @@ impl UiWgpuRenderer {
                 .filter(|node| node.paint_group_id == group_id)
                 .find_map(|node| node.target.world_depth)
         };
-        // World groups are written first, screen groups last. Screen depth 0
-        // therefore overwrites a world depth at overlap and keeps screen UI on
-        // top without leaving the normalized [0, 1] range.
         let group_depth_value = |group_id: u32| group_depth(group_id).unwrap_or(0.0);
         group_ids.sort_by(|a, b| {
             match (group_depth(*a), group_depth(*b)) {
@@ -4314,7 +4317,7 @@ impl UiWgpuRenderer {
         });
         for group_id in group_ids {
             if let Some(group) = groups.get(&group_id) {
-                let external_depth = group_depth_value(group_id).max(EXTERNAL_WORLD_DEPTH_MIN);
+                let external_depth = group_depth_value(group_id);
                 let depth_instances = group
                     .iter()
                     .map(|instance| UiInstance {
@@ -5780,6 +5783,7 @@ pub(crate) fn render_renderer_with_viewport_offscreen_for_test(
             size,
             logical_viewport,
             time_seconds,
+            UiDrawMode::All,
         );
     }
     encoder.copy_texture_to_buffer(

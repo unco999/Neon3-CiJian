@@ -58,7 +58,7 @@ mod dx12_interop;
 use gpu_preview::HeightmapPreviewConverter;
 pub use ui_program_gpu::GpuUiProgramBackend;
 use ui_renderer::{
-    LocalPresentationCommit, PendingLocalPresentationKey, UiHitBinding, UiWgpuRenderer,
+    LocalPresentationCommit, PendingLocalPresentationKey, UiDrawMode, UiHitBinding, UiWgpuRenderer,
 };
 use world_ui_pipeline::{WorldUiCamera, WorldUiCameraState, WorldUiPipeline};
 
@@ -1503,6 +1503,7 @@ impl WindowedRuntime {
                     WORLD_UI_LAB_LOGICAL_SIZE[1] as f32,
                 ],
                 gpu.started_at.elapsed().as_secs_f32(),
+                UiDrawMode::All,
             );
         }
         let camera_state = gpu
@@ -1555,6 +1556,7 @@ impl WindowedRuntime {
                 gpu.physical_viewport_size(),
                 gpu.logical_viewport_size(),
                 gpu.started_at.elapsed().as_secs_f32(),
+                UiDrawMode::All,
             );
             drop(pass);
             gpu.last_draw_instance_count = gpu.ui.last_panel_instance_count();
@@ -2630,7 +2632,12 @@ impl HeadlessExternalGpu {
         Ok(result)
     }
 
-    fn render(&mut self, snapshots: &HashMap<RenderSurfaceKind, HashMap<UiFragmentId, UiFragment>>, snapshot_ms: f32) -> Result<(), String> {
+    fn render(
+        &mut self,
+        snapshots: &HashMap<RenderSurfaceKind, HashMap<UiFragmentId, UiFragment>>,
+        combined: &HashMap<UiFragmentId, UiFragment>,
+        snapshot_ms: f32,
+    ) -> Result<(), String> {
         if self.external_surfaces.is_empty() {
             return Ok(());
         }
@@ -2752,15 +2759,27 @@ impl HeadlessExternalGpu {
             });
             let stage = Instant::now();
             let kind = self.surface_kinds.get(surface_id).copied().unwrap_or(RenderSurfaceKind::ScreenUi);
-            let fragments = snapshots.get(&kind).unwrap_or_else(|| snapshots.values().next().expect("surface snapshot"));
-            self.ui.draw(&self.device, &self.queue, &mut pass, fragments, [shared.width, shared.height], [shared.width as f32, shared.height as f32], 0.0);
-            timing.color_pass_ms += stage.elapsed().as_secs_f32() * 1000.0;
+            let mode = match kind {
+                RenderSurfaceKind::WorldUi => UiDrawMode::World,
+                _ => UiDrawMode::Screen,
+            };
+            let fragments = snapshots.get(&kind);
+            // A surface whose kind has no snapshot (e.g. a world surface opened
+            // while the Flow only declares screen UI) renders its clear color
+            // only. Never fall back to another kind's snapshot: that would
+            // paint screen UI into the world target (and vice versa).
+            if let Some(fragments) = fragments {
+                self.ui.draw(&self.device, &self.queue, &mut pass, fragments, [shared.width, shared.height], [shared.width as f32, shared.height as f32], 0.0, mode);
+                timing.color_pass_ms += stage.elapsed().as_secs_f32() * 1000.0;
+            }
             drop(pass);
             // Occlusion depth pass: re-emit the same instances into the matched
             // R32Float ring buffer so the consumer can depth-test the overlay
             // against its scene depth. Uses the same buffer index as the color
-            // ring so both stay frame-coherent.
-            if let Some(depth_ring) = self.external_depth_surfaces.get_mut(surface_id)
+            // ring so both stay frame-coherent. Only runs when the color pass
+            // actually drew (draw_depth consumes this pass's instances).
+            if fragments.is_some()
+                && let Some(depth_ring) = self.external_depth_surfaces.get_mut(surface_id)
                 && let Some(depth_shared) = depth_ring.get_mut(write_index)
             {
                 let depth_view = depth_shared
@@ -2810,11 +2829,16 @@ impl HeadlessExternalGpu {
                     multiview_mask: None,
                 });
                 let stage = Instant::now();
+                // The ID target is the unified pick buffer for the whole
+                // combined Flow: it carries every hit binding (screen and
+                // world) so the consumer resolves pointer hits from one
+                // texture regardless of which color target the panel came
+                // from. Same buffer index / frame sequence as color.
                 self.ui.draw_hit_id(
                     &self.device,
                     &self.queue,
                     &mut id_pass,
-                    fragments,
+                    combined,
                     [id_shared.width, id_shared.height],
                     [id_shared.width as f32, id_shared.height as f32],
                     0.0,
@@ -2905,14 +2929,14 @@ pub fn spawn_headless_external_server(endpoint: SocketAddr) -> std::thread::Join
                     while !render_stop.load(std::sync::atomic::Ordering::Relaxed) {
                         std::thread::sleep(Duration::from_millis(16));
                         let snapshot_start = Instant::now();
-                         let snapshots = match render_runtime.lock() {
+                         let (snapshots, combined) = match render_runtime.lock() {
                              Ok(runtime) => runtime.external_surface_snapshots(),
                             Err(_) => break,
                         };
                         let snapshot_ms = snapshot_start.elapsed().as_secs_f32() * 1000.0;
                         match render_gpu.lock() {
                             Ok(mut gpu) => {
-                                 if let Err(error) = gpu.render(&snapshots, snapshot_ms) {
+                                 if let Err(error) = gpu.render(&snapshots, &combined, snapshot_ms) {
                                     eprintln!("[neon-wgpu-runtime] render error: {error}");
                                 }
                             }
@@ -3209,6 +3233,7 @@ impl WindowGpu {
                 [shared.width, shared.height],
                 [shared.width as f32, shared.height as f32],
                 self.started_at.elapsed().as_secs_f32(),
+                UiDrawMode::All,
             );
             drop(pass);
             shared.frame_sequence = shared.frame_sequence.saturating_add(1);
@@ -3300,6 +3325,7 @@ impl WindowGpu {
                     WORLD_UI_LAB_LOGICAL_SIZE[1] as f32,
                 ],
                 self.started_at.elapsed().as_secs_f32(),
+                UiDrawMode::All,
             );
         }
         self.queue.submit(Some(encoder.finish()));
@@ -7100,21 +7126,25 @@ impl WgpuRuntime {
 
     pub fn external_surface_snapshots(
         &self,
-    ) -> HashMap<RenderSurfaceKind, HashMap<UiFragmentId, UiFragment>> {
+    ) -> (
+        HashMap<RenderSurfaceKind, HashMap<UiFragmentId, UiFragment>>,
+        HashMap<UiFragmentId, UiFragment>,
+    ) {
         let combined = self.fragments_snapshot();
-        [
+        let split = [
             (RenderSurfaceKind::ScreenUi, combined.iter().map(|(id, fragment)| {
                 let mut fragment = fragment.clone();
-                retain_surface_nodes(&mut fragment.root, &fragment.effects, RenderSurfaceKind::ScreenUi);
+                retain_surface_nodes(&mut fragment.root, &fragment.effects, RenderSurfaceKind::ScreenUi, false);
                 fragment.effects.retain(|effect| !matches!(effect, neon_ui_schema::UiEffect::CameraVisibility { .. }));
                 (id.clone(), fragment)
             }).collect()),
             (RenderSurfaceKind::WorldUi, combined.iter().map(|(id, fragment)| {
                 let mut fragment = fragment.clone();
-                retain_surface_nodes(&mut fragment.root, &fragment.effects, RenderSurfaceKind::WorldUi);
+                retain_surface_nodes(&mut fragment.root, &fragment.effects, RenderSurfaceKind::WorldUi, false);
                 (id.clone(), self.filter_world_panels(&fragment))
             }).collect()),
-        ].into_iter().collect()
+        ].into_iter().collect();
+        (split, combined)
     }
 
     fn filter_world_panels(&self, fragment: &UiFragment) -> UiFragment {
@@ -8210,24 +8240,28 @@ fn retain_surface_nodes(
     node: &mut neon_ui_schema::UiNode,
     effects: &[neon_ui_schema::UiEffect],
     kind: RenderSurfaceKind,
+    inherited_world: bool,
 ) -> bool {
-    let is_world = effects.iter().any(|effect| {
-        matches!(effect, neon_ui_schema::UiEffect::CameraVisibility { binding } if binding.node_id == node.node_id)
+    // A node belongs to the world surface if it is a projected world panel or
+    // any ancestor is. World subtrees must move as one unit: the panel's leaf
+    // children (labels, bars, images) have no CameraVisibility effect of their
+    // own yet must follow the panel into the world target.
+    let is_world = inherited_world
+        || effects.iter().any(|effect| {
+            matches!(effect, neon_ui_schema::UiEffect::CameraVisibility { binding } if binding.node_id == node.node_id)
+        });
+    node.children.retain_mut(|child| {
+        retain_surface_nodes(child, effects, kind, is_world)
     });
-    node.children.retain_mut(|child| retain_surface_nodes(child, effects, kind));
-    let has_world_child = !node.children.is_empty();
-    match kind {
-        RenderSurfaceKind::WorldUi => {
-            let keep = is_world || has_world_child;
-            node.visible &= keep;
-            keep
-        }
-        RenderSurfaceKind::ScreenUi => {
-            let keep = !is_world;
-            node.visible &= keep;
-            keep
-        }
-    }
+    let keep = match kind {
+        // Structural containers (the transparent fragment root) are not world
+        // nodes themselves but must survive so their world descendants stay
+        // reachable by the layout pass.
+        RenderSurfaceKind::WorldUi => is_world || !node.children.is_empty(),
+        RenderSurfaceKind::ScreenUi => !is_world,
+    };
+    node.visible &= keep;
+    keep
 }
 
 fn diagnostics_value(diagnostics: RenderDiagnostics) -> Value {
@@ -8292,6 +8326,86 @@ mod tests {
             })
             .unwrap();
         controller
+    }
+
+    fn surface_split_fragment() -> UiFragment {
+        fn node(id: &str, kind: UiNodeKind, children: Vec<UiNode>) -> UiNode {
+            UiNode {
+                node_id: UiNodeId(id.into()),
+                kind,
+                bounds: UiBounds { x: 0.0, y: 0.0, width: 10.0, height: 10.0 },
+                layout: None,
+                visible: true,
+                enabled: true,
+                text_key: None,
+                text: None,
+                image: None,
+                surface: None,
+                style: UiStyle::default(),
+                enter_transition: None,
+                world_depth: None,
+                children,
+            }
+        }
+        UiFragment {
+            fragment_id: UiFragmentId("surface-split".into()),
+            revision: Revision(1),
+            effects: vec![neon_ui_schema::UiEffect::CameraVisibility {
+                binding: neon_ui_schema::UiCameraVisibilityBinding {
+                    node_id: UiNodeId("world-panel".into()),
+                    camera_id: CameraId("cam".into()),
+                    camera_kind: neon_world_bridge::CameraKind::ThreeDimensional,
+                    anchor_id: None,
+                },
+            }],
+            root: node(
+                "root",
+                UiNodeKind::Panel,
+                vec![
+                    node(
+                        "world-panel",
+                        UiNodeKind::Panel,
+                        vec![node("world-label", UiNodeKind::Label, vec![])],
+                    ),
+                    node("screen-button", UiNodeKind::Button, vec![]),
+                ],
+            ),
+        }
+    }
+
+    fn retained_ids(root: &UiNode, ids: &mut Vec<String>) {
+        if root.visible {
+            ids.push(root.node_id.0.clone());
+        }
+        for child in &root.children {
+            retained_ids(child, ids);
+        }
+    }
+
+    #[test]
+    fn retain_surface_nodes_keeps_world_subtrees_and_screen_ui_separate() {
+        let fragment = surface_split_fragment();
+
+        let mut world = fragment.clone();
+        retain_surface_nodes(&mut world.root, &world.effects, RenderSurfaceKind::WorldUi, false);
+        let mut world_ids = Vec::new();
+        retained_ids(&world.root, &mut world_ids);
+        // The transparent root container survives so the layout pass can reach
+        // the world subtree; the whole world subtree (panel + leaf label) is
+        // kept; the screen button is dropped.
+        assert!(world_ids.contains(&"root".to_string()));
+        assert!(world_ids.contains(&"world-panel".to_string()));
+        assert!(world_ids.contains(&"world-label".to_string()));
+        assert!(!world_ids.contains(&"screen-button".to_string()));
+
+        let mut screen = fragment.clone();
+        retain_surface_nodes(&mut screen.root, &screen.effects, RenderSurfaceKind::ScreenUi, false);
+        let mut screen_ids = Vec::new();
+        retained_ids(&screen.root, &mut screen_ids);
+        assert!(screen_ids.contains(&"root".to_string()));
+        assert!(!screen_ids.contains(&"world-panel".to_string()));
+        assert!(!screen_ids.contains(&"world-label".to_string()));
+        assert!(screen_ids.contains(&"screen-button".to_string()));
     }
 
     #[test]
@@ -9613,6 +9727,7 @@ mod tests {
                     WORLD_UI_LAB_LOGICAL_SIZE[1] as f32,
                 ],
                 0.0,
+                UiDrawMode::All,
             );
         }
         queue.submit(Some(encoder.finish()));
