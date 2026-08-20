@@ -3709,6 +3709,18 @@ impl UiWgpuRenderer {
         // CPU first-press handling must be ready as soon as the visible frame is
         // drawn; asynchronous GPU hit readback is only supplemental.
         self.refresh_hit_bindings(fragments);
+        if mode == UiDrawMode::World {
+            static DIAG: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let tick = DIAG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if tick % 120 == 0 {
+                eprintln!(
+                    "[neon-wgpu-runtime] world draw: plan={} instances={} sampled_world={}",
+                    self.plan.len(),
+                    self.instances.len(),
+                    self.sampled.iter().filter(|visual| visual.world_depth.is_some()).count(),
+                );
+            }
+        }
         // Dropdown/modal/tooltip chrome is screen-UI presentation; the world
         // target never carries it. World panels are only emitted through the
         // ordinary instance loop above, so a World pass emits zero popups.
@@ -4369,6 +4381,29 @@ impl UiWgpuRenderer {
             &self.data_grid_text_display_cache,
             &self.available_cameras,
         );
+        {
+            static DIAG: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let tick = DIAG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if tick % 120 == 0 {
+                let mut root_info = "no-fragments".to_string();
+                if let Some(fragment) = display_fragments.values().next() {
+                    root_info = format!(
+                        "id={} root_visible={} root_opacity={} root_children={} effects={}",
+                        fragment.fragment_id.0,
+                        fragment.root.visible,
+                        fragment.root.style.opacity,
+                        fragment.root.children.len(),
+                        fragment.effects.len(),
+                    );
+                }
+                eprintln!(
+                    "[neon-wgpu-runtime] refresh_plan: fragments={} nodes={} [{}]",
+                    display_fragments.len(),
+                    nodes.len(),
+                    root_info,
+                );
+            }
+        }
         let live: HashSet<_> = nodes.iter().map(|(id, _, _, _)| id.clone()).collect();
         if viewport_changed {
             self.current.clear();

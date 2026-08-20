@@ -2334,6 +2334,8 @@ struct HeadlessExternalGpu {
     queue: wgpu::Queue,
     adapter: wgpu::Adapter,
     ui: UiWgpuRenderer,
+    screen_ui: UiWgpuRenderer,
+    world_ui: UiWgpuRenderer,
     input: LocalInputState,
     captured_binding: Option<UiHitBinding>,
     pending_control_value: Option<neon_ui_schema::UiSemanticPayloadValue>,
@@ -2376,6 +2378,12 @@ impl HeadlessExternalGpu {
         .map_err(|error| format!("headless external device: {error}"))?;
         Ok(Self {
             ui: UiWgpuRenderer::new_with_depth(
+                &device,
+                wgpu::TextureFormat::Rgba8Unorm,
+                wgpu::TextureFormat::R32Float,
+            ),
+            screen_ui: UiWgpuRenderer::new(&device, wgpu::TextureFormat::Rgba8Unorm),
+            world_ui: UiWgpuRenderer::new_with_depth(
                 &device,
                 wgpu::TextureFormat::Rgba8Unorm,
                 wgpu::TextureFormat::R32Float,
@@ -2670,9 +2678,16 @@ impl HeadlessExternalGpu {
         }
         self.last_external_render_at = Some(Instant::now());
         // The filtered snapshot contains live world-panel bounds derived from
-        // the latest camera and anchor, not a new UI program revision.
+        // the latest camera and anchor, not a new UI program revision. The
+        // renderers cache their flattened plan keyed by `fragment.revision`,
+        // which does NOT change when only the projected bounds move. Each
+        // renderer must therefore invalidate its plan so the re-projected
+        // bounds actually reach the color/depth pass; otherwise the world UI
+        // freezes at its first projected position.
         let stage = Instant::now();
         self.ui.invalidate_plan();
+        self.world_ui.invalidate_plan();
+        self.screen_ui.invalidate_plan();
         timing.invalidate_plan_ms = stage.elapsed().as_secs_f32() * 1000.0;
         self.next_external_frame_sequence = self.next_external_frame_sequence.saturating_add(1);
         let frame_sequence = self.next_external_frame_sequence;
@@ -2690,17 +2705,11 @@ impl HeadlessExternalGpu {
                         color.consumer_fence.GetCompletedValue() >= color.frame_sequence
                     })
                 });
-                let depth_free = self.external_depth_surfaces.values().all(|ring| {
-                    ring.get(index).is_none_or(|depth| unsafe {
-                        depth.consumer_fence.GetCompletedValue() >= depth.frame_sequence
-                    })
-                });
-                let id_free = self.external_id_surfaces.values().all(|ring| {
-                    ring.get(index).is_none_or(|id| unsafe {
-                        id.consumer_fence.GetCompletedValue() >= id.frame_sequence
-                    })
-                });
-                (color_free && depth_free && id_free).then_some(index)
+                // Color rings are the ownership fence for a published frame.
+                // Depth/ID are auxiliary targets for the same slot and must
+                // not independently exhaust the producer ring when their
+                // consumer fence becomes visible one render tick later.
+                color_free.then_some(index)
             })
         });
         let Some(write_index) = write_index else {
@@ -2730,11 +2739,24 @@ impl HeadlessExternalGpu {
             let hal_queue = unsafe { self.queue.as_hal::<wgpu::hal::api::Dx12>() }
                 .ok_or("dx12_queue_unavailable")?;
             let view = shared.texture.create_view(&wgpu::TextureViewDescriptor::default());
-            let color_depth_view = self
-                .color_depth_targets
-                .get(surface_id)
-                .and_then(|targets| targets.get(write_index))
-                .map(|target| target.create_view(&wgpu::TextureViewDescriptor::default()));
+            let kind = self.surface_kinds.get(surface_id).copied().unwrap_or(RenderSurfaceKind::ScreenUi);
+            let mode = match kind {
+                RenderSurfaceKind::WorldUi => UiDrawMode::World,
+                _ => UiDrawMode::Screen,
+            };
+            // Only the world/all renderers declare a depth-stencil format. The
+            // screen UI pipeline has `depth_stencil: None`, so attaching a local
+            // Depth32Float target to its color pass fails validation (pipeline
+            // targets are incompatible with the render pass). Attach depth only
+            // for renderers that actually consume it.
+            let color_depth_view = if matches!(mode, UiDrawMode::World | UiDrawMode::All) {
+                self.color_depth_targets
+                    .get(surface_id)
+                    .and_then(|targets| targets.get(write_index))
+                    .map(|target| target.create_view(&wgpu::TextureViewDescriptor::default()))
+            } else {
+                None
+            };
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("neon3-headless-external-ui-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -2758,18 +2780,18 @@ impl HeadlessExternalGpu {
                 multiview_mask: None,
             });
             let stage = Instant::now();
-            let kind = self.surface_kinds.get(surface_id).copied().unwrap_or(RenderSurfaceKind::ScreenUi);
-            let mode = match kind {
-                RenderSurfaceKind::WorldUi => UiDrawMode::World,
-                _ => UiDrawMode::Screen,
-            };
             let fragments = snapshots.get(&kind);
             // A surface whose kind has no snapshot (e.g. a world surface opened
             // while the Flow only declares screen UI) renders its clear color
             // only. Never fall back to another kind's snapshot: that would
             // paint screen UI into the world target (and vice versa).
             if let Some(fragments) = fragments {
-                self.ui.draw(&self.device, &self.queue, &mut pass, fragments, [shared.width, shared.height], [shared.width as f32, shared.height as f32], 0.0, mode);
+                let renderer = match mode {
+                    UiDrawMode::World => &mut self.world_ui,
+                    UiDrawMode::Screen => &mut self.screen_ui,
+                    UiDrawMode::All => &mut self.ui,
+                };
+                renderer.draw(&self.device, &self.queue, &mut pass, fragments, [shared.width, shared.height], [shared.width as f32, shared.height as f32], 0.0, mode);
                 timing.color_pass_ms += stage.elapsed().as_secs_f32() * 1000.0;
             }
             drop(pass);
@@ -2799,7 +2821,7 @@ impl HeadlessExternalGpu {
                     multiview_mask: None,
                 });
                 let stage = Instant::now();
-                self.ui.draw_depth(&self.queue, &mut depth_pass);
+                self.world_ui.draw_depth(&self.queue, &mut depth_pass);
                 timing.external_depth_pass_ms += stage.elapsed().as_secs_f32() * 1000.0;
                 drop(depth_pass);
                 depth_shared.frame_sequence = frame_sequence;
@@ -2852,7 +2874,7 @@ impl HeadlessExternalGpu {
             hal_queue.add_signal_fence(shared.fence.clone(), shared.frame_sequence);
         }
         self.queue.submit(Some(encoder.finish()));
-        let stage_timings = self.ui.last_stage_timings();
+        let stage_timings = self.screen_ui.last_stage_timings();
         timing.refresh_plan_ms = stage_timings.refresh_plan_ms;
         timing.compose_visuals_ms = stage_timings.compose_visuals_ms;
         timing.text_layout_ms = stage_timings.text_layout_ms;
@@ -2952,11 +2974,25 @@ pub fn spawn_headless_external_server(endpoint: SocketAddr) -> std::thread::Join
                     let response = match request.method.as_str() {
                         "render.surface.open" => {
                             let request_id = request.request_id;
-                            match serde_json::from_value(request.params)
+                            let parsed =
+                                serde_json::from_value::<RenderSurfaceOpen>(request.params);
+                            let opened_size = parsed
+                                .as_ref()
+                                .ok()
+                                .map(|open| [open.size.width.max(1), open.size.height.max(1)]);
+                            match parsed
                                 .map_err(|_| "invalid_surface_open".to_string())
                                 .and_then(|open| gpu.lock().expect("gpu lock").open(open))
                             {
-                                Ok(result) => runtime.lock().expect("runtime lock").accept(request_id, result),
+                                Ok(result) => {
+                                    // Keep the world-anchor projection viewport in
+                                    // sync with the actual opened surface size so UI
+                                    // screen positions match the host's scene pixels.
+                                    if let Some(size) = opened_size {
+                                        runtime.lock().expect("runtime lock").viewport = size;
+                                    }
+                                    runtime.lock().expect("runtime lock").accept(request_id, result)
+                                }
                                 Err(error) => runtime.lock().expect("runtime lock").reject(request_id, "external_surface_open_failed", &error, None),
                             }
                         }
@@ -6727,6 +6763,9 @@ fn handle_window_external_surface_open(
             );
         }
     };
+    // Keep the world-anchor projection viewport in sync with the actual
+    // opened surface size so UI screen positions match the host's scene pixels.
+    runtime.viewport = [open.size.width.max(1), open.size.height.max(1)];
     let (completed_tx, completed_rx) = std::sync::mpsc::channel();
     if proxy
         .send_event(WindowCommand::OpenExternalSurface {
@@ -7130,7 +7169,11 @@ impl WgpuRuntime {
         HashMap<RenderSurfaceKind, HashMap<UiFragmentId, UiFragment>>,
         HashMap<UiFragmentId, UiFragment>,
     ) {
-        let combined = self.fragments_snapshot();
+        // Use the RAW fragments, not `fragments_snapshot()`. The latter already
+        // applies `filter_world_panels`, which strips the CameraVisibility
+        // effects; splitting from that would leave `retain_surface_nodes`
+        // unable to identify world panels and delete the entire world UI.
+        let combined = self.fragments.clone();
         let split = [
             (RenderSurfaceKind::ScreenUi, combined.iter().map(|(id, fragment)| {
                 let mut fragment = fragment.clone();
@@ -7271,6 +7314,56 @@ impl WgpuRuntime {
             self.viewport,
             &mut depths,
         );
+        if has_world_panel {
+            static DIAG_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let tick = DIAG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if tick % 120 == 0 {
+                let visible: Vec<&neon_ui_schema::UiNode> =
+                    filtered.root.children.iter().filter(|child| child.visible).collect();
+                let world_visible: Vec<&neon_ui_schema::UiNode> = filtered
+                    .root
+                    .children
+                    .iter()
+                    .filter(|child| child.visible && child.world_depth.is_some())
+                    .collect();
+                let mut sample = "none".to_string();
+                if let Some(first) = world_visible.first() {
+                    sample = format!(
+                        "x={} y={} w={} h={} depth={:?}",
+                        first.bounds.x,
+                        first.bounds.y,
+                        first.bounds.width,
+                        first.bounds.height,
+                        first.world_depth
+                    );
+                }
+                let mut camera_report = "no-camera".to_string();
+                let mut anchor_report = "no-anchor".to_string();
+                for effect in &filtered.effects {
+                    if let neon_ui_schema::UiEffect::CameraVisibility { binding } = effect {
+                        if self.world_bridge.camera_is_available(&binding.camera_id, binding.camera_kind) {
+                            if let Some(frame) = self.world_bridge.camera(&binding.camera_id) {
+                                if let neon_world_bridge::CameraFramePayload::ThreeDimensional { position, .. } = &frame.payload {
+                                    camera_report = format!("{:.2},{:.2},{:.2}", position[0], position[1], position[2]);
+                                }
+                            }
+                        } else {
+                            camera_report = "unavailable".to_string();
+                        }
+                        if let Some(anchor_id) = &binding.anchor_id {
+                            if let Some(anchor) = self.world_bridge.anchor(anchor_id) {
+                                anchor_report = format!("{:.2},{:.2},{:.2}", anchor.position[0], anchor.position[1], anchor.position[2]);
+                            }
+                        }
+                        break;
+                    }
+                }
+                eprintln!(
+                    "[neon-wgpu-runtime] world-ui diag: camera[{camera_report}] anchor[{anchor_report}] world_visible={} sample[{sample}]",
+                    world_visible.len(),
+                );
+            }
+        }
         // Draw order: world panels are otherwise emitted in tree order, which
         // lets a far panel (drawn later) cover a near one. Sort direct children
         // by camera depth far -> near so near panels draw last and stay on top.
@@ -7362,21 +7455,27 @@ impl WgpuRuntime {
         let kind = frame.payload.kind();
         let sequence = frame.sequence;
         match self.world_bridge.submit_camera_frame(frame) {
-            Ok(()) => self.accept(
-                request_id,
-                serde_json::json!({
-                    "camera_id": camera_id,
-                    "kind": kind,
-                    "sequence": sequence,
-                    "state": "accepted"
-                }),
-            ),
-            Err(error) => self.reject(
-                request_id,
-                "camera_frame_rejected",
-                &format!("{error:?}"),
-                None,
-            ),
+            Ok(()) => {
+                eprintln!("[neon-wgpu-runtime] camera frame ACCEPTED camera={} seq={sequence}", camera_id.0);
+                self.accept(
+                    request_id,
+                    serde_json::json!({
+                        "camera_id": camera_id,
+                        "kind": kind,
+                        "sequence": sequence,
+                        "state": "accepted"
+                    }),
+                )
+            }
+            Err(error) => {
+                eprintln!("[neon-wgpu-runtime] camera frame REJECTED camera={} seq={sequence}: {error:?}", camera_id.0);
+                self.reject(
+                    request_id,
+                    "camera_frame_rejected",
+                    &format!("{error:?}"),
+                    None,
+                )
+            }
         }
     }
 
@@ -7425,16 +7524,22 @@ impl WgpuRuntime {
         let sequence = batch.sequence;
         let count = batch.anchors.len();
         match self.world_bridge.submit_anchor_batch(batch) {
-            Ok(()) => self.accept(
-                request_id,
-                serde_json::json!({"sequence": sequence, "anchor_count": count, "state": "accepted"}),
-            ),
-            Err(error) => self.reject(
-                request_id,
-                "world_anchor_batch_rejected",
-                &format!("{error:?}"),
-                None,
-            ),
+            Ok(()) => {
+                eprintln!("[neon-wgpu-runtime] anchor batch ACCEPTED seq={sequence} count={count}");
+                self.accept(
+                    request_id,
+                    serde_json::json!({"sequence": sequence, "anchor_count": count, "state": "accepted"}),
+                )
+            }
+            Err(error) => {
+                eprintln!("[neon-wgpu-runtime] anchor batch REJECTED seq={sequence} count={count}: {error:?}");
+                self.reject(
+                    request_id,
+                    "world_anchor_batch_rejected",
+                    &format!("{error:?}"),
+                    None,
+                )
+            }
         }
     }
 
