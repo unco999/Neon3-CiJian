@@ -2530,7 +2530,8 @@ impl HeadlessExternalGpu {
         let color_depth_targets = (0..open.buffer_count)
             .map(|_| create_color_depth_target(&self.device, open.size.width, open.size.height))
             .collect::<Vec<_>>();
-        self.color_depth_targets.insert(open.surface_id.clone(), color_depth_targets);
+        self.color_depth_targets
+            .insert(open.surface_id.clone(), color_depth_targets);
         let generation = 1;
         let texture_token = format!("surface:{}:texture:g{}", open.surface_id, generation);
         let fence_token = format!("surface:{}:fence:g{}", open.surface_id, generation);
@@ -2755,11 +2756,6 @@ impl HeadlessExternalGpu {
                 RenderSurfaceKind::WorldUi => UiDrawMode::World,
                 _ => UiDrawMode::Screen,
             };
-            // Only the world/all renderers declare a depth-stencil format. The
-            // screen UI pipeline has `depth_stencil: None`, so attaching a local
-            // Depth32Float target to its color pass fails validation (pipeline
-            // targets are incompatible with the render pass). Attach depth only
-            // for renderers that actually consume it.
             let color_depth_view = if matches!(mode, UiDrawMode::World | UiDrawMode::All) {
                 self.color_depth_targets
                     .get(surface_id)
@@ -2809,10 +2805,12 @@ impl HeadlessExternalGpu {
             // Occlusion depth pass: re-emit the same instances into the matched
             // R32Float ring buffer so the consumer can depth-test the overlay
             // against its scene depth. Uses the same buffer index as the color
-            // ring so both stay frame-coherent. Only runs when the color pass
-            // actually drew (draw_depth consumes this pass's instances).
-            if fragments.is_some()
-                && let Some(depth_ring) = self.external_depth_surfaces.get_mut(surface_id)
+            // ring so both stay frame-coherent. This MUST run on every frame
+            // the color pass runs, even with no world fragments: gating it on
+            // fragments lets the depth ring fall behind the color ring (e.g.
+            // during startup), wedging that ring slot forever and throttling
+            // the pipeline to a subset of ring slots.
+            if let Some(depth_ring) = self.external_depth_surfaces.get_mut(surface_id)
                 && let Some(depth_shared) = depth_ring.get_mut(write_index)
             {
                 let depth_view = depth_shared
@@ -2832,7 +2830,14 @@ impl HeadlessExternalGpu {
                     multiview_mask: None,
                 });
                 let stage = Instant::now();
-                self.world_ui.draw_depth(&self.queue, &mut depth_pass);
+                // Only draw when the color pass actually rendered fragments
+                // this frame. `draw_depth` replays the renderer's flattened
+                // instances, which are stale on fragment-less frames; the
+                // clear-only pass still advances the ring so it stays in
+                // lockstep with the color ring.
+                if fragments.is_some() {
+                    self.world_ui.draw_depth(&self.queue, &mut depth_pass);
+                }
                 timing.external_depth_pass_ms += stage.elapsed().as_secs_f32() * 1000.0;
                 drop(depth_pass);
                 depth_shared.frame_sequence = frame_sequence;
@@ -2934,6 +2939,14 @@ impl HeadlessExternalGpu {
             "frames": timings,
         })
     }
+
+    fn depth_probe(&self) -> Value {
+        json!({
+            "frame_sequence": self.next_external_frame_sequence,
+            "world_ui": self.world_ui.depth_diagnostics(),
+            "screen_ui": self.screen_ui.depth_diagnostics(),
+        })
+    }
 }
 
 #[cfg(windows)]
@@ -3005,6 +3018,11 @@ pub fn spawn_headless_external_server(endpoint: SocketAddr) -> std::thread::Join
                         "render.diagnostics" => {
                             let request_id = request.request_id;
                             let result = gpu.lock().expect("gpu lock").diagnostics();
+                            runtime.lock().expect("runtime lock").accept(request_id, result)
+                        }
+                        "render.depth_probe" => {
+                            let request_id = request.request_id;
+                            let result = gpu.lock().expect("gpu lock").depth_probe();
                             runtime.lock().expect("runtime lock").accept(request_id, result)
                         }
                         "ui.host.pointer_event" => {
@@ -7173,6 +7191,11 @@ impl WgpuRuntime {
                 let mut fragment = fragment.clone();
                 retain_surface_nodes(&mut fragment.root, &fragment.effects, RenderSurfaceKind::ScreenUi, false);
                 fragment.effects.retain(|effect| !matches!(effect, neon_ui_schema::UiEffect::CameraVisibility { .. }));
+                // The fragment root is only a structural full-viewport
+                // container. Its schema default style is opaque, which would
+                // turn the screen surface into a full-screen blue overlay.
+                fragment.root.style.background_color = [0.0; 4];
+                fragment.root.style.border_color = [0.0; 4];
                 (id.clone(), fragment)
             }).collect()),
             (RenderSurfaceKind::WorldUi, combined.iter().map(|(id, fragment)| {
@@ -7240,38 +7263,32 @@ impl WgpuRuntime {
                         node.visible = false;
                         return;
                     };
-                    let CameraFramePayload::ThreeDimensional {
-                        position,
-                        orientation,
-                        vertical_fov_radians,
-                        near,
-                        far,
-                    } = frame.payload else {
+                    let CameraFramePayload::ThreeDimensional { near, .. } = frame.payload else {
                         node.visible = false;
                         return;
                     };
-                    projected = project_world_point_to_screen_with_depth(
-                        anchor.position,
-                        position,
-                        orientation,
-                        vertical_fov_radians,
-                        near,
-                        far,
-                        viewport,
-                    );
-                    if let Some(([_x, _y], depth)) = projected {
+                    // The host projects the anchor with its authoritative camera
+                    // and ships the normalized placement; the runtime only
+                    // consumes it. Out-of-range coords = off-screen/behind.
+                    let norm_x = anchor.screen_x;
+                    let norm_y = anchor.screen_y;
+                    let depth = anchor.view_distance;
+                    if !(0.0..=1.0).contains(&norm_x)
+                        || !(0.0..=1.0).contains(&norm_y)
+                        || !(depth > 0.0)
+                    {
+                        hidden = true;
+                    } else {
+                        let x = norm_x * viewport[0] as f32;
+                        let y = norm_y * viewport[1] as f32;
+                        projected = Some(([x, y], depth));
                         depths.insert(node.node_id.0.clone(), depth);
-                        // Occlusion depth, shared convention with the Bevy
-                        // composite: 0.0 = never occluded (always-visible panel),
-                        // (0.0, 1.0) = depth-tested, encoded far-free as
-                        // 1 - near / view_distance (near -> 0, far/infinity -> 1).
-                        // The composite reconstructs d = near / (1 - depth) and
-                        // compares against the scene distance directly, so no
-                        // far parameter needs to stay in sync across processes.
-                        // The encoding stays monotonic near -> far, which also
-                        // preserves the UI-internal z-order in the color pass.
+                        // Occlusion depth uses the same infinite reversed-Z
+                        // convention as Bevy's scene depth: near / view_distance
+                        // (near -> 1, far/infinity -> 0). A zero remains the
+                        // sentinel for an always-visible panel.
                         let occlusion_depth = if anchor.occlusion == "depth_tested" {
-                            (1.0 - near / depth).clamp(0.0, 1.0)
+                            (near / depth).clamp(0.0, 1.0)
                         } else {
                             0.0
                         };
@@ -7287,8 +7304,6 @@ impl WgpuRuntime {
                         for child in &mut node.children {
                             scale_world_subtree(child, scale, true);
                         }
-                    } else {
-                        hidden = true;
                     }
                 }
             }
@@ -9111,6 +9126,9 @@ mod tests {
                 position: [1.0, 2.0, 3.0],
                 billboard: true,
                 occlusion: "always_visible".into(),
+                screen_x: 0.5,
+                screen_y: 0.5,
+                view_distance: 10.0,
             }),
         ));
         assert_eq!(response.status, RpcStatus::Accepted);
@@ -9122,7 +9140,7 @@ mod tests {
     }
 
     #[test]
-    fn world_panel_is_placed_at_the_projected_anchor_position() {
+    fn world_panel_is_placed_at_the_host_provided_anchor_placement() {
         let mut runtime = WgpuRuntime::headless(1);
         runtime
             .world_bridge
@@ -9135,7 +9153,7 @@ mod tests {
                 precision_mode: neon_world_bridge::WorldPrecisionMode::CameraRelativeF64,
             })
             .unwrap();
-        // Camera at origin looking -Z, 90° vertical FOV.
+        // Camera available (availability gate only; placement comes from the host).
         runtime
             .world_bridge
             .submit_camera_frame(CameraFrame {
@@ -9153,7 +9171,7 @@ mod tests {
                 },
             })
             .unwrap();
-        // Anchor dead ahead at (0, 0, -2) → screen center.
+        // Host placement: dead center (0.5, 0.5), view distance 2 m.
         runtime
             .world_bridge
             .submit_anchor(WorldUiAnchor {
@@ -9165,6 +9183,9 @@ mod tests {
                 position: [0.0, 0.0, -2.0],
                 billboard: true,
                 occlusion: "depth_tested".into(),
+                screen_x: 0.5,
+                screen_y: 0.5,
+                view_distance: 2.0,
             })
             .unwrap();
         let mut gated = fragment(1);
@@ -9204,10 +9225,16 @@ mod tests {
             .root
             .children[0]
             .bounds;
+        let depth = snapshot[&UiFragmentId("static-fragment".into())]
+            .root
+            .children[0]
+            .world_depth
+            .expect("depth-tested world panel exports a depth");
         // viewport [1280, 720]: center (640, 360). depth 2 → scale (6/2).clamp = 2.0,
         // so width 20, height 20 → bounds.x = 640 - 10, y = 360 - 20.
         assert!((bounds.x - 630.0).abs() < 0.5, "x was {}", bounds.x);
         assert!((bounds.y - 340.0).abs() < 0.5, "y was {}", bounds.y);
+        assert!((depth - 0.05).abs() < f32::EPSILON, "depth was {depth}");
     }
 
     #[test]

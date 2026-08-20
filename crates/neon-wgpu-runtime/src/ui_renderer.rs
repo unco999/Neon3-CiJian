@@ -16,7 +16,7 @@ use neon_ui_schema::{
 use serde_json::{json, Value};
 
 const SHADER: &str = r#"
-struct View { viewport: vec2<f32>, _pad: vec2<f32> }
+struct View { viewport: vec2<f32>, color_mode: u32, _pad: u32 }
 @group(0) @binding(0) var<uniform> view: View;
 
 fn srgb_to_linear(value: vec3<f32>) -> vec3<f32> {
@@ -96,7 +96,7 @@ fn fs_main(input: VsOut) -> @location(0) vec4<f32> {
         // attachment. Otherwise its near depth rejects all visible World UI
         // children while contributing no color itself.
         if (alpha <= 0.001) { discard; }
-        return vec4<f32>(srgb_to_linear(color.rgb), alpha);
+        return vec4<f32>(select(srgb_to_linear(color.rgb), color.rgb, view.color_mode == 1u), alpha);
     }
     let radius = min(input.params.y, min(input.size.x, input.size.y) * 0.5);
     let point = input.local * input.size - input.size * 0.5;
@@ -107,12 +107,12 @@ fn fs_main(input: VsOut) -> @location(0) vec4<f32> {
     let color = mix(input.fill, input.border, border_alpha);
     let alpha = color.a * input.params.z * shape_alpha;
     if (alpha <= 0.001) { discard; }
-    return vec4<f32>(srgb_to_linear(color.rgb), alpha);
+    return vec4<f32>(select(srgb_to_linear(color.rgb), color.rgb, view.color_mode == 1u), alpha);
 }
 "#;
 
 const HIT_SHADER: &str = r#"
-struct View { viewport: vec2<f32>, _pad: vec2<f32> }
+struct View { viewport: vec2<f32>, color_mode: u32, _pad: u32 }
 @group(0) @binding(0) var<uniform> view: View;
 fn outside_clip(pixel: vec2<f32>, clip: vec4<f32>, radius: f32) -> bool { if (pixel.x < clip.x || pixel.y < clip.y || pixel.x > clip.z || pixel.y > clip.w) { return true; } if (radius <= 0.0) { return false; } let size=clip.zw-clip.xy; let r=min(radius,min(size.x,size.y)*0.5); let point=pixel-(clip.xy+size*0.5); let extent=max(size*0.5-vec2<f32>(r),vec2<f32>(0.0)); return length(max(abs(point)-extent,vec2<f32>(0.0)))>r; }
 struct VsIn { @location(0) rect: vec4<f32>, @location(1) params: vec4<f32>, @location(2) hit_id: u32, @location(3) clip: vec4<f32> }
@@ -144,7 +144,7 @@ const HIT_CLEAR_SHADER: &str = r#"
 "#;
 
 const DEPTH_SHADER: &str = r#"
-struct View { viewport: vec2<f32>, _pad: vec2<f32> }
+struct View { viewport: vec2<f32>, color_mode: u32, _pad: u32 }
 @group(0) @binding(0) var<uniform> view: View;
 fn outside_clip(pixel: vec2<f32>, clip: vec4<f32>, radius: f32) -> bool {
     if (pixel.x < clip.x || pixel.y < clip.y || pixel.x > clip.z || pixel.y > clip.w) { return true; }
@@ -193,7 +193,7 @@ struct VsOut {
 "#;
 
 const IMAGE_SHADER: &str = r#"
-struct View { viewport: vec2<f32>, _pad: vec2<f32> }
+struct View { viewport: vec2<f32>, color_mode: u32, _pad: u32 }
 @group(0) @binding(0) var<uniform> view: View;
 @group(1) @binding(0) var image_texture: texture_2d<f32>;
 @group(1) @binding(1) var image_sampler: sampler;
@@ -212,12 +212,13 @@ struct VsOut { @builtin(position) position: vec4<f32>, @location(0) local: vec2<
    let sample = textureSample(image_texture, image_sampler, input.uv);
   let alpha = sample.a * input.tint.a;
   if (alpha <= 0.001) { discard; }
-  return vec4<f32>(sample.rgb * srgb_to_linear(input.tint.rgb), alpha);
+  let tint = select(srgb_to_linear(input.tint.rgb), input.tint.rgb, view.color_mode == 1u);
+  return vec4<f32>(sample.rgb * tint, alpha);
 }
 "#;
 
 const TEXT_SHADER: &str = r#"
-struct View { viewport: vec2<f32>, _pad: vec2<f32> }
+struct View { viewport: vec2<f32>, color_mode: u32, _pad: u32 }
 @group(0) @binding(0) var<uniform> view: View;
 @group(1) @binding(0) var glyph_atlas: texture_2d<f32>;
 @group(1) @binding(1) var glyph_sampler: sampler;
@@ -235,7 +236,8 @@ struct VsOut { @builtin(position) position: vec4<f32>, @location(0) local: vec2<
  if (input.pixel.x < input.clip.x || input.pixel.y < input.clip.y || input.pixel.x > input.clip.z || input.pixel.y > input.clip.w) { discard; }
  let coverage = textureSample(glyph_atlas, glyph_sampler, input.uv).a;
  if (coverage <= 0.001) { discard; }
-  return vec4<f32>(srgb_to_linear(input.color.rgb), input.color.a * coverage);
+  let color = select(srgb_to_linear(input.color.rgb), input.color.rgb, view.color_mode == 1u);
+  return vec4<f32>(color, input.color.a * coverage);
 }
 "#;
 
@@ -258,7 +260,8 @@ struct UiInstance {
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct UiView {
     viewport: [f32; 2],
-    _pad: [f32; 2],
+    color_mode: u32,
+    _pad: u32,
 }
 
 #[repr(C)]
@@ -811,6 +814,12 @@ pub(crate) enum UiDrawMode {
     Screen,
 }
 
+fn color_pass_depth(world_depth: Option<f32>) -> f32 {
+    // The exported world depth is reversed-Z, but the producer color pass uses
+    // the ordinary LessEqual depth test.
+    world_depth.map_or(0.0, |depth| 1.0 - depth)
+}
+
 pub struct UiWgpuRenderer {
     color_format: wgpu::TextureFormat,
     pipeline: wgpu::RenderPipeline,
@@ -905,7 +914,7 @@ impl UiWgpuRenderer {
             label: Some("neon3-ui-view-layout"),
             entries: &[wgpu::BindGroupLayoutEntry {
                 binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX,
+                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: false,
@@ -1172,8 +1181,12 @@ impl UiWgpuRenderer {
             primitive: wgpu::PrimitiveState::default(),
             depth_stencil: depth_format.map(|_| wgpu::DepthStencilState {
                 format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: Some(true),
-                depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                // Keep the attachment format compatible with the world color
+                // pass, but let the explicit far-to-near painter order decide
+                // which panel covers another. The exported R32 depth ring is
+                // the separate scene-occlusion path.
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::Always),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
@@ -1463,7 +1476,8 @@ impl UiWgpuRenderer {
             0,
             bytemuck::bytes_of(&UiView {
                 viewport: self.viewport_logical_size,
-                _pad: [0.0; 2],
+                color_mode: 0,
+                _pad: 0,
             }),
         );
         self.view_buffer_viewport_revision = self.viewport_revision;
@@ -3668,7 +3682,10 @@ impl UiWgpuRenderer {
                 0,
                 bytemuck::bytes_of(&UiView {
                     viewport: self.viewport_logical_size,
-                    _pad: [0.0; 2],
+                    // Bevy's HDR camera keeps the post-tonemap target in
+                    // linear display space until the final surface encode.
+                    color_mode: 0,
+                    _pad: 0,
                 }),
             );
             self.view_buffer_viewport_revision = self.viewport_revision;
@@ -3836,7 +3853,7 @@ impl UiWgpuRenderer {
                         visual.clip.y + visual.clip.height,
                     ],
                     uv: image.uv,
-                    depth: visual.world_depth.unwrap_or(0.0),
+                    depth: color_pass_depth(visual.world_depth),
                     paint_group_id: self
                         .plan
                         .iter()
@@ -3883,7 +3900,7 @@ impl UiWgpuRenderer {
                                 visual.clip.y + visual.clip.height,
                             ],
                             uv: [0.0, 0.0, 1.0, 1.0],
-                            depth: visual.world_depth.unwrap_or(0.0),
+                            depth: color_pass_depth(visual.world_depth),
                             paint_group_id: self
                                 .plan
                                 .iter()
@@ -4104,11 +4121,13 @@ impl UiWgpuRenderer {
         };
         depth_keys.sort_by(|a, b| {
             match (group_depth(*a), group_depth(*b)) {
-                // World groups are painted far-to-near. Fixed screen UI is
+                // The external color target's effective overlay order is
+                // near-to-far: the later group is the visible top layer.
+                // Reversed-Z values are larger nearer the camera. Fixed screen UI is
                 // always painted after every world group, independently of
                 // its color-pass position.z value.
-                (Some(a), Some(b)) => b
-                    .partial_cmp(&a)
+                (Some(a), Some(b)) => a
+                    .partial_cmp(&b)
                     .unwrap_or(std::cmp::Ordering::Equal),
                 (Some(_), None) => std::cmp::Ordering::Less,
                 (None, Some(_)) => std::cmp::Ordering::Greater,
@@ -4296,13 +4315,11 @@ impl UiWgpuRenderer {
             return;
         };
         // The exported convention is 0.0 = never occluded (always-visible)
-        // and (0.0, 1.0) = far-free normalized depth (1 - near / view_distance).
-        // This target only ever carries projected world panels (the screen
-        // surface has no depth ring), so the raw normalized world depth is
-        // written unchanged -- no reserved marker value is needed to keep
-        // screen UI on top anymore. R32Float has no depth test of its own, so
-        // emit complete groups far to near; the later near group overwrites
-        // the earlier far value.
+        // and (0.0, 1.0) = Bevy-compatible reversed-Z depth
+        // (near / view_distance). This target only ever carries projected world
+        // panels, so the raw value is written unchanged. R32Float has no depth
+        // test of its own, so emit complete groups far to near; the later near
+        // group overwrites the earlier far value.
         let mut groups: HashMap<u32, Vec<UiInstance>> = HashMap::new();
         for instance in &self.instances {
             groups
@@ -4318,37 +4335,81 @@ impl UiWgpuRenderer {
                 .find_map(|node| node.target.world_depth)
         };
         let group_depth_value = |group_id: u32| group_depth(group_id).unwrap_or(0.0);
+        {
+            static DIAG_COUNT: std::sync::atomic::AtomicUsize =
+                std::sync::atomic::AtomicUsize::new(0);
+            if DIAG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 120 == 0 {
+                let mut depths = group_ids
+                    .iter()
+                    .filter_map(|group_id| group_depth(*group_id))
+                    .collect::<Vec<_>>();
+                depths.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                depths.dedup_by(|a, b| (*a - *b).abs() < 1e-6);
+                let min = depths.first().copied().unwrap_or(0.0);
+                let max = depths.last().copied().unwrap_or(0.0);
+                eprintln!(
+                    "[neon3-depth-diag] groups={} distinct_depths={} min={min:.6} max={max:.6}",
+                    group_ids.len(),
+                    depths.len(),
+                );
+            }
+        }
         group_ids.sort_by(|a, b| {
             match (group_depth(*a), group_depth(*b)) {
-                (Some(a), Some(b)) => b
-                    .partial_cmp(&a)
+                (Some(a), Some(b)) => a
+                    .partial_cmp(&b)
                     .unwrap_or(std::cmp::Ordering::Equal),
                 (Some(_), None) => std::cmp::Ordering::Less,
                 (None, Some(_)) => std::cmp::Ordering::Greater,
                 (None, None) => std::cmp::Ordering::Equal,
             }
         });
+        let mut ordered_depth_instances = Vec::new();
+        let mut ranges = Vec::new();
         for group_id in group_ids {
             if let Some(group) = groups.get(&group_id) {
                 let external_depth = group_depth_value(group_id);
-                let depth_instances = group
-                    .iter()
-                    .map(|instance| UiInstance {
-                        depth: external_depth,
-                        ..*instance
-                    })
-                    .collect::<Vec<_>>();
-                queue.write_buffer(
-                    &self.depth_instance_buffer,
-                    0,
-                    bytemuck::cast_slice(&depth_instances),
-                );
-                pass.set_pipeline(rect_pipeline);
-                pass.set_bind_group(0, &self.view_bind_group, &[]);
-                pass.set_vertex_buffer(0, self.depth_instance_buffer.slice(..));
-                pass.draw(0..6, 0..group.len() as u32);
+                let start = ordered_depth_instances.len() as u32;
+                ordered_depth_instances.extend(group.iter().map(|instance| UiInstance {
+                    depth: external_depth,
+                    ..*instance
+                }));
+                ranges.push((start, group.len() as u32));
             }
         }
+        if ordered_depth_instances.is_empty() {
+            return;
+        }
+        queue.write_buffer(
+            &self.depth_instance_buffer,
+            0,
+            bytemuck::cast_slice(&ordered_depth_instances),
+        );
+        pass.set_pipeline(rect_pipeline);
+        pass.set_bind_group(0, &self.view_bind_group, &[]);
+        pass.set_vertex_buffer(0, self.depth_instance_buffer.slice(..));
+        for (start, count) in ranges {
+            pass.draw(0..6, start..start + count);
+        }
+    }
+
+    pub(crate) fn depth_diagnostics(&self) -> Value {
+        let mut groups = HashMap::<u32, f32>::new();
+        for node in &self.plan {
+            if let Some(depth) = node.target.world_depth {
+                groups.entry(node.paint_group_id).or_insert(depth);
+            }
+        }
+        let mut depths = groups.values().copied().collect::<Vec<_>>();
+        depths.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        depths.dedup_by(|a, b| (*a - *b).abs() < 1e-6);
+        json!({
+            "groups": groups.len(),
+            "distinct_depths": depths.len(),
+            "min_depth": depths.first().copied().unwrap_or(0.0),
+            "max_depth": depths.last().copied().unwrap_or(0.0),
+            "depths": depths,
+        })
     }
 
     fn refresh_plan(
@@ -4435,19 +4496,26 @@ impl UiWgpuRenderer {
                 paint_group_id: 0,
             });
         }
-        // CameraVisibility marks the actual projected World UI root. The
-        // fragment/layout root is only a structural container and must not
-        // merge multiple world panels into one paint group.
-        let world_group_roots = fragments
+        // World snapshots have already had CameraVisibility effects consumed
+        // by the host-side projection filter. Identify each projected panel by
+        // its own inherited world depth instead of relying on those removed
+        // effects; otherwise every panel collapses into one paint group and the
+        // exported depth ring contains a single value.
+        let world_group_roots = self
+            .plan
             .iter()
-            .flat_map(|(fragment_id, fragment)| {
-                fragment.effects.iter().filter_map(|effect| {
-                    let neon_ui_schema::UiEffect::CameraVisibility { binding } = effect else {
-                        return None;
-                    };
-                    Some(format!("{}/{}", fragment_id.0, binding.node_id.0))
+            .filter(|node| {
+                if node.target.world_depth.is_none() {
+                    return false;
+                }
+                node.parent_id.as_deref().is_none_or(|parent_id| {
+                    self.plan
+                        .iter()
+                        .find(|parent| parent.id == parent_id)
+                        .is_none_or(|parent| parent.target.world_depth.is_none())
                 })
             })
+            .map(|node| node.id.clone())
             .collect::<HashSet<_>>();
         let mut group_ids = HashMap::<String, u32>::new();
         let mut next_group_id = 1_u32;
@@ -4961,7 +5029,7 @@ impl UiWgpuRenderer {
                 visual.clip.x + visual.clip.width,
                 visual.clip.y + visual.clip.height,
             ],
-            depth: visual.world_depth.unwrap_or(0.0),
+            depth: color_pass_depth(visual.world_depth),
             paint_group_id: visual.paint_group_id,
         }
     }
@@ -6231,7 +6299,7 @@ fn layout_text(
                 color: [0.86, 0.95, 0.98, visual.style.opacity],
                 clip,
                 uv: glyph.uv,
-                depth: visual.world_depth.unwrap_or(0.0),
+                depth: color_pass_depth(visual.world_depth),
                 paint_group_id: visual.paint_group_id,
             });
             x += glyph.advance * text_scale;

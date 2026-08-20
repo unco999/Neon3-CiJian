@@ -224,7 +224,7 @@ impl Codelet for Select {
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
     let i = gid.x;
     if (i >= {n}u) {{ return; }}
-    if (mask[i] > 0.5) {{ out[i] = a[i]; }} else {{ out[i] = b[i]; }}
+    if (mask[i] > 0.5) {{ out[i] = b[i]; }} else {{ out[i] = a[i]; }}
 }}
 "#,
             wg = WORKGROUP
@@ -326,15 +326,8 @@ fn crit_combo_runs_on_gpu_and_reads_back_correct_hp() {
 
     let outputs = executor.run(scene, &inputs).expect("gpu run failed");
     let hp_out = outputs.get("target.hp").expect("target.hp exported");
-    let crit_out = outputs.get("frame.crit").expect("frame.crit exported");
 
     let expected = expected_hp(&atk, &def, &hp, &frame);
-    eprintln!("gpu={hp_out:?}");
-    eprintln!("exp={expected:?}");
-    eprintln!("gpu_crit={crit_out:?}");
-    for f in &frame {
-        eprintln!("frame={f} roll={}", crit_roll(*f));
-    }
     assert_eq!(hp_out.len() as u32, N);
     for i in 0..N as usize {
         assert!(

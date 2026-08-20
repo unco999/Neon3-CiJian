@@ -328,6 +328,19 @@ pub enum RenderSurfaceKind {
     WorldUi,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RenderSurfaceColorSpace {
+    Linear,
+    Srgb,
+}
+
+impl Default for RenderSurfaceColorSpace {
+    fn default() -> Self {
+        Self::Srgb
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RenderSurfaceSize {
@@ -354,6 +367,8 @@ pub struct RenderSurfaceOpen {
     pub kind: RenderSurfaceKind,
     pub size: RenderSurfaceSize,
     pub format: String,
+    #[serde(default)]
+    pub color_space: RenderSurfaceColorSpace,
     pub depth: bool,
     pub buffer_count: u8,
     pub placement: Option<RenderSurfacePlacement>,
@@ -1170,6 +1185,7 @@ mod tests {
             kind: RenderSurfaceKind::ScreenUi,
             size: RenderSurfaceSize { width: 1280, height: 720 },
             format: "rgba8unorm".into(),
+            color_space: RenderSurfaceColorSpace::Srgb,
             depth: false,
             buffer_count: 1,
             placement: None,

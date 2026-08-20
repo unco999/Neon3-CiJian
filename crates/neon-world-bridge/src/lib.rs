@@ -173,6 +173,17 @@ pub struct WorldUiAnchorSample {
     pub billboard: bool,
     #[serde(default = "default_anchor_occlusion")]
     pub occlusion: String,
+    /// Normalized viewport x (0..1, y-down from top-left) computed by the host
+    /// with its authoritative camera projection. Out-of-range (<0 or >1) marks
+    /// the anchor off-screen or behind the camera; the runtime hides it.
+    #[serde(default = "default_out_of_range")]
+    pub screen_x: f32,
+    /// Normalized viewport y (0..1, y-down from top-left).
+    #[serde(default = "default_out_of_range")]
+    pub screen_y: f32,
+    /// View-axis distance in meters (view-space -z) of the anchor point.
+    #[serde(default)]
+    pub view_distance: f32,
 }
 
 /// Latest-value input from an optional camera-control provider. Transport
@@ -235,8 +246,9 @@ impl CameraControlFocus {
 /// Latest-value world-space position of a host-owned UI anchor.
 ///
 /// The anchor carries only identity and a world-space point. It never carries a
-/// renderer-local matrix, screen coordinate, UI node, or GPU resource. The sole
-/// renderer owner projects it to screen space using the matching camera frame.
+/// renderer-local matrix, screen coordinate, UI node, or GPU resource. The host
+/// projects the anchor with its authoritative camera and the renderer consumes
+/// the normalized placement directly; no second projection exists.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorldUiAnchor {
@@ -256,6 +268,15 @@ pub struct WorldUiAnchor {
     /// Drives the normalized depth written to the UI depth target.
     #[serde(default = "default_anchor_occlusion")]
     pub occlusion: String,
+    /// Host-computed normalized viewport placement (0..1, y-down). Out-of-range
+    /// (<0 or >1) means off-screen or behind the camera; the runtime hides it.
+    #[serde(default = "default_out_of_range")]
+    pub screen_x: f32,
+    #[serde(default = "default_out_of_range")]
+    pub screen_y: f32,
+    /// View-axis distance in meters (view-space -z) of the anchor point.
+    #[serde(default)]
+    pub view_distance: f32,
 }
 
 /// Default anchor occlusion: on top of scene geometry, never depth-tested.
@@ -263,11 +284,19 @@ pub fn default_anchor_occlusion() -> String {
     "always_visible".to_owned()
 }
 
+/// Sentinel normalized coordinate: marks an anchor off-screen / behind camera.
+pub fn default_out_of_range() -> f32 {
+    -1.0
+}
+
 impl WorldUiAnchor {
     fn is_valid(&self) -> bool {
         !self.anchor_id.0.trim().is_empty()
             && self.sequence != 0
             && self.position.iter().all(|value| value.is_finite())
+            && self.screen_x.is_finite()
+            && self.screen_y.is_finite()
+            && self.view_distance.is_finite()
     }
 }
 
@@ -360,6 +389,9 @@ impl WorldInformationBridge {
             || batch.anchors.iter().any(|anchor| {
                 anchor.anchor_id.0.trim().is_empty()
                     || !anchor.position.iter().all(|value| value.is_finite())
+                    || !anchor.screen_x.is_finite()
+                    || !anchor.screen_y.is_finite()
+                    || !anchor.view_distance.is_finite()
             })
         {
             return Err(WorldBridgeError::InvalidWorldAnchor);
@@ -375,6 +407,9 @@ impl WorldInformationBridge {
                 position: sample.position,
                 billboard: sample.billboard,
                 occlusion: sample.occlusion,
+                screen_x: sample.screen_x,
+                screen_y: sample.screen_y,
+                view_distance: sample.view_distance,
             })?;
         }
         *self = candidate;
@@ -548,6 +583,9 @@ mod tests {
             position: [0.0, 0.0, 0.0],
             billboard: true,
             occlusion: "always_visible".into(),
+            screen_x: 0.5,
+            screen_y: 0.5,
+            view_distance: 10.0,
         };
         bridge.submit_anchor(base.clone()).unwrap();
         // Wrong world space is rejected.
@@ -594,12 +632,18 @@ mod tests {
                         position: [1.0, 2.0, 3.0],
                         billboard: true,
                         occlusion: "depth_tested".into(),
+                        screen_x: 0.5,
+                        screen_y: 0.5,
+                        view_distance: 10.0,
                     },
                     WorldUiAnchorSample {
                         anchor_id: WorldAnchorId("monster.m1".into()),
                         position: [4.0, 5.0, 6.0],
                         billboard: false,
                         occlusion: "always_visible".into(),
+                        screen_x: -1.0,
+                        screen_y: -1.0,
+                        view_distance: 0.0,
                     },
                 ],
             })
