@@ -4295,7 +4295,8 @@ impl UiWgpuRenderer {
         let Some(rect_pipeline) = &self.depth_pipeline else {
             return;
         };
-        // The exported convention is 0.0 = near/always-on-top and 1.0 = far.
+        // The exported convention is 0.0 = never occluded (always-visible)
+        // and (0.0, 1.0) = far-free normalized depth (1 - near / view_distance).
         // This target only ever carries projected world panels (the screen
         // surface has no depth ring), so the raw normalized world depth is
         // written unchanged -- no reserved marker value is needed to keep

@@ -1,0 +1,17 @@
+[package]
+name = "neon-gpu-exec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Neon3 GPU script executor: turns a compiled script (IR + waves) into wgpu dispatches and readback"
+
+[dependencies]
+neon-gpu-script = { path = "../neon-gpu-script" }
+neon-gpu = { path = "../neon-gpu" }
+wgpu.workspace = true
+thiserror = "2"
+bytemuck.workspace = true
+
+[dev-dependencies]
+pollster.workspace = true
+bytemuck.workspace = true

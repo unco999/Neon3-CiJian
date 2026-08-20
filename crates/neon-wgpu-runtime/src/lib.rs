@@ -2705,11 +2705,22 @@ impl HeadlessExternalGpu {
                         color.consumer_fence.GetCompletedValue() >= color.frame_sequence
                     })
                 });
-                // Color rings are the ownership fence for a published frame.
-                // Depth/ID are auxiliary targets for the same slot and must
-                // not independently exhaust the producer ring when their
-                // consumer fence becomes visible one render tick later.
-                color_free.then_some(index)
+                // A ring slot is one published frame: the matching color,
+                // occlusion depth, and hit-ID textures must all be released
+                // before any of them can be overwritten. Reusing a slot after
+                // only its color fence completes races the host's depth sample
+                // and makes scene occlusion compare different frame revisions.
+                let depth_free = self.external_depth_surfaces.values().all(|ring| {
+                    ring.get(index).is_none_or(|depth| unsafe {
+                        depth.consumer_fence.GetCompletedValue() >= depth.frame_sequence
+                    })
+                });
+                let id_free = self.external_id_surfaces.values().all(|ring| {
+                    ring.get(index).is_none_or(|id| unsafe {
+                        id.consumer_fence.GetCompletedValue() >= id.frame_sequence
+                    })
+                });
+                (color_free && depth_free && id_free).then_some(index)
             })
         });
         let Some(write_index) = write_index else {
@@ -2974,25 +2985,11 @@ pub fn spawn_headless_external_server(endpoint: SocketAddr) -> std::thread::Join
                     let response = match request.method.as_str() {
                         "render.surface.open" => {
                             let request_id = request.request_id;
-                            let parsed =
-                                serde_json::from_value::<RenderSurfaceOpen>(request.params);
-                            let opened_size = parsed
-                                .as_ref()
-                                .ok()
-                                .map(|open| [open.size.width.max(1), open.size.height.max(1)]);
-                            match parsed
+                            match serde_json::from_value(request.params)
                                 .map_err(|_| "invalid_surface_open".to_string())
                                 .and_then(|open| gpu.lock().expect("gpu lock").open(open))
                             {
-                                Ok(result) => {
-                                    // Keep the world-anchor projection viewport in
-                                    // sync with the actual opened surface size so UI
-                                    // screen positions match the host's scene pixels.
-                                    if let Some(size) = opened_size {
-                                        runtime.lock().expect("runtime lock").viewport = size;
-                                    }
-                                    runtime.lock().expect("runtime lock").accept(request_id, result)
-                                }
+                                Ok(result) => runtime.lock().expect("runtime lock").accept(request_id, result),
                                 Err(error) => runtime.lock().expect("runtime lock").reject(request_id, "external_surface_open_failed", &error, None),
                             }
                         }
@@ -6763,9 +6760,6 @@ fn handle_window_external_surface_open(
             );
         }
     };
-    // Keep the world-anchor projection viewport in sync with the actual
-    // opened surface size so UI screen positions match the host's scene pixels.
-    runtime.viewport = [open.size.width.max(1), open.size.height.max(1)];
     let (completed_tx, completed_rx) = std::sync::mpsc::channel();
     if proxy
         .send_event(WindowCommand::OpenExternalSurface {
@@ -7267,13 +7261,17 @@ impl WgpuRuntime {
                     );
                     if let Some(([_x, _y], depth)) = projected {
                         depths.insert(node.node_id.0.clone(), depth);
-                        // Normalized occlusion depth, shared convention with the
-                        // Bevy composite: 0.0 = near plane (never occluded),
-                        // 1.0 = far plane. Depth-tested panels expose their real
-                        // depth; always-visible panels pin to 0.0 so scene
-                        // geometry can never discard them.
+                        // Occlusion depth, shared convention with the Bevy
+                        // composite: 0.0 = never occluded (always-visible panel),
+                        // (0.0, 1.0) = depth-tested, encoded far-free as
+                        // 1 - near / view_distance (near -> 0, far/infinity -> 1).
+                        // The composite reconstructs d = near / (1 - depth) and
+                        // compares against the scene distance directly, so no
+                        // far parameter needs to stay in sync across processes.
+                        // The encoding stays monotonic near -> far, which also
+                        // preserves the UI-internal z-order in the color pass.
                         let occlusion_depth = if anchor.occlusion == "depth_tested" {
-                            ((depth - near) / (far - near)).clamp(0.0, 1.0)
+                            (1.0 - near / depth).clamp(0.0, 1.0)
                         } else {
                             0.0
                         };
