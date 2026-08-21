@@ -9,8 +9,8 @@ use std::net::SocketAddr;
 use neon_protocol::ClientIdentity;
 use neon_ui_schema::{
     UiDataGridInputFrame, UiFragment, UiHostInbound, UiHostPresentationUpdate, UiHostPublication,
-    UiInputSchema, UiProgram, UiProgramDragDropEvent, UiProgramInputSnapshot,
-    UiProgramSemanticEvent, UiPointerEvent, UiRepeatFrame, UiWindowRequest,
+    UiInputSchema, UiPointerEvent, UiProgram, UiProgramDragDropEvent, UiProgramInputSnapshot,
+    UiProgramSemanticEvent, UiRepeatFrame, UiWindowRequest,
 };
 use serde::{Deserialize, Serialize};
 
@@ -312,10 +312,12 @@ impl UiHostAdapter {
         frame: UiRepeatFrame,
     ) -> Result<UiRepeatApplyResult, UiHostAdapterError> {
         let mut repeats = self.repeats.clone();
-        let result = repeats.apply(&self.program, frame).map_err(|error| UiHostAdapterError {
-            code: error.code,
-            message: "repeat input publication was rejected",
-        })?;
+        let result = repeats
+            .apply(&self.program, frame)
+            .map_err(|error| UiHostAdapterError {
+                code: error.code,
+                message: "repeat input publication was rejected",
+            })?;
         self.repeats = repeats;
         Ok(result)
     }
@@ -448,7 +450,10 @@ impl UiHostAdapter {
         }
         if event.sequence == 0
             || event.timestamp_monotonic_ns == 0
-            || !event.pixel.iter().all(|value| value.is_finite() && *value >= 0.0)
+            || !event
+                .pixel
+                .iter()
+                .all(|value| value.is_finite() && *value >= 0.0)
             || !event.delta.iter().all(|value| value.is_finite())
         {
             return Err(UiHostAdapterError {
@@ -1079,7 +1084,9 @@ mod tests {
             timestamp_monotonic_ns: 10,
         };
         assert!(matches!(
-            adapter.validate_inbound(UiHostInbound::PointerEvent { event: event.clone() }),
+            adapter.validate_inbound(UiHostInbound::PointerEvent {
+                event: event.clone()
+            }),
             Ok(UiHostInboundResult::PointerEvent(_))
         ));
         assert_eq!(
@@ -1154,8 +1161,10 @@ mod tests {
 
     #[test]
     fn apply_publication_publishes_emitevent_to_eventd() {
-        use neon_ipc::{read_json_frame, write_json_frame, DEFAULT_MAX_FRAME_SIZE};
-        use neon_protocol::{ClientKind, EventAck, EventAckStatus, EventFrame, EventId, EventResponse};
+        use neon_ipc::{DEFAULT_MAX_FRAME_SIZE, read_json_frame, write_json_frame};
+        use neon_protocol::{
+            ClientKind, EventAck, EventAckStatus, EventFrame, EventId, EventResponse,
+        };
 
         // Stand in for neon-eventd: accept one publish frame and assert it is the
         // directed `flow.<flow_name>.<variable>` observation.
@@ -1163,8 +1172,7 @@ mod tests {
         let endpoint = server.local_addr().unwrap();
         let server_thread = std::thread::spawn(move || {
             let mut stream = server.accept().unwrap();
-            let frame: EventFrame =
-                read_json_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE).unwrap();
+            let frame: EventFrame = read_json_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE).unwrap();
             let EventFrame::Publish(publish) = frame else {
                 panic!("expected a publish frame");
             };

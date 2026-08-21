@@ -13,7 +13,11 @@ pub enum ExecError {
     #[error("codelet `{name}` got disallowed constant `{key}`")]
     DisallowedConst { name: String, key: String },
     #[error("codelet `{name}` expects {expected} value inputs, got {actual}")]
-    ValueCount { name: String, expected: usize, actual: usize },
+    ValueCount {
+        name: String,
+        expected: usize,
+        actual: usize,
+    },
     #[error("internal: value node {0} has no buffer yet (dependency order violation)")]
     MissingValueBuffer(usize),
     #[error("device poll failed: {0}")]

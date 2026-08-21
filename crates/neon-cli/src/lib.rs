@@ -157,28 +157,19 @@ pub fn debug_usage() -> &'static str {
 /// Event module commands for the dedicated `neon3.event` protocol.
 #[derive(Debug, PartialEq)]
 pub enum EventCommand {
-    Snapshot {
-        endpoint: SocketAddr,
-    },
-    Subscribe {
-        endpoint: SocketAddr,
-        name: String,
-    },
+    Snapshot { endpoint: SocketAddr },
+    Subscribe { endpoint: SocketAddr, name: String },
 }
 
 impl EventCommand {
     pub fn parse(args: &[String]) -> Result<Self, String> {
         match args {
-            [event, snapshot, endpoint]
-                if event == "event" && snapshot == "snapshot" =>
-            {
+            [event, snapshot, endpoint] if event == "event" && snapshot == "snapshot" => {
                 Ok(Self::Snapshot {
                     endpoint: parse_endpoint(endpoint)?,
                 })
             }
-            [event, subscribe, endpoint, name]
-                if event == "event" && subscribe == "subscribe" =>
-            {
+            [event, subscribe, endpoint, name] if event == "event" && subscribe == "subscribe" => {
                 Ok(Self::Subscribe {
                     endpoint: parse_endpoint(endpoint)?,
                     name: name.clone(),
@@ -235,7 +226,9 @@ pub fn execute_event(command: EventCommand) -> Result<String, TransportError> {
             };
             client.send_value(&serde_json::to_value(EventFrame::Subscribe(subscribe))?)?;
             let response = client.recv_value()?;
-            let ack: neon_protocol::EventAck = match serde_json::from_value::<EventResponse>(response)? {
+            let ack: neon_protocol::EventAck = match serde_json::from_value::<EventResponse>(
+                response,
+            )? {
                 EventResponse::Ack(ack) => ack,
                 EventResponse::Delivery(_) => {
                     return Ok(format!(
@@ -299,9 +292,7 @@ fn call_event_snapshot(endpoint: SocketAddr) -> Result<Value, TransportError> {
     };
     let mut rpc = RpcClient::connect(endpoint)?;
     let response = rpc.call(&request)?;
-    response
-        .result
-        .ok_or(TransportError::ConnectionClosed)
+    response.result.ok_or(TransportError::ConnectionClosed)
 }
 
 fn parse_world_ui_capture(
@@ -986,11 +977,7 @@ mod tests {
     #[test]
     fn event_command_parses_snapshot_and_subscribe() {
         assert_eq!(
-            EventCommand::parse(&[
-                "event".into(),
-                "snapshot".into(),
-                "127.0.0.1:4010".into(),
-            ]),
+            EventCommand::parse(&["event".into(), "snapshot".into(), "127.0.0.1:4010".into(),]),
             Ok(EventCommand::Snapshot {
                 endpoint: "127.0.0.1:4010".parse().unwrap(),
             })
@@ -1008,12 +995,8 @@ mod tests {
             })
         );
         assert!(
-            EventCommand::parse(&[
-                "event".into(),
-                "publish".into(),
-                "127.0.0.1:4010".into(),
-            ])
-            .is_err()
+            EventCommand::parse(&["event".into(), "publish".into(), "127.0.0.1:4010".into(),])
+                .is_err()
         );
     }
 
@@ -1048,7 +1031,9 @@ mod tests {
     #[test]
     fn event_subscribe_command_streams_deliveries() {
         use neon_ipc::{DEFAULT_MAX_FRAME_SIZE, RpcServer, read_json_frame, write_json_frame};
-        use neon_protocol::{EventAckStatus, EventDelivery, EventEnvelope, EventId, EventResponse, EVENT_PROTOCOL};
+        use neon_protocol::{
+            EVENT_PROTOCOL, EventAckStatus, EventDelivery, EventEnvelope, EventId, EventResponse,
+        };
         use std::thread;
 
         let server = RpcServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
@@ -1059,7 +1044,10 @@ mod tests {
             let EventFrame::Subscribe(subscribe) = frame else {
                 panic!("expected subscribe frame");
             };
-            assert_eq!(subscribe.filters[0].name_prefix.as_deref(), Some("nui.variable."));
+            assert_eq!(
+                subscribe.filters[0].name_prefix.as_deref(),
+                Some("nui.variable.")
+            );
             write_json_frame(
                 &mut stream,
                 &EventResponse::Ack(neon_protocol::EventAck {

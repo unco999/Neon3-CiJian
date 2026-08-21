@@ -168,7 +168,8 @@ impl DataPool {
         };
         self.live -= 1;
         self.version += 1;
-        self.deferred_free.push((handle.slot, self.frame + self.deferred_frames));
+        self.deferred_free
+            .push((handle.slot, self.frame + self.deferred_frames));
         Ok(())
     }
 
@@ -326,7 +327,13 @@ mod tests {
     fn out_of_bounds_handle_rejected() {
         let pool = DataPool::new(layout(), 4);
         let err = pool.resolve(Handle::new(99, 0)).unwrap_err();
-        assert_eq!(err, PoolError::OutOfBounds { slot: 99, capacity: 4 });
+        assert_eq!(
+            err,
+            PoolError::OutOfBounds {
+                slot: 99,
+                capacity: 4
+            }
+        );
     }
 
     #[test]

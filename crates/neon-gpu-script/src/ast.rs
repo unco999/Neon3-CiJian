@@ -71,7 +71,11 @@ pub enum Arg {
     /// A nested kernel call; the compiler hoists it into an anonymous SSA node.
     Call(Box<CallExpr>),
     /// Named argument: either a compile-time constant or a value reference.
-    Named { key: String, value: ArgValue, pos: Pos },
+    Named {
+        key: String,
+        value: ArgValue,
+        pos: Pos,
+    },
 }
 
 /// A kernel call used as a nested argument (`mul(dmg, 2.0)` inside `select`).

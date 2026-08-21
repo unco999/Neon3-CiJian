@@ -854,6 +854,11 @@ pub struct UiTransition {
     pub easing: UiEasing,
     #[serde(default)]
     pub from: UiTransitionState,
+    /// Flow motion identity attached by the UI runtime when a state transition
+    /// selects a declared motion. Renderer-side diagnostics expose it; the
+    /// renderer never interprets it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub motion_key: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1099,7 +1104,10 @@ impl UiPointerEvent {
         self.surface_id == *expected_surface
             && self.generation == expected_generation
             && self.sequence > 0
-            && self.pixel.iter().all(|value| value.is_finite() && *value >= 0.0)
+            && self
+                .pixel
+                .iter()
+                .all(|value| value.is_finite() && *value >= 0.0)
             && self.delta.iter().all(|value| value.is_finite())
             && self.timestamp_monotonic_ns > 0
     }
@@ -1314,14 +1322,53 @@ pub struct NuiFlowWorldPanelDeclaration {
 
 /// Finite UI-local statechart declared by NUI Flow. It may only control
 /// presentation; domain mutations leave through declared semantic intents.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NuiFlowStateMachine {
     pub key: String,
     pub initial_state: String,
-    pub states: Vec<String>,
+    pub states: Vec<NuiFlowState>,
     #[serde(default)]
     pub transitions: Vec<NuiFlowStateTransition>,
+}
+
+/// A named presentation state. Every state carries optional per-node style
+/// records; a state transition interpolates from the previous state's records
+/// to the current node visuals automatically.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NuiFlowState {
+    pub name: String,
+    #[serde(default)]
+    pub styles: Vec<NuiFlowStateStyle>,
+}
+
+/// Per-node style snapshot declared inside a presentation state. Fields mirror
+/// `UiTransitionState` so a state transition can seed the animation `from`
+/// directly from the previous state.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NuiFlowStateStyle {
+    pub node_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bounds: Option<UiBounds>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background_color: Option<[f32; 4]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub border_color: Option<[f32; 4]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub border_width: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub corner_radius: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opacity: Option<f32>,
+}
+
+impl NuiFlowState {
+    /// Resolves the style record for a node key, if the state declares one.
+    pub fn style_for(&self, node_key: &str) -> Option<&NuiFlowStateStyle> {
+        self.styles.iter().find(|style| style.node_key == node_key)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -2764,6 +2811,7 @@ mod tests {
                 }),
                 ..UiTransitionState::default()
             },
+            motion_key: None,
         });
         fragment.validate().unwrap();
         fragment.root.enter_transition.as_mut().unwrap().duration_ms = 0;

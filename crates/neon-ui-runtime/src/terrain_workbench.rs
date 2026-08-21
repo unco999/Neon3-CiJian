@@ -14,8 +14,7 @@ use neon_ui_schema::{
 
 use crate::{compile_nui_flow_program, parse_nui_flow};
 
-pub const TERRAIN_WORKBENCH_FLOW: &str =
-    include_str!("../tests/fixtures/ui/terrain-workbench.nui");
+pub const TERRAIN_WORKBENCH_FLOW: &str = include_str!("../tests/fixtures/ui/terrain-workbench.nui");
 
 pub fn terrain_workbench_program_revision() -> UiProgramRevision {
     UiProgramRevision {

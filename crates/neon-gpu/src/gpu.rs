@@ -235,7 +235,8 @@ impl GpuPool {
             let dst = self.mapped_hal.ptr.as_ptr().add(ptr.offset as usize);
             std::ptr::copy(bytes.as_ptr(), dst, bytes.len());
         }
-        self.dirty.push(ptr.offset as u64..(ptr.offset + ptr.size) as u64);
+        self.dirty
+            .push(ptr.offset as u64..(ptr.offset + ptr.size) as u64);
         self.pending_sync = true;
         self.logic.bump_version();
         Ok(())
@@ -300,7 +301,8 @@ impl GpuPool {
                 let dst = self.mapped_hal.ptr.as_ptr().add(offset as usize);
                 std::ptr::write_bytes(dst, 0, self.logic.layout().size as usize);
             }
-            self.dirty.push(offset..offset + self.logic.layout().array_stride as u64);
+            self.dirty
+                .push(offset..offset + self.logic.layout().array_stride as u64);
         }
         self.pending_sync = true;
     }
@@ -390,30 +392,28 @@ impl PoolHeap {
             .pools
             .iter()
             .enumerate()
-            .map(|(i, p)| {
-                wgpu::BindGroupLayoutEntry {
-                    binding: i as u32,
-                    visibility: wgpu::ShaderStages::COMPUTE
-                        | wgpu::ShaderStages::VERTEX
-                        | wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage {
-                            read_only: p.read_only,
-                        },
-                        has_dynamic_offset: false,
-                        min_binding_size: NonZeroU64::new(p.buffer().size()),
+            .map(|(i, p)| wgpu::BindGroupLayoutEntry {
+                binding: i as u32,
+                visibility: wgpu::ShaderStages::COMPUTE
+                    | wgpu::ShaderStages::VERTEX
+                    | wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage {
+                        read_only: p.read_only,
                     },
-                    count: None,
-                }
+                    has_dynamic_offset: false,
+                    min_binding_size: NonZeroU64::new(p.buffer().size()),
+                },
+                count: None,
             })
             .collect();
 
-        self.bind_group_layout = self.device.create_bind_group_layout(
-            &wgpu::BindGroupLayoutDescriptor {
-                label: Some("neon-gpu::PoolHeap::bgl"),
-                entries: &entries,
-            },
-        );
+        self.bind_group_layout =
+            self.device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("neon-gpu::PoolHeap::bgl"),
+                    entries: &entries,
+                });
 
         let entries: Vec<wgpu::BindGroupEntry> = self
             .pools

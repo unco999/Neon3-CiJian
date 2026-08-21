@@ -128,13 +128,19 @@ pub unsafe fn invalidate(
     unsafe {
         match backend {
             #[cfg(target_os = "windows")]
-            HalBackend::Dx12 => invalidate_impl::<wgpu_hal::api::Dx12>(device, buffer, ranges, name),
-            HalBackend::Vulkan => invalidate_impl::<wgpu_hal::api::Vulkan>(device, buffer, ranges, name),
+            HalBackend::Dx12 => {
+                invalidate_impl::<wgpu_hal::api::Dx12>(device, buffer, ranges, name)
+            }
+            HalBackend::Vulkan => {
+                invalidate_impl::<wgpu_hal::api::Vulkan>(device, buffer, ranges, name)
+            }
             #[cfg(any(target_os = "macos", target_os = "ios"))]
             HalBackend::Metal => {
                 invalidate_impl::<wgpu_hal::api::Metal>(device, buffer, ranges, name)
             }
-            HalBackend::Gles => invalidate_impl::<wgpu_hal::api::Gles>(device, buffer, ranges, name),
+            HalBackend::Gles => {
+                invalidate_impl::<wgpu_hal::api::Gles>(device, buffer, ranges, name)
+            }
         }
     }
 }

@@ -7,23 +7,25 @@
 use std::fmt;
 
 use windows::{
-    core::PCWSTR,
     Win32::{
         Foundation::{
-            CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS, GENERIC_ALL, HANDLE, LUID,
+            CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, GENERIC_ALL, HANDLE, LUID,
         },
         Graphics::{
             Direct3D12::{
                 D3D12_FENCE_FLAG_SHARED, D3D12_HEAP_FLAG_SHARED, D3D12_HEAP_PROPERTIES,
                 D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_DESC, D3D12_RESOURCE_DIMENSION_TEXTURE2D,
                 D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_COMMON,
-                D3D12_TEXTURE_LAYOUT_UNKNOWN,
-                ID3D12Device, ID3D12Fence, ID3D12Resource,
+                D3D12_TEXTURE_LAYOUT_UNKNOWN, ID3D12Device, ID3D12Fence, ID3D12Resource,
             },
-            Dxgi::Common::{DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R32_UINT, DXGI_SAMPLE_DESC},
+            Dxgi::Common::{
+                DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32_UINT,
+                DXGI_SAMPLE_DESC,
+            },
         },
         System::Threading::{GetCurrentProcess, OpenProcess, PROCESS_DUP_HANDLE},
     },
+    core::PCWSTR,
 };
 
 #[derive(Debug)]
@@ -101,8 +103,8 @@ pub fn duplicate_handle_to_process(handle: HANDLE, target_pid: u32) -> Result<us
 }
 
 pub fn adapter_info(adapter: &wgpu::Adapter) -> Result<AdapterInfo, Error> {
-    let hal_adapter = unsafe { adapter.as_hal::<wgpu::hal::api::Dx12>() }
-        .ok_or(Error::MissingHalAdapter)?;
+    let hal_adapter =
+        unsafe { adapter.as_hal::<wgpu::hal::api::Dx12>() }.ok_or(Error::MissingHalAdapter)?;
     let desc = unsafe { hal_adapter.raw_adapter().GetDesc2() }
         .map_err(|error| Error::AdapterDescription(error.to_string()))?;
     Ok(AdapterInfo {
@@ -126,14 +128,18 @@ pub fn create_shared_surface(
     format: wgpu::TextureFormat,
 ) -> Result<SharedSurface, Error> {
     let adapter_info = adapter_info(adapter)?;
-    let hal_device = unsafe { device.as_hal::<wgpu::hal::api::Dx12>() }
-        .ok_or(Error::MissingHalDevice)?;
+    let hal_device =
+        unsafe { device.as_hal::<wgpu::hal::api::Dx12>() }.ok_or(Error::MissingHalDevice)?;
     let raw_device: &ID3D12Device = hal_device.raw_device();
     let dxgi_format = match format {
         wgpu::TextureFormat::Rgba8Unorm => DXGI_FORMAT_R8G8B8A8_UNORM,
         wgpu::TextureFormat::R32Uint => DXGI_FORMAT_R32_UINT,
         wgpu::TextureFormat::R32Float => DXGI_FORMAT_R32_FLOAT,
-        _ => return Err(Error::CreateResource("unsupported shared surface format".into())),
+        _ => {
+            return Err(Error::CreateResource(
+                "unsupported shared surface format".into(),
+            ));
+        }
     };
     let desc = D3D12_RESOURCE_DESC {
         Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
@@ -143,7 +149,10 @@ pub fn create_shared_surface(
         DepthOrArraySize: 1,
         MipLevels: 1,
         Format: dxgi_format,
-        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
         Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
         // Both color and ID shared surfaces are cleared and rendered by the
         // Neon owner before Bevy samples them. D3D12 requires this capability

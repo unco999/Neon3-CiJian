@@ -1442,9 +1442,7 @@ fn rejected(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        UiProgramSemanticEventRouter, lower_nui_flow_effects, parse_nui_flow,
-    };
+    use crate::{UiProgramSemanticEventRouter, lower_nui_flow_effects, parse_nui_flow};
     use neon_ipc::RpcClient;
     use neon_protocol::{ClientIdentity, ClientKind, ProtocolVersion, RequestId, ServiceName};
     use neon_ui_schema::UiFragmentId;
@@ -2018,8 +2016,7 @@ mod tests {
         let endpoint = server.local_addr().unwrap();
         let server_thread = std::thread::spawn(move || {
             let mut stream = server.accept().unwrap();
-            let frame: EventFrame =
-                read_json_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE).unwrap();
+            let frame: EventFrame = read_json_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE).unwrap();
             let EventFrame::Publish(publish) = frame else {
                 panic!("expected a publish frame");
             };
@@ -2087,9 +2084,7 @@ mod tests {
             input_revision: snapshot.inputs.input_revision,
             request_id: "gallery-publish-request".into(),
             idempotency_key: "gallery-publish-key".into(),
-            requested_value: Some(neon_ui_schema::UiSemanticPayloadValue::Bool {
-                value: false,
-            }),
+            requested_value: Some(neon_ui_schema::UiSemanticPayloadValue::Bool { value: false }),
             interaction: neon_ui_schema::UiSemanticInteractionMetadata {
                 interaction_id: "gallery-publish-interaction".into(),
                 sequence: 1,

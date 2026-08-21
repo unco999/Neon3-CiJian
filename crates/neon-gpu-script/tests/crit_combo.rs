@@ -1,7 +1,7 @@
 //! End-to-end tests for the crit_combo scene plus frontend error cases.
 
 use neon_gpu_script::{
-    compile, ConstValue, IrArg, KernelRegistry, NodeKind, ScriptError, WorldRegistry,
+    ConstValue, IrArg, KernelRegistry, NodeKind, ScriptError, WorldRegistry, compile,
 };
 
 const CRIT_SRC: &str = r#"
@@ -61,7 +61,11 @@ fn crit_combo_parses_and_validates() {
     assert_eq!(scene.ir.inputs.len(), 4);
     assert_eq!(scene.ir.outputs.len(), 1);
     assert_eq!(scene.ir.outputs[0].to_string(), "target.hp");
-    assert_eq!(scene.ir.nodes.len(), 9, "4 input nodes + 5 kernel nodes (mul hoisted)");
+    assert_eq!(
+        scene.ir.nodes.len(),
+        9,
+        "4 input nodes + 5 kernel nodes (mul hoisted)"
+    );
     assert_eq!(scene.ir.exports.len(), 1);
 }
 
@@ -118,7 +122,10 @@ fn crit_combo_constants_are_baked() {
         vec![
             IrArg::Value(idx("stats")),
             IrArg::Value(idx("def")),
-            IrArg::Const { key: "kind".into(), value: ConstValue::Str("physical".into()) },
+            IrArg::Const {
+                key: "kind".into(),
+                value: ConstValue::Str("physical".into())
+            },
         ]
     );
 
@@ -127,7 +134,10 @@ fn crit_combo_constants_are_baked() {
         crit.args,
         vec![
             IrArg::Value(idx("frame")),
-            IrArg::Const { key: "chance".into(), value: ConstValue::Number(0.25) },
+            IrArg::Const {
+                key: "chance".into(),
+                value: ConstValue::Number(0.25)
+            },
         ]
     );
 }
@@ -151,12 +161,7 @@ fn crit_combo_waves_expose_parallelism() {
 
     assert_eq!(
         scene.waves,
-        vec![
-            vec![dmg, crit],
-            vec![anon_mul],
-            vec![hit],
-            vec![hp],
-        ],
+        vec![vec![dmg, crit], vec![anon_mul], vec![hit], vec![hp],],
         "wave 0: dmg+crit parallel; wave 1: hoisted mul; wave 2: hit; wave 3: hp"
     );
 }
@@ -174,7 +179,9 @@ fn export_target_must_be_declared_output() {
         }
         "#,
     );
-    assert!(matches!(err, ScriptError::UndeclaredOutput { ref domain, ref name } if domain == "target" && name == "stats"));
+    assert!(
+        matches!(err, ScriptError::UndeclaredOutput { ref domain, ref name } if domain == "target" && name == "stats")
+    );
 }
 
 #[test]
@@ -197,7 +204,9 @@ fn two_writers_of_one_resource_conflict() {
         }
         "#,
     );
-    assert!(matches!(err, ScriptError::WriterConflict { ref domain, ref name } if domain == "target" && name == "hp"));
+    assert!(
+        matches!(err, ScriptError::WriterConflict { ref domain, ref name } if domain == "target" && name == "hp")
+    );
 }
 
 #[test]
@@ -278,7 +287,9 @@ fn unknown_world_resource_rejected() {
         }
         "#,
     );
-    assert!(matches!(err, ScriptError::UnknownWorld { ref domain, ref name } if domain == "target" && name == "missing"));
+    assert!(
+        matches!(err, ScriptError::UnknownWorld { ref domain, ref name } if domain == "target" && name == "missing")
+    );
 }
 
 #[test]
@@ -294,7 +305,9 @@ fn read_only_resource_cannot_be_output() {
         }
         "#,
     );
-    assert!(matches!(err, ScriptError::ReadOnlyOutput { ref domain, ref name } if domain == "target" && name == "def"));
+    assert!(
+        matches!(err, ScriptError::ReadOnlyOutput { ref domain, ref name } if domain == "target" && name == "def")
+    );
 }
 
 #[test]
@@ -310,7 +323,9 @@ fn unknown_named_param_rejected() {
         }
         "#,
     );
-    assert!(matches!(err, ScriptError::UnknownParam { ref name, ref param } if name == "mul" && param == "flavor"));
+    assert!(
+        matches!(err, ScriptError::UnknownParam { ref name, ref param } if name == "mul" && param == "flavor")
+    );
 }
 
 #[test]
@@ -326,7 +341,9 @@ fn wrong_value_arg_count_rejected() {
         }
         "#,
     );
-    assert!(matches!(err, ScriptError::KernelArgCount { ref name, expected, actual } if name == "mul" && expected == 2 && actual == 1));
+    assert!(
+        matches!(err, ScriptError::KernelArgCount { ref name, expected, actual } if name == "mul" && expected == 2 && actual == 1)
+    );
 }
 
 #[test]

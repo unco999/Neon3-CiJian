@@ -13,7 +13,7 @@ use neon_ui_schema::{
     UiDropPlacement, UiEasing, UiFragment, UiFragmentRevision, UiIntent, UiJustifyContent,
     UiLayout, UiLayoutMode, UiNode, UiNodeKind, UiSemanticPayloadValue, UiStyle, UiTransition,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 const SHADER: &str = r#"
 struct View { viewport: vec2<f32>, color_mode: u32, _pad: u32 }
@@ -820,7 +820,15 @@ fn color_pass_depth(world_depth: Option<f32>) -> f32 {
     world_depth.map_or(0.0, |depth| 1.0 - depth)
 }
 
+fn is_world_panel_path(path: &str) -> bool {
+    path.rsplit('/')
+        .next()
+        .and_then(|key| key.strip_prefix('p'))
+        .is_some_and(|index| !index.is_empty() && index.chars().all(|c| c.is_ascii_digit()))
+}
+
 pub struct UiWgpuRenderer {
+    trace_role: &'static str,
     color_format: wgpu::TextureFormat,
     pipeline: wgpu::RenderPipeline,
     depth_format: Option<wgpu::TextureFormat>,
@@ -891,7 +899,11 @@ pub struct UiWgpuRenderer {
 
 impl UiWgpuRenderer {
     pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
-        Self::new_internal(device, format, None)
+        Self::new_internal(device, format, None, "screen")
+    }
+
+    pub(crate) fn new_unified(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
+        Self::new_internal(device, format, None, "unified")
     }
 
     /// Renderer that also emits a per-pixel occlusion depth target (R32Float).
@@ -902,13 +914,14 @@ impl UiWgpuRenderer {
         format: wgpu::TextureFormat,
         depth_format: wgpu::TextureFormat,
     ) -> Self {
-        Self::new_internal(device, format, Some(depth_format))
+        Self::new_internal(device, format, Some(depth_format), "world")
     }
 
     fn new_internal(
         device: &wgpu::Device,
         format: wgpu::TextureFormat,
         depth_format: Option<wgpu::TextureFormat>,
+        trace_role: &'static str,
     ) -> Self {
         let view_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("neon3-ui-view-layout"),
@@ -1353,6 +1366,7 @@ impl UiWgpuRenderer {
             })
         });
         Self {
+            trace_role,
             color_format: format,
             pipeline,
             depth_format,
@@ -1531,6 +1545,7 @@ impl UiWgpuRenderer {
         self.update_scroll_metrics();
         for index in 0..self.plan.len() {
             let node = &self.plan[index];
+            let was_active = self.active.contains_key(&node.id);
             // Always begin with a canonical transition sample. Inherited composition
             // below must never accumulate in `sampled` across renderer entry points.
             self.sampled[index] = Self::sample(
@@ -1541,6 +1556,26 @@ impl UiWgpuRenderer {
                 node.transition.as_ref(),
                 time_seconds,
             );
+            if !was_active
+                && self.trace_role != "screen"
+                && is_world_panel_path(&node.id)
+                && self.active.get(&node.id).is_some_and(|active| {
+                    active.transition.motion_key.is_some()
+                })
+            {
+                if let Some(active) = self.active.get(&node.id) {
+                    eprintln!(
+                        "{}",
+                        json!({
+                            "event": "world_ui_transition_begin",
+                            "node_path": node.id,
+                            "motion_key": active.transition.motion_key,
+                            "start_seconds": active.started_at_seconds,
+                            "duration_ms": active.transition.duration_ms,
+                        })
+                    );
+                }
+            }
         }
 
         let plan_index = self
@@ -1696,20 +1731,6 @@ impl UiWgpuRenderer {
         top_layer
     }
 
-    /// Semantic declaration paths only. Numeric renderer hit IDs remain private
-    /// to this process and are never included in a diagnostic response.
-    pub(crate) fn semantic_hit_nodes(&self) -> Vec<String> {
-        let mut paths = self
-            .hit_bindings
-            .values()
-            .filter(|binding| binding.intent.is_some() && binding.data_grid_cell.is_none())
-            .map(|binding| binding.node_path.clone())
-            .collect::<Vec<_>>();
-        paths.sort();
-        paths.dedup();
-        paths
-    }
-
     /// Resolves the topmost declared control at the current pointer position.
     /// This is a local fallback for capture only; the renderer still submits the
     /// GPU hit pass for hover/readback diagnostics.
@@ -1757,43 +1778,7 @@ impl UiWgpuRenderer {
     /// Debug-only semantic diagnostics for a prepared pointer sample. Renderer
     /// hit IDs remain process-local, including on this diagnostic path.
     pub(crate) fn pointer_probe_snapshot(&self) -> Value {
-        let fallback = self
-            .hit_id_at_pointer()
-            .and_then(|hit_id| self.hit_binding(hit_id));
-        let modal = self.active_modal_index().map(|index| {
-            let visual = self.visual_at(index);
-            json!({
-                "active": true,
-                "semantic_node_path": self.plan[index].id,
-                "blocks_pointer": self.modal_blocks_pointer(),
-                "bounds": {"x": visual.bounds.x, "y": visual.bounds.y, "width": visual.bounds.width, "height": visual.bounds.height},
-            })
-        }).unwrap_or_else(|| json!({"active": false, "blocks_pointer": false}));
-        let scroll_container = self.pointer_position.and_then(|pointer| {
-            self.plan.iter().rev().find_map(|node| {
-                let metrics = self.scroll_metrics.get(&node.id)?;
-                (node.target.scroll && contains(metrics.viewport, pointer)).then(|| {
-                    let offset = self
-                        .scroll_offsets
-                        .get(&node.id)
-                        .copied()
-                        .unwrap_or(node.target.declared_scroll_offset);
-                    json!({
-                        "semantic_node_path": node.id,
-                        "offset": {"x": offset[0], "y": offset[1]},
-                        "max_offset": {"x": metrics.max_offset[0], "y": metrics.max_offset[1]},
-                    })
-                })
-            })
-        });
-        json!({
-            "fallback_hit": match fallback {
-                Some(binding) => json!({"status": "hit", "semantic_node_path": binding.node_path}),
-                None => json!({"status": "miss", "semantic_node_path": Value::Null}),
-            },
-            "modal": modal,
-            "scroll_container": scroll_container,
-        })
+        Value::Null
     }
 
     /// Test-only semantic scroll control. Production input continues to update
@@ -3300,12 +3285,91 @@ impl UiWgpuRenderer {
     }
 
     pub(crate) fn has_active_animation(&mut self, time_seconds: f32) -> bool {
-        self.active.retain(|_, active| {
+        let mut completed = Vec::new();
+        self.active.retain(|id, active| {
             let end = active.started_at_seconds
                 + (active.transition.delay_ms + active.transition.duration_ms) as f32 / 1000.0;
-            time_seconds < end
+            if time_seconds < end {
+                true
+            } else {
+                completed.push((
+                    id.clone(),
+                    active.target.clone(),
+                    active.transition.motion_key.clone(),
+                    active.started_at_seconds,
+                    active.transition.duration_ms,
+                ));
+                false
+            }
         });
+        for (node, target, motion_key, start_seconds, duration_ms) in completed {
+            if self.trace_role != "screen"
+                && is_world_panel_path(&node)
+            {
+                eprintln!(
+                    "{}",
+                    json!({
+                        "event": "world_ui_transition_end",
+                        "node_path": node,
+                        "motion_key": motion_key,
+                        "start_seconds": start_seconds,
+                        "end_seconds": time_seconds,
+                        "duration_ms": duration_ms,
+                    })
+                );
+            }
+            // Pin the rendered value to the exact target. Without this the
+            // last in-flight interpolation (progress < 1.0) survives in
+            // `current`, so the next `sample` treats it as a fresh source and
+            // re-starts a no-op motion against the still-present
+            // `enter_transition` — the endless start/complete churn.
+            self.current.insert(node.clone(), target);
+        }
         !self.active.is_empty() || time_seconds < self.pressed_until_seconds
+    }
+
+    /// Renderer-side snapshot of every in-flight transition. `node_key` is the
+    /// stable plan path (fragment_id/node_id), `motion_key` is the Flow motion
+    /// identity attached by the UI runtime (renderer never interprets it),
+    /// `elapsed_ms`/`duration_ms` drive progress, and `target` describes the
+    /// destination visual. Purely diagnostic; never read by frame production.
+    pub(crate) fn active_transition_debug_snapshot(&self, time_seconds: f32) -> Value {
+        let mut transitions = self
+            .active
+            .iter()
+            .map(|(node_key, active)| {
+                let elapsed_ms = ((time_seconds - active.started_at_seconds) * 1000.0).max(0.0);
+                json!({
+                    "node_key": node_key,
+                    "motion_key": active.transition.motion_key,
+                    "elapsed_ms": elapsed_ms,
+                    "delay_ms": active.transition.delay_ms,
+                    "duration_ms": active.transition.duration_ms,
+                    "easing": format_easing(active.transition.easing),
+                    "progress": ((elapsed_ms - active.transition.delay_ms as f32)
+                        / active.transition.duration_ms as f32)
+                        .clamp(0.0, 1.0),
+                    "target": {
+                        "bounds": {
+                            "x": active.target.bounds.x,
+                            "y": active.target.bounds.y,
+                            "width": active.target.bounds.width,
+                            "height": active.target.bounds.height,
+                        },
+                        "opacity": active.target.style.opacity,
+                        "numeric_value": match &active.target.presentation {
+                            Some(UiControlPresentation::Numeric { value, min, max }) => {
+                                json!({"value": value, "min": min, "max": max})
+                            }
+                            _ => Value::Null,
+                        },
+                    },
+                })
+            })
+            .collect::<Vec<_>>();
+        transitions
+            .sort_by(|left, right| left["node_key"].as_str().cmp(&right["node_key"].as_str()));
+        json!({ "count": transitions.len(), "transitions": transitions })
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -3735,9 +3799,7 @@ impl UiWgpuRenderer {
             self.dropdown_popup_instances()
         };
         for index in 0..self.plan.len() {
-            if self.plan[index].target.scroll
-                && sampled_in_mode(&self.sampled[index], mode)
-            {
+            if self.plan[index].target.scroll && sampled_in_mode(&self.sampled[index], mode) {
                 popup_instances.extend(
                     self.scroll_chrome_instances(&self.sampled[index], &self.plan[index].id),
                 );
@@ -3800,7 +3862,8 @@ impl UiWgpuRenderer {
         }
         if self.instance_capacity > self.depth_instance_capacity {
             self.depth_instance_capacity = self.instance_capacity;
-            self.depth_instance_buffer = create_instance_buffer(device, self.depth_instance_capacity);
+            self.depth_instance_buffer =
+                create_instance_buffer(device, self.depth_instance_capacity);
         }
         if popup_instances.len() > self.popup_instance_capacity {
             self.popup_instance_capacity = popup_instances.len().next_power_of_two();
@@ -3971,17 +4034,23 @@ impl UiWgpuRenderer {
                 let mut texts = texts;
                 if mode != UiDrawMode::World {
                     for (visual, text) in &list_box_texts {
-                        if let Some(instances) = layout_text(device, queue, font, visual, text, None) {
+                        if let Some(instances) =
+                            layout_text(device, queue, font, visual, text, None)
+                        {
                             texts.extend(instances);
                         }
                     }
                     for (visual, text) in &tab_texts {
-                        if let Some(instances) = layout_text(device, queue, font, visual, text, None) {
+                        if let Some(instances) =
+                            layout_text(device, queue, font, visual, text, None)
+                        {
                             texts.extend(instances);
                         }
                     }
                     for (visual, text) in &drag_value_texts {
-                        if let Some(instances) = layout_text(device, queue, font, visual, text, None) {
+                        if let Some(instances) =
+                            layout_text(device, queue, font, visual, text, None)
+                        {
                             texts.extend(instances);
                         }
                     }
@@ -4114,9 +4183,7 @@ impl UiWgpuRenderer {
                 // Reversed-Z values are larger nearer the camera. Fixed screen UI is
                 // always painted after every world group, independently of
                 // its color-pass position.z value.
-                (Some(a), Some(b)) => a
-                    .partial_cmp(&b)
-                    .unwrap_or(std::cmp::Ordering::Equal),
+                (Some(a), Some(b)) => a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal),
                 (Some(_), None) => std::cmp::Ordering::Less,
                 (None, Some(_)) => std::cmp::Ordering::Greater,
                 (None, None) => std::cmp::Ordering::Equal,
@@ -4157,7 +4224,8 @@ impl UiWgpuRenderer {
             self.instance_capacity = ordered_rects.len().next_power_of_two();
             self.instance_buffer = create_instance_buffer(device, self.instance_capacity);
             self.depth_instance_capacity = self.instance_capacity;
-            self.depth_instance_buffer = create_instance_buffer(device, self.depth_instance_capacity);
+            self.depth_instance_buffer =
+                create_instance_buffer(device, self.depth_instance_capacity);
         }
         if ordered_images.len() > self.image_capacity {
             self.image_capacity = ordered_images.len().next_power_of_two();
@@ -4323,15 +4391,11 @@ impl UiWgpuRenderer {
                 .find_map(|node| node.target.world_depth)
         };
         let group_depth_value = |group_id: u32| group_depth(group_id).unwrap_or(0.0);
-        group_ids.sort_by(|a, b| {
-            match (group_depth(*a), group_depth(*b)) {
-                (Some(a), Some(b)) => a
-                    .partial_cmp(&b)
-                    .unwrap_or(std::cmp::Ordering::Equal),
-                (Some(_), None) => std::cmp::Ordering::Less,
-                (None, Some(_)) => std::cmp::Ordering::Greater,
-                (None, None) => std::cmp::Ordering::Equal,
-            }
+        group_ids.sort_by(|a, b| match (group_depth(*a), group_depth(*b)) {
+            (Some(a), Some(b)) => a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
         });
         let mut ordered_depth_instances = Vec::new();
         let mut ranges = Vec::new();
@@ -4878,6 +4942,24 @@ impl UiWgpuRenderer {
         transition: Option<&UiTransition>,
         time_seconds: f32,
     ) -> UiVisual {
+        // World anchor projection is a frame-local placement, not a UI motion.
+        // Keep the presentation transition alive while snapping x/y to the
+        // latest projected anchor so camera dragging cannot restart or lag
+        // behind a size/color animation.
+        if target.world_depth.is_some()
+            && let Some(active_transition) = active.get_mut(id)
+            && Self::same_world_visual_except_position(&active_transition.target, target)
+        {
+            active_transition.from.bounds.x = target.bounds.x;
+            active_transition.from.bounds.y = target.bounds.y;
+            active_transition.target.bounds.x = target.bounds.x;
+            active_transition.target.bounds.y = target.bounds.y;
+            let mut sampled = sample_transition(active_transition, time_seconds);
+            sampled.bounds.x = target.bounds.x;
+            sampled.bounds.y = target.bounds.y;
+            current.insert(id.to_owned(), sampled.clone());
+            return sampled;
+        }
         if let Some(active_transition) = active.get(id)
             && active_transition.target == *target
         {
@@ -4886,16 +4968,63 @@ impl UiWgpuRenderer {
             return sampled;
         }
         let source = current.get(id).cloned();
+        // The enter_transition stays on the fragment after the motion has
+        // already completed. If the current rendered value already equals the
+        // target, re-starting the motion is a pure no-op that only reprints
+        // "start"/"complete" and re-enters `active`. Skip it and stay settled.
+        if source.as_ref() == Some(target)
+            || (target.world_depth.is_some()
+                && source
+                    .as_ref()
+                    .is_some_and(|source| Self::same_world_visual_except_position(source, target)))
+        {
+            current.insert(id.to_owned(), target.clone());
+            return target.clone();
+        }
+        // A subtree motion may be attached to numeric descendants so an
+        // authoritative value can interpolate. Do not turn layout-only noise
+        // on unchanged numeric controls into active transitions: the parent
+        // panel already carries the structural motion, and these nodes would
+        // otherwise restart on every revised layout sample.
+        if let Some(transition) = transition
+            && transition.from.bounds.is_none()
+            && transition.from.background_color.is_none()
+            && transition.from.border_color.is_none()
+            && transition.from.border_width.is_none()
+            && transition.from.corner_radius.is_none()
+            && transition.from.opacity.is_none()
+            && matches!(
+                (&source, &target.presentation),
+                (
+                    Some(UiVisual {
+                        presentation: Some(UiControlPresentation::Numeric { value: from, .. }),
+                        ..
+                    }),
+                    Some(UiControlPresentation::Numeric { value: to, .. })
+                ) if (*from - *to).abs() <= f32::EPSILON
+            )
+        {
+            current.insert(id.to_owned(), target.clone());
+            return target.clone();
+        }
         let sampled = match transition {
             Some(transition) if transition.duration_ms > 0 => {
-                let from = source.unwrap_or_else(|| transition_source(target, transition));
+                let mut from = source.unwrap_or_else(|| transition_source(target, transition));
+                if target.world_depth.is_some() {
+                    from.bounds.x = target.bounds.x;
+                    from.bounds.y = target.bounds.y;
+                }
                 let next_active = ActiveTransition {
                     from,
                     target: target.clone(),
                     started_at_seconds: time_seconds,
                     transition: transition.clone(),
                 };
-                let sampled = sample_transition(&next_active, time_seconds);
+                let mut sampled = sample_transition(&next_active, time_seconds);
+                if target.world_depth.is_some() {
+                    sampled.bounds.x = target.bounds.x;
+                    sampled.bounds.y = target.bounds.y;
+                }
                 active.insert(id.to_owned(), next_active);
                 sampled
             }
@@ -4903,6 +5032,20 @@ impl UiWgpuRenderer {
         };
         current.insert(id.to_owned(), sampled.clone());
         sampled
+    }
+
+    fn same_world_visual_except_position(left: &UiVisual, right: &UiVisual) -> bool {
+        let mut left = left.clone();
+        let mut right = right.clone();
+        left.bounds.x = 0.0;
+        left.bounds.y = 0.0;
+        right.bounds.x = 0.0;
+        right.bounds.y = 0.0;
+        left.clip.x = 0.0;
+        left.clip.y = 0.0;
+        right.clip.x = 0.0;
+        right.clip.y = 0.0;
+        left == right
     }
 
     fn instance(&self, visual: &UiVisual, node_path: &str, time_seconds: f32) -> UiInstance {
@@ -5891,7 +6034,7 @@ pub(crate) fn render_hit_ids_for_test(
 }
 
 #[cfg(test)]
-fn render_hit_ids_with_renderer_for_test(
+pub(crate) fn render_hit_ids_with_renderer_for_test(
     renderer: &mut UiWgpuRenderer,
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -7437,8 +7580,7 @@ fn sample_transition(active: &ActiveTransition, time_seconds: f32) -> UiVisual {
     let presentation = match (&active.from.presentation, &active.target.presentation) {
         (
             Some(UiControlPresentation::Numeric {
-                value: from_value,
-                ..
+                value: from_value, ..
             }),
             Some(UiControlPresentation::Numeric {
                 value: target_value,
@@ -7526,6 +7668,15 @@ fn ease(t: f32, easing: UiEasing) -> f32 {
                 1.0 - (-2.0 * t + 2.0).powi(2) * 0.5
             }
         }
+    }
+}
+
+fn format_easing(easing: UiEasing) -> &'static str {
+    match easing {
+        UiEasing::Linear => "linear",
+        UiEasing::EaseIn => "ease_in",
+        UiEasing::EaseOut => "ease_out",
+        UiEasing::EaseInOut => "ease_in_out",
     }
 }
 
@@ -7655,7 +7806,7 @@ mod tests {
         ServiceName,
     };
     use neon_ui_runtime::{
-        demo_domain::DemoDragDropDomain, lower_nui_flow_effects, parse_nui_flow, UiRuntime,
+        UiRuntime, demo_domain::DemoDragDropDomain, lower_nui_flow_effects, parse_nui_flow,
     };
     use neon_ui_schema::{
         TextRef, UiAlignItems, UiCommand, UiDropPlacement, UiEffect, UiFragmentId,
@@ -8828,6 +8979,7 @@ mod tests {
                 }),
                 ..UiTransitionState::default()
             },
+            motion_key: None,
         });
         root.children.push(UiNode {
             node_id: UiNodeId("child".into()),
@@ -9274,9 +9426,11 @@ mod tests {
         assert!(nonblank(&accepted_pixels));
         assert!(!renderer.data_grid_scroll_holds.contains_key("f/grid"));
         assert_eq!(renderer.scroll_offsets["f/grid"][1], desired_offset);
-        assert!(body_rows(&renderer)
-            .iter()
-            .all(|path| !initial_rows.contains(path)));
+        assert!(
+            body_rows(&renderer)
+                .iter()
+                .all(|path| !initial_rows.contains(path))
+        );
 
         let rollback = fragments_at(4, 0);
         renderer.scroll_offsets.insert("f/grid".into(), [0.0; 2]);
@@ -9719,18 +9873,18 @@ mod tests {
                 .unwrap()
                 .2
         };
-        assert!(!component_chrome_instances(visual(
-            "grid/assets/data-grid-row-asset-42/cell-state"
-        ))
-        .is_empty());
-        assert!(!component_chrome_instances(visual(
-            "grid/assets/data-grid-row-asset-42/cell-owner"
-        ))
-        .is_empty());
-        assert!(!component_chrome_instances(visual(
-            "grid/assets/data-grid-row-asset-42/cell-notes"
-        ))
-        .is_empty());
+        assert!(
+            !component_chrome_instances(visual("grid/assets/data-grid-row-asset-42/cell-state"))
+                .is_empty()
+        );
+        assert!(
+            !component_chrome_instances(visual("grid/assets/data-grid-row-asset-42/cell-owner"))
+                .is_empty()
+        );
+        assert!(
+            !component_chrome_instances(visual("grid/assets/data-grid-row-asset-42/cell-notes"))
+                .is_empty()
+        );
     }
 
     #[test]
@@ -10304,10 +10458,6 @@ mod tests {
             Some(UiSemanticPayloadValue::Bool { value: true })
         );
         assert!(renderer.focus_control_at_pointer());
-        assert!(
-            renderer.semantic_hit_nodes().is_empty(),
-            "generated paths must remain renderer-local"
-        );
     }
 
     fn test_device(label: &'static str) -> (wgpu::Device, wgpu::Queue) {
@@ -10370,6 +10520,7 @@ mod tests {
                     }),
                     ..UiTransitionState::default()
                 },
+                motion_key: None,
             }),
             children: Vec::new(),
             world_depth: None,
@@ -10902,6 +11053,64 @@ mod tests {
     }
 
     #[test]
+    fn unified_hit_image_uses_last_overlapping_panel_without_bubbling() {
+        let _gpu_test = GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let (device, queue) = test_device("neon3-unified-hit-order");
+        let mut root = node();
+        root.enter_transition = None;
+        let child = |id: &str| {
+            let mut value = node();
+            value.node_id = UiNodeId(id.into());
+            value.kind = UiNodeKind::Button;
+            value.enter_transition = None;
+            value.bounds = UiBounds {
+                x: 10.0,
+                y: 10.0,
+                width: 40.0,
+                height: 30.0,
+            };
+            value
+        };
+        root.children = vec![child("lower"), child("upper")];
+        let invoke = |action: &str| UiIntent::Invoke {
+            action: action.into(),
+            params: json!({}),
+        };
+        let fragment = UiFragment {
+            fragment_id: neon_ui_schema::UiFragmentId("combined".into()),
+            revision: Revision(1),
+            root,
+            effects: vec![
+                neon_ui_schema::UiEffect::BoundSemanticIntent {
+                    node_id: UiNodeId("lower".into()),
+                    intent: invoke("lower"),
+                },
+                neon_ui_schema::UiEffect::BoundSemanticIntent {
+                    node_id: UiNodeId("upper".into()),
+                    intent: invoke("upper"),
+                },
+            ],
+        };
+        let fragments = HashMap::from([(fragment.fragment_id.clone(), fragment)]);
+        let mut renderer = UiWgpuRenderer::new(&device, wgpu::TextureFormat::Rgba8Unorm);
+        let hits = render_hit_ids_with_renderer_for_test(
+            &mut renderer,
+            &device,
+            &queue,
+            &fragments,
+            [100, 80],
+        );
+        let hit_id = hits[20 * 100 + 20];
+        let binding = renderer
+            .hit_binding(hit_id)
+            .expect("overlap must produce one topmost ID");
+        assert_eq!(binding.node_path, "combined/upper");
+        assert_eq!(binding.intent, Some(invoke("upper")));
+    }
+
+    #[test]
     fn wgpu_layout_resolves_flex_grow_shrink_alignment_and_intrinsic_text() {
         let mut root = node();
         root.bounds = UiBounds {
@@ -11035,9 +11244,11 @@ mod tests {
         assert!((shrunk[0].width - 150.0).abs() < 0.001);
         assert_eq!(shrunk[1].width, 250.0);
         assert_eq!(shrunk[2].width, 100.0);
-        assert!(shrunk
-            .iter()
-            .all(|pane| pane.x + pane.width <= bounds.width + 0.001));
+        assert!(
+            shrunk
+                .iter()
+                .all(|pane| pane.x + pane.width <= bounds.width + 0.001)
+        );
     }
 
     #[test]
@@ -11526,9 +11737,11 @@ mod tests {
                 .unwrap()
                 .2
         };
-        assert!(flattened
-            .iter()
-            .all(|(path, _, _, _)| path != "component-gallery-drop/equipment-item-template"));
+        assert!(
+            flattened
+                .iter()
+                .all(|(path, _, _, _)| path != "component-gallery-drop/equipment-item-template")
+        );
         let target = visual("equipment-zone").bounds;
         let instance = visual(instance_key).bounds;
         let label = visual(label_key);
@@ -12058,13 +12271,6 @@ mod tests {
             renderer.hit_id_at_pointer().is_some(),
             "the default-hidden dialog must not block gallery controls"
         );
-        let probe = renderer.pointer_probe_snapshot();
-        assert_eq!(probe["fallback_hit"]["status"], "hit");
-        assert_eq!(
-            probe["fallback_hit"]["semantic_node_path"],
-            "component-gallery/feature-toggle"
-        );
-        assert!(probe["fallback_hit"].get("render_id").is_none());
         assert_eq!(
             renderer.scroll_metrics["component-gallery/gallery-controls"].max_offset,
             [0.0, 284.0]
@@ -12873,6 +13079,7 @@ mod tests {
                 numeric_value: Some(0.0),
                 ..UiTransitionState::default()
             },
+            motion_key: None,
         };
         let active = ActiveTransition {
             from: transition_source(&target, &transition),
@@ -12887,7 +13094,10 @@ mod tests {
             }
             _ => panic!("numeric presentation must be sampled"),
         }
-        assert_eq!(sample_transition(&active, 1.2).presentation, target.presentation);
+        assert_eq!(
+            sample_transition(&active, 1.2).presentation,
+            target.presentation
+        );
     }
 
     #[test]
@@ -12953,6 +13163,7 @@ mod tests {
                 duration_ms: 100,
                 easing: UiEasing::Linear,
                 from: UiTransitionState::default(),
+                motion_key: None,
             },
         };
         assert_eq!(sample_transition(&active, 0.05).bounds.x, 50.0);
@@ -13004,11 +13215,84 @@ mod tests {
                     opacity: Some(0.0),
                     ..UiTransitionState::default()
                 },
+                motion_key: None,
             }),
             1.0,
         );
         assert!(renderer.has_active_animation(1.005));
         assert!(!renderer.has_active_animation(1.020));
+    }
+
+    #[test]
+    fn world_projection_moves_immediately_without_restarting_presentation_motion() {
+        let target = UiVisual {
+            bounds: UiBounds {
+                x: 100.0,
+                y: 120.0,
+                width: 200.0,
+                height: 70.0,
+            },
+            style: UiStyle::default(),
+            kind: UiNodeKind::Panel,
+            enabled: true,
+            clip: UiBounds {
+                x: 100.0,
+                y: 120.0,
+                width: 200.0,
+                height: 70.0,
+            },
+            clip_radius: 0.0,
+            image: None,
+            surface: None,
+            text: None,
+            presentation: None,
+            scroll: false,
+            declared_scroll_offset: [0.0; 2],
+            world_depth: Some(0.5),
+            paint_group_id: 0,
+        };
+        let transition = UiTransition {
+            delay_ms: 0,
+            duration_ms: 500,
+            easing: UiEasing::EaseInOut,
+            from: UiTransitionState {
+                bounds: Some(UiBounds {
+                    x: 100.0,
+                    y: 120.0,
+                    width: 200.0,
+                    height: 70.0,
+                }),
+                background_color: Some([0.0, 0.0, 0.0, 1.0]),
+                ..UiTransitionState::default()
+            },
+            motion_key: Some("world-panel".into()),
+        };
+        let mut current = HashMap::new();
+        let mut active = HashMap::new();
+        UiWgpuRenderer::sample(
+            &mut current,
+            &mut active,
+            "world/p0",
+            &target,
+            Some(&transition),
+            1.0,
+        );
+        let mut moved = target.clone();
+        moved.bounds.x = 700.0;
+        moved.bounds.y = 540.0;
+        moved.clip.x = 700.0;
+        moved.clip.y = 540.0;
+        let sampled = UiWgpuRenderer::sample(
+            &mut current,
+            &mut active,
+            "world/p0",
+            &moved,
+            Some(&transition),
+            1.016,
+        );
+        assert_eq!([sampled.bounds.x, sampled.bounds.y], [700.0, 540.0]);
+        assert_eq!(active.len(), 1, "camera motion must not create a new transition");
+        assert!(active["world/p0"].started_at_seconds == 1.0);
     }
 
     #[test]

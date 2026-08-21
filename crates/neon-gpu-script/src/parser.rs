@@ -24,13 +24,18 @@ pub fn parse(tokens: &[Token]) -> Result<Script, ScriptError> {
             other => {
                 return Err(ScriptError::Parse {
                     pos,
-                    msg: format!("unexpected keyword `{other}` (expected `scene` or `schema_version`)"),
+                    msg: format!(
+                        "unexpected keyword `{other}` (expected `scene` or `schema_version`)"
+                    ),
                 });
             }
         }
     }
 
-    Ok(Script { schema_version, scenes })
+    Ok(Script {
+        schema_version,
+        scenes,
+    })
 }
 
 struct Parser<'a> {
@@ -55,7 +60,10 @@ impl<'a> Parser<'a> {
 
     fn peek_ident(&self) -> Result<(String, Pos), ScriptError> {
         match self.peek() {
-            Some(Token { kind: TokenKind::Ident(s), pos }) => Ok((s.clone(), *pos)),
+            Some(Token {
+                kind: TokenKind::Ident(s),
+                pos,
+            }) => Ok((s.clone(), *pos)),
             Some(t) => Err(ScriptError::Parse {
                 pos: t.pos,
                 msg: format!("expected identifier, found `{:?}`", t.kind),
@@ -83,7 +91,10 @@ impl<'a> Parser<'a> {
 
     fn expect_ident(&mut self, what: &str) -> Result<(String, Pos), ScriptError> {
         match self.peek() {
-            Some(Token { kind: TokenKind::Ident(s), pos }) => {
+            Some(Token {
+                kind: TokenKind::Ident(s),
+                pos,
+            }) => {
                 let (s, pos) = (s.clone(), *pos);
                 self.bump();
                 Ok((s, pos))
@@ -101,7 +112,10 @@ impl<'a> Parser<'a> {
 
     fn expect_number(&mut self) -> Result<(f64, Pos), ScriptError> {
         match self.peek() {
-            Some(Token { kind: TokenKind::Number(n), pos }) => {
+            Some(Token {
+                kind: TokenKind::Number(n),
+                pos,
+            }) => {
                 let (n, pos) = (*n, *pos);
                 self.bump();
                 Ok((n, pos))
@@ -121,7 +135,11 @@ impl<'a> Parser<'a> {
         let (domain, pos) = self.expect_ident(what)?;
         self.expect(TokenKind::Dot, "expected `.` in qualified name")?;
         let (name, _) = self.expect_ident("name after `.`")?;
-        if let Some(Token { kind: TokenKind::Dot, pos: dot_pos }) = self.peek() {
+        if let Some(Token {
+            kind: TokenKind::Dot,
+            pos: dot_pos,
+        }) = self.peek()
+        {
             return Err(ScriptError::Parse {
                 pos: *dot_pos,
                 msg: "qualified names are two-part `domain.name`; nested namespaces are not supported"
@@ -134,7 +152,13 @@ impl<'a> Parser<'a> {
     fn parse_scene(&mut self) -> Result<Scene, ScriptError> {
         self.expect(TokenKind::Ident("scene".into()), "`scene`")?;
         let (name, pos) = self.expect_ident("scene name")?;
-        if matches!(self.peek(), Some(Token { kind: TokenKind::Eq, .. })) {
+        if matches!(
+            self.peek(),
+            Some(Token {
+                kind: TokenKind::Eq,
+                ..
+            })
+        ) {
             self.bump();
         }
         self.expect(TokenKind::Lbrace, "`{` after scene name")?;
@@ -145,11 +169,17 @@ impl<'a> Parser<'a> {
 
         loop {
             match self.peek() {
-                Some(Token { kind: TokenKind::Rbrace, .. }) => {
+                Some(Token {
+                    kind: TokenKind::Rbrace,
+                    ..
+                }) => {
                     self.bump();
                     break;
                 }
-                Some(Token { kind: TokenKind::Ident(kw), pos }) => {
+                Some(Token {
+                    kind: TokenKind::Ident(kw),
+                    pos,
+                }) => {
                     let kw = kw.clone();
                     let kw_pos = *pos;
                     match kw.as_str() {
@@ -169,9 +199,16 @@ impl<'a> Parser<'a> {
                                     }
                                     _ => world.name.clone(),
                                 };
-                                inputs.push(InputDecl { world, alias, pos: dpos });
+                                inputs.push(InputDecl {
+                                    world,
+                                    alias,
+                                    pos: dpos,
+                                });
                                 match self.peek() {
-                                    Some(Token { kind: TokenKind::Comma, .. }) => {
+                                    Some(Token {
+                                        kind: TokenKind::Comma,
+                                        ..
+                                    }) => {
                                         self.bump();
                                     }
                                     _ => break,
@@ -185,7 +222,10 @@ impl<'a> Parser<'a> {
                                 let (q, _) = self.parse_qualified("output world resource name")?;
                                 outputs.push(q);
                                 match self.peek() {
-                                    Some(Token { kind: TokenKind::Comma, .. }) => {
+                                    Some(Token {
+                                        kind: TokenKind::Comma,
+                                        ..
+                                    }) => {
                                         self.bump();
                                     }
                                     _ => break,
@@ -197,7 +237,10 @@ impl<'a> Parser<'a> {
                             self.expect(TokenKind::Colon, "`:` after body")?;
                             loop {
                                 match self.peek() {
-                                    Some(Token { kind: TokenKind::Rbrace, .. }) => break,
+                                    Some(Token {
+                                        kind: TokenKind::Rbrace,
+                                        ..
+                                    }) => break,
                                     None => {
                                         return Err(ScriptError::Parse {
                                             pos: kw_pos,
@@ -233,7 +276,13 @@ impl<'a> Parser<'a> {
             }
         }
 
-        Ok(Scene { name, pos, inputs, outputs, body })
+        Ok(Scene {
+            name,
+            pos,
+            inputs,
+            outputs,
+            body,
+        })
     }
 
     fn parse_stmt(&mut self) -> Result<Stmt, ScriptError> {
@@ -254,7 +303,12 @@ impl<'a> Parser<'a> {
         self.expect(TokenKind::Eq, "`=` after value name")?;
         let (kernel, _) = self.expect_ident("kernel name")?;
         let args = self.parse_call_args()?;
-        Ok(LetStmt { name, pos, kernel, args })
+        Ok(LetStmt {
+            name,
+            pos,
+            kernel,
+            args,
+        })
     }
 
     fn parse_call_args(&mut self) -> Result<Vec<Arg>, ScriptError> {
@@ -262,7 +316,10 @@ impl<'a> Parser<'a> {
         let mut args = Vec::new();
         loop {
             match self.peek() {
-                Some(Token { kind: TokenKind::Rparen, .. }) => {
+                Some(Token {
+                    kind: TokenKind::Rparen,
+                    ..
+                }) => {
                     self.bump();
                     break;
                 }
@@ -275,7 +332,10 @@ impl<'a> Parser<'a> {
                 _ => {
                     args.push(self.parse_arg()?);
                     match self.peek() {
-                        Some(Token { kind: TokenKind::Comma, .. }) => {
+                        Some(Token {
+                            kind: TokenKind::Comma,
+                            ..
+                        }) => {
                             self.bump();
                         }
                         _ => {}
@@ -288,12 +348,18 @@ impl<'a> Parser<'a> {
 
     fn parse_arg(&mut self) -> Result<Arg, ScriptError> {
         let (first, pos) = match self.peek() {
-            Some(Token { kind: TokenKind::Number(n), .. }) => {
+            Some(Token {
+                kind: TokenKind::Number(n),
+                ..
+            }) => {
                 let n = *n;
                 self.bump();
                 return Ok(Arg::Pos(ArgValue::Number(n)));
             }
-            Some(Token { kind: TokenKind::Ident(s), pos }) => {
+            Some(Token {
+                kind: TokenKind::Ident(s),
+                pos,
+            }) => {
                 let (s, pos) = (s.clone(), *pos);
                 self.bump();
                 (s, pos)
@@ -312,25 +378,47 @@ impl<'a> Parser<'a> {
             }
         };
         // `first` is an identifier here.
-        if matches!(self.peek(), Some(Token { kind: TokenKind::Lparen, .. })) {
+        if matches!(
+            self.peek(),
+            Some(Token {
+                kind: TokenKind::Lparen,
+                ..
+            })
+        ) {
             let args = self.parse_call_args()?;
-            return Ok(Arg::Call(Box::new(CallExpr { kernel: first, args, pos })));
+            return Ok(Arg::Call(Box::new(CallExpr {
+                kernel: first,
+                args,
+                pos,
+            })));
         }
         match self.peek() {
-            Some(Token { kind: TokenKind::Eq, .. }) => {
+            Some(Token {
+                kind: TokenKind::Eq,
+                ..
+            }) => {
                 self.bump();
                 let value = match self.peek() {
-                    Some(Token { kind: TokenKind::Number(n), .. }) => {
+                    Some(Token {
+                        kind: TokenKind::Number(n),
+                        ..
+                    }) => {
                         let n = *n;
                         self.bump();
                         ArgValue::Number(n)
                     }
-                    Some(Token { kind: TokenKind::Str(s), .. }) => {
+                    Some(Token {
+                        kind: TokenKind::Str(s),
+                        ..
+                    }) => {
                         let s = s.clone();
                         self.bump();
                         ArgValue::Str(s)
                     }
-                    Some(Token { kind: TokenKind::Ident(s), .. }) => {
+                    Some(Token {
+                        kind: TokenKind::Ident(s),
+                        ..
+                    }) => {
                         let s = s.clone();
                         self.bump();
                         ArgValue::Ident(s)
@@ -338,7 +426,10 @@ impl<'a> Parser<'a> {
                     Some(t) => {
                         return Err(ScriptError::Parse {
                             pos: t.pos,
-                            msg: format!("expected constant or value reference, found `{:?}`", t.kind),
+                            msg: format!(
+                                "expected constant or value reference, found `{:?}`",
+                                t.kind
+                            ),
                         });
                     }
                     None => {
@@ -348,7 +439,11 @@ impl<'a> Parser<'a> {
                         });
                     }
                 };
-                Ok(Arg::Named { key: first, value, pos })
+                Ok(Arg::Named {
+                    key: first,
+                    value,
+                    pos,
+                })
             }
             _ => Ok(Arg::Pos(ArgValue::Ident(first))),
         }
@@ -359,6 +454,10 @@ impl<'a> Parser<'a> {
         let (target, pos) = self.parse_qualified("export target world resource name")?;
         self.expect(TokenKind::Eq, "`=` after export target")?;
         let (source, _) = self.expect_ident("source value name")?;
-        Ok(ExportStmt { target, source, pos })
+        Ok(ExportStmt {
+            target,
+            source,
+            pos,
+        })
     }
 }

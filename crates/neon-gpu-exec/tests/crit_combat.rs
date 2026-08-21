@@ -1,4 +1,4 @@
-﻿//! End-to-end GPU test: the crit_combo script runs on a real headless device
+//! End-to-end GPU test: the crit_combo script runs on a real headless device
 //! and the exported `target.hp` is read back and verified against a CPU
 //! reference computation of the same algorithm.
 
@@ -6,7 +6,7 @@ use std::collections::HashMap;
 
 use neon_gpu_exec::codelet::{ConstArg, FieldTy};
 use neon_gpu_exec::{Codelet, Executor, InputField};
-use neon_gpu_script::{compile, KernelRegistry, WorldRegistry};
+use neon_gpu_script::{KernelRegistry, WorldRegistry, compile};
 
 const N: u32 = 4;
 const WORKGROUP: u32 = 64;
@@ -62,16 +62,14 @@ fn headless_device() -> (wgpu::Device, wgpu::Queue) {
         apply_limit_buckets: false,
     }))
     .expect("no adapter available");
-    let (device, queue) = pollster::block_on(adapter.request_device(
-        &wgpu::DeviceDescriptor {
-            label: Some("neon-gpu-exec test device"),
-            required_features: wgpu::Features::empty(),
-            required_limits: wgpu::Limits::default(),
-            experimental_features: Default::default(),
-            memory_hints: wgpu::MemoryHints::default(),
-            trace: Default::default(),
-        },
-    ))
+    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        label: Some("neon-gpu-exec test device"),
+        required_features: wgpu::Features::empty(),
+        required_limits: wgpu::Limits::default(),
+        experimental_features: Default::default(),
+        memory_hints: wgpu::MemoryHints::default(),
+        trace: Default::default(),
+    }))
     .expect("device request failed");
     (device, queue)
 }
@@ -312,10 +310,38 @@ fn crit_combo_runs_on_gpu_and_reads_back_correct_hp() {
     queue.write_buffer(&frame_buf, 0, bytemuck::cast_slice(&frame));
 
     let mut inputs = HashMap::new();
-    inputs.insert("stats".into(), InputField { buffer: stats_buf, per_entity: 8, ty: FieldTy::F32 });
-    inputs.insert("def".into(), InputField { buffer: def_buf, per_entity: 1, ty: FieldTy::F32 });
-    inputs.insert("frame".into(), InputField { buffer: frame_buf, per_entity: 1, ty: FieldTy::U32 });
-    inputs.insert("target_hp".into(), InputField { buffer: hp_buf, per_entity: 1, ty: FieldTy::F32 });
+    inputs.insert(
+        "stats".into(),
+        InputField {
+            buffer: stats_buf,
+            per_entity: 8,
+            ty: FieldTy::F32,
+        },
+    );
+    inputs.insert(
+        "def".into(),
+        InputField {
+            buffer: def_buf,
+            per_entity: 1,
+            ty: FieldTy::F32,
+        },
+    );
+    inputs.insert(
+        "frame".into(),
+        InputField {
+            buffer: frame_buf,
+            per_entity: 1,
+            ty: FieldTy::U32,
+        },
+    );
+    inputs.insert(
+        "target_hp".into(),
+        InputField {
+            buffer: hp_buf,
+            per_entity: 1,
+            ty: FieldTy::F32,
+        },
+    );
 
     let mut executor = Executor::new(device, queue);
     executor.register_codelet("damage_formula", Box::new(DamageFormula));
@@ -339,9 +365,23 @@ fn crit_combo_runs_on_gpu_and_reads_back_correct_hp() {
     }
 
     // The script's own wave plan proves the parallelism we claimed.
-    let dmg = scene.ir.nodes.iter().position(|n| n.result == "dmg").unwrap();
-    let crit = scene.ir.nodes.iter().position(|n| n.result == "crit").unwrap();
-    assert_eq!(scene.waves[0], vec![dmg, crit], "wave 0 must expose dmg+crit parallelism");
+    let dmg = scene
+        .ir
+        .nodes
+        .iter()
+        .position(|n| n.result == "dmg")
+        .unwrap();
+    let crit = scene
+        .ir
+        .nodes
+        .iter()
+        .position(|n| n.result == "crit")
+        .unwrap();
+    assert_eq!(
+        scene.waves[0],
+        vec![dmg, crit],
+        "wave 0 must expose dmg+crit parallelism"
+    );
 }
 
 #[test]
@@ -353,9 +393,30 @@ fn missing_input_alias_rejected() {
     let mut inputs = HashMap::new();
     let stats_buf = storage_buffer(&device, "x", (N * 8) as usize);
     let buf = storage_buffer(&device, "x2", N as usize);
-    inputs.insert("stats".into(), InputField { buffer: stats_buf, per_entity: 8, ty: FieldTy::F32 });
-    inputs.insert("def".into(), InputField { buffer: buf.clone(), per_entity: 1, ty: FieldTy::F32 });
-    inputs.insert("frame".into(), InputField { buffer: buf.clone(), per_entity: 1, ty: FieldTy::U32 });
+    inputs.insert(
+        "stats".into(),
+        InputField {
+            buffer: stats_buf,
+            per_entity: 8,
+            ty: FieldTy::F32,
+        },
+    );
+    inputs.insert(
+        "def".into(),
+        InputField {
+            buffer: buf.clone(),
+            per_entity: 1,
+            ty: FieldTy::F32,
+        },
+    );
+    inputs.insert(
+        "frame".into(),
+        InputField {
+            buffer: buf.clone(),
+            per_entity: 1,
+            ty: FieldTy::U32,
+        },
+    );
 
     let mut executor = Executor::new(device, queue);
     executor.register_codelet("damage_formula", Box::new(DamageFormula));

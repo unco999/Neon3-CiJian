@@ -38,35 +38,59 @@ pub fn tokenize(src: &str) -> Result<Vec<Token>, ScriptError> {
                 }
             }
             '.' => {
-                out.push(Token { kind: TokenKind::Dot, pos: i });
+                out.push(Token {
+                    kind: TokenKind::Dot,
+                    pos: i,
+                });
                 i += 1;
             }
             ',' => {
-                out.push(Token { kind: TokenKind::Comma, pos: i });
+                out.push(Token {
+                    kind: TokenKind::Comma,
+                    pos: i,
+                });
                 i += 1;
             }
             ':' => {
-                out.push(Token { kind: TokenKind::Colon, pos: i });
+                out.push(Token {
+                    kind: TokenKind::Colon,
+                    pos: i,
+                });
                 i += 1;
             }
             '=' => {
-                out.push(Token { kind: TokenKind::Eq, pos: i });
+                out.push(Token {
+                    kind: TokenKind::Eq,
+                    pos: i,
+                });
                 i += 1;
             }
             '{' => {
-                out.push(Token { kind: TokenKind::Lbrace, pos: i });
+                out.push(Token {
+                    kind: TokenKind::Lbrace,
+                    pos: i,
+                });
                 i += 1;
             }
             '}' => {
-                out.push(Token { kind: TokenKind::Rbrace, pos: i });
+                out.push(Token {
+                    kind: TokenKind::Rbrace,
+                    pos: i,
+                });
                 i += 1;
             }
             '(' => {
-                out.push(Token { kind: TokenKind::Lparen, pos: i });
+                out.push(Token {
+                    kind: TokenKind::Lparen,
+                    pos: i,
+                });
                 i += 1;
             }
             ')' => {
-                out.push(Token { kind: TokenKind::Rparen, pos: i });
+                out.push(Token {
+                    kind: TokenKind::Rparen,
+                    pos: i,
+                });
                 i += 1;
             }
             '-' => {
@@ -97,7 +121,10 @@ pub fn tokenize(src: &str) -> Result<Vec<Token>, ScriptError> {
                     });
                 }
                 i += 1;
-                out.push(Token { kind: TokenKind::Str(s), pos: start });
+                out.push(Token {
+                    kind: TokenKind::Str(s),
+                    pos: start,
+                });
             }
             _ if c.is_ascii_digit() => {
                 let pos = i;

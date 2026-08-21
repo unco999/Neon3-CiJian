@@ -906,7 +906,14 @@ mod tests {
         let value = serde_json::to_value(&envelope).unwrap();
         assert_eq!(value["epoch"], 7);
         assert_eq!(value["sequence"], 10042);
-        for forbidden in ["texture", "buffer", "handle", "path", "hit_id", "element_id"] {
+        for forbidden in [
+            "texture",
+            "buffer",
+            "handle",
+            "path",
+            "hit_id",
+            "element_id",
+        ] {
             assert!(value.get(forbidden).is_none());
         }
         let decoded: EventEnvelope = serde_json::from_value(value).unwrap();
@@ -1127,7 +1134,10 @@ mod tests {
         assert_eq!(value["preferred_backends"][0], "dx12");
         assert!(value.get("handle").is_none());
         assert!(value.get("texture_handle").is_none());
-        assert_eq!(serde_json::from_value::<RenderBackendNegotiation>(value).unwrap(), negotiation);
+        assert_eq!(
+            serde_json::from_value::<RenderBackendNegotiation>(value).unwrap(),
+            negotiation
+        );
 
         let surface = RenderSurfaceDescriptor {
             session_id: "host-session-001".into(),
@@ -1154,7 +1164,10 @@ mod tests {
         let value = serde_json::to_value(&surface).unwrap();
         assert!(value["texture"].get("broker_token").is_some());
         assert!(value["texture"].get("handle").is_none());
-        assert_eq!(serde_json::from_value::<RenderSurfaceDescriptor>(value).unwrap(), surface);
+        assert_eq!(
+            serde_json::from_value::<RenderSurfaceDescriptor>(value).unwrap(),
+            surface
+        );
     }
 
     #[test]
@@ -1183,7 +1196,10 @@ mod tests {
             session_id: "bevy-session".into(),
             surface_id: "bevy.screen".into(),
             kind: RenderSurfaceKind::ScreenUi,
-            size: RenderSurfaceSize { width: 1280, height: 720 },
+            size: RenderSurfaceSize {
+                width: 1280,
+                height: 720,
+            },
             format: "rgba8unorm".into(),
             color_space: RenderSurfaceColorSpace::Srgb,
             depth: false,
@@ -1204,6 +1220,9 @@ mod tests {
         };
         let value = serde_json::to_value(&open).unwrap();
         assert_eq!(value["targets"][1]["kind"], "id");
-        assert_eq!(serde_json::from_value::<RenderSurfaceOpen>(value).unwrap(), open);
+        assert_eq!(
+            serde_json::from_value::<RenderSurfaceOpen>(value).unwrap(),
+            open
+        );
     }
 }

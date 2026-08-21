@@ -18,7 +18,8 @@ pub fn layering(scene: &IrScene) -> Vec<Vec<NodeId>> {
         }
     }
 
-    let mut by_level: std::collections::BTreeMap<u32, Vec<NodeId>> = std::collections::BTreeMap::new();
+    let mut by_level: std::collections::BTreeMap<u32, Vec<NodeId>> =
+        std::collections::BTreeMap::new();
     for (id, node) in scene.nodes.iter().enumerate() {
         if matches!(node.kind, NodeKind::Kernel { .. }) {
             by_level.entry(levels[id]).or_default().push(id);
@@ -36,7 +37,12 @@ mod tests {
     fn input_node(id: usize, alias: &str) -> IrNode {
         IrNode {
             id,
-            kind: NodeKind::Input { world: QualifiedName { domain: "t".into(), name: alias.into() } },
+            kind: NodeKind::Input {
+                world: QualifiedName {
+                    domain: "t".into(),
+                    name: alias.into(),
+                },
+            },
             args: Vec::new(),
             preds: Vec::new(),
             result: alias.into(),
@@ -55,21 +61,27 @@ mod tests {
                 input_node(1, "b"),
                 IrNode {
                     id: 2,
-                    kind: NodeKind::Kernel { kernel: "k1".into() },
+                    kind: NodeKind::Kernel {
+                        kernel: "k1".into(),
+                    },
                     args: Vec::new(),
                     preds: vec![0, 1],
                     result: "c".into(),
                 },
                 IrNode {
                     id: 3,
-                    kind: NodeKind::Kernel { kernel: "k2".into() },
+                    kind: NodeKind::Kernel {
+                        kernel: "k2".into(),
+                    },
                     args: Vec::new(),
                     preds: vec![2],
                     result: "d".into(),
                 },
                 IrNode {
                     id: 4,
-                    kind: NodeKind::Kernel { kernel: "k3".into() },
+                    kind: NodeKind::Kernel {
+                        kernel: "k3".into(),
+                    },
                     args: Vec::new(),
                     preds: vec![2, 1],
                     result: "e".into(),

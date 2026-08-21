@@ -52,7 +52,10 @@ fn main() -> io::Result<()> {
         "watch" => {
             for sequence in 1..=count {
                 let result = request(endpoint, sequence).map_err(io::Error::other)?;
-                println!("{}", json!({"callback": "depth.frame", "sequence": sequence, "data": result}));
+                println!(
+                    "{}",
+                    json!({"callback": "depth.frame", "sequence": sequence, "data": result})
+                );
                 thread::sleep(Duration::from_millis(100));
             }
         }

@@ -494,7 +494,9 @@ mod tests {
 
     #[test]
     fn event_publish_frame_round_trips_over_loopback() {
-        use neon_protocol::{EventAck, EventAckStatus, EventPublish, EventResponse, EVENT_PROTOCOL};
+        use neon_protocol::{
+            EVENT_PROTOCOL, EventAck, EventAckStatus, EventPublish, EventResponse,
+        };
 
         let server = RpcServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
         let endpoint = server.local_addr().unwrap();
@@ -543,7 +545,10 @@ mod tests {
             })
             .unwrap();
         assert_eq!(ack.status, EventAckStatus::Accepted);
-        assert_eq!(ack.event_id, Some(neon_protocol::EventId("event-001".into())));
+        assert_eq!(
+            ack.event_id,
+            Some(neon_protocol::EventId("event-001".into()))
+        );
         thread.join().unwrap();
     }
 }

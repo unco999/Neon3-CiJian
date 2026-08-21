@@ -31,8 +31,7 @@ const COMPONENT_GALLERY_SOURCE: &str =
     include_str!("../../tests/fixtures/ui/imgui-component-gallery.nui");
 const DATA_GRID_SOURCE: &str = include_str!("../../tests/fixtures/ui/data-grid-demo.nui");
 const SCROLL_VIEW_SOURCE: &str = include_str!("../../tests/fixtures/ui/scroll-view-demo.nui");
-const VIRTUAL_LIST_SOURCE: &str =
-    include_str!("../../tests/fixtures/ui/virtual-list-demo.nui");
+const VIRTUAL_LIST_SOURCE: &str = include_str!("../../tests/fixtures/ui/virtual-list-demo.nui");
 
 fn main() {
     let mut args = std::env::args().skip(1);

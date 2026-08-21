@@ -57,10 +57,7 @@ impl UiVariableEventPublisher {
             module: module.into(),
             surface: surface.into(),
             flow_name: flow_name.into(),
-            emit_event_keys: emit_event_keys
-                .into_iter()
-                .map(Into::into)
-                .collect(),
+            emit_event_keys: emit_event_keys.into_iter().map(Into::into).collect(),
         }
     }
 
@@ -124,11 +121,7 @@ impl UiVariableEventPublisher {
         let publish = EventPublish {
             protocol: "neon3.event".into(),
             version: PROTOCOL_VERSION,
-            request_id: RequestId(format!(
-                "ui-var-{}-{}",
-                self.client.instance_id,
-                change.key
-            )),
+            request_id: RequestId(format!("ui-var-{}-{}", self.client.instance_id, change.key)),
             publisher: self.client.clone(),
             name: event_name.into(),
             schema_version: 1,
@@ -142,7 +135,9 @@ impl UiVariableEventPublisher {
             }),
             idempotency_key: None,
         };
-        let ack = client.publish(&publish).map_err(|error| error.to_string())?;
+        let ack = client
+            .publish(&publish)
+            .map_err(|error| error.to_string())?;
         if ack.status == EventAckStatus::Accepted {
             Ok(ack)
         } else {
@@ -172,9 +167,11 @@ mod tests {
     fn disabled_publisher_returns_no_results() {
         let publisher = UiVariableEventPublisher::disabled("module", "surface");
         assert!(!publisher.enabled());
-        assert!(publisher
-            .publish_variable_changes(&[change("brush_size", "i32", json!({"value": 8}))])
-            .is_empty());
+        assert!(
+            publisher
+                .publish_variable_changes(&[change("brush_size", "i32", json!({"value": 8}))])
+                .is_empty()
+        );
     }
 
     #[test]

@@ -1,0 +1,22 @@
+# Minimal state motion fixture. The statechart selects presentation branches
+# and motion policy; the renderer owns frame-time sampling.
+flow combined-status
+input health f32:0..100 default 82
+input mana f32:0..100 default 64
+motion status-hit duration 140 easing ease_in_out
+motion health-change duration 320 easing ease_out
+machine status initial idle
+state status hit
+on status character.status.toggle -> hit
+on status character.status.reset -> idle
+transition status idle -> hit motion status-hit
+transition status hit -> idle motion health-change
+style status.idle.status-root x 16 y 16 w 320 h 140
+style status.hit.status-root x 16 y 16 w 480 h 240
+surface combined-status
+  panel status-root x 16 y 16 w 320 h 140 column pad 8 gap 6 fill #244A62 line #8ED6F0
+    panel bars row w 304 h 48 gap 8 fill #183445
+      progress_bar health_bar numeric $health
+      progress_bar mana_bar numeric $mana
+    button status-action h 24 value "Toggle status" event character.status.toggle
+    button status-reset h 24 value "Reset status" event character.status.reset

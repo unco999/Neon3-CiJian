@@ -115,14 +115,18 @@ fn build_scene(
             });
         }
         if builder.value_defs.contains_key(&decl.alias) {
-            return Err(ScriptError::SsaViolation { name: decl.alias.clone() });
+            return Err(ScriptError::SsaViolation {
+                name: decl.alias.clone(),
+            });
         }
         let id = builder.nodes.len();
         builder.value_defs.insert(decl.alias.clone(), id);
         inputs.push((decl.alias.clone(), id));
         builder.nodes.push(IrNode {
             id,
-            kind: NodeKind::Input { world: decl.world.clone() },
+            kind: NodeKind::Input {
+                world: decl.world.clone(),
+            },
             args: Vec::new(),
             preds: Vec::new(),
             result: decl.alias.clone(),
@@ -148,13 +152,17 @@ fn build_scene(
         match stmt {
             Stmt::Let(stmt) => {
                 if builder.value_defs.contains_key(&stmt.name) {
-                    return Err(ScriptError::SsaViolation { name: stmt.name.clone() });
+                    return Err(ScriptError::SsaViolation {
+                        name: stmt.name.clone(),
+                    });
                 }
                 builder.build_call(&stmt.kernel, &stmt.args, stmt.name.clone())?;
             }
             Stmt::Export(stmt) => {
                 let source = *builder.value_defs.get(&stmt.source).ok_or_else(|| {
-                    ScriptError::UndefinedValue { name: stmt.source.clone() }
+                    ScriptError::UndefinedValue {
+                        name: stmt.source.clone(),
+                    }
                 })?;
                 if !scene.outputs.contains(&stmt.target) {
                     return Err(ScriptError::UndeclaredOutput {
@@ -195,7 +203,9 @@ impl NodeBuilder<'_> {
         let spec = self
             .kernels
             .get(kernel)
-            .ok_or_else(|| ScriptError::UnknownKernel { name: kernel.to_string() })?;
+            .ok_or_else(|| ScriptError::UnknownKernel {
+                name: kernel.to_string(),
+            })?;
 
         let mut ir_args = Vec::new();
         let mut preds = Vec::new();
@@ -273,7 +283,9 @@ impl NodeBuilder<'_> {
         self.value_defs.insert(result.clone(), id);
         self.nodes.push(IrNode {
             id,
-            kind: NodeKind::Kernel { kernel: kernel.to_string() },
+            kind: NodeKind::Kernel {
+                kernel: kernel.to_string(),
+            },
             args: ir_args,
             preds,
             result,
@@ -285,6 +297,8 @@ impl NodeBuilder<'_> {
         self.value_defs
             .get(name)
             .copied()
-            .ok_or_else(|| ScriptError::UndefinedValue { name: name.to_string() })
+            .ok_or_else(|| ScriptError::UndefinedValue {
+                name: name.to_string(),
+            })
     }
 }

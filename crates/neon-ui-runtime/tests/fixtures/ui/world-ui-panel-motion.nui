@@ -1,0 +1,17 @@
+# World UI interaction case: click toggles size and color on the panel.
+flow world-panel-motion
+machine marker initial compact
+state marker expanded
+on marker world.marker.toggle -> expanded
+on marker world.marker.reset -> compact
+motion marker-expand duration 240 easing ease_out
+motion marker-reset duration 180 easing ease_in_out
+transition marker compact -> expanded motion marker-expand
+transition marker expanded -> compact motion marker-reset
+style marker.compact.marker x 0 y 0 w 240 h 48 fill #183445 line #5DA9D6
+style marker.expanded.marker x 0 y 0 w 420 h 112 fill #6B3B35 line #F2B36F
+surface world-marker-root
+  world panel marker camera 3d:editor-camera anchor world-marker w 240 h 48
+    text marker-label value "World marker"
+    button marker-action h 24 value "Toggle" event world.marker.toggle
+    button marker-reset h 24 value "Reset" event world.marker.reset

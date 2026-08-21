@@ -4,8 +4,8 @@ use std::collections::BTreeMap;
 
 use neon_protocol::Revision;
 use neon_ui_schema::{
-    NuiFlowDocument, NuiFlowDragAxis, NuiFlowStateTrigger, UiBranchPredicate, UiDropPlacement,
-    UiInputValue, UiProgramSemanticEvent, UiResolvedInputs,
+    NuiFlowDocument, NuiFlowDragAxis, NuiFlowStateStyle, NuiFlowStateTrigger, UiBranchPredicate,
+    UiDropPlacement, UiInputValue, UiProgramSemanticEvent, UiResolvedInputs,
 };
 
 use crate::UiLocalPresentationState;
@@ -16,7 +16,7 @@ pub struct NuiFlowStateMachineRuntime {
     revision: Revision,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct NuiFlowStateTransitionResult {
     pub machine_key: String,
     pub previous_state: String,
@@ -24,6 +24,14 @@ pub struct NuiFlowStateTransitionResult {
     pub emitted_intent: Option<String>,
     pub motion_key: Option<String>,
     pub revision: Revision,
+    /// Style overrides from the previous state. The transition consumer
+    /// (e.g. `forward_host_request`) copies these into the animation `from`
+    /// so the renderer interpolates from the old state's appearance.
+    pub previous_styles: Vec<NuiFlowStateStyle>,
+    /// Style overrides of the target state. The transition consumer writes
+    /// these into the fragment nodes so the animation ends at the new
+    /// state's appearance.
+    pub target_styles: Vec<NuiFlowStateStyle>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -214,10 +222,15 @@ impl NuiFlowStateMachineRuntime {
                             .is_some_and(|predicate| predicate_matches(predicate, inputs))
                 })?;
                 self.transition(
-                    machine.key.as_str(),
+                    machine,
                     &transition.target_state,
                     transition.emit_intent.clone(),
-                    motion_key_for(machine, self.state(machine.key.as_str()), &transition.target_state, transition.motion_key.clone()),
+                    motion_key_for(
+                        machine,
+                        self.state(machine.key.as_str()),
+                        &transition.target_state,
+                        transition.motion_key.clone(),
+                    ),
                 )
             })
             .collect()
@@ -239,12 +252,12 @@ impl NuiFlowStateMachineRuntime {
                     None,
                 )
             });
-            self.transition(
-                machine.key.as_str(),
-                &transition.target_state,
-                transition.emit_intent.clone(),
-                motion_key,
-            )
+self.transition(
+                    machine,
+                    &transition.target_state,
+                    transition.emit_intent.clone(),
+                    motion_key,
+                )
         }).collect()
     }
 
@@ -259,24 +272,44 @@ impl NuiFlowStateMachineRuntime {
 
     fn transition(
         &mut self,
-        machine_key: &str,
+        machine: &neon_ui_schema::NuiFlowStateMachine,
         target_state: &str,
         emitted_intent: Option<String>,
         motion_key: Option<String>,
     ) -> Option<NuiFlowStateTransitionResult> {
-        let previous_state = self.states.get(machine_key)?.clone();
+        let previous_state = self.states.get(&machine.key)?.clone();
         if previous_state == target_state {
             return None;
         }
+        // Collect style overrides from the previous state — these become
+        // the animation `from` when the renderer interpolates to the new
+        // state's node visuals.
+        let previous_styles = machine
+            .states
+            .iter()
+            .find(|s| s.name == previous_state)
+            .map(|s| s.styles.clone())
+            .unwrap_or_default();
+        // Collect style overrides of the target state — these are written
+        // into the fragment nodes so the animation ends at the target
+        // state's appearance.
+        let target_styles = machine
+            .states
+            .iter()
+            .find(|s| s.name == target_state)
+            .map(|s| s.styles.clone())
+            .unwrap_or_default();
         self.revision = Revision(self.revision.0 + 1);
-        self.states.insert(machine_key.into(), target_state.into());
+        self.states.insert(machine.key.clone(), target_state.into());
         Some(NuiFlowStateTransitionResult {
-            machine_key: machine_key.into(),
+            machine_key: machine.key.clone(),
             previous_state,
             state: target_state.into(),
             emitted_intent,
             motion_key,
             revision: self.revision,
+            previous_styles,
+            target_styles,
         })
     }
 }
@@ -389,6 +422,83 @@ mod tests {
         let mut runtime = NuiFlowStateMachineRuntime::new(&document);
         let result = runtime.dispatch(&document, &inputs(false, "ready"), "status.toggle");
         assert_eq!(result[0].motion_key.as_deref(), Some("hit"));
+    }
+
+    #[test]
+    fn reverse_state_transition_resolves_motion_from_current_state() {
+        let source = "motion health-change duration 320 easing ease_out\nmachine status initial idle\nstate status hit\non status status.toggle -> hit\non status status.reset -> idle\ntransition status idle -> hit motion health-change\ntransition status hit -> idle motion health-change\nsurface status\n";
+        let document = crate::parse_nui_flow(source).unwrap();
+        let mut runtime = NuiFlowStateMachineRuntime::new(&document);
+        // Forward: idle -> hit resolves the declared motion.
+        let forward = runtime.dispatch(&document, &inputs(false, "ready"), "status.toggle");
+        assert_eq!(forward[0].state, "hit");
+        assert_eq!(forward[0].motion_key.as_deref(), Some("health-change"));
+        // Idempotent intent while already in the target state is a no-op.
+        assert!(
+            runtime
+                .dispatch(&document, &inputs(false, "ready"), "status.toggle")
+                .is_empty()
+        );
+        // Reverse: hit -> idle resolves the same motion with a distinct pair.
+        let reverse = runtime.dispatch(&document, &inputs(false, "ready"), "status.reset");
+        assert_eq!(reverse[0].state, "idle");
+        assert_eq!(reverse[0].motion_key.as_deref(), Some("health-change"));
+        assert_ne!(forward[0].previous_state, reverse[0].previous_state);
+        // Idempotent reverse is also a no-op.
+        assert!(
+            runtime
+                .dispatch(&document, &inputs(false, "ready"), "status.reset")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn state_transition_carries_previous_and_target_style_snapshots() {
+        let source = concat!(
+            "motion expand duration 140 easing ease_in_out\n",
+            "machine status initial idle\n",
+            "state status hit\n",
+            "on status status.toggle -> hit\n",
+            "transition status idle -> hit motion expand\n",
+            "style status.idle.status-root x 32 y 32 w 320 h 160\n",
+            "style status.hit.status-root x 16 y 16 w 480 h 240\n",
+            "surface status\n",
+        );
+        let document = crate::parse_nui_flow(source).unwrap();
+        let mut runtime = NuiFlowStateMachineRuntime::new(&document);
+        let result = runtime.dispatch(&document, &inputs(false, "ready"), "status.toggle");
+        assert_eq!(result[0].state, "hit");
+        // The old state's style becomes the animation `from`.
+        let idle_root = result[0]
+            .previous_styles
+            .iter()
+            .find(|style| style.node_key == "status-root")
+            .expect("idle status-root style must be carried");
+        assert_eq!(
+            idle_root.bounds,
+            Some(neon_ui_schema::UiBounds {
+                x: 32.0,
+                y: 32.0,
+                width: 320.0,
+                height: 160.0,
+            })
+        );
+        // The new state's style becomes the animation target.
+        let hit_root = result[0]
+            .target_styles
+            .iter()
+            .find(|style| style.node_key == "status-root")
+            .expect("hit status-root style must be carried");
+        assert_eq!(
+            hit_root.bounds,
+            Some(neon_ui_schema::UiBounds {
+                x: 16.0,
+                y: 16.0,
+                width: 480.0,
+                height: 240.0,
+            })
+        );
+        assert_ne!(idle_root.bounds, hit_root.bounds);
     }
 
     #[test]

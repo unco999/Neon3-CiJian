@@ -379,7 +379,10 @@ impl WorldInformationBridge {
     /// Applies one host frame atomically at the contract boundary. Individual
     /// anchors retain their stable identities while the frame sequence provides
     /// one latest-value ordering point for backpressure and diagnostics.
-    pub fn submit_anchor_batch(&mut self, batch: WorldUiAnchorBatch) -> Result<(), WorldBridgeError> {
+    pub fn submit_anchor_batch(
+        &mut self,
+        batch: WorldUiAnchorBatch,
+    ) -> Result<(), WorldBridgeError> {
         let Some(world) = self.world.as_ref() else {
             return Err(WorldBridgeError::WorldSpaceMismatch);
         };
@@ -562,6 +565,9 @@ mod tests {
                 position: [1.0, 2.0, 3.0],
                 billboard: true,
                 occlusion: "always_visible".into(),
+                screen_x: 0.5,
+                screen_y: 0.5,
+                view_distance: 10.0,
             })
             .unwrap();
         let stored = bridge.anchor(&anchor_id).expect("anchor stored");
@@ -649,7 +655,19 @@ mod tests {
             })
             .unwrap();
         assert_eq!(bridge.anchors().len(), 2);
-        assert_eq!(bridge.anchor(&WorldAnchorId("monster.m0".into())).unwrap().producer_epoch, 4);
-        assert_eq!(bridge.anchor(&WorldAnchorId("monster.m1".into())).unwrap().sequence, 2);
+        assert_eq!(
+            bridge
+                .anchor(&WorldAnchorId("monster.m0".into()))
+                .unwrap()
+                .producer_epoch,
+            4
+        );
+        assert_eq!(
+            bridge
+                .anchor(&WorldAnchorId("monster.m1".into()))
+                .unwrap()
+                .sequence,
+            2
+        );
     }
 }

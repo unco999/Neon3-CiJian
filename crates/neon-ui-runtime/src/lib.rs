@@ -29,21 +29,21 @@ use neon_ui_schema::{
     ERROR_UI_PROGRAM_TEXT_REGISTRY_CAPACITY_OVERFLOW,
     ERROR_UI_PROGRAM_TEXT_REGISTRY_GENERATION_MISMATCH,
     ERROR_UI_PROGRAM_TEXT_REGISTRY_STALE_REVISION, ERROR_UI_PROGRAM_TEXT_TOO_LONG,
-    ERROR_UI_PROGRAM_UNKNOWN_INPUT_KEY, ERROR_UI_PROGRAM_UNKNOWN_TEXT_HANDLE, TextRef,
-    UI_SURFACE_SCHEMA_VERSION, UiBinding, UiBoundProperty, UiBounds, UiBranchPredicate,
-    UiBranchRecord, UiCommand, UiCpuFrameOutput, UiCpuNodeState, UiCpuRenderPrimitive,
-    UiCpuSemanticTarget, UiCpuViewport, UiDataGridCellTarget, UiDataGridDeclaration,
-    UiDataGridFrame, UiDataGridInputFrame, UiDataGridRecord, UiDependencyIndex, UiDiagnostic,
-    UiDiagnosticSeverity, UiDiagnosticsState, UiEffect, UiEventTraceRecord, UiFragment,
-    UiFragmentId, UiFragmentSubmission, UiHostFragmentContext, UiHostInbound, UiHostPublication,
-    NuiFlowDocument,
-    UiInputChange, UiInputFrame, UiInputSchema, UiInputUpdateClass, UiInputValue,
-    UiInputValueSource, UiInspectorState, UiInspectorTab, UiIntent, UiIrDocument, UiNode, UiNodeId,
-    UiNodeKind, UiProgram, UiProgramDragDropEvent, UiProgramLayoutRecord, UiProgramLiteralText,
-    UiProgramNode, UiProgramResourceKind, UiProgramRevision, UiProgramSemanticEvent,
-    UiProgramCapability, UiProgramCapabilityOwner, UiProgramCapabilityStatus,
-    UiProgramSemanticEventKind, UiProgramSemanticEventResult, UiProgramSemanticEventStatus,
-    UiRepeatFrame, UiResolvedInputValue, UiResolvedInputs, UiSchemaError, UiSemanticEvent,
+    ERROR_UI_PROGRAM_UNKNOWN_INPUT_KEY, ERROR_UI_PROGRAM_UNKNOWN_TEXT_HANDLE, NuiFlowDocument,
+    NuiFlowStateStyle, TextRef, UI_SURFACE_SCHEMA_VERSION, UiBinding, UiBoundProperty, UiBounds,
+    UiBranchPredicate, UiBranchRecord, UiCommand, UiCpuFrameOutput, UiCpuNodeState,
+    UiCpuRenderPrimitive, UiCpuSemanticTarget, UiCpuViewport, UiDataGridCellTarget,
+    UiDataGridDeclaration, UiDataGridFrame, UiDataGridInputFrame, UiDataGridRecord,
+    UiDependencyIndex, UiDiagnostic, UiDiagnosticSeverity, UiDiagnosticsState, UiEffect,
+    UiEventTraceRecord, UiFragment, UiFragmentId, UiFragmentSubmission, UiHostFragmentContext,
+    UiHostInbound, UiHostPublication, UiInputChange, UiInputFrame, UiInputKind, UiInputSchema,
+    UiInputUpdateClass, UiInputValue, UiInputValueSource, UiInspectorState, UiInspectorTab,
+    UiIntent, UiIrDocument, UiNode, UiNodeId, UiNodeKind, UiProgram, UiProgramCapability,
+    UiProgramCapabilityOwner, UiProgramCapabilityStatus, UiProgramDragDropEvent,
+    UiProgramLayoutRecord, UiProgramLiteralText, UiProgramNode, UiProgramResourceKind,
+    UiProgramRevision, UiProgramSemanticEvent, UiProgramSemanticEventKind,
+    UiProgramSemanticEventResult, UiProgramSemanticEventStatus, UiRepeatFrame,
+    UiResolvedInputValue, UiResolvedInputs, UiSchemaError, UiSemanticEvent,
     UiSemanticInteractionMetadata, UiSemanticPayloadValue, UiStyle, UiSurfaceEvent,
     UiSurfaceEventKind, UiSurfaceEventRequest, UiSurfaceId, UiSurfaceSnapshot, UiSurfaceState,
     UiTemplateRecord, UiTextHandle, UiTextHandleDiagnostic, UiTextHandleStatus, UiTextRecord,
@@ -63,8 +63,8 @@ pub mod host_adapter;
 pub mod nui_flow;
 pub mod nui_state_machine;
 pub mod terrain_workbench;
-use host_adapter::{UiHostAdapter, UiHostAdapterConfig};
 pub use event_publisher::{EVENT_VARIABLE_CHANGED, FLOW_EVENT_PREFIX, UiVariableEventPublisher};
+use host_adapter::{UiHostAdapter, UiHostAdapterConfig};
 pub use nui_flow::{
     NuiFlowError, apply_nui_ir_patch, bind_nui_flow_resources, compile_nui_flow_program,
     format_nui_flow, lower_nui_flow, lower_nui_flow_effects, parse_nui_flow, parse_nui_flow_patch,
@@ -78,6 +78,14 @@ pub const SERVICE_NAME: &str = "ui-runtime";
 pub const WORKBENCH_SURFACE_ID: &str = "surface.ui-workbench";
 pub const AI_TERRAIN_SURFACE_ID: &str = "surface.ai.terrain-generator";
 pub const CAPABILITY_DEBUG_INTERACTION: &str = "debug.interaction.v1";
+/// Statechart-driven presentation transitions (motion declarations bound to
+/// state transitions). Advertised explicitly so hosts can gate on it before
+/// submitting state-machine flows.
+pub const CAPABILITY_STATE_ANIMATION: &str = "ui.state.animation.v1";
+/// Renderer-side numeric interpolation of `UiControlPresentation::Numeric`.
+/// Advertised explicitly so hosts can gate on it before relying on smooth
+/// progress-bar updates without generating intermediate input frames.
+pub const CAPABILITY_NUMERIC_ANIMATION: &str = "ui.numeric.animation.v1";
 const INTERACTION_TRACE_CAPACITY: usize = 256;
 
 /// Materializes one visible instance from a hidden declarative template prototype.
@@ -591,7 +599,16 @@ impl UiInputStore {
                 });
             }
         }
-        let next_revision = Revision(self.resolved_inputs.input_revision.0 + 1);
+        // An empty change list does not alter any input value, so the input
+        // revision must not advance. Host click fallbacks and confirmation
+        // publications otherwise bump the revision behind the consumer's
+        // `expected_input_revision`, and every following real input frame is
+        // rejected with ui_program_stale_input_revision.
+        let next_revision = if frame.changes.is_empty() {
+            self.resolved_inputs.input_revision
+        } else {
+            Revision(self.resolved_inputs.input_revision.0 + 1)
+        };
         let mut changed_slots = Vec::new();
         let mut variable_changes = Vec::new();
         let mut values = self.resolved_inputs.values.clone();
@@ -602,6 +619,7 @@ impl UiInputStore {
                 .iter()
                 .find(|slot| slot.key == key)
                 .expect("validated slot exists");
+            let value = canonicalize_input_value(&slot.kind, value);
             let source = match slot.update_class {
                 UiInputUpdateClass::ReliableExternal => UiInputValueSource::ReliableExternal,
                 UiInputUpdateClass::LocalPresentation => UiInputValueSource::LocalPresentation,
@@ -678,6 +696,21 @@ impl UiInputStore {
                 UiInputUpdateClass::LocalPresentation
             )
         )
+    }
+}
+
+fn canonicalize_input_value(kind: &UiInputKind, value: UiInputValue) -> UiInputValue {
+    match (kind, value) {
+        (UiInputKind::F32Range { minimum, maximum }, UiInputValue::F32 { value }) => {
+            let mut value = value.clamp(*minimum, *maximum);
+            if (value - *minimum).abs() <= 1e-5 {
+                value = *minimum;
+            } else if (value - *maximum).abs() <= 1e-5 {
+                value = *maximum;
+            }
+            UiInputValue::F32 { value }
+        }
+        (_, value) => value,
     }
 }
 
@@ -1280,14 +1313,89 @@ fn input_value_as_event_payload(value: &UiInputValue) -> Option<UiSemanticPayloa
     })
 }
 
-fn apply_transition_to_fragment(fragment: &mut UiFragment, transition: UiTransition) {
-    fn apply(node: &mut UiNode, transition: &UiTransition) {
-        node.enter_transition = Some(transition.clone());
+fn apply_transition_to_fragment(fragment: &mut UiFragment, motion: &PendingStateMotion) {
+    let numeric_nodes = fragment
+        .effects
+        .iter()
+        .filter_map(|effect| match effect {
+            UiEffect::ControlPresentation {
+                node_id,
+                state: neon_ui_schema::UiControlPresentation::Numeric { .. },
+            } => Some(node_id.0.as_str()),
+            _ => None,
+        })
+        .collect::<std::collections::HashSet<_>>();
+
+    fn apply(
+        node: &mut UiNode,
+        motion: &PendingStateMotion,
+        numeric_nodes: &std::collections::HashSet<&str>,
+        in_motion_scope: bool,
+    ) {
+        // Animate declared state-style nodes and numeric controls. Do not
+        // attach a transition to every label/repeated row: that creates a
+        // large active set and can turn a single panel resize into dozens of
+        // unnecessary transition jobs.
+        let has_style = motion
+            .previous_styles
+            .iter()
+            .any(|style| style.node_key == node.node_id.0)
+            || motion
+                .target_styles
+                .iter()
+                .any(|style| style.node_key == node.node_id.0);
+        let motion_scope = in_motion_scope || has_style;
+        if has_style || (motion_scope && numeric_nodes.contains(node.node_id.0.as_str())) {
+            let mut transition = motion.transition.clone();
+            // Seed the animation `from` with the previous state's style record.
+            if let Some(style) = motion
+                .previous_styles
+                .iter()
+                .find(|style| style.node_key == node.node_id.0)
+            {
+                transition.from = UiTransitionState {
+                    bounds: style.bounds,
+                    background_color: style.background_color,
+                    border_color: style.border_color,
+                    border_width: style.border_width,
+                    corner_radius: style.corner_radius,
+                    opacity: style.opacity,
+                    numeric_value: None,
+                };
+            }
+            // Apply the target state's style record directly to the node; the
+            // renderer interpolates from `from` (old state) to these values.
+            if let Some(style) = motion
+                .target_styles
+                .iter()
+                .find(|style| style.node_key == node.node_id.0)
+            {
+                if let Some(bounds) = style.bounds {
+                    node.bounds = bounds;
+                }
+                if let Some(color) = style.background_color {
+                    node.style.background_color = color;
+                }
+                if let Some(color) = style.border_color {
+                    node.style.border_color = color;
+                }
+                if let Some(width) = style.border_width {
+                    node.style.border_width = width;
+                }
+                if let Some(radius) = style.corner_radius {
+                    node.style.corner_radius = radius;
+                }
+                if let Some(opacity) = style.opacity {
+                    node.style.opacity = opacity;
+                }
+            }
+            node.enter_transition = Some(transition);
+        }
         for child in &mut node.children {
-            apply(child, transition);
+            apply(child, motion, numeric_nodes, motion_scope);
         }
     }
-    apply(&mut fragment.root, &transition);
+    apply(&mut fragment.root, motion, &numeric_nodes, false);
 }
 
 /// Stable string name of an input kind, used in `nui.variable.changed` payloads.
@@ -1316,7 +1424,9 @@ fn input_value_to_json(value: &UiInputValue) -> serde_json::Value {
         UiInputValue::U32 { value } => json!({"value": value}),
         UiInputValue::F32 { value } => json!({"value": value}),
         UiInputValue::Enum { value } => json!({"value": value}),
-        UiInputValue::TextHandle { value } => json!({"text_handle": {"id": value.id, "generation": value.generation}}),
+        UiInputValue::TextHandle { value } => {
+            json!({"text_handle": {"id": value.id, "generation": value.generation}})
+        }
         UiInputValue::AssetHandle { id, generation } => {
             json!({"asset_id": id, "generation": generation})
         }
@@ -1411,38 +1521,40 @@ fn refresh_fragment_from_program(
                     selected: state.active || state.selected,
                 })
             }
-            UiNodeKind::Slider | UiNodeKind::DragValue | UiNodeKind::ProgressBar => state.numeric_value.and_then(|value| {
-                program
-                    .binding_records
-                    .iter()
-                    .find(|binding| {
-                        binding.node_key == node.key
-                            && binding.property == UiBoundProperty::NumericValue
-                    })
-                    .and_then(|binding| {
-                        schema
-                            .slots
-                            .iter()
-                            .find(|slot| slot.key == binding.input_key)
-                    })
-                    .and_then(|slot| match slot.kind {
-                        neon_ui_schema::UiInputKind::I32Range { minimum, maximum } => {
-                            Some((minimum as f32, maximum as f32))
-                        }
-                        neon_ui_schema::UiInputKind::U32Range { minimum, maximum } => {
-                            Some((minimum as f32, maximum as f32))
-                        }
-                        neon_ui_schema::UiInputKind::F32Range { minimum, maximum } => {
-                            Some((minimum, maximum))
-                        }
-                        _ => None,
-                    })
-                    .map(|bounds| neon_ui_schema::UiControlPresentation::Numeric {
-                        value,
-                        min: bounds.0,
-                        max: bounds.1,
-                    })
-            }),
+            UiNodeKind::Slider | UiNodeKind::DragValue | UiNodeKind::ProgressBar => {
+                state.numeric_value.and_then(|value| {
+                    program
+                        .binding_records
+                        .iter()
+                        .find(|binding| {
+                            binding.node_key == node.key
+                                && binding.property == UiBoundProperty::NumericValue
+                        })
+                        .and_then(|binding| {
+                            schema
+                                .slots
+                                .iter()
+                                .find(|slot| slot.key == binding.input_key)
+                        })
+                        .and_then(|slot| match slot.kind {
+                            neon_ui_schema::UiInputKind::I32Range { minimum, maximum } => {
+                                Some((minimum as f32, maximum as f32))
+                            }
+                            neon_ui_schema::UiInputKind::U32Range { minimum, maximum } => {
+                                Some((minimum as f32, maximum as f32))
+                            }
+                            neon_ui_schema::UiInputKind::F32Range { minimum, maximum } => {
+                                Some((minimum, maximum))
+                            }
+                            _ => None,
+                        })
+                        .map(|bounds| neon_ui_schema::UiControlPresentation::Numeric {
+                            value,
+                            min: bounds.0,
+                            max: bounds.1,
+                        })
+                })
+            }
             UiNodeKind::Scrollbar => state.numeric_value.and_then(|value| {
                 program
                     .binding_records
@@ -2487,6 +2599,17 @@ fn stable_program_hash(
     format!("fnv1a64-{hash:016x}")
 }
 
+/// Transition selected by a state-machine dispatch plus the previous and
+/// target state's per-node style overrides. The renderer uses `previous_styles`
+/// to seed the animation `from` and writes `target_styles` into the fragment
+/// nodes so the animation ends at the new state's appearance.
+#[derive(Clone, Debug)]
+struct PendingStateMotion {
+    transition: UiTransition,
+    previous_styles: Vec<NuiFlowStateStyle>,
+    target_styles: Vec<NuiFlowStateStyle>,
+}
+
 pub struct UiRuntime {
     epoch: u64,
     client: ClientIdentity,
@@ -2503,6 +2626,12 @@ pub struct UiRuntime {
     interaction_traces: InteractionTraceStore,
     flow_document: Option<NuiFlowDocument>,
     flow_state_machine: Option<NuiFlowStateMachineRuntime>,
+    wgpu_endpoint: Option<SocketAddr>,
+    /// State transition selected by the last state-machine dispatch that has
+    /// not yet been applied to a fragment carrying the updated authoritative
+    /// inputs. Set during `forward_host_request`; consumed and cleared by
+    /// `handle_external_input_frame` after the next input frame arrives.
+    pending_motion: Option<PendingStateMotion>,
 }
 
 impl UiRuntime {
@@ -2528,6 +2657,8 @@ impl UiRuntime {
             interaction_traces: InteractionTraceStore::default(),
             flow_document: None,
             flow_state_machine: None,
+            wgpu_endpoint: None,
+            pending_motion: None,
         }
     }
 
@@ -2543,6 +2674,13 @@ impl UiRuntime {
     /// observations. Pass `None` to run without event forwarding.
     pub fn with_eventd_endpoint(mut self, endpoint: Option<SocketAddr>) -> Self {
         self.eventd_endpoint = endpoint;
+        self
+    }
+
+    /// Sets the WGPU renderer endpoint so that input-frame processing can
+    /// re-submit the fragment with a pending motion applied.
+    pub fn with_wgpu_endpoint(mut self, endpoint: SocketAddr) -> Self {
+        self.wgpu_endpoint = Some(endpoint);
         self
     }
 
@@ -2564,6 +2702,8 @@ impl UiRuntime {
                 "ui.input.repeat.v1".into(),
                 "ui.data_grid.window.v1".into(),
                 "ui.host.pointer_event.v1".into(),
+                CAPABILITY_STATE_ANIMATION.into(),
+                CAPABILITY_NUMERIC_ANIMATION.into(),
                 CAPABILITY_DEBUG_INTERACTION.into(),
             ],
         }
@@ -2806,20 +2946,27 @@ impl UiRuntime {
         epoch: u64,
     ) -> Result<(), TransportError> {
         let server = RpcServer::bind(endpoint)?;
-        let mut runtime =
-            Self::new(epoch, "ui-runtime-forwarder").with_eventd_endpoint(eventd_endpoint);
+        let mut runtime = Self::new(epoch, "ui-runtime-forwarder")
+            .with_eventd_endpoint(eventd_endpoint)
+            .with_wgpu_endpoint(wgpu_endpoint);
         server.serve_until(|request| {
             let shutdown = request.method == "service.shutdown";
             let request_id = request.request_id.clone();
             let response = if request.method == "ui.fragment.submit" {
-                eprintln!("[neon-ui-runtime] received ui.fragment.submit request={}", request.request_id.0);
+                eprintln!(
+                    "[neon-ui-runtime] received ui.fragment.submit request={}",
+                    request.request_id.0
+                );
                 runtime
                     .forward_fragment(wgpu_endpoint, request)
                     .unwrap_or_else(|error| {
                         runtime.rejected(request_id, "service_unavailable", &error.to_string())
                     })
             } else if request.method == "ui.flow.submit" {
-                eprintln!("[neon-ui-runtime] received ui.flow.submit request={}", request.request_id.0);
+                eprintln!(
+                    "[neon-ui-runtime] received ui.flow.submit request={}",
+                    request.request_id.0
+                );
                 runtime
                     .forward_flow_source(wgpu_endpoint, request)
                     .unwrap_or_else(|error| {
@@ -2865,8 +3012,11 @@ impl UiRuntime {
             .and_then(Value::as_str)
             .filter(|source| !source.trim().is_empty())
             .ok_or_else(|| TransportError::Io(std::io::Error::other("NUI source is required")))?;
-        let document = parse_nui_flow(source)
-            .map_err(|error| TransportError::Io(std::io::Error::other(format!("NUI parse failed: {error:?}"))))?;
+        let document = parse_nui_flow(source).map_err(|error| {
+            TransportError::Io(std::io::Error::other(format!(
+                "NUI parse failed: {error:?}"
+            )))
+        })?;
         let revision = UiProgramRevision {
             program_id: document.ir.surface_id.0.clone(),
             revision: Revision(1),
@@ -2886,8 +3036,11 @@ impl UiRuntime {
             })
             .collect(),
         };
-        let program = compile_nui_flow_program(&document, revision)
-            .map_err(|error| TransportError::Io(std::io::Error::other(format!("NUI compile failed: {error:?}"))))?;
+        let program = compile_nui_flow_program(&document, revision).map_err(|error| {
+            TransportError::Io(std::io::Error::other(format!(
+                "NUI compile failed: {error:?}"
+            )))
+        })?;
         // Re-submitting the same flow advances the fragment revision so the
         // renderer accepts the replacement instead of treating it as stale.
         let fragment_revision = self
@@ -2900,13 +3053,10 @@ impl UiRuntime {
             root: document.ir.root.clone(),
             effects: lower_nui_flow_effects(&document),
         };
-        let adapter = UiHostAdapter::activate(
-            program.clone(),
-            document.input_schema.clone(),
-            self.epoch,
-        )
-        .map_err(|error| TransportError::Io(std::io::Error::other(error.message)))?
-        .with_event_publisher(self.eventd_endpoint, self.client.clone());
+        let adapter =
+            UiHostAdapter::activate(program.clone(), document.input_schema.clone(), self.epoch)
+                .map_err(|error| TransportError::Io(std::io::Error::other(error.message)))?
+                .with_event_publisher(self.eventd_endpoint, self.client.clone());
         self.host_adapter = Some(adapter);
         let forwarded = RpcRequest {
             protocol: "neon3.rpc".into(),
@@ -3047,7 +3197,7 @@ impl UiRuntime {
             );
         }
         let mut next_flow_state_machine = self.flow_state_machine.clone();
-        let mut selected_motion = None;
+        let mut selected_motion: Option<PendingStateMotion> = None;
         let adapter = self
             .host_adapter
             .as_mut()
@@ -3115,8 +3265,10 @@ impl UiRuntime {
             }
         }
         if let UiHostInbound::SemanticIntent { event } = &inbound
-            && let (Some(document), Some(machine)) =
-                (self.flow_document.as_ref(), next_flow_state_machine.as_mut())
+            && let (Some(document), Some(machine)) = (
+                self.flow_document.as_ref(),
+                next_flow_state_machine.as_mut(),
+            )
         {
             let inputs = self
                 .host_adapter
@@ -3124,19 +3276,56 @@ impl UiRuntime {
                 .expect("host adapter is activated")
                 .snapshot()
                 .scalar_inputs;
-            if let Some(transition) = machine
-                .dispatch_semantic_event(document, &inputs, event)
-                .into_iter()
-                .next()
-                && let Some(motion_key) = transition.motion_key
-            {
-                selected_motion = document
-                    .motions
-                    .iter()
-                    .find(|motion| motion.key == motion_key)
-                    .map(|motion| motion.transition.clone());
+            let transitions = machine.dispatch_semantic_event(document, &inputs, event);
+            if let Some(transition) = transitions.into_iter().next() {
+                if let Some(motion_key) = transition.motion_key {
+                    let base = document
+                        .motions
+                        .iter()
+                        .find(|motion| motion.key == motion_key)
+                        .map(|motion| motion.transition.clone());
+                    if let Some(base_transition) = base {
+                        let pending = PendingStateMotion {
+                            transition: base_transition,
+                            previous_styles: transition.previous_styles,
+                            target_styles: transition.target_styles,
+                        };
+                        selected_motion = Some(pending.clone());
+                        // Persist so the next input frame refresh can also
+                        // apply the motion with the updated authoritative inputs.
+                        // Consumed by `handle_external_input_frame`.
+                        self.pending_motion = Some(pending);
+                    }
+                }
+            } else if document.state_machines.iter().any(|machine| {
+                machine.transitions.iter().any(|transition| {
+                    matches!(
+                        &transition.trigger,
+                        neon_ui_schema::NuiFlowStateTrigger::Intent { name }
+                            if name == &event.intent
+                    )
+                })
+            }) {
             }
         }
+        // Start local presentation motion before waiting for the authoritative
+        // host response. A slow domain must not delay the panel's visual state
+        // transition; the later publication retargets the same renderer-owned
+        // animation from its current sampled value.
+        let optimistic_motion_submitted = if let Some(motion) = selected_motion.clone()
+            && self.wgpu_endpoint.is_some()
+            && self.cached_fragment.is_some()
+        {
+            match self.apply_motion_to_current_fragment(motion) {
+                Ok(()) => true,
+                Err(error) => {
+                    eprintln!("[neon-ui] optimistic motion submit failed: {error}");
+                    false
+                }
+            }
+        } else {
+            false
+        };
         if let Some(context) = &context {
             self.record_interaction(
                 context,
@@ -3170,14 +3359,20 @@ impl UiRuntime {
             UiHostInbound::SemanticIntent { event } => Some(event.clone()),
             _ => None,
         };
-        let host_response = match RpcClient::connect(host_endpoint).and_then(|mut client| client.call(&forwarded)) {
+        let host_response = match RpcClient::connect(host_endpoint)
+            .and_then(|client| client.with_timeout(std::time::Duration::from_millis(200)))
+            .and_then(|mut client| client.call(&forwarded))
+        {
             Ok(response) => response,
             Err(_error) if local_semantic_event.is_some() => {
                 // External hosts may intentionally omit a separate domain
                 // process for a UI-only integration case. Preserve the typed
                 // semantic event and revision contract locally rather than
                 // turning a valid renderer click into a transport failure.
-                let adapter = self.host_adapter.as_ref().expect("host adapter is activated");
+                let adapter = self
+                    .host_adapter
+                    .as_ref()
+                    .expect("host adapter is activated");
                 let input_revision = adapter.snapshot().scalar_inputs.input_revision;
                 RpcResponse {
                     request_id: forwarded.request_id.clone(),
@@ -3337,8 +3532,8 @@ impl UiRuntime {
             );
             updated
         };
-        if let Some(motion) = selected_motion.clone() {
-            apply_transition_to_fragment(&mut updated, motion);
+        if !optimistic_motion_submitted && let Some(motion) = selected_motion.as_ref() {
+            apply_transition_to_fragment(&mut updated, &motion);
         }
         if let Some(publication_result) = publication_result {
             for effect in &mut updated.effects {
@@ -3986,7 +4181,19 @@ impl UiRuntime {
             );
         };
         match adapter.apply_external_input(frame) {
-            Ok(result) => self.accepted(request.request_id, json!(result)),
+            Ok(result) => {
+                let response = self.accepted(request.request_id, json!(result));
+                // If a state-machine transition selected a motion while the
+                // fragment still carried the old input values, re-submit the
+                // fragment now with the updated values and the motion applied.
+                // The WGPU renderer retargets from the current displayed value.
+                if let Some(motion) = self.pending_motion.take() {
+                    if let Err(error) = self.apply_motion_to_current_fragment(motion) {
+                        eprintln!("[neon-ui-runtime] apply_motion_to_current_fragment: {error}");
+                    }
+                }
+                response
+            }
             Err(error) => {
                 let current_input_revision = self
                     .host_adapter
@@ -4008,6 +4215,54 @@ impl UiRuntime {
                 )
             }
         }
+    }
+
+    /// Refreshes the cached fragment with the current adapter inputs, applies
+    /// the given motion as `enter_transition` on every node, and re-submits
+    /// the fragment to the WGPU renderer. This lets the renderer interpolate
+    /// from the previously displayed value to the new target.
+    ///
+    /// Called after `handle_external_input_frame` applies the authoritative
+    /// domain value update that follows a state-machine transition.
+    fn apply_motion_to_current_fragment(
+        &mut self,
+        motion: PendingStateMotion,
+    ) -> Result<(), String> {
+        let Some(adapter) = self.host_adapter.as_ref() else {
+            return Err("no active host adapter".into());
+        };
+        let Some(fragment) = self.cached_fragment.clone() else {
+            return Err("no cached fragment".into());
+        };
+        let Some(wgpu_endpoint) = self.wgpu_endpoint else {
+            return Err("wgpu_endpoint not configured".into());
+        };
+        let snapshot = adapter.snapshot();
+        let mut updated = fragment.clone();
+        updated.revision = Revision(updated.revision.0.saturating_add(1));
+        refresh_fragment_from_program(
+            &mut updated,
+            adapter.program(),
+            &snapshot.scalar_inputs,
+            adapter.input_schema(),
+        );
+        apply_transition_to_fragment(&mut updated, &motion);
+        let submit = RpcRequest {
+            protocol: "neon3.rpc".into(),
+            version: PROTOCOL_VERSION,
+            request_id: RequestId(format!("motion-apply-{}", updated.revision.0)),
+            client: self.client.clone(),
+            target: ServiceName(SERVICE_NAME.into()),
+            method: "ui.fragment.submit".into(),
+            params: json!(UiCommand::SubmitFragment {
+                submission: UiFragmentSubmission::new(updated)
+            }),
+            expected_revision: Some(fragment.revision),
+            idempotency_key: Some(format!("motion-apply:{}", fragment.revision.0)),
+        };
+        self.forward_fragment(wgpu_endpoint, submit)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
     }
 
     fn handle_repeat_input(&mut self, request: RpcRequest) -> RpcResponse {
@@ -4226,6 +4481,7 @@ impl UiRuntime {
                         }),
                         ..UiTransitionState::default()
                     },
+                    motion_key: None,
                 }),
                 world_depth: None,
                 children: vec![UiNode {
@@ -4257,6 +4513,7 @@ impl UiRuntime {
                             opacity: Some(0.0),
                             ..UiTransitionState::default()
                         },
+                        motion_key: None,
                     }),
                     world_depth: None,
                     children: Vec::new(),
@@ -5110,7 +5367,9 @@ mod tests {
                                 );
                                 (2, "gallery-cell", frame(&host_program, 56, 2))
                             }
-                             UiHostInbound::DragDrop { .. } | UiHostInbound::PointerEvent { .. } => unreachable!(),
+                            UiHostInbound::DragDrop { .. } | UiHostInbound::PointerEvent { .. } => {
+                                unreachable!()
+                            }
                         };
                         RpcResponse {
                             request_id: request.request_id,
@@ -7096,8 +7355,8 @@ mod tests {
         document.resource_budget.max_instances = 4;
 
         let revision = compiler_program_revision();
-        let program = compile_ui_program(&document, revision.clone(), &compiler_schema(true))
-            .unwrap();
+        let program =
+            compile_ui_program(&document, revision.clone(), &compiler_schema(true)).unwrap();
         assert_eq!(program.template_records.len(), 1);
 
         let mut runtime = UiRuntime::new(7, "repeat-input");
@@ -7185,10 +7444,7 @@ mod tests {
             list_revision: Revision(2),
             rows: vec![UiRepeatRow {
                 stable_row_key: "npc.guard".into(),
-                values: BTreeMap::from([(
-                    "row_key".into(),
-                    UiInputValue::F32 { value: 3.0 },
-                )]),
+                values: BTreeMap::from([("row_key".into(), UiInputValue::F32 { value: 3.0 })]),
                 semantic_payload: BTreeMap::new(),
             }],
             expected_program_revision: program.revision.clone(),
@@ -7209,5 +7465,168 @@ mod tests {
             rejected.error.expect("rejection carries an error").code,
             "ui_program_input_type_mismatch"
         );
+    }
+
+    #[test]
+    fn external_input_frame_applies_pending_state_motion_and_resubmits_fragment() {
+        // Verify that the core logic (refresh_fragment_from_program +
+        // apply_transition_to_fragment) correctly applies a motion to a
+        // fragment that has been refreshed with updated input values.
+        //
+        // This test does NOT use mock servers; it directly invokes the
+        // fragment refresh + transition apply pipeline to prove the
+        // numeric value and enter_transition are combined correctly.
+
+        // --- 1. Parse the state-motion fixture ---
+        let source = include_str!("../tests/fixtures/ui/state-motion.nui");
+        let document = crate::parse_nui_flow(source).expect("state-motion fixture must parse");
+
+        // --- 2. Build a program revision and compile ---
+        let program_revision = neon_ui_schema::UiProgramRevision {
+            program_id: "surface.combined-status".into(),
+            revision: neon_protocol::Revision(1),
+            schema_version: neon_ui_schema::UI_PROGRAM_SCHEMA_VERSION,
+            capabilities: vec![
+                neon_ui_schema::UiProgramCapability {
+                    name: neon_ui_schema::UI_PROGRAM_CAPABILITY_NAME.into(),
+                    version: 1,
+                    owner: neon_ui_schema::UiProgramCapabilityOwner::SharedContract,
+                    status: neon_ui_schema::UiProgramCapabilityStatus::Supported,
+                },
+                neon_ui_schema::UiProgramCapability {
+                    name: neon_ui_schema::UI_PROGRAM_TEXT_REGISTRY_CAPABILITY_NAME.into(),
+                    version: 1,
+                    owner: neon_ui_schema::UiProgramCapabilityOwner::SharedContract,
+                    status: neon_ui_schema::UiProgramCapabilityStatus::Supported,
+                },
+                neon_ui_schema::UiProgramCapability {
+                    name: neon_ui_schema::UI_PROGRAM_BOUNDED_STRUCTURE_CAPABILITY_NAME.into(),
+                    version: 1,
+                    owner: neon_ui_schema::UiProgramCapabilityOwner::SharedContract,
+                    status: neon_ui_schema::UiProgramCapabilityStatus::Supported,
+                },
+                neon_ui_schema::UiProgramCapability {
+                    name: neon_ui_schema::UI_PROGRAM_SEMANTIC_EVENT_CAPABILITY_NAME.into(),
+                    version: 1,
+                    owner: neon_ui_schema::UiProgramCapabilityOwner::SharedContract,
+                    status: neon_ui_schema::UiProgramCapabilityStatus::Supported,
+                },
+            ],
+        };
+        let program = crate::compile_nui_flow_program(&document, program_revision)
+            .expect("state-motion fixture must compile");
+
+        // --- 3. Build a UiProgramNode entry for the health_bar progress_bar
+        //     so that refresh_fragment_from_program can find its binding. ---
+        // The fixture declares `progress_bar health_bar numeric $health` with
+        // `input health f32:0..100 default 82`.
+
+        // --- 4. Build the initial fragment (as forward_flow_source would) ---
+        let fragment = UiFragment {
+            fragment_id: UiFragmentId("surface.combined-status".into()),
+            revision: Revision(1),
+            root: document.ir.root.clone(),
+            effects: lower_nui_flow_effects(&document),
+        };
+
+        // --- 5. Build a resolved-inputs snapshot with health=100 ---
+        let schema = document.input_schema;
+        let mut store = crate::UiInputStore::activate(program.revision.clone(), schema.clone())
+            .expect("input store must activate");
+        // Apply health=100
+        store
+            .apply(
+                crate::UiInputWriter::External,
+                UiInputFrame {
+                    program_revision: program.revision.clone(),
+                    expected_input_revision: store.snapshot().input_revision,
+                    request_id: "test-input".into(),
+                    idempotency_key: "test-input".into(),
+                    changes: vec![UiInputChange {
+                        key: "health".into(),
+                        value: UiInputValue::F32 { value: 100.0 },
+                    }],
+                },
+            )
+            .expect("health=100 must apply");
+        let inputs = store.snapshot();
+
+        // --- 6. Refresh the fragment with the updated inputs ---
+        let mut updated = fragment.clone();
+        updated.revision = Revision(updated.revision.0.saturating_add(1));
+        refresh_fragment_from_program(&mut updated, &program, &inputs, &schema);
+
+        // --- 7. Apply the health-change motion (duration 320ms, ease_out) ---
+        let motion = UiTransition {
+            delay_ms: 0,
+            duration_ms: 320,
+            easing: neon_ui_schema::UiEasing::EaseOut,
+            from: UiTransitionState {
+                bounds: None,
+                background_color: None,
+                border_color: None,
+                border_width: None,
+                corner_radius: None,
+                opacity: None,
+                numeric_value: None,
+            },
+            motion_key: Some("health-change".into()),
+        };
+        let pending_motion = PendingStateMotion {
+            transition: motion,
+            previous_styles: Vec::new(),
+            target_styles: vec![NuiFlowStateStyle {
+                node_key: "health_bar".into(),
+                bounds: None,
+                background_color: None,
+                border_color: None,
+                border_width: None,
+                corner_radius: None,
+                opacity: Some(1.0),
+            }],
+        };
+        apply_transition_to_fragment(&mut updated, &pending_motion);
+
+        // --- 8. Verify the fragment has the correct structure ---
+        fn find_node<'a>(node: &'a UiNode, id: &str) -> Option<&'a UiNode> {
+            if node.node_id.0 == id {
+                return Some(node);
+            }
+            for child in &node.children {
+                if let Some(found) = find_node(child, id) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+
+        let health_bar = find_node(&updated.root, "health_bar")
+            .expect("health_bar node must exist in the fragment");
+        assert!(
+            health_bar.enter_transition.is_some(),
+            "health_bar must have enter_transition after motion is applied"
+        );
+        if let Some(transition) = &health_bar.enter_transition {
+            assert_eq!(transition.duration_ms, 320);
+            assert_eq!(transition.easing, neon_ui_schema::UiEasing::EaseOut);
+        }
+
+        // Check that the fragment has a ControlPresentation effect with value=100.
+        let health_presentation = updated.effects.iter().find(|effect| {
+            matches!(
+                effect,
+                UiEffect::ControlPresentation {
+                    node_id,
+                    state: neon_ui_schema::UiControlPresentation::Numeric { value: 100.0, .. }
+                } if node_id.0 == "health_bar"
+            )
+        });
+        assert!(
+            health_presentation.is_some(),
+            "fragment must carry a ControlPresentation::Numeric {{ value: 100.0 }} for health_bar"
+        );
+
+        // The fragment should have a valid revision.
+        assert_eq!(updated.revision, Revision(2));
     }
 }

@@ -30,7 +30,11 @@ pub enum ScriptError {
     UnknownKernel { name: String },
 
     #[error("kernel `{name}` expects {expected} value args, got {actual}")]
-    KernelArgCount { name: String, expected: usize, actual: usize },
+    KernelArgCount {
+        name: String,
+        expected: usize,
+        actual: usize,
+    },
 
     #[error("kernel `{name}` has no parameter `{param}`")]
     UnknownParam { name: String, param: String },

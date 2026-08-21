@@ -3,10 +3,10 @@
 use std::collections::HashMap;
 
 use neon_gpu::hal_map::{self, HalBackend, MappedBuffer};
-use neon_gpu_script::ir::{IrNode, NodeKind};
 use neon_gpu_script::CompiledScene;
+use neon_gpu_script::ir::{IrNode, NodeKind};
 
-use crate::codelet::{split_args, Codelet, ConstArg, FieldTy};
+use crate::codelet::{Codelet, ConstArg, FieldTy, split_args};
 use crate::error::ExecError;
 
 const WORKGROUP: u32 = 64;
@@ -79,9 +79,11 @@ impl Executor {
         }
 
         // ---- record all dispatches into one encoder (GPU runs to completion)
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("neon-gpu-exec scene"),
-        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("neon-gpu-exec scene"),
+            });
 
         for wave in &scene.waves {
             for &node_id in wave {
@@ -101,7 +103,9 @@ impl Executor {
         // ---- readback buffers for exports ---------------------------------
         let mut readbacks = Vec::new();
         for (target, node_id) in &ir.exports {
-            let buf = node_buffers[*node_id].clone().ok_or(ExecError::MissingValueBuffer(*node_id))?;
+            let buf = node_buffers[*node_id]
+                .clone()
+                .ok_or(ExecError::MissingValueBuffer(*node_id))?;
             let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(&format!("readback::{target}")),
                 size: n as u64 * 4,
@@ -214,16 +218,13 @@ impl Executor {
         Ok(Some(out))
     }
 
-    fn build_pipeline(
-        &self,
-        kernel: &str,
-        wgsl: String,
-        value_count: usize,
-    ) -> PipelineEntry {
-        let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some(&format!("shader::{kernel}")),
-            source: wgpu::ShaderSource::Wgsl(wgsl.into()),
-        });
+    fn build_pipeline(&self, kernel: &str, wgsl: String, value_count: usize) -> PipelineEntry {
+        let module = self
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some(&format!("shader::{kernel}")),
+                source: wgpu::ShaderSource::Wgsl(wgsl.into()),
+            });
         let entries: Vec<wgpu::BindGroupLayoutEntry> = (0..=value_count)
             .map(|b| wgpu::BindGroupLayoutEntry {
                 binding: b as u32,
@@ -238,26 +239,33 @@ impl Executor {
                 count: None,
             })
             .collect();
-        let bind_group_layout = self.device.create_bind_group_layout(
-            &wgpu::BindGroupLayoutDescriptor {
-                label: Some(&format!("bgl::{kernel}")),
-                entries: &entries,
-            },
-        );
-        let pipeline_layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some(&format!("layout::{kernel}")),
-            bind_group_layouts: &[Some(&bind_group_layout)],
-            immediate_size: 0,
-        });
-        let pipeline = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some(&format!("pipeline::{kernel}")),
-            layout: Some(&pipeline_layout),
-            module: &module,
-            entry_point: Some("main"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
-        PipelineEntry { pipeline, bind_group_layout }
+        let bind_group_layout =
+            self.device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some(&format!("bgl::{kernel}")),
+                    entries: &entries,
+                });
+        let pipeline_layout = self
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some(&format!("layout::{kernel}")),
+                bind_group_layouts: &[Some(&bind_group_layout)],
+                immediate_size: 0,
+            });
+        let pipeline = self
+            .device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(&format!("pipeline::{kernel}")),
+                layout: Some(&pipeline_layout),
+                module: &module,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+        PipelineEntry {
+            pipeline,
+            bind_group_layout,
+        }
     }
 
     fn infer_entity_count(
@@ -310,10 +318,8 @@ impl Executor {
             backend: self.backend,
         };
         // SAFETY: same buffer and range were just mapped.
-        unsafe {
-            hal_map::invalidate(&self.device, buffer, self.backend, [0..size].into_iter())
-        }
-        .map_err(|e| ExecError::Readback(e.to_string()))?;
+        unsafe { hal_map::invalidate(&self.device, buffer, self.backend, [0..size].into_iter()) }
+            .map_err(|e| ExecError::Readback(e.to_string()))?;
 
         let words: &[f32] = bytemuck::cast_slice(unsafe {
             std::slice::from_raw_parts(mapped.ptr.as_ptr(), size as usize)
@@ -321,10 +327,8 @@ impl Executor {
         let out = words[..n as usize].to_vec();
 
         // SAFETY: the buffer is still mapped and alive.
-        unsafe {
-            hal_map::unmap(&self.device, buffer, self.backend)
-        }
-        .map_err(|e| ExecError::Readback(e.to_string()))?;
+        unsafe { hal_map::unmap(&self.device, buffer, self.backend) }
+            .map_err(|e| ExecError::Readback(e.to_string()))?;
         Ok(out)
     }
 }

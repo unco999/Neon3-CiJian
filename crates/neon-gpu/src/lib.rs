@@ -38,5 +38,5 @@ pub mod pool;
 
 pub use gpu::{GpuError, GpuPool, PoolHeap};
 pub use handle::{GpuPtr, Handle, PoolId};
-pub use layout::{ty, LayoutBuilder, StructLayout, Type};
+pub use layout::{LayoutBuilder, StructLayout, Type, ty};
 pub use pool::{DataPool, PoolError};

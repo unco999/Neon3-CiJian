@@ -23,17 +23,16 @@ use neon_protocol::{
     ClientKind, HealthStatus, InteractionId, InteractionSemanticTarget, InteractionTraceError,
     InteractionTraceFilters, InteractionTraceOutcome, InteractionTraceQuery,
     InteractionTraceRecord, InteractionTraceStage, PROTOCOL_VERSION, RenderBackend,
-    RenderBackendNegotiation, RenderSurfaceOpen, RenderSurfaceKind, RenderSurfaceTargetKind,
-    RequestId, Revision, RpcError,
-    RpcRequest, RpcResponse, RpcStatus,
-    ServiceDescription, ServiceHealth, ServiceName,
+    RenderBackendNegotiation, RenderSurfaceKind, RenderSurfaceOpen, RenderSurfaceTargetKind,
+    RequestId, Revision, RpcError, RpcRequest, RpcResponse, RpcStatus, ServiceDescription,
+    ServiceHealth, ServiceName,
 };
 #[cfg(test)]
 use neon_ui_schema::UiFragmentSubmission;
 use neon_ui_schema::{
     TextRef, UiBounds, UiCommand, UiDataGridWindowRequest, UiFragment, UiFragmentId, UiHostInbound,
-    UiNode, UiNodeId, UiNodeKind, UiPointerEvent, UiPointerEventType, UiSemanticEvent, UiStyle,
-    UiSemanticEventType, UiTransition, UiTransitionState, UiWindowRequest,
+    UiNode, UiNodeId, UiNodeKind, UiPointerEvent, UiPointerEventType, UiSemanticEvent,
+    UiSemanticEventType, UiStyle, UiTransition, UiTransitionState, UiWindowRequest,
 };
 use neon_world_bridge::{
     CameraControlSample, CameraFrame, CameraFramePayload, CameraId, WorldInformationBridge,
@@ -49,12 +48,12 @@ use winit::{
     window::{Window, WindowId},
 };
 
+#[cfg(windows)]
+mod dx12_interop;
 mod gpu_preview;
 mod ui_program_gpu;
 mod ui_renderer;
 mod world_ui_pipeline;
-#[cfg(windows)]
-mod dx12_interop;
 use gpu_preview::HeightmapPreviewConverter;
 pub use ui_program_gpu::GpuUiProgramBackend;
 use ui_renderer::{
@@ -68,14 +67,19 @@ pub const CAPABILITY_UI_HIT_TARGET: &str = "wgpu.ui.hit_target.v1";
 pub const CAPABILITY_UI_SEMANTIC_EVENT: &str = "wgpu.ui.semantic_event.v1";
 pub const CAPABILITY_UI_PROGRAM_SEMANTIC_EVENT: &str = "wgpu.ui.program.semantic_event.v1";
 pub const CAPABILITY_UI_RENDER_SURFACE: &str = "wgpu.ui.render_surface.v1";
-pub const CAPABILITY_EXTERNAL_HOST_BACKEND_MATCH: &str =
-    "wgpu.external_host.backend_match.v1";
+pub const CAPABILITY_EXTERNAL_HOST_BACKEND_MATCH: &str = "wgpu.external_host.backend_match.v1";
 pub const CAPABILITY_EXTERNAL_HOST_D3D12_SURFACE: &str =
     "wgpu.external_host.d3d12_shared_texture.v1";
 pub const CAPABILITY_AI_TERRAIN_GENERATION: &str = "wgpu.ai.terrain_generation.v1";
 pub const CAPABILITY_DEBUG_INTERACTION: &str = "debug.interaction.v1";
 pub const CAPABILITY_DEBUG_WINDOW_CAPTURE: &str = "debug.window.capture.v1";
 pub const CAPABILITY_WORLD_UI_LAB_CAMERA: &str = "wgpu.world_ui.lab.camera.v1";
+/// Statechart-driven transition sampling in the renderer. Explicit so hosts can
+/// gate on it before relying on state-transition motion.
+pub const CAPABILITY_STATE_ANIMATION: &str = "wgpu.ui.state.animation.v1";
+/// Numeric presentation interpolation in the renderer. Explicit so hosts can
+/// gate on it before relying on smooth progress-bar updates.
+pub const CAPABILITY_NUMERIC_ANIMATION: &str = "wgpu.ui.numeric.animation.v1";
 pub const UI_HIT_TARGET: &str = "ui.hit_id.v1";
 pub const UI_COLOR_TARGET: &str = "ui.color.v1";
 pub const RENDER_HIT_NONE: u32 = u32::MAX;
@@ -1126,8 +1130,12 @@ impl WindowedRuntime {
             UiPointerEventType::Enter | UiPointerEventType::Move => {
                 gpu.input.set_hover_id(gpu.ui.hit_id_at_pointer());
                 gpu.pending_hit_pixel = Some([
-                    pointer[0].max(0.0).min(gpu.config.width.saturating_sub(1) as f32) as u32,
-                    pointer[1].max(0.0).min(gpu.config.height.saturating_sub(1) as f32) as u32,
+                    pointer[0]
+                        .max(0.0)
+                        .min(gpu.config.width.saturating_sub(1) as f32) as u32,
+                    pointer[1]
+                        .max(0.0)
+                        .min(gpu.config.height.saturating_sub(1) as f32) as u32,
                 ]);
                 self.redraw_pending = true;
                 Ok(json!({"state": "observed"}))
@@ -1304,9 +1312,9 @@ impl WindowedRuntime {
         // failing `as_hal::<Dx12>()` at surface creation.
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::DX12,
-            ..wgpu::InstanceDescriptor::new_with_display_handle(
-                Box::new(event_loop.owned_display_handle()),
-            )
+            ..wgpu::InstanceDescriptor::new_with_display_handle(Box::new(
+                event_loop.owned_display_handle(),
+            ))
         });
         let gpu = WindowGpu::new(&window, instance, self.world_ui_lab_camera.clone())?;
         if let Ok(mut camera) = self.world_ui_lab_camera.lock() {
@@ -1589,10 +1597,7 @@ impl WindowedRuntime {
             );
             gpu.hit_target_dirty = false;
         }
-        gpu.encode_external_surfaces(
-            &mut encoder,
-            &self.fragments,
-        )?;
+        gpu.encode_external_surfaces(&mut encoder, &self.fragments)?;
         #[cfg(debug_assertions)]
         gpu.final_target_blitter.copy(
             &gpu.device,
@@ -1908,8 +1913,10 @@ impl WindowedRuntime {
             "active_drag": active_drag,
             "pending_hit_readback": gpu.pending_hit_slot.is_some(),
             "pending_hit_pixel": gpu.pending_hit_pixel.is_some(),
-            "semantic_hit_nodes": gpu.ui.semantic_hit_nodes(),
             "dropdown": gpu.ui.dropdown_debug_snapshot(),
+            "active_transitions": gpu
+                .ui
+                .active_transition_debug_snapshot(gpu.started_at.elapsed().as_secs_f32()),
             "pointer_delivery": self.pointer_delivery.lock().ok().map(|state| state.clone()),
             "data_grid_window_delivery": self.data_grid_window_delivery.lock().ok().map(|state| state.clone()),
         })
@@ -1970,10 +1977,6 @@ impl WindowedRuntime {
             .ok()
             .map(|state| state.clone())
             .unwrap_or_else(|| json!({"state": "unavailable"}));
-        probe["last_pointer"] = json!({
-            "outcome": gpu.last_pointer_outcome,
-            "semantic_node_path": gpu.last_pointer_node_path,
-        });
         self.redraw_pending = true;
         probe
     }
@@ -2336,6 +2339,8 @@ struct HeadlessExternalGpu {
     ui: UiWgpuRenderer,
     screen_ui: UiWgpuRenderer,
     world_ui: UiWgpuRenderer,
+    pointer_hit_target: wgpu::Texture,
+    pointer_hit_target_view: wgpu::TextureView,
     input: LocalInputState,
     captured_binding: Option<UiHitBinding>,
     pending_control_value: Option<neon_ui_schema::UiSemanticPayloadValue>,
@@ -2351,6 +2356,7 @@ struct HeadlessExternalGpu {
     last_rendered_fragments: Option<HashMap<RenderSurfaceKind, HashMap<UiFragmentId, UiFragment>>>,
     last_rendered_all_surfaces: bool,
     frame_timings: VecDeque<ExternalFrameTiming>,
+    started_at: Instant,
 }
 
 #[cfg(windows)]
@@ -2376,18 +2382,31 @@ impl HeadlessExternalGpu {
             trace: wgpu::Trace::Off,
         }))
         .map_err(|error| format!("headless external device: {error}"))?;
+        let pointer_hit_target = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("neon3-external-pointer-hit-id"),
+            size: wgpu::Extent3d {
+                width: 1280,
+                height: 720,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R32Uint,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let pointer_hit_target_view = pointer_hit_target.create_view(&Default::default());
         Ok(Self {
-            ui: UiWgpuRenderer::new_with_depth(
-                &device,
-                wgpu::TextureFormat::Rgba8Unorm,
-                wgpu::TextureFormat::R32Float,
-            ),
+            ui: UiWgpuRenderer::new_unified(&device, wgpu::TextureFormat::Rgba8Unorm),
             screen_ui: UiWgpuRenderer::new(&device, wgpu::TextureFormat::Rgba8Unorm),
             world_ui: UiWgpuRenderer::new_with_depth(
                 &device,
                 wgpu::TextureFormat::Rgba8Unorm,
                 wgpu::TextureFormat::R32Float,
             ),
+            pointer_hit_target,
+            pointer_hit_target_view,
             input: LocalInputState::default(),
             captured_binding: None,
             pending_control_value: None,
@@ -2406,53 +2425,159 @@ impl HeadlessExternalGpu {
             last_rendered_fragments: None,
             last_rendered_all_surfaces: false,
             frame_timings: VecDeque::new(),
+            started_at: Instant::now(),
         })
+    }
+
+    fn read_pointer_hit_id(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        pointer_hit_target: &wgpu::Texture,
+        pointer_hit_target_view: &wgpu::TextureView,
+        renderer: &mut UiWgpuRenderer,
+        fragments: &HashMap<UiFragmentId, UiFragment>,
+        pixel: [f32; 2],
+        time_seconds: f32,
+    ) -> Result<u32, String> {
+        let x = pixel[0].clamp(0.0, 1279.0) as u32;
+        let y = pixel[1].clamp(0.0, 719.0) as u32;
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("neon3-external-pointer-hit-readback"),
+        });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("neon3-external-pointer-hit-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: pointer_hit_target_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            renderer.draw_hit_id(
+                device,
+                queue,
+                &mut pass,
+                fragments,
+                [1280, 720],
+                [1280.0, 720.0],
+                time_seconds,
+            );
+        }
+        let Some(slot) = renderer.enqueue_hit_readback(&mut encoder, pointer_hit_target, [x, y])
+        else {
+            return Err("pointer_hit_readback_busy".into());
+        };
+        queue.submit(Some(encoder.finish()));
+        if !renderer.begin_hit_readback_mapping(slot) {
+            return Err("pointer_hit_readback_mapping_failed".into());
+        }
+        let deadline = Instant::now() + Duration::from_millis(16);
+        while Instant::now() < deadline {
+            let _ = device.poll(wgpu::PollType::Poll);
+            if let Some(result) = renderer.try_complete_hit_readback(slot) {
+                return result.map_err(|error| format!("pointer_hit_readback_failed: {error}"));
+            }
+            thread::yield_now();
+        }
+        Err("pointer_hit_readback_timeout".into())
     }
 
     fn pointer_event(
         &mut self,
         event: UiPointerEvent,
         fragments: &HashMap<UiFragmentId, UiFragment>,
+        _surface_kind: RenderSurfaceKind,
     ) -> Result<Value, String> {
         if event.generation != 1 {
             return Err("ui_pointer_generation_stale".into());
         }
-        self.ui.set_pointer_position(event.pixel);
-        self.ui.prepare_interaction(fragments, [1280, 720], [1280.0, 720.0], 0.0);
+        // Use the same monotonic clock as the render loop. A fixed 0.0 here
+        // resets every ActiveTransition's elapsed time on each pointer move,
+        // so a hover/drag during an animation snaps the node back to its start
+        // pose and the render loop then completes it immediately — the
+        // start/complete spam observed on pointer movement.
+        let now = self.started_at.elapsed().as_secs_f32();
+        // Screen and World UI share one hit image. The event surface selects
+        // the color/depth composition target, but never selects a separate
+        // interaction tree. This makes the topmost panel win across both UI
+        // kinds and prevents parent/node bubbling from producing a second hit.
+        self.ui.invalidate_plan();
+        let id_hit = match event.event_type {
+            UiPointerEventType::Down => Some(Self::read_pointer_hit_id(
+                &self.device,
+                &self.queue,
+                &self.pointer_hit_target,
+                &self.pointer_hit_target_view,
+                &mut self.ui,
+                fragments,
+                event.pixel,
+                now,
+            )?),
+            UiPointerEventType::Enter
+            | UiPointerEventType::Move
+            | UiPointerEventType::Up
+            | UiPointerEventType::Wheel
+            | UiPointerEventType::Leave
+            | UiPointerEventType::Cancel => None,
+        };
+        let ui = &mut self.ui;
+        ui.set_pointer_position(event.pixel);
+        ui.prepare_interaction(fragments, [1280, 720], [1280.0, 720.0], now);
         match event.event_type {
             UiPointerEventType::Enter | UiPointerEventType::Move => {
-                self.input.set_hover_id(self.ui.hit_id_at_pointer());
+                self.input.set_hover_id(None);
                 Ok(json!({"state": "observed"}))
             }
             UiPointerEventType::Down => {
                 if !matches!(event.button, Some(neon_ui_schema::UiPointerButton::Primary)) {
                     return Err("ui_pointer_button_unsupported".into());
                 }
-                self.input.set_hover_id(self.ui.hit_id_at_pointer());
+                let hit_id = id_hit.filter(|id| *id != RENDER_HIT_NONE);
+                self.input.set_hover_id(hit_id);
                 self.input
                     .pointer_down()
-                    .map_err(|_| "press_without_semantic_hit".to_owned())?;
+                    .map_err(|_| {
+                            format!(
+                            "press_without_semantic_hit:pointer=({:.1},{:.1}) unified_id_hit={:?}",
+                            event.pixel[0],
+                            event.pixel[1],
+                            id_hit,
+                        )
+                    })?;
                 self.captured_binding = self
                     .input
                     .capture_id
-                    .and_then(|hit_id| self.ui.hit_binding(hit_id));
+                    .and_then(|hit_id| ui.hit_binding(hit_id));
                 if self.captured_binding.is_none() {
                     let _ = self.input.pointer_up(false);
                     return Err("press_without_semantic_binding".into());
                 }
                 if let Some(binding) = self.captured_binding.clone() {
                     self.pending_control_value = binding.control_value.clone();
-                    self.ui.press_hovered(0.0);
+                    ui.press_hovered(now);
                 }
                 Ok(json!({"state": "captured"}))
             }
             UiPointerEventType::Up => {
                 let capture_id = self.input.capture_id;
-                let binding = self.captured_binding.take().or_else(|| {
-                    capture_id.and_then(|hit_id| self.ui.hit_binding(hit_id))
-                });
+                let binding = self
+                    .captured_binding
+                    .take()
+                    .or_else(|| capture_id.and_then(|hit_id| ui.hit_binding(hit_id)));
                 let control_value = self.pending_control_value.take();
-                if self.input.pointer_up(binding.is_some() || capture_id.is_some()).is_err() {
+                if self
+                    .input
+                    .pointer_up(binding.is_some() || capture_id.is_some())
+                    .is_err()
+                {
                     return Err("pointer_release_rejected".into());
                 }
                 let Some(binding) = binding else {
@@ -2462,9 +2587,34 @@ impl HeadlessExternalGpu {
                     return Ok(json!({"state": "released"}));
                 };
                 self.next_semantic_sequence = self.next_semantic_sequence.saturating_add(1);
+                let event_id = format!("wgpu-pointer-click-{}", self.next_semantic_sequence);
+                if binding.node_path.ends_with("/p0")
+                    || binding.node_path.contains("/p")
+                        && binding.node_path.split('/').next_back().is_some_and(|key| {
+                            key.strip_prefix('p')
+                                .is_some_and(|index| !index.is_empty() && index.chars().all(|c| c.is_ascii_digit()))
+                        })
+                {
+                    eprintln!(
+                        "[neon-wgpu-runtime] world-ui-click id={} node={} interaction_id={} ",
+                        capture_id.unwrap_or(RENDER_HIT_NONE),
+                        binding.node_path,
+                        event_id,
+                    );
+                }
+                eprintln!(
+                    "{}",
+                    json!({
+                        "event": "wgpu_semantic_click",
+                        "event_id": event_id,
+                        "node_path": binding.node_path,
+                        "hit_id": capture_id.unwrap_or(RENDER_HIT_NONE),
+                        "timestamp_monotonic_ns": self.started_at.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
+                    })
+                );
                 Ok(json!({"semantic_event": UiSemanticEvent {
                     event: UiSemanticEventType::PointerClick,
-                    event_id: format!("wgpu-pointer-click-{}", self.next_semantic_sequence),
+                    event_id,
                     renderer_epoch: 1,
                     composition_revision: binding.fragment.revision,
                     fragment: binding.fragment,
@@ -2479,10 +2629,12 @@ impl HeadlessExternalGpu {
             }
             UiPointerEventType::Wheel => {
                 let delta = match event.delta_mode {
-                    neon_ui_schema::UiPointerDeltaMode::Line => [event.delta[0] * 24.0, event.delta[1] * 24.0],
+                    neon_ui_schema::UiPointerDeltaMode::Line => {
+                        [event.delta[0] * 24.0, event.delta[1] * 24.0]
+                    }
                     _ => event.delta,
                 };
-                self.ui.scroll_wheel_at_pointer(delta);
+                ui.scroll_wheel_at_pointer(delta);
                 Ok(json!({"state": "scrolled"}))
             }
             UiPointerEventType::Leave | UiPointerEventType::Cancel => {
@@ -2514,8 +2666,10 @@ impl HeadlessExternalGpu {
                 .map_err(|error| error.to_string())?,
             );
         }
-        self.external_surfaces.insert(open.surface_id.clone(), surfaces);
-        self.surface_kinds.insert(open.surface_id.clone(), open.kind);
+        self.external_surfaces
+            .insert(open.surface_id.clone(), surfaces);
+        self.surface_kinds
+            .insert(open.surface_id.clone(), open.kind);
         self.last_rendered_all_surfaces = false;
         self.last_rendered_fragments = None;
         let color_depth_targets = (0..open.buffer_count)
@@ -2530,7 +2684,11 @@ impl HeadlessExternalGpu {
             open.surface_id.clone(),
             (texture_token.clone(), fence_token.clone()),
         );
-        if open.targets.iter().any(|target| target.kind == RenderSurfaceTargetKind::Id) {
+        if open
+            .targets
+            .iter()
+            .any(|target| target.kind == RenderSurfaceTargetKind::Id)
+        {
             let mut id_surfaces = Vec::with_capacity(open.buffer_count as usize);
             for _ in 0..open.buffer_count {
                 id_surfaces.push(
@@ -2544,7 +2702,8 @@ impl HeadlessExternalGpu {
                     .map_err(|error| error.to_string())?,
                 );
             }
-            self.external_id_surfaces.insert(open.surface_id.clone(), id_surfaces);
+            self.external_id_surfaces
+                .insert(open.surface_id.clone(), id_surfaces);
         }
         if open.depth {
             let mut depth_surfaces = Vec::with_capacity(open.buffer_count as usize);
@@ -2560,7 +2719,8 @@ impl HeadlessExternalGpu {
                     .map_err(|error| error.to_string())?,
                 );
             }
-            self.external_depth_surfaces.insert(open.surface_id.clone(), depth_surfaces);
+            self.external_depth_surfaces
+                .insert(open.surface_id.clone(), depth_surfaces);
         }
         Ok(json!({
             "surface_id": open.surface_id,
@@ -2574,7 +2734,10 @@ impl HeadlessExternalGpu {
     }
 
     fn acquire(&self, surface_id: &str, pid: u32) -> Result<Value, String> {
-        let shared = self.external_surfaces.get(surface_id).ok_or("surface_not_found")?;
+        let shared = self
+            .external_surfaces
+            .get(surface_id)
+            .ok_or("surface_not_found")?;
         let (texture_token, fence_token) = self
             .external_handle_tokens
             .get(surface_id)
@@ -2617,12 +2780,14 @@ impl HeadlessExternalGpu {
         if let Some((texture, fence, id_texture, id_fence)) = result["buffers"]
             .as_array()
             .and_then(|buffers| buffers.first())
-            .map(|first| (
-                first["color_texture_handle"].clone(),
-                first["color_fence_handle"].clone(),
-                first["id_texture_handle"].clone(),
-                first["id_fence_handle"].clone(),
-            ))
+            .map(|first| {
+                (
+                    first["color_texture_handle"].clone(),
+                    first["color_fence_handle"].clone(),
+                    first["id_texture_handle"].clone(),
+                    first["id_fence_handle"].clone(),
+                )
+            })
         {
             result["texture_handle"] = texture;
             result["fence_handle"] = fence;
@@ -2635,18 +2800,29 @@ impl HeadlessExternalGpu {
     fn render(
         &mut self,
         snapshots: &HashMap<RenderSurfaceKind, HashMap<UiFragmentId, UiFragment>>,
-        combined: &HashMap<UiFragmentId, UiFragment>,
+        unified_hit_fragments: &HashMap<UiFragmentId, UiFragment>,
         snapshot_ms: f32,
     ) -> Result<(), String> {
         if self.external_surfaces.is_empty() {
             return Ok(());
         }
+        // Monotonic wall-clock for the render loop. Transition sampling and
+        // press/hover animations consume this every frame; a fixed value (or
+        // zero) freezes every ActiveTransition at its start pose.
+        let time_seconds = self.started_at.elapsed().as_secs_f32();
         let mut timing = ExternalFrameTiming::default();
         timing.snapshot_ms = snapshot_ms;
+        let has_external_id_targets = !self.external_id_surfaces.is_empty();
         // A static resolved snapshot does not need another layout, text upload,
         // color pass, depth pass, or ID pass. The consumer keeps sampling the
-        // last complete buffer from the ring.
-        if self.last_rendered_all_surfaces
+        // last complete buffer from the ring. Exception: while a transition or
+        // press animation is still in flight the snapshot is unchanged but the
+        // frame must keep rendering so the interpolation advances.
+        let has_active_animation = self.screen_ui.has_active_animation(time_seconds)
+            || self.world_ui.has_active_animation(time_seconds)
+            || (has_external_id_targets && self.ui.has_active_animation(time_seconds));
+        if !has_active_animation
+            && self.last_rendered_all_surfaces
             && self
                 .last_rendered_fragments
                 .as_ref()
@@ -2677,16 +2853,20 @@ impl HeadlessExternalGpu {
         // bounds actually reach the color/depth pass; otherwise the world UI
         // freezes at its first projected position.
         let stage = Instant::now();
-        self.ui.invalidate_plan();
+        if has_external_id_targets {
+            self.ui.invalidate_plan();
+        }
         self.world_ui.invalidate_plan();
         self.screen_ui.invalidate_plan();
         timing.invalidate_plan_ms = stage.elapsed().as_secs_f32() * 1000.0;
         self.next_external_frame_sequence = self.next_external_frame_sequence.saturating_add(1);
         let frame_sequence = self.next_external_frame_sequence;
         timing.frame_sequence = frame_sequence;
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("neon3-headless-external-ui"),
-        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("neon3-headless-external-ui"),
+            });
         // A combined Flow is published as one atomic frame. Every external
         // target must use the same ring slot, otherwise screen and world UI can
         // visibly come from different camera/layout revisions.
@@ -2741,8 +2921,14 @@ impl HeadlessExternalGpu {
             let shared = &mut shared_ring[write_index];
             let hal_queue = unsafe { self.queue.as_hal::<wgpu::hal::api::Dx12>() }
                 .ok_or("dx12_queue_unavailable")?;
-            let view = shared.texture.create_view(&wgpu::TextureViewDescriptor::default());
-            let kind = self.surface_kinds.get(surface_id).copied().unwrap_or(RenderSurfaceKind::ScreenUi);
+            let view = shared
+                .texture
+                .create_view(&wgpu::TextureViewDescriptor::default());
+            let kind = self
+                .surface_kinds
+                .get(surface_id)
+                .copied()
+                .unwrap_or(RenderSurfaceKind::ScreenUi);
             let mode = match kind {
                 RenderSurfaceKind::WorldUi => UiDrawMode::World,
                 _ => UiDrawMode::Screen,
@@ -2761,7 +2947,10 @@ impl HeadlessExternalGpu {
                     view: &view,
                     depth_slice: None,
                     resolve_target: None,
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store },
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
                 })],
                 depth_stencil_attachment: color_depth_view.as_ref().map(|view| {
                     wgpu::RenderPassDepthStencilAttachment {
@@ -2789,7 +2978,16 @@ impl HeadlessExternalGpu {
                     UiDrawMode::Screen => &mut self.screen_ui,
                     UiDrawMode::All => &mut self.ui,
                 };
-                renderer.draw(&self.device, &self.queue, &mut pass, fragments, [shared.width, shared.height], [shared.width as f32, shared.height as f32], 0.0, mode);
+                renderer.draw(
+                    &self.device,
+                    &self.queue,
+                    &mut pass,
+                    fragments,
+                    [shared.width, shared.height],
+                    [shared.width as f32, shared.height as f32],
+                    time_seconds,
+                    mode,
+                );
                 timing.color_pass_ms += stage.elapsed().as_secs_f32() * 1000.0;
             }
             drop(pass);
@@ -2813,7 +3011,10 @@ impl HeadlessExternalGpu {
                         view: &depth_view,
                         depth_slice: None,
                         resolve_target: None,
-                        ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store },
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: wgpu::StoreOp::Store,
+                        },
                     })],
                     depth_stencil_attachment: None,
                     timestamp_writes: None,
@@ -2850,7 +3051,10 @@ impl HeadlessExternalGpu {
                         view: &id_view,
                         depth_slice: None,
                         resolve_target: None,
-                        ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store },
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: wgpu::StoreOp::Store,
+                        },
                     })],
                     depth_stencil_attachment: None,
                     timestamp_writes: None,
@@ -2867,10 +3071,10 @@ impl HeadlessExternalGpu {
                     &self.device,
                     &self.queue,
                     &mut id_pass,
-                    combined,
+                    &unified_hit_fragments,
                     [id_shared.width, id_shared.height],
                     [id_shared.width as f32, id_shared.height as f32],
-                    0.0,
+                    time_seconds,
                 );
                 timing.hit_pass_ms += stage.elapsed().as_secs_f32() * 1000.0;
                 drop(id_pass);
@@ -2938,10 +3142,33 @@ impl HeadlessExternalGpu {
             "screen_ui": self.screen_ui.depth_diagnostics(),
         })
     }
+
+    /// Whether the most recently recorded frame was dropped (no free ring slot).
+    fn last_frame_dropped(&self) -> bool {
+        self.frame_timings
+            .back()
+            .is_some_and(|timing| timing.dropped)
+    }
+
+    /// Whether the most recently recorded frame was skipped as a static no-op.
+    fn last_frame_skipped_static(&self) -> bool {
+        self.frame_timings
+            .back()
+            .is_some_and(|timing| timing.skipped_static)
+    }
+
+    /// Whether the most recently recorded frame was skipped by the 16 ms throttle.
+    fn last_frame_skipped_throttled(&self) -> bool {
+        self.frame_timings
+            .back()
+            .is_some_and(|timing| timing.skipped_throttled)
+    }
 }
 
 #[cfg(windows)]
-pub fn spawn_headless_external_server(endpoint: SocketAddr) -> std::thread::JoinHandle<Result<(), String>> {
+pub fn spawn_headless_external_server(
+    endpoint: SocketAddr,
+) -> std::thread::JoinHandle<Result<(), String>> {
     std::thread::Builder::new()
         .name("neon3-headless-external-gpu".into())
         .spawn(move || {
@@ -2963,21 +3190,110 @@ pub fn spawn_headless_external_server(endpoint: SocketAddr) -> std::thread::Join
             let render_thread = std::thread::Builder::new()
                 .name("neon3-headless-external-render".into())
                 .spawn(move || {
+                    // Rolling diagnostics for the render loop. Aggregates over
+                    // a fixed window so we can observe frame pacing, snapshot
+                    // cost and GPU-lock contention without spamming every frame.
+                    let mut diag_frames = 0u32;
+                    let mut diag_interval_sum_ms = 0f32;
+                    let mut diag_interval_max_ms = 0f32;
+                    let mut diag_snapshot_sum_ms = 0f32;
+                    let mut diag_snapshot_max_ms = 0f32;
+                    let mut diag_render_sum_ms = 0f32;
+                    let mut diag_render_max_ms = 0f32;
+                    let mut diag_lock_wait_sum_ms = 0f32;
+                    let mut diag_lock_wait_max_ms = 0f32;
+                    let mut diag_dropped = 0u32;
+                    let mut diag_skipped_static = 0u32;
+                    let mut diag_skipped_throttled = 0u32;
+                    let mut last_frame_at = Instant::now();
                     while !render_stop.load(std::sync::atomic::Ordering::Relaxed) {
                         std::thread::sleep(Duration::from_millis(16));
+                        let frame_start = Instant::now();
+                        let interval_ms = (frame_start - last_frame_at).as_secs_f32() * 1000.0;
+                        last_frame_at = frame_start;
                         let snapshot_start = Instant::now();
-                         let (snapshots, combined) = match render_runtime.lock() {
+                         let (snapshots, _combined, unified_hit_fragments) = match render_runtime.lock() {
                              Ok(runtime) => runtime.external_surface_snapshots(),
                             Err(_) => break,
                         };
                         let snapshot_ms = snapshot_start.elapsed().as_secs_f32() * 1000.0;
-                        match render_gpu.lock() {
-                            Ok(mut gpu) => {
-                                 if let Err(error) = gpu.render(&snapshots, &combined, snapshot_ms) {
-                                    eprintln!("[neon-wgpu-runtime] render error: {error}");
+                        let render_start = Instant::now();
+                        let mut dropped = false;
+                        let mut skipped_static = false;
+                        let mut skipped_throttled = false;
+                        let lock_wait_ms = loop {
+                            match render_gpu.try_lock() {
+                                Ok(mut gpu) => {
+                                    let wait_ms =
+                                        render_start.elapsed().as_secs_f32() * 1000.0;
+                                    if let Err(error) =
+                                        gpu.render(
+                                            &snapshots,
+                                            &unified_hit_fragments,
+                                            snapshot_ms,
+                                        )
+                                    {
+                                        eprintln!("[neon-wgpu-runtime] render error: {error}");
+                                    }
+                                    dropped = gpu.last_frame_dropped();
+                                    skipped_static = gpu.last_frame_skipped_static();
+                                    skipped_throttled = gpu.last_frame_skipped_throttled();
+                                    break wait_ms;
                                 }
+                                Err(std::sync::TryLockError::WouldBlock) => {
+                                    std::thread::yield_now();
+                                    continue;
+                                }
+                                Err(_) => return,
                             }
-                            Err(_) => break,
+                        };
+                        let render_ms = render_start.elapsed().as_secs_f32() * 1000.0;
+                        diag_frames += 1;
+                        diag_interval_sum_ms += interval_ms;
+                        diag_interval_max_ms = diag_interval_max_ms.max(interval_ms);
+                        diag_snapshot_sum_ms += snapshot_ms;
+                        diag_snapshot_max_ms = diag_snapshot_max_ms.max(snapshot_ms);
+                        diag_render_sum_ms += render_ms;
+                        diag_render_max_ms = diag_render_max_ms.max(render_ms);
+                        diag_lock_wait_sum_ms += lock_wait_ms;
+                        diag_lock_wait_max_ms = diag_lock_wait_max_ms.max(lock_wait_ms);
+                        if dropped {
+                            diag_dropped += 1;
+                        }
+                        if skipped_static {
+                            diag_skipped_static += 1;
+                        }
+                        if skipped_throttled {
+                            diag_skipped_throttled += 1;
+                        }
+                        if diag_frames >= 60 {
+                            eprintln!(
+                                "[neon-wgpu-runtime] render diag: window={} frames interval avg={:.1}ms max={:.1}ms | snapshot avg={:.2}ms max={:.2}ms | render(total incl lock) avg={:.2}ms max={:.2}ms | lock_wait avg={:.2}ms max={:.2}ms | dropped={} static_skip={} throttled={}",
+                                diag_frames,
+                                diag_interval_sum_ms / diag_frames as f32,
+                                diag_interval_max_ms,
+                                diag_snapshot_sum_ms / diag_frames as f32,
+                                diag_snapshot_max_ms,
+                                diag_render_sum_ms / diag_frames as f32,
+                                diag_render_max_ms,
+                                diag_lock_wait_sum_ms / diag_frames as f32,
+                                diag_lock_wait_max_ms,
+                                diag_dropped,
+                                diag_skipped_static,
+                                diag_skipped_throttled,
+                            );
+                            diag_frames = 0;
+                            diag_interval_sum_ms = 0.0;
+                            diag_interval_max_ms = 0.0;
+                            diag_snapshot_sum_ms = 0.0;
+                            diag_snapshot_max_ms = 0.0;
+                            diag_render_sum_ms = 0.0;
+                            diag_render_max_ms = 0.0;
+                            diag_lock_wait_sum_ms = 0.0;
+                            diag_lock_wait_max_ms = 0.0;
+                            diag_dropped = 0;
+                            diag_skipped_static = 0;
+                            diag_skipped_throttled = 0;
                         }
                     }
                 })
@@ -3023,16 +3339,102 @@ pub fn spawn_headless_external_server(endpoint: SocketAddr) -> std::thread::Join
                                 .get("event")
                                 .cloned()
                                 .unwrap_or(request.params);
+                            // Timestamp the request arrival to measure end-to-end
+                            // pointer latency: RPC -> runtime lock -> snapshot ->
+                            // gpu lock -> hit resolution. Printed on the Down
+                            // path so we see press latency without spamming on
+                            // every mouse-move sample.
+                            let arrived_at = Instant::now();
                             match serde_json::from_value::<UiPointerEvent>(event)
                                 .map_err(|error| format!("invalid_pointer_event: {error}"))
                                 .and_then(|event| {
-                                    let fragments = runtime
+                                    let snapshot_start = Instant::now();
+                                    let (mut surface_kind, surface_mapping) = {
+                                        let gpu = gpu.lock().expect("gpu lock");
+                                        match gpu.surface_kinds.get(&event.surface_id.0).copied() {
+                                            Some(kind) => (kind, "registered"),
+                                            None => (
+                                                RenderSurfaceKind::ScreenUi,
+                                                "missing_surface_mapping",
+                                            ),
+                                        }
+                                    };
+                                    let (_, combined_fragments, unified_hit_fragments) = runtime
                                         .lock()
                                         .expect("runtime lock")
-                                        .fragments_snapshot();
-                                    gpu.lock()
-                                        .expect("gpu lock")
-                                        .pointer_event(event, &fragments)
+                                        .external_surface_snapshots();
+                                    let inferred_world = surface_mapping
+                                        == "missing_surface_mapping"
+                                        && combined_fragments.values().any(|fragment| {
+                                            fragment.effects.iter().any(|effect| {
+                                                matches!(
+                                                    effect,
+                                                    neon_ui_schema::UiEffect::CameraVisibility { .. }
+                                                )
+                                            })
+                                        });
+                                    if inferred_world {
+                                        surface_kind = RenderSurfaceKind::WorldUi;
+                                    }
+                                    let snapshot_ms =
+                                        snapshot_start.elapsed().as_secs_f32() * 1000.0;
+                                    let gpu_wait_start = Instant::now();
+                                    let result = if surface_mapping == "missing_surface_mapping"
+                                        && !inferred_world
+                                    {
+                                        Err(format!(
+                                            "pointer_surface_mapping_missing:surface_id={} known_surfaces={:?}",
+                                            event.surface_id.0,
+                                            gpu.lock()
+                                                .expect("gpu lock")
+                                                .surface_kinds
+                                                .keys()
+                                                .collect::<Vec<_>>(),
+                                        ))
+                                    } else {
+                                        let mut gpu = loop {
+                                            match gpu.try_lock() {
+                                                Ok(guard) => break guard,
+                                                Err(std::sync::TryLockError::WouldBlock) => {
+                                                    std::thread::yield_now();
+                                                    continue;
+                                                }
+                                                Err(_) => {
+                                                    return Err(
+                                                        "gpu_lock_poisoned".to_string(),
+                                                    )
+                                                }
+                                            }
+                                        };
+                                        gpu.pointer_event(
+                                            event,
+                                            &unified_hit_fragments,
+                                            surface_kind,
+                                        )
+                                    };
+                                    let total_ms = arrived_at.elapsed().as_secs_f32() * 1000.0;
+                                    if result
+                                        .as_ref()
+                                        .map(|value| {
+                                            value
+                                                .get("semantic_event")
+                                                .or_else(|| value.get("state"))
+                                                .is_some_and(|state| {
+                                                    state
+                                                        .as_str()
+                                                        .is_some_and(|s| s == "captured")
+                                                })
+                                        })
+                                        .unwrap_or(false)
+                                    {
+                                        eprintln!(
+                                            "[neon-wgpu-runtime] pointer latency: total={:.2}ms snapshot={:.2}ms gpu_lock_wait={:.2}ms",
+                                            total_ms,
+                                            snapshot_ms,
+                                            gpu_wait_start.elapsed().as_secs_f32() * 1000.0,
+                                        );
+                                    }
+                                    result
                                 })
                             {
                                 Ok(result) => runtime.lock().expect("runtime lock").accept(request_id, result),
@@ -3250,7 +3652,9 @@ impl WindowGpu {
                 fragments.len(),
                 shared.frame_sequence
             );
-            let view = shared.texture.create_view(&wgpu::TextureViewDescriptor::default());
+            let view = shared
+                .texture
+                .create_view(&wgpu::TextureViewDescriptor::default());
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("neon3-external-host-surface-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -3285,7 +3689,9 @@ impl WindowGpu {
             hal_queue.add_signal_fence(shared.fence.clone(), fence_value);
         }
         for (surface_id, shared) in self.external_id_surfaces.iter_mut() {
-            let view = shared.texture.create_view(&wgpu::TextureViewDescriptor::default());
+            let view = shared
+                .texture
+                .create_view(&wgpu::TextureViewDescriptor::default());
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("neon3-external-host-id-surface-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -3316,7 +3722,9 @@ impl WindowGpu {
             shared.frame_sequence = self
                 .external_surfaces
                 .get(surface_id)
-                .map_or(shared.frame_sequence.saturating_add(1), |color| color.frame_sequence);
+                .map_or(shared.frame_sequence.saturating_add(1), |color| {
+                    color.frame_sequence
+                });
             let hal_queue = unsafe { self.queue.as_hal::<wgpu::hal::api::Dx12>() }
                 .ok_or_else(|| "dx12_queue_unavailable".to_owned())?;
             hal_queue.add_signal_fence(shared.fence.clone(), shared.frame_sequence);
@@ -3487,7 +3895,7 @@ impl WindowGpu {
             force_fallback_adapter: false,
             apply_limit_buckets: false,
         }))
-            .map_err(|error| format!("request adapter: {error}"))?;
+        .map_err(|error| format!("request adapter: {error}"))?;
         #[cfg(windows)]
         let dx12_adapter = dx12_interop::adapter_info(&adapter)
             .map_err(|error| format!("inspect DX12 adapter for external host interop: {error}"))?;
@@ -3747,9 +4155,10 @@ impl WindowGpu {
         if open.buffer_count != 1 {
             return Err("buffer_ring_not_ready".into());
         }
-        let id_target = open.targets.iter().find(|target| {
-            target.kind == neon_protocol::RenderSurfaceTargetKind::Id
-        });
+        let id_target = open
+            .targets
+            .iter()
+            .find(|target| target.kind == neon_protocol::RenderSurfaceTargetKind::Id);
         if let Some(id_target) = id_target
             && id_target.format != "r32uint"
         {
@@ -3775,8 +4184,10 @@ impl WindowGpu {
                 wgpu::TextureFormat::R32Uint,
             )
             .map_err(|error| error.to_string())?;
-            self.external_id_surfaces.insert(open.surface_id.clone(), id_surface);
-            let id_texture_token = format!("surface:{}:id-texture:g{}", open.surface_id, generation);
+            self.external_id_surfaces
+                .insert(open.surface_id.clone(), id_surface);
+            let id_texture_token =
+                format!("surface:{}:id-texture:g{}", open.surface_id, generation);
             let id_fence_token = format!("surface:{}:id-fence:g{}", open.surface_id, generation);
             self.external_handle_tokens.insert(
                 format!("{}:id", open.surface_id),
@@ -3842,11 +4253,16 @@ impl WindowGpu {
             "fence_handle": fence_handle
         });
         if let Some(id_surface) = self.external_id_surfaces.get(surface_id) {
-            let id_texture_handle = dx12_interop::duplicate_handle_to_process(id_surface.texture_handle, pid)
-                .map_err(|error| error.to_string())?;
-            let id_fence_handle = dx12_interop::duplicate_handle_to_process(id_surface.fence_handle, pid)
-                .map_err(|error| error.to_string())?;
-            let Some((id_texture_token, id_fence_token)) = self.external_handle_tokens.get(&format!("{}:id", surface_id)) else {
+            let id_texture_handle =
+                dx12_interop::duplicate_handle_to_process(id_surface.texture_handle, pid)
+                    .map_err(|error| error.to_string())?;
+            let id_fence_handle =
+                dx12_interop::duplicate_handle_to_process(id_surface.fence_handle, pid)
+                    .map_err(|error| error.to_string())?;
+            let Some((id_texture_token, id_fence_token)) = self
+                .external_handle_tokens
+                .get(&format!("{}:id", surface_id))
+            else {
                 return Err("id_surface_broker_token_not_found".into());
             };
             result["id_texture_token"] = json!(id_texture_token);
@@ -3910,11 +4326,7 @@ fn create_hit_target(
     (target, view)
 }
 
-fn create_color_depth_target(
-    device: &wgpu::Device,
-    width: u32,
-    height: u32,
-) -> wgpu::Texture {
+fn create_color_depth_target(device: &wgpu::Device, width: u32, height: u32) -> wgpu::Texture {
     device.create_texture(&wgpu::TextureDescriptor {
         label: Some("neon3-ui-color-depth"),
         size: wgpu::Extent3d {
@@ -4076,6 +4488,7 @@ fn forward_pointer_click(
     proxy: Option<EventLoopProxy<WindowCommand>>,
     pending: Option<PendingLocalPresentationKey>,
 ) {
+    let queued_at = Instant::now();
     let node_path = diagnostic_node_path(&binding);
     let Some(intent) = binding.intent.clone() else {
         if let Ok(mut state) = delivery.lock() {
@@ -4084,7 +4497,12 @@ fn forward_pointer_click(
         return;
     };
     if let Ok(mut state) = delivery.lock() {
-        *state = json!({"state": "pending", "sequence": sequence, "node_path": node_path.clone()});
+        *state = json!({
+            "state": "pending",
+            "sequence": sequence,
+            "node_path": node_path.clone(),
+            "queued": true,
+        });
     }
     let semantic_target = semantic_target(&binding);
     let fragment_revision = binding.fragment.revision;
@@ -4136,10 +4554,20 @@ fn forward_pointer_click(
             expected_revision: Some(event.fragment.revision),
             idempotency_key: Some(format!("wgpu-pointer-click:{renderer_epoch}:{sequence}")),
         };
-        match RpcClient::connect(endpoint).and_then(|mut client| client.call(&request)) {
+        let rpc_result = RpcClient::connect(endpoint)
+            .and_then(|client| client.with_timeout(Duration::from_millis(250)))
+            .and_then(|mut client| client.call(&request));
+        let elapsed_ms = queued_at.elapsed().as_secs_f64() * 1000.0;
+        match rpc_result {
             Ok(response) if response.status == RpcStatus::Accepted => {
                 if let Ok(mut state) = delivery.lock() {
-                    *state = json!({"state": "accepted", "sequence": sequence, "node_path": node_path, "revision": response.revision});
+                    *state = json!({
+                        "state": "accepted",
+                        "sequence": sequence,
+                        "node_path": node_path,
+                        "revision": response.revision,
+                        "elapsed_ms": elapsed_ms,
+                    });
                 }
                 if let (Some(interaction_id), Ok(mut traces)) =
                     (interaction_id.clone(), traces.lock())
@@ -4165,7 +4593,13 @@ fn forward_pointer_click(
             Ok(response) => {
                 let error = response.error;
                 if let Ok(mut state) = delivery.lock() {
-                    *state = json!({"state": "rejected", "sequence": sequence, "node_path": node_path, "error": error});
+                    *state = json!({
+                        "state": "rejected",
+                        "sequence": sequence,
+                        "node_path": node_path,
+                        "error": error,
+                        "elapsed_ms": elapsed_ms,
+                    });
                 }
                 if let (Some(interaction_id), Ok(mut traces)) = (interaction_id, traces.lock()) {
                     let error = error
@@ -4196,7 +4630,13 @@ fn forward_pointer_click(
             }
             Err(error) => {
                 if let Ok(mut state) = delivery.lock() {
-                    *state = json!({"state": "transport_failed", "sequence": sequence, "node_path": node_path, "error": error.to_string()});
+                    *state = json!({
+                        "state": "transport_failed",
+                        "sequence": sequence,
+                        "node_path": node_path,
+                        "error": error.to_string(),
+                        "elapsed_ms": elapsed_ms,
+                    });
                 }
                 if let (Some(interaction_id), Ok(mut traces)) = (interaction_id, traces.lock()) {
                     traces.append(
@@ -5499,7 +5939,7 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                         }
                         camera.register(registration)?;
                         Ok(world_ui_lab_camera_status(&camera))
-                });
+                    });
                 let _ = completed.send(result);
             }
             WindowCommand::OpenExternalSurface { open, completed } => {
@@ -6452,6 +6892,32 @@ fn project_world_point_to_screen(
     .map(|(screen, _)| screen)
 }
 
+fn project_world_point_from_frame(
+    anchor: &WorldUiAnchor,
+    frame: &CameraFrame,
+    viewport: [u32; 2],
+) -> Option<[f32; 2]> {
+    let CameraFramePayload::ThreeDimensional {
+        position,
+        orientation,
+        vertical_fov_radians,
+        near,
+        far,
+    } = frame.payload
+    else {
+        return None;
+    };
+    project_world_point_to_screen(
+        anchor.position,
+        position,
+        orientation,
+        vertical_fov_radians,
+        near,
+        far,
+        viewport,
+    )
+}
+
 fn project_world_point_to_screen_with_depth(
     anchor_position: [f64; 3],
     camera_position: [f64; 3],
@@ -6705,11 +7171,14 @@ fn spawn_window_server(
                 runtime.handle(request)
             };
             if mutates_composition && response.status == RpcStatus::Accepted {
-                let (applied_tx, applied_rx) = std::sync::mpsc::channel();
                 let send = proxy.send_event(WindowCommand::Fragments {
                     composition_revision: runtime.diagnostics().graph_revision,
                     fragments: runtime.fragments_snapshot(),
-                    applied: Some(applied_tx),
+                    // Composition is applied by the window event loop. Do not
+                    // make the control-plane request wait for a frame or GPU
+                    // submission; visual feedback must continue independently
+                    // of RPC response latency.
+                    applied: None,
                 });
                 if send.is_err() {
                     return (
@@ -6721,20 +7190,6 @@ fn spawn_window_server(
                         ),
                         !shutdown,
                     );
-                }
-                match applied_rx.recv_timeout(std::time::Duration::from_secs(5)) {
-                    Ok(()) => {}
-                    Err(_) => {
-                        return (
-                            runtime.reject(
-                                response.request_id,
-                                "window_compositor_timeout",
-                                "window compositor did not apply the fragment",
-                                Some(runtime.diagnostics().graph_revision),
-                            ),
-                            !shutdown,
-                        );
-                    }
                 }
             }
             (response, !shutdown)
@@ -6802,12 +7257,31 @@ fn handle_window_external_surface_acquire(
     request: RpcRequest,
 ) -> RpcResponse {
     if request.client.kind != ClientKind::ExternalHost {
-        return runtime.reject(request.request_id, "external_host_required", "render.surface.acquire requires an external host client", None);
+        return runtime.reject(
+            request.request_id,
+            "external_host_required",
+            "render.surface.acquire requires an external host client",
+            None,
+        );
     }
-    let surface_id = request.params.get("surface_id").and_then(Value::as_str).unwrap_or_default().to_owned();
-    let pid = request.params.get("pid").and_then(Value::as_u64).unwrap_or_default() as u32;
+    let surface_id = request
+        .params
+        .get("surface_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let pid = request
+        .params
+        .get("pid")
+        .and_then(Value::as_u64)
+        .unwrap_or_default() as u32;
     if surface_id.is_empty() || pid == 0 {
-        return runtime.reject(request.request_id, "invalid_surface_acquire", "surface_id and pid are required", None);
+        return runtime.reject(
+            request.request_id,
+            "invalid_surface_acquire",
+            "surface_id and pid are required",
+            None,
+        );
     }
     let (completed_tx, completed_rx) = std::sync::mpsc::channel();
     if proxy
@@ -6818,12 +7292,22 @@ fn handle_window_external_surface_acquire(
         })
         .is_err()
     {
-        return runtime.reject(request.request_id, "window_compositor_unavailable", "window compositor is unavailable", None);
+        return runtime.reject(
+            request.request_id,
+            "window_compositor_unavailable",
+            "window compositor is unavailable",
+            None,
+        );
     }
     match completed_rx.recv_timeout(Duration::from_secs(5)) {
         Ok(Ok(result)) => runtime.accept(request.request_id, result),
         Ok(Err(error)) => runtime.reject(request.request_id, &error, &error, None),
-        Err(_) => runtime.reject(request.request_id, "window_compositor_timeout", "window compositor did not acquire the external surface", None),
+        Err(_) => runtime.reject(
+            request.request_id,
+            "window_compositor_timeout",
+            "window compositor did not acquire the external surface",
+            None,
+        ),
     }
 }
 
@@ -6833,11 +7317,26 @@ fn handle_window_external_surface_frame(
     request: RpcRequest,
 ) -> RpcResponse {
     if request.client.kind != ClientKind::ExternalHost {
-        return runtime.reject(request.request_id, "external_host_required", "render.surface.frame requires an external host client", None);
+        return runtime.reject(
+            request.request_id,
+            "external_host_required",
+            "render.surface.frame requires an external host client",
+            None,
+        );
     }
-    let surface_id = request.params.get("surface_id").and_then(Value::as_str).unwrap_or_default().to_owned();
+    let surface_id = request
+        .params
+        .get("surface_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
     if surface_id.is_empty() {
-        return runtime.reject(request.request_id, "invalid_surface_frame", "surface_id is required", None);
+        return runtime.reject(
+            request.request_id,
+            "invalid_surface_frame",
+            "surface_id is required",
+            None,
+        );
     }
     let (completed_tx, completed_rx) = std::sync::mpsc::channel();
     if proxy
@@ -6847,12 +7346,22 @@ fn handle_window_external_surface_frame(
         })
         .is_err()
     {
-        return runtime.reject(request.request_id, "window_compositor_unavailable", "window compositor is unavailable", None);
+        return runtime.reject(
+            request.request_id,
+            "window_compositor_unavailable",
+            "window compositor is unavailable",
+            None,
+        );
     }
     match completed_rx.recv_timeout(Duration::from_secs(5)) {
         Ok(Ok(result)) => runtime.accept(request.request_id, result),
         Ok(Err(error)) => runtime.reject(request.request_id, &error, &error, None),
-        Err(_) => runtime.reject(request.request_id, "window_compositor_timeout", "window compositor did not return the external surface frame", None),
+        Err(_) => runtime.reject(
+            request.request_id,
+            "window_compositor_timeout",
+            "window compositor did not return the external surface frame",
+            None,
+        ),
     }
 }
 
@@ -6944,6 +7453,7 @@ impl WindowedRuntime {
                     opacity: Some(0.0),
                     ..UiTransitionState::default()
                 },
+                motion_key: None,
             }),
             world_depth: None,
             children: vec![
@@ -6978,6 +7488,7 @@ impl WindowedRuntime {
                             opacity: Some(0.0),
                             ..UiTransitionState::default()
                         },
+                        motion_key: None,
                     }),
                     world_depth: None,
                     children: Vec::new(),
@@ -7019,6 +7530,7 @@ impl WindowedRuntime {
                             opacity: Some(0.0),
                             ..UiTransitionState::default()
                         },
+                        motion_key: None,
                     }),
                     world_depth: None,
                     children: Vec::new(),
@@ -7108,6 +7620,8 @@ impl WgpuRuntime {
             CAPABILITY_EXTERNAL_HOST_BACKEND_MATCH.into(),
             "wgpu.world.info.bridge".into(),
             "wgpu.world.ui.anchor.batch.v1".into(),
+            CAPABILITY_STATE_ANIMATION.into(),
+            CAPABILITY_NUMERIC_ANIMATION.into(),
         ];
         if self.window_gpu_available {
             capabilities.push(CAPABILITY_AI_TERRAIN_GENERATION.into());
@@ -7160,9 +7674,7 @@ impl WgpuRuntime {
     pub fn fragments_snapshot(&self) -> HashMap<UiFragmentId, UiFragment> {
         self.fragments
             .iter()
-            .map(|(id, fragment)| {
-                (id.clone(), self.filter_world_panels(fragment))
-            })
+            .map(|(id, fragment)| (id.clone(), self.filter_world_panels(fragment)))
             .collect()
     }
 
@@ -7171,6 +7683,7 @@ impl WgpuRuntime {
     ) -> (
         HashMap<RenderSurfaceKind, HashMap<UiFragmentId, UiFragment>>,
         HashMap<UiFragmentId, UiFragment>,
+        HashMap<UiFragmentId, UiFragment>,
     ) {
         // Use the RAW fragments, not `fragments_snapshot()`. The latter already
         // applies `filter_world_panels`, which strips the CameraVisibility
@@ -7178,32 +7691,77 @@ impl WgpuRuntime {
         // unable to identify world panels and delete the entire world UI.
         let combined = self.fragments.clone();
         let split = [
-            (RenderSurfaceKind::ScreenUi, combined.iter().map(|(id, fragment)| {
-                let mut fragment = fragment.clone();
-                retain_surface_nodes(&mut fragment.root, &fragment.effects, RenderSurfaceKind::ScreenUi, false);
-                fragment.effects.retain(|effect| !matches!(effect, neon_ui_schema::UiEffect::CameraVisibility { .. }));
-                // The fragment root is only a structural full-viewport
-                // container. Its schema default style is opaque, which would
-                // turn the screen surface into a full-screen blue overlay.
-                fragment.root.style.background_color = [0.0; 4];
-                fragment.root.style.border_color = [0.0; 4];
-                (id.clone(), fragment)
-            }).collect()),
-            (RenderSurfaceKind::WorldUi, combined.iter().map(|(id, fragment)| {
-                let mut fragment = fragment.clone();
-                retain_surface_nodes(&mut fragment.root, &fragment.effects, RenderSurfaceKind::WorldUi, false);
-                (id.clone(), self.filter_world_panels(&fragment))
-            }).collect()),
-        ].into_iter().collect();
-        (split, combined)
+            (
+                RenderSurfaceKind::ScreenUi,
+                combined
+                    .iter()
+                    .map(|(id, fragment)| {
+                        let mut fragment = fragment.clone();
+                        retain_surface_nodes(
+                            &mut fragment.root,
+                            &fragment.effects,
+                            RenderSurfaceKind::ScreenUi,
+                            false,
+                        );
+                        fragment.effects.retain(|effect| {
+                            !matches!(effect, neon_ui_schema::UiEffect::CameraVisibility { .. })
+                        });
+                        // The fragment root is only a structural full-viewport
+                        // container. Its schema default style is opaque, which would
+                        // turn the screen surface into a full-screen blue overlay.
+                        fragment.root.style.background_color = [0.0; 4];
+                        fragment.root.style.border_color = [0.0; 4];
+                        (id.clone(), fragment)
+                    })
+                    .collect(),
+            ),
+            (
+                RenderSurfaceKind::WorldUi,
+                combined
+                    .iter()
+                    .map(|(id, fragment)| {
+                        let mut fragment = fragment.clone();
+                        retain_surface_nodes(
+                            &mut fragment.root,
+                            &fragment.effects,
+                            RenderSurfaceKind::WorldUi,
+                            false,
+                        );
+                        (id.clone(), self.filter_world_panels(&fragment))
+                    })
+                    .collect(),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let unified_hit_fragments = self.unified_hit_fragments(&combined);
+        (split, combined, unified_hit_fragments)
+    }
+
+    /// Produces the single interaction composition used by both ScreenUi and
+    /// WorldUi pointer hit testing. World anchor placement is resolved once at
+    /// this boundary; the renderer then draws one flat R32Uint ID image.
+    fn unified_hit_fragments(
+        &self,
+        combined: &HashMap<UiFragmentId, UiFragment>,
+    ) -> HashMap<UiFragmentId, UiFragment> {
+        combined
+            .iter()
+            .map(|(id, fragment)| (id.clone(), self.filter_world_panels(fragment)))
+            .collect()
     }
 
     fn filter_world_panels(&self, fragment: &UiFragment) -> UiFragment {
         let mut filtered = fragment.clone();
-        let has_world_panel = filtered.effects.iter().any(|effect| {
-            matches!(effect, neon_ui_schema::UiEffect::CameraVisibility { .. })
-        });
-        fn scale_world_subtree(node: &mut neon_ui_schema::UiNode, scale: f32, include_position: bool) {
+        let has_world_panel = filtered
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, neon_ui_schema::UiEffect::CameraVisibility { .. }));
+        fn scale_world_subtree(
+            node: &mut neon_ui_schema::UiNode,
+            scale: f32,
+            include_position: bool,
+        ) {
             if include_position {
                 node.bounds.x *= scale;
                 node.bounds.y *= scale;
@@ -7219,9 +7777,15 @@ impl WgpuRuntime {
                 }
                 layout.gap *= scale;
                 layout.flex_basis = layout.flex_basis.map(|value| value * scale);
-                layout.min_size = layout.min_size.map(|value| [value[0] * scale, value[1] * scale]);
-                layout.max_size = layout.max_size.map(|value| [value[0] * scale, value[1] * scale]);
-                layout.preferred_size = layout.preferred_size.map(|value| [value[0] * scale, value[1] * scale]);
+                layout.min_size = layout
+                    .min_size
+                    .map(|value| [value[0] * scale, value[1] * scale]);
+                layout.max_size = layout
+                    .max_size
+                    .map(|value| [value[0] * scale, value[1] * scale]);
+                layout.preferred_size = layout
+                    .preferred_size
+                    .map(|value| [value[0] * scale, value[1] * scale]);
             }
             for child in &mut node.children {
                 scale_world_subtree(child, scale, true);
@@ -7258,12 +7822,29 @@ impl WgpuRuntime {
                         node.visible = false;
                         return;
                     };
-                    // The host projects the anchor with its authoritative camera
-                    // and ships the normalized placement; the runtime only
-                    // consumes it. Out-of-range coords = off-screen/behind.
-                    let norm_x = anchor.screen_x;
-                    let norm_y = anchor.screen_y;
-                    let depth = anchor.view_distance;
+                    // Prefer the host's authoritative normalized placement.
+                    // Older producers may omit it; when the world bridge has a
+                    // valid camera frame, project the stable world position as
+                    // a deterministic compatibility fallback. This keeps many
+                    // independent world panels hittable without inventing a
+                    // second layout or GPU ownership path.
+                    let normalized = if (0.0..=1.0).contains(&anchor.screen_x)
+                        && (0.0..=1.0).contains(&anchor.screen_y)
+                        && anchor.view_distance > 0.0
+                    {
+                        Some(([anchor.screen_x, anchor.screen_y], anchor.view_distance))
+                    } else {
+                        project_world_point_from_frame(anchor, frame, viewport).map(|pixel| {
+                            (
+                                [pixel[0] / viewport[0] as f32, pixel[1] / viewport[1] as f32],
+                                anchor.view_distance,
+                            )
+                        })
+                    };
+                    let Some(([norm_x, norm_y], depth)) = normalized else {
+                        hidden = true;
+                        return;
+                    };
                     if !(0.0..=1.0).contains(&norm_x)
                         || !(0.0..=1.0).contains(&norm_y)
                         || !(depth > 0.0)
@@ -7289,7 +7870,9 @@ impl WgpuRuntime {
                         node.bounds.height *= scale;
                         if let Some(layout) = &mut node.layout {
                             layout.clip = neon_ui_schema::UiClipPolicy::None;
-                            for value in &mut layout.padding { *value *= scale; }
+                            for value in &mut layout.padding {
+                                *value *= scale;
+                            }
                             layout.gap *= scale;
                         }
                         for child in &mut node.children {
@@ -7333,9 +7916,9 @@ impl WgpuRuntime {
         // The world bridge has already applied the camera gate and anchor
         // projection above. Leaving this effect in the renderer snapshot makes
         // UiWgpuRenderer apply a second, unrelated camera-availability gate.
-        filtered.effects.retain(|effect| {
-            !matches!(effect, neon_ui_schema::UiEffect::CameraVisibility { .. })
-        });
+        filtered
+            .effects
+            .retain(|effect| !matches!(effect, neon_ui_schema::UiEffect::CameraVisibility { .. }));
         if has_world_panel {
             // World panels use renderer-projected coordinates, so their root
             // must not reflow them as ordinary column children. The root is a
@@ -7410,20 +7993,20 @@ impl WgpuRuntime {
         let sequence = frame.sequence;
         match self.world_bridge.submit_camera_frame(frame) {
             Ok(()) => self.accept(
-                    request_id,
-                    serde_json::json!({
-                        "camera_id": camera_id,
-                        "kind": kind,
-                        "sequence": sequence,
-                        "state": "accepted"
-                    }),
-                ),
+                request_id,
+                serde_json::json!({
+                    "camera_id": camera_id,
+                    "kind": kind,
+                    "sequence": sequence,
+                    "state": "accepted"
+                }),
+            ),
             Err(error) => self.reject(
-                    request_id,
-                    "camera_frame_rejected",
-                    &format!("{error:?}"),
-                    None,
-                ),
+                request_id,
+                "camera_frame_rejected",
+                &format!("{error:?}"),
+                None,
+            ),
         }
     }
 
@@ -7435,7 +8018,12 @@ impl WgpuRuntime {
         let anchor: WorldUiAnchor = match serde_json::from_value(params) {
             Ok(anchor) => anchor,
             Err(_) => {
-                return self.reject(request_id, "invalid_request", "invalid world UI anchor", None);
+                return self.reject(
+                    request_id,
+                    "invalid_request",
+                    "invalid world UI anchor",
+                    None,
+                );
             }
         };
         let anchor_id = anchor.anchor_id.clone();
@@ -7466,55 +8054,41 @@ impl WgpuRuntime {
         let batch: WorldUiAnchorBatch = match serde_json::from_value(params) {
             Ok(batch) => batch,
             Err(_) => {
-                return self.reject(request_id, "invalid_request", "invalid world UI anchor batch", None);
+                return self.reject(
+                    request_id,
+                    "invalid_request",
+                    "invalid world UI anchor batch",
+                    None,
+                );
             }
         };
         let sequence = batch.sequence;
+        let timestamp_monotonic_ns = batch.timestamp_monotonic_ns;
         let count = batch.anchors.len();
+        let first_anchor = batch.anchors.first().map(|anchor| {
+            format!(
+                "id={} position={:?} screen=({:.3},{:.3}) distance={:.3}",
+                anchor.anchor_id.0,
+                anchor.position,
+                anchor.screen_x,
+                anchor.screen_y,
+                anchor.view_distance,
+            )
+        });
         match self.world_bridge.submit_anchor_batch(batch) {
             Ok(()) => self.accept(
                     request_id,
                     serde_json::json!({"sequence": sequence, "anchor_count": count, "state": "accepted"}),
                 ),
             Err(error) => self.reject(
-                    request_id,
-                    "world_anchor_batch_rejected",
-                    &format!("{error:?}"),
-                    None,
-                )
+                request_id,
+                "world_anchor_batch_rejected",
+                &format!(
+                    "{error:?}: sequence={sequence} timestamp_monotonic_ns={timestamp_monotonic_ns} anchor_count={count} first_anchor={first_anchor:?}"
+                ),
+                None,
+            )
         }
-    }
-
-    /// Projects a host-owned world-space anchor to a fullscreen pixel using the
-    /// matching 3D camera frame. Returns `None` when the anchor is behind the
-    /// camera, outside the near/far range, or outside the view frustum.
-    ///
-    /// The camera looks along -Z (right-handed Y-up), matching Bevy and the
-    /// `RightHandedYUpNegativeZForward` coordinate system.
-    pub(crate) fn project_world_anchor_to_screen(
-        anchor: &WorldUiAnchor,
-        frame: &CameraFrame,
-        viewport: [u32; 2],
-    ) -> Option<[f32; 2]> {
-        let neon_world_bridge::CameraFramePayload::ThreeDimensional {
-            position,
-            orientation,
-            vertical_fov_radians,
-            near,
-            far,
-        } = frame.payload
-        else {
-            return None;
-        };
-        project_world_point_to_screen(
-            anchor.position,
-            position,
-            orientation,
-            vertical_fov_radians,
-            near,
-            far,
-            viewport,
-        )
     }
 
     pub fn command_receipt(&self, request_id: &RequestId) -> Option<&CommandReceipt> {
@@ -8297,9 +8871,8 @@ fn retain_surface_nodes(
         || effects.iter().any(|effect| {
             matches!(effect, neon_ui_schema::UiEffect::CameraVisibility { binding } if binding.node_id == node.node_id)
         });
-    node.children.retain_mut(|child| {
-        retain_surface_nodes(child, effects, kind, is_world)
-    });
+    node.children
+        .retain_mut(|child| retain_surface_nodes(child, effects, kind, is_world));
     let keep = match kind {
         // Structural containers (the transparent fragment root) are not world
         // nodes themselves but must survive so their world descendants stay
@@ -8380,7 +8953,12 @@ mod tests {
             UiNode {
                 node_id: UiNodeId(id.into()),
                 kind,
-                bounds: UiBounds { x: 0.0, y: 0.0, width: 10.0, height: 10.0 },
+                bounds: UiBounds {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 10.0,
+                    height: 10.0,
+                },
                 layout: None,
                 visible: true,
                 enabled: true,
@@ -8434,7 +9012,12 @@ mod tests {
         let fragment = surface_split_fragment();
 
         let mut world = fragment.clone();
-        retain_surface_nodes(&mut world.root, &world.effects, RenderSurfaceKind::WorldUi, false);
+        retain_surface_nodes(
+            &mut world.root,
+            &world.effects,
+            RenderSurfaceKind::WorldUi,
+            false,
+        );
         let mut world_ids = Vec::new();
         retained_ids(&world.root, &mut world_ids);
         // The transparent root container survives so the layout pass can reach
@@ -8446,7 +9029,12 @@ mod tests {
         assert!(!world_ids.contains(&"screen-button".to_string()));
 
         let mut screen = fragment.clone();
-        retain_surface_nodes(&mut screen.root, &screen.effects, RenderSurfaceKind::ScreenUi, false);
+        retain_surface_nodes(
+            &mut screen.root,
+            &screen.effects,
+            RenderSurfaceKind::ScreenUi,
+            false,
+        );
         let mut screen_ids = Vec::new();
         retained_ids(&screen.root, &mut screen_ids);
         assert!(screen_ids.contains(&"root".to_string()));
@@ -8845,9 +9433,7 @@ mod tests {
         );
         assert_eq!(snapshot.status, RpcStatus::Accepted);
         assert_eq!(
-            snapshot
-                .result
-                .unwrap()["capabilities"]
+            snapshot.result.unwrap()["capabilities"]
                 .as_array()
                 .unwrap()
                 .contains(&json!(CAPABILITY_EXTERNAL_HOST_BACKEND_MATCH)),
@@ -9148,6 +9734,13 @@ mod tests {
                 anchor_id: Some(neon_world_bridge::WorldAnchorId("player.main".into())),
             },
         });
+        gated.effects.push(UiEffect::BoundSemanticIntent {
+            node_id: UiNodeId("status-root".into()),
+            intent: neon_ui_schema::UiIntent::Invoke {
+                action: "world.test.click".into(),
+                params: json!({}),
+            },
+        });
         runtime.fragments.insert(gated.fragment_id.clone(), gated);
         let snapshot = runtime.fragments_snapshot();
         let bounds = &snapshot[&UiFragmentId("static-fragment".into())]
@@ -9164,6 +9757,31 @@ mod tests {
         assert!((bounds.x - 630.0).abs() < 0.5, "x was {}", bounds.x);
         assert!((bounds.y - 340.0).abs() < 0.5, "y was {}", bounds.y);
         assert!((depth - 0.05).abs() < f32::EPSILON, "depth was {depth}");
+        let (device, queue) = test_device("neon3-world-ui-id-target");
+        let mut id_renderer = ui_renderer::UiWgpuRenderer::new(
+            &device,
+            wgpu::TextureFormat::Rgba8Unorm,
+        );
+        let pixels = ui_renderer::render_hit_ids_with_renderer_for_test(
+            &mut id_renderer,
+            &device,
+            &queue,
+            &snapshot,
+            [1280, 720],
+        );
+        let hit_id = pixels[350 * 1280 + 640];
+        assert_ne!(
+            hit_id,
+            RENDER_HIT_NONE,
+            "the projected WorldUi panel must write a non-clear ID"
+        );
+        assert_eq!(
+            id_renderer
+                .hit_binding(hit_id)
+                .expect("ID must map to a semantic binding")
+                .node_path,
+            "static-fragment/status-root"
+        );
     }
 
     #[test]

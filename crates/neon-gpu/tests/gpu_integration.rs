@@ -14,7 +14,7 @@ use bytemuck::{Pod, Zeroable};
 use neon_gpu::gpu::{GpuError, GpuPool, PoolHeap};
 use neon_gpu::hal_map::{self, HalBackend, MappedBuffer};
 use neon_gpu::layout::{LayoutBuilder, Type};
-use neon_gpu::ty as ty;
+use neon_gpu::ty;
 use neon_gpu::{GpuPtr, Handle, PoolId};
 
 const POOL_CAPACITY: u32 = 16;
@@ -66,16 +66,14 @@ fn headless_device() -> (wgpu::Device, wgpu::Queue, HalBackend) {
     }))
     .expect("no adapter available");
 
-    let (device, queue) = pollster::block_on(adapter.request_device(
-        &wgpu::DeviceDescriptor {
-            label: Some("neon-gpu test device"),
-            required_features: wgpu::Features::empty(),
-            required_limits: wgpu::Limits::default(),
-            experimental_features: Default::default(),
-            memory_hints: wgpu::MemoryHints::default(),
-            trace: Default::default(),
-        },
-    ))
+    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        label: Some("neon-gpu test device"),
+        required_features: wgpu::Features::empty(),
+        required_limits: wgpu::Limits::default(),
+        experimental_features: Default::default(),
+        memory_hints: wgpu::MemoryHints::default(),
+        trace: Default::default(),
+    }))
     .expect("device request failed");
 
     let backend = HalBackend::from_backend(device.adapter_info().backend)
@@ -135,9 +133,8 @@ fn cpu_write_gpu_read_roundtrip() {
 
     // --- pool + heap ------------------------------------------------------
     let mut heap = PoolHeap::new(device.clone());
-    let pool_id: PoolId = heap.add_pool(
-        GpuPool::new(&device, layout.clone(), POOL_CAPACITY, true, "test_pool").unwrap(),
-    );
+    let pool_id: PoolId = heap
+        .add_pool(GpuPool::new(&device, layout.clone(), POOL_CAPACITY, true, "test_pool").unwrap());
 
     // Write three live elements through the persistent mapping.
     let items = [
@@ -247,7 +244,12 @@ fn cpu_write_gpu_read_roundtrip() {
     // --- read back through the hal mapping --------------------------------
     // SAFETY: the readback buffer is still mapped and the ranges are in bounds.
     unsafe {
-        hal_map::invalidate(&device, &readback, backend, [0..RESULT_WORDS as u64 * 4].into_iter())
+        hal_map::invalidate(
+            &device,
+            &readback,
+            backend,
+            [0..RESULT_WORDS as u64 * 4].into_iter(),
+        )
     }
     .expect("invalidate");
 
@@ -275,8 +277,11 @@ fn deferred_free_tombstones_slot() {
     let mut handles = Vec::new();
     for i in 0..4u32 {
         let h = pool.alloc().unwrap();
-        pool.write_bytes(h, bytemuck::bytes_of(&ItemBytes::new(i as f32, 0.0, 1.0, 2)))
-            .unwrap();
+        pool.write_bytes(
+            h,
+            bytemuck::bytes_of(&ItemBytes::new(i as f32, 0.0, 1.0, 2)),
+        )
+        .unwrap();
         handles.push(h);
     }
     pool.free(handles[1]).unwrap();
@@ -333,7 +338,9 @@ fn oversize_write_rejected() {
 fn empty_buffer_rejected() {
     let (device, _queue, _backend) = headless_device();
     let layout = item_layout();
-    let err = GpuPool::new(&device, layout, 0, true, "empty").err().unwrap();
+    let err = GpuPool::new(&device, layout, 0, true, "empty")
+        .err()
+        .unwrap();
     assert!(matches!(err, GpuError::EmptyBuffer));
 }
 

@@ -13,15 +13,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use neon_ipc::{RpcServer, TransportError};
 use neon_observability::{
-    CommandJournal, CommandReceipt, CommandState, DebugSnapshot, EVENT_COMMAND_RECEIVED,
-    TraceLevel,
+    CommandJournal, CommandReceipt, CommandState, DebugSnapshot, EVENT_COMMAND_RECEIVED, TraceLevel,
 };
 use neon_protocol::{
-    EventAck, EventAckStatus, EventDelivery, EventEnvelope, EventError,
+    EVENT_PROTOCOL, EventAck, EventAckStatus, EventDelivery, EventEnvelope, EventError,
     EventFilter, EventFrame, EventId, EventPublish, EventResponse, EventRetention, EventSnapshot,
-    EventSubscribe, HealthStatus, PROTOCOL_VERSION, RequestId, Revision, RpcError, RpcRequest,
-    RpcResponse, RpcStatus, ServiceDescription, ServiceEvent, ServiceHealth, ServiceName,
-    EVENT_PROTOCOL, RPC_PROTOCOL,
+    EventSubscribe, HealthStatus, PROTOCOL_VERSION, RPC_PROTOCOL, RequestId, Revision, RpcError,
+    RpcRequest, RpcResponse, RpcStatus, ServiceDescription, ServiceEvent, ServiceHealth,
+    ServiceName,
 };
 use serde_json::{Value, json};
 
@@ -81,11 +80,7 @@ impl EventdCore {
             subscribers: HashMap::new(),
             idempotent: HashMap::new(),
             stats: EventStats::default(),
-            journal: CommandJournal::new(
-                ServiceName(SERVICE_NAME.into()),
-                epoch,
-                ring_capacity,
-            ),
+            journal: CommandJournal::new(ServiceName(SERVICE_NAME.into()), epoch, ring_capacity),
         }
     }
 
@@ -278,7 +273,11 @@ impl EventdCore {
         subscribe: EventSubscribe,
     ) -> Result<(EventAck, Vec<EventEnvelope>, u64), EventAck> {
         if subscribe.filters.is_empty() {
-            return Err(self.reject_subscribe(&subscribe, "event_subscribe_invalid", "过滤器不能为空"));
+            return Err(self.reject_subscribe(
+                &subscribe,
+                "event_subscribe_invalid",
+                "过滤器不能为空",
+            ));
         }
 
         let replay = match subscribe.replay_from_sequence {
@@ -355,7 +354,11 @@ impl EventdCore {
         }
     }
 
-    fn replace_subscriber_sender(&mut self, subscriber_id: u64, sender: mpsc::Sender<EventEnvelope>) {
+    fn replace_subscriber_sender(
+        &mut self,
+        subscriber_id: u64,
+        sender: mpsc::Sender<EventEnvelope>,
+    ) {
         if let Some(subscriber) = self.subscribers.get_mut(&subscriber_id) {
             subscriber.sender = sender;
         }
@@ -498,128 +501,129 @@ impl Eventd {
         );
         let result = (|| -> Result<Value, (&'static str, &'static str)> {
             match request.method.as_str() {
-            "service.health" => Ok(json!(ServiceHealth {
-                service: ServiceName(SERVICE_NAME.into()),
-                status: HealthStatus::Healthy,
-                epoch: guard.epoch,
-            })),
-            "service.describe" => Ok(json!(self.service_description())),
-            "service.shutdown" => Ok(json!({"state": "accepted"})),
-            "debug.snapshot.get" => Ok(json!(DebugSnapshot {
-                service: ServiceName(SERVICE_NAME.into()),
-                epoch: guard.epoch,
-                revision: Revision(0),
-                health: HealthStatus::Healthy,
-                capabilities: self.service_description().capabilities,
-                active_jobs: guard
-                    .subscribers
-                    .iter()
-                    .map(|(id, _)| format!("subscriber-{id}"))
-                    .collect(),
-            })),
-            "debug.health.check" => Ok(json!(ServiceHealth {
-                service: ServiceName(SERVICE_NAME.into()),
-                status: HealthStatus::Healthy,
-                epoch: guard.epoch,
-            })),
-            "debug.diagnostics.get" => Ok(json!({
-                "epoch": guard.epoch,
-                "current_sequence": guard.current_sequence(),
-                "retained": guard.ring.len(),
-                "capacity": guard.ring_capacity,
-                "active_subscriptions": guard.subscribers.len(),
-                "stats": guard.stats,
-            })),
-            "debug.command.get" => {
-                let id = request
-                    .params
-                    .get("request_id")
-                    .and_then(Value::as_str)
-                    .map(|value| RequestId(value.into()));
-                match id {
-                    Some(id) => Ok(json!(CommandReceipt {
-                        request_id: id.clone(),
-                        state: CommandState::Accepted,
-                        revision_before: None,
-                        revision_after: None,
-                        error_code: None,
-                    })),
-                    None => Err(("invalid_request", "request_id is required")),
-                }
-            }
-            "debug.trace.query" | "debug.journal.query" => Ok(json!(guard.journal.records())),
-            "event.snapshot" => Ok(json!(guard.event_snapshot())),
-            "event.schema.register" => {
-                let name = request
-                    .params
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .ok_or(("invalid_request", "name is required"))?;
-                let schema_version = request
-                    .params
-                    .get("schema_version")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(1) as u16;
-                guard.register_name(name, schema_version);
-                Ok(json!({"name": name, "schema_version": schema_version, "registered": true}))
-            }
-            "event.schema.get" => {
-                let name = request
-                    .params
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .ok_or(("invalid_request", "name is required"))?;
-                guard
-                    .registered_names
-                    .get(name)
-                    .map(|version| json!({"name": name, "schema_version": version}))
-                    .ok_or(("event_unknown_name", "事件名未注册"))
-            }
-            "event.schema.list" => {
-                let mut names = guard
-                    .registered_names
-                    .iter()
-                    .map(|(name, version)| json!({"name": name, "schema_version": version}))
-                    .collect::<Vec<_>>();
-                names.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
-                Ok(json!(names))
-            }
-            "event.retention.get" => Ok(json!(guard.retention())),
-            "event.retention.set" => {
-                let capacity = request
-                    .params
-                    .get("capacity")
-                    .and_then(Value::as_u64)
-                    .ok_or(("invalid_request", "capacity is required"))? as usize;
-                if capacity < RING_CAPACITY_FLOOR {
-                    Err(("event_retention_invalid", "capacity must be positive"))
-                } else {
-                    guard.ring_capacity = capacity;
-                    while guard.ring.len() > capacity {
-                        guard.ring.pop_front();
+                "service.health" => Ok(json!(ServiceHealth {
+                    service: ServiceName(SERVICE_NAME.into()),
+                    status: HealthStatus::Healthy,
+                    epoch: guard.epoch,
+                })),
+                "service.describe" => Ok(json!(self.service_description())),
+                "service.shutdown" => Ok(json!({"state": "accepted"})),
+                "debug.snapshot.get" => Ok(json!(DebugSnapshot {
+                    service: ServiceName(SERVICE_NAME.into()),
+                    epoch: guard.epoch,
+                    revision: Revision(0),
+                    health: HealthStatus::Healthy,
+                    capabilities: self.service_description().capabilities,
+                    active_jobs: guard
+                        .subscribers
+                        .iter()
+                        .map(|(id, _)| format!("subscriber-{id}"))
+                        .collect(),
+                })),
+                "debug.health.check" => Ok(json!(ServiceHealth {
+                    service: ServiceName(SERVICE_NAME.into()),
+                    status: HealthStatus::Healthy,
+                    epoch: guard.epoch,
+                })),
+                "debug.diagnostics.get" => Ok(json!({
+                    "epoch": guard.epoch,
+                    "current_sequence": guard.current_sequence(),
+                    "retained": guard.ring.len(),
+                    "capacity": guard.ring_capacity,
+                    "active_subscriptions": guard.subscribers.len(),
+                    "stats": guard.stats,
+                })),
+                "debug.command.get" => {
+                    let id = request
+                        .params
+                        .get("request_id")
+                        .and_then(Value::as_str)
+                        .map(|value| RequestId(value.into()));
+                    match id {
+                        Some(id) => Ok(json!(CommandReceipt {
+                            request_id: id.clone(),
+                            state: CommandState::Accepted,
+                            revision_before: None,
+                            revision_after: None,
+                            error_code: None,
+                        })),
+                        None => Err(("invalid_request", "request_id is required")),
                     }
-                    Ok(json!(guard.retention()))
                 }
-            }
-            "event.stats" => Ok(json!(guard.stats)),
-            "event.fastpath.status" => Ok(json!({
-                "available": false,
-                "reason": "fastpath is not enabled in V1; TCP framing is the default transport",
-            })),
-            "service.subscribe" => Ok(json!(SubscriptionPoll {
-                epoch: guard.epoch,
-                current_sequence: guard.current_sequence(),
-                events: guard
-                    .ring
-                    .iter()
-                    .map(|envelope| ServiceEvent {
-                        epoch: envelope.epoch,
-                        sequence: envelope.sequence,
-                        payload: json!(envelope),
-                    })
-                    .collect(),
-            })),
-            _ => Err(("unsupported_method", "method is not supported")),
+                "debug.trace.query" | "debug.journal.query" => Ok(json!(guard.journal.records())),
+                "event.snapshot" => Ok(json!(guard.event_snapshot())),
+                "event.schema.register" => {
+                    let name = request
+                        .params
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .ok_or(("invalid_request", "name is required"))?;
+                    let schema_version = request
+                        .params
+                        .get("schema_version")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(1) as u16;
+                    guard.register_name(name, schema_version);
+                    Ok(json!({"name": name, "schema_version": schema_version, "registered": true}))
+                }
+                "event.schema.get" => {
+                    let name = request
+                        .params
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .ok_or(("invalid_request", "name is required"))?;
+                    guard
+                        .registered_names
+                        .get(name)
+                        .map(|version| json!({"name": name, "schema_version": version}))
+                        .ok_or(("event_unknown_name", "事件名未注册"))
+                }
+                "event.schema.list" => {
+                    let mut names = guard
+                        .registered_names
+                        .iter()
+                        .map(|(name, version)| json!({"name": name, "schema_version": version}))
+                        .collect::<Vec<_>>();
+                    names.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+                    Ok(json!(names))
+                }
+                "event.retention.get" => Ok(json!(guard.retention())),
+                "event.retention.set" => {
+                    let capacity = request
+                        .params
+                        .get("capacity")
+                        .and_then(Value::as_u64)
+                        .ok_or(("invalid_request", "capacity is required"))?
+                        as usize;
+                    if capacity < RING_CAPACITY_FLOOR {
+                        Err(("event_retention_invalid", "capacity must be positive"))
+                    } else {
+                        guard.ring_capacity = capacity;
+                        while guard.ring.len() > capacity {
+                            guard.ring.pop_front();
+                        }
+                        Ok(json!(guard.retention()))
+                    }
+                }
+                "event.stats" => Ok(json!(guard.stats)),
+                "event.fastpath.status" => Ok(json!({
+                    "available": false,
+                    "reason": "fastpath is not enabled in V1; TCP framing is the default transport",
+                })),
+                "service.subscribe" => Ok(json!(SubscriptionPoll {
+                    epoch: guard.epoch,
+                    current_sequence: guard.current_sequence(),
+                    events: guard
+                        .ring
+                        .iter()
+                        .map(|envelope| ServiceEvent {
+                            epoch: envelope.epoch,
+                            sequence: envelope.sequence,
+                            payload: json!(envelope),
+                        })
+                        .collect(),
+                })),
+                _ => Err(("unsupported_method", "method is not supported")),
             }
         })();
 
@@ -684,7 +688,9 @@ struct SubscriptionPoll {
 }
 
 fn matches_any(filters: &[EventFilter], envelope: &EventEnvelope) -> bool {
-    filters.iter().any(|filter| matches_filter(filter, envelope))
+    filters
+        .iter()
+        .any(|filter| matches_filter(filter, envelope))
 }
 
 fn matches_filter(filter: &EventFilter, envelope: &EventEnvelope) -> bool {
@@ -724,8 +730,8 @@ fn current_unix_ms() -> u64 {
 mod tests {
     use super::*;
     use neon_protocol::{
-        ClientIdentity, ClientKind, EventFilter, EventFrame, EventPublish, EventSubscribe,
-        EventAckStatus, RpcStatus,
+        ClientIdentity, ClientKind, EventAckStatus, EventFilter, EventFrame, EventPublish,
+        EventSubscribe, RpcStatus,
     };
     use serde_json::json;
 
@@ -869,7 +875,10 @@ mod tests {
             .unwrap()
         };
         publish(&service, "miss", "nui.variable.changed");
-        assert!(live.recv_timeout(std::time::Duration::from_millis(20)).is_err());
+        assert!(
+            live.recv_timeout(std::time::Duration::from_millis(20))
+                .is_err()
+        );
     }
 
     #[test]
@@ -921,7 +930,10 @@ mod tests {
                 max_rate_hz: None,
             })
         };
-        assert_eq!(result.unwrap_err().error.unwrap().code, "event_replay_unavailable");
+        assert_eq!(
+            result.unwrap_err().error.unwrap().code,
+            "event_replay_unavailable"
+        );
     }
 
     #[test]
@@ -947,16 +959,29 @@ mod tests {
         let snapshot = rpc("event.snapshot", json!({}));
         assert_eq!(snapshot.result.unwrap()["current_sequence"], 0);
 
-        let registered = rpc("event.schema.register", json!({"name": "project.opened", "schema_version": 1}));
+        let registered = rpc(
+            "event.schema.register",
+            json!({"name": "project.opened", "schema_version": 1}),
+        );
         assert_eq!(registered.status, RpcStatus::Accepted);
 
         let list = rpc("event.schema.list", json!({}));
-        assert!(list.result.unwrap().as_array().unwrap().iter().any(|entry| entry["name"] == "project.opened"));
+        assert!(
+            list.result
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["name"] == "project.opened")
+        );
 
         publish(&service, "rpc-pub", "project.opened");
         let diagnostics = rpc("debug.diagnostics.get", json!({}));
         assert_eq!(diagnostics.result.as_ref().unwrap()["current_sequence"], 1);
-        assert_eq!(diagnostics.result.as_ref().unwrap()["stats"]["published"], 1);
+        assert_eq!(
+            diagnostics.result.as_ref().unwrap()["stats"]["published"],
+            1
+        );
     }
 
     #[test]
@@ -1009,22 +1034,25 @@ mod tests {
         // Subscribe on a fresh connection and receive the live event.
         let mut subscriber = neon_ipc::EventClient::connect(endpoint).unwrap();
         subscriber
-            .send_value(&serde_json::to_value(EventFrame::Subscribe(EventSubscribe {
-                protocol: "neon3.event".into(),
-                version: PROTOCOL_VERSION,
-                request_id: RequestId("tcp-sub".into()),
-                client: publisher(),
-                filters: vec![EventFilter {
-                    name: None,
-                    name_prefix: Some("nui.variable.".into()),
-                    publisher_kinds: None,
-                }],
-                replay_from_sequence: None,
-                max_rate_hz: None,
-            }))
-            .unwrap())
+            .send_value(
+                &serde_json::to_value(EventFrame::Subscribe(EventSubscribe {
+                    protocol: "neon3.event".into(),
+                    version: PROTOCOL_VERSION,
+                    request_id: RequestId("tcp-sub".into()),
+                    client: publisher(),
+                    filters: vec![EventFilter {
+                        name: None,
+                        name_prefix: Some("nui.variable.".into()),
+                        publisher_kinds: None,
+                    }],
+                    replay_from_sequence: None,
+                    max_rate_hz: None,
+                }))
+                .unwrap(),
+            )
             .unwrap();
-        let response: EventResponse = serde_json::from_value(subscriber.recv_value().unwrap()).unwrap();
+        let response: EventResponse =
+            serde_json::from_value(subscriber.recv_value().unwrap()).unwrap();
         match response {
             EventResponse::Ack(ack) => assert_eq!(ack.status, EventAckStatus::Accepted),
             _ => panic!("expected subscribe ack"),
@@ -1043,7 +1071,8 @@ mod tests {
                 idempotency_key: None,
             })
             .unwrap();
-        let delivery: EventResponse = serde_json::from_value(subscriber.recv_value().unwrap()).unwrap();
+        let delivery: EventResponse =
+            serde_json::from_value(subscriber.recv_value().unwrap()).unwrap();
         match delivery {
             EventResponse::Delivery(delivery) => {
                 assert_eq!(delivery.event.name, "nui.variable.changed");
@@ -1082,10 +1111,7 @@ enum Outbound {
     Event(EventResponse),
 }
 
-fn handle_connection(
-    service: &Eventd,
-    stream: std::net::TcpStream,
-) -> Result<(), TransportError> {
+fn handle_connection(service: &Eventd, stream: std::net::TcpStream) -> Result<(), TransportError> {
     use std::io::{BufReader, BufWriter, Write};
     let reader_stream = stream.try_clone().map_err(TransportError::Io)?;
     let mut reader = BufReader::new(reader_stream);
@@ -1097,12 +1123,16 @@ fn handle_connection(
     let writer_thread = std::thread::spawn(move || {
         while let Ok(outbound) = write_rx.recv() {
             let written = match outbound {
-                Outbound::Rpc(response) => {
-                    neon_ipc::write_json_frame(&mut writer, &response, neon_ipc::DEFAULT_MAX_FRAME_SIZE)
-                }
-                Outbound::Event(response) => {
-                    neon_ipc::write_json_frame(&mut writer, &response, neon_ipc::DEFAULT_MAX_FRAME_SIZE)
-                }
+                Outbound::Rpc(response) => neon_ipc::write_json_frame(
+                    &mut writer,
+                    &response,
+                    neon_ipc::DEFAULT_MAX_FRAME_SIZE,
+                ),
+                Outbound::Event(response) => neon_ipc::write_json_frame(
+                    &mut writer,
+                    &response,
+                    neon_ipc::DEFAULT_MAX_FRAME_SIZE,
+                ),
             };
             if written.is_err() || writer.flush().is_err() {
                 break;
@@ -1121,8 +1151,7 @@ fn handle_connection(
         let value: Value =
             match neon_ipc::read_json_frame(&mut reader, neon_ipc::DEFAULT_MAX_FRAME_SIZE) {
                 Ok(value) => value,
-                Err(TransportError::ConnectionClosed)
-                | Err(TransportError::Timeout) => break,
+                Err(TransportError::ConnectionClosed) | Err(TransportError::Timeout) => break,
                 Err(error) => return Err(error),
             };
         match value.get("protocol").and_then(Value::as_str) {
@@ -1162,29 +1191,38 @@ fn dispatch_event_frame(
     match frame {
         EventFrame::Publish(publish) => {
             let ack = service.publish(publish);
-            if write_tx.send(Outbound::Event(EventResponse::Ack(ack))).is_err() {
+            if write_tx
+                .send(Outbound::Event(EventResponse::Ack(ack)))
+                .is_err()
+            {
                 return Err(TransportError::ConnectionClosed);
             }
         }
         EventFrame::Subscribe(subscribe) => {
             // Perform the subscription registration under the lock, then
             // release it before sending frames or returning through cleanup.
-            let outcome: (EventAck, Vec<EventEnvelope>, Option<(u64, mpsc::Receiver<EventEnvelope>)>) =
-                {
-                    let mut core = service.core.lock().expect("eventd core lock");
-                    match core.subscribe(subscribe) {
-                        Ok((ack, replay, subscriber_id)) => {
-                            let (sender, receiver) = mpsc::channel();
-                            core.replace_subscriber_sender(subscriber_id, sender);
-                            *active_subscriber_id = Some(subscriber_id);
-                            (ack, replay, Some((subscriber_id, receiver)))
-                        }
-                        Err(ack) => (ack, Vec::new(), None),
+            let outcome: (
+                EventAck,
+                Vec<EventEnvelope>,
+                Option<(u64, mpsc::Receiver<EventEnvelope>)>,
+            ) = {
+                let mut core = service.core.lock().expect("eventd core lock");
+                match core.subscribe(subscribe) {
+                    Ok((ack, replay, subscriber_id)) => {
+                        let (sender, receiver) = mpsc::channel();
+                        core.replace_subscriber_sender(subscriber_id, sender);
+                        *active_subscriber_id = Some(subscriber_id);
+                        (ack, replay, Some((subscriber_id, receiver)))
                     }
-                };
+                    Err(ack) => (ack, Vec::new(), None),
+                }
+            };
             let (ack, replay, live) = outcome;
             // Ack first, then replay, then live events.
-            if write_tx.send(Outbound::Event(EventResponse::Ack(ack))).is_err() {
+            if write_tx
+                .send(Outbound::Event(EventResponse::Ack(ack)))
+                .is_err()
+            {
                 return Err(TransportError::ConnectionClosed);
             }
             for envelope in replay {

@@ -8,19 +8,17 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use neon_protocol::{AssetRef, Revision};
 use neon_ui_schema::{
     NuiFlowDocument, NuiFlowDragAxis, NuiFlowDragDeclaration, NuiFlowDropDeclaration,
-    NuiFlowMotion, NuiFlowParseDiagnostic, NuiFlowStateMachine, NuiFlowStateTransition,
-    NuiFlowStateTrigger,
-    NuiFlowWorldPanelDeclaration, NuiSourceSpan, RenderSurfaceRef, TextRef, UiAlignItems,
-    UiBoundProperty, UiBounds, UiBranchDeclaration, UiBranchLayoutParticipation, UiBranchPredicate,
-    UiCameraVisibilityBinding, UiClipPolicy, UiDataGridColumn, UiDataGridDeclaration,
-    UiDataGridPresentation, UiDiagnosticSeverity, UiDragAxis, UiDragBinding, UiDragBoundary,
-    UiDropBinding, UiDropPlacement, UiEffect, UiGridInputSlot, UiInputKind, UiInputPacking,
-    UiInputSchema, UiInputSlot, UiInputUpdateClass, UiInputValue, UiIntent, UiIrBinding,
-    UiIrDocument, UiIrPatch, UiIrPatchOperation, UiIrPatchOperationKind, UiJustifyContent,
-    UiEasing, UiLayout, UiLayoutMode, UiNode, UiNodeId, UiNodeKind, UiProgram,
-    UiProgramEventDeclaration, UiProgramRevision, UiResourceBudget, UiSourceSpan, UiStyle,
-    UiSurfaceId, UiTemplateDeclaration, UiTransition,
-    UiTransitionState,
+    NuiFlowMotion, NuiFlowParseDiagnostic, NuiFlowState, NuiFlowStateMachine, NuiFlowStateStyle,
+    NuiFlowStateTransition, NuiFlowStateTrigger, NuiFlowWorldPanelDeclaration, NuiSourceSpan,
+    RenderSurfaceRef, TextRef, UiAlignItems, UiBoundProperty, UiBounds, UiBranchDeclaration,
+    UiBranchLayoutParticipation, UiBranchPredicate, UiCameraVisibilityBinding, UiClipPolicy,
+    UiDataGridColumn, UiDataGridDeclaration, UiDataGridPresentation, UiDiagnosticSeverity,
+    UiDragAxis, UiDragBinding, UiDragBoundary, UiDropBinding, UiDropPlacement, UiEasing, UiEffect,
+    UiGridInputSlot, UiInputKind, UiInputPacking, UiInputSchema, UiInputSlot, UiInputUpdateClass,
+    UiInputValue, UiIntent, UiIrBinding, UiIrDocument, UiIrPatch, UiIrPatchOperation,
+    UiIrPatchOperationKind, UiJustifyContent, UiLayout, UiLayoutMode, UiNode, UiNodeId, UiNodeKind,
+    UiProgram, UiProgramEventDeclaration, UiProgramRevision, UiResourceBudget, UiSourceSpan,
+    UiStyle, UiSurfaceId, UiTemplateDeclaration, UiTransition, UiTransitionState,
 };
 use neon_world_bridge::{CameraId, CameraKind, WorldAnchorId};
 use serde_json::json;
@@ -135,7 +133,10 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
                 continue;
             }
             if let Some(motion) = parse_motion_declaration(content, line)? {
-                if motions.iter().any(|existing: &NuiFlowMotion| existing.key == motion.key) {
+                if motions
+                    .iter()
+                    .any(|existing: &NuiFlowMotion| existing.key == motion.key)
+                {
                     return Err(error(
                         "nui_flow_duplicate_motion",
                         "motion keys must be unique",
@@ -374,7 +375,11 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
                             1,
                         )
                     })?;
-                if !machine.states.iter().any(|candidate| candidate == state) {
+                if !machine
+                    .states
+                    .iter()
+                    .any(|candidate| &candidate.name == state)
+                {
                     return Err(error(
                         "nui_flow_invalid_state_machine",
                         "branch references an undeclared machine state",
@@ -742,11 +747,7 @@ pub fn format_nui_flow(source: &str) -> FlowResult<String> {
         lines.push(format!("input {} grid default grid:empty", slot.key));
     }
     for slot in &parsed.input_schema.slots {
-        let emit = if parsed
-            .input_schema
-            .emit_event_keys
-            .contains(&slot.key)
-        {
+        let emit = if parsed.input_schema.emit_event_keys.contains(&slot.key) {
             " emitevent"
         } else {
             ""
@@ -766,8 +767,36 @@ pub fn format_nui_flow(source: &str) -> FlowResult<String> {
             "machine {} initial {}",
             machine.key, machine.initial_state
         ));
-        for state in machine.states.iter().filter(|state| *state != &machine.initial_state) {
-            lines.push(format!("state {} {}", machine.key, state));
+        for state in machine
+            .states
+            .iter()
+            .filter(|s| s.name != machine.initial_state)
+        {
+            lines.push(format!("state {} {}", machine.key, state.name));
+            for style in &state.styles {
+                lines.push(format!(
+                    "  style {}.{}.{} {}",
+                    machine.key,
+                    state.name,
+                    style.node_key,
+                    format_state_style(style)
+                ));
+            }
+        }
+        for state in machine
+            .states
+            .iter()
+            .filter(|s| s.name == machine.initial_state)
+        {
+            for style in &state.styles {
+                lines.push(format!(
+                    "  style {}.{}.{} {}",
+                    machine.key,
+                    state.name,
+                    style.node_key,
+                    format_state_style(style)
+                ));
+            }
         }
         for transition in &machine.transitions {
             if let Some(motion_key) = &transition.motion_key {
@@ -805,6 +834,59 @@ fn format_easing(easing: UiEasing) -> &'static str {
         UiEasing::EaseOut => "ease_out",
         UiEasing::EaseInOut => "ease_in_out",
     }
+}
+
+/// Renders a state style record as Flow attribute tokens (no `style` prefix).
+fn format_state_style(style: &NuiFlowStateStyle) -> String {
+    let mut out = String::new();
+    if let Some(bounds) = style.bounds {
+        out.push_str(&format!(
+            "x {} y {} w {} h {}",
+            bounds.x, bounds.y, bounds.width, bounds.height
+        ));
+    }
+    if let Some(color) = style.background_color {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(&format!("fill {}", format_color(color)));
+    }
+    if let Some(color) = style.border_color {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(&format!("line {}", format_color(color)));
+    }
+    if let Some(width) = style.border_width {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(&format!("border_width {width}"));
+    }
+    if let Some(radius) = style.corner_radius {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(&format!("corner_radius {radius}"));
+    }
+    if let Some(opacity) = style.opacity {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(&format!("opacity {opacity}"));
+    }
+    out
+}
+
+fn format_color(color: [f32; 4]) -> String {
+    let [r, g, b, a] = color;
+    format!(
+        "#{:02X}{:02X}{:02X}{:02X}",
+        (r.clamp(0.0, 1.0) * 255.0) as u8,
+        (g.clamp(0.0, 1.0) * 255.0) as u8,
+        (b.clamp(0.0, 1.0) * 255.0) as u8,
+        (a.clamp(0.0, 1.0) * 255.0) as u8,
+    )
 }
 
 pub fn parse_nui_flow_patch(source: &str) -> FlowResult<UiIrPatch> {
@@ -1179,6 +1261,7 @@ fn parse_motion_declaration(text: &str, line: u32) -> FlowResult<Option<NuiFlowM
             duration_ms: duration_ms as u32,
             easing,
             from: UiTransitionState::default(),
+            motion_key: Some(words[1].clone()),
         },
     }))
 }
@@ -1206,7 +1289,10 @@ fn parse_state_machine_declaration(
             machines.push(NuiFlowStateMachine {
                 key: words[1].into(),
                 initial_state: words[3].into(),
-                states: vec![words[3].into()],
+                states: vec![NuiFlowState {
+                    name: words[3].into(),
+                    styles: Vec::new(),
+                }],
                 transitions: Vec::new(),
             });
             Ok(true)
@@ -1219,10 +1305,140 @@ fn parse_state_machine_declaration(
                 .iter_mut()
                 .find(|machine| machine.key == words[1])
                 .ok_or_else(|| invalid("state references an undeclared machine"))?;
-            if machine.states.iter().any(|state| state == words[2]) {
+            if machine.states.iter().any(|s| s.name == words[2]) {
                 return Err(invalid("state keys must be unique within a machine"));
             }
-            machine.states.push(words[2].into());
+            machine.states.push(NuiFlowState {
+                name: words[2].into(),
+                styles: Vec::new(),
+            });
+            Ok(true)
+        }
+        Some("style") => {
+            // style <machine>.<state>.<node_key> [x <n>] [y <n>] [w <n>] [h <n>]
+            //     [fill <color>] [line <color>] [border_width <n>]
+            //     [corner_radius <n>] [opacity <n>]
+            if words.len() < 4 {
+                return Err(invalid(
+                    "style syntax is: style <machine.state.node_key> <attributes>",
+                ));
+            }
+            let path = words[1];
+            let path_parts: Vec<&str> = path.split('.').collect();
+            if path_parts.len() != 3 {
+                return Err(invalid("style path must be <machine>.<state>.<node_key>"));
+            }
+            let machine = machines
+                .iter_mut()
+                .find(|m| m.key == path_parts[0])
+                .ok_or_else(|| invalid("style references an undeclared machine"))?;
+            let state = machine
+                .states
+                .iter_mut()
+                .find(|s| s.name == path_parts[1])
+                .ok_or_else(|| invalid("style references an undeclared state"))?;
+            let mut style = NuiFlowStateStyle {
+                node_key: path_parts[2].into(),
+                bounds: None,
+                background_color: None,
+                border_color: None,
+                border_width: None,
+                corner_radius: None,
+                opacity: None,
+            };
+            let mut bounds = style.bounds;
+            let mut i = 2;
+            while i < words.len() {
+                match words[i] {
+                    "x" => {
+                        let x: f32 = words[i + 1].parse().map_err(|_| invalid("invalid x"))?;
+                        let current = bounds.get_or_insert(UiBounds {
+                            x: 0.0,
+                            y: 0.0,
+                            width: 0.0,
+                            height: 0.0,
+                        });
+                        current.x = x;
+                        i += 2;
+                    }
+                    "y" => {
+                        let y: f32 = words[i + 1].parse().map_err(|_| invalid("invalid y"))?;
+                        let current = bounds.get_or_insert(UiBounds {
+                            x: 0.0,
+                            y: 0.0,
+                            width: 0.0,
+                            height: 0.0,
+                        });
+                        current.y = y;
+                        i += 2;
+                    }
+                    "w" => {
+                        let w: f32 = words[i + 1].parse().map_err(|_| invalid("invalid w"))?;
+                        let current = bounds.get_or_insert(UiBounds {
+                            x: 0.0,
+                            y: 0.0,
+                            width: 0.0,
+                            height: 0.0,
+                        });
+                        current.width = w;
+                        i += 2;
+                    }
+                    "h" => {
+                        let h: f32 = words[i + 1].parse().map_err(|_| invalid("invalid h"))?;
+                        let current = bounds.get_or_insert(UiBounds {
+                            x: 0.0,
+                            y: 0.0,
+                            width: 0.0,
+                            height: 0.0,
+                        });
+                        current.height = h;
+                        i += 2;
+                    }
+                    "fill" | "background" => {
+                        style.background_color = Some(color(words[i + 1], line)?);
+                        i += 2;
+                    }
+                    "line" | "border" => {
+                        style.border_color = Some(color(words[i + 1], line)?);
+                        i += 2;
+                    }
+                    "border_width" => {
+                        let v: f32 = words[i + 1]
+                            .parse()
+                            .map_err(|_| invalid("invalid border_width"))?;
+                        style.border_width = Some(v);
+                        i += 2;
+                    }
+                    "corner_radius" => {
+                        let v: f32 = words[i + 1]
+                            .parse()
+                            .map_err(|_| invalid("invalid corner_radius"))?;
+                        style.corner_radius = Some(v);
+                        i += 2;
+                    }
+                    "opacity" => {
+                        let v: f32 = words[i + 1]
+                            .parse()
+                            .map_err(|_| invalid("invalid opacity"))?;
+                        style.opacity = Some(v);
+                        i += 2;
+                    }
+                    _ => {
+                        return Err(invalid("unknown style attribute"));
+                    }
+                }
+            }
+            style.bounds = bounds;
+            if style.bounds.is_none()
+                && style.background_color.is_none()
+                && style.border_color.is_none()
+                && style.border_width.is_none()
+                && style.corner_radius.is_none()
+                && style.opacity.is_none()
+            {
+                return Err(invalid("style must declare at least one attribute"));
+            }
+            state.styles.push(style);
             Ok(true)
         }
         Some("sync") => {
@@ -1483,7 +1699,7 @@ fn validate_state_machines(
         if !machine
             .states
             .iter()
-            .any(|state| state == &machine.initial_state)
+            .any(|s| s.name == machine.initial_state)
         {
             return Err(error(
                 "nui_flow_invalid_state_machine",
@@ -1497,7 +1713,7 @@ fn validate_state_machines(
                 && !machine
                     .states
                     .iter()
-                    .any(|state| state == &transition.from_state)
+                    .any(|s| s.name == transition.from_state)
             {
                 return Err(error(
                     "nui_flow_invalid_state_machine",
@@ -1509,7 +1725,7 @@ fn validate_state_machines(
             if !machine
                 .states
                 .iter()
-                .any(|state| state == &transition.target_state)
+                .any(|s| s.name == transition.target_state)
             {
                 return Err(error(
                     "nui_flow_invalid_state_machine",
@@ -3368,6 +3584,10 @@ fn take_node(parent: &mut UiNode, key: &str, taken: &mut Option<UiNode>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::NuiFlowStateMachineRuntime;
+    use neon_ui_schema::{
+        UI_PROGRAM_SCHEMA_VERSION, UiProgramRevision, UiResolvedInputValue, UiResolvedInputs,
+    };
 
     const WORKBENCH: &str = r#"
 version 1
@@ -3420,10 +3640,12 @@ panel workspace row gap 8
     #[test]
     fn grid_inputs_cannot_declare_emitevent() {
         let error = parse_nui_flow("input rows grid default grid:empty emitevent\n").unwrap_err();
-        assert!(error
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.code == "nui_flow_invalid_input"));
+        assert!(
+            error
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "nui_flow_invalid_input")
+        );
     }
 
     #[test]
@@ -3465,6 +3687,62 @@ panel workspace row gap 8
                 .iter()
                 .any(|diagnostic| diagnostic.code == "nui_flow_missing_world_camera")
         );
+    }
+
+    #[test]
+    fn world_panel_motion_fixture_toggles_size_and_color() {
+        let document = parse_nui_flow(include_str!(
+            "../tests/fixtures/ui/world-ui-panel-motion.nui"
+        ))
+        .unwrap();
+        assert_eq!(document.world_panels.len(), 1);
+        assert_eq!(document.motions.len(), 2);
+        let machine = document
+            .state_machines
+            .iter()
+            .find(|machine| machine.key == "marker")
+            .unwrap();
+        let compact = machine
+            .states
+            .iter()
+            .find(|state| state.name == "compact")
+            .unwrap();
+        let expanded = machine
+            .states
+            .iter()
+            .find(|state| state.name == "expanded")
+            .unwrap();
+        assert_eq!(compact.styles[0].bounds.unwrap().width, 240.0);
+        assert_eq!(expanded.styles[0].bounds.unwrap().width, 420.0);
+        let compact_color = compact.styles[0].background_color.unwrap();
+        let expanded_color = expanded.styles[0].background_color.unwrap();
+        assert!((compact_color[0] - 0.094).abs() < 0.002);
+        assert!((compact_color[1] - 0.204).abs() < 0.002);
+        assert!((compact_color[2] - 0.271).abs() < 0.002);
+        assert!((expanded_color[0] - 0.42).abs() < 0.002);
+        assert!((expanded_color[1] - 0.231).abs() < 0.002);
+        assert!((expanded_color[2] - 0.208).abs() < 0.002);
+        let mut runtime = NuiFlowStateMachineRuntime::new(&document);
+        let inputs = UiResolvedInputs {
+            program_revision: UiProgramRevision {
+                program_id: "world-panel-motion".into(),
+                revision: Revision(1),
+                schema_version: UI_PROGRAM_SCHEMA_VERSION,
+                capabilities: Vec::new(),
+            },
+            input_revision: Revision(0),
+            values: BTreeMap::<String, UiResolvedInputValue>::new(),
+            changed_slots: Vec::new(),
+        };
+        let expanded_result = runtime.dispatch(&document, &inputs, "world.marker.toggle");
+        assert_eq!(expanded_result[0].state, "expanded");
+        assert_eq!(
+            expanded_result[0].motion_key.as_deref(),
+            Some("marker-expand")
+        );
+        let reset_result = runtime.dispatch(&document, &inputs, "world.marker.reset");
+        assert_eq!(reset_result[0].state, "compact");
+        assert_eq!(reset_result[0].motion_key.as_deref(), Some("marker-reset"));
     }
 
     #[test]
@@ -3644,7 +3922,12 @@ panel workspace row gap 8
         assert_eq!(document.motions[0].key, "health-change");
         assert_eq!(document.motions[0].transition.duration_ms, 320);
         assert_eq!(document.state_machines[0].transitions[0].motion_key, None);
-        assert_eq!(document.state_machines[0].transitions[1].motion_key.as_deref(), Some("health-change"));
+        assert_eq!(
+            document.state_machines[0].transitions[1]
+                .motion_key
+                .as_deref(),
+            Some("health-change")
+        );
         let formatted = format_nui_flow(&source).unwrap();
         assert!(formatted.contains("motion health-change duration 320 easing ease_out"));
         assert!(formatted.contains("transition status idle -> hit motion health-change"));
@@ -3816,6 +4099,118 @@ panel workspace row gap 8
                 .iter()
                 .any(|node| node.node_id.0 == "command-bar")
         );
+    }
+
+    #[test]
+    fn state_motion_fixture_round_trips_motions_and_transitions() {
+        let source = include_str!("../tests/fixtures/ui/state-motion.nui");
+        let document = parse_nui_flow(source).unwrap();
+
+        assert_eq!(document.motions.len(), 2);
+        assert_eq!(document.motions[0].key, "status-hit");
+        assert_eq!(document.motions[0].transition.duration_ms, 140);
+        assert_eq!(document.motions[1].key, "health-change");
+        assert_eq!(document.motions[1].transition.duration_ms, 320);
+        assert_eq!(
+            document.motions[1].transition.motion_key.as_deref(),
+            Some("health-change")
+        );
+
+        let machine = &document.state_machines[0];
+        assert_eq!(machine.key, "status");
+        let forward = machine
+            .transitions
+            .iter()
+            .find(|transition| {
+                transition.from_state == "idle"
+                    && transition.target_state == "hit"
+                    && transition.motion_key.is_some()
+            })
+            .expect("forward transition with motion");
+        assert_eq!(forward.motion_key.as_deref(), Some("status-hit"));
+        let reverse = machine
+            .transitions
+            .iter()
+            .find(|transition| {
+                transition.from_state == "hit"
+                    && transition.target_state == "idle"
+                    && transition.motion_key.is_some()
+            })
+            .expect("reverse transition with motion");
+        assert_eq!(reverse.motion_key.as_deref(), Some("health-change"));
+
+        // Compile round trip preserves both motions and both transition pairs.
+        let program = compile_nui_flow_program(
+            &document,
+            UiProgramRevision {
+                program_id: document.ir.surface_id.0.clone(),
+                revision: Revision(1),
+                schema_version: neon_ui_schema::UI_PROGRAM_SCHEMA_VERSION,
+                capabilities: vec![
+                    neon_ui_schema::UiProgramCapability {
+                        name: neon_ui_schema::UI_PROGRAM_CAPABILITY_NAME.into(),
+                        version: 1,
+                        owner: neon_ui_schema::UiProgramCapabilityOwner::SharedContract,
+                        status: neon_ui_schema::UiProgramCapabilityStatus::Supported,
+                    },
+                    neon_ui_schema::UiProgramCapability {
+                        name: neon_ui_schema::UI_PROGRAM_SEMANTIC_EVENT_CAPABILITY_NAME.into(),
+                        version: 1,
+                        owner: neon_ui_schema::UiProgramCapabilityOwner::SharedContract,
+                        status: neon_ui_schema::UiProgramCapabilityStatus::Supported,
+                    },
+                ],
+            },
+        )
+        .expect("state-motion fixture must compile");
+        let formatted = format_nui_flow(source).expect("state-motion fixture must format");
+        assert!(formatted.contains("motion status-hit duration 140 easing ease_in_out"));
+        assert!(formatted.contains("motion health-change duration 320 easing ease_out"));
+        assert!(formatted.contains("transition status idle -> hit motion status-hit"));
+        assert!(formatted.contains("transition status hit -> idle motion health-change"));
+        assert!(!program.nodes.is_empty());
+
+        // State style records parse and survive formatting.
+        let idle = document
+            .state_machines
+            .iter()
+            .flat_map(|machine| &machine.states)
+            .find(|state| state.name == "idle")
+            .expect("idle state must exist");
+        let hit = document
+            .state_machines
+            .iter()
+            .flat_map(|machine| &machine.states)
+            .find(|state| state.name == "hit")
+            .expect("hit state must exist");
+        let idle_root = idle
+            .style_for("status-root")
+            .expect("idle style for status-root must exist");
+        assert_eq!(
+            idle_root.bounds,
+            Some(neon_ui_schema::UiBounds {
+                x: 16.0,
+                y: 16.0,
+                width: 320.0,
+                height: 140.0,
+            })
+        );
+        let hit_root = hit
+            .style_for("status-root")
+            .expect("hit style for status-root must exist");
+        assert_eq!(
+            hit_root.bounds,
+            Some(neon_ui_schema::UiBounds {
+                x: 16.0,
+                y: 16.0,
+                width: 480.0,
+                height: 240.0,
+            })
+        );
+        // idled bounds differ from hit bounds: the renderer can interpolate.
+        assert_ne!(idle_root.bounds, hit_root.bounds);
+        assert!(formatted.contains("style status.idle.status-root"));
+        assert!(formatted.contains("style status.hit.status-root"));
     }
 
     #[test]

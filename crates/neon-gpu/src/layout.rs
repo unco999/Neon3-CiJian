@@ -61,7 +61,10 @@ pub enum Type {
     Vec3(Scalar),
     Vec4(Scalar),
     /// Fixed-length array. Stride follows the storage-buffer 16-byte rule.
-    Array { count: u32, element: Box<Type> },
+    Array {
+        count: u32,
+        element: Box<Type>,
+    },
     /// A nested struct.
     Struct(StructLayout),
 }
@@ -94,7 +97,11 @@ impl Type {
     }
 
     /// WGSL type name. Registers nested structs into `seen` for emission.
-    pub fn wgsl_name(&self, seen: &mut HashSet<String>, out: &mut String) -> Result<(), LayoutError> {
+    pub fn wgsl_name(
+        &self,
+        seen: &mut HashSet<String>,
+        out: &mut String,
+    ) -> Result<(), LayoutError> {
         match self {
             Type::F32 => out.push_str("f32"),
             Type::I32 => out.push_str("i32"),
@@ -177,11 +184,7 @@ impl StructLayout {
         Ok(out)
     }
 
-    fn register(
-        &self,
-        seen: &mut HashSet<String>,
-        out: &mut String,
-    ) -> Result<(), LayoutError> {
+    fn register(&self, seen: &mut HashSet<String>, out: &mut String) -> Result<(), LayoutError> {
         if !seen.insert(self.name.clone()) {
             return Ok(());
         }
@@ -311,10 +314,7 @@ pub enum LayoutError {
     #[error("field path must not be empty")]
     EmptyPath,
     #[error("duplicate field `{field}` in struct `{struct_name}`")]
-    DuplicateField {
-        struct_name: String,
-        field: String,
-    },
+    DuplicateField { struct_name: String, field: String },
     #[error("struct `{0}` has no field `{1}`")]
     UnknownField(String, String),
     #[error("field `{field}` of struct `{struct_name}` is not a struct; cannot descend")]
@@ -429,10 +429,7 @@ mod tests {
 
     #[test]
     fn wgsl_source_emits_nested_defs_once() {
-        let inner = LayoutBuilder::new("Inner")
-            .field("a", F32)
-            .build()
-            .unwrap();
+        let inner = LayoutBuilder::new("Inner").field("a", F32).build().unwrap();
         let outer = LayoutBuilder::new("Outer")
             .field("tag", U32)
             .field("inner", ty::strukt(inner.clone()))
