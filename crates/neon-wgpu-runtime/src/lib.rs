@@ -2419,15 +2419,6 @@ impl HeadlessExternalGpu {
         }
         self.ui.set_pointer_position(event.pixel);
         self.ui.prepare_interaction(fragments, [1280, 720], [1280.0, 720.0], 0.0);
-        if matches!(&event.event_type, UiPointerEventType::Down | UiPointerEventType::Up) {
-            eprintln!(
-                "[neon-wgpu-runtime] external pointer {:?} sequence={} hover={:?} capture={:?}",
-                event.event_type,
-                event.sequence,
-                self.ui.hit_id_at_pointer(),
-                self.input.capture_id,
-            );
-        }
         match event.event_type {
             UiPointerEventType::Enter | UiPointerEventType::Move => {
                 self.input.set_hover_id(self.ui.hit_id_at_pointer());
@@ -7327,56 +7318,6 @@ impl WgpuRuntime {
             self.viewport,
             &mut depths,
         );
-        if has_world_panel {
-            static DIAG_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-            let tick = DIAG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if tick % 120 == 0 {
-                let visible: Vec<&neon_ui_schema::UiNode> =
-                    filtered.root.children.iter().filter(|child| child.visible).collect();
-                let world_visible: Vec<&neon_ui_schema::UiNode> = filtered
-                    .root
-                    .children
-                    .iter()
-                    .filter(|child| child.visible && child.world_depth.is_some())
-                    .collect();
-                let mut sample = "none".to_string();
-                if let Some(first) = world_visible.first() {
-                    sample = format!(
-                        "x={} y={} w={} h={} depth={:?}",
-                        first.bounds.x,
-                        first.bounds.y,
-                        first.bounds.width,
-                        first.bounds.height,
-                        first.world_depth
-                    );
-                }
-                let mut camera_report = "no-camera".to_string();
-                let mut anchor_report = "no-anchor".to_string();
-                for effect in &filtered.effects {
-                    if let neon_ui_schema::UiEffect::CameraVisibility { binding } = effect {
-                        if self.world_bridge.camera_is_available(&binding.camera_id, binding.camera_kind) {
-                            if let Some(frame) = self.world_bridge.camera(&binding.camera_id) {
-                                if let neon_world_bridge::CameraFramePayload::ThreeDimensional { position, .. } = &frame.payload {
-                                    camera_report = format!("{:.2},{:.2},{:.2}", position[0], position[1], position[2]);
-                                }
-                            }
-                        } else {
-                            camera_report = "unavailable".to_string();
-                        }
-                        if let Some(anchor_id) = &binding.anchor_id {
-                            if let Some(anchor) = self.world_bridge.anchor(anchor_id) {
-                                anchor_report = format!("{:.2},{:.2},{:.2}", anchor.position[0], anchor.position[1], anchor.position[2]);
-                            }
-                        }
-                        break;
-                    }
-                }
-                eprintln!(
-                    "[neon-wgpu-runtime] world-ui diag: camera[{camera_report}] anchor[{anchor_report}] world_visible={} sample[{sample}]",
-                    world_visible.len(),
-                );
-            }
-        }
         // Draw order: world panels are otherwise emitted in tree order, which
         // lets a far panel (drawn later) cover a near one. Sort direct children
         // by camera depth far -> near so near panels draw last and stay on top.
@@ -7468,9 +7409,7 @@ impl WgpuRuntime {
         let kind = frame.payload.kind();
         let sequence = frame.sequence;
         match self.world_bridge.submit_camera_frame(frame) {
-            Ok(()) => {
-                eprintln!("[neon-wgpu-runtime] camera frame ACCEPTED camera={} seq={sequence}", camera_id.0);
-                self.accept(
+            Ok(()) => self.accept(
                     request_id,
                     serde_json::json!({
                         "camera_id": camera_id,
@@ -7478,17 +7417,13 @@ impl WgpuRuntime {
                         "sequence": sequence,
                         "state": "accepted"
                     }),
-                )
-            }
-            Err(error) => {
-                eprintln!("[neon-wgpu-runtime] camera frame REJECTED camera={} seq={sequence}: {error:?}", camera_id.0);
-                self.reject(
+                ),
+            Err(error) => self.reject(
                     request_id,
                     "camera_frame_rejected",
                     &format!("{error:?}"),
                     None,
-                )
-            }
+                ),
         }
     }
 
@@ -7537,22 +7472,16 @@ impl WgpuRuntime {
         let sequence = batch.sequence;
         let count = batch.anchors.len();
         match self.world_bridge.submit_anchor_batch(batch) {
-            Ok(()) => {
-                eprintln!("[neon-wgpu-runtime] anchor batch ACCEPTED seq={sequence} count={count}");
-                self.accept(
+            Ok(()) => self.accept(
                     request_id,
                     serde_json::json!({"sequence": sequence, "anchor_count": count, "state": "accepted"}),
-                )
-            }
-            Err(error) => {
-                eprintln!("[neon-wgpu-runtime] anchor batch REJECTED seq={sequence} count={count}: {error:?}");
-                self.reject(
+                ),
+            Err(error) => self.reject(
                     request_id,
                     "world_anchor_batch_rejected",
                     &format!("{error:?}"),
                     None,
                 )
-            }
         }
     }
 

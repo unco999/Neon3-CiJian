@@ -880,6 +880,7 @@ pub struct UiTransitionState {
     pub border_width: Option<f32>,
     pub corner_radius: Option<f32>,
     pub opacity: Option<f32>,
+    pub numeric_value: Option<f32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1289,6 +1290,8 @@ pub struct NuiFlowDocument {
     #[serde(default)]
     pub state_machines: Vec<NuiFlowStateMachine>,
     #[serde(default)]
+    pub motions: Vec<NuiFlowMotion>,
+    #[serde(default)]
     pub drags: Vec<NuiFlowDragDeclaration>,
     #[serde(default)]
     pub drops: Vec<NuiFlowDropDeclaration>,
@@ -1338,6 +1341,16 @@ pub struct NuiFlowStateTransition {
     pub target_state: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub emit_intent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub motion_key: Option<String>,
+}
+
+/// Renderer-owned timing policy selected by a UI-local state transition.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NuiFlowMotion {
+    pub key: String,
+    pub transition: UiTransition,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

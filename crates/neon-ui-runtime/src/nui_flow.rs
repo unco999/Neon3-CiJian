@@ -8,7 +8,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use neon_protocol::{AssetRef, Revision};
 use neon_ui_schema::{
     NuiFlowDocument, NuiFlowDragAxis, NuiFlowDragDeclaration, NuiFlowDropDeclaration,
-    NuiFlowParseDiagnostic, NuiFlowStateMachine, NuiFlowStateTransition, NuiFlowStateTrigger,
+    NuiFlowMotion, NuiFlowParseDiagnostic, NuiFlowStateMachine, NuiFlowStateTransition,
+    NuiFlowStateTrigger,
     NuiFlowWorldPanelDeclaration, NuiSourceSpan, RenderSurfaceRef, TextRef, UiAlignItems,
     UiBoundProperty, UiBounds, UiBranchDeclaration, UiBranchLayoutParticipation, UiBranchPredicate,
     UiCameraVisibilityBinding, UiClipPolicy, UiDataGridColumn, UiDataGridDeclaration,
@@ -16,8 +17,10 @@ use neon_ui_schema::{
     UiDropBinding, UiDropPlacement, UiEffect, UiGridInputSlot, UiInputKind, UiInputPacking,
     UiInputSchema, UiInputSlot, UiInputUpdateClass, UiInputValue, UiIntent, UiIrBinding,
     UiIrDocument, UiIrPatch, UiIrPatchOperation, UiIrPatchOperationKind, UiJustifyContent,
-    UiLayout, UiLayoutMode, UiNode, UiNodeId, UiNodeKind, UiProgram, UiProgramEventDeclaration,
-    UiProgramRevision, UiResourceBudget, UiSourceSpan, UiStyle, UiSurfaceId, UiTemplateDeclaration,
+    UiEasing, UiLayout, UiLayoutMode, UiNode, UiNodeId, UiNodeKind, UiProgram,
+    UiProgramEventDeclaration, UiProgramRevision, UiResourceBudget, UiSourceSpan, UiStyle,
+    UiSurfaceId, UiTemplateDeclaration, UiTransition,
+    UiTransitionState,
 };
 use neon_world_bridge::{CameraId, CameraKind, WorldAnchorId};
 use serde_json::json;
@@ -44,6 +47,7 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
     let mut templates = Vec::new();
     let mut data_grids = Vec::new();
     let mut state_machines = Vec::new();
+    let mut motions = Vec::new();
     let mut drags = Vec::new();
     let mut drops = Vec::new();
     let mut world_panels = Vec::new();
@@ -128,6 +132,18 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
                 continue;
             }
             if parse_state_machine_declaration(content, &mut state_machines, line)? {
+                continue;
+            }
+            if let Some(motion) = parse_motion_declaration(content, line)? {
+                if motions.iter().any(|existing: &NuiFlowMotion| existing.key == motion.key) {
+                    return Err(error(
+                        "nui_flow_duplicate_motion",
+                        "motion keys must be unique",
+                        line,
+                        1,
+                    ));
+                }
+                motions.push(motion);
                 continue;
             }
             if let Some((input, emit_event)) = parse_input(content, line)? {
@@ -426,6 +442,20 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
         }
     }
     validate_state_machines(&state_machines, &schema)?;
+    for machine in &state_machines {
+        for transition in &machine.transitions {
+            if let Some(motion_key) = &transition.motion_key {
+                if !motions.iter().any(|motion| &motion.key == motion_key) {
+                    return Err(error(
+                        "nui_flow_unknown_motion",
+                        "state transition references an undeclared motion",
+                        1,
+                        1,
+                    ));
+                }
+            }
+        }
+    }
     for drag in &drags {
         if !source_map.contains_key(&drag.source_node_key) {
             return Err(error(
@@ -510,6 +540,7 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
         ir,
         input_schema: schema,
         state_machines,
+        motions,
         drags,
         drops,
         world_panels,
@@ -722,6 +753,31 @@ pub fn format_nui_flow(source: &str) -> FlowResult<String> {
         };
         lines.push(format!("{}{emit}", format_input(slot)));
     }
+    for motion in &parsed.motions {
+        lines.push(format!(
+            "motion {} duration {} easing {}",
+            motion.key,
+            motion.transition.duration_ms,
+            format_easing(motion.transition.easing)
+        ));
+    }
+    for machine in &parsed.state_machines {
+        lines.push(format!(
+            "machine {} initial {}",
+            machine.key, machine.initial_state
+        ));
+        for state in machine.states.iter().filter(|state| *state != &machine.initial_state) {
+            lines.push(format!("state {} {}", machine.key, state));
+        }
+        for transition in &machine.transitions {
+            if let Some(motion_key) = &transition.motion_key {
+                lines.push(format!(
+                    "transition {} {} -> {} motion {}",
+                    machine.key, transition.from_state, transition.target_state, motion_key
+                ));
+            }
+        }
+    }
     for resource in &parsed.ir.resources {
         let kind = match resource.kind {
             neon_ui_schema::UiProgramResourceKind::Image => "image",
@@ -740,6 +796,15 @@ pub fn format_nui_flow(source: &str) -> FlowResult<String> {
         &mut lines,
     );
     Ok(lines.join("\n") + "\n")
+}
+
+fn format_easing(easing: UiEasing) -> &'static str {
+    match easing {
+        UiEasing::Linear => "linear",
+        UiEasing::EaseIn => "ease_in",
+        UiEasing::EaseOut => "ease_out",
+        UiEasing::EaseInOut => "ease_in_out",
+    }
 }
 
 pub fn parse_nui_flow_patch(source: &str) -> FlowResult<UiIrPatch> {
@@ -1071,6 +1136,53 @@ fn parse_header(text: &str, header: &mut Header, line: u32) -> FlowResult<bool> 
     }
 }
 
+fn parse_motion_declaration(text: &str, line: u32) -> FlowResult<Option<NuiFlowMotion>> {
+    let words = tokenize(text, line)?;
+    if words.first().map(String::as_str) != Some("motion") {
+        return Ok(None);
+    }
+    if words.len() != 6 || !valid_key(&words[1]) || words[2] != "duration" || words[4] != "easing" {
+        return Err(error(
+            "nui_flow_invalid_motion",
+            "motion syntax is: motion <key> duration <ms> easing <linear|ease_in|ease_out|ease_in_out>",
+            line,
+            1,
+        ));
+    }
+    let duration_ms = parse_u64(&words[3], line, "duration")?;
+    if duration_ms > u64::from(u32::MAX) {
+        return Err(error(
+            "nui_flow_invalid_motion",
+            "motion duration exceeds the supported range",
+            line,
+            1,
+        ));
+    }
+    let easing = match words[5].as_str() {
+        "linear" => UiEasing::Linear,
+        "ease_in" => UiEasing::EaseIn,
+        "ease_out" => UiEasing::EaseOut,
+        "ease_in_out" => UiEasing::EaseInOut,
+        _ => {
+            return Err(error(
+                "nui_flow_invalid_motion",
+                "motion easing is not supported",
+                line,
+                1,
+            ));
+        }
+    };
+    Ok(Some(NuiFlowMotion {
+        key: words[1].clone(),
+        transition: UiTransition {
+            delay_ms: 0,
+            duration_ms: duration_ms as u32,
+            easing,
+            from: UiTransitionState::default(),
+        },
+    }))
+}
+
 fn parse_state_machine_declaration(
     text: &str,
     machines: &mut Vec<NuiFlowStateMachine>,
@@ -1130,6 +1242,7 @@ fn parse_state_machine_declaration(
                 predicate: Some(predicate),
                 target_state: words[5].into(),
                 emit_intent: None,
+                motion_key: None,
             });
             Ok(true)
         }
@@ -1172,6 +1285,34 @@ fn parse_state_machine_declaration(
                 predicate,
                 target_state: words[arrow_index + 1].into(),
                 emit_intent,
+                motion_key: None,
+            });
+            Ok(true)
+        }
+        Some("transition") => {
+            if words.len() != 7
+                || !valid_key(words[1])
+                || !valid_key(words[2])
+                || words[3] != "->"
+                || !valid_key(words[4])
+                || words[5] != "motion"
+                || !valid_key(words[6])
+            {
+                return Err(invalid(
+                    "transition syntax is: transition <machine> <from_state> -> <to_state> motion <motion_key>",
+                ));
+            }
+            let machine = machines
+                .iter_mut()
+                .find(|machine| machine.key == words[1])
+                .ok_or_else(|| invalid("transition references an undeclared machine"))?;
+            machine.transitions.push(NuiFlowStateTransition {
+                from_state: words[2].into(),
+                trigger: NuiFlowStateTrigger::Sync,
+                predicate: None,
+                target_state: words[4].into(),
+                emit_intent: None,
+                motion_key: Some(words[6].into()),
             });
             Ok(true)
         }
@@ -1352,6 +1493,19 @@ fn validate_state_machines(
             ));
         }
         for transition in &machine.transitions {
+            if transition.from_state != "*"
+                && !machine
+                    .states
+                    .iter()
+                    .any(|state| state == &transition.from_state)
+            {
+                return Err(error(
+                    "nui_flow_invalid_state_machine",
+                    "transition source state is not declared",
+                    1,
+                    1,
+                ));
+            }
             if !machine
                 .states
                 .iter()
@@ -1360,6 +1514,14 @@ fn validate_state_machines(
                 return Err(error(
                     "nui_flow_invalid_state_machine",
                     "transition target state is not declared",
+                    1,
+                    1,
+                ));
+            }
+            if transition.motion_key.is_some() && transition.from_state == "*" {
+                return Err(error(
+                    "nui_flow_invalid_state_machine",
+                    "motion transitions require an explicit source state",
                     1,
                     1,
                 ));
@@ -3469,6 +3631,30 @@ panel workspace row gap 8
         let formatted = format_nui_flow(source).unwrap();
         assert_eq!(grid.source_key, "asset_window");
         assert!(formatted.contains("source $asset_window capacity 64 row_height 28 overscan 3 columns \"Name:240,Status:120\""));
+    }
+
+    #[test]
+    fn state_motion_declarations_parse_validate_and_format() {
+        let source = "version 1\nsurface status revision 1\nmotion health-change duration 320 easing ease_out\nmachine status initial idle\nstate status hit\non status status.toggle -> hit\ntransition status idle -> hit motion health-change\nsurface root\n  progress_bar health numeric $health\n";
+        let source = source.replace(
+            "surface root",
+            "input health f32:0..100 default 82\nsurface root",
+        );
+        let document = parse_nui_flow(&source).unwrap();
+        assert_eq!(document.motions[0].key, "health-change");
+        assert_eq!(document.motions[0].transition.duration_ms, 320);
+        assert_eq!(document.state_machines[0].transitions[0].motion_key, None);
+        assert_eq!(document.state_machines[0].transitions[1].motion_key.as_deref(), Some("health-change"));
+        let formatted = format_nui_flow(&source).unwrap();
+        assert!(formatted.contains("motion health-change duration 320 easing ease_out"));
+        assert!(formatted.contains("transition status idle -> hit motion health-change"));
+    }
+
+    #[test]
+    fn state_motion_references_must_be_declared() {
+        let source = "machine status initial idle\nstate status hit\non status status.toggle -> hit\ntransition status idle -> hit motion missing\nsurface root\n";
+        let error = parse_nui_flow(source).unwrap_err();
+        assert_eq!(error.diagnostics[0].code, "nui_flow_unknown_motion");
     }
 
     #[test]

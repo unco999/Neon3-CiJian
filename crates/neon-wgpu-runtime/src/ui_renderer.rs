@@ -3726,18 +3726,6 @@ impl UiWgpuRenderer {
         // CPU first-press handling must be ready as soon as the visible frame is
         // drawn; asynchronous GPU hit readback is only supplemental.
         self.refresh_hit_bindings(fragments);
-        if mode == UiDrawMode::World {
-            static DIAG: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-            let tick = DIAG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if tick % 120 == 0 {
-                eprintln!(
-                    "[neon-wgpu-runtime] world draw: plan={} instances={} sampled_world={}",
-                    self.plan.len(),
-                    self.instances.len(),
-                    self.sampled.iter().filter(|visual| visual.world_depth.is_some()).count(),
-                );
-            }
-        }
         // Dropdown/modal/tooltip chrome is screen-UI presentation; the world
         // target never carries it. World panels are only emitted through the
         // ordinary instance loop above, so a World pass emits zero popups.
@@ -4335,25 +4323,6 @@ impl UiWgpuRenderer {
                 .find_map(|node| node.target.world_depth)
         };
         let group_depth_value = |group_id: u32| group_depth(group_id).unwrap_or(0.0);
-        {
-            static DIAG_COUNT: std::sync::atomic::AtomicUsize =
-                std::sync::atomic::AtomicUsize::new(0);
-            if DIAG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 120 == 0 {
-                let mut depths = group_ids
-                    .iter()
-                    .filter_map(|group_id| group_depth(*group_id))
-                    .collect::<Vec<_>>();
-                depths.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-                depths.dedup_by(|a, b| (*a - *b).abs() < 1e-6);
-                let min = depths.first().copied().unwrap_or(0.0);
-                let max = depths.last().copied().unwrap_or(0.0);
-                eprintln!(
-                    "[neon3-depth-diag] groups={} distinct_depths={} min={min:.6} max={max:.6}",
-                    group_ids.len(),
-                    depths.len(),
-                );
-            }
-        }
         group_ids.sort_by(|a, b| {
             match (group_depth(*a), group_depth(*b)) {
                 (Some(a), Some(b)) => a
@@ -4443,29 +4412,6 @@ impl UiWgpuRenderer {
             &self.data_grid_text_display_cache,
             &self.available_cameras,
         );
-        {
-            static DIAG: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-            let tick = DIAG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if tick % 120 == 0 {
-                let mut root_info = "no-fragments".to_string();
-                if let Some(fragment) = display_fragments.values().next() {
-                    root_info = format!(
-                        "id={} root_visible={} root_opacity={} root_children={} effects={}",
-                        fragment.fragment_id.0,
-                        fragment.root.visible,
-                        fragment.root.style.opacity,
-                        fragment.root.children.len(),
-                        fragment.effects.len(),
-                    );
-                }
-                eprintln!(
-                    "[neon-wgpu-runtime] refresh_plan: fragments={} nodes={} [{}]",
-                    display_fragments.len(),
-                    nodes.len(),
-                    root_info,
-                );
-            }
-        }
         let live: HashSet<_> = nodes.iter().map(|(id, _, _, _)| id.clone()).collect();
         if viewport_changed {
             self.current.clear();
@@ -7446,6 +7392,16 @@ fn resolve_children(
 
 fn transition_source(target: &UiVisual, transition: &UiTransition) -> UiVisual {
     let from = transition.from;
+    let presentation = match (&target.presentation, from.numeric_value) {
+        (Some(UiControlPresentation::Numeric { min, max, .. }), Some(value)) => {
+            Some(UiControlPresentation::Numeric {
+                value,
+                min: *min,
+                max: *max,
+            })
+        }
+        _ => target.presentation.clone(),
+    };
     UiVisual {
         bounds: from.bounds.unwrap_or(target.bounds),
         style: UiStyle {
@@ -7464,7 +7420,7 @@ fn transition_source(target: &UiVisual, transition: &UiTransition) -> UiVisual {
         image: target.image.clone(),
         surface: target.surface.clone(),
         text: target.text.clone(),
-        presentation: target.presentation.clone(),
+        presentation,
         scroll: target.scroll,
         declared_scroll_offset: target.declared_scroll_offset,
         world_depth: target.world_depth,
@@ -7478,6 +7434,24 @@ fn sample_transition(active: &ActiveTransition, time_seconds: f32) -> UiVisual {
         / active.transition.duration_ms as f32)
         .clamp(0.0, 1.0);
     let t = ease(progress, active.transition.easing);
+    let presentation = match (&active.from.presentation, &active.target.presentation) {
+        (
+            Some(UiControlPresentation::Numeric {
+                value: from_value,
+                ..
+            }),
+            Some(UiControlPresentation::Numeric {
+                value: target_value,
+                min,
+                max,
+            }),
+        ) => Some(UiControlPresentation::Numeric {
+            value: lerp(*from_value, *target_value, t),
+            min: *min,
+            max: *max,
+        }),
+        _ => active.target.presentation.clone(),
+    };
     UiVisual {
         bounds: lerp_bounds(active.from.bounds, active.target.bounds, t),
         style: UiStyle {
@@ -7510,7 +7484,7 @@ fn sample_transition(active: &ActiveTransition, time_seconds: f32) -> UiVisual {
         image: active.target.image.clone(),
         surface: active.target.surface.clone(),
         text: active.target.text.clone(),
-        presentation: active.target.presentation.clone(),
+        presentation,
         scroll: active.target.scroll,
         declared_scroll_offset: active.target.declared_scroll_offset,
         world_depth: active.target.world_depth,
@@ -12856,6 +12830,64 @@ mod tests {
         assert!(midpoint.style.opacity > 0.5 && midpoint.style.opacity < 1.0);
         assert!(midpoint.bounds.y < 40.0 && midpoint.bounds.y > 20.0);
         assert_eq!(sample_transition(&active, 1.2).bounds, target.bounds);
+    }
+
+    #[test]
+    fn transition_samples_numeric_control_values() {
+        let visual = |value: f32| UiVisual {
+            bounds: UiBounds {
+                x: 0.0,
+                y: 0.0,
+                width: 100.0,
+                height: 16.0,
+            },
+            style: UiStyle::default(),
+            kind: UiNodeKind::ProgressBar,
+            enabled: true,
+            clip: UiBounds {
+                x: -1_000_000.0,
+                y: -1_000_000.0,
+                width: 2_000_000.0,
+                height: 2_000_000.0,
+            },
+            clip_radius: 0.0,
+            image: None,
+            surface: None,
+            text: None,
+            presentation: Some(UiControlPresentation::Numeric {
+                value,
+                min: 0.0,
+                max: 100.0,
+            }),
+            scroll: false,
+            declared_scroll_offset: [0.0; 2],
+            world_depth: None,
+            paint_group_id: 0,
+        };
+        let target = visual(100.0);
+        let transition = UiTransition {
+            delay_ms: 0,
+            duration_ms: 200,
+            easing: UiEasing::Linear,
+            from: UiTransitionState {
+                numeric_value: Some(0.0),
+                ..UiTransitionState::default()
+            },
+        };
+        let active = ActiveTransition {
+            from: transition_source(&target, &transition),
+            target: target.clone(),
+            started_at_seconds: 1.0,
+            transition,
+        };
+        match sample_transition(&active, 1.1).presentation {
+            Some(UiControlPresentation::Numeric { value, min, max }) => {
+                assert!((value - 50.0).abs() < 0.001);
+                assert_eq!((min, max), (0.0, 100.0));
+            }
+            _ => panic!("numeric presentation must be sampled"),
+        }
+        assert_eq!(sample_transition(&active, 1.2).presentation, target.presentation);
     }
 
     #[test]

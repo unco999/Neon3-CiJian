@@ -22,6 +22,7 @@ pub struct NuiFlowStateTransitionResult {
     pub previous_state: String,
     pub state: String,
     pub emitted_intent: Option<String>,
+    pub motion_key: Option<String>,
     pub revision: Revision,
 }
 
@@ -216,6 +217,7 @@ impl NuiFlowStateMachineRuntime {
                     machine.key.as_str(),
                     &transition.target_state,
                     transition.emit_intent.clone(),
+                    motion_key_for(machine, self.state(machine.key.as_str()), &transition.target_state, transition.motion_key.clone()),
                 )
             })
             .collect()
@@ -229,7 +231,20 @@ impl NuiFlowStateMachineRuntime {
     ) -> Vec<NuiFlowStateTransitionResult> {
         document.state_machines.iter().filter_map(|machine| {
             let transition = machine.transitions.iter().find(|transition| matches!(&transition.trigger, NuiFlowStateTrigger::Intent { name } if name == intent) && transition.predicate.as_ref().is_none_or(|predicate| predicate_matches(predicate, inputs)))?;
-            self.transition(machine.key.as_str(), &transition.target_state, transition.emit_intent.clone())
+            let motion_key = transition.motion_key.clone().or_else(|| {
+                motion_key_for(
+                    machine,
+                    self.state(machine.key.as_str()),
+                    &transition.target_state,
+                    None,
+                )
+            });
+            self.transition(
+                machine.key.as_str(),
+                &transition.target_state,
+                transition.emit_intent.clone(),
+                motion_key,
+            )
         }).collect()
     }
 
@@ -247,6 +262,7 @@ impl NuiFlowStateMachineRuntime {
         machine_key: &str,
         target_state: &str,
         emitted_intent: Option<String>,
+        motion_key: Option<String>,
     ) -> Option<NuiFlowStateTransitionResult> {
         let previous_state = self.states.get(machine_key)?.clone();
         if previous_state == target_state {
@@ -259,9 +275,30 @@ impl NuiFlowStateMachineRuntime {
             previous_state,
             state: target_state.into(),
             emitted_intent,
+            motion_key,
             revision: self.revision,
         })
     }
+}
+
+fn motion_key_for(
+    machine: &neon_ui_schema::NuiFlowStateMachine,
+    previous_state: Option<&str>,
+    target_state: &str,
+    explicit: Option<String>,
+) -> Option<String> {
+    explicit.or_else(|| {
+        let previous_state = previous_state?;
+        machine
+            .transitions
+            .iter()
+            .find(|candidate| {
+                candidate.from_state == previous_state
+                    && candidate.target_state == target_state
+                    && candidate.motion_key.is_some()
+            })
+            .and_then(|candidate| candidate.motion_key.clone())
+    })
 }
 
 fn predicate_matches(predicate: &UiBranchPredicate, inputs: &UiResolvedInputs) -> bool {
@@ -343,6 +380,15 @@ mod tests {
             transition[0].emitted_intent.as_deref(),
             Some("asset.review.publish")
         );
+    }
+
+    #[test]
+    fn state_transition_resolves_motion_by_source_and_target_state() {
+        let source = "motion hit duration 140 easing ease_in_out\nmachine status initial idle\nstate status hit\non status status.toggle -> hit\ntransition status idle -> hit motion hit\nsurface status\n";
+        let document = crate::parse_nui_flow(source).unwrap();
+        let mut runtime = NuiFlowStateMachineRuntime::new(&document);
+        let result = runtime.dispatch(&document, &inputs(false, "ready"), "status.toggle");
+        assert_eq!(result[0].motion_key.as_deref(), Some("hit"));
     }
 
     #[test]

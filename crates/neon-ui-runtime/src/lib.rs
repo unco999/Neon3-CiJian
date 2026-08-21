@@ -36,6 +36,7 @@ use neon_ui_schema::{
     UiDataGridFrame, UiDataGridInputFrame, UiDataGridRecord, UiDependencyIndex, UiDiagnostic,
     UiDiagnosticSeverity, UiDiagnosticsState, UiEffect, UiEventTraceRecord, UiFragment,
     UiFragmentId, UiFragmentSubmission, UiHostFragmentContext, UiHostInbound, UiHostPublication,
+    NuiFlowDocument,
     UiInputChange, UiInputFrame, UiInputSchema, UiInputUpdateClass, UiInputValue,
     UiInputValueSource, UiInspectorState, UiInspectorTab, UiIntent, UiIrDocument, UiNode, UiNodeId,
     UiNodeKind, UiProgram, UiProgramDragDropEvent, UiProgramLayoutRecord, UiProgramLiteralText,
@@ -1279,6 +1280,16 @@ fn input_value_as_event_payload(value: &UiInputValue) -> Option<UiSemanticPayloa
     })
 }
 
+fn apply_transition_to_fragment(fragment: &mut UiFragment, transition: UiTransition) {
+    fn apply(node: &mut UiNode, transition: &UiTransition) {
+        node.enter_transition = Some(transition.clone());
+        for child in &mut node.children {
+            apply(child, transition);
+        }
+    }
+    apply(&mut fragment.root, &transition);
+}
+
 /// Stable string name of an input kind, used in `nui.variable.changed` payloads.
 fn ui_input_kind_name(kind: &neon_ui_schema::UiInputKind) -> String {
     use neon_ui_schema::UiInputKind;
@@ -1400,7 +1411,7 @@ fn refresh_fragment_from_program(
                     selected: state.active || state.selected,
                 })
             }
-            UiNodeKind::Slider | UiNodeKind::DragValue => state.numeric_value.and_then(|value| {
+            UiNodeKind::Slider | UiNodeKind::DragValue | UiNodeKind::ProgressBar => state.numeric_value.and_then(|value| {
                 program
                     .binding_records
                     .iter()
@@ -2490,6 +2501,8 @@ pub struct UiRuntime {
     host_adapter: Option<UiHostAdapter>,
     eventd_endpoint: Option<SocketAddr>,
     interaction_traces: InteractionTraceStore,
+    flow_document: Option<NuiFlowDocument>,
+    flow_state_machine: Option<NuiFlowStateMachineRuntime>,
 }
 
 impl UiRuntime {
@@ -2513,6 +2526,8 @@ impl UiRuntime {
             host_adapter: None,
             eventd_endpoint: None,
             interaction_traces: InteractionTraceStore::default(),
+            flow_document: None,
+            flow_state_machine: None,
         }
     }
 
@@ -2908,6 +2923,8 @@ impl UiRuntime {
         };
         let response = self.forward_fragment(wgpu_endpoint, forwarded)?;
         if response.status == RpcStatus::Accepted {
+            self.flow_state_machine = Some(NuiFlowStateMachineRuntime::new(&document));
+            self.flow_document = Some(document.clone());
             let mut enriched = response;
             enriched.result = Some(json!({
                 "state": "accepted",
@@ -3029,6 +3046,8 @@ impl UiRuntime {
                 None,
             );
         }
+        let mut next_flow_state_machine = self.flow_state_machine.clone();
+        let mut selected_motion = None;
         let adapter = self
             .host_adapter
             .as_mut()
@@ -3095,6 +3114,29 @@ impl UiRuntime {
                 return Ok(self.rejected(request_id, error.code, error.message));
             }
         }
+        if let UiHostInbound::SemanticIntent { event } = &inbound
+            && let (Some(document), Some(machine)) =
+                (self.flow_document.as_ref(), next_flow_state_machine.as_mut())
+        {
+            let inputs = self
+                .host_adapter
+                .as_ref()
+                .expect("host adapter is activated")
+                .snapshot()
+                .scalar_inputs;
+            if let Some(transition) = machine
+                .dispatch_semantic_event(document, &inputs, event)
+                .into_iter()
+                .next()
+                && let Some(motion_key) = transition.motion_key
+            {
+                selected_motion = document
+                    .motions
+                    .iter()
+                    .find(|motion| motion.key == motion_key)
+                    .map(|motion| motion.transition.clone());
+            }
+        }
         if let Some(context) = &context {
             self.record_interaction(
                 context,
@@ -3124,16 +3166,17 @@ impl UiRuntime {
                 Some(forwarded.request_id.clone()),
             );
         }
+        let local_semantic_event = match &inbound {
+            UiHostInbound::SemanticIntent { event } => Some(event.clone()),
+            _ => None,
+        };
         let host_response = match RpcClient::connect(host_endpoint).and_then(|mut client| client.call(&forwarded)) {
             Ok(response) => response,
-            Err(error) if matches!(inbound, UiHostInbound::SemanticIntent { .. }) => {
+            Err(_error) if local_semantic_event.is_some() => {
                 // External hosts may intentionally omit a separate domain
                 // process for a UI-only integration case. Preserve the typed
                 // semantic event and revision contract locally rather than
                 // turning a valid renderer click into a transport failure.
-                eprintln!(
-                    "[neon-ui-runtime] domain endpoint unavailable; accepting semantic UI event locally: {error}"
-                );
                 let adapter = self.host_adapter.as_ref().expect("host adapter is activated");
                 let input_revision = adapter.snapshot().scalar_inputs.input_revision;
                 RpcResponse {
@@ -3266,6 +3309,9 @@ impl UiRuntime {
                 ));
             }
         };
+        let semantic_input_revision = publication_result
+            .as_ref()
+            .map(|publication| publication.snapshot.scalar_inputs.input_revision.0);
         let mut updated = if let Some(update) = replacement {
             let (replacement_adapter, replacement_fragment) =
                 match candidate.apply_presentation_update(update, &fragment) {
@@ -3291,6 +3337,9 @@ impl UiRuntime {
             );
             updated
         };
+        if let Some(motion) = selected_motion.clone() {
+            apply_transition_to_fragment(&mut updated, motion);
+        }
         if let Some(publication_result) = publication_result {
             for effect in &mut updated.effects {
                 if let UiEffect::DataGridFrame { declaration, frame } = effect
@@ -3403,8 +3452,12 @@ impl UiRuntime {
         }
         if response.status == RpcStatus::Accepted {
             self.host_adapter = Some(candidate);
+            self.flow_state_machine = next_flow_state_machine;
             if let Some(semantic_feedback) = semantic_feedback {
-                response.result = Some(json!({"semantic_intent": semantic_feedback}));
+                response.result = Some(json!({
+                    "semantic_intent": semantic_feedback,
+                    "input_revision": semantic_input_revision,
+                }));
             }
             self.idempotent_responses
                 .insert(idempotency_key, response.clone());
@@ -3934,7 +3987,26 @@ impl UiRuntime {
         };
         match adapter.apply_external_input(frame) {
             Ok(result) => self.accepted(request.request_id, json!(result)),
-            Err(error) => self.rejected(request.request_id, error.code, error.message),
+            Err(error) => {
+                let current_input_revision = self
+                    .host_adapter
+                    .as_ref()
+                    .map(|adapter| adapter.snapshot().scalar_inputs.input_revision)
+                    .unwrap_or(Revision(0));
+                self.rejected_at_revision(
+                    request.request_id,
+                    error.code,
+                    error.message,
+                    current_input_revision,
+                    Some(json!({
+                        "expected_program_revision": self
+                            .host_adapter
+                            .as_ref()
+                            .map(|adapter| adapter.program().clone()),
+                        "expected_input_revision": current_input_revision,
+                    })),
+                )
+            }
         }
     }
 
@@ -4065,6 +4137,30 @@ impl UiRuntime {
                 code: code.into(),
                 message: message.into(),
                 current_revision: Some(self.debug_snapshot().revision),
+                object_id: None,
+            }),
+        }
+    }
+
+    fn rejected_at_revision(
+        &mut self,
+        request_id: RequestId,
+        code: &str,
+        message: &str,
+        current_revision: Revision,
+        result: Option<Value>,
+    ) -> RpcResponse {
+        self.record_receipt(&request_id, CommandState::Rejected, Some(code.into()));
+        RpcResponse {
+            request_id,
+            status: RpcStatus::Rejected,
+            revision: Some(current_revision),
+            result,
+            snapshot: None,
+            error: Some(RpcError {
+                code: code.into(),
+                message: message.into(),
+                current_revision: Some(current_revision),
                 object_id: None,
             }),
         }
