@@ -2331,6 +2331,47 @@ struct ExternalFrameTiming {
     skipped_throttled: bool,
 }
 
+/// Per-frame counters aggregated over a 60-frame window. Every 60 render
+/// frames the headless render loop emits a single structured `ui_perf_window`
+/// JSONL line with these counters. This replaces the earlier human-readable
+/// `eprintln!` summary so automated probes can consume the data.
+#[cfg(windows)]
+#[derive(Default, Clone, Debug)]
+struct UiPerfCounters {
+    /// Total frames attempted (including skipped and dropped).
+    render_frames: u64,
+    /// Frames that actually produced a color pass (not skipped, not dropped).
+    rendered_frames: u64,
+    /// Frames where all ring buffers were busy.
+    dropped_frames: u64,
+    /// Frames skipped because the snapshot was unchanged and no animation active.
+    skipped_static_frames: u64,
+    /// Frames skipped by the 16ms throttle.
+    skipped_throttled_frames: u64,
+    /// wgpu.world.camera.submit_frame requests received.
+    camera_frames_received: u64,
+    /// wgpu.world.ui.anchor.submit(_batch) requests received.
+    anchor_batches_received: u64,
+    /// Pointer down events received.
+    pointer_down_received: u64,
+    /// Pointer up events received.
+    pointer_up_received: u64,
+    /// Semantic click events resolved from pointer hits.
+    semantic_clicks: u64,
+    /// Unified ID pass executions (one per rendered frame with external ID targets).
+    unified_id_passes: u64,
+    /// Draw calls in the ID pass (should be 1 for the batch).
+    unified_id_draw_calls: u64,
+    /// Instance count in the ID pass.
+    unified_id_instances: u64,
+    /// ID readback operations (one per pointer down).
+    unified_id_readbacks: u64,
+    /// Presentation transitions started.
+    transition_begins: u64,
+    /// Presentation transitions completed.
+    transition_ends: u64,
+}
+
 #[cfg(windows)]
 struct HeadlessExternalGpu {
     device: wgpu::Device,
@@ -2357,6 +2398,19 @@ struct HeadlessExternalGpu {
     last_rendered_all_surfaces: bool,
     frame_timings: VecDeque<ExternalFrameTiming>,
     started_at: Instant,
+    perf: UiPerfCounters,
+    /// Frame sequence of the latest completed persistent unified ID texture.
+    /// The render loop owns the ID pass; pointer events only read a pixel from
+    /// the most recent completed frame and pair it with `id_frame_bindings`
+    /// from the same frame (never a fresh redraw on pointer down).
+    id_frame_sequence: u64,
+    /// Binding map of the latest completed unified ID frame. Paired with
+    /// `id_frame_sequence` so a pointer readback and its numeric-ID lookup
+    /// always come from the same composition frame.
+    id_frame_bindings: std::collections::HashMap<u32, UiHitBinding>,
+    /// False until the render loop has produced at least one completed ID
+    /// frame into `pointer_hit_target`.
+    id_frame_ready: bool,
 }
 
 #[cfg(windows)]
@@ -2426,51 +2480,35 @@ impl HeadlessExternalGpu {
             last_rendered_all_surfaces: false,
             frame_timings: VecDeque::new(),
             started_at: Instant::now(),
+            perf: UiPerfCounters::default(),
+            id_frame_sequence: 0,
+            id_frame_bindings: std::collections::HashMap::new(),
+            id_frame_ready: false,
         })
     }
 
-    fn read_pointer_hit_id(
+    /// Reads a single pixel from the latest completed unified ID frame. The
+    /// render loop owns the ID pass; pointer-down events must NOT redraw the
+    /// whole ID image (plan §4.1). This only copies one pixel and maps the
+    /// readback buffer, then returns the numeric ID (RENDER_HIT_NONE on miss).
+    fn read_completed_id_frame(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         pointer_hit_target: &wgpu::Texture,
-        pointer_hit_target_view: &wgpu::TextureView,
+        id_frame_ready: bool,
         renderer: &mut UiWgpuRenderer,
-        fragments: &HashMap<UiFragmentId, UiFragment>,
         pixel: [f32; 2],
-        time_seconds: f32,
     ) -> Result<u32, String> {
+        if !id_frame_ready {
+            return Err("pointer_id_frame_unavailable".into());
+        }
         let x = pixel[0].clamp(0.0, 1279.0) as u32;
         let y = pixel[1].clamp(0.0, 719.0) as u32;
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("neon3-external-pointer-hit-readback"),
         });
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("neon3-external-pointer-hit-pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: pointer_hit_target_view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            renderer.draw_hit_id(
-                device,
-                queue,
-                &mut pass,
-                fragments,
-                [1280, 720],
-                [1280.0, 720.0],
-                time_seconds,
-            );
-        }
+        // No clear, no draw: the persistent `pointer_hit_target` already
+        // contains the current frame's unified ID content from `render()`.
         let Some(slot) = renderer.enqueue_hit_readback(&mut encoder, pointer_hit_target, [x, y])
         else {
             return Err("pointer_hit_readback_busy".into());
@@ -2511,16 +2549,17 @@ impl HeadlessExternalGpu {
         // kinds and prevents parent/node bubbling from producing a second hit.
         self.ui.invalidate_plan();
         let id_hit = match event.event_type {
-            UiPointerEventType::Down => Some(Self::read_pointer_hit_id(
-                &self.device,
-                &self.queue,
-                &self.pointer_hit_target,
-                &self.pointer_hit_target_view,
-                &mut self.ui,
-                fragments,
-                event.pixel,
-                now,
-            )?),
+            UiPointerEventType::Down => {
+                self.perf.unified_id_readbacks += 1;
+                Some(Self::read_completed_id_frame(
+                    &self.device,
+                    &self.queue,
+                    &self.pointer_hit_target,
+                    self.id_frame_ready,
+                    &mut self.ui,
+                    event.pixel,
+                )?)
+            }
             UiPointerEventType::Enter
             | UiPointerEventType::Move
             | UiPointerEventType::Up
@@ -2537,6 +2576,7 @@ impl HeadlessExternalGpu {
                 Ok(json!({"state": "observed"}))
             }
             UiPointerEventType::Down => {
+                self.perf.pointer_down_received += 1;
                 if !matches!(event.button, Some(neon_ui_schema::UiPointerButton::Primary)) {
                     return Err("ui_pointer_button_unsupported".into());
                 }
@@ -2555,7 +2595,18 @@ impl HeadlessExternalGpu {
                 self.captured_binding = self
                     .input
                     .capture_id
-                    .and_then(|hit_id| ui.hit_binding(hit_id));
+                    .and_then(|hit_id| {
+                        // Numeric ID -> binding must come from the same frame
+                        // that produced the readback pixel. `id_frame_bindings`
+                        // is the snapshot taken by `render()` together with the
+                        // persistent ID texture, so the pairing is exact. Fall
+                        // back to the live renderer map only if the paired map
+                        // lacks the id (defensive; should not happen normally).
+                        self.id_frame_bindings
+                            .get(&hit_id)
+                            .cloned()
+                            .or_else(|| ui.hit_binding(hit_id))
+                    });
                 if self.captured_binding.is_none() {
                     let _ = self.input.pointer_up(false);
                     return Err("press_without_semantic_binding".into());
@@ -2567,6 +2618,7 @@ impl HeadlessExternalGpu {
                 Ok(json!({"state": "captured"}))
             }
             UiPointerEventType::Up => {
+                self.perf.pointer_up_received += 1;
                 let capture_id = self.input.capture_id;
                 let binding = self
                     .captured_binding
@@ -2586,6 +2638,7 @@ impl HeadlessExternalGpu {
                 let Some(intent) = binding.intent else {
                     return Ok(json!({"state": "released"}));
                 };
+                self.perf.semantic_clicks += 1;
                 self.next_semantic_sequence = self.next_semantic_sequence.saturating_add(1);
                 let event_id = format!("wgpu-pointer-click-{}", self.next_semantic_sequence);
                 if binding.node_path.ends_with("/p0")
@@ -3076,13 +3129,58 @@ impl HeadlessExternalGpu {
                     [id_shared.width as f32, id_shared.height as f32],
                     time_seconds,
                 );
+                self.perf.unified_id_passes += 1;
                 timing.hit_pass_ms += stage.elapsed().as_secs_f32() * 1000.0;
                 drop(id_pass);
+                self.perf.unified_id_instances = (self
+                    .ui
+                    .hit_binding_count() as u64)
+                    .max(self.perf.unified_id_instances);
                 id_shared.frame_sequence = frame_sequence;
                 hal_queue.add_signal_fence(id_shared.fence.clone(), frame_sequence);
             }
             shared.frame_sequence = frame_sequence;
             hal_queue.add_signal_fence(shared.fence.clone(), shared.frame_sequence);
+        }
+        // Persistent unified ID frame: re-emit the same unified ID pass into the
+        // process-local pointer texture so pointer-down events can read a single
+        // pixel of an already-completed frame instead of redrawing the whole ID
+        // image on every click (plan §4.1 / §4.4). Both the external ring
+        // buffers and this local frame come from the same `unified_hit_fragments`
+        // at the same frame sequence, so a pointer readback and its binding map
+        // lookup pair to the same composition frame.
+        if has_external_id_targets {
+            let pointer_view = self.pointer_hit_target_view.clone();
+            let mut pointer_id_pass =
+                encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("neon3-headless-external-pointer-id-frame"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &pointer_view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+            self.ui.draw_hit_id(
+                &self.device,
+                &self.queue,
+                &mut pointer_id_pass,
+                &unified_hit_fragments,
+                [1280, 720],
+                [1280.0, 720.0],
+                time_seconds,
+            );
+            drop(pointer_id_pass);
+            self.id_frame_sequence = frame_sequence;
+            self.id_frame_bindings = self.ui.hit_bindings_snapshot();
+            self.id_frame_ready = true;
         }
         self.queue.submit(Some(encoder.finish()));
         let stage_timings = self.screen_ui.last_stage_timings();
@@ -3140,6 +3238,32 @@ impl HeadlessExternalGpu {
             "frame_sequence": self.next_external_frame_sequence,
             "world_ui": self.world_ui.depth_diagnostics(),
             "screen_ui": self.screen_ui.depth_diagnostics(),
+        })
+    }
+
+    /// Returns the latest completed unified ID frame snapshot for diagnostics.
+    /// Only used by the `debug.unified_id.inspect` RPC method (plan §5.3).
+    /// Exposes numeric_id, node_path, and intent; never exposes bounds, clip,
+    /// or renderer-local topology to the protocol.
+    pub(crate) fn unified_id_inspect(&self) -> Value {
+        let id_map = self
+            .id_frame_bindings
+            .iter()
+            .filter(|(numeric_id, _)| **numeric_id != RENDER_HIT_NONE)
+            .map(|(numeric_id, binding)| {
+                json!({
+                    "numeric_id": numeric_id,
+                    "node_path": binding.node_path,
+                    "intent": binding.intent.as_ref().map(|intent| format!("{intent:?}")),
+                    "interaction_key": binding.node_path.rsplit('/').next().unwrap_or(""),
+                })
+            })
+            .collect::<Vec<_>>();
+        json!({
+            "frame_sequence": self.id_frame_sequence,
+            "ready": self.id_frame_ready,
+            "binding_count": self.id_frame_bindings.len(),
+            "id_map": id_map,
         })
     }
 
@@ -3221,7 +3345,7 @@ pub fn spawn_headless_external_server(
                         let mut dropped = false;
                         let mut skipped_static = false;
                         let mut skipped_throttled = false;
-                        let lock_wait_ms = loop {
+                        let (lock_wait_ms, gpu_perf) = loop {
                             match render_gpu.try_lock() {
                                 Ok(mut gpu) => {
                                     let wait_ms =
@@ -3238,7 +3362,26 @@ pub fn spawn_headless_external_server(
                                     dropped = gpu.last_frame_dropped();
                                     skipped_static = gpu.last_frame_skipped_static();
                                     skipped_throttled = gpu.last_frame_skipped_throttled();
-                                    break wait_ms;
+                                    // Update GPU-side perf counters inside the lock.
+                                    gpu.perf.render_frames += 1;
+                                    if dropped {
+                                        gpu.perf.dropped_frames += 1;
+                                    } else if skipped_static {
+                                        gpu.perf.skipped_static_frames += 1;
+                                    } else if skipped_throttled {
+                                        gpu.perf.skipped_throttled_frames += 1;
+                                    } else {
+                                        gpu.perf.rendered_frames += 1;
+                                    }
+                                    // Track camera/anchor from the runtime.
+                                    if let Ok(runtime) = render_runtime.lock() {
+                                        gpu.perf.camera_frames_received =
+                                            runtime.camera_frames_received;
+                                        gpu.perf.anchor_batches_received =
+                                            runtime.anchor_batches_received;
+                                    }
+let perf = gpu.perf.clone();
+                    break (wait_ms, perf);
                                 }
                                 Err(std::sync::TryLockError::WouldBlock) => {
                                     std::thread::yield_now();
@@ -3267,20 +3410,42 @@ pub fn spawn_headless_external_server(
                             diag_skipped_throttled += 1;
                         }
                         if diag_frames >= 60 {
-                            eprintln!(
-                                "[neon-wgpu-runtime] render diag: window={} frames interval avg={:.1}ms max={:.1}ms | snapshot avg={:.2}ms max={:.2}ms | render(total incl lock) avg={:.2}ms max={:.2}ms | lock_wait avg={:.2}ms max={:.2}ms | dropped={} static_skip={} throttled={}",
-                                diag_frames,
-                                diag_interval_sum_ms / diag_frames as f32,
-                                diag_interval_max_ms,
-                                diag_snapshot_sum_ms / diag_frames as f32,
-                                diag_snapshot_max_ms,
-                                diag_render_sum_ms / diag_frames as f32,
-                                diag_render_max_ms,
-                                diag_lock_wait_sum_ms / diag_frames as f32,
-                                diag_lock_wait_max_ms,
-                                diag_dropped,
-                                diag_skipped_static,
-                                diag_skipped_throttled,
+                            // Structured JSONL window — replaces the earlier
+                            // human-only eprintln! so automated probes can
+                            // consume frame-pacing and GPU-cost data.
+                            let avg_interval = diag_interval_sum_ms / diag_frames as f32;
+                            let avg_snapshot = diag_snapshot_sum_ms / diag_frames as f32;
+                            let avg_render = diag_render_sum_ms / diag_frames as f32;
+                            let avg_lock = diag_lock_wait_sum_ms / diag_frames as f32;
+                            println!(
+                                "{}",
+                                serde_json::json!({
+                                    "event": "ui_perf_window",
+                                    "window_frames": diag_frames,
+                                    "rendered_frames": gpu_perf.rendered_frames,
+                                    "dropped_frames": gpu_perf.dropped_frames,
+                                    "skipped_static_frames": gpu_perf.skipped_static_frames,
+                                    "skipped_throttled_frames": gpu_perf.skipped_throttled_frames,
+                                    "camera_frames_received": gpu_perf.camera_frames_received,
+                                    "anchor_batches_received": gpu_perf.anchor_batches_received,
+                                    "unified_id_passes": gpu_perf.unified_id_passes,
+                                    "unified_id_instances": gpu_perf.unified_id_instances,
+                                    "pointer_down_received": gpu_perf.pointer_down_received,
+                                    "semantic_clicks": gpu_perf.semantic_clicks,
+                                    "transition_begins": gpu_perf.transition_begins,
+                                    "transition_ends": gpu_perf.transition_ends,
+                                    "interval_avg_ms": format!("{:.1}", avg_interval),
+                                    "interval_max_ms": format!("{:.1}", diag_interval_max_ms),
+                                    "snapshot_avg_ms": format!("{:.2}", avg_snapshot),
+                                    "snapshot_max_ms": format!("{:.2}", diag_snapshot_max_ms),
+                                    "render_avg_ms": format!("{:.2}", avg_render),
+                                    "render_max_ms": format!("{:.2}", diag_render_max_ms),
+                                    "lock_wait_avg_ms": format!("{:.2}", avg_lock),
+                                    "lock_wait_max_ms": format!("{:.2}", diag_lock_wait_max_ms),
+                                    "diag_dropped": diag_dropped,
+                                    "diag_skipped_static": diag_skipped_static,
+                                    "diag_skipped_throttled": diag_skipped_throttled,
+                                })
                             );
                             diag_frames = 0;
                             diag_interval_sum_ms = 0.0;
@@ -3330,6 +3495,11 @@ pub fn spawn_headless_external_server(
                         "render.depth_probe" => {
                             let request_id = request.request_id;
                             let result = gpu.lock().expect("gpu lock").depth_probe();
+                            runtime.lock().expect("runtime lock").accept(request_id, result)
+                        }
+                        "debug.unified_id.inspect" => {
+                            let request_id = request.request_id;
+                            let result = gpu.lock().expect("gpu lock").unified_id_inspect();
                             runtime.lock().expect("runtime lock").accept(request_id, result)
                         }
                         "ui.host.pointer_event" => {
@@ -7564,6 +7734,15 @@ pub struct WgpuRuntime {
     world_bridge: WorldInformationBridge,
     world_ui_lab_camera: Arc<Mutex<WorldUiLabCameraController>>,
     viewport: [u32; 2],
+
+    // Performance counters updated by the RPC handlers and sampled by the
+    // headless render loop's 60-frame ui_perf_window. These are monotonic
+    // counters that only advance; the render loop reads the latest value.
+    camera_frames_received: u64,
+    anchor_batches_received: u64,
+    pointer_down_received: u64,
+    pointer_up_received: u64,
+    semantic_clicks: u64,
 }
 
 impl WgpuRuntime {
@@ -7586,6 +7765,11 @@ impl WgpuRuntime {
             // projected in the shared-texture viewport, not the window lab's
             // historical 1280x800 viewport.
             viewport: [1280, 720],
+            camera_frames_received: 0,
+            anchor_batches_received: 0,
+            pointer_down_received: 0,
+            pointer_up_received: 0,
+            semantic_clicks: 0,
         }
     }
 
@@ -8273,12 +8457,15 @@ impl WgpuRuntime {
                 self.configure_world_information(request_id, request.params)
             }
             "wgpu.world.camera.submit_frame" => {
+                self.camera_frames_received += 1;
                 self.submit_world_camera_frame(request_id, request.params)
             }
             "wgpu.world.ui.anchor.submit" => {
+                self.anchor_batches_received += 1;
                 self.submit_world_ui_anchor(request_id, request.params)
             }
             "wgpu.world.ui.anchor.submit_batch" => {
+                self.anchor_batches_received += 1;
                 self.submit_world_ui_anchor_batch(request_id, request.params)
             }
             "wgpu.resource.inspect" => self.resource_inspect(request_id),

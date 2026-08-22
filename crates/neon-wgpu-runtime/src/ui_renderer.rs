@@ -1525,6 +1525,19 @@ impl UiWgpuRenderer {
         self.hit_bindings.get(&hit_id).cloned()
     }
 
+    /// Number of hit bindings in the current ID frame. Used by the headless
+    /// render loop's perf counters to report `unified_id_instances`.
+    pub(crate) fn hit_binding_count(&self) -> usize {
+        self.hit_bindings.len()
+    }
+
+    /// Snapshot of the binding map for the last ID pass. Used to pair a
+    /// completed unified ID frame with its numeric-ID -> semantic binding map
+    /// so a pointer readback and its lookup come from the same frame.
+    pub(crate) fn hit_bindings_snapshot(&self) -> std::collections::HashMap<u32, UiHitBinding> {
+        self.hit_bindings.clone()
+    }
+
     /// Makes CPU-side pointer handling independent of a prior redraw or GPU hit readback.
     /// Rendering still performs the full composed visual pass; this prepares the current
     /// declaration sample and its renderer-local semantic bindings for an incoming press.

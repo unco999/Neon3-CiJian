@@ -944,36 +944,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "neon-gpu"
-version = "0.1.0"
-dependencies = [
- "bytemuck",
- "pollster",
- "thiserror 2.0.20",
- "wgpu",
- "wgpu-hal",
-]
-
-[[package]]
-name = "neon-gpu-exec"
-version = "0.1.0"
-dependencies = [
- "bytemuck",
- "neon-gpu",
- "neon-gpu-script",
- "pollster",
- "thiserror 2.0.20",
- "wgpu",
-]
-
-[[package]]
-name = "neon-gpu-script"
-version = "0.1.0"
-dependencies = [
- "thiserror 2.0.20",
-]
-
-[[package]]
 name = "neon-ipc"
 version = "0.1.0"
 dependencies = [

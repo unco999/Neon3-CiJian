@@ -1,9 +1,0 @@
-[package]
-name = "neon-gpu-script"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-description = "Neon3 GPU script language: lexer, parser, SSA IR, dataflow graph and wave planning"
-
-[dependencies]
-thiserror = "2"
