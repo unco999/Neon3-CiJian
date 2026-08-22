@@ -1,5 +1,5 @@
-# Unified declarative component gallery. Every control uses a typed input binding
-# and a semantic intent; no renderer identity or domain-specific rule is present.
+# 宫崎骏风格海滨小镇 · 汤屋商店街。所有控件仍绑定类型化 input + 语义 intent；
+# 视觉主题从暗色工作台升级为温暖治愈的和风小镇，无 renderer 身份或领域规则。
 version 1
 surface surface.component-gallery revision 1
 flow component-gallery
@@ -21,85 +21,108 @@ input progress_value f32:0..1 default 0.68
 input asset_window grid default grid:empty
 resource gallery-image image
 resource world-ui-lab.preview render_surface
+machine town_tabs initial beta
+state town_tabs alpha
+state town_tabs gamma
+sync town_tabs when $tabs_choice=alpha -> alpha
+sync town_tabs when $tabs_choice=beta -> beta
+sync town_tabs when $tabs_choice=gamma -> gamma
 drag compass-drag source backpack-compass axis both snap 0 threshold 3 within surface
 drag potion-drag source backpack-potion axis both snap 0 threshold 3 within surface
 drag gem-drag source backpack-gem axis both snap 0 threshold 3 within surface
 drop equipment-compass-drop target equipment-zone accepts compass-drag placement into present equipment-item-template emit inventory.item.equip
 drop crafting-potion-drop target crafting-zone accepts potion-drag placement into present crafting-item-template emit inventory.item.craft
 drop discard-gem-drop target discard-zone accepts gem-drag placement into present discarded-item-template emit inventory.item.discard
-surface component-gallery overlay minw 2048 h 1080 align stretch clip scroll fill #17201E
-  panel gallery-layout row minw 2048 gap 12 pad 16 align stretch fill #17201E
-    scroll gallery-controls column minw 360 maxw 430 grow 1 shrink 0 gap 6 pad 10 align stretch fill #1D2A28
-      text gallery-title h 28 value "Component Gallery"
-      button action-button h 30 checked $feature_enabled enabled $controls_enabled value "Toggle feature" event gallery.button.activate
+surface component-gallery overlay minw 2048 h 1080 align stretch clip scroll fill #A8D8E8
+  panel gallery-layout row minw 2048 gap 12 pad 16 align stretch fill #A8D8E8
+    scroll gallery-controls column minw 360 maxw 430 grow 1 shrink 0 gap 6 pad 10 align stretch fill #F6EBD8 line #C89B6B
+      panel sky-banner row h 64 pad 10 gap 10 align center fill #A8D8E8 line #7FB5C9
+        text sky-title value "宫崎小镇 · 汤屋商店街"
+        text sky-subtitle value "海风 云影 与一盏暖灯"
+      button action-button h 30 checked $feature_enabled enabled $controls_enabled value "点亮灯笼" event gallery.button.activate
       input gallery-text h 32 enabled $controls_enabled value $gallery_text event gallery.text.commit
       text status-gallery_text h 18 value "Text input: empty"
-      progress_bar gallery-progress h 24 numeric $progress_value enabled $controls_enabled value "Progress"
+      progress_bar gallery-progress h 24 numeric $progress_value enabled $controls_enabled value "温泉水位"
       text status-progress_value h 18 value "progress_value: 0.68"
-      panel image-preview column h 126 gap 6 pad 8 align stretch fill #243634 line #46766D
-        text image-preview-title h 18 value "Image preview"
-        image gallery-image h 88 resource gallery-image fill #315360 line #76B7BE
-      checkbox feature-toggle h 30 checked $feature_enabled enabled $controls_enabled value "Enable feature" event gallery.checkbox.toggle
+      panel image-preview column h 126 gap 6 pad 8 align stretch fill #FDF9F2 line #C89B6B
+        text image-preview-title h 18 value "店铺招牌"
+        image gallery-image h 88 resource gallery-image fill #F0E4CE line #B8845C
+      checkbox feature-toggle h 30 checked $feature_enabled enabled $controls_enabled value "营业中" event gallery.checkbox.toggle
       text status-feature_enabled h 18 value "feature_enabled: true"
-      radio_button mode-radio h 30 selected $radio_selected enabled $controls_enabled value "Select mode" event gallery.radio.select
+      radio_button mode-radio h 30 selected $radio_selected enabled $controls_enabled value "晴日" event gallery.radio.select
       text status-radio_selected h 18 value "radio_selected: false"
-      slider exposure-slider h 30 numeric $slider_value enabled $controls_enabled value "Exposure" event gallery.slider.commit
+      slider exposure-slider h 30 numeric $slider_value enabled $controls_enabled value "天色" event gallery.slider.commit
       text status-slider_value h 18 value "slider_value: 0.5"
-      drag_value count-drag h 30 numeric $drag_value enabled $controls_enabled value "Item count" event gallery.drag_value.commit
+      drag_value count-drag h 30 numeric $drag_value enabled $controls_enabled value "柴火捆数" event gallery.drag_value.commit
       text status-drag_value h 18 value "Current count: 12"
-      combo mode-combo h 32 state $combo_choice enabled $controls_enabled value "Mode selector" event gallery.combo.select
+      combo mode-combo h 32 state $combo_choice enabled $controls_enabled value "店铺类型" event gallery.combo.select
       text status-combo_choice h 18 value "combo_choice: beta"
-      dropdown mode-dropdown h 32 state $dropdown_choice enabled $controls_enabled value "Mode menu" event gallery.dropdown.select
+      dropdown mode-dropdown h 32 state $dropdown_choice enabled $controls_enabled value "今日菜单" event gallery.dropdown.select
       text status-dropdown_choice h 18 value "dropdown_choice: beta"
-      tabs mode-tabs h 32 state $tabs_choice enabled $controls_enabled value "Mode tabs" event gallery.tabs.select
+      tabs mode-tabs h 32 state $tabs_choice enabled $controls_enabled value "游览区域" event gallery.tabs.select
       text status-tabs_choice h 18 value "Selected mode: beta"
-      selectable item-selectable h 30 selected $item_selected enabled $controls_enabled value "Selectable item" event gallery.selectable.select
+      selectable item-selectable h 30 selected $item_selected enabled $controls_enabled value "招牌选择" event gallery.selectable.select
       text status-item_selected h 18 value "item_selected: true"
-      list_box item-list h 90 state $list_choice enabled $controls_enabled value "Available modes" event gallery.list_box.select
+      list_box item-list h 90 state $list_choice enabled $controls_enabled value "货架清单" event gallery.list_box.select
       text status-list_choice h 18 value "Selected mode: beta"
-      scrollbar gallery-scroll h 20 scroll $scroll_position enabled $controls_enabled value "Scrollbar" event gallery.scrollbar.commit
-        tooltip gallery-scroll-tooltip x 0 y 26 w 184 h 34 fill #25363B value "Tooltip: local overlay"
+      scrollbar gallery-scroll h 20 scroll $scroll_position enabled $controls_enabled value "卷轴" event gallery.scrollbar.commit
+        tooltip gallery-scroll-tooltip x 0 y 26 w 184 h 34 fill #F2C94C value "卷轴：本地悬浮提示"
       text status-scroll_position h 18 value "scroll_position: 0.35"
-      panel control-reference h 132 column pad 8 gap 6 fill #243634 line #46766D
-        text control-reference-title value "Control notes"
-        text control-reference-body value "Bound state, semantic events, and local presentation stay visible in this scroll rail."
-      checkbox dialog-toggle h 30 checked $dialog_visible enabled $controls_enabled value "Open dialog" event gallery.dialog.toggle
+      panel control-reference h 132 column pad 8 gap 6 fill #FDF9F2 line #C89B6B
+        text control-reference-title value "小镇手记"
+        text control-reference-body value "暖帘、风铃与柴火。控件状态、语义事件与本地展示都留在这条卷轴里。"
+      checkbox dialog-toggle h 30 checked $dialog_visible enabled $controls_enabled value "打开告示" event gallery.dialog.toggle
     data_grid asset-grid minw 720 grow 2 shrink 0 source $asset_window capacity 80 row_height 24 overscan 20 columns "name:220:edit:64:virtual_list.name.commit,status:150:dropdown:draft|ready|archived:virtual_list.status.set,owner:130:select:virtual_list.owner.toggle,notes:260:edit:128:virtual_list.notes.commit"
-    scroll field-pack column minw 720 maxw 860 grow 1 shrink 0 pad 12 gap 10 align stretch fill #202A32 line #4E8391
-      panel pack-header row h 42 pad 8 gap 8 align center fill #293943
-        text pack-title value "Field Pack / 18.4 kg"
-        text pack-budget value "Capacity 12 / 16"
-      panel world-ui-lab-preview column h 238 shrink 0 pad 8 gap 6 align stretch fill #172531 line #4EA6BE
-        text world-ui-lab-preview-title h 20 value "World UI Lab Preview"
-        text world-ui-lab-preview-description h 18 value "Normal UI surface sampled by the world-space panel pass."
+    scroll field-pack column minw 720 maxw 860 grow 1 shrink 0 pad 12 gap 10 align stretch fill #F6EBD8 line #C89B6B
+      panel pack-header row h 42 pad 8 gap 8 align center fill #D98E73 line #A8583C
+        text pack-title value "汤屋 · 油屋"
+        text pack-budget value "客满 12 / 16"
+      branch bakery-view h 150 in town_tabs.alpha
+        panel bakery-panel column h 150 pad 10 gap 6 align stretch fill #FDF9F2 line #C89B6B
+          text bakery-heading value "面包屋 · 炉火正旺"
+          text bakery-body value "刚出炉的南瓜面包与海盐卷。"
+          progress_bar bakery-oven h 20 numeric $progress_value value "烤炉温度"
+      branch grocery-view h 150 in town_tabs.beta
+        panel grocery-panel column h 150 pad 10 gap 6 align stretch fill #FDF9F2 line #A8C8A0
+          text grocery-heading value "杂货铺 · 山货杂陈"
+          text grocery-body value "柴火、山菜与手作小物。"
+          progress_bar grocery-stock h 20 numeric $progress_value value "货架充盈"
+      branch bathhouse-view h 150 in town_tabs.gamma
+        panel bathhouse-panel column h 150 pad 10 gap 6 align stretch fill #EAF6FA line #6FA8C9
+          text bathhouse-heading value "温泉汤屋 · 雾气氤氲"
+          text bathhouse-body value "汤池水温刚好，晚风穿过暖帘。"
+          progress_bar bathhouse-water h 20 numeric $progress_value value "汤池水位"
+      panel world-ui-lab-preview column h 238 shrink 0 pad 8 gap 6 align stretch fill #EAF6FA line #6FA8C9
+        text world-ui-lab-preview-title h 20 value "World UI 温泉预览"
+        text world-ui-lab-preview-description h 18 value "普通 UI 面板经世界空间投影采样。"
         render world-ui-lab.preview h 180
-      panel backpack-items column w 636 h 196 shrink 0 pad 8 gap 8 clip none fill #18252D line #38616E
-        text backpack-heading h 22 value "Backpack items"
-        panel backpack-compass row w 620 h 42 shrink 0 pad 8 gap 8 align center fill #315360 line #76B7BE
-          text backpack-compass-name value "Brass compass"
-          text backpack-compass-meta value "Navigation / 0.2 kg"
-        panel backpack-potion row w 620 h 42 shrink 0 pad 8 gap 8 align center fill #47365A line #B48DCE
-          text backpack-potion-name value "Restoration potion"
-          text backpack-potion-meta value "Consumable / 0.6 kg"
-        panel backpack-gem row w 620 h 42 shrink 0 pad 8 gap 8 align center fill #4C4030 line #D6AA62
-          text backpack-gem-name value "Sunstone gem"
-          text backpack-gem-meta value "Crafting / 1.1 kg"
-      panel equipment-zone column h 126 pad 10 gap 6 fill #243E47 line #67B6C5
-        text equipment-heading value "Equipment bay"
-        text equipment-hint value "Compass accepts navigation gear"
+      panel backpack-items column w 636 h 196 shrink 0 pad 8 gap 8 clip none fill #FDF9F2 line #C89B6B
+        text backpack-heading h 22 value "货架 · 可拖拽的物件"
+        panel backpack-compass row w 620 h 42 shrink 0 pad 8 gap 8 align center fill #6FA8C9 line #4E8FAE
+          text backpack-compass-name value "琉璃风铃"
+          text backpack-compass-meta value "饰物 / 0.2 kg"
+        panel backpack-potion row w 620 h 42 shrink 0 pad 8 gap 8 align center fill #D98E73 line #A8583C
+          text backpack-potion-name value "南瓜面包"
+          text backpack-potion-meta value "食物 / 0.6 kg"
+        panel backpack-gem row w 620 h 42 shrink 0 pad 8 gap 8 align center fill #6FA8C9 line #4E8FAE
+          text backpack-gem-name value "银鳞海鱼"
+          text backpack-gem-meta value "渔获 / 1.1 kg"
+      panel equipment-zone column h 126 pad 10 gap 6 fill #C7DDBC line #8FB58A
+        text equipment-heading value "风铃挂架"
+        text equipment-hint value "风铃挂在檐下"
         template equipment-item-template h 44 capacity 2 key item_key overflow_summary
-          text equipment-item-template-label value "Equipped item"
-      panel crafting-zone column h 126 pad 10 gap 6 fill #3D3348 line #B48DCE
-        text crafting-heading value "Crafting satchel"
-        text crafting-hint value "Potion accepts blend ingredients"
+          text equipment-item-template-label value "已挂风铃"
+      panel crafting-zone column h 126 pad 10 gap 6 fill #F0E4CE line #C89B6B
+        text crafting-heading value "烤炉"
+        text crafting-hint value "面包送入炉中"
         template crafting-item-template h 44 capacity 2 key item_key overflow_summary
-          text crafting-item-template-label value "Crafted item"
-      panel discard-zone column grow 1 pad 10 gap 6 fill #46362E line #D8A65E
-        text discard-heading value "Drop zone"
-        text discard-hint value "Gem accepts salvage items"
+          text crafting-item-template-label value "烤制中"
+      panel discard-zone column grow 1 pad 10 gap 6 fill #A8D8E8 line #7FB5C9
+        text discard-heading value "海边"
+        text discard-hint value "海鱼放归大海"
         template discarded-item-template h 44 capacity 2 key item_key overflow_summary
-          text discarded-item-template-label value "Discarded item"
-  dialog gallery-dialog x 692 y 310 column w 296 h 184 pad 14 gap 10 align stretch visible $dialog_visible fill #263334 line #66B7A0
-    text dialog-title h 26 value "Dialog example"
-    text dialog-body h 48 value "This dialog blocks the gallery behind it."
-    checkbox dialog-close h 32 checked $dialog_visible value "Close dialog" event gallery.dialog.toggle
+          text discarded-item-template-label value "放归"
+  dialog gallery-dialog x 692 y 310 column w 296 h 184 pad 14 gap 10 align stretch visible $dialog_visible fill #FDF9F2 line #C89B6B
+    text dialog-title h 26 value "町内告示"
+    text dialog-body h 48 value "今日町会：黄昏后在汤屋前集合看烟火。"
+    checkbox dialog-close h 32 checked $dialog_visible value "收起告示" event gallery.dialog.toggle
