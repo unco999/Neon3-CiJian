@@ -3,9 +3,10 @@
 use std::{
     collections::{HashMap, VecDeque},
     net::SocketAddr,
+    sync::{Arc, Mutex},
 };
 
-use neon_ipc::{RpcServer, TransportError};
+use neon_ipc::{BlockingRpcServer, TransportError};
 use neon_observability::{
     CommandJournal, CommandReceipt, CommandState, DebugSnapshot, EVENT_COMMAND_ACCEPTED,
     EVENT_COMMAND_RECEIVED, EVENT_COMMAND_REJECTED, JournalFilter, TraceLevel,
@@ -368,13 +369,14 @@ impl Projectd {
 }
 
 pub fn serve(endpoint: SocketAddr, epoch: u64) -> Result<(), TransportError> {
-    let server = RpcServer::bind(endpoint)?;
-    let mut service = Projectd::fixture(epoch);
-    service.set_endpoint(server.local_addr()?);
-    server.serve_until(|request| {
-        let shutdown = request.method == "service.shutdown";
-        (service.handle(request), !shutdown)
-    })
+    let server = BlockingRpcServer::bind(endpoint)?;
+    let service = Arc::new(Mutex::new(Projectd::fixture(epoch)));
+    {
+        let mut guard = service.lock().unwrap();
+        guard.set_endpoint(server.local_addr()?);
+    }
+    let handler = move |request| service.lock().unwrap().handle(request);
+    server.serve_until(handler, |request| request.method == "service.shutdown")
 }
 
 fn key(asset: &AssetRef) -> (String, u64, u64, String) {

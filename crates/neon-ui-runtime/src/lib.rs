@@ -3,6 +3,7 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     net::SocketAddr,
+    sync::mpsc::{self, Receiver, Sender},
 };
 
 use neon_ipc::{RpcClient, RpcServer, TransportError};
@@ -64,7 +65,8 @@ pub mod nui_flow;
 pub mod nui_state_machine;
 pub mod terrain_workbench;
 pub use event_publisher::{EVENT_VARIABLE_CHANGED, FLOW_EVENT_PREFIX, UiVariableEventPublisher};
-use host_adapter::{UiHostAdapter, UiHostAdapterConfig};
+use host_adapter::UiHostAdapter;
+pub use host_adapter::UiHostAdapterConfig;
 pub use nui_flow::{
     NuiFlowError, apply_nui_ir_patch, bind_nui_flow_resources, compile_nui_flow_program,
     format_nui_flow, lower_nui_flow, lower_nui_flow_effects, parse_nui_flow, parse_nui_flow_patch,
@@ -142,7 +144,7 @@ struct InteractionTraceStore {
     records: VecDeque<InteractionTraceRecord>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct InteractionTraceContext {
     interaction_id: InteractionId,
     semantic_target: Option<InteractionSemanticTarget>,
@@ -1313,7 +1315,10 @@ fn input_value_as_event_payload(value: &UiInputValue) -> Option<UiSemanticPayloa
     })
 }
 
-fn apply_transition_to_fragment(fragment: &mut UiFragment, motion: &PendingStateMotion) {
+fn apply_transitions_to_fragment(fragment: &mut UiFragment, motions: &[PendingStateMotion]) {
+    if motions.is_empty() {
+        return;
+    }
     let numeric_nodes = fragment
         .effects
         .iter()
@@ -1328,7 +1333,7 @@ fn apply_transition_to_fragment(fragment: &mut UiFragment, motion: &PendingState
 
     fn apply(
         node: &mut UiNode,
-        motion: &PendingStateMotion,
+        motions: &[PendingStateMotion],
         numeric_nodes: &std::collections::HashSet<&str>,
         in_motion_scope: bool,
     ) {
@@ -1336,16 +1341,14 @@ fn apply_transition_to_fragment(fragment: &mut UiFragment, motion: &PendingState
         // attach a transition to every label/repeated row: that creates a
         // large active set and can turn a single panel resize into dozens of
         // unnecessary transition jobs.
-        let has_style = motion
-            .previous_styles
-            .iter()
-            .any(|style| style.node_key == node.node_id.0)
-            || motion
-                .target_styles
-                .iter()
-                .any(|style| style.node_key == node.node_id.0);
+        let motion = motions.iter().find(|motion| {
+            motion.previous_styles.iter().any(|style| style.node_key == node.node_id.0)
+                || motion.target_styles.iter().any(|style| style.node_key == node.node_id.0)
+        });
+        let has_style = motion.is_some();
         let motion_scope = in_motion_scope || has_style;
         if has_style || (motion_scope && numeric_nodes.contains(node.node_id.0.as_str())) {
+            let motion = motion.or_else(|| motions.first()).expect("motion exists");
             let mut transition = motion.transition.clone();
             // Seed the animation `from` with the previous state's style record.
             if let Some(style) = motion
@@ -1392,10 +1395,10 @@ fn apply_transition_to_fragment(fragment: &mut UiFragment, motion: &PendingState
             node.enter_transition = Some(transition);
         }
         for child in &mut node.children {
-            apply(child, motion, numeric_nodes, motion_scope);
+            apply(child, motions, numeric_nodes, motion_scope);
         }
     }
-    apply(&mut fragment.root, motion, &numeric_nodes, false);
+    apply(&mut fragment.root, motions, &numeric_nodes, false);
 }
 
 /// Stable string name of an input kind, used in `nui.variable.changed` payloads.
@@ -2610,6 +2613,38 @@ struct PendingStateMotion {
     target_styles: Vec<NuiFlowStateStyle>,
 }
 
+impl PendingStateMotion {
+    /// Stable presentation scope for coalescing repeated clicks on one panel.
+    /// State-style node keys are panel-local and remain stable across fragment
+    /// revisions; motions for different panels must never replace each other.
+    fn scope_key(&self) -> String {
+        self.target_styles
+            .first()
+            .or_else(|| self.previous_styles.first())
+            .map(|style| style.node_key.clone())
+            .unwrap_or_else(|| {
+                self.transition
+                    .motion_key
+                    .clone()
+                    .unwrap_or_else(|| "anonymous-motion".into())
+            })
+    }
+}
+
+/// A host-forward deferred to the next service tick. The pointer lane returns
+/// `accepted` as soon as the presentation motion has been submitted to the
+/// renderer; the host RPC and its publication application run later from the
+/// queue so a slow/rejected/offline host never blocks the next pointer.
+#[derive(Clone, Debug)]
+struct PendingHostForward {
+    prep: ForwardHostPrep,
+}
+
+struct HostForwardCompletion {
+    prep: ForwardHostPrep,
+    response: Result<RpcResponse, TransportError>,
+}
+
 pub struct UiRuntime {
     epoch: u64,
     client: ClientIdentity,
@@ -2631,7 +2666,35 @@ pub struct UiRuntime {
     /// not yet been applied to a fragment carrying the updated authoritative
     /// inputs. Set during `forward_host_request`; consumed and cleared by
     /// `handle_external_input_frame` after the next input frame arrives.
-    pending_motion: Option<PendingStateMotion>,
+    pending_motions: Vec<PendingStateMotion>,
+    /// Deferred host forward + publication application. Pointer-lane inbound
+    /// requests enqueue here and return `accepted` immediately; the queue is
+    /// drained on the next service tick so the next pointer never waits for a
+    /// host response.
+    pending_host_forwards: VecDeque<PendingHostForward>,
+    /// When `true`, `forward_host_request` enqueues the host forward for
+    /// pointer-derived inbounds and returns `accepted` immediately. The
+    /// `serve_forwarder` path sets this; unit tests that call the method
+    /// directly keep the default synchronous behavior.
+    async_host_forward: bool,
+}
+
+/// Context captured during the sync prep phase of a host forward. The caller
+/// can either complete the host forward synchronously (direct-call tests) or
+/// enqueue the struct for deferred processing (pointer-lane server path).
+#[derive(Clone, Debug)]
+struct ForwardHostPrep {
+    request_id: RequestId,
+    idempotency_key: String,
+    host_endpoint: SocketAddr,
+    forwarded: RpcRequest,
+    local_semantic_event: Option<UiProgramSemanticEvent>,
+    selected_motions: Vec<PendingStateMotion>,
+    optimistic_motion_submitted: bool,
+    context: Option<InteractionTraceContext>,
+    semantic_feedback: Option<Value>,
+    // The state machine has already been advanced during the sync prep.
+    // The completion path only updates host_adapter + cached_fragment.
 }
 
 impl UiRuntime {
@@ -2658,7 +2721,9 @@ impl UiRuntime {
             flow_document: None,
             flow_state_machine: None,
             wgpu_endpoint: None,
-            pending_motion: None,
+            pending_motions: Vec::new(),
+            pending_host_forwards: VecDeque::new(),
+            async_host_forward: false,
         }
     }
 
@@ -2949,9 +3014,25 @@ impl UiRuntime {
         let mut runtime = Self::new(epoch, "ui-runtime-forwarder")
             .with_eventd_endpoint(eventd_endpoint)
             .with_wgpu_endpoint(wgpu_endpoint);
-        server.serve_until(|request| {
+        // Pointer-lane inbound returns `accepted` immediately after the
+        // presentation motion is submitted. Host forwarding is deferred to the
+        // next service tick so a slow host response cannot block the next
+        // pointer (plan §3.1). Completions are polled before each request and
+        // host calls run on one ordered worker so accepted publications cannot
+        // overtake one another.
+        runtime.async_host_forward = true;
+        let (host_completion_tx, host_completion_rx) = mpsc::channel();
+        let mut active_host_forwards = 0_usize;
+        let result = server.serve_until(|request| {
             let shutdown = request.method == "service.shutdown";
             let request_id = request.request_id.clone();
+            active_host_forwards = active_host_forwards.saturating_sub(
+                runtime.poll_host_forward_completions(wgpu_endpoint, &host_completion_rx),
+            );
+            if active_host_forwards == 0 {
+                active_host_forwards +=
+                    runtime.start_next_pending_host_forward(host_completion_tx.clone());
+            }
             let response = if request.method == "ui.fragment.submit" {
                 eprintln!(
                     "[neon-ui-runtime] received ui.fragment.submit request={}",
@@ -2976,6 +3057,7 @@ impl UiRuntime {
                 runtime
                     .forward_host_request(domain_endpoint, wgpu_endpoint, request)
                     .unwrap_or_else(|error| {
+                        eprintln!("[neon-ui-runtime] ui.host.inbound failed: {error}");
                         runtime.rejected(request_id, "service_unavailable", &error.to_string())
                     })
             } else if request.method == "ui.input.event" && renderer_event_targets_wgpu(&request) {
@@ -2993,8 +3075,48 @@ impl UiRuntime {
             } else {
                 runtime.handle_service_request(request)
             };
+            if shutdown {
+                // A shutdown is the one control-plane operation allowed to
+                // wait. Give already accepted host forwards a bounded window
+                // to publish their final fragments; pointer requests never
+                // enter this wait path.
+                let deadline = std::time::Instant::now()
+                    + std::time::Duration::from_secs(2);
+                while active_host_forwards > 0
+                    || !runtime.pending_host_forwards.is_empty()
+                {
+                    active_host_forwards = active_host_forwards.saturating_sub(
+                        runtime.poll_host_forward_completions(
+                            wgpu_endpoint,
+                            &host_completion_rx,
+                        ),
+                    );
+                    if active_host_forwards == 0 {
+                        active_host_forwards +=
+                            runtime.start_next_pending_host_forward(host_completion_tx.clone());
+                    }
+                    if active_host_forwards == 0 && runtime.pending_host_forwards.is_empty() {
+                        break;
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        eprintln!(
+                            "[neon-ui-runtime] shutdown timed out waiting for {} host forwards",
+                            active_host_forwards + runtime.pending_host_forwards.len()
+                        );
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                active_host_forwards = active_host_forwards.saturating_sub(
+                    runtime.poll_host_forward_completions(wgpu_endpoint, &host_completion_rx),
+                );
+            }
             (response, !shutdown)
-        })
+        });
+        if let Err(error) = &result {
+            eprintln!("[neon-ui-runtime] forwarder stopped: {error}");
+        }
+        result
     }
 
     /// Accepts NUI Flow source at runtime. Parsing, lowering, program
@@ -3197,7 +3319,7 @@ impl UiRuntime {
             );
         }
         let mut next_flow_state_machine = self.flow_state_machine.clone();
-        let mut selected_motion: Option<PendingStateMotion> = None;
+        let mut selected_motions = Vec::new();
         let adapter = self
             .host_adapter
             .as_mut()
@@ -3277,7 +3399,7 @@ impl UiRuntime {
                 .snapshot()
                 .scalar_inputs;
             let transitions = machine.dispatch_semantic_event(document, &inputs, event);
-            if let Some(transition) = transitions.into_iter().next() {
+            for transition in transitions {
                 if let Some(motion_key) = transition.motion_key {
                     let base = document
                         .motions
@@ -3290,33 +3412,30 @@ impl UiRuntime {
                             previous_styles: transition.previous_styles,
                             target_styles: transition.target_styles,
                         };
-                        selected_motion = Some(pending.clone());
-                        // Persist so the next input frame refresh can also
-                        // apply the motion with the updated authoritative inputs.
-                        // Consumed by `handle_external_input_frame`.
-                        self.pending_motion = Some(pending);
+                        selected_motions.push(pending);
                     }
                 }
-            } else if document.state_machines.iter().any(|machine| {
-                machine.transitions.iter().any(|transition| {
-                    matches!(
-                        &transition.trigger,
-                        neon_ui_schema::NuiFlowStateTrigger::Intent { name }
-                            if name == &event.intent
-                    )
-                })
-            }) {
             }
+        }
+        // Keep all panel motions until the next authoritative input frame;
+        // another click must append/retarget its panel, not overwrite the
+        // transition selected by an earlier panel in the same update window.
+        for motion in &selected_motions {
+            let scope_key = motion.scope_key();
+            self.pending_motions
+                .retain(|pending| pending.scope_key() != scope_key);
+            self.pending_motions.push(motion.clone());
         }
         // Start local presentation motion before waiting for the authoritative
         // host response. A slow domain must not delay the panel's visual state
         // transition; the later publication retargets the same renderer-owned
         // animation from its current sampled value.
-        let optimistic_motion_submitted = if let Some(motion) = selected_motion.clone()
+        let optimistic_motion_submitted = if !selected_motions.is_empty()
             && self.wgpu_endpoint.is_some()
             && self.cached_fragment.is_some()
         {
-            match self.apply_motion_to_current_fragment(motion) {
+            let motions = self.pending_motions.clone();
+            match self.apply_motions_to_current_fragment(&motions) {
                 Ok(()) => true,
                 Err(error) => {
                     eprintln!("[neon-ui] optimistic motion submit failed: {error}");
@@ -3359,16 +3478,45 @@ impl UiRuntime {
             UiHostInbound::SemanticIntent { event } => Some(event.clone()),
             _ => None,
         };
+        // Build the deferred forward context. Used by both the sync path
+        // (direct-call tests, non-pointer inbounds) and the pointer-lane
+        // async path (host RPC deferred to the next service tick).
+        let prep = ForwardHostPrep {
+            request_id: request_id.clone(),
+            idempotency_key: idempotency_key.clone(),
+            host_endpoint,
+            forwarded: forwarded.clone(),
+            local_semantic_event: local_semantic_event.clone(),
+            selected_motions: selected_motions.clone(),
+            optimistic_motion_submitted,
+            context: context.clone(),
+            semantic_feedback: semantic_feedback.clone(),
+        };
+        // Pointer-lane async path: enqueue the host forward and return
+        // `accepted` immediately. The host RPC + publication application
+        // runs on the next service tick (drained by `drain_pending_host_forwards`),
+        // so arriving pointers never wait for a slow / offline host.
+        // The state machine is advanced optimistically at enqueue time so
+        // the next pointer dispatches from the post-transition state.
+        if self.async_host_forward && matches!(&inbound, UiHostInbound::SemanticIntent { .. }) {
+            self.pending_host_forwards.push_back(PendingHostForward { prep });
+            if let Some(next) = next_flow_state_machine {
+                self.flow_state_machine = Some(next);
+            }
+            let response = self.accepted(request_id, json!({
+                "state": "accepted",
+                "semantic_intent": semantic_feedback,
+            }));
+            self.idempotent_responses.insert(idempotency_key, response.clone());
+            return Ok(response);
+        }
+        // Sync path: host RPC + publication application synchronously.
         let host_response = match RpcClient::connect(host_endpoint)
             .and_then(|client| client.with_timeout(std::time::Duration::from_millis(200)))
             .and_then(|mut client| client.call(&forwarded))
         {
             Ok(response) => response,
             Err(_error) if local_semantic_event.is_some() => {
-                // External hosts may intentionally omit a separate domain
-                // process for a UI-only integration case. Preserve the typed
-                // semantic event and revision contract locally rather than
-                // turning a valid renderer click into a transport failure.
                 let adapter = self
                     .host_adapter
                     .as_ref()
@@ -3395,6 +3543,26 @@ impl UiRuntime {
             }
             Err(error) => return Err(error.into()),
         };
+        self.complete_host_forward(wgpu_endpoint, prep, host_response, next_flow_state_machine)
+    }
+
+    /// Applies a completed host response to the runtime: parses the publication,
+    /// creates the updated fragment (with grid effects and pending motions),
+    /// submits it to the renderer, and records the interaction trace. Shared by
+    /// the synchronous forward path and the deferred pointer-lane drain.
+    fn complete_host_forward(
+        &mut self,
+        wgpu_endpoint: SocketAddr,
+        prep: ForwardHostPrep,
+        host_response: RpcResponse,
+        next_flow_state_machine: Option<NuiFlowStateMachineRuntime>,
+    ) -> Result<RpcResponse, TransportError> {
+        let request_id = prep.request_id.clone();
+        let idempotency_key = prep.idempotency_key.clone();
+        let context = prep.context.clone();
+        let forwarded = prep.forwarded.clone();
+        let selected_motions = prep.selected_motions.clone();
+        let optimistic_motion_submitted = prep.optimistic_motion_submitted;
         if host_response.status != RpcStatus::Accepted {
             if let Some(context) = &context {
                 let error = host_response
@@ -3532,10 +3700,10 @@ impl UiRuntime {
             );
             updated
         };
-        if !optimistic_motion_submitted && let Some(motion) = selected_motion.as_ref() {
-            apply_transition_to_fragment(&mut updated, &motion);
+        if !optimistic_motion_submitted && !selected_motions.is_empty() {
+            apply_transitions_to_fragment(&mut updated, &selected_motions);
         }
-        if let Some(publication_result) = publication_result {
+        if let Some(publication_result) = &publication_result {
             for effect in &mut updated.effects {
                 if let UiEffect::DataGridFrame { declaration, frame } = effect
                     && let Some(input) = publication_result
@@ -3579,7 +3747,8 @@ impl UiRuntime {
                     InteractionTraceOutcome::Rejected,
                     Some(InteractionTraceError {
                         code: "ui_host_invalid_fragment".into(),
-                        message: "host publication cannot be applied to the active fragment".into(),
+                        message: "host publication cannot be applied to the active fragment"
+                            .into(),
                     }),
                     None,
                 );
@@ -3647,8 +3816,15 @@ impl UiRuntime {
         }
         if response.status == RpcStatus::Accepted {
             self.host_adapter = Some(candidate);
-            self.flow_state_machine = next_flow_state_machine;
-            if let Some(semantic_feedback) = semantic_feedback {
+            // Deferred pointer-lane completion passes `None` because the
+            // state machine was already advanced when the request was
+            // enqueued. Do not erase it here: doing so made the next panel
+            // interaction lose its transition dispatch after the first host
+            // publication completed.
+            if let Some(next_flow_state_machine) = next_flow_state_machine {
+                self.flow_state_machine = Some(next_flow_state_machine);
+            }
+            if let Some(semantic_feedback) = prep.semantic_feedback {
                 response.result = Some(json!({
                     "semantic_intent": semantic_feedback,
                     "input_revision": semantic_input_revision,
@@ -3659,6 +3835,91 @@ impl UiRuntime {
         }
         response.request_id = request_id;
         Ok(response)
+    }
+
+    fn start_next_pending_host_forward(
+        &mut self,
+        sender: Sender<HostForwardCompletion>,
+    ) -> usize {
+        let Some(pending) = self.pending_host_forwards.pop_front() else {
+            return 0;
+        };
+        let prep = pending.prep;
+        let forwarded = prep.forwarded.clone();
+        let host_endpoint = prep.host_endpoint;
+        std::thread::spawn(move || {
+            let response = RpcClient::connect(host_endpoint)
+                .and_then(|client| client.with_timeout(std::time::Duration::from_millis(200)))
+                .and_then(|mut client| client.call(&forwarded));
+            let _ = sender.send(HostForwardCompletion { prep, response });
+        });
+        1
+    }
+
+    fn poll_host_forward_completions(
+        &mut self,
+        wgpu_endpoint: SocketAddr,
+        receiver: &Receiver<HostForwardCompletion>,
+    ) -> usize {
+        let mut completed = 0;
+        while let Ok(completion) = receiver.try_recv() {
+            completed += 1;
+            self.complete_host_forward_result(wgpu_endpoint, completion);
+        }
+        completed
+    }
+
+    fn complete_host_forward_result(
+        &mut self,
+        wgpu_endpoint: SocketAddr,
+        completion: HostForwardCompletion,
+    ) {
+        let HostForwardCompletion { prep, response } = completion;
+        let forwarded = prep.forwarded.clone();
+        let host_response = match response {
+            Ok(response) => response,
+            Err(_error) if prep.local_semantic_event.is_some() => {
+                let adapter = self
+                    .host_adapter
+                    .as_ref()
+                    .expect("host adapter is activated");
+                let input_revision = adapter.snapshot().scalar_inputs.input_revision;
+                RpcResponse {
+                    request_id: forwarded.request_id.clone(),
+                    status: RpcStatus::Accepted,
+                    revision: Some(input_revision),
+                    result: Some(json!(UiHostPublication {
+                        scalar_frame: UiInputFrame {
+                            program_revision: adapter.program().revision.clone(),
+                            expected_input_revision: input_revision,
+                            request_id: forwarded.request_id.0.clone(),
+                            idempotency_key: forwarded
+                                .idempotency_key
+                                .clone()
+                                .unwrap_or_default(),
+                            changes: Vec::new(),
+                        },
+                        grid_inputs: Vec::new(),
+                        presentation_update: None,
+                    })),
+                    error: None,
+                    snapshot: None,
+                }
+            }
+            Err(error) => {
+                eprintln!(
+                    "[neon-ui-runtime] deferred host forward failed request={} error={error}",
+                    prep.request_id.0
+                );
+                return;
+            }
+        };
+        if let Err(error) = self.complete_host_forward(wgpu_endpoint, prep, host_response, None) {
+            eprintln!(
+                "[neon-ui-runtime] deferred host forward completion failed request={} error={error}",
+                forwarded.request_id.0
+            );
+        }
     }
 
     fn ensure_host_adapter(&mut self, host_endpoint: SocketAddr) -> Result<(), TransportError> {
@@ -4187,8 +4448,9 @@ impl UiRuntime {
                 // fragment still carried the old input values, re-submit the
                 // fragment now with the updated values and the motion applied.
                 // The WGPU renderer retargets from the current displayed value.
-                if let Some(motion) = self.pending_motion.take() {
-                    if let Err(error) = self.apply_motion_to_current_fragment(motion) {
+                if !self.pending_motions.is_empty() {
+                    let motions = std::mem::take(&mut self.pending_motions);
+                    if let Err(error) = self.apply_motions_to_current_fragment(&motions) {
                         eprintln!("[neon-ui-runtime] apply_motion_to_current_fragment: {error}");
                     }
                 }
@@ -4224,9 +4486,9 @@ impl UiRuntime {
     ///
     /// Called after `handle_external_input_frame` applies the authoritative
     /// domain value update that follows a state-machine transition.
-    fn apply_motion_to_current_fragment(
+    fn apply_motions_to_current_fragment(
         &mut self,
-        motion: PendingStateMotion,
+        motions: &[PendingStateMotion],
     ) -> Result<(), String> {
         let Some(adapter) = self.host_adapter.as_ref() else {
             return Err("no active host adapter".into());
@@ -4246,7 +4508,7 @@ impl UiRuntime {
             &snapshot.scalar_inputs,
             adapter.input_schema(),
         );
-        apply_transition_to_fragment(&mut updated, &motion);
+        apply_transitions_to_fragment(&mut updated, motions);
         let submit = RpcRequest {
             protocol: "neon3.rpc".into(),
             version: PROTOCOL_VERSION,
@@ -5358,14 +5620,14 @@ mod tests {
                                 request: neon_ui_schema::UiWindowRequest::DataGrid { request },
                             } => {
                                 assert_eq!(request.source_key, "asset_window");
-                                (1, "gallery-window", frame(&host_program, 56, 1))
+                                (0, "gallery-window", frame(&host_program, 56, 1))
                             }
                             UiHostInbound::DataGridCell { event } => {
                                 assert_eq!(
                                     event.data_grid_cell.unwrap().stable_row_key,
                                     "virtual-row-56"
                                 );
-                                (2, "gallery-cell", frame(&host_program, 56, 2))
+                                (0, "gallery-cell", frame(&host_program, 56, 2))
                             }
                             UiHostInbound::DragDrop { .. } | UiHostInbound::PointerEvent { .. } => {
                                 unreachable!()
@@ -7470,7 +7732,7 @@ mod tests {
     #[test]
     fn external_input_frame_applies_pending_state_motion_and_resubmits_fragment() {
         // Verify that the core logic (refresh_fragment_from_program +
-        // apply_transition_to_fragment) correctly applies a motion to a
+        // apply_transitions_to_fragment correctly applies a motion to a
         // fragment that has been refreshed with updated input values.
         //
         // This test does NOT use mock servers; it directly invokes the
@@ -7585,7 +7847,7 @@ mod tests {
                 opacity: Some(1.0),
             }],
         };
-        apply_transition_to_fragment(&mut updated, &pending_motion);
+        apply_transitions_to_fragment(&mut updated, std::slice::from_ref(&pending_motion));
 
         // --- 8. Verify the fragment has the correct structure ---
         fn find_node<'a>(node: &'a UiNode, id: &str) -> Option<&'a UiNode> {
@@ -7628,5 +7890,432 @@ mod tests {
 
         // The fragment should have a valid revision.
         assert_eq!(updated.revision, Revision(2));
+    }
+
+    #[test]
+    fn batch_state_motions_attach_to_two_panels_without_replacing_each_other() {
+        fn panel(id: &str) -> UiNode {
+            UiNode {
+                node_id: UiNodeId(id.into()),
+                kind: UiNodeKind::Panel,
+                bounds: UiBounds {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 100.0,
+                    height: 40.0,
+                },
+                layout: None,
+                visible: true,
+                enabled: true,
+                text_key: None,
+                text: None,
+                image: None,
+                surface: None,
+                style: UiStyle::default(),
+                enter_transition: None,
+                world_depth: None,
+                children: Vec::new(),
+            }
+        }
+        let mut fragment = UiFragment {
+            fragment_id: UiFragmentId("batch-motion".into()),
+            revision: Revision(1),
+            root: UiNode {
+                node_id: UiNodeId("root".into()),
+                kind: UiNodeKind::Panel,
+                bounds: UiBounds {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 200.0,
+                    height: 100.0,
+                },
+                layout: None,
+                visible: true,
+                enabled: true,
+                text_key: None,
+                text: None,
+                image: None,
+                surface: None,
+                style: UiStyle::default(),
+                enter_transition: None,
+                world_depth: None,
+                children: vec![panel("panel-a"), panel("panel-b")],
+            },
+            effects: Vec::new(),
+        };
+        let motion = |node_key: &str, duration_ms: u32| PendingStateMotion {
+            transition: UiTransition {
+                delay_ms: 0,
+                duration_ms,
+                easing: neon_ui_schema::UiEasing::EaseOut,
+                from: UiTransitionState {
+                    bounds: None,
+                    background_color: None,
+                    border_color: None,
+                    border_width: None,
+                    corner_radius: None,
+                    opacity: None,
+                    numeric_value: None,
+                },
+                motion_key: Some(format!("motion-{node_key}")),
+            },
+            previous_styles: Vec::new(),
+            target_styles: vec![NuiFlowStateStyle {
+                node_key: node_key.into(),
+                bounds: Some(UiBounds {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 120.0,
+                    height: 60.0,
+                }),
+                background_color: None,
+                border_color: None,
+                border_width: None,
+                corner_radius: None,
+                opacity: None,
+            }],
+        };
+        let motions = vec![motion("panel-a", 180), motion("panel-b", 320)];
+        apply_transitions_to_fragment(&mut fragment, &motions);
+        assert_eq!(fragment.root.children[0].enter_transition.as_ref().unwrap().duration_ms, 180);
+        assert_eq!(fragment.root.children[1].enter_transition.as_ref().unwrap().duration_ms, 320);
+    }
+
+    #[test]
+    fn four_panel_transitions_are_collected_in_one_batch() {
+        fn panel(id: &str) -> UiNode {
+            UiNode {
+                node_id: UiNodeId(id.into()),
+                kind: UiNodeKind::Panel,
+                bounds: UiBounds {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 100.0,
+                    height: 40.0,
+                },
+                layout: None,
+                visible: true,
+                enabled: true,
+                text_key: None,
+                text: None,
+                image: None,
+                surface: None,
+                style: UiStyle::default(),
+                enter_transition: None,
+                world_depth: None,
+                children: Vec::new(),
+            }
+        }
+        let mut fragment = UiFragment {
+            fragment_id: UiFragmentId("four-panel-batch".into()),
+            revision: Revision(1),
+            root: UiNode {
+                node_id: UiNodeId("root".into()),
+                kind: UiNodeKind::Panel,
+                bounds: UiBounds {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 400.0,
+                    height: 100.0,
+                },
+                layout: None,
+                visible: true,
+                enabled: true,
+                text_key: None,
+                text: None,
+                image: None,
+                surface: None,
+                style: UiStyle::default(),
+                enter_transition: None,
+                world_depth: None,
+                children: (0..4)
+                    .map(|index| panel(&format!("panel-{index}")))
+                    .collect(),
+            },
+            effects: Vec::new(),
+        };
+        let motion = |node_key: &str, duration_ms: u32| PendingStateMotion {
+            transition: UiTransition {
+                delay_ms: 0,
+                duration_ms,
+                easing: neon_ui_schema::UiEasing::EaseOut,
+                from: UiTransitionState {
+                    bounds: None,
+                    background_color: None,
+                    border_color: None,
+                    border_width: None,
+                    corner_radius: None,
+                    opacity: None,
+                    numeric_value: None,
+                },
+                motion_key: Some(format!("motion-{node_key}")),
+            },
+            previous_styles: Vec::new(),
+            target_styles: vec![NuiFlowStateStyle {
+                node_key: node_key.into(),
+                bounds: Some(UiBounds {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 120.0,
+                    height: 60.0,
+                }),
+                background_color: None,
+                border_color: None,
+                border_width: None,
+                corner_radius: None,
+                opacity: None,
+            }],
+        };
+        let motions = vec![
+            motion("panel-0", 100),
+            motion("panel-1", 140),
+            motion("panel-2", 180),
+            motion("panel-3", 220),
+        ];
+        apply_transitions_to_fragment(&mut fragment, &motions);
+        for (index, expected) in [(0, 100), (1, 140), (2, 180), (3, 220)] {
+            let transition = fragment.root.children[index]
+                .enter_transition
+                .as_ref()
+                .expect("every panel in the batch must carry a transition");
+            assert_eq!(transition.duration_ms, expected);
+        }
+    }
+
+    #[test]
+    fn same_panel_retarget_replaces_only_same_scope() {
+        // Dispatch A1, B1, then A2. The batch must keep B1 and replace only the
+        // A scope with A2, proving per-scope dedup with no Option overwrite.
+        let motion = |node_key: &str, duration_ms: u32| PendingStateMotion {
+            transition: UiTransition {
+                delay_ms: 0,
+                duration_ms,
+                easing: neon_ui_schema::UiEasing::EaseOut,
+                from: UiTransitionState {
+                    bounds: None,
+                    background_color: None,
+                    border_color: None,
+                    border_width: None,
+                    corner_radius: None,
+                    opacity: None,
+                    numeric_value: None,
+                },
+                motion_key: Some(format!("motion-{node_key}")),
+            },
+            previous_styles: Vec::new(),
+            target_styles: vec![NuiFlowStateStyle {
+                node_key: node_key.into(),
+                bounds: None,
+                background_color: None,
+                border_color: None,
+                border_width: None,
+                corner_radius: None,
+                opacity: None,
+            }],
+        };
+        let mut pending = Vec::new();
+        for selected in [motion("panel-a", 100), motion("panel-b", 150), motion("panel-a", 200)] {
+            let scope_key = selected.scope_key();
+            pending.retain(|existing: &PendingStateMotion| existing.scope_key() != scope_key);
+            pending.push(selected);
+        }
+        assert_eq!(pending.len(), 2, "A2 and B1 must remain after A1 is replaced");
+        let scopes = pending
+            .iter()
+            .map(|motion| motion.scope_key())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            scopes,
+            std::collections::BTreeSet::from(["panel-a".to_owned(), "panel-b".to_owned()])
+        );
+        let retargeted = pending
+            .iter()
+            .find(|motion| motion.scope_key() == "panel-a")
+            .unwrap();
+        assert_eq!(retargeted.transition.duration_ms, 200);
+    }
+
+    #[test]
+    fn presentation_starts_before_host_response() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let document = parse_nui_flow(include_str!(
+            "../tests/fixtures/ui/state-motion.nui"
+        ))
+        .unwrap();
+        let program = compile_nui_flow_program(
+            &document,
+            UiProgramRevision {
+                program_id: "combined-status-test".into(),
+                revision: Revision(1),
+                schema_version: neon_ui_schema::UI_PROGRAM_SCHEMA_VERSION,
+                capabilities: [
+                    neon_ui_schema::UI_PROGRAM_CAPABILITY_NAME,
+                    neon_ui_schema::UI_PROGRAM_TEXT_REGISTRY_CAPABILITY_NAME,
+                    neon_ui_schema::UI_PROGRAM_BOUNDED_STRUCTURE_CAPABILITY_NAME,
+                    neon_ui_schema::UI_PROGRAM_SEMANTIC_EVENT_CAPABILITY_NAME,
+                ]
+                .into_iter()
+                .map(|name| UiProgramCapability {
+                    name: name.into(),
+                    version: 1,
+                    owner: UiProgramCapabilityOwner::SharedContract,
+                    status: UiProgramCapabilityStatus::Supported,
+                })
+                .collect(),
+            },
+        )
+        .unwrap();
+        let declaration = program
+            .event_records
+            .iter()
+            .find(|declaration| declaration.intent == "character.status.toggle")
+            .unwrap()
+            .clone();
+        let fragment = UiFragment {
+            fragment_id: UiFragmentId("host-route-delay".into()),
+            revision: Revision(1),
+            root: document.ir.root.clone(),
+            effects: lower_nui_flow_effects(&document),
+        };
+        let host = RpcServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let host_endpoint = host.local_addr().unwrap();
+        let schema = document.input_schema.clone();
+        let renderer_seen = Arc::new(AtomicU64::new(0));
+        let renderer_seen_for_host = renderer_seen.clone();
+        let host_thread = thread::spawn(move || {
+            let mut calls = 0u32;
+            host.serve_until(|request| {
+                calls += 1;
+                let shutdown = calls >= 2;
+                let response = match request.method.as_str() {
+                    "ui.host.adapter.get" => RpcResponse {
+                        request_id: request.request_id,
+                        status: RpcStatus::Accepted,
+                        revision: Some(Revision(0)),
+                        result: Some(json!(UiHostAdapterConfig {
+                            program: program.clone(),
+                            input_schema: schema.clone()
+                        })),
+                        snapshot: None,
+                        error: None,
+                    },
+                    "ui.host.inbound" => {
+                        // The host deliberately delays 500 ms. The presentation
+                        // fragment must already be visible in the renderer before
+                        // this response is produced.
+                        std::thread::sleep(Duration::from_millis(500));
+                        let seen = renderer_seen_for_host.load(Ordering::SeqCst);
+                        RpcResponse {
+                            request_id: request.request_id,
+                            status: RpcStatus::Accepted,
+                            revision: Some(Revision(1)),
+                            result: Some(json!({
+                                "scalar_frame": {
+                                    "program_revision": program.revision,
+                                    "expected_input_revision": Revision(0),
+                                    "request_id": "delayed-host-publication",
+                                    "idempotency_key": "delayed-host-publication",
+                                    "changes": []
+                                },
+                                "grid_inputs": [],
+                                "presentation_update": null,
+                                "renderer_seen_when_responding": seen,
+                            })),
+                            snapshot: None,
+                            error: None,
+                        }
+                    }
+                    _ => unreachable!(),
+                };
+                (response, !shutdown)
+            })
+        });
+        let renderer = RpcServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let renderer_endpoint = renderer.local_addr().unwrap();
+        let renderer_seen_holder = renderer_seen.clone();
+        let renderer_thread = thread::spawn(move || {
+            let mut calls = 0u32;
+            renderer.serve_until(|request| {
+                calls += 1;
+                let UiCommand::SubmitFragment { submission } =
+                    serde_json::from_value(request.params).unwrap()
+                else {
+                    unreachable!()
+                };
+                let revision = submission.fragment.revision;
+                fn has_transition(node: &UiNode, node_id: &str) -> bool {
+                    (node.node_id.0 == node_id && node.enter_transition.is_some())
+                        || node.children.iter().any(|child| has_transition(child, node_id))
+                }
+                if revision == Revision(2) {
+                    assert!(has_transition(&submission.fragment.root, "status-root"));
+                    renderer_seen_holder.store(1, Ordering::SeqCst);
+                } else if revision == Revision(3) {
+                    assert!(has_transition(&submission.fragment.root, "status-root"));
+                }
+                let response = RpcResponse {
+                    request_id: request.request_id,
+                    status: RpcStatus::Accepted,
+                    revision: Some(revision),
+                    result: Some(json!({})),
+                    snapshot: None,
+                    error: None,
+                };
+                (response, calls < 2)
+            })
+        });
+        let mut runtime = UiRuntime::new(7, "delayed-host-route");
+        runtime.cached_fragment = Some(fragment.clone());
+        runtime.flow_document = Some(document.clone());
+        runtime.flow_state_machine = Some(NuiFlowStateMachineRuntime::new(&document));
+        runtime = runtime.with_wgpu_endpoint(renderer_endpoint);
+        let event = UiSemanticEvent {
+            event: neon_ui_schema::UiSemanticEventType::PointerClick,
+            event_id: "delayed-host-event".into(),
+            renderer_epoch: 7,
+            composition_revision: Revision(1),
+            fragment: neon_ui_schema::UiFragmentRevision {
+                id: fragment.fragment_id,
+                revision: Revision(1),
+            },
+            intent: UiIntent::Invoke {
+                action: declaration.intent.clone(),
+                params: json!({}),
+            },
+            pointer: Some(neon_ui_schema::UiPointerMetadata { id: 1, sequence: 1 }),
+            focus: None,
+            data_grid_cell: None,
+            text: None,
+            control_value: None,
+            drag_drop: None,
+        };
+        let response = runtime
+            .forward_host_request(
+                host_endpoint,
+                renderer_endpoint,
+                RpcRequest {
+                    protocol: "neon3.rpc".into(),
+                    version: PROTOCOL_VERSION,
+                    request_id: RequestId("delayed-host-event".into()),
+                    client: runtime.client.clone(),
+                    target: ServiceName(SERVICE_NAME.into()),
+                    method: "ui.host.inbound".into(),
+                    params: json!(event),
+                    expected_revision: Some(Revision(1)),
+                    idempotency_key: Some("delayed-host-event".into()),
+                },
+            )
+            .unwrap();
+        assert_eq!(response.status, RpcStatus::Accepted);
+        let renderer_seen_after = renderer_seen.load(Ordering::SeqCst);
+        assert_eq!(
+            renderer_seen_after, 1,
+            "the optimistic motion fragment must reach the renderer before the host response"
+        );
+        host_thread.join().unwrap().unwrap();
+        renderer_thread.join().unwrap().unwrap();
     }
 }

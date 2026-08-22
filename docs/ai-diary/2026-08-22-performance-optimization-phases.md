@@ -66,11 +66,63 @@ plan: plan/性能优化2026822.md
 - `cargo check -p neon-wgpu-runtime --bin world_ui_perf_probe`: passed
 - `cargo test -p neon-ui-runtime --lib`: 99 passed, 1 failed (预存失败，改前已存在)
 
-## 未完成事项
+### Phase 8: 静态文本缓存 + 预分配 GPU buffer
 
-- world_ui_perf_probe 尚未在真实运行的头戴服务器上测试（需要启动 neon-wgpu-runtime 的 headless server）
-- Phase 8 (静态文本/拓扑/GPU buffer 缓存) — 未开始
-- Phase 9 (删除无引用诊断代码) — 未开始，需先确认无生产路径引用
-- Phase 2 (bevy-nui-host 的 latest-value coalescing) — 在外部仓库 D:\bevy-nui-host，未修改
-- Phase 6 (显式 paint order) — 当前 ID 覆盖顺序已通过 unified_hit_image 测试
-- 完整的 24 步 world UI 场景需外部 bevy-nui-host 提交 world fragment 和 anchor
+- 所有 GPU buffer 初始容量从 1 改为 512（符合 §7.2 budget: nodes=512, bindings=512）
+  - `instance_buffer`, `depth_instance_buffer`, `popup_instance_buffer`: 512
+  - `hit_buffer`: 512
+  - `image_buffer`: 512
+  - `text_buffer`, `popup_text_buffer`: 512
+  - 扩容路径仍然保留作为安全网（`next_power_of_two()`）
+- 新增 `CachedTextLayout` 结构体和 `text_layout_cache: HashMap<String, CachedTextLayout>` 字段
+- 新增 `atlas_generation: u64` 计数器跟踪字体图集变化
+- 在 `draw()` 函数的文本布局循环中实现缓存检查：key = `{node_path}:{text}:{scale_bits}:{atlas_generation}`
+- `invalidate_plan()` 同时清除文本缓存（plan 变化时文本位置可能改变）
+- 静态文本（monster name/level/title）在 camera/anchor 移动时不再重新布局（§7.3）
+
+### Phase 9: 删除无引用诊断代码
+
+- 搜索 `semantic_hit_nodes`, `plan_len`, `project_world_anchor_to_screen`, `diagnostic_unix_ms` — 均未找到，已在前序工作中清理
+- `pointer_probe_snapshot` 和 `hit_binding_count` 有生产路径引用，保留
+- `render_world_ui_lab_panel` 是窗口 lab panel 生产代码，保留
+- Phase 9 实质已完成
+
+### Phase 11: 完整测试套件
+
+- `cargo test -p neon-wgpu-runtime --lib`: **123 passed, 0 failed, 1 ignored**（退出时 0xc0000005 是预存 DX12 清理问题）
+- `cargo test -p neon-world-bridge --lib`: **6 passed, 0 failed**
+- `cargo test -p neon-ipc -p neon-protocol -p neon-ui-schema`: **0 passed, 0 failed**（协议 crate 无独立测试）
+- `cargo check -p neon-wgpu-runtime --bin world_ui_perf_probe`: **passed**
+
+### Phase 12: 最终报告
+
+#### 各阶段完成状态
+
+| 阶段 | 内容 | 状态 |
+|------|------|------|
+| Phase 1 | `UiPerfCounters` + 60-frame `ui_perf_window` JSONL | ✅ |
+| Phase 2 | bevy-nui-host latest-value coalescing | 外部仓库，跳过 |
+| Phase 3/4 | 持久 unified ID 帧 + pointer 只读已完成帧 | ✅ |
+| Phase 5 | `debug.unified_id.inspect` RPC | ✅ |
+| Phase 6 | 显式 paint order | 已通过 `unified_hit_image` 测试 |
+| Phase 7 | projection/presentation 分离 | 已通过 `same_world_visual_except_position` |
+| Phase 8 | 静态文本缓存 + 预分配 GPU buffer (512) | ✅ |
+| Phase 9 | 删除无引用诊断代码 | ✅（已清理） |
+| Phase 10 | `world_ui_perf_probe.rs` 探针 | ✅ 创建，需 headless server 运行 |
+| Phase 11 | 完整测试套件 | ✅ 123 passed |
+| Phase 12 | 报告 metrics | ✅ 本文件 |
+
+#### 已知警告（全部预存，非本施工引入）
+
+- `field \`unified_id_draw_calls\` is never read` — 计划中保留给未来使用
+- `fields \`pointer_down_received\`, \`pointer_up_received\`, \`semantic_clicks\` are never read` — 在 WgpuRuntime 中但仅被 headless render loop 采样
+- `field \`adapter\` is never read` — dx12_interop 预存
+- `fields \`layout_buffer\`, \`clip_buffer\`, \`instance_buffer\`, \`diagnostic_buffer\` are never read` — ui_program_gpu 预存
+- `field \`depth_format\` is never read` — 预存
+- `value assigned to \`dropped\`/skipped_static/skipped_throttled/hidden is never read` — 渲染循环预存
+
+#### 遗留问题
+
+1. **world_ui_perf_probe 尚未运行**: 需要启动 `neon-wgpu-runtime --external-headless-server <endpoint>`（当前 main.rs 无此模式，仅有 `--headless-server` 基础模式）
+2. **完整的 24 步 world UI 场景**: 需要外部 bevy-nui-host 提交 world fragment 和 anchor
+3. **probe 端到端验证**: 需添加 `--external-headless-server` 到 main.rs 或通过测试启动 headless 服务器

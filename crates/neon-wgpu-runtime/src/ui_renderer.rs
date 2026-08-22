@@ -16,8 +16,19 @@ use neon_ui_schema::{
 use serde_json::{Value, json};
 
 const SHADER: &str = r#"
-struct View { viewport: vec2<f32>, color_mode: u32, _pad: u32 }
+struct View { viewport: vec2<f32>, color_mode: u32, time_seconds: f32 }
 @group(0) @binding(0) var<uniform> view: View;
+
+fn animation_progress(animation: vec4<f32>) -> f32 {
+    if (animation.w == 0.0 || animation.y <= 0.0) { return 1.0; }
+    let t = clamp((view.time_seconds - animation.x) / animation.y, 0.0, 1.0);
+    if (animation.z == 1.0) { return t * t; }
+    if (animation.z == 2.0) { return 1.0 - (1.0 - t) * (1.0 - t); }
+    if (animation.z == 3.0) {
+        return select(2.0 * t * t, 1.0 - pow(-2.0 * t + 2.0, 2.0) / 2.0, t >= 0.5);
+    }
+    return t;
+}
 
 fn srgb_to_linear(value: vec3<f32>) -> vec3<f32> {
     let low = value / 12.92;
@@ -39,6 +50,11 @@ struct VsIn {
     @location(3) params: vec4<f32>,
     @location(4) clip: vec4<f32>,
     @location(5) depth: f32,
+    @location(6) from_rect: vec4<f32>,
+    @location(7) from_fill: vec4<f32>,
+    @location(8) from_border: vec4<f32>,
+    @location(9) from_params: vec4<f32>,
+    @location(10) animation: vec4<f32>,
 }
 
 struct VsOut {
@@ -59,14 +75,19 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32, input: VsIn) -> VsOut {
         vec2<f32>(0.0, 1.0), vec2<f32>(1.0, 0.0), vec2<f32>(1.0, 1.0)
     );
     let local = corners[vertex_index];
-    let pixel = input.rect.xy + local * input.rect.zw;
+    let t = animation_progress(input.animation);
+    let rect = mix(input.from_rect, input.rect, t);
+    let fill = mix(input.from_fill, input.fill, t);
+    let border = mix(input.from_border, input.border, t);
+    let params = mix(input.from_params, input.params, t);
+    let pixel = rect.xy + local * rect.zw;
     var output: VsOut;
     output.position = vec4<f32>(pixel.x / view.viewport.x * 2.0 - 1.0, 1.0 - pixel.y / view.viewport.y * 2.0, input.depth, 1.0);
     output.local = local;
-    output.size = input.rect.zw;
-    output.fill = input.fill;
-    output.border = input.border;
-    output.params = input.params;
+    output.size = rect.zw;
+    output.fill = fill;
+    output.border = border;
+    output.params = params;
     output.clip = input.clip;
     output.pixel = pixel;
     return output;
@@ -112,8 +133,9 @@ fn fs_main(input: VsOut) -> @location(0) vec4<f32> {
 "#;
 
 const HIT_SHADER: &str = r#"
-struct View { viewport: vec2<f32>, color_mode: u32, _pad: u32 }
+struct View { viewport: vec2<f32>, color_mode: u32, time_seconds: f32 }
 @group(0) @binding(0) var<uniform> view: View;
+fn animation_progress(animation: vec4<f32>) -> f32 { if (animation.w == 0.0 || animation.y <= 0.0) { return 1.0; } let t=clamp((view.time_seconds-animation.x)/animation.y,0.0,1.0); if(animation.z==1.0){return t*t;} if(animation.z==2.0){return 1.0-(1.0-t)*(1.0-t);} if(animation.z==3.0){return select(2.0*t*t,1.0-pow(-2.0*t+2.0,2.0)/2.0,t>=0.5);} return t; }
 fn outside_clip(pixel: vec2<f32>, clip: vec4<f32>, radius: f32) -> bool { if (pixel.x < clip.x || pixel.y < clip.y || pixel.x > clip.z || pixel.y > clip.w) { return true; } if (radius <= 0.0) { return false; } let size=clip.zw-clip.xy; let r=min(radius,min(size.x,size.y)*0.5); let point=pixel-(clip.xy+size*0.5); let extent=max(size*0.5-vec2<f32>(r),vec2<f32>(0.0)); return length(max(abs(point)-extent,vec2<f32>(0.0)))>r; }
 struct VsIn { @location(0) rect: vec4<f32>, @location(1) params: vec4<f32>, @location(2) hit_id: u32, @location(3) clip: vec4<f32> }
 struct VsOut { @builtin(position) position: vec4<f32>, @location(0) local: vec2<f32>, @location(1) size: vec2<f32>, @location(2) params: vec4<f32>, @location(3) @interpolate(flat) hit_id: u32, @location(4) clip: vec4<f32>, @location(5) pixel: vec2<f32> }
@@ -144,8 +166,9 @@ const HIT_CLEAR_SHADER: &str = r#"
 "#;
 
 const DEPTH_SHADER: &str = r#"
-struct View { viewport: vec2<f32>, color_mode: u32, _pad: u32 }
+struct View { viewport: vec2<f32>, color_mode: u32, time_seconds: f32 }
 @group(0) @binding(0) var<uniform> view: View;
+fn animation_progress(animation: vec4<f32>) -> f32 { if (animation.w == 0.0 || animation.y <= 0.0) { return 1.0; } let t=clamp((view.time_seconds-animation.x)/animation.y,0.0,1.0); if(animation.z==1.0){return t*t;} if(animation.z==2.0){return 1.0-(1.0-t)*(1.0-t);} if(animation.z==3.0){return select(2.0*t*t,1.0-pow(-2.0*t+2.0,2.0)/2.0,t>=0.5);} return t; }
 fn outside_clip(pixel: vec2<f32>, clip: vec4<f32>, radius: f32) -> bool {
     if (pixel.x < clip.x || pixel.y < clip.y || pixel.x > clip.z || pixel.y > clip.w) { return true; }
     if (radius <= 0.0) { return false; }
@@ -160,6 +183,11 @@ struct VsIn {
     @location(3) params: vec4<f32>,
     @location(4) clip: vec4<f32>,
     @location(5) depth: f32,
+    @location(6) from_rect: vec4<f32>,
+    @location(7) from_fill: vec4<f32>,
+    @location(8) from_border: vec4<f32>,
+    @location(9) from_params: vec4<f32>,
+    @location(10) animation: vec4<f32>,
 }
 struct VsOut {
     @builtin(position) position: vec4<f32>,
@@ -173,12 +201,11 @@ struct VsOut {
         vec2<f32>(0.0, 0.0), vec2<f32>(1.0, 0.0), vec2<f32>(0.0, 1.0),
         vec2<f32>(0.0, 1.0), vec2<f32>(1.0, 0.0), vec2<f32>(1.0, 1.0)
     );
-    let local = corners[vertex_index];
-    let pixel = input.rect.xy + local * input.rect.zw;
+    let local = corners[vertex_index]; let t = animation_progress(input.animation); let rect=mix(input.from_rect,input.rect,t); let params=mix(input.from_params,input.params,t); let pixel = rect.xy + local * rect.zw;
     var output: VsOut;
     output.position = vec4<f32>(pixel.x / view.viewport.x * 2.0 - 1.0, 1.0 - pixel.y / view.viewport.y * 2.0, 0.0, 1.0);
     output.clip = input.clip;
-    output.params = input.params;
+    output.params = params;
     output.pixel = pixel;
     output.depth = input.depth;
     return output;
@@ -254,6 +281,12 @@ struct UiInstance {
     /// Normalized color-pass depth (0.0 = near/always-on-top, 1.0 = far).
     depth: f32,
     paint_group_id: u32,
+    from_rect: [f32; 4],
+    from_fill: [f32; 4],
+    from_border: [f32; 4],
+    from_params: [f32; 4],
+    /// start seconds, duration seconds, easing code, enabled.
+    animation: [f32; 4],
 }
 
 #[repr(C)]
@@ -261,7 +294,7 @@ struct UiInstance {
 struct UiView {
     viewport: [f32; 2],
     color_mode: u32,
-    _pad: u32,
+    time_seconds: f32,
 }
 
 #[repr(C)]
@@ -788,6 +821,14 @@ struct CachedDataGridTextDisplay {
     text: String,
 }
 
+/// Cache entry for a single text-bearing node's laid-out glyph instances.
+/// Re-layout is skipped when the composite cache key (node path + text +
+/// text scale + atlas generation) matches (plan §7.3).
+#[derive(Clone)]
+struct CachedTextLayout {
+    text_instances: Vec<UiTextInstance>,
+}
+
 /// Per-draw stage timings collected on the last color pass. Diagnostics only;
 /// collecting these never alters rendering behavior or draw order.
 #[derive(Default, Clone, Copy)]
@@ -820,11 +861,26 @@ fn color_pass_depth(world_depth: Option<f32>) -> f32 {
     world_depth.map_or(0.0, |depth| 1.0 - depth)
 }
 
+fn gpu_easing(easing: UiEasing) -> f32 {
+    match easing {
+        UiEasing::Linear => 0.0,
+        UiEasing::EaseIn => 1.0,
+        UiEasing::EaseOut => 2.0,
+        UiEasing::EaseInOut => 3.0,
+    }
+}
+
 fn is_world_panel_path(path: &str) -> bool {
     path.rsplit('/')
         .next()
         .and_then(|key| key.strip_prefix('p'))
         .is_some_and(|index| !index.is_empty() && index.chars().all(|c| c.is_ascii_digit()))
+}
+
+fn transition_finished(active: &ActiveTransition, time_seconds: f32) -> bool {
+    time_seconds
+        >= active.started_at_seconds
+            + (active.transition.delay_ms + active.transition.duration_ms) as f32 / 1000.0
 }
 
 pub struct UiWgpuRenderer {
@@ -846,6 +902,8 @@ pub struct UiWgpuRenderer {
     debug_semantic_nodes: Vec<DebugSemanticNode>,
     sampled: Vec<UiVisual>,
     instances: Vec<UiInstance>,
+    uploaded_instances: Vec<UiInstance>,
+    uploaded_depth_instances: Vec<UiInstance>,
     viewport_physical_size: [u32; 2],
     viewport_logical_size: [f32; 2],
     viewport_revision: u64,
@@ -893,6 +951,13 @@ pub struct UiWgpuRenderer {
     data_grid_frames: HashMap<String, neon_ui_schema::UiDataGridFrame>,
     data_grid_scroll_holds: HashMap<String, DataGridScrollHold>,
     data_grid_text_display_cache: HashMap<DataGridCellIdentity, CachedDataGridTextDisplay>,
+    /// Text layout cache: keyed by `{fragment_id}:{node_path}`, stores the
+    /// computed glyph instances so camera/anchor movement does not re-layout
+    /// static monster name/level/title text (plan §7.3).
+    text_layout_cache: HashMap<String, CachedTextLayout>,
+    /// Monotonic font atlas generation counter. Incremented when a new glyph is
+    /// rasterized so the text layout cache can detect atlas changes.
+    atlas_generation: u64,
     available_cameras: HashSet<(neon_world_bridge::CameraId, neon_world_bridge::CameraKind)>,
     last_stage_timings: UiDrawStageTimings,
 }
@@ -998,6 +1063,31 @@ impl UiWgpuRenderer {
                             format: wgpu::VertexFormat::Float32,
                             offset: 80,
                             shader_location: 5,
+                        },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x4,
+                            offset: 88,
+                            shader_location: 6,
+                        },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x4,
+                            offset: 104,
+                            shader_location: 7,
+                        },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x4,
+                            offset: 120,
+                            shader_location: 8,
+                        },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x4,
+                            offset: 136,
+                            shader_location: 9,
+                        },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x4,
+                            offset: 152,
+                            shader_location: 10,
                         },
                     ],
                 })],
@@ -1344,6 +1434,11 @@ impl UiWgpuRenderer {
                                 offset: 80,
                                 shader_location: 5,
                             },
+                            wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 88, shader_location: 6 },
+                            wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 104, shader_location: 7 },
+                            wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 120, shader_location: 8 },
+                            wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 136, shader_location: 9 },
+                            wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 152, shader_location: 10 },
                         ],
                     })],
                     compilation_options: Default::default(),
@@ -1373,17 +1468,22 @@ impl UiWgpuRenderer {
             depth_pipeline,
             view_buffer,
             view_bind_group,
-            instance_buffer: create_instance_buffer(device, 1),
-            instance_capacity: 1,
-            depth_instance_buffer: create_instance_buffer(device, 1),
-            depth_instance_capacity: 1,
-            popup_instance_buffer: create_instance_buffer(device, 1),
-            popup_instance_capacity: 1,
+            // Pre-allocate GPU buffers to the plan's known budget (512 nodes,
+            // 512 bindings) so the render loop never re-creates buffers on the
+            // hot path. The growth path still exists as a safety net.
+            instance_buffer: create_instance_buffer(device, 512),
+            instance_capacity: 512,
+            depth_instance_buffer: create_instance_buffer(device, 512),
+            depth_instance_capacity: 512,
+            popup_instance_buffer: create_instance_buffer(device, 512),
+            popup_instance_capacity: 512,
             plan_revisions: HashMap::new(),
             plan: Vec::new(),
             debug_semantic_nodes: Vec::new(),
             sampled: Vec::new(),
             instances: Vec::new(),
+            uploaded_instances: Vec::new(),
+            uploaded_depth_instances: Vec::new(),
             viewport_physical_size: [0, 0],
             viewport_logical_size: [0.0, 0.0],
             viewport_revision: 0,
@@ -1395,22 +1495,22 @@ impl UiWgpuRenderer {
             pressed_until_seconds: 0.0,
             hit_pipeline,
             hit_clear_pipeline,
-            hit_buffer: create_hit_buffer(device, 1),
-            hit_capacity: 1,
+            hit_buffer: create_hit_buffer(device, 512),
+            hit_capacity: 512,
             hit_readbacks: HitReadbackRing::new(device, 3),
             hit_bindings: HashMap::new(),
             image_pipeline,
-            image_buffer: create_image_buffer(device, 1),
-            image_capacity: 1,
+            image_buffer: create_image_buffer(device, 512),
+            image_capacity: 512,
             resident_images: HashMap::new(),
             image_atlas: None,
             resident_render_surfaces: HashMap::new(),
             image_texture_layout,
             text_pipeline,
-            text_buffer: create_text_buffer(device, 1),
-            text_capacity: 1,
-            popup_text_buffer: create_text_buffer(device, 1),
-            popup_text_capacity: 1,
+            text_buffer: create_text_buffer(device, 512),
+            text_capacity: 512,
+            popup_text_buffer: create_text_buffer(device, 512),
+            popup_text_capacity: 512,
             _text_texture_layout: text_texture_layout,
             resident_font: None,
             last_panel_instance_count: 0,
@@ -1430,6 +1530,8 @@ impl UiWgpuRenderer {
             data_grid_frames: HashMap::new(),
             data_grid_scroll_holds: HashMap::new(),
             data_grid_text_display_cache: HashMap::new(),
+            text_layout_cache: HashMap::new(),
+            atlas_generation: 0,
             available_cameras: HashSet::new(),
             last_stage_timings: UiDrawStageTimings::default(),
         }
@@ -1491,7 +1593,7 @@ impl UiWgpuRenderer {
             bytemuck::bytes_of(&UiView {
                 viewport: self.viewport_logical_size,
                 color_mode: 0,
-                _pad: 0,
+                time_seconds,
             }),
         );
         self.view_buffer_viewport_revision = self.viewport_revision;
@@ -3753,20 +3855,21 @@ impl UiWgpuRenderer {
         }
         self.ensure_builtin_font(device, queue);
         self.update_viewport(viewport_physical_size, viewport_logical_size);
-        if self.view_buffer_viewport_revision != self.viewport_revision {
-            queue.write_buffer(
-                &self.view_buffer,
-                0,
-                bytemuck::bytes_of(&UiView {
-                    viewport: self.viewport_logical_size,
-                    // Bevy's HDR camera keeps the post-tonemap target in
-                    // linear display space until the final surface encode.
-                    color_mode: 0,
-                    _pad: 0,
-                }),
-            );
-            self.view_buffer_viewport_revision = self.viewport_revision;
-        }
+        // The only per-frame animation upload is this 16-byte view uniform.
+        // Every transition record remains resident in the instance buffer and
+        // WGSL samples it from the monotonic clock.
+        queue.write_buffer(
+            &self.view_buffer,
+            0,
+            bytemuck::bytes_of(&UiView {
+                viewport: self.viewport_logical_size,
+                // Bevy's HDR camera keeps the post-tonemap target in linear
+                // display space until the final surface encode.
+                color_mode: 0,
+                time_seconds,
+            }),
+        );
+        self.view_buffer_viewport_revision = self.viewport_revision;
         let stage = Instant::now();
         self.refresh_plan(fragments, viewport_logical_size);
         let refresh_plan_ms = stage.elapsed().as_secs_f32() * 1000.0;
@@ -3872,27 +3975,32 @@ impl UiWgpuRenderer {
         if self.instances.len() > self.instance_capacity {
             self.instance_capacity = self.instances.len().next_power_of_two();
             self.instance_buffer = create_instance_buffer(device, self.instance_capacity);
+            self.uploaded_instances.clear();
         }
         if self.instance_capacity > self.depth_instance_capacity {
             self.depth_instance_capacity = self.instance_capacity;
             self.depth_instance_buffer =
                 create_instance_buffer(device, self.depth_instance_capacity);
+            self.uploaded_depth_instances.clear();
         }
         if popup_instances.len() > self.popup_instance_capacity {
             self.popup_instance_capacity = popup_instances.len().next_power_of_two();
             self.popup_instance_buffer =
                 create_instance_buffer(device, self.popup_instance_capacity);
         }
-        // The instance vector is rebuilt from the current plan on every draw.
-        // Upload it as a complete snapshot so a composition update cannot draw
-        // a newly sized DataGrid from stale buffer contents.
-        let stage = Instant::now();
-        queue.write_buffer(
-            &self.instance_buffer,
-            0,
-            bytemuck::cast_slice(&self.instances),
-        );
-        buffer_upload_ms += stage.elapsed().as_secs_f32() * 1000.0;
+        // Transition records are immutable after begin/retarget. During the
+        // animation WGSL samples `animation` from the time uniform, so avoid
+        // re-uploading panel data every frame.
+        if self.instances != self.uploaded_instances {
+            let stage = Instant::now();
+            queue.write_buffer(
+                &self.instance_buffer,
+                0,
+                bytemuck::cast_slice(&self.instances),
+            );
+            self.uploaded_instances.clone_from(&self.instances);
+            buffer_upload_ms += stage.elapsed().as_secs_f32() * 1000.0;
+        }
         let images = self
             .sampled
             .iter()
@@ -4030,17 +4138,42 @@ impl UiWgpuRenderer {
                         {
                             return None;
                         }
+                        let text = text.unwrap();
+                        // Static text cache: skip re-layout when the same
+                        // node_path + text content + text_scale combination
+                        // was already computed (plan §7.3). The cache key
+                        // includes the atlas generation so that new glyph
+                        // rasterizations trigger a refresh.
+                        let node_path = &self.plan[index].id;
+                        let text_scale = if visual.bounds.height > 0.0 && visual.bounds.height <= 40.0 {
+                            (visual.bounds.height / 28.0).clamp(0.5, 2.0)
+                        } else {
+                            1.0
+                        };
+                        let scale_bits = text_scale.to_bits();
+                        let cache_key = format!("{node_path}:{text}:{scale_bits}:{}", self.atlas_generation);
+                        if let Some(cached) = self.text_layout_cache.get(&cache_key) {
+                            return cached.text_instances.clone().into();
+                        }
                         let horizontal_scroll = (visual.kind == UiNodeKind::TextInput
                             && local_text.is_some())
                         .then_some(self.editing.horizontal_scroll);
-                        layout_text(
+                        let instances = layout_text(
                             device,
                             queue,
                             font,
                             visual,
-                            text.unwrap(),
+                            text,
                             horizontal_scroll,
-                        )
+                        );
+                        if let Some(instances) = instances {
+                            self.text_layout_cache.insert(cache_key, CachedTextLayout {
+                                text_instances: instances.clone(),
+                            });
+                            Some(instances)
+                        } else {
+                            None
+                        }
                     })
                     .flatten()
                     .collect::<Vec<_>>();
@@ -4358,6 +4491,11 @@ impl UiWgpuRenderer {
     /// plan before consuming that projected snapshot.
     pub(crate) fn invalidate_plan(&mut self) {
         self.plan_revisions.clear();
+        // The text layout cache is tied to the same fragment revision set.
+        // When the plan is invalidated (e.g. camera/anchor projection change),
+        // the text positions may have shifted, so clear the cache to force
+        // re-layout on the next frame (plan §7.3).
+        self.text_layout_cache.clear();
     }
 
     fn update_viewport(&mut self, physical_size: [u32; 2], logical_size: [f32; 2]) -> bool {
@@ -4379,7 +4517,7 @@ impl UiWgpuRenderer {
     /// separate from the 2D painter order used by the color pass. Text glyphs do
     /// not write independent sparse depth: their occlusion belongs to the owning
     /// panel surface, so a far panel's text cannot survive over a nearer panel.
-    pub(crate) fn draw_depth<'a>(&'a self, queue: &wgpu::Queue, pass: &mut wgpu::RenderPass<'a>) {
+    pub(crate) fn draw_depth<'a>(&'a mut self, queue: &wgpu::Queue, pass: &mut wgpu::RenderPass<'a>) {
         let Some(rect_pipeline) = &self.depth_pipeline else {
             return;
         };
@@ -4426,11 +4564,14 @@ impl UiWgpuRenderer {
         if ordered_depth_instances.is_empty() {
             return;
         }
-        queue.write_buffer(
-            &self.depth_instance_buffer,
-            0,
-            bytemuck::cast_slice(&ordered_depth_instances),
-        );
+        if self.uploaded_depth_instances != ordered_depth_instances {
+            queue.write_buffer(
+                &self.depth_instance_buffer,
+                0,
+                bytemuck::cast_slice(&ordered_depth_instances),
+            );
+            self.uploaded_depth_instances = ordered_depth_instances.clone();
+        }
         pass.set_pipeline(rect_pipeline);
         pass.set_bind_group(0, &self.view_bind_group, &[]);
         pass.set_vertex_buffer(0, self.depth_instance_buffer.slice(..));
@@ -4931,6 +5072,7 @@ impl UiWgpuRenderer {
                         clip,
                         depth: 0.0,
                         paint_group_id: 0,
+                        ..UiInstance::zeroed()
                     },
                     UiInstance {
                         rect: [thumb.x, thumb.y, thumb.width, thumb.height],
@@ -4940,6 +5082,7 @@ impl UiWgpuRenderer {
                         clip,
                         depth: 0.0,
                         paint_group_id: 0,
+                        ..UiInstance::zeroed()
                     },
                 ])
             })
@@ -4963,24 +5106,34 @@ impl UiWgpuRenderer {
             && let Some(active_transition) = active.get_mut(id)
             && Self::same_world_visual_except_position(&active_transition.target, target)
         {
+            if transition_finished(active_transition, time_seconds) {
+                current.insert(id.to_owned(), target.clone());
+                return target.clone();
+            }
             active_transition.from.bounds.x = target.bounds.x;
             active_transition.from.bounds.y = target.bounds.y;
             active_transition.target.bounds.x = target.bounds.x;
             active_transition.target.bounds.y = target.bounds.y;
-            let mut sampled = sample_transition(active_transition, time_seconds);
-            sampled.bounds.x = target.bounds.x;
-            sampled.bounds.y = target.bounds.y;
-            current.insert(id.to_owned(), sampled.clone());
-            return sampled;
+            current.insert(id.to_owned(), target.clone());
+            return target.clone();
         }
         if let Some(active_transition) = active.get(id)
             && active_transition.target == *target
         {
-            let sampled = sample_transition(active_transition, time_seconds);
-            current.insert(id.to_owned(), sampled.clone());
-            return sampled;
+            if transition_finished(active_transition, time_seconds) {
+                current.insert(id.to_owned(), target.clone());
+                return target.clone();
+            }
+            current.insert(id.to_owned(), target.clone());
+            return target.clone();
         }
-        let source = current.get(id).cloned();
+        // Retarget/cancel samples the old descriptor exactly once. This is the
+        // only CPU interpolation point: steady-state frames leave the panel
+        // record untouched and WGSL advances it from the time uniform.
+        let source = active
+            .get(id)
+            .map(|active_transition| sample_transition(active_transition, time_seconds))
+            .or_else(|| current.get(id).cloned());
         // The enter_transition stays on the fragment after the motion has
         // already completed. If the current rendered value already equals the
         // target, re-starting the motion is a pure no-op that only reprints
@@ -5033,13 +5186,8 @@ impl UiWgpuRenderer {
                     started_at_seconds: time_seconds,
                     transition: transition.clone(),
                 };
-                let mut sampled = sample_transition(&next_active, time_seconds);
-                if target.world_depth.is_some() {
-                    sampled.bounds.x = target.bounds.x;
-                    sampled.bounds.y = target.bounds.y;
-                }
                 active.insert(id.to_owned(), next_active);
-                sampled
+                target.clone()
             }
             _ => target.clone(),
         };
@@ -5115,7 +5263,7 @@ impl UiWgpuRenderer {
             fill[1] = (fill[1] * 1.08).min(1.0);
             fill[2] = (fill[2] * 1.08).min(1.0);
         }
-        UiInstance {
+        let mut instance = UiInstance {
             rect: [bounds.x, bounds.y, bounds.width, bounds.height],
             fill,
             border: style.border_color,
@@ -5133,7 +5281,74 @@ impl UiWgpuRenderer {
             ],
             depth: color_pass_depth(visual.world_depth),
             paint_group_id: visual.paint_group_id,
+            from_rect: [bounds.x, bounds.y, bounds.width, bounds.height],
+            from_fill: fill,
+            from_border: style.border_color,
+            from_params: [
+                style.border_width,
+                style.corner_radius,
+                style.opacity,
+                visual.clip_radius,
+            ],
+            animation: [0.0; 4],
+        };
+        if let Some(active) = self.active.get(node_path) {
+            let from_style = if active.from.style == UiStyle::default() {
+                default_component_style(&active.from.kind)
+            } else {
+                active.from.style
+            };
+            instance.from_rect = [
+                active.from.bounds.x,
+                active.from.bounds.y,
+                active.from.bounds.width,
+                active.from.bounds.height,
+            ];
+            instance.from_fill = from_style.background_color;
+            instance.from_border = from_style.border_color;
+            instance.from_params = [
+                from_style.border_width,
+                from_style.corner_radius,
+                from_style.opacity,
+                active.from.clip_radius,
+            ];
+            instance.animation = [
+                active.started_at_seconds + active.transition.delay_ms as f32 / 1000.0,
+                active.transition.duration_ms as f32 / 1000.0,
+                gpu_easing(active.transition.easing),
+                1.0,
+            ];
+        } else {
+            // A parent panel's GPU track also moves its descendants. Encode
+            // the inherited start offset into the child's one-time record so
+            // the vertex shader can apply the same track without CPU sampling
+            // or a second per-frame upload.
+            let mut parent = self
+                .plan
+                .iter()
+                .find(|node| node.id == node_path)
+                .and_then(|node| node.parent_id.clone());
+            while let Some(parent_id) = parent {
+                if let Some(active) = self.active.get(&parent_id) {
+                    instance.from_rect[0] += active.from.bounds.x - active.target.bounds.x;
+                    instance.from_rect[1] += active.from.bounds.y - active.target.bounds.y;
+                    instance.animation = [
+                        active.started_at_seconds
+                            + active.transition.delay_ms as f32 / 1000.0,
+                        active.transition.duration_ms as f32 / 1000.0,
+                        gpu_easing(active.transition.easing),
+                        1.0,
+                    ];
+                    break;
+                }
+                parent = self
+                    .plan
+                    .iter()
+                    .find(|node| node.id == parent_id)
+                    .and_then(|node| node.parent_id.clone());
+            }
         }
+        instance
     }
 
     fn component_chrome_instances(&self, visual: &UiVisual, node_path: &str) -> Vec<UiInstance> {
@@ -5193,6 +5408,7 @@ impl UiWgpuRenderer {
                 ],
                 depth: 0.0,
                 paint_group_id: visual.paint_group_id,
+                ..UiInstance::zeroed()
             });
         }
         instances
@@ -5279,6 +5495,7 @@ impl UiWgpuRenderer {
             clip,
             depth: 0.0,
             paint_group_id: 0,
+            ..UiInstance::zeroed()
         }];
         for (row, option) in rows.into_iter().zip(options) {
             instances.push(UiInstance {
@@ -5293,6 +5510,7 @@ impl UiWgpuRenderer {
                 clip,
                 depth: 0.0,
                 paint_group_id: 0,
+                ..UiInstance::zeroed()
             });
         }
         instances
@@ -5603,6 +5821,7 @@ fn component_chrome_instances(visual: &UiVisual) -> Vec<UiInstance> {
         clip,
         depth: 0.0,
         paint_group_id: 0,
+        ..UiInstance::zeroed()
     };
     let selected = matches!(
         &visual.presentation,
@@ -5740,6 +5959,7 @@ fn component_chrome_instances(visual: &UiVisual) -> Vec<UiInstance> {
                     clip,
                     depth: 0.0,
                     paint_group_id: 0,
+                    ..UiInstance::zeroed()
                 },
             ]
         }
@@ -6439,6 +6659,7 @@ fn overlay_instance(bounds: UiBounds, clip: UiBounds, color: [f32; 4]) -> UiInst
         clip: [clip.x, clip.y, clip.x + clip.width, clip.y + clip.height],
         depth: 0.0,
         paint_group_id: 0,
+        ..UiInstance::zeroed()
     }
 }
 
@@ -13379,5 +13600,56 @@ mod tests {
             })
             .unwrap();
         assert_eq!(ring.try_complete(slot).unwrap().unwrap(), 37);
+    }
+
+    #[test]
+    fn ui_instance_abi_matches_vertex_attributes() {
+        // The color/depth vertex buffer layout encodes offsets 0..=152 and the
+        // WGSL `VsIn` reads locations 0..=10 as Float32x4/Float32. Freeze the
+        // `#[repr(C)]` layout so a future field reorder cannot silently break
+        // the shader bindings.
+        assert_eq!(std::mem::size_of::<UiInstance>(), 168);
+        assert_eq!(std::mem::align_of::<UiInstance>(), 4);
+        #[rustfmt::skip]
+        let offsets = [
+            (0,   16), // rect
+            (16,  16), // fill
+            (32,  16), // border
+            (48,  16), // params
+            (64,  16), // clip
+            (80,  4),  // depth (f32)
+            (84,  4),  // paint_group_id (u32)
+            (88,  16), // from_rect
+            (104, 16), // from_fill
+            (120, 16), // from_border
+            (136, 16), // from_params
+            (152, 16), // animation
+        ];
+        let mut cursor = 0usize;
+        for (offset, size) in offsets {
+            assert_eq!(cursor, offset, "UiInstance field offset drift at {cursor}");
+            cursor += size;
+        }
+        assert_eq!(cursor, std::mem::size_of::<UiInstance>());
+        let instance = UiInstance::zeroed();
+        assert_eq!(instance.animation, [0.0; 4]);
+        assert_eq!(instance.depth, 0.0);
+        assert_eq!(instance.paint_group_id, 0);
+    }
+
+    #[test]
+    fn ui_view_abi_matches_time_uniform() {
+        assert_eq!(std::mem::size_of::<UiView>(), 16);
+        assert_eq!(std::mem::align_of::<UiView>(), 4);
+        let view = UiView {
+            viewport: [12.0, 34.0],
+            color_mode: 1,
+            time_seconds: 1.25,
+        };
+        let bytes = bytemuck::bytes_of(&view);
+        assert_eq!(&bytes[0..4], &12.0f32.to_ne_bytes());
+        assert_eq!(&bytes[4..8], &34.0f32.to_ne_bytes());
+        assert_eq!(&bytes[8..12], &1u32.to_ne_bytes());
+        assert_eq!(&bytes[12..16], &1.25f32.to_ne_bytes());
     }
 }

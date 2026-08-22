@@ -2865,7 +2865,10 @@ impl HeadlessExternalGpu {
         let time_seconds = self.started_at.elapsed().as_secs_f32();
         let mut timing = ExternalFrameTiming::default();
         timing.snapshot_ms = snapshot_ms;
-        let has_external_id_targets = !self.external_id_surfaces.is_empty();
+        // Pointer hit testing uses the process-local persistent ID frame below.
+        // External ID rings are optional and require a consumer to import and
+        // release every slot; do not make the render loop depend on them.
+        let has_external_id_targets = !self.external_surfaces.is_empty();
         // A static resolved snapshot does not need another layout, text upload,
         // color pass, depth pass, or ID pass. The consumer keeps sampling the
         // last complete buffer from the ring. Exception: while a transition or
@@ -2906,7 +2909,7 @@ impl HeadlessExternalGpu {
         // bounds actually reach the color/depth pass; otherwise the world UI
         // freezes at its first projected position.
         let stage = Instant::now();
-        if has_external_id_targets {
+        if !self.external_surfaces.is_empty() {
             self.ui.invalidate_plan();
         }
         self.world_ui.invalidate_plan();
@@ -3181,6 +3184,15 @@ impl HeadlessExternalGpu {
             self.id_frame_sequence = frame_sequence;
             self.id_frame_bindings = self.ui.hit_bindings_snapshot();
             self.id_frame_ready = true;
+            // The persistent process-local ID frame is the active pointer
+            // path. Count it here even when no external ID ring was opened;
+            // otherwise diagnostics incorrectly report zero ID passes while
+            // pointer hit testing is fully operational.
+            self.perf.unified_id_passes += 1;
+            self.perf.unified_id_instances = self
+                .perf
+                .unified_id_instances
+                .max(self.id_frame_bindings.len() as u64);
         }
         self.queue.submit(Some(encoder.finish()));
         let stage_timings = self.screen_ui.last_stage_timings();
@@ -3296,7 +3308,8 @@ pub fn spawn_headless_external_server(
     std::thread::Builder::new()
         .name("neon3-headless-external-gpu".into())
         .spawn(move || {
-            let server = neon_ipc::RpcServer::bind(endpoint).map_err(|error| error.to_string())?;
+            let server =
+                neon_ipc::BlockingRpcServer::bind(endpoint).map_err(|error| error.to_string())?;
             let runtime = Arc::new(Mutex::new(WgpuRuntime::headless(1)));
             let gpu = Arc::new(Mutex::new(HeadlessExternalGpu::new()?));
 
@@ -3465,8 +3478,8 @@ let perf = gpu.perf.clone();
                 .expect("start headless external render thread");
 
             let result = server
-                .serve_until(|request| {
-                    let shutdown = request.method == "service.shutdown";
+                .serve_until(
+                    move |request| {
                     let response = match request.method.as_str() {
                         "render.surface.open" => {
                             let request_id = request.request_id;
@@ -3613,12 +3626,11 @@ let perf = gpu.perf.clone();
                         }
                         _ => runtime.lock().expect("runtime lock").handle(request),
                     };
-                    if shutdown {
-                        stop.store(true, std::sync::atomic::Ordering::Relaxed);
-                    }
-                    (response, !shutdown)
-                })
-                .map_err(|error| error.to_string());
+                    response
+                },
+                |request| request.method == "service.shutdown",
+            )
+            .map_err(|error| error.to_string());
 
             stop.store(true, std::sync::atomic::Ordering::Relaxed);
             let _ = render_thread.join();
@@ -7222,7 +7234,7 @@ fn spawn_window_server(
     world_ui_lab_camera: Arc<Mutex<WorldUiLabCameraController>>,
 ) {
     thread::spawn(move || {
-        let server = match neon_ipc::RpcServer::bind(endpoint) {
+        let server = match neon_ipc::BlockingRpcServer::bind(endpoint) {
             Ok(server) => server,
             Err(error) => {
                 eprintln!("window RPC server bind failed: {error}");
@@ -7230,10 +7242,16 @@ fn spawn_window_server(
                 return;
             }
         };
-        let mut runtime =
-            WgpuRuntime::window_control(epoch, interaction_traces, world_ui_lab_camera);
-        if let Err(error) = server.serve_until(|request| {
-            let shutdown = request.method == "service.shutdown";
+        let runtime = Arc::new(Mutex::new(WgpuRuntime::window_control(
+            epoch,
+            interaction_traces,
+            world_ui_lab_camera,
+        )));
+        let handler_proxy = proxy.clone();
+        if let Err(error) = server.serve_until(
+            move |request| {
+                let mut runtime = runtime.lock().expect("runtime lock");
+                let proxy = &handler_proxy;
             let mutates_composition = matches!(
                 request.method.as_str(),
                 "wgpu.ui.submit_fragment"
@@ -7351,19 +7369,18 @@ fn spawn_window_server(
                     applied: None,
                 });
                 if send.is_err() {
-                    return (
-                        runtime.reject(
-                            response.request_id,
-                            "window_compositor_unavailable",
-                            "window compositor is unavailable",
-                            None,
-                        ),
-                        !shutdown,
+                    return runtime.reject(
+                        response.request_id,
+                        "window_compositor_unavailable",
+                        "window compositor is unavailable",
+                        None,
                     );
                 }
             }
-            (response, !shutdown)
-        }) {
+            response
+        },
+        |request| request.method == "service.shutdown",
+        ) {
             eprintln!("window RPC server request failed: {error}");
         }
         let _ = proxy.send_event(WindowCommand::Shutdown);

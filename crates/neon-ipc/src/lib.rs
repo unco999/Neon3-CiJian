@@ -8,6 +8,11 @@ use std::time::Duration;
 
 use neon_protocol::{RpcRequest, RpcResponse};
 
+mod async_rpc;
+pub use async_rpc::{
+    AsyncRpcClient, AsyncRpcServer, BlockingRpcClient, BlockingRpcServer, RpcTransport,
+};
+
 pub const DEFAULT_MAX_FRAME_SIZE: usize = 1024 * 1024;
 
 #[derive(Debug)]
@@ -18,6 +23,7 @@ pub enum TransportError {
     RequestIdMismatch,
     ConnectionClosed,
     Timeout,
+    Cancelled,
     Io(io::Error),
 }
 
@@ -32,6 +38,7 @@ impl fmt::Display for TransportError {
             Self::RequestIdMismatch => write!(formatter, "request_id_mismatch"),
             Self::ConnectionClosed => write!(formatter, "connection_closed"),
             Self::Timeout => write!(formatter, "timeout"),
+            Self::Cancelled => write!(formatter, "cancelled"),
             Self::Io(error) => write!(formatter, "transport_io: {error}"),
         }
     }
@@ -242,7 +249,7 @@ impl RpcServer {
     }
 }
 
-fn ensure_loopback(endpoint: SocketAddr) -> Result<(), TransportError> {
+pub(crate) fn ensure_loopback(endpoint: SocketAddr) -> Result<(), TransportError> {
     if endpoint.ip().is_loopback() {
         Ok(())
     } else {
@@ -280,7 +287,7 @@ pub fn read_json_frame<T: serde::de::DeserializeOwned>(
     Ok(serde_json::from_slice(&payload)?)
 }
 
-fn map_io_error(error: io::Error) -> TransportError {
+pub(crate) fn map_io_error(error: io::Error) -> TransportError {
     match error.kind() {
         io::ErrorKind::UnexpectedEof
         | io::ErrorKind::ConnectionReset

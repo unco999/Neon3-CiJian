@@ -12,3 +12,4 @@ keywords = ["neon3", "rpc", "ipc", "game-engine"]
 neon-protocol = { version = "0.1.0", path = "../neon-protocol" }
 serde_json.workspace = true
 serde.workspace = true
+tokio = { version = "1", features = ["net", "io-util", "sync", "time", "rt", "rt-multi-thread", "macros"] }

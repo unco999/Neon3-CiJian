@@ -18,14 +18,17 @@ fn main() {
             .expect("headless server endpoint is required")
             .parse()
             .expect("headless server endpoint must be a socket address");
-        let server =
-            neon_ipc::RpcServer::bind(endpoint).expect("headless server must bind loopback");
-        let mut runtime = neon_wgpu_runtime::WgpuRuntime::headless(1);
+        let server = neon_ipc::BlockingRpcServer::bind(endpoint)
+            .expect("headless server must bind loopback");
+        let runtime = std::sync::Arc::new(std::sync::Mutex::new(
+            neon_wgpu_runtime::WgpuRuntime::headless(1),
+        ));
+        let handler = move |request| {
+            let mut guard = runtime.lock().expect("runtime lock");
+            guard.handle(request)
+        };
         server
-            .serve_until(|request| {
-                let shutdown = request.method == "service.shutdown";
-                (runtime.handle(request), !shutdown)
-            })
+            .serve_until(handler, |request| request.method == "service.shutdown")
             .expect("headless server request must complete");
         return;
     }
