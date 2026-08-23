@@ -5412,7 +5412,7 @@ impl UiWgpuRenderer {
                     preview.clip.x + preview.clip.width,
                     preview.clip.y + preview.clip.height,
                 ],
-                depth: 0.0,
+                depth: color_pass_depth(preview.world_depth),
                 paint_group_id: visual.paint_group_id,
                 ..UiInstance::zeroed()
             });
@@ -5825,8 +5825,8 @@ fn component_chrome_instances(visual: &UiVisual) -> Vec<UiInstance> {
         border,
         params: [1.0, radius, visual.style.opacity, visual.clip_radius],
         clip,
-        depth: 0.0,
-        paint_group_id: 0,
+        depth: color_pass_depth(visual.world_depth),
+        paint_group_id: visual.paint_group_id,
         ..UiInstance::zeroed()
     };
     let selected = matches!(
@@ -5963,8 +5963,8 @@ fn component_chrome_instances(visual: &UiVisual) -> Vec<UiInstance> {
                     border: [0.18, 0.52, 0.90, 0.92],
                     params: [0.0, 3.0, visual.style.opacity, visual.clip_radius],
                     clip,
-                    depth: 0.0,
-                    paint_group_id: 0,
+                    depth: color_pass_depth(visual.world_depth),
+                    paint_group_id: visual.paint_group_id,
                     ..UiInstance::zeroed()
                 },
             ]
