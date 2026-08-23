@@ -66,3 +66,37 @@ Pointer tracing now emits only lifecycle-boundary records: Bevy send, WGPU
 semantic click, Bevy semantic receive, and WorldUi transition begin/end. This
 separates transport queue delay, GPU readback delay, and presentation-transition
 time without per-frame or per-node logging.
+
+The city-only startup flow now uses a modal city console with explicit
+`city.enter` and `city.reset` events. Text intrinsic sizing now measures actual
+wrapped glyph advances, and auto-height Column/Row containers include child
+content, padding, and gaps. This removes the fixed-height text clipping seen in
+the startup screen and keeps the modal from leaking pointer input to WorldUi.
+
+The physics playground startup was fixed as well: its generated 120-object Flow
+needed `instances=1024` rather than `256`, and its Bevy camera used 4x MSAA even
+though the external composite samples a single-sample depth texture. The case
+now uses `Msaa::Off` and has a compile-budget regression test.
+
+WorldUi scaling follow-up completed the model: host external backing surfaces
+use 2x physical resolution (`2560x1440`) with `1280x720` logical coordinates,
+while WorldUi projection stores a root `world_scale`. Renderer flattening now
+keeps logical child layout unchanged and applies scale once to final visual
+bounds/clips, instead of mutating child padding/gap/bounds during projection.
+
+Physics click logs later showed semantic delivery was correct but the ECS target
+was missing: spawned dynamic entities had `PhysicsObject` but no explicit
+`Velocity`, while the interaction system queried `(&PhysicsObject, &mut Velocity)`.
+Adding `Velocity::default()` to every spawned object fixes kick, fireworks, and
+gravity-well velocity updates through the same Rapier query.
+
+The Bevy showcase was reduced to the city/monster case. The fox-girl asset,
+world panel, state path, helper cleanup system, and camera route were removed.
+The screen surface now exposes only a city console, while monster panels remain
+the only WorldUi content. Startup modal and pointer blocking remain declarative.
+
+The startup options layout exposed a structural Flow issue: `branch` nodes used
+the absolute layout default, so all active branch children overlapped at the
+same origin. Branch parsing now assigns transparent column layout by default;
+the initialization screen was redesigned as a compact options panel and the
+branch strategy has a parser regression test.

@@ -742,6 +742,9 @@ struct UiVisual {
     /// Normalized occlusion depth inherited from a projected world panel.
     /// Screen UI has `None` and is omitted from the external depth pass.
     world_depth: Option<f32>,
+    /// Uniform distance-based scale inherited from a projected world panel.
+    /// `None` for screen UI; used to scale glyphs with their panel subtree.
+    world_scale: Option<f32>,
     paint_group_id: u32,
 }
 
@@ -4140,18 +4143,21 @@ impl UiWgpuRenderer {
                         }
                         let text = text.unwrap();
                         // Static text cache: skip re-layout when the same
-                        // node_path + text content + text_scale combination
-                        // was already computed (plan §7.3). The cache key
+                        // node_path and text content were already computed.
+                        // WorldUi text uses the same root scale as its panel;
+                        // it is not independently auto-sized. Pair the cache
+                        // with the resolved visual geometry so text cannot be
+                        // reused from an obsolete projection frame.
                         // includes the atlas generation so that new glyph
                         // rasterizations trigger a refresh.
                         let node_path = &self.plan[index].id;
-                        let text_scale = if visual.bounds.height > 0.0 && visual.bounds.height <= 40.0 {
-                            (visual.bounds.height / 28.0).clamp(0.5, 2.0)
-                        } else {
-                            1.0
-                        };
-                        let scale_bits = text_scale.to_bits();
-                        let cache_key = format!("{node_path}:{text}:{scale_bits}:{}", self.atlas_generation);
+                        let cache_key = format!(
+                            "{node_path}:{text}:{}:{:?}:{:?}:{:?}",
+                            self.atlas_generation,
+                            visual.bounds,
+                            visual.clip,
+                            visual.world_scale,
+                        );
                         if let Some(cached) = self.text_layout_cache.get(&cache_key) {
                             return cached.text_instances.clone().into();
                         }
@@ -6559,14 +6565,14 @@ fn layout_text(
     horizontal_scroll: Option<f32>,
 ) -> Option<Vec<UiTextInstance>> {
     let clip = text_clip(visual)?;
-    let text_scale = if visual.bounds.height > 0.0 && visual.bounds.height <= 40.0 {
-        (visual.bounds.height / 28.0).clamp(0.5, 2.0)
-    } else {
-        1.0
-    };
+    // Glyph scale comes only from the owning WorldUi root transform. It is not
+    // derived from text bounds or content height, so camera distance cannot
+    // create an independent text-layout feedback loop.
+    let text_scale = visual.world_scale.unwrap_or(1.0);
     let mut lines = Vec::<Vec<AtlasGlyph>>::new();
     let mut line = Vec::<AtlasGlyph>::new();
     let mut line_width = 0.0;
+    let wrap_width = (visual.bounds.width - 8.0).max(1.0);
     for ch in text.chars() {
         if ch == '\n' {
             lines.push(std::mem::take(&mut line));
@@ -6574,7 +6580,7 @@ fn layout_text(
             continue;
         }
         let glyph = ensure_glyph(device, queue, font, ch).ok()?;
-        if !line.is_empty() && line_width + glyph.advance * text_scale > visual.bounds.width {
+        if !line.is_empty() && line_width + glyph.advance * text_scale > wrap_width {
             lines.push(std::mem::take(&mut line));
             line_width = 0.0;
         }
@@ -6741,6 +6747,8 @@ fn flatten_fragments_with_data_grid_display_cache(
             Some(viewport_logical_size),
             false,
             &hidden_world_nodes,
+            None,
+            None,
             None,
         );
     }
@@ -6942,7 +6950,7 @@ fn append_data_grid_frames(
                 presentation: None,
                 scroll: false,
                 declared_scroll_offset: [0.0; 2],
-                world_depth: None,
+                world_depth: None, world_scale: None,
                 paint_group_id: 0,
             };
             let mut sticky_header = vec![(
@@ -7018,7 +7026,7 @@ fn append_data_grid_frames(
                     presentation: None,
                     scroll: false,
                     declared_scroll_offset: [0.0; 2],
-                    world_depth: None,
+                    world_depth: None, world_scale: None,
                     paint_group_id: grid.paint_group_id,
                 };
                 let row_path = format!("{grid_path}/data-grid-row-{}", row.stable_row_key);
@@ -7339,6 +7347,22 @@ fn collect_node_paths(fragment_id: &str, root: &UiNode) -> HashMap<String, Strin
     paths
 }
 
+fn scale_world_bounds(
+    bounds: UiBounds,
+    scale: Option<f32>,
+    origin: Option<[f32; 2]>,
+) -> UiBounds {
+    let (Some(scale), Some(origin)) = (scale, origin) else {
+        return bounds;
+    };
+    UiBounds {
+        x: origin[0] + (bounds.x - origin[0]) * scale,
+        y: origin[1] + (bounds.y - origin[1]) * scale,
+        width: bounds.width * scale,
+        height: bounds.height * scale,
+    }
+}
+
 fn flatten_node(
     out: &mut Vec<(String, Option<String>, UiVisual, Option<UiTransition>)>,
     fragment_id: &str,
@@ -7352,6 +7376,8 @@ fn flatten_node(
     inherited_top_layer: bool,
     hidden_world_nodes: &HashSet<&str>,
     inherited_depth: Option<f32>,
+    inherited_scale: Option<f32>,
+    inherited_world_origin: Option<[f32; 2]>,
 ) {
     let node_layout = node.layout.unwrap_or_default();
     let bounds = UiBounds {
@@ -7366,6 +7392,14 @@ fn flatten_node(
             |size| size[1],
         ),
     };
+    let world_scale = node.world_scale.or(inherited_scale);
+    let world_origin = inherited_world_origin.or_else(|| {
+        world_scale.map(|_| [bounds.x + bounds.width * 0.5, bounds.y + bounds.height])
+    });
+    // Keep layout-space bounds untouched. World scale is applied once to the
+    // final visual below; children continue to resolve against the stable
+    // logical subtree, never against a previously scaled parent.
+    let visual_bounds = scale_world_bounds(bounds, world_scale, world_origin);
     let top_layer = inherited_top_layer
         || matches!(
             node.kind,
@@ -7405,11 +7439,11 @@ fn flatten_node(
             node_path.clone(),
             parent_id.map(str::to_owned),
             UiVisual {
-                bounds,
+                bounds: visual_bounds,
                 style: node.style,
                 kind: node.kind.clone(),
                 enabled: node.enabled,
-                clip: effective_clip,
+                clip: scale_world_bounds(effective_clip, world_scale, world_origin),
                 clip_radius: own_clip_radius.unwrap_or(0.0),
                 image: node.image.clone(),
                 surface: node.surface.clone(),
@@ -7418,6 +7452,7 @@ fn flatten_node(
                 scroll: node_layout.clip == UiClipPolicy::Scroll,
                 declared_scroll_offset: node_layout.scroll_offset,
                 world_depth: node.world_depth.or(inherited_depth),
+                world_scale,
                 paint_group_id: 0,
             },
             node.enter_transition.clone(),
@@ -7459,6 +7494,8 @@ fn flatten_node(
             top_layer,
             hidden_world_nodes,
             node.world_depth.or(inherited_depth),
+            world_scale,
+            world_origin,
         );
     }
 }
@@ -7507,27 +7544,78 @@ fn clamp_dimension(value: f32, layout: &UiLayout, height: bool) -> f32 {
 }
 
 fn intrinsic_size(node: &UiNode, font: Option<&ResidentFont>) -> [f32; 2] {
-    let Some(text) = node.text.as_ref().and_then(text_ref_value) else {
-        return [0.0, 0.0];
-    };
-    let line_height = font.map_or(FONT_RASTER_SIZE, |font| font.line_height);
-    let width = font.map_or_else(
-        || text.chars().count() as f32 * FONT_RASTER_SIZE * 0.5,
-        |font| {
-            text.chars()
-                .map(|ch| font.font.metrics(ch, FONT_RASTER_SIZE).advance_width)
-                .sum()
-        },
-    );
-    [
-        width
-            + if node.kind == UiNodeKind::TextInput {
-                TEXT_INPUT_INSET * 2.0
+    if let Some(text) = node.text.as_ref().and_then(text_ref_value) {
+        let line_height = font.map_or(FONT_RASTER_SIZE, |font| font.line_height);
+        let advance = |ch: char| {
+            font.map_or_else(
+                || {
+                    if ch.is_ascii() {
+                        FONT_RASTER_SIZE * 0.5
+                    } else {
+                        FONT_RASTER_SIZE
+                    }
+                },
+                |font| font.font.metrics(ch, FONT_RASTER_SIZE).advance_width,
+            )
+        };
+        let text_inset = if node.kind == UiNodeKind::TextInput { TEXT_INPUT_INSET * 2.0 } else { 8.0 };
+        let available_width = if node.bounds.width > text_inset {
+            (node.bounds.width - text_inset).max(1.0)
+        } else {
+            text.chars().map(advance).sum::<f32>()
+        };
+        let mut line_width = 0.0;
+        let mut max_line_width: f32 = 0.0;
+        let mut line_count = 1.0;
+        for ch in text.chars() {
+            if ch == '\n' {
+                max_line_width = max_line_width.max(line_width);
+                line_width = 0.0;
+                line_count += 1.0;
+                continue;
+            }
+            let glyph_width = advance(ch);
+            if line_width > 0.0 && line_width + glyph_width > available_width.max(1.0) {
+                max_line_width = max_line_width.max(line_width);
+                line_width = 0.0;
+                line_count += 1.0;
+            }
+            line_width += glyph_width;
+        }
+        max_line_width = max_line_width.max(line_width);
+        return [
+            if node.bounds.width > 0.0 {
+                node.bounds.width
             } else {
-                0.0
+                max_line_width + text_inset
             },
-        line_height,
-    ]
+            (node.bounds.height.max(line_height * line_count)),
+        ];
+    }
+    let layout = node.layout.unwrap_or_default();
+    if node.children.is_empty() {
+        return [0.0, 0.0];
+    }
+    let children = node
+        .children
+        .iter()
+        .filter(|child| child.visible)
+        .map(|child| intrinsic_size(child, font))
+        .collect::<Vec<_>>();
+    let gap = layout.gap * children.len().saturating_sub(1) as f32;
+    let padding_width = layout.padding[1] + layout.padding[3];
+    let padding_height = layout.padding[0] + layout.padding[2];
+    match layout.mode {
+        UiLayoutMode::Row => [
+            node.bounds.width.max(children.iter().map(|size| size[0]).sum::<f32>() + gap + padding_width),
+            node.bounds.height.max(children.iter().map(|size| size[1]).fold(0.0, f32::max) + padding_height),
+        ],
+        UiLayoutMode::Column => [
+            node.bounds.width.max(children.iter().map(|size| size[0]).fold(0.0, f32::max) + padding_width),
+            node.bounds.height.max(children.iter().map(|size| size[1]).sum::<f32>() + gap + padding_height),
+        ],
+        _ => [0.0, 0.0],
+    }
 }
 
 fn is_interactive_control(kind: &UiNodeKind) -> bool {
@@ -7801,6 +7889,7 @@ fn transition_source(target: &UiVisual, transition: &UiTransition) -> UiVisual {
         scroll: target.scroll,
         declared_scroll_offset: target.declared_scroll_offset,
         world_depth: target.world_depth,
+        world_scale: target.world_scale,
         paint_group_id: target.paint_group_id,
     }
 }
@@ -7864,6 +7953,7 @@ fn sample_transition(active: &ActiveTransition, time_seconds: f32) -> UiVisual {
         scroll: active.target.scroll,
         declared_scroll_offset: active.target.declared_scroll_offset,
         world_depth: active.target.world_depth,
+        world_scale: active.target.world_scale,
         paint_group_id: active.target.paint_group_id,
     }
 }
@@ -8238,7 +8328,7 @@ mod tests {
             presentation: None,
             scroll: false,
             declared_scroll_offset: [0.0; 2],
-            world_depth: None,
+            world_depth: None, world_scale: None,
             paint_group_id: 0,
         };
         let target_a = UiVisual {
@@ -8468,7 +8558,7 @@ mod tests {
             presentation: None,
             scroll: false,
             declared_scroll_offset: [0.0; 2],
-            world_depth: None,
+            world_depth: None, world_scale: None,
             paint_group_id: 0,
         };
         let node_path = "grid/assets/data-grid-row-asset-42/cell-name".to_owned();
@@ -8555,7 +8645,7 @@ mod tests {
                 presentation: None,
                 scroll: false,
                 declared_scroll_offset: [0.0; 2],
-                world_depth: None,
+                world_depth: None, world_scale: None,
                 paint_group_id: 0,
             },
             transition: None,
@@ -8641,7 +8731,7 @@ mod tests {
                 presentation: None,
                 scroll: false,
                 declared_scroll_offset: [0.0; 2],
-                world_depth: None,
+                world_depth: None, world_scale: None,
                 paint_group_id: 0,
             },
             transition: None,
@@ -8816,7 +8906,7 @@ mod tests {
                 }),
                 scroll: false,
                 declared_scroll_offset: [0.0; 2],
-                world_depth: None,
+                world_depth: None, world_scale: None,
                 paint_group_id: 0,
             },
             transition: None,
@@ -8895,7 +8985,7 @@ mod tests {
             }),
             scroll: false,
             declared_scroll_offset: [0.0; 2],
-            world_depth: None,
+            world_depth: None, world_scale: None,
             paint_group_id: 0,
         };
         let mut renderer = UiWgpuRenderer::new(&device, wgpu::TextureFormat::Rgba8Unorm);
@@ -8995,7 +9085,7 @@ mod tests {
             presentation: None,
             scroll: false,
             declared_scroll_offset: [0.0; 2],
-            world_depth: None,
+            world_depth: None, world_scale: None,
             paint_group_id: 0,
         };
         renderer.plan.push(PlannedNode {
@@ -9058,7 +9148,7 @@ mod tests {
             presentation: None,
             scroll: true,
             declared_scroll_offset: [0.0; 2],
-            world_depth: None,
+            world_depth: None, world_scale: None,
             paint_group_id: 0,
         };
         let child = UiVisual {
@@ -9136,7 +9226,7 @@ mod tests {
             presentation: None,
             scroll: true,
             declared_scroll_offset: [20.0, 30.0],
-            world_depth: None,
+            world_depth: None, world_scale: None,
             paint_group_id: 0,
         };
         let child = UiVisual {
@@ -9239,7 +9329,7 @@ mod tests {
                 opacity: 1.0,
             },
             enter_transition: None,
-            world_depth: None,
+            world_depth: None, world_scale: None,
             children: Vec::new(),
         });
         let pixels = render_offscreen_for_test(
@@ -9319,7 +9409,7 @@ mod tests {
                 style: UiStyle::default(),
                 enter_transition: None,
                 children: Vec::new(),
-                world_depth: None,
+                world_depth: None, world_scale: None,
             })
             .collect();
         root.children.push(UiNode {
@@ -9340,7 +9430,7 @@ mod tests {
             surface: None,
             style: UiStyle::default(),
             enter_transition: None,
-            world_depth: None,
+            world_depth: None, world_scale: None,
             children: Vec::new(),
         });
         root.children.push(UiNode {
@@ -9361,7 +9451,7 @@ mod tests {
             surface: None,
             style: UiStyle::default(),
             enter_transition: None,
-            world_depth: None,
+            world_depth: None, world_scale: None,
             children: Vec::new(),
         });
         let pixels = render_hit_ids_for_test(
@@ -9488,7 +9578,7 @@ mod tests {
                 },
                 enter_transition: None,
                 children: Vec::new(),
-                world_depth: None,
+                world_depth: None, world_scale: None,
             };
             let fragment = UiFragment {
                 fragment_id: UiFragmentId("f".into()),
@@ -9797,7 +9887,7 @@ mod tests {
                 opacity: 1.0,
             },
             enter_transition: None,
-            world_depth: None,
+            world_depth: None, world_scale: None,
             children: Vec::new(),
         };
         let cell = |id| neon_ui_schema::UiDataGridCell {
@@ -9978,7 +10068,7 @@ mod tests {
             surface: None,
             style: UiStyle::default(),
             enter_transition: None,
-            world_depth: None,
+            world_depth: None, world_scale: None,
             children: Vec::new(),
         };
         let cell = |id, presentation_override| neon_ui_schema::UiDataGridCell {
@@ -10141,7 +10231,7 @@ mod tests {
             surface: None,
             style: UiStyle::default(),
             enter_transition: None,
-            world_depth: None,
+            world_depth: None, world_scale: None,
             children: Vec::new(),
         };
         let declaration = neon_ui_schema::UiDataGridDeclaration {
@@ -10300,7 +10390,7 @@ mod tests {
             surface: None,
             style: UiStyle::default(),
             enter_transition: None,
-            world_depth: None,
+            world_depth: None, world_scale: None,
             children: Vec::new(),
         };
         let declaration = neon_ui_schema::UiDataGridDeclaration {
@@ -10530,7 +10620,7 @@ mod tests {
             surface: None,
             style: UiStyle::default(),
             enter_transition: None,
-            world_depth: None,
+            world_depth: None, world_scale: None,
             children: Vec::new(),
         };
         let declaration = neon_ui_schema::UiDataGridDeclaration {
@@ -10757,7 +10847,7 @@ mod tests {
                 motion_key: None,
             }),
             children: Vec::new(),
-            world_depth: None,
+            world_depth: None, world_scale: None,
         }
     }
 
@@ -11261,7 +11351,7 @@ mod tests {
             surface: None,
             style: UiStyle::default(),
             enter_transition: None,
-            world_depth: None,
+            world_depth: None, world_scale: None,
             children: Vec::new(),
         });
         let fragments = HashMap::from([(
@@ -11390,7 +11480,7 @@ mod tests {
                 style: UiStyle::default(),
                 enter_transition: None,
                 children: Vec::new(),
-                world_depth: None,
+                world_depth: None, world_scale: None,
             });
         }
         let fragments = HashMap::from([(
@@ -11552,7 +11642,7 @@ mod tests {
                 ..UiStyle::default()
             },
             enter_transition: None,
-            world_depth: None,
+            world_depth: None, world_scale: None,
             children: Vec::new(),
         };
         let mut fragment = UiFragment {
@@ -11604,7 +11694,7 @@ mod tests {
                 ..UiStyle::default()
             },
             enter_transition: None,
-            world_depth: None,
+            world_depth: None, world_scale: None,
             children: Vec::new(),
         };
         let fragments = HashMap::from([(
@@ -12970,7 +13060,7 @@ mod tests {
                 opacity: 1.0,
             },
             enter_transition: None,
-            world_depth: None,
+            world_depth: None, world_scale: None,
             children: Vec::new(),
         };
         let fragment = UiFragment {
@@ -13028,7 +13118,7 @@ mod tests {
             },
             enter_transition: None,
             children: Vec::new(),
-            world_depth: None,
+            world_depth: None, world_scale: None,
         };
         let fragment = UiFragment {
             fragment_id: UiFragmentId("bundled-cjk-text".into()),
@@ -13086,7 +13176,7 @@ mod tests {
             },
             enter_transition: None,
             children: Vec::new(),
-            world_depth: None,
+            world_depth: None, world_scale: None,
         };
         let root = UiNode {
             node_id: UiNodeId("clip-root".into()),
@@ -13116,7 +13206,7 @@ mod tests {
             },
             enter_transition: None,
             children: vec![label],
-            world_depth: None,
+            world_depth: None, world_scale: None,
         };
         let pixels = render_offscreen_for_test(
             &device,
@@ -13192,7 +13282,7 @@ mod tests {
                 style: UiStyle::default(),
                 enter_transition: None,
                 children: Vec::new(),
-                world_depth: None,
+                world_depth: None, world_scale: None,
             },
             UiNode {
                 node_id: UiNodeId("second".into()),
@@ -13213,7 +13303,7 @@ mod tests {
                 style: UiStyle::default(),
                 enter_transition: None,
                 children: Vec::new(),
-                world_depth: None,
+                world_depth: None, world_scale: None,
             },
         ];
         let fragments = HashMap::from([(
@@ -13255,7 +13345,7 @@ mod tests {
             presentation: None,
             scroll: false,
             declared_scroll_offset: [0.0; 2],
-            world_depth: None,
+            world_depth: None, world_scale: None,
             paint_group_id: 0,
         };
         let transition = node().enter_transition.unwrap();
@@ -13301,7 +13391,7 @@ mod tests {
             }),
             scroll: false,
             declared_scroll_offset: [0.0; 2],
-            world_depth: None,
+            world_depth: None, world_scale: None,
             paint_group_id: 0,
         };
         let target = visual(100.0);
@@ -13359,7 +13449,7 @@ mod tests {
             presentation: None,
             scroll: false,
             declared_scroll_offset: [0.0; 2],
-            world_depth: None,
+            world_depth: None, world_scale: None,
             paint_group_id: 0,
         };
         let target = UiVisual {
@@ -13385,7 +13475,7 @@ mod tests {
             presentation: None,
             scroll: false,
             declared_scroll_offset: [0.0; 2],
-            world_depth: None,
+            world_depth: None, world_scale: None,
             paint_group_id: 0,
         };
         let active = ActiveTransition {
@@ -13433,7 +13523,7 @@ mod tests {
             presentation: None,
             scroll: false,
             declared_scroll_offset: [0.0; 2],
-            world_depth: None,
+            world_depth: None, world_scale: None,
             paint_group_id: 0,
         };
         UiWgpuRenderer::sample(
@@ -13483,6 +13573,7 @@ mod tests {
             scroll: false,
             declared_scroll_offset: [0.0; 2],
             world_depth: Some(0.5),
+            world_scale: None,
             paint_group_id: 0,
         };
         let transition = UiTransition {
@@ -13527,6 +13618,53 @@ mod tests {
         assert_eq!([sampled.bounds.x, sampled.bounds.y], [700.0, 540.0]);
         assert_eq!(active.len(), 1, "camera motion must not create a new transition");
         assert!(active["world/p0"].started_at_seconds == 1.0);
+    }
+
+    #[test]
+    fn intrinsic_text_height_accounts_for_wrapped_lines() {
+        let mut value = node();
+        value.node_id = UiNodeId("wrapped".into());
+        value.text = Some(TextRef::Literal {
+            value: "选择一个入口，开始观察怪物面板、统一命中图和本地动画。".into(),
+        });
+        value.bounds.width = 120.0;
+        value.bounds.height = 0.0;
+        let size = intrinsic_size(&value, None);
+        assert!(size[1] > FONT_RASTER_SIZE);
+        assert_eq!(size[0], 120.0);
+    }
+
+    #[test]
+    fn city_copy_width_requires_two_lines_before_font_residency() {
+        let mut value = node();
+        value.node_id = UiNodeId("city-copy".into());
+        value.text = Some(TextRef::Literal {
+            value: "选择一个入口，开始观察怪物面板、统一命中图和本地动画。".into(),
+        });
+        value.bounds.width = 388.0;
+        value.bounds.height = 0.0;
+        let size = intrinsic_size(&value, None);
+        assert_eq!(size[0], 388.0);
+        assert!(
+            size[1] >= FONT_RASTER_SIZE * 2.0,
+            "city copy must reserve two lines, got {}",
+            size[1]
+        );
+    }
+
+    #[test]
+    fn declared_button_height_is_preserved_by_auto_parent_measurement() {
+        let mut button = node();
+        button.node_id = UiNodeId("city-enter".into());
+        button.kind = UiNodeKind::Button;
+        button.text = Some(TextRef::Literal {
+            value: "进入城市".into(),
+        });
+        button.bounds.width = 388.0;
+        button.bounds.height = 48.0;
+        let size = intrinsic_size(&button, None);
+        assert_eq!(size[0], 388.0);
+        assert!(size[1] >= 48.0);
     }
 
     #[test]

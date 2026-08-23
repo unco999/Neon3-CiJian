@@ -215,6 +215,7 @@ fn main() {
             style: UiStyle::default(),
             enter_transition: None,
             world_depth: None,
+            world_scale: None,
             children: vec![
                 // Monster 0 panel — clickable
                 UiNode {
@@ -237,6 +238,7 @@ fn main() {
                     },
                     enter_transition: None,
                     world_depth: None,
+                    world_scale: None,
                     children: vec![],
                 },
                 // Monster 1 panel — clickable
@@ -260,6 +262,7 @@ fn main() {
                     },
                     enter_transition: None,
                     world_depth: None,
+                    world_scale: None,
                     children: vec![],
                 },
             ],

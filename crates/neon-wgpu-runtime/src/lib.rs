@@ -90,6 +90,7 @@ const WORLD_UI_LAB_PANEL_TARGET: &str = "world-ui-lab.panel";
 const WORLD_UI_LAB_LOGICAL_SIZE: [u32; 2] = [640, 360];
 const WORLD_UI_LAB_PANEL_SIZE: [u32; 2] = [1280, 720];
 const WORLD_UI_LAB_PREVIEW_SIZE: [u32; 2] = [640, 360];
+const HEADLESS_UI_LOGICAL_SIZE: [f32; 2] = [1280.0, 720.0];
 
 #[derive(Clone, Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -2439,8 +2440,8 @@ impl HeadlessExternalGpu {
         let pointer_hit_target = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("neon3-external-pointer-hit-id"),
             size: wgpu::Extent3d {
-                width: 1280,
-                height: 720,
+                width: 2560,
+                height: 1440,
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
@@ -2502,8 +2503,8 @@ impl HeadlessExternalGpu {
         if !id_frame_ready {
             return Err("pointer_id_frame_unavailable".into());
         }
-        let x = pixel[0].clamp(0.0, 1279.0) as u32;
-        let y = pixel[1].clamp(0.0, 719.0) as u32;
+        let x = pixel[0].clamp(0.0, 2559.0) as u32;
+        let y = pixel[1].clamp(0.0, 1439.0) as u32;
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("neon3-external-pointer-hit-readback"),
         });
@@ -3040,7 +3041,7 @@ impl HeadlessExternalGpu {
                     &mut pass,
                     fragments,
                     [shared.width, shared.height],
-                    [shared.width as f32, shared.height as f32],
+                    HEADLESS_UI_LOGICAL_SIZE,
                     time_seconds,
                     mode,
                 );
@@ -3129,7 +3130,7 @@ impl HeadlessExternalGpu {
                     &mut id_pass,
                     &unified_hit_fragments,
                     [id_shared.width, id_shared.height],
-                    [id_shared.width as f32, id_shared.height as f32],
+                    HEADLESS_UI_LOGICAL_SIZE,
                     time_seconds,
                 );
                 self.perf.unified_id_passes += 1;
@@ -3859,7 +3860,7 @@ impl WindowGpu {
                 &mut pass,
                 fragments,
                 [shared.width, shared.height],
-                [shared.width as f32, shared.height as f32],
+                HEADLESS_UI_LOGICAL_SIZE,
                 self.started_at.elapsed().as_secs_f32(),
                 UiDrawMode::All,
             );
@@ -3897,7 +3898,7 @@ impl WindowGpu {
                 &mut pass,
                 fragments,
                 [shared.width, shared.height],
-                [shared.width as f32, shared.height as f32],
+                HEADLESS_UI_LOGICAL_SIZE,
                 self.started_at.elapsed().as_secs_f32(),
             );
             drop(pass);
@@ -4553,6 +4554,7 @@ fn world_ui_lab_fragment() -> HashMap<UiFragmentId, UiFragment> {
         },
         enter_transition: None,
         world_depth: None,
+        world_scale: None,
         children: Vec::new(),
     };
     let root = UiNode {
@@ -4580,6 +4582,7 @@ fn world_ui_lab_fragment() -> HashMap<UiFragmentId, UiFragment> {
         },
         enter_transition: None,
         world_depth: None,
+        world_scale: None,
         children: vec![
             label(
                 "callsign",
@@ -7643,6 +7646,7 @@ impl WindowedRuntime {
                 motion_key: None,
             }),
             world_depth: None,
+            world_scale: None,
             children: vec![
                 UiNode {
                     node_id: neon_ui_schema::UiNodeId("demo-title".into()),
@@ -7678,6 +7682,7 @@ impl WindowedRuntime {
                         motion_key: None,
                     }),
                     world_depth: None,
+                    world_scale: None,
                     children: Vec::new(),
                 },
                 UiNode {
@@ -7720,6 +7725,7 @@ impl WindowedRuntime {
                         motion_key: None,
                     }),
                     world_depth: None,
+                    world_scale: None,
                     children: Vec::new(),
                 },
             ],
@@ -7958,40 +7964,6 @@ impl WgpuRuntime {
             .effects
             .iter()
             .any(|effect| matches!(effect, neon_ui_schema::UiEffect::CameraVisibility { .. }));
-        fn scale_world_subtree(
-            node: &mut neon_ui_schema::UiNode,
-            scale: f32,
-            include_position: bool,
-        ) {
-            if include_position {
-                node.bounds.x *= scale;
-                node.bounds.y *= scale;
-            }
-            node.bounds.width *= scale;
-            node.bounds.height *= scale;
-            if let Some(layout) = &mut node.layout {
-                for value in &mut layout.padding {
-                    *value *= scale;
-                }
-                for value in &mut layout.margin {
-                    *value *= scale;
-                }
-                layout.gap *= scale;
-                layout.flex_basis = layout.flex_basis.map(|value| value * scale);
-                layout.min_size = layout
-                    .min_size
-                    .map(|value| [value[0] * scale, value[1] * scale]);
-                layout.max_size = layout
-                    .max_size
-                    .map(|value| [value[0] * scale, value[1] * scale]);
-                layout.preferred_size = layout
-                    .preferred_size
-                    .map(|value| [value[0] * scale, value[1] * scale]);
-            }
-            for child in &mut node.children {
-                scale_world_subtree(child, scale, true);
-            }
-        }
         fn visit(
             node: &mut neon_ui_schema::UiNode,
             effects: &[neon_ui_schema::UiEffect],
@@ -8067,17 +8039,13 @@ impl WgpuRuntime {
                         };
                         node.world_depth = Some(occlusion_depth);
                         let scale = (6.0 / depth).clamp(0.5, 2.0);
-                        node.bounds.width *= scale;
-                        node.bounds.height *= scale;
+                        // Keep the authored panel topology and text layout at
+                        // one stable logical size. Distance changes are a
+                        // single uniform subtree scale applied by the renderer;
+                        // they must not mutate padding, gaps, or child layout.
+                        node.world_scale = Some(scale);
                         if let Some(layout) = &mut node.layout {
                             layout.clip = neon_ui_schema::UiClipPolicy::None;
-                            for value in &mut layout.padding {
-                                *value *= scale;
-                            }
-                            layout.gap *= scale;
-                        }
-                        for child in &mut node.children {
-                            scale_world_subtree(child, scale, true);
                         }
                     }
                 }
@@ -9173,6 +9141,7 @@ mod tests {
                 style: UiStyle::default(),
                 enter_transition: None,
                 world_depth: None,
+                world_scale: None,
                 children,
             }
         }
@@ -9586,6 +9555,7 @@ mod tests {
                 style: UiStyle::default(),
                 enter_transition: None,
                 world_depth: None,
+                world_scale: None,
                 children: Vec::new(),
             },
             effects: vec![UiEffect::SemanticAction {
@@ -9727,6 +9697,7 @@ mod tests {
             style: UiStyle::default(),
             enter_transition: None,
             world_depth: None,
+            world_scale: None,
             children: Vec::new(),
         };
         gated.root.children.push(marker);
@@ -9927,6 +9898,7 @@ mod tests {
             style: UiStyle::default(),
             enter_transition: None,
             world_depth: None,
+            world_scale: None,
             children: Vec::new(),
         };
         gated.root.children.push(marker);
@@ -9956,10 +9928,18 @@ mod tests {
             .children[0]
             .world_depth
             .expect("depth-tested world panel exports a depth");
-        // viewport [1280, 720]: center (640, 360). depth 2 → scale (6/2).clamp = 2.0,
-        // so width 20, height 20 → bounds.x = 640 - 10, y = 360 - 20.
-        assert!((bounds.x - 630.0).abs() < 0.5, "x was {}", bounds.x);
-        assert!((bounds.y - 340.0).abs() < 0.5, "y was {}", bounds.y);
+        assert_eq!(
+            snapshot[&UiFragmentId("static-fragment".into())]
+                .root
+                .children[0]
+                .world_scale,
+            Some(2.0)
+        );
+        // viewport [1280, 720]: center (640, 360). depth 2 → uniform scale 2.0.
+        // The anchor point remains the panel's bottom-center; authored x/y are
+        // not rewritten by the projection filter.
+        assert!((bounds.x - 635.0).abs() < 0.5, "x was {}", bounds.x);
+        assert!((bounds.y - 350.0).abs() < 0.5, "y was {}", bounds.y);
         assert!((depth - 0.05).abs() < f32::EPSILON, "depth was {depth}");
         let (device, queue) = test_device("neon3-world-ui-id-target");
         let mut id_renderer = ui_renderer::UiWgpuRenderer::new(
@@ -10496,6 +10476,7 @@ mod tests {
             },
             enter_transition: None,
             world_depth: None,
+            world_scale: None,
             children: Vec::new(),
         };
         let fragments = HashMap::from([(
@@ -10701,6 +10682,7 @@ mod tests {
             },
             enter_transition: None,
             world_depth: None,
+            world_scale: None,
             children: Vec::new(),
         };
         let fragments = HashMap::from([(
@@ -10838,6 +10820,7 @@ mod tests {
             enter_transition: None,
             children: Vec::new(),
             world_depth: None,
+            world_scale: None,
         };
         let fragments = HashMap::from([(
             UiFragmentId("srgb-acceptance".into()),
@@ -10898,6 +10881,7 @@ mod tests {
                 },
                 enter_transition: None,
                 world_depth: None,
+                world_scale: None,
                 children: Vec::new(),
             },
             UiNode {
@@ -10919,6 +10903,7 @@ mod tests {
                 style: UiStyle::default(),
                 enter_transition: None,
                 world_depth: None,
+                world_scale: None,
                 children: Vec::new(),
             },
             UiNode {
@@ -10940,6 +10925,7 @@ mod tests {
                 style: UiStyle::default(),
                 enter_transition: None,
                 world_depth: None,
+                world_scale: None,
                 children: Vec::new(),
             },
             UiNode {
@@ -10965,6 +10951,7 @@ mod tests {
                 enter_transition: None,
                 children: Vec::new(),
                 world_depth: None,
+                world_scale: None,
             },
         ];
         let pixels = ui_renderer::render_hit_ids_for_test(
@@ -11037,6 +11024,7 @@ mod tests {
             style: UiStyle::default(),
             enter_transition: None,
             world_depth: None,
+            world_scale: None,
             children: Vec::new(),
         };
         let clipper = UiNode {
@@ -11062,6 +11050,7 @@ mod tests {
             enter_transition: None,
             children: vec![child],
             world_depth: None,
+            world_scale: None,
         };
         let root = UiNode {
             node_id: UiNodeId("clip-root".into()),
@@ -11083,6 +11072,7 @@ mod tests {
             enter_transition: None,
             children: vec![clipper],
             world_depth: None,
+            world_scale: None,
         };
         let pixels = ui_renderer::render_hit_ids_for_test(
             &device,

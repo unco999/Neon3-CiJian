@@ -2043,8 +2043,21 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
         style: UiStyle::default(),
         enter_transition: None,
         world_depth: None,
+        world_scale: None,
         children: Vec::new(),
     };
+    if component == "branch" {
+        // A branch is a conditional structural container. Its children must
+        // receive a deterministic flow layout instead of inheriting the
+        // schema's absolute default, otherwise every branch child starts at
+        // the same origin and overlaps. The branch itself is transparent;
+        // only its active subtree paints.
+        let layout = node.layout.as_mut().expect("Flow nodes have layout");
+        layout.mode = UiLayoutMode::Column;
+        layout.clip = UiClipPolicy::None;
+        node.style.background_color[3] = 0.0;
+        node.style.border_color[3] = 0.0;
+    }
     if is_render_surface {
         node.surface = Some(RenderSurfaceRef {
             target_id: format!("render.{}", node.node_id.0),
@@ -3510,6 +3523,7 @@ fn insert_node(
         style: UiStyle::default(),
         enter_transition: None,
         world_depth: None,
+        world_scale: None,
         children: Vec::new(),
     });
     Ok(())
@@ -3600,6 +3614,21 @@ panel workspace row gap 8
   panel inspector column gap 6
     text title value $terrain_name
 "#;
+
+    #[test]
+    fn branch_is_a_transparent_column_layout_container() {
+        let document = parse_nui_flow(
+            "input show bool default true\nsurface root w 400 h 300\n  branch choices h 260 when $show\n    text title value \"Title\" w 300 h 32\n    button first value \"First\" w 300 h 48\n    button second value \"Second\" w 300 h 48\n",
+        )
+        .expect("branch fixture must parse");
+        let branch = &document.ir.root.children[0];
+        assert_eq!(
+            branch.layout.as_ref().map(|layout| layout.mode),
+            Some(UiLayoutMode::Column)
+        );
+        assert_eq!(branch.style.background_color[3], 0.0);
+        assert_eq!(branch.style.border_color[3], 0.0);
+    }
 
     #[test]
     fn lowers_workbench_with_stable_keys_and_bindings() {

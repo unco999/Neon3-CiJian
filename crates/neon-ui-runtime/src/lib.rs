@@ -3375,6 +3375,8 @@ impl UiRuntime {
                     "intent": event.intent,
                     "source_node_key": event.source_node_key,
                     "payload": event.payload,
+                    "requested_value": event.requested_value,
+                    "event_id": event.event_id,
                 }));
             }
             if let Err(error) = self
@@ -4746,6 +4748,7 @@ impl UiRuntime {
                     motion_key: None,
                 }),
                 world_depth: None,
+                world_scale: None,
                 children: vec![UiNode {
                     node_id: UiNodeId("title-label".into()),
                     kind: UiNodeKind::Label,
@@ -4778,6 +4781,7 @@ impl UiRuntime {
                         motion_key: None,
                     }),
                     world_depth: None,
+                    world_scale: None,
                     children: Vec::new(),
                 }],
             },

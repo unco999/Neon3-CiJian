@@ -33,6 +33,7 @@ fn request(sequence: u64) -> RpcRequest {
             style: UiStyle::default(),
             enter_transition: None,
             world_depth: None,
+            world_scale: None,
             children: Vec::new(),
         },
         effects: Vec::new(),

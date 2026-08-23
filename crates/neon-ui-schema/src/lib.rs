@@ -652,6 +652,11 @@ pub struct UiNode {
     /// panel's descendants so every glyph/bar shares its anchor depth.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub world_depth: Option<f32>,
+    /// Uniform scale applied to the whole projected world panel subtree.
+    /// `None` for ordinary screen UI. Inherited by descendants so every
+    /// glyph/bar shares one distance-based scale instead of re-layouting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub world_scale: Option<f32>,
     pub children: Vec<UiNode>,
 }
 
