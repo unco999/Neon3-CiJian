@@ -793,6 +793,7 @@ mod tests {
                 style: UiStyle::default(),
                 enter_transition: None,
                 world_depth: None,
+                world_scale: None,
                 children: Vec::new(),
             },
             effects: Vec::new(),
@@ -909,6 +910,7 @@ mod tests {
                 style: UiStyle::default(),
                 enter_transition: None,
                 world_depth: None,
+                world_scale: None,
                 children: Vec::new(),
             }
         }

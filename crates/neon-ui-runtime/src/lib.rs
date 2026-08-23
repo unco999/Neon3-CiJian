@@ -3014,13 +3014,14 @@ impl UiRuntime {
         let mut runtime = Self::new(epoch, "ui-runtime-forwarder")
             .with_eventd_endpoint(eventd_endpoint)
             .with_wgpu_endpoint(wgpu_endpoint);
-        // Pointer-lane inbound returns `accepted` immediately after the
-        // presentation motion is submitted. Host forwarding is deferred to the
-        // next service tick so a slow host response cannot block the next
-        // pointer (plan §3.1). Completions are polled before each request and
-        // host calls run on one ordered worker so accepted publications cannot
-        // overtake one another.
-        runtime.async_host_forward = true;
+        // Keep the control-plane mutation ordered until the server has a real
+        // wake-up path for asynchronous completions. Returning accepted while
+        // the host publication is only queued made a window click appear to
+        // require a second click: the next RPC was the thing that drained the
+        // previous completion. A synchronous forward still preserves the
+        // single ordered command lane and guarantees one click -> one
+        // publication -> one fragment submission.
+        runtime.async_host_forward = false;
         let (host_completion_tx, host_completion_rx) = mpsc::channel();
         let mut active_host_forwards = 0_usize;
         let result = server.serve_until(|request| {
@@ -3075,6 +3076,14 @@ impl UiRuntime {
             } else {
                 runtime.handle_service_request(request)
             };
+            // An accepted async pointer event must start its ordered host
+            // forward in the same service tick. Waiting for the next inbound
+            // RPC made window clicks appear to require two presses: the first
+            // event was queued, and only the second request drained it.
+            if !shutdown && active_host_forwards == 0 {
+                active_host_forwards +=
+                    runtime.start_next_pending_host_forward(host_completion_tx.clone());
+            }
             if shutdown {
                 // A shutdown is the one control-plane operation allowed to
                 // wait. Give already accepted host forwards a bounded window
@@ -3289,7 +3298,11 @@ impl UiRuntime {
         self.ensure_host_adapter(host_endpoint)?;
         let mut inbound = match serde_json::from_value::<UiHostInbound>(request.params.clone()) {
             Ok(inbound) => inbound,
-            Err(_) => self.renderer_event_to_host_inbound(request.params.clone())?,
+            Err(_) => {
+                let event: UiSemanticEvent = serde_json::from_value(request.params.clone())
+                    .map_err(|_| TransportError::Io(std::io::Error::other("invalid UI host inbound")))?;
+                self.renderer_event_to_host_inbound_value(event)?
+            }
         };
         let mut semantic_feedback = None;
         if let UiHostInbound::DragDrop {
@@ -3983,6 +3996,25 @@ impl UiRuntime {
     ) -> Result<UiHostInbound, TransportError> {
         let event: UiSemanticEvent = serde_json::from_value(params)
             .map_err(|_| TransportError::Io(std::io::Error::other("invalid UI host inbound")))?;
+        self.renderer_event_to_host_inbound_value(event)
+    }
+
+    fn renderer_event_to_host_inbound_value(
+        &mut self,
+        mut event: UiSemanticEvent,
+    ) -> Result<UiHostInbound, TransportError> {
+        // The renderer can legitimately be one composition revision behind
+        // while the previous click's host publication is being delivered. A
+        // pointer intent is still bound to the same stable fragment identity;
+        // rebase only that revision to the active fragment before validation.
+        // Program identity, node binding, input revision, epoch, sequence and
+        // idempotency checks remain authoritative and are still enforced.
+        if let Some(active) = self.cached_fragment.as_ref()
+            && event.fragment.id == active.fragment_id
+            && event.fragment.revision != active.revision
+        {
+            event.fragment.revision = active.revision;
+        }
         self.validate_semantic_event(&event)
             .map_err(|code| TransportError::Io(std::io::Error::other(code)))?;
         if event.data_grid_cell.is_some() {
@@ -4372,7 +4404,7 @@ impl UiRuntime {
     }
 
     fn handle_input_event(&mut self, mut request: RpcRequest) -> RpcResponse {
-        let event: UiSemanticEvent = match serde_json::from_value(request.params.clone()) {
+        let mut event: UiSemanticEvent = match serde_json::from_value(request.params.clone()) {
             Ok(event) => event,
             Err(_) => {
                 return self.rejected(
@@ -4382,6 +4414,17 @@ impl UiRuntime {
                 );
             }
         };
+        // A renderer-side pointer event can arrive one fragment revision behind
+        // while the previous accepted click's publication is being applied.
+        // Rebind same-identity input events to the current active fragment;
+        // semantic binding, input sequence, epoch and idempotency validation
+        // still run below.
+        if let Some(active) = self.cached_fragment.as_ref()
+            && event.fragment.id == active.fragment_id
+            && event.fragment.revision != active.revision
+        {
+            event.fragment.revision = active.revision;
+        }
         match self.validate_semantic_event(&event) {
             Ok(()) => {
                 let neon_ui_schema::UiIntent::Invoke { action, params } = event.intent.clone();
@@ -4511,6 +4554,7 @@ impl UiRuntime {
             adapter.input_schema(),
         );
         apply_transitions_to_fragment(&mut updated, motions);
+        let next_fragment = updated.clone();
         let submit = RpcRequest {
             protocol: "neon3.rpc".into(),
             version: PROTOCOL_VERSION,
@@ -4524,9 +4568,21 @@ impl UiRuntime {
             expected_revision: Some(fragment.revision),
             idempotency_key: Some(format!("motion-apply:{}", fragment.revision.0)),
         };
-        self.forward_fragment(wgpu_endpoint, submit)
-            .map(|_| ())
-            .map_err(|error| error.to_string())
+        let response = self
+            .forward_fragment(wgpu_endpoint, submit)
+            .map_err(|error| error.to_string())?;
+        if response.status != RpcStatus::Accepted {
+            return Err(response
+                .error
+                .map(|error| error.message)
+                .unwrap_or_else(|| "motion fragment submission rejected".into()));
+        }
+        // The optimistic motion is an authoritative renderer fragment for the
+        // next host publication. Keep the cache at the same revision or the
+        // deferred host lane will submit the old revision and every following
+        // interaction will fail with fragment_revision_stale.
+        self.cached_fragment = Some(next_fragment);
+        Ok(())
     }
 
     fn handle_repeat_input(&mut self, request: RpcRequest) -> RpcResponse {
@@ -6888,6 +6944,7 @@ mod tests {
                 style: UiStyle::default(),
                 enter_transition: None,
                 world_depth: None,
+                world_scale: None,
                 children: vec![UiNode {
                     node_id: UiNodeId("commit".into()),
                     kind: UiNodeKind::Button,
@@ -6907,6 +6964,7 @@ mod tests {
                     style: UiStyle::default(),
                     enter_transition: None,
                     world_depth: None,
+                    world_scale: None,
                     children: Vec::new(),
                 }],
             },
@@ -7008,6 +7066,7 @@ mod tests {
             style: UiStyle::default(),
             enter_transition: None,
             world_depth: None,
+            world_scale: None,
             children: Vec::new(),
         });
         document.data_grids.push(UiDataGridDeclaration {
@@ -7340,6 +7399,7 @@ mod tests {
             style: UiStyle::default(),
             enter_transition: None,
             world_depth: None,
+            world_scale: None,
             children: Vec::new(),
         });
         document.data_grids.push(UiDataGridDeclaration {
@@ -7550,6 +7610,7 @@ mod tests {
             style: UiStyle::default(),
             enter_transition: None,
             world_depth: None,
+            world_scale: None,
             children: Vec::new(),
         });
         assert_eq!(
@@ -7603,6 +7664,7 @@ mod tests {
             style: UiStyle::default(),
             enter_transition: None,
             world_depth: None,
+            world_scale: None,
             children: Vec::new(),
         });
         document.templates.push(UiTemplateDeclaration {
@@ -7918,6 +7980,7 @@ mod tests {
                 style: UiStyle::default(),
                 enter_transition: None,
                 world_depth: None,
+                world_scale: None,
                 children: Vec::new(),
             }
         }
@@ -7943,6 +8006,7 @@ mod tests {
                 style: UiStyle::default(),
                 enter_transition: None,
                 world_depth: None,
+                world_scale: None,
                 children: vec![panel("panel-a"), panel("panel-b")],
             },
             effects: Vec::new(),
@@ -8007,6 +8071,7 @@ mod tests {
                 style: UiStyle::default(),
                 enter_transition: None,
                 world_depth: None,
+                world_scale: None,
                 children: Vec::new(),
             }
         }
@@ -8032,6 +8097,7 @@ mod tests {
                 style: UiStyle::default(),
                 enter_transition: None,
                 world_depth: None,
+                world_scale: None,
                 children: (0..4)
                     .map(|index| panel(&format!("panel-{index}")))
                     .collect(),

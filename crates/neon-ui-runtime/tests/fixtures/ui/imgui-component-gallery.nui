@@ -3,7 +3,7 @@
 version 1
 surface surface.component-gallery revision 1
 flow component-gallery
-budget nodes=200 bindings=132 instances=144 text=200 glyphs=16384 events=76 clips=84
+budget nodes=200 bindings=132 instances=144 text=200 glyphs=16384 events=76 clips=4096
 input controls_enabled bool default true
 input feature_enabled bool default true emitevent
 input radio_selected bool default false

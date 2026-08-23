@@ -28,7 +28,11 @@ use serde_json::json;
 #[cfg(windows)]
 use std::os::windows::io::AsRawHandle;
 
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
+// Windowed WGPU initialization creates several UI/world preview pipelines
+// after the surface binds. Surface readiness is therefore not compositor
+// readiness; allow the GPU construction phase to finish before failing the
+// session supervisor.
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
 const HELP: &str = "neon-dev case <kanban-reparent|asset-review|component-gallery|data-grid|scroll-view|virtual-list> [--show-logs]\nneon-dev status [manifest-path]\nneon-dev scenario <drag-card02-before|component-gallery-interactions|component-gallery-window-input>\nneon-dev capture-window <wgpu-loopback-endpoint> [path]\nneon-dev debug-interaction <wgpu-loopback-endpoint> <interaction-id>\nneon-dev inspect-window <wgpu-loopback-endpoint>\nneon-dev probe-window <wgpu-loopback-endpoint> <x> <y>";
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 

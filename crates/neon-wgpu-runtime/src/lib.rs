@@ -753,7 +753,12 @@ impl LocalInputState {
         }
         self.last_sequence
             .insert(request.pointer_id, request.sequence);
-        self.set_hover_id((hit_id != RENDER_HIT_NONE).then_some(hit_id));
+        // A completed GPU readback is observational only. Once the local
+        // pointer is captured, an older ID frame must never overwrite the
+        // captured control or move the interaction back to Hovered/Idle.
+        if self.capture_id.is_none() {
+            self.set_hover_id((hit_id != RENDER_HIT_NONE).then_some(hit_id));
+        }
         Ok(())
     }
 
@@ -1051,7 +1056,7 @@ struct WindowGpu {
     _world_ui_lab_depth: wgpu::Texture,
     world_ui_lab_depth: wgpu::TextureView,
     world_ui_lab_fragment: HashMap<UiFragmentId, UiFragment>,
-    ai: neon_wgpu_ai::AiEngine,
+    ai: Option<neon_wgpu_ai::AiEngine>,
     heightmap_preview: HeightmapPreviewConverter,
     hit_target: wgpu::Texture,
     hit_target_view: wgpu::TextureView,
@@ -1481,9 +1486,18 @@ impl WindowedRuntime {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("neon3-final-composition"),
             });
-        // The panel remains a stable renderer-private input; the gallery surface
-        // receives the composed, depth-tested world scene below.
-        {
+        let (lab_active, camera_state) = gpu
+            .world_ui_lab_camera
+            .lock()
+            .map(|camera| (camera.active(), camera.state()))
+            .unwrap_or((false, WorldUiCameraState {
+                position: [0.0; 3], yaw: 0.0, pitch: 0.0, vertical_fov: 35.0f32.to_radians(),
+            }));
+        if lab_active {
+            // The lab preview is demand-driven. When no external lab surface
+            // owns focus, skip its panel, scene, and depth passes entirely so
+            // pointer interaction on the main gallery is not GPU-bound by an
+            // inactive diagnostic preview.
             gpu.world_ui_lab_fragment = world_ui_lab_fragment();
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("neon3-world-ui-lab-panel-pass"),
@@ -1502,39 +1516,18 @@ impl WindowedRuntime {
                 multiview_mask: None,
             });
             gpu.ui.draw(
-                &gpu.device,
-                &gpu.queue,
-                &mut pass,
-                &gpu.world_ui_lab_fragment,
+                &gpu.device, &gpu.queue, &mut pass, &gpu.world_ui_lab_fragment,
                 WORLD_UI_LAB_PANEL_SIZE,
-                [
-                    WORLD_UI_LAB_LOGICAL_SIZE[0] as f32,
-                    WORLD_UI_LAB_LOGICAL_SIZE[1] as f32,
-                ],
-                gpu.started_at.elapsed().as_secs_f32(),
-                UiDrawMode::All,
+                [WORLD_UI_LAB_LOGICAL_SIZE[0] as f32, WORLD_UI_LAB_LOGICAL_SIZE[1] as f32],
+                gpu.started_at.elapsed().as_secs_f32(), UiDrawMode::All,
             );
+            drop(pass);
+            gpu.world_ui.render_lab_scene(
+                &gpu.device, &gpu.queue, &mut encoder, &gpu.world_ui_lab_surface,
+                &gpu.world_ui_lab_depth, WORLD_UI_LAB_PREVIEW_SIZE, &gpu.world_ui_lab_panel,
+                world_ui_lab_camera(WORLD_UI_LAB_PREVIEW_SIZE, camera_state),
+            )?;
         }
-        let camera_state = gpu
-            .world_ui_lab_camera
-            .lock()
-            .map(|camera| camera.state())
-            .unwrap_or(WorldUiCameraState {
-                position: [0.0; 3],
-                yaw: 0.0,
-                pitch: 0.0,
-                vertical_fov: 35.0f32.to_radians(),
-            });
-        gpu.world_ui.render_lab_scene(
-            &gpu.device,
-            &gpu.queue,
-            &mut encoder,
-            &gpu.world_ui_lab_surface,
-            &gpu.world_ui_lab_depth,
-            WORLD_UI_LAB_PREVIEW_SIZE,
-            &gpu.world_ui_lab_panel,
-            world_ui_lab_camera(WORLD_UI_LAB_PREVIEW_SIZE, camera_state),
-        )?;
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("neon3-final-clear-pass"),
@@ -2549,25 +2542,6 @@ impl HeadlessExternalGpu {
         // interaction tree. This makes the topmost panel win across both UI
         // kinds and prevents parent/node bubbling from producing a second hit.
         self.ui.invalidate_plan();
-        let id_hit = match event.event_type {
-            UiPointerEventType::Down => {
-                self.perf.unified_id_readbacks += 1;
-                Some(Self::read_completed_id_frame(
-                    &self.device,
-                    &self.queue,
-                    &self.pointer_hit_target,
-                    self.id_frame_ready,
-                    &mut self.ui,
-                    event.pixel,
-                )?)
-            }
-            UiPointerEventType::Enter
-            | UiPointerEventType::Move
-            | UiPointerEventType::Up
-            | UiPointerEventType::Wheel
-            | UiPointerEventType::Leave
-            | UiPointerEventType::Cancel => None,
-        };
         let ui = &mut self.ui;
         ui.set_pointer_position(event.pixel);
         ui.prepare_interaction(fragments, [1280, 720], [1280.0, 720.0], now);
@@ -2581,33 +2555,20 @@ impl HeadlessExternalGpu {
                 if !matches!(event.button, Some(neon_ui_schema::UiPointerButton::Primary)) {
                     return Err("ui_pointer_button_unsupported".into());
                 }
-                let hit_id = id_hit.filter(|id| *id != RENDER_HIT_NONE);
-                self.input.set_hover_id(hit_id);
+                let current_hit = ui.hit_binding_at_pointer();
+                self.input
+                    .set_hover_id(current_hit.as_ref().map(|(hit_id, _)| *hit_id));
                 self.input
                     .pointer_down()
                     .map_err(|_| {
                             format!(
-                            "press_without_semantic_hit:pointer=({:.1},{:.1}) unified_id_hit={:?}",
+                            "press_without_semantic_hit:pointer=({:.1},{:.1}) cpu_hit={:?}",
                             event.pixel[0],
                             event.pixel[1],
-                            id_hit,
+                            current_hit.as_ref().map(|(hit_id, binding)| (*hit_id, binding.node_path.clone())),
                         )
                     })?;
-                self.captured_binding = self
-                    .input
-                    .capture_id
-                    .and_then(|hit_id| {
-                        // Numeric ID -> binding must come from the same frame
-                        // that produced the readback pixel. `id_frame_bindings`
-                        // is the snapshot taken by `render()` together with the
-                        // persistent ID texture, so the pairing is exact. Fall
-                        // back to the live renderer map only if the paired map
-                        // lacks the id (defensive; should not happen normally).
-                        self.id_frame_bindings
-                            .get(&hit_id)
-                            .cloned()
-                            .or_else(|| ui.hit_binding(hit_id))
-                    });
+                self.captured_binding = current_hit.map(|(_, binding)| binding);
                 if self.captured_binding.is_none() {
                     let _ = self.input.pointer_up(false);
                     return Err("press_without_semantic_binding".into());
@@ -2639,6 +2600,9 @@ impl HeadlessExternalGpu {
                 let Some(intent) = binding.intent else {
                     return Ok(json!({"state": "released"}));
                 };
+                let toggle_value = ui
+                    .finish_toggle_control(&binding.node_path)
+                    .map(|(value, _)| value);
                 self.perf.semantic_clicks += 1;
                 self.next_semantic_sequence = self.next_semantic_sequence.saturating_add(1);
                 let event_id = format!("wgpu-pointer-click-{}", self.next_semantic_sequence);
@@ -2677,7 +2641,7 @@ impl HeadlessExternalGpu {
                     focus: None,
                     data_grid_cell: binding.data_grid_cell,
                     text: None,
-                    control_value: control_value.or(binding.control_value),
+                    control_value: toggle_value.or(control_value).or(binding.control_value),
                     drag_drop: None,
                 }}))
             }
@@ -3652,12 +3616,21 @@ struct ReleasedBinding {
 fn release_captured_binding(gpu: &mut WindowGpu) -> Option<ReleasedBinding> {
     let initial_value = gpu.pending_control_value.take();
     let finished_value = gpu.ui.finish_value_gesture();
-    let control_value = finished_value
+    let binding = gpu.captured_binding.take();
+    let toggle_value = binding
+        .as_ref()
+        .and_then(|binding| gpu.ui.finish_toggle_control(&binding.node_path));
+    let control_value = toggle_value
         .as_ref()
         .map(|(value, _)| value.clone())
+        .or_else(|| finished_value
+        .as_ref()
+        .map(|(value, _)| value.clone())
+        )
         .or(initial_value);
-    let local_presentation = finished_value.map(|(_, presentation)| presentation);
-    let binding = gpu.captured_binding.take();
+    let local_presentation = toggle_value
+        .map(|(_, presentation)| presentation)
+        .or_else(|| finished_value.map(|(_, presentation)| presentation));
     if gpu.input.pointer_up(binding.is_some()).is_err() {
         if let Some(presentation) = local_presentation.as_ref() {
             gpu.ui.rollback_local_presentation(presentation);
@@ -4176,14 +4149,21 @@ impl WindowGpu {
         let world_ui_lab_depth_view = world_ui_lab_depth.create_view(&Default::default());
         let world_ui = WorldUiPipeline::new(&device, wgpu::TextureFormat::Rgba8Unorm);
         let heightmap_preview = HeightmapPreviewConverter::new(&device);
-        let mut ai = neon_wgpu_ai::AiEngine::new(device.clone(), queue.clone());
+        // AI pipeline creation is expensive and the DX12 FXC backend cannot
+        // compile the optional conv2d path on every adapter. Windowed UI cases
+        // do not need terrain AI, so keep it lazy and opt in explicitly.
+        let mut ai = if std::env::var("NEON_ENABLE_AI").as_deref() == Ok("1") {
+            Some(neon_wgpu_ai::AiEngine::new(device.clone(), queue.clone()))
+        } else {
+            None
+        };
         let configured_pack = std::env::var_os("NEON_AI_PACK")
             .map(std::path::PathBuf::from)
             .or_else(|| {
                 let path = std::path::PathBuf::from("assets/ai/terrain_run1/terrain_run1.pack");
                 path.exists().then_some(path)
             });
-        if let Some(path) = configured_pack {
+        if let (Some(ai), Some(path)) = (ai.as_mut(), configured_pack) {
             match std::fs::read(&path)
                 .map_err(|error| error.to_string())
                 .and_then(|bytes| {
@@ -4267,11 +4247,13 @@ impl WindowGpu {
         {
             return Err("invalid_render_surface_target".into());
         }
-        if !self.ai.has_model() {
+        let Some(ai) = self.ai.as_mut() else {
+            return Err("ai_disabled".into());
+        };
+        if !ai.has_model() {
             return Err("ai_model_not_loaded".into());
         }
-        let generation = self
-            .ai
+        let generation = ai
             .generate_gpu(neon_wgpu_ai::GenerateRequest {
                 cond: neon_wgpu_ai::format::TerrainCond {
                     sub: command.condition.sub,
@@ -5157,6 +5139,7 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
         if self.window.is_none()
             && let Err(error) = self.initialize(event_loop)
         {
+            eprintln!("neon-wgpu window initialization failed: {error}");
             self.exit_error = Some(error);
             event_loop.exit();
         }
@@ -5219,13 +5202,11 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                         self.redraw_pending = true;
                     }
                     gpu.ui.update_value_gesture();
-                    let x = position
-                        .x
+                    let x = (position.x * gpu.scale_factor)
                         .max(0.0)
                         .min(gpu.config.width.saturating_sub(1) as f64)
                         as u32;
-                    let y = position
-                        .y
+                    let y = (position.y * gpu.scale_factor)
                         .max(0.0)
                         .min(gpu.config.height.saturating_sub(1) as f64)
                         as u32;
@@ -5453,10 +5434,13 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                         }
                         self.redraw_pending = true;
                     } else {
-                        // Pointer release uses the captured hit binding. Fall back to the
-                        // already planned control geometry when asynchronous readback has
-                        // not completed before the OS press event.
-                        gpu.input.set_hover_id(gpu.ui.hit_id_at_pointer());
+                        // Resolve the current composed visual and semantic binding
+                        // together. Do not use an asynchronous GPU ID as the
+                        // authoritative window-click target: that ID may belong
+                        // to the previous frame after scroll, resize, or a
+                        // presentation update.
+                        let current_hit = gpu.ui.hit_binding_at_pointer();
+                        gpu.input.set_hover_id(current_hit.as_ref().map(|(id, _)| *id));
                         if gpu.input.pointer_down().is_err() {
                             gpu.last_pointer_outcome = "press_without_semantic_hit".into();
                             gpu.last_pointer_node_path = None;
@@ -5475,10 +5459,7 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                             );
                             return;
                         }
-                        gpu.captured_binding = gpu
-                            .input
-                            .capture_id
-                            .and_then(|hit_id| gpu.ui.hit_binding(hit_id));
+                        gpu.captured_binding = current_hit.map(|(_, binding)| binding);
                         gpu.pending_control_value = gpu
                             .captured_binding
                             .as_ref()
@@ -6107,7 +6088,10 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                 let _ = completed.send(result);
             }
             WindowCommand::AiModelStatus { completed } => {
-                let status = self.gpu.as_ref().and_then(|gpu| gpu.ai.model_info());
+                let status = self
+                    .gpu
+                    .as_ref()
+                    .and_then(|gpu| gpu.ai.as_ref().and_then(|ai| ai.model_info()));
                 let _ = completed.send(status);
             }
             WindowCommand::RegisterWorldUiLabCamera {
@@ -11185,6 +11169,11 @@ mod tests {
             input.capture_id,
             Some(41),
             "move outside must retain capture"
+        );
+        assert_eq!(
+            input.hover_id,
+            Some(41),
+            "stale GPU readback must not overwrite the captured hover target"
         );
         input.pointer_up(true).unwrap();
         assert_eq!(input.state, LocalInteractionState::Idle);

@@ -195,6 +195,8 @@ struct VsOut {
     @location(1) params: vec4<f32>,
     @location(2) pixel: vec2<f32>,
     @location(3) depth: f32,
+    @location(4) local: vec2<f32>,
+    @location(5) size: vec2<f32>,
 }
 @vertex fn vs_main(@builtin(vertex_index) vertex_index: u32, input: VsIn) -> VsOut {
     var corners = array<vec2<f32>, 6>(
@@ -208,6 +210,8 @@ struct VsOut {
     output.params = params;
     output.pixel = pixel;
     output.depth = input.depth;
+    output.local = local;
+    output.size = rect.zw;
     return output;
 }
 @fragment fn fs_main(input: VsOut) -> @location(0) f32 {
@@ -215,6 +219,30 @@ struct VsOut {
     // Zero is a valid topmost depth for screen UI. The external target is a
     // color target, so screen groups can overwrite world depth at overlap.
     if (input.depth < 0.0) { discard; }
+    // Match the color pass's visible-region test so depth coverage aligns with
+    // the antialiased color edge. The color pass fades the shape over a 1px
+    // smoothstep; a hard clip edge here would sit 1px inside that fade and
+    // leave a ring of depth=0 (always-visible) pixels that the host never
+    // occludes, which shows up as white fringes along every panel edge.
+    var shape_alpha: f32;
+    if (input.params.y < 0.0) {
+        let cut = min(-input.params.y, input.size.x * 0.25);
+        let point = input.local * input.size;
+        let left = cut * (1.0 - input.local.y);
+        let right = input.size.x - cut * input.local.y;
+        let edge_distance = min(
+            min(point.x - left, right - point.x),
+            min(point.y, input.size.y - point.y)
+        );
+        shape_alpha = smoothstep(-1.0, 1.0, edge_distance);
+    } else {
+        let radius = min(input.params.y, min(input.size.x, input.size.y) * 0.5);
+        let point = input.local * input.size - input.size * 0.5;
+        let extent = max(input.size * 0.5 - vec2<f32>(radius), vec2<f32>(0.0));
+        let corner_distance = length(max(abs(point) - extent, vec2<f32>(0.0))) - radius;
+        shape_alpha = 1.0 - smoothstep(0.0, 1.0, corner_distance);
+    }
+    if (shape_alpha <= 0.001) { discard; }
     return input.depth;
 }
 "#;
@@ -725,9 +753,72 @@ impl HitReadbackRing {
     }
 }
 
+/// Logical layout geometry for a flattened node, independent of camera
+/// distance and final projection. This is the single source of truth for
+/// text measurement, wrapping, and layout decisions.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct LogicalLayoutBox {
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    content_x: f32,
+    content_y: f32,
+    content_width: f32,
+    content_height: f32,
+    clip: Option<UiBounds>,
+}
+
+/// Final visual projection applied after logical layout completes. Screen UI
+/// uses a fixed identity transform; WorldUi applies its root uniform scale
+/// around the projected bottom-center origin.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct FinalVisualTransform {
+    origin: [f32; 2],
+    uniform_scale: f32,
+    world_depth: Option<f32>,
+}
+
+impl FinalVisualTransform {
+    fn identity() -> Self {
+        Self {
+            origin: [0.0, 0.0],
+            uniform_scale: 1.0,
+            world_depth: None,
+        }
+    }
+
+    fn is_identity(&self) -> bool {
+        self.origin == [0.0, 0.0] && self.uniform_scale == 1.0 && self.world_depth.is_none()
+    }
+
+    fn project_point(&self, point: [f32; 2]) -> [f32; 2] {
+        [
+            self.origin[0] + (point[0] - self.origin[0]) * self.uniform_scale,
+            self.origin[1] + (point[1] - self.origin[1]) * self.uniform_scale,
+        ]
+    }
+
+    fn project_bounds(&self, bounds: UiBounds) -> UiBounds {
+        let top_left = self.project_point([bounds.x, bounds.y]);
+        UiBounds {
+            x: top_left[0],
+            y: top_left[1],
+            width: bounds.width * self.uniform_scale,
+            height: bounds.height * self.uniform_scale,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 struct UiVisual {
+    /// Final visual bounds after the complete logical layout and any WorldUi
+    /// root projection. Screen UI and WorldUi both render from this.
     bounds: UiBounds,
+    /// Logical pre-projection geometry. Text measurement and wrapping always
+    /// use `logical_bounds`, never the projected `bounds`, so camera distance
+    /// cannot feed back into re-layout.
+    logical_bounds: LogicalLayoutBox,
     style: UiStyle,
     kind: UiNodeKind,
     enabled: bool,
@@ -830,6 +921,10 @@ struct CachedDataGridTextDisplay {
 #[derive(Clone)]
 struct CachedTextLayout {
     text_instances: Vec<UiTextInstance>,
+    /// Final visual origin used when the glyph instances were built. The
+    /// logical line layout is reusable, but sampled scroll/parent translation
+    /// must be applied to the cached visual instances on cache hits.
+    visual_origin: [f32; 2],
 }
 
 /// Per-draw stage timings collected on the last color pass. Diagnostics only;
@@ -902,6 +997,7 @@ pub struct UiWgpuRenderer {
     popup_instance_capacity: usize,
     plan_revisions: HashMap<neon_ui_schema::UiFragmentId, neon_protocol::Revision>,
     plan: Vec<PlannedNode>,
+    plan_index: HashMap<String, usize>,
     debug_semantic_nodes: Vec<DebugSemanticNode>,
     sampled: Vec<UiVisual>,
     instances: Vec<UiInstance>,
@@ -922,6 +1018,7 @@ pub struct UiWgpuRenderer {
     hit_capacity: usize,
     hit_readbacks: HitReadbackRing,
     hit_bindings: HashMap<u32, UiHitBinding>,
+    hit_id_by_node: HashMap<String, u32>,
     image_pipeline: wgpu::RenderPipeline,
     image_buffer: wgpu::Buffer,
     image_capacity: usize,
@@ -1482,6 +1579,7 @@ impl UiWgpuRenderer {
             popup_instance_capacity: 512,
             plan_revisions: HashMap::new(),
             plan: Vec::new(),
+            plan_index: HashMap::new(),
             debug_semantic_nodes: Vec::new(),
             sampled: Vec::new(),
             instances: Vec::new(),
@@ -1502,6 +1600,7 @@ impl UiWgpuRenderer {
             hit_capacity: 512,
             hit_readbacks: HitReadbackRing::new(device, 3),
             hit_bindings: HashMap::new(),
+            hit_id_by_node: HashMap::new(),
             image_pipeline,
             image_buffer: create_image_buffer(device, 512),
             image_capacity: 512,
@@ -1628,6 +1727,10 @@ impl UiWgpuRenderer {
 
     pub(crate) fn hit_binding(&self, hit_id: u32) -> Option<UiHitBinding> {
         self.hit_bindings.get(&hit_id).cloned()
+    }
+
+    fn plan_index_of(&self, node_path: &str) -> Option<usize> {
+        self.plan_index.get(node_path).copied()
     }
 
     /// Number of hit bindings in the current ID frame. Used by the headless
@@ -1849,6 +1952,20 @@ impl UiWgpuRenderer {
         top_layer
     }
 
+    fn has_scroll_ancestor_in_plan(plan: &[PlannedNode], index: usize) -> bool {
+        let mut parent = plan[index].parent_id.as_deref();
+        while let Some(parent_id) = parent {
+            let Some(parent_index) = plan.iter().position(|node| node.id == parent_id) else {
+                break;
+            };
+            if plan[parent_index].target.scroll {
+                return true;
+            }
+            parent = plan[parent_index].parent_id.as_deref();
+        }
+        false
+    }
+
     /// Resolves the topmost declared control at the current pointer position.
     /// This is a local fallback for capture only; the renderer still submits the
     /// GPU hit pass for hover/readback diagnostics.
@@ -1875,6 +1992,35 @@ impl UiWgpuRenderer {
                 self.hit_bindings
                     .iter()
                     .find_map(|(hit_id, binding)| (binding.node_path == node.id).then_some(*hit_id))
+            })
+    }
+
+    /// Resolve a window pointer against the same composed visual and semantic
+    /// binding snapshot in one operation. This avoids using a numeric GPU ID
+    /// from a previous asynchronous frame to choose the current control.
+    pub(crate) fn hit_binding_at_pointer(&self) -> Option<(u32, UiHitBinding)> {
+        let pointer = self.pointer_position?;
+        let modal = self.active_modal_index();
+        self.plan
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, node)| {
+                let visual = self.visual_at(index);
+                if !visual.enabled
+                    || !contains(visual.bounds, pointer)
+                    || !contains(visual.clip, pointer)
+                {
+                    return None;
+                }
+                if let Some(modal) = modal
+                    && !self.node_is_in_subtree(node.id.as_str(), modal)
+                {
+                    return None;
+                }
+                self.hit_bindings.iter().find_map(|(hit_id, binding)| {
+                    (binding.node_path == node.id).then_some((*hit_id, binding.clone()))
+                })
             })
     }
 
@@ -1932,9 +2078,7 @@ impl UiWgpuRenderer {
         node_path: &str,
     ) -> Result<UiHitBinding, &'static str> {
         let index = self
-            .plan
-            .iter()
-            .position(|node| node.id == node_path)
+            .plan_index_of(node_path)
             .ok_or("unknown_semantic_target")?;
         let visual = self.visual_at(index);
         if !visual.enabled || visual.bounds.width <= 0.0 || visual.bounds.height <= 0.0 {
@@ -1949,9 +2093,13 @@ impl UiWgpuRenderer {
         if visible_right <= visible_left || visible_bottom <= visible_top {
             return Err("semantic_target_clipped");
         }
+        let hit_id = self
+            .hit_id_by_node
+            .get(node_path)
+            .copied()
+            .ok_or("semantic_target_not_hittable")?;
         self.hit_bindings
-            .values()
-            .find(|binding| binding.node_path == node_path)
+            .get(&hit_id)
             .cloned()
             .ok_or("semantic_target_not_hittable")
     }
@@ -1977,11 +2125,8 @@ impl UiWgpuRenderer {
                 });
             };
             let expected_plan_path = format!("{}/{}", node.fragment_id, node.node_key);
-            self.plan
-                .iter()
-                .position(|planned| {
-                    planned.id == node.plan_path && planned.id == expected_plan_path
-                })
+            self.plan_index_of(&node.plan_path)
+                .filter(|_| node.plan_path == expected_plan_path)
                 .ok_or("semantic_node_not_in_current_plan")
         };
         let point = |node_key: &str| {
@@ -2028,9 +2173,7 @@ impl UiWgpuRenderer {
             return Err("invalid_gesture_fraction");
         }
         let index = self
-            .plan
-            .iter()
-            .position(|node| node.id == node_path)
+            .plan_index_of(node_path)
             .ok_or("unknown_semantic_target")?;
         let visual = self.visual_at(index);
         let (bounds, current_fraction) = match (&visual.kind, &visual.presentation) {
@@ -2509,6 +2652,43 @@ impl UiWgpuRenderer {
         ))
     }
 
+    /// Produces an immediate renderer-local toggle prediction. The domain
+    /// remains authoritative; the pending value is cleared on an accepted
+    /// fragment publication or rolled back on rejection.
+    pub(crate) fn finish_toggle_control(
+        &mut self,
+        node_path: &str,
+    ) -> Option<(UiSemanticPayloadValue, LocalPresentationCommit)> {
+        let index = self.plan_index_of(node_path)?;
+        let visual = self.visual_at(index);
+        if !matches!(visual.kind, UiNodeKind::Checkbox | UiNodeKind::RadioButton | UiNodeKind::Selectable)
+        {
+            return None;
+        }
+        let selected = self
+            .value_previews
+            .get(node_path)
+            .and_then(|value| match value {
+                UiSemanticPayloadValue::Bool { value } => Some(*value),
+                _ => None,
+            })
+            .or_else(|| match &visual.presentation {
+                Some(UiControlPresentation::Toggle { selected }) => Some(*selected),
+                _ => None,
+            })?;
+        let value = UiSemanticPayloadValue::Bool { value: !selected };
+        self.value_previews
+            .insert(node_path.to_owned(), value.clone());
+        self.pointer_visual_dirty = true;
+        Some((
+            value.clone(),
+            LocalPresentationCommit::Value {
+                node_path: node_path.to_owned(),
+                value,
+            },
+        ))
+    }
+
     pub(crate) fn cancel_value_gesture(&mut self) {
         if let Some(gesture) = self.value_gesture.take() {
             self.value_previews.remove(&gesture.node_path);
@@ -2713,7 +2893,7 @@ impl UiWgpuRenderer {
     }
 
     fn node_is_in_subtree(&self, node_id: &str, root: usize) -> bool {
-        let mut current = self.plan.iter().position(|node| node.id == node_id);
+        let mut current = self.plan_index_of(node_id);
         while let Some(index) = current {
             if index == root {
                 return true;
@@ -2721,7 +2901,7 @@ impl UiWgpuRenderer {
             current = self.plan[index]
                 .parent_id
                 .as_deref()
-                .and_then(|parent| self.plan.iter().position(|node| node.id == parent));
+                .and_then(|parent| self.plan_index_of(parent));
         }
         false
     }
@@ -2761,25 +2941,10 @@ impl UiWgpuRenderer {
         if self.modal_blocks_pointer() {
             return false;
         }
-        let Some(pointer) = self.pointer_position else {
+        let Some((_, binding)) = self.hit_binding_at_pointer() else {
             return false;
         };
-        let Some(path) = self.hit_bindings.values().find_map(|binding| {
-            self.plan
-                .iter()
-                .enumerate()
-                .find(|(_, node)| node.id == binding.node_path)
-                .filter(|(index, node)| {
-                    self.active_modal_allows_node(&node.id)
-                        && self.visual_at(*index).enabled
-                        && contains(self.visual_at(*index).bounds, pointer)
-                        && contains(self.visual_at(*index).clip, pointer)
-                })
-                .map(|_| binding.node_path.clone())
-        }) else {
-            return false;
-        };
-        self.focused_control = Some(path);
+        self.focused_control = Some(binding.node_path);
         self.pointer_visual_dirty = true;
         true
     }
@@ -4099,6 +4264,9 @@ impl UiWgpuRenderer {
                 })
             })
             .collect::<Vec<_>>();
+        let scroll_dynamic = (0..self.plan.len())
+            .map(|index| Self::has_scroll_ancestor_in_plan(&self.plan, index))
+            .collect::<Vec<_>>();
         let stage = Instant::now();
         let (texts, popup_texts) = self
             .resident_font
@@ -4145,25 +4313,47 @@ impl UiWgpuRenderer {
                         // Static text cache: skip re-layout when the same
                         // node_path and text content were already computed.
                         // WorldUi text uses the same root scale as its panel;
-                        // it is not independently auto-sized. Pair the cache
-                        // with the resolved visual geometry so text cannot be
-                        // reused from an obsolete projection frame.
+                        // it is not independently auto-sized. Key the cache on
+                        // the logical pre-projection geometry so projecting a
+                        // panel at a different camera distance reuses the text
+                        // layout instead of re-measuring it.
                         // includes the atlas generation so that new glyph
                         // rasterizations trigger a refresh.
                         let node_path = &self.plan[index].id;
-                        let cache_key = format!(
-                            "{node_path}:{text}:{}:{:?}:{:?}:{:?}",
-                            self.atlas_generation,
-                            visual.bounds,
-                            visual.clip,
-                            visual.world_scale,
-                        );
-                        if let Some(cached) = self.text_layout_cache.get(&cache_key) {
-                            return cached.text_instances.clone().into();
-                        }
                         let horizontal_scroll = (visual.kind == UiNodeKind::TextInput
                             && local_text.is_some())
                         .then_some(self.editing.horizontal_scroll);
+                        let cache_key = format!(
+                            "{node_path}:{text}:{}:{:?}:{:?}:{:?}:{:?}",
+                            self.atlas_generation,
+                            visual.logical_bounds,
+                            visual.logical_bounds.clip,
+                            visual.world_scale,
+                            horizontal_scroll,
+                        );
+                        // Scroll is a per-frame visual transform. A cached
+                        // final instance contains rect/clip coordinates and
+                        // must not be reused across scroll samples. Keep the
+                        // logical cache for static nodes, but rebuild text in
+                        // a scrolling subtree so the current panel position
+                        // and viewport clip are authoritative.
+                        if !scroll_dynamic[index]
+                            && let Some(cached) = self.text_layout_cache.get(&cache_key)
+                        {
+                            let mut instances = cached.text_instances.clone();
+                            let delta = [
+                                visual.bounds.x - cached.visual_origin[0],
+                                visual.bounds.y - cached.visual_origin[1],
+                            ];
+                            if let Some(clip) = text_clip(visual) {
+                                for instance in &mut instances {
+                                    instance.rect[0] += delta[0];
+                                    instance.rect[1] += delta[1];
+                                    instance.clip = clip;
+                                }
+                            }
+                            return instances.into();
+                        }
                         let instances = layout_text(
                             device,
                             queue,
@@ -4173,9 +4363,12 @@ impl UiWgpuRenderer {
                             horizontal_scroll,
                         );
                         if let Some(instances) = instances {
-                            self.text_layout_cache.insert(cache_key, CachedTextLayout {
-                                text_instances: instances.clone(),
-                            });
+                            if !scroll_dynamic[index] {
+                                self.text_layout_cache.insert(cache_key, CachedTextLayout {
+                                    text_instances: instances.clone(),
+                                    visual_origin: [visual.bounds.x, visual.bounds.y],
+                                });
+                            }
                             Some(instances)
                         } else {
                             None
@@ -4666,6 +4859,13 @@ impl UiWgpuRenderer {
                 paint_group_id: 0,
             });
         }
+        self.plan_index.clear();
+        self.plan_index.extend(
+            self.plan
+                .iter()
+                .enumerate()
+                .map(|(index, node)| (node.id.clone(), index)),
+        );
         // World snapshots have already had CameraVisibility effects consumed
         // by the host-side projection filter. Identify each projected panel by
         // its own inherited world depth instead of relying on those removed
@@ -4868,9 +5068,11 @@ impl UiWgpuRenderer {
     ) -> Vec<(u32, usize)> {
         let declarations = collect_hit_declarations(&self.data_grid_display_fragments(fragments));
         self.hit_bindings.clear();
+        self.hit_id_by_node.clear();
         let mut hit_nodes = Vec::new();
         for index in 0..self.plan.len() {
             let node_path = self.plan[index].id.clone();
+            let hit_node_path = node_path.clone();
             let visual = self.visual_at(index);
             let kind = visual.kind.clone();
             let enabled = visual.enabled;
@@ -4919,6 +5121,7 @@ impl UiWgpuRenderer {
                 });
             }
             self.hit_bindings.insert(hit_id, binding);
+            self.hit_id_by_node.insert(hit_node_path, hit_id);
             hit_nodes.push((hit_id, index));
         }
         hit_nodes
@@ -5216,6 +5419,12 @@ impl UiWgpuRenderer {
     }
 
     fn instance(&self, visual: &UiVisual, node_path: &str, time_seconds: f32) -> UiInstance {
+        let mut visual = visual.clone();
+        if let Some(UiSemanticPayloadValue::Bool { value }) = self.value_previews.get(node_path)
+            && matches!(visual.kind, UiNodeKind::Checkbox | UiNodeKind::RadioButton | UiNodeKind::Selectable)
+        {
+            visual.presentation = Some(UiControlPresentation::Toggle { selected: *value });
+        }
         let mut style = if visual.style == UiStyle::default() {
             default_component_style(&visual.kind)
         } else {
@@ -5269,6 +5478,14 @@ impl UiWgpuRenderer {
             fill[1] = (fill[1] * 1.08).min(1.0);
             fill[2] = (fill[2] * 1.08).min(1.0);
         }
+        // A child without its own transition follows its parent's GPU motion
+        // through `from_rect`. Its final clip is otherwise too narrow to
+        // contain the child at the parent's starting position, so retain the
+        // union of the target clip and the translated starting clip.
+        let parent_transition_offset = self.parent_transition_offset(node_path);
+        let paint_clip = parent_transition_offset.map_or(visual.clip, |offset| {
+            union_bounds(visual.clip, translate_bounds(visual.clip, offset))
+        });
         let mut instance = UiInstance {
             rect: [bounds.x, bounds.y, bounds.width, bounds.height],
             fill,
@@ -5280,10 +5497,10 @@ impl UiWgpuRenderer {
                 visual.clip_radius,
             ],
             clip: [
-                visual.clip.x,
-                visual.clip.y,
-                visual.clip.x + visual.clip.width,
-                visual.clip.y + visual.clip.height,
+                paint_clip.x,
+                paint_clip.y,
+                paint_clip.x + paint_clip.width,
+                paint_clip.y + paint_clip.height,
             ],
             depth: color_pass_depth(visual.world_depth),
             paint_group_id: visual.paint_group_id,
@@ -5324,43 +5541,59 @@ impl UiWgpuRenderer {
                 gpu_easing(active.transition.easing),
                 1.0,
             ];
-        } else {
+        } else if let Some(offset) = parent_transition_offset {
             // A parent panel's GPU track also moves its descendants. Encode
             // the inherited start offset into the child's one-time record so
             // the vertex shader can apply the same track without CPU sampling
             // or a second per-frame upload.
-            let mut parent = self
-                .plan
-                .iter()
-                .find(|node| node.id == node_path)
-                .and_then(|node| node.parent_id.clone());
-            while let Some(parent_id) = parent {
-                if let Some(active) = self.active.get(&parent_id) {
-                    instance.from_rect[0] += active.from.bounds.x - active.target.bounds.x;
-                    instance.from_rect[1] += active.from.bounds.y - active.target.bounds.y;
-                    instance.animation = [
-                        active.started_at_seconds
-                            + active.transition.delay_ms as f32 / 1000.0,
-                        active.transition.duration_ms as f32 / 1000.0,
-                        gpu_easing(active.transition.easing),
-                        1.0,
-                    ];
-                    break;
-                }
-                parent = self
-                    .plan
-                    .iter()
-                    .find(|node| node.id == parent_id)
-                    .and_then(|node| node.parent_id.clone());
+            instance.from_rect[0] += offset[0];
+            instance.from_rect[1] += offset[1];
+            if let Some((_, active)) = self.find_parent_transition(node_path) {
+                instance.animation = [
+                    active.started_at_seconds + active.transition.delay_ms as f32 / 1000.0,
+                    active.transition.duration_ms as f32 / 1000.0,
+                    gpu_easing(active.transition.easing),
+                    1.0,
+                ];
             }
         }
         instance
+    }
+
+    fn find_parent_transition(&self, node_path: &str) -> Option<(&str, &ActiveTransition)> {
+        let mut parent = self
+            .plan
+            .iter()
+            .find(|node| node.id == node_path)
+            .and_then(|node| node.parent_id.as_deref());
+        while let Some(parent_id) = parent {
+            if let Some(active) = self.active.get(parent_id) {
+                return Some((parent_id, active));
+            }
+            parent = self
+                .plan
+                .iter()
+                .find(|node| node.id == parent_id)
+                .and_then(|node| node.parent_id.as_deref());
+        }
+        None
+    }
+
+    fn parent_transition_offset(&self, node_path: &str) -> Option<[f32; 2]> {
+        self.find_parent_transition(node_path).map(|(_, active)| [
+            active.from.bounds.x - active.target.bounds.x,
+            active.from.bounds.y - active.target.bounds.y,
+        ])
     }
 
     fn component_chrome_instances(&self, visual: &UiVisual, node_path: &str) -> Vec<UiInstance> {
         let mut preview = visual.clone();
         if let Some(value) = self.value_previews.get(node_path) {
             preview.presentation = match (&preview.presentation, value) {
+                (
+                    Some(UiControlPresentation::Toggle { .. }),
+                    UiSemanticPayloadValue::Bool { value },
+                ) => Some(UiControlPresentation::Toggle { selected: *value }),
                 (
                     Some(UiControlPresentation::Numeric { min, max, .. }),
                     UiSemanticPayloadValue::F32 { value },
@@ -6556,6 +6789,73 @@ fn input_clip(visual: &UiVisual) -> UiBounds {
     }
 }
 
+/// Shared text line-breaking result. Both intrinsic measurement and glyph
+/// layout use the same underlying `break_text_lines` so they can never
+/// disagree about how many lines text occupies or how wide it is.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct TextMeasure {
+    line_count: u32,
+    max_line_width: f32,
+    total_height: f32,
+    line_height: f32,
+}
+
+/// Break `text` into character groups per line using the same wrapping
+/// rules that `measure_text_lines` and `layout_text` rely on.  This is the
+/// single source of truth for line-breaking decisions.
+fn break_text_lines(
+    text: &str,
+    available_width: f32,
+    advance: &impl Fn(char) -> f32,
+) -> Vec<Vec<char>> {
+    let width = available_width.max(1.0);
+    let mut lines: Vec<Vec<char>> = Vec::new();
+    let mut line: Vec<char> = Vec::new();
+    let mut line_width = 0.0;
+    for ch in text.chars() {
+        if ch == '\n' {
+            lines.push(std::mem::take(&mut line));
+            line_width = 0.0;
+            continue;
+        }
+        let gw = advance(ch);
+        if !line.is_empty() && line_width + gw > width {
+            lines.push(std::mem::take(&mut line));
+            line_width = 0.0;
+        }
+        line_width += gw;
+        line.push(ch);
+    }
+    if !line.is_empty() || lines.is_empty() {
+        lines.push(line);
+    }
+    lines
+}
+
+/// Measure text lines using the same breaking rules as `break_text_lines`.
+/// This is the function that `intrinsic_size` calls to get the aggregate
+/// measure; `layout_text` calls `break_text_lines` directly and then
+/// rasterizes each line.
+fn measure_text_lines(
+    text: &str,
+    available_width: f32,
+    line_height: f32,
+    advance: &impl Fn(char) -> f32,
+) -> TextMeasure {
+    let lines = break_text_lines(text, available_width, advance);
+    let line_count = lines.len() as u32;
+    let max_line_width = lines
+        .iter()
+        .map(|line| line.iter().map(|&ch| advance(ch)).sum::<f32>())
+        .fold(0.0f32, f32::max);
+    TextMeasure {
+        line_count,
+        max_line_width,
+        total_height: line_height * line_count as f32,
+        line_height,
+    }
+}
+
 fn layout_text(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -6569,38 +6869,30 @@ fn layout_text(
     // derived from text bounds or content height, so camera distance cannot
     // create an independent text-layout feedback loop.
     let text_scale = visual.world_scale.unwrap_or(1.0);
-    let mut lines = Vec::<Vec<AtlasGlyph>>::new();
-    let mut line = Vec::<AtlasGlyph>::new();
-    let mut line_width = 0.0;
-    let wrap_width = (visual.bounds.width - 8.0).max(1.0);
-    for ch in text.chars() {
-        if ch == '\n' {
-            lines.push(std::mem::take(&mut line));
-            line_width = 0.0;
-            continue;
-        }
-        let glyph = ensure_glyph(device, queue, font, ch).ok()?;
-        if !line.is_empty() && line_width + glyph.advance * text_scale > wrap_width {
-            lines.push(std::mem::take(&mut line));
-            line_width = 0.0;
-        }
-        line_width += glyph.advance * text_scale;
-        line.push(glyph);
-    }
-    if !line.is_empty() || lines.is_empty() {
-        lines.push(line);
-    }
-
-    let block_height = font.line_height * text_scale * lines.len() as f32;
+    // Text measurement always runs in logical (pre-projection) space. The
+    // logical safe inset is subtracted once; a WorldUi scale must not turn
+    // the 8px inset into a different effective inset, and camera distance
+    // cannot change how many glyphs fit on a line.
+    let wrap_width = (visual.logical_bounds.width.max(1.0) - text_safe_inset(&visual.kind)).max(1.0);
+    let advance = |ch: char| {
+        // Use atlas glyph advance (cached) so line-breaking is identical to
+        // what intrinsic_size would compute.
+        font.font.metrics(ch, FONT_RASTER_SIZE).advance_width
+    };
+    let char_lines = break_text_lines(text, wrap_width, &advance);
+    let block_height = font.line_height * text_scale * char_lines.len() as f32;
     let top = visual.bounds.y + ((visual.bounds.height - block_height).max(0.0) * 0.5);
     let mut result = Vec::new();
-    for (line_index, glyphs) in lines.into_iter().enumerate() {
-        let advance = glyphs
-            .iter()
-            .map(|glyph| glyph.advance * text_scale)
-            .sum::<f32>();
+    for (line_index, glyph_chars) in char_lines.into_iter().enumerate() {
+        let mut glyphs = Vec::new();
+        let mut line_advance = 0.0;
+        for ch in glyph_chars {
+            let glyph = ensure_glyph(device, queue, font, ch).ok()?;
+            line_advance += glyph.advance * text_scale;
+            glyphs.push(glyph);
+        }
         let mut x = if visual.kind == UiNodeKind::Button {
-            visual.bounds.x + ((visual.bounds.width - advance).max(0.0) * 0.5)
+            visual.bounds.x + ((visual.bounds.width - line_advance).max(0.0) * 0.5)
         } else {
             visual.bounds.x
                 + if visual.kind == UiNodeKind::TextInput {
@@ -6634,6 +6926,16 @@ fn layout_text(
         }
     }
     Some(result)
+}
+
+/// Logical horizontal safe inset applied to text measurement and drawing.
+/// The same value must be used for intrinsic measurement and actual layout.
+fn text_safe_inset(kind: &UiNodeKind) -> f32 {
+    if *kind == UiNodeKind::TextInput {
+        TEXT_INPUT_INSET * 2.0
+    } else {
+        8.0
+    }
 }
 
 fn text_advance(font: &fontdue::Font, value: &str, char_count: usize) -> f32 {
@@ -6715,6 +7017,14 @@ fn flatten_fragments_with_data_grid_display_cache(
     ordered.sort_by(|left, right| left.fragment_id.0.cmp(&right.fragment_id.0));
     let mut result = Vec::new();
     for fragment in ordered {
+        // A fragment root is projected into the current viewport, but an
+        // explicitly authored root box still defines its own clip boundary.
+        // Preserve that boundary as the initial inherited clip; roots that
+        // use auto dimensions continue to clip to the viewport only.
+        let authored_root_clip = (fragment.root.layout.is_some()
+            && fragment.root.bounds.width > 0.0
+            && fragment.root.bounds.height > 0.0)
+            .then_some(fragment.root.bounds);
         let hidden_world_nodes = fragment
             .effects
             .iter()
@@ -6729,22 +7039,38 @@ fn flatten_fragments_with_data_grid_display_cache(
             })
             .collect::<HashSet<_>>();
         let mut root = fragment.root.clone();
-        root.bounds = UiBounds {
-            x: 0.0,
-            y: 0.0,
-            width: viewport_logical_size[0],
-            height: viewport_logical_size[1],
-        };
+        // Ordinary fragment roots remain viewport-sized for compatibility with
+        // surface composition. A root with an authored entry transition must
+        // retain its authored target geometry, otherwise the transition is
+        // silently rewritten to the viewport before sampling.
+        let preserve_authored_root = root
+            .enter_transition
+            .as_ref()
+            .and_then(|transition| transition.from.bounds)
+            .is_some_and(|from| {
+                root.bounds.width > 0.0
+                    && root.bounds.height > 0.0
+                    && (root.bounds.x - from.x).abs() > f32::EPSILON
+            });
+        let root_uses_viewport = !preserve_authored_root;
+        if root_uses_viewport {
+            root.bounds = UiBounds {
+                x: 0.0,
+                y: 0.0,
+                width: viewport_logical_size[0],
+                height: viewport_logical_size[1],
+            };
+        }
         flatten_node(
             &mut result,
             &fragment.fragment_id.0,
             &root,
             [0.0, 0.0],
-            None,
+            authored_root_clip,
             None,
             None,
             font,
-            Some(viewport_logical_size),
+            root_uses_viewport.then_some(viewport_logical_size),
             false,
             &hidden_world_nodes,
             None,
@@ -6928,6 +7254,20 @@ fn append_data_grid_frames(
                     width: content_width,
                     height: row_height,
                 },
+                logical_bounds: logical_box_from_bounds(
+                    UiBounds {
+                        x: grid.bounds.x,
+                        y: grid.bounds.y,
+                        width: content_width,
+                        height: row_height,
+                    },
+                    Some(UiBounds {
+                        x: grid.bounds.x,
+                        y: grid.bounds.y,
+                        width: content_width,
+                        height: row_height,
+                    }),
+                ),
                 style: UiStyle {
                     background_color: [0.10, 0.16, 0.19, 1.0],
                     border_color: [0.30, 0.48, 0.52, 1.0],
@@ -7005,6 +7345,15 @@ fn append_data_grid_frames(
                         width: content_width,
                         height: row_height,
                     },
+                    logical_bounds: logical_box_from_bounds(
+                        UiBounds {
+                            x: grid.bounds.x,
+                            y,
+                            width: content_width,
+                            height: row_height,
+                        },
+                        Some(body_clip),
+                    ),
                     style: UiStyle {
                         background_color: if row_index % 2 == 0 {
                             [0.055, 0.085, 0.10, 1.0]
@@ -7435,11 +7784,24 @@ fn flatten_node(
     }
     if node.style.opacity > 0.0 {
         let node_path = format!("{fragment_id}/{}", node.node_id.0);
+        let logical_bounds = LogicalLayoutBox {
+            x: bounds.x,
+            y: bounds.y,
+            width: bounds.width,
+            height: bounds.height,
+            content_x: bounds.x + node_layout.padding[3],
+            content_y: bounds.y + node_layout.padding[0],
+            content_width: (bounds.width - node_layout.padding[1] - node_layout.padding[3]).max(0.0),
+            content_height: (bounds.height - node_layout.padding[0] - node_layout.padding[2])
+                .max(0.0),
+            clip: own_clip,
+        };
         out.push((
             node_path.clone(),
             parent_id.map(str::to_owned),
             UiVisual {
                 bounds: visual_bounds,
+                logical_bounds,
                 style: node.style,
                 kind: node.kind.clone(),
                 enabled: node.enabled,
@@ -7508,12 +7870,22 @@ fn resolved_dimension(
     height: bool,
 ) -> f32 {
     let intrinsic = intrinsic_size(node, font);
+    let intrinsic_value = if height { intrinsic[1] } else { intrinsic[0] };
+    // A scroll container's explicit dimension is its viewport, not an
+    // intrinsic-content minimum. Its children contribute to scroll extent and
+    // are translated during composition; expanding the container here would
+    // collapse max_offset to zero and make the whole scroll panel grow with
+    // its content.
+    if node.layout.is_some_and(|value| value.clip == UiClipPolicy::Scroll) && declared > 0.0 {
+        return clamp_dimension(declared, layout, height);
+    }
+    // §4.1: explicit w/h is a minimum guarantee, not a ceiling. If the
+    // intrinsic content is larger, the resolved size grows to accommodate
+    // it.  This prevents text from being silently clipped by a fixed height.
     let mut value = if declared > 0.0 {
-        declared
-    } else if height {
-        intrinsic[1]
+        declared.max(intrinsic_value)
     } else {
-        intrinsic[0]
+        intrinsic_value
     };
     if let Some([width, height_value]) = layout.preferred_size {
         value = if height { height_value } else { width };
@@ -7558,38 +7930,25 @@ fn intrinsic_size(node: &UiNode, font: Option<&ResidentFont>) -> [f32; 2] {
                 |font| font.font.metrics(ch, FONT_RASTER_SIZE).advance_width,
             )
         };
-        let text_inset = if node.kind == UiNodeKind::TextInput { TEXT_INPUT_INSET * 2.0 } else { 8.0 };
+        // Use the same safe inset as layout_text to ensure intrinsic and
+        // actual measurement agree on the available width.
+        let text_inset = text_safe_inset(&node.kind);
         let available_width = if node.bounds.width > text_inset {
             (node.bounds.width - text_inset).max(1.0)
         } else {
             text.chars().map(advance).sum::<f32>()
         };
-        let mut line_width = 0.0;
-        let mut max_line_width: f32 = 0.0;
-        let mut line_count = 1.0;
-        for ch in text.chars() {
-            if ch == '\n' {
-                max_line_width = max_line_width.max(line_width);
-                line_width = 0.0;
-                line_count += 1.0;
-                continue;
-            }
-            let glyph_width = advance(ch);
-            if line_width > 0.0 && line_width + glyph_width > available_width.max(1.0) {
-                max_line_width = max_line_width.max(line_width);
-                line_width = 0.0;
-                line_count += 1.0;
-            }
-            line_width += glyph_width;
-        }
-        max_line_width = max_line_width.max(line_width);
+        // intrinsic_size and layout_text share break_text_lines via
+        // measure_text_lines, so the line count and max width always match
+        // what is actually drawn.
+        let measure = measure_text_lines(text, available_width, line_height, &advance);
         return [
             if node.bounds.width > 0.0 {
                 node.bounds.width
             } else {
-                max_line_width + text_inset
+                measure.max_line_width + text_inset
             },
-            (node.bounds.height.max(line_height * line_count)),
+            (node.bounds.height.max(measure.total_height)),
         ];
     }
     let layout = node.layout.unwrap_or_default();
@@ -7663,8 +8022,12 @@ fn resolve_children(
                     }
                 }
                 UiBounds {
-                    x: bounds.x + child.bounds.x - parent_layout.scroll_offset[0],
-                    y: bounds.y + child.bounds.y - parent_layout.scroll_offset[1],
+                    // Scroll is a final subtree transform. Keep absolute
+                    // layout coordinates stable here so track calculation,
+                    // text layout, hit geometry, and composition all share
+                    // one logical coordinate system.
+                    x: bounds.x + child.bounds.x,
+                    y: bounds.y + child.bounds.y,
                     width,
                     height,
                 }
@@ -7832,15 +8195,15 @@ fn resolve_children(
             cursor += main_margin_start;
             let result = if row {
                 UiBounds {
-                    x: inner.x + cursor - parent_layout.scroll_offset[0],
-                    y: inner.y + cross_offset - parent_layout.scroll_offset[1],
+                    x: inner.x + cursor,
+                    y: inner.y + cross_offset,
                     width: main_sizes[index],
                     height: cross_size,
                 }
             } else {
                 UiBounds {
-                    x: inner.x + cross_offset - parent_layout.scroll_offset[0],
-                    y: inner.y + cursor - parent_layout.scroll_offset[1],
+                    x: inner.x + cross_offset,
+                    y: inner.y + cursor,
                     width: cross_size,
                     height: main_sizes[index],
                 }
@@ -7867,8 +8230,10 @@ fn transition_source(target: &UiVisual, transition: &UiTransition) -> UiVisual {
         }
         _ => target.presentation.clone(),
     };
+    let bounds = from.bounds.unwrap_or(target.bounds);
     UiVisual {
-        bounds: from.bounds.unwrap_or(target.bounds),
+        bounds,
+        logical_bounds: logical_box_from_bounds(bounds, from_bounds_clip(from.bounds, target)),
         style: UiStyle {
             background_color: from
                 .background_color
@@ -7894,6 +8259,12 @@ fn transition_source(target: &UiVisual, transition: &UiTransition) -> UiVisual {
     }
 }
 
+fn from_bounds_clip(from: Option<UiBounds>, target: &UiVisual) -> Option<UiBounds> {
+    // Logical clip follows the animated bounds box while keeping the inherited
+    // projection clip unchanged.
+    from.map(|_| target.logical_bounds.clip.unwrap_or(target.clip)).or(target.logical_bounds.clip)
+}
+
 fn sample_transition(active: &ActiveTransition, time_seconds: f32) -> UiVisual {
     let elapsed_ms = ((time_seconds - active.started_at_seconds) * 1000.0).max(0.0);
     let progress = ((elapsed_ms - active.transition.delay_ms as f32)
@@ -7917,8 +8288,10 @@ fn sample_transition(active: &ActiveTransition, time_seconds: f32) -> UiVisual {
         }),
         _ => active.target.presentation.clone(),
     };
+    let bounds = lerp_bounds(active.from.bounds, active.target.bounds, t);
     UiVisual {
-        bounds: lerp_bounds(active.from.bounds, active.target.bounds, t),
+        bounds,
+        logical_bounds: logical_box_from_bounds(bounds, active.target.logical_bounds.clip),
         style: UiStyle {
             background_color: lerp4(
                 active.from.style.background_color,
@@ -7955,6 +8328,23 @@ fn sample_transition(active: &ActiveTransition, time_seconds: f32) -> UiVisual {
         world_depth: active.target.world_depth,
         world_scale: active.target.world_scale,
         paint_group_id: active.target.paint_group_id,
+    }
+}
+
+/// Build a uniform logical box whose content area equals its bounds (no
+/// padding). Used for visuals constructed outside `flatten_node`, such as
+/// transition intermediates and data grid rows.
+fn logical_box_from_bounds(bounds: UiBounds, clip: Option<UiBounds>) -> LogicalLayoutBox {
+    LogicalLayoutBox {
+        x: bounds.x,
+        y: bounds.y,
+        width: bounds.width,
+        height: bounds.height,
+        content_x: bounds.x,
+        content_y: bounds.y,
+        content_width: bounds.width,
+        content_height: bounds.height,
+        clip,
     }
 }
 
@@ -8094,6 +8484,27 @@ fn contains(bounds: UiBounds, position: [f32; 2]) -> bool {
         && position[0] <= bounds.x + bounds.width
         && position[1] >= bounds.y
         && position[1] <= bounds.y + bounds.height
+}
+
+fn translate_bounds(bounds: UiBounds, offset: [f32; 2]) -> UiBounds {
+    UiBounds {
+        x: bounds.x + offset[0],
+        y: bounds.y + offset[1],
+        ..bounds
+    }
+}
+
+fn union_bounds(left: UiBounds, right: UiBounds) -> UiBounds {
+    let x = left.x.min(right.x);
+    let y = left.y.min(right.y);
+    let right_edge = (left.x + left.width).max(right.x + right.width);
+    let bottom_edge = (left.y + left.height).max(right.y + right.height);
+    UiBounds {
+        x,
+        y,
+        width: (right_edge - x).max(0.0),
+        height: (bottom_edge - y).max(0.0),
+    }
 }
 
 fn normalize_logical_viewport(logical_size: [f32; 2], physical_size: [u32; 2]) -> [f32; 2] {
@@ -8312,6 +8723,20 @@ mod tests {
                 width: 20.0,
                 height: 20.0,
             },
+            logical_bounds: logical_box_from_bounds(
+                UiBounds {
+                    x: 8.0,
+                    y: 8.0,
+                    width: 20.0,
+                    height: 20.0,
+                },
+                Some(UiBounds {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 160.0,
+                    height: 80.0,
+                }),
+            ),
             style: UiStyle::default(),
             kind: UiNodeKind::Panel,
             enabled: true,
@@ -8338,6 +8763,20 @@ mod tests {
                 width: 40.0,
                 height: 40.0,
             },
+            logical_bounds: logical_box_from_bounds(
+                UiBounds {
+                    x: 48.0,
+                    y: 8.0,
+                    width: 40.0,
+                    height: 40.0,
+                },
+                Some(UiBounds {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 160.0,
+                    height: 80.0,
+                }),
+            ),
             ..source.clone()
         };
         let target_b = UiVisual {
@@ -8347,6 +8786,20 @@ mod tests {
                 width: 40.0,
                 height: 40.0,
             },
+            logical_bounds: logical_box_from_bounds(
+                UiBounds {
+                    x: 104.0,
+                    y: 8.0,
+                    width: 40.0,
+                    height: 40.0,
+                },
+                Some(UiBounds {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 160.0,
+                    height: 80.0,
+                }),
+            ),
             ..source.clone()
         };
         let mut renderer = UiWgpuRenderer::new(&device, wgpu::TextureFormat::Rgba8Unorm);
@@ -8540,6 +8993,15 @@ mod tests {
         };
         let mut visual = UiVisual {
             bounds: logical,
+            logical_bounds: logical_box_from_bounds(
+                logical,
+                Some(UiBounds {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 100.0,
+                    height: 100.0,
+                }),
+            ),
             style: UiStyle::default(),
             kind: UiNodeKind::TextInput,
             enabled: true,
@@ -8632,6 +9094,7 @@ mod tests {
             parent_id: None,
             target: UiVisual {
                 bounds,
+                logical_bounds: logical_box_from_bounds(bounds, Some(bounds)),
                 style: UiStyle::default(),
                 kind: UiNodeKind::TextInput,
                 enabled: true,
@@ -8718,6 +9181,7 @@ mod tests {
             parent_id: None,
             target: UiVisual {
                 bounds: input.bounds,
+                logical_bounds: logical_box_from_bounds(input.bounds, Some(input.bounds)),
                 style: UiStyle::default(),
                 kind: UiNodeKind::TextInput,
                 enabled: true,
@@ -8884,6 +9348,15 @@ mod tests {
             parent_id: None,
             target: UiVisual {
                 bounds,
+                logical_bounds: logical_box_from_bounds(
+                    bounds,
+                    Some(UiBounds {
+                        x: 0.0,
+                        y: 0.0,
+                        width: 200.0,
+                        height: 160.0,
+                    }),
+                ),
                 style: UiStyle::default(),
                 kind: UiNodeKind::Dropdown,
                 enabled: true,
@@ -8963,6 +9436,15 @@ mod tests {
         };
         let visual = UiVisual {
             bounds,
+            logical_bounds: logical_box_from_bounds(
+                bounds,
+                Some(UiBounds {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 200.0,
+                    height: 100.0,
+                }),
+            ),
             style: UiStyle::default(),
             kind: UiNodeKind::Tabs,
             enabled: true,
@@ -9069,6 +9551,20 @@ mod tests {
                 width: 40.0,
                 height: 20.0,
             },
+            logical_bounds: logical_box_from_bounds(
+                UiBounds {
+                    x: 10.0,
+                    y: 10.0,
+                    width: 40.0,
+                    height: 20.0,
+                },
+                Some(UiBounds {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 100.0,
+                    height: 100.0,
+                }),
+            ),
             style: UiStyle::default(),
             kind: UiNodeKind::Slider,
             enabled: true,
@@ -9123,6 +9619,72 @@ mod tests {
     }
 
     #[test]
+    fn focus_uses_topmost_plan_order_instead_of_hash_map_iteration_order() {
+        let (device, _queue) = test_device("neon3-ui-focus-plan-order");
+        let mut renderer = UiWgpuRenderer::new(&device, wgpu::TextureFormat::Rgba8Unorm);
+        let mut lower = node();
+        lower.kind = UiNodeKind::Button;
+        lower.bounds = UiBounds { x: 10.0, y: 10.0, width: 60.0, height: 30.0 };
+        lower.enter_transition = None;
+        let mut upper = lower.clone();
+        upper.node_id = UiNodeId("upper".into());
+        upper.bounds.x = 20.0;
+        let fragment = UiFragment {
+            fragment_id: UiFragmentId("focus-order".into()),
+            revision: Revision(1),
+            root: {
+                let mut root = node();
+                root.enter_transition = None;
+                root.children = vec![lower, upper];
+                root
+            },
+            effects: Vec::new(),
+        };
+        let fragments = HashMap::from([(UiFragmentId("focus-order".into()), fragment)]);
+        renderer.refresh_plan(&fragments, [128.0, 96.0]);
+        renderer.refresh_hit_bindings(&fragments);
+        renderer.compose_sampled_visuals(0.0);
+        renderer.set_pointer_position([30.0, 20.0]);
+        assert!(renderer.focus_control_at_pointer());
+        assert_eq!(renderer.focused_control.as_deref(), Some("focus-order/upper"));
+    }
+
+    #[test]
+    fn toggle_prediction_changes_visual_immediately_and_returns_semantic_value() {
+        let (device, _queue) = test_device("neon3-ui-toggle-prediction");
+        let mut renderer = UiWgpuRenderer::new(&device, wgpu::TextureFormat::Rgba8Unorm);
+        let mut toggle = node();
+        toggle.node_id = UiNodeId("feature-toggle".into());
+        toggle.kind = UiNodeKind::Checkbox;
+        toggle.bounds = UiBounds { x: 10.0, y: 10.0, width: 80.0, height: 30.0 };
+        toggle.enter_transition = None;
+        let mut root = node();
+        root.enter_transition = None;
+        root.children = vec![toggle];
+        let fragment_id = UiFragmentId("toggle-prediction".into());
+        let fragment = UiFragment {
+            fragment_id: fragment_id.clone(),
+            revision: Revision(1),
+            root,
+            effects: vec![UiEffect::ControlPresentation {
+                node_id: UiNodeId("feature-toggle".into()),
+                state: UiControlPresentation::Toggle { selected: true },
+            }],
+        };
+        let fragments = HashMap::from([(fragment_id, fragment)]);
+        renderer.refresh_plan(&fragments, [128.0, 96.0]);
+        renderer.refresh_hit_bindings(&fragments);
+        renderer.compose_sampled_visuals(0.0);
+        let (value, commit) = renderer.finish_toggle_control("toggle-prediction/feature-toggle").unwrap();
+        assert_eq!(value, UiSemanticPayloadValue::Bool { value: false });
+        assert!(matches!(commit, LocalPresentationCommit::Value { .. }));
+        assert!(matches!(
+            renderer.value_previews.get("toggle-prediction/feature-toggle"),
+            Some(UiSemanticPayloadValue::Bool { value: false })
+        ));
+    }
+
+    #[test]
     fn scroll_view_handles_wheel_and_thumb_drag_locally() {
         let _gpu_test = GPU_TEST_LOCK
             .lock()
@@ -9137,6 +9699,7 @@ mod tests {
         };
         let scroll = UiVisual {
             bounds: viewport,
+            logical_bounds: logical_box_from_bounds(viewport, Some(viewport)),
             style: UiStyle::default(),
             kind: UiNodeKind::Panel,
             enabled: true,
@@ -9158,6 +9721,15 @@ mod tests {
                 width: 300.0,
                 height: 300.0,
             },
+            logical_bounds: logical_box_from_bounds(
+                UiBounds {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 300.0,
+                    height: 300.0,
+                },
+                Some(viewport),
+            ),
             clip: viewport,
             ..scroll.clone()
         };
@@ -9215,6 +9787,7 @@ mod tests {
         };
         let scroll = UiVisual {
             bounds: viewport,
+            logical_bounds: logical_box_from_bounds(viewport, Some(viewport)),
             style: UiStyle::default(),
             kind: UiNodeKind::Panel,
             enabled: true,
@@ -9236,6 +9809,15 @@ mod tests {
                 width: 300.0,
                 height: 300.0,
             },
+            logical_bounds: logical_box_from_bounds(
+                UiBounds {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 300.0,
+                    height: 300.0,
+                },
+                Some(viewport),
+            ),
             clip: viewport,
             ..scroll.clone()
         };
@@ -13247,7 +13829,7 @@ mod tests {
     }
 
     #[test]
-    fn flatten_uses_declared_column_layout_and_scroll_offset() {
+    fn flatten_keeps_declared_column_layout_in_logical_coordinates() {
         let mut root = node();
         root.bounds = UiBounds {
             x: 0.0,
@@ -13316,8 +13898,73 @@ mod tests {
             },
         )]);
         let nodes = flatten_fragments(&fragments, [100.0, 100.0], None);
-        assert_eq!(nodes[1].2.bounds.y, 1.0);
-        assert_eq!(nodes[2].2.bounds.y, 13.0);
+        // Scroll is applied once by sampled composition. Flattening must keep
+        // authored logical track positions stable for all children.
+        assert_eq!(nodes[1].2.logical_bounds.y, 4.0);
+        assert_eq!(nodes[2].2.logical_bounds.y, 16.0);
+    }
+
+    #[test]
+    fn scroll_composition_moves_whole_panel_without_collapsing_child_tracks() {
+        let (device, _queue) = test_device("neon3-scroll-whole-panel");
+        let mut first = node();
+        first.node_id = UiNodeId("first-label".into());
+        first.kind = UiNodeKind::Label;
+        first.bounds = UiBounds { x: 0.0, y: 0.0, width: 80.0, height: 20.0 };
+        first.text = Some(TextRef::Literal { value: "First".into() });
+        first.enter_transition = None;
+        let mut second = node();
+        second.node_id = UiNodeId("second-label".into());
+        second.kind = UiNodeKind::Label;
+        second.bounds = UiBounds { x: 0.0, y: 0.0, width: 80.0, height: 20.0 };
+        second.text = Some(TextRef::Literal { value: "Second".into() });
+        second.enter_transition = None;
+        let mut scroll = node();
+        scroll.node_id = UiNodeId("scroll-panel".into());
+        scroll.bounds = UiBounds { x: 0.0, y: 0.0, width: 100.0, height: 30.0 };
+        scroll.layout = Some(UiLayout {
+            mode: UiLayoutMode::Column,
+            gap: 2.0,
+            clip: UiClipPolicy::Scroll,
+            ..UiLayout::default()
+        });
+        scroll.children = vec![first, second];
+        scroll.enter_transition = None;
+        let mut root = node();
+        root.node_id = UiNodeId("root".into());
+        root.bounds = UiBounds { x: 0.0, y: 0.0, width: 100.0, height: 100.0 };
+        root.children = vec![scroll];
+        root.enter_transition = None;
+        let fragment_id = UiFragmentId("scroll-regression".into());
+        let fragment = UiFragment {
+            fragment_id: fragment_id.clone(),
+            revision: Revision(1),
+            root,
+            effects: Vec::new(),
+        };
+        let fragments = HashMap::from([(fragment_id, fragment)]);
+        let mut renderer = UiWgpuRenderer::new(&device, wgpu::TextureFormat::Rgba8Unorm);
+        renderer.update_viewport([100, 100], [100.0, 100.0]);
+        renderer.refresh_plan(&fragments, [100.0, 100.0]);
+        renderer.scroll_offsets.insert("scroll-regression/scroll-panel".into(), [0.0, 10.0]);
+        renderer.compose_sampled_visuals(0.0);
+        let first = renderer
+            .plan
+            .iter()
+            .position(|node| node.id.ends_with("/first-label"))
+            .unwrap();
+        let second = renderer
+            .plan
+            .iter()
+            .position(|node| node.id.ends_with("/second-label"))
+            .unwrap();
+        let first_y = renderer.sampled[first].bounds.y;
+        let second_y = renderer.sampled[second].bounds.y;
+        assert_eq!(renderer.sampled[first].logical_bounds.y, 0.0);
+        assert_eq!(renderer.sampled[second].logical_bounds.y, 22.0);
+        assert_eq!(second_y - first_y, 22.0);
+        assert_eq!(first_y, -10.0);
+        assert_eq!(second_y, 12.0);
     }
 
     #[test]
@@ -13329,6 +13976,20 @@ mod tests {
                 width: 100.0,
                 height: 80.0,
             },
+            logical_bounds: logical_box_from_bounds(
+                UiBounds {
+                    x: 10.0,
+                    y: 20.0,
+                    width: 100.0,
+                    height: 80.0,
+                },
+                Some(UiBounds {
+                    x: -1_000_000.0,
+                    y: -1_000_000.0,
+                    width: 2_000_000.0,
+                    height: 2_000_000.0,
+                }),
+            ),
             style: UiStyle::default(),
             kind: UiNodeKind::Panel,
             enabled: true,
@@ -13371,6 +14032,20 @@ mod tests {
                 width: 100.0,
                 height: 16.0,
             },
+            logical_bounds: logical_box_from_bounds(
+                UiBounds {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 100.0,
+                    height: 16.0,
+                },
+                Some(UiBounds {
+                    x: -1_000_000.0,
+                    y: -1_000_000.0,
+                    width: 2_000_000.0,
+                    height: 2_000_000.0,
+                }),
+            ),
             style: UiStyle::default(),
             kind: UiNodeKind::ProgressBar,
             enabled: true,
@@ -13433,6 +14108,20 @@ mod tests {
                 width: 20.0,
                 height: 20.0,
             },
+            logical_bounds: logical_box_from_bounds(
+                UiBounds {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 20.0,
+                    height: 20.0,
+                },
+                Some(UiBounds {
+                    x: -1_000_000.0,
+                    y: -1_000_000.0,
+                    width: 2_000_000.0,
+                    height: 2_000_000.0,
+                }),
+            ),
             style: UiStyle::default(),
             kind: UiNodeKind::Panel,
             enabled: true,
@@ -13459,6 +14148,20 @@ mod tests {
                 width: 20.0,
                 height: 20.0,
             },
+            logical_bounds: logical_box_from_bounds(
+                UiBounds {
+                    x: 100.0,
+                    y: 0.0,
+                    width: 20.0,
+                    height: 20.0,
+                },
+                Some(UiBounds {
+                    x: -1_000_000.0,
+                    y: -1_000_000.0,
+                    width: 2_000_000.0,
+                    height: 2_000_000.0,
+                }),
+            ),
             style: UiStyle::default(),
             kind: UiNodeKind::Panel,
             enabled: true,
@@ -13507,6 +14210,20 @@ mod tests {
                 width: 10.0,
                 height: 10.0,
             },
+            logical_bounds: logical_box_from_bounds(
+                UiBounds {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 10.0,
+                    height: 10.0,
+                },
+                Some(UiBounds {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 10.0,
+                    height: 10.0,
+                }),
+            ),
             style: UiStyle::default(),
             kind: UiNodeKind::Panel,
             enabled: true,
@@ -13556,6 +14273,20 @@ mod tests {
                 width: 200.0,
                 height: 70.0,
             },
+            logical_bounds: logical_box_from_bounds(
+                UiBounds {
+                    x: 100.0,
+                    y: 120.0,
+                    width: 200.0,
+                    height: 70.0,
+                },
+                Some(UiBounds {
+                    x: 100.0,
+                    y: 120.0,
+                    width: 200.0,
+                    height: 70.0,
+                }),
+            ),
             style: UiStyle::default(),
             kind: UiNodeKind::Panel,
             enabled: true,
@@ -13789,5 +14520,299 @@ mod tests {
         assert_eq!(&bytes[4..8], &34.0f32.to_ne_bytes());
         assert_eq!(&bytes[8..12], &1u32.to_ne_bytes());
         assert_eq!(&bytes[12..16], &1.25f32.to_ne_bytes());
+    }
+
+    // ── Intrinsic text measurement (§14.1) ────────────────────────────
+
+    const TEST_LINE_HEIGHT: f32 = 20.0;
+
+    fn fixed_advance(ch: char) -> f32 {
+        if ch.is_ascii() { 8.0 } else { 16.0 }
+    }
+
+    #[test]
+    fn measure_ascii_single_line() {
+        let m = measure_text_lines("Hello", 200.0, TEST_LINE_HEIGHT, &fixed_advance);
+        assert_eq!(m.line_count, 1);
+        assert_eq!(m.max_line_width, 40.0); // 5 × 8
+        assert_eq!(m.total_height, TEST_LINE_HEIGHT);
+    }
+
+    #[test]
+    fn measure_cjk_single_line() {
+        // 地(16) 形(16) U(8) I(8) = 48, no wrapping at width 200
+        let m = measure_text_lines("地形UI", 200.0, TEST_LINE_HEIGHT, &fixed_advance);
+        assert_eq!(m.line_count, 1);
+        assert_eq!(m.max_line_width, 48.0);
+    }
+
+    #[test]
+    fn measure_cjk_auto_wrap_two_lines() {
+        // 地(16) 形(16) U(8) I(8) 测(16) 试(16) = 80 total.
+        // Width 40: [地形U](40) then [I测试](40) → 2 lines, max width 40
+        let m = measure_text_lines("地形UI测试", 40.0, TEST_LINE_HEIGHT, &fixed_advance);
+        assert_eq!(m.line_count, 2);
+        assert_eq!(m.max_line_width, 40.0);
+        assert_eq!(m.total_height, TEST_LINE_HEIGHT * 2.0);
+    }
+
+    #[test]
+    fn measure_explicit_newline() {
+        let m = measure_text_lines("A\nBC", 200.0, TEST_LINE_HEIGHT, &fixed_advance);
+        assert_eq!(m.line_count, 2);
+        // First line: "A" → 8, second line: "BC" → 16
+        assert_eq!(m.max_line_width, 16.0);
+    }
+
+    #[test]
+    fn measure_overflow_single_token() {
+        // "Super" = 5 × 8 = 40, width = 16, so it wraps: Su/pe/r → 3 lines
+        let m = measure_text_lines("Super", 16.0, TEST_LINE_HEIGHT, &fixed_advance);
+        assert_eq!(m.line_count, 3);
+        assert_eq!(m.max_line_width, 16.0); // each line = 2 chars × 8
+    }
+
+    #[test]
+    fn measure_emoji_uses_fallback_advance() {
+        // For non-ASCII, fixed_advance returns 16 per char
+        let m = measure_text_lines("😀🌊", 200.0, TEST_LINE_HEIGHT, &fixed_advance);
+        assert_eq!(m.line_count, 1);
+        assert_eq!(m.max_line_width, 32.0);
+    }
+
+    #[test]
+    fn measure_font_not_loaded_fallback() {
+        // When font is None, intrinsic_size falls back to FONT_RASTER_SIZE estimates
+        let node = UiNode {
+            node_id: UiNodeId("fallback-test".into()),
+            kind: UiNodeKind::Label,
+            bounds: UiBounds { x: 0.0, y: 0.0, width: 0.0, height: 0.0 },
+            layout: None,
+            visible: true,
+            enabled: true,
+            text_key: None,
+            text: Some(TextRef::Literal { value: "Hello".into() }),
+            image: None,
+            surface: None,
+            style: UiStyle::default(),
+            enter_transition: None,
+            children: Vec::new(),
+            world_depth: None, world_scale: None,
+        };
+        let [width, height] = intrinsic_size(&node, None);
+        // Without font, each ASCII char = FONT_RASTER_SIZE * 0.5 = 8.0
+        // 5 chars × 8.0 = 40.0 + inset 8 = 48.0 (auto width)
+        assert_eq!(width, 48.0);
+        // Height = 1 line × FONT_RASTER_SIZE = 16
+        assert_eq!(height, 16.0);
+    }
+
+    #[test]
+    fn measure_break_text_lines_roundtrip() {
+        // Verify that break_text_lines and measure_text_lines agree
+        let text = "Hello\nWorld";
+        let width = 100.0;
+        let advance = &fixed_advance;
+        let lines = break_text_lines(text, width, advance);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].iter().collect::<String>(), "Hello");
+        assert_eq!(lines[1].iter().collect::<String>(), "World");
+        let m = measure_text_lines(text, width, TEST_LINE_HEIGHT, advance);
+        assert_eq!(m.line_count as usize, lines.len());
+    }
+
+    // ── Container layout tests (§14.2) ──────────────────────────────
+
+    #[test]
+    fn column_padding_gap_affects_child_tracks() {
+        let mut child1 = node();
+        child1.node_id = UiNodeId("a".into());
+        child1.bounds = UiBounds { x: 0.0, y: 0.0, width: 20.0, height: 10.0 };
+        child1.enter_transition = None;
+        let mut child2 = node();
+        child2.node_id = UiNodeId("b".into());
+        child2.bounds = UiBounds { x: 0.0, y: 0.0, width: 30.0, height: 15.0 };
+        child2.enter_transition = None;
+        let mut root = node();
+        root.node_id = UiNodeId("col".into());
+        root.bounds = UiBounds { x: 0.0, y: 0.0, width: 0.0, height: 0.0 };
+        root.layout = Some(UiLayout {
+            mode: UiLayoutMode::Column,
+            padding: [4.0, 6.0, 4.0, 6.0], // top, right, bottom, left
+            gap: 3.0,
+            ..UiLayout::default()
+        });
+        root.children = vec![child1, child2];
+        root.enter_transition = None;
+        let fragment = UiFragment {
+            fragment_id: UiFragmentId("col-pad-gap".into()),
+            revision: Revision(1),
+            root,
+            effects: Vec::new(),
+        };
+        let mut fragments = HashMap::new();
+        fragments.insert(UiFragmentId("col-pad-gap".into()), fragment);
+        let (device, _queue) = test_device("neon3-col-pad-gap");
+        let mut renderer = UiWgpuRenderer::new(&device, wgpu::TextureFormat::Rgba8Unorm);
+        renderer.update_viewport([256, 256], [256.0, 256.0]);
+        renderer.refresh_plan(&fragments, [256.0, 256.0]);
+        // Child A: y = padding_top = 4
+        // Child B: y = padding_top + child_a_height + gap = 4 + 10 + 3 = 17
+        let a = renderer.plan.iter().find(|n| n.id.ends_with("/a")).unwrap();
+        let b = renderer.plan.iter().find(|n| n.id.ends_with("/b")).unwrap();
+        assert!((a.target.logical_bounds.y - 4.0).abs() < 0.001, "child A y should be padding_top");
+        assert!((b.target.logical_bounds.y - 17.0).abs() < 0.001, "child B y should include padding + height + gap");
+    }
+
+    #[test]
+    fn row_padding_gap_affects_child_tracks() {
+        let mut child1 = node();
+        child1.node_id = UiNodeId("a".into());
+        child1.bounds = UiBounds { x: 0.0, y: 0.0, width: 20.0, height: 10.0 };
+        child1.enter_transition = None;
+        let mut child2 = node();
+        child2.node_id = UiNodeId("b".into());
+        child2.bounds = UiBounds { x: 0.0, y: 0.0, width: 30.0, height: 15.0 };
+        child2.enter_transition = None;
+        let mut root = node();
+        root.node_id = UiNodeId("row".into());
+        root.bounds = UiBounds { x: 0.0, y: 0.0, width: 0.0, height: 0.0 };
+        root.layout = Some(UiLayout {
+            mode: UiLayoutMode::Row,
+            padding: [2.0, 4.0, 2.0, 4.0], // top, right, bottom, left
+            gap: 5.0,
+            ..UiLayout::default()
+        });
+        root.children = vec![child1, child2];
+        root.enter_transition = None;
+        let fragment = UiFragment {
+            fragment_id: UiFragmentId("row-pad-gap".into()),
+            revision: Revision(1),
+            root,
+            effects: Vec::new(),
+        };
+        let mut fragments = HashMap::new();
+        fragments.insert(UiFragmentId("row-pad-gap".into()), fragment);
+        let (device, _queue) = test_device("neon3-row-pad-gap");
+        let mut renderer = UiWgpuRenderer::new(&device, wgpu::TextureFormat::Rgba8Unorm);
+        renderer.update_viewport([256, 256], [256.0, 256.0]);
+        renderer.refresh_plan(&fragments, [256.0, 256.0]);
+        // Child A: x = padding_left = 4
+        // Child B: x = 4 + child_a_width + gap = 4 + 20 + 5 = 29
+        let a = renderer.plan.iter().find(|n| n.id.ends_with("/a")).unwrap();
+        let b = renderer.plan.iter().find(|n| n.id.ends_with("/b")).unwrap();
+        assert!((a.target.logical_bounds.x - 4.0).abs() < 0.001);
+        assert!((b.target.logical_bounds.x - 29.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn invisible_child_does_not_occupy_track_space() {
+        let mut child1 = node();
+        child1.node_id = UiNodeId("visible".into());
+        child1.bounds = UiBounds { x: 0.0, y: 0.0, width: 20.0, height: 10.0 };
+        child1.enter_transition = None;
+        let mut child2 = node();
+        child2.node_id = UiNodeId("hidden".into());
+        child2.bounds = UiBounds { x: 0.0, y: 0.0, width: 20.0, height: 10.0 };
+        child2.visible = false;
+        child2.enter_transition = None;
+        let mut root = node();
+        root.node_id = UiNodeId("col".into());
+        root.bounds = UiBounds { x: 0.0, y: 0.0, width: 0.0, height: 0.0 };
+        root.layout = Some(UiLayout {
+            mode: UiLayoutMode::Column,
+            gap: 2.0,
+            ..UiLayout::default()
+        });
+        root.children = vec![child1, child2];
+        root.enter_transition = None;
+        let fragment = UiFragment {
+            fragment_id: UiFragmentId("branch-space".into()),
+            revision: Revision(1),
+            root,
+            effects: Vec::new(),
+        };
+        let mut fragments = HashMap::new();
+        fragments.insert(UiFragmentId("branch-space".into()), fragment);
+        let (device, _queue) = test_device("neon3-invisible-child");
+        let mut renderer = UiWgpuRenderer::new(&device, wgpu::TextureFormat::Rgba8Unorm);
+        renderer.update_viewport([256, 256], [256.0, 256.0]);
+        renderer.refresh_plan(&fragments, [256.0, 256.0]);
+        // Only the visible child should appear in the plan
+        assert!(renderer.plan.iter().any(|n| n.id.ends_with("/visible")));
+        assert!(!renderer.plan.iter().any(|n| n.id.ends_with("/hidden")));
+    }
+
+    #[test]
+    fn explicit_height_does_not_clip_text_content() {
+        let (device, _queue) = test_device("neon3-text-no-clip");
+        let mut text_node = node();
+        text_node.node_id = UiNodeId("label".into());
+        text_node.kind = UiNodeKind::Label;
+        text_node.bounds = UiBounds { x: 0.0, y: 0.0, width: 200.0, height: 8.0 };
+        text_node.text = Some(TextRef::Literal { value: "Hello World".into() });
+        text_node.enter_transition = None;
+        let fragment = UiFragment {
+            fragment_id: UiFragmentId("text-no-clip".into()),
+            revision: Revision(1),
+            root: text_node,
+            effects: Vec::new(),
+        };
+        let mut fragments = HashMap::new();
+        fragments.insert(UiFragmentId("text-no-clip".into()), fragment);
+        let mut renderer = UiWgpuRenderer::new(&device, wgpu::TextureFormat::Rgba8Unorm);
+        renderer.update_viewport([256, 256], [256.0, 256.0]);
+        renderer.refresh_plan(&fragments, [256.0, 256.0]);
+        let label = renderer.plan.iter().find(|n| n.id.ends_with("/label")).unwrap();
+        // §4.1: explicit height is a minimum guarantee, not a clip ceiling.
+        // The label's resolved height must be >= 1 line height (~16-20px) even
+        // though the declared height is only 8.
+        assert!(
+            label.target.logical_bounds.height >= 16.0,
+            "explicit height 8 must not clip text; resolved height = {}",
+            label.target.logical_bounds.height,
+        );
+    }
+
+    #[test]
+    fn margin_does_not_double_count_in_parent_track() {
+        let mut child = node();
+        child.node_id = UiNodeId("child".into());
+        child.bounds = UiBounds { x: 0.0, y: 0.0, width: 30.0, height: 10.0 };
+        child.layout = Some(UiLayout {
+            margin: [2.0, 0.0, 0.0, 0.0], // top margin only
+            ..UiLayout::default()
+        });
+        child.enter_transition = None;
+        let mut root = node();
+        root.node_id = UiNodeId("col".into());
+        root.bounds = UiBounds { x: 0.0, y: 0.0, width: 0.0, height: 0.0 };
+        root.layout = Some(UiLayout {
+            mode: UiLayoutMode::Column,
+            ..UiLayout::default()
+        });
+        root.children = vec![child];
+        root.enter_transition = None;
+        let fragment = UiFragment {
+            fragment_id: UiFragmentId("margin".into()),
+            revision: Revision(1),
+            root,
+            effects: Vec::new(),
+        };
+        let mut fragments = HashMap::new();
+        fragments.insert(UiFragmentId("margin".into()), fragment);
+        let (device, _queue) = test_device("neon3-margin");
+        let mut renderer = UiWgpuRenderer::new(&device, wgpu::TextureFormat::Rgba8Unorm);
+        renderer.update_viewport([256, 256], [256.0, 256.0]);
+        renderer.refresh_plan(&fragments, [256.0, 256.0]);
+        let child_visual = renderer.plan.iter().find(|n| n.id.ends_with("/child")).unwrap();
+        // Child y should be offset by margin top (2px), but the child's own
+        // height should be 10 (not 12 = 10 + 2*1). Margin is not added to
+        // the child's own bounds — it's applied to the parent's track.
+        assert!((child_visual.target.logical_bounds.y - 2.0).abs() < 0.001,
+            "child y should be margin top (2), got {}", child_visual.target.logical_bounds.y);
+        assert!((child_visual.target.logical_bounds.height - 10.0).abs() < 0.001,
+            "child height should be 10 (margin not added to bounds), got {}",
+            child_visual.target.logical_bounds.height);
     }
 }
