@@ -3,9 +3,12 @@ name = "neon-projectd"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "Neon3 project and asset authority service"
+repository.workspace = true
+readme = "README.md"
 
 [dependencies]
-neon-protocol = { path = "../neon-protocol" }
-neon-observability = { path = "../neon-observability" }
-neon-ipc = { path = "../neon-ipc" }
+neon-protocol = { version = "0.1.0", path = "../neon-protocol" }
+neon-observability = { version = "0.1.0", path = "../neon-observability" }
+neon-ipc = { version = "0.1.0", path = "../neon-ipc" }
 serde_json.workspace = true

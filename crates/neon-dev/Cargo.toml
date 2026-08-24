@@ -3,12 +3,15 @@ name = "neon-dev"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "Neon3 local development and scenario tooling"
+repository.workspace = true
+readme = "README.md"
 
 [dependencies]
 windows-sys.workspace = true
-neon-ipc = { path = "../neon-ipc" }
-neon-protocol = { path = "../neon-protocol" }
-neon-ui-runtime = { path = "../neon-ui-runtime" }
-neon-ui-schema = { path = "../neon-ui-schema" }
+neon-ipc = { version = "0.1.0", path = "../neon-ipc" }
+neon-protocol = { version = "0.1.0", path = "../neon-protocol" }
+neon-ui-runtime = { version = "0.1.0", path = "../neon-ui-runtime" }
+neon-ui-schema = { version = "0.1.0", path = "../neon-ui-schema" }
 serde_json.workspace = true
 png = "0.18"

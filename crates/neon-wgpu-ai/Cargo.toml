@@ -3,6 +3,8 @@ name = "neon-wgpu-ai"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+readme = "README.md"
 description = "GPU inference kernels and model executors for Neon3. Compute only; the sole caller is neon-wgpu-runtime, which owns the device."
 
 [dependencies]

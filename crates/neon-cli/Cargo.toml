@@ -3,9 +3,12 @@ name = "neon-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "Neon3 public command-line protocol client"
+repository.workspace = true
+readme = "README.md"
 
 [dependencies]
-neon-protocol = { path = "../neon-protocol" }
-neon-ipc = { path = "../neon-ipc" }
-neon-ui-schema = { path = "../neon-ui-schema" }
+neon-protocol = { version = "0.1.0", path = "../neon-protocol" }
+neon-ipc = { version = "0.1.0", path = "../neon-ipc" }
+neon-ui-schema = { version = "0.1.0", path = "../neon-ui-schema" }
 serde_json.workspace = true

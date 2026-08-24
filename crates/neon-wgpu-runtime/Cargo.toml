@@ -3,14 +3,17 @@ name = "neon-wgpu-runtime"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "Neon3 WGPU renderer and window runtime"
+repository.workspace = true
+readme = "README.md"
 
 [dependencies]
-neon-wgpu-ai = { path = "../neon-wgpu-ai" }
-neon-protocol = { path = "../neon-protocol" }
-neon-observability = { path = "../neon-observability" }
-neon-ui-schema = { path = "../neon-ui-schema" }
-neon-world-bridge = { path = "../neon-world-bridge" }
-neon-ipc = { path = "../neon-ipc" }
+neon-wgpu-ai = { version = "0.1.0", path = "../neon-wgpu-ai" }
+neon-protocol = { version = "0.1.0", path = "../neon-protocol" }
+neon-observability = { version = "0.1.0", path = "../neon-observability" }
+neon-ui-schema = { version = "0.1.0", path = "../neon-ui-schema" }
+neon-world-bridge = { version = "0.1.0", path = "../neon-world-bridge" }
+neon-ipc = { version = "0.1.0", path = "../neon-ipc" }
 bytemuck.workspace = true
 pollster.workspace = true
 png = "0.18"
@@ -22,5 +25,5 @@ fontdue.workspace = true
 windows.workspace = true
 
 [dev-dependencies]
-neon-projectd = { path = "../neon-projectd" }
-neon-ui-runtime = { path = "../neon-ui-runtime" }
+neon-projectd = { version = "0.1.0", path = "../neon-projectd" }
+neon-ui-runtime = { version = "0.1.0", path = "../neon-ui-runtime" }

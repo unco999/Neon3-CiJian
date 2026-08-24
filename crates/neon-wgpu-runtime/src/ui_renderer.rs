@@ -4533,8 +4533,8 @@ impl UiWgpuRenderer {
         }
         let image_capacity = images.len().max(popup_images.len());
         if image_capacity > self.image_capacity {
-                self.image_capacity = image_capacity.next_power_of_two();
-                self.image_buffer = create_image_buffer(device, self.image_capacity);
+            self.image_capacity = image_capacity.next_power_of_two();
+            self.image_buffer = create_image_buffer(device, self.image_capacity);
         }
         // Do not upload `images` here. The sorted `ordered_images` payload below
         // is the only image batch consumed by the render pass; uploading this

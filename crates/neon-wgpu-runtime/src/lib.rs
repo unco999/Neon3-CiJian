@@ -2881,7 +2881,8 @@ impl HeadlessExternalGpu {
                 .preload_external_image(&self.device, &self.queue, source);
             match (screen, world) {
                 (Ok(_), Ok(_)) => {
-                    self.preloaded_external_images.insert(source.image_id.clone());
+                    self.preloaded_external_images
+                        .insert(source.image_id.clone());
                     // The fragment tree can be unchanged while its image atlas
                     // gains a new resident entry. A cached transparent frame
                     // from before this upload is no longer valid.
@@ -2890,7 +2891,9 @@ impl HeadlessExternalGpu {
                 (screen, world) => {
                     eprintln!(
                         "[neon-wgpu-runtime] external image preload failed for {}: screen={:?} world={:?}",
-                        source.image_id, screen.err(), world.err()
+                        source.image_id,
+                        screen.err(),
+                        world.err()
                     );
                 }
             }
@@ -3344,7 +3347,12 @@ impl HeadlessExternalGpu {
         let height = shared.height;
         let points = points
             .iter()
-            .map(|point| [point[0].min(width.saturating_sub(1)), point[1].min(height.saturating_sub(1))])
+            .map(|point| {
+                [
+                    point[0].min(width.saturating_sub(1)),
+                    point[1].min(height.saturating_sub(1)),
+                ]
+            })
             .collect::<Vec<_>>();
         let bytes_per_row = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
         let mirror = self.device.create_texture(&wgpu::TextureDescriptor {
@@ -3365,22 +3373,27 @@ impl HeadlessExternalGpu {
         let source_view = shared
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
-        let source_layout = self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("neon3-external-color-sample-layout"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Texture {
-                    multisampled: false,
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                },
-                count: None,
-            }],
-        });
-        let shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("neon3-external-color-sample-shader"),
-            source: wgpu::ShaderSource::Wgsl(r#"
+        let source_layout =
+            self.device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("neon3-external-color-sample-layout"),
+                    entries: &[wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            multisampled: false,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        },
+                        count: None,
+                    }],
+                });
+        let shader = self
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("neon3-external-color-sample-shader"),
+                source: wgpu::ShaderSource::Wgsl(
+                    r#"
                 @group(0) @binding(0) var source: texture_2d<f32>;
                 @vertex fn vs(@builtin(vertex_index) index: u32) -> @builtin(position) vec4<f32> {
                     var positions = array<vec2<f32>, 3>(
@@ -3391,38 +3404,44 @@ impl HeadlessExternalGpu {
                 @fragment fn fs(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
                     return textureLoad(source, vec2<i32>(position.xy), 0);
                 }
-            "#.into()),
-        });
-        let pipeline_layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("neon3-external-color-sample-pipeline-layout"),
-            bind_group_layouts: &[Some(&source_layout)],
-            immediate_size: 0,
-        });
-        let pipeline = self.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("neon3-external-color-sample-pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs"),
-                buffers: &[],
-                compilation_options: Default::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::Rgba8Unorm,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
+            "#
+                    .into(),
+                ),
+            });
+        let pipeline_layout = self
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("neon3-external-color-sample-pipeline-layout"),
+                bind_group_layouts: &[Some(&source_layout)],
+                immediate_size: 0,
+            });
+        let pipeline = self
+            .device
+            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("neon3-external-color-sample-pipeline"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs"),
+                    buffers: &[],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Rgba8Unorm,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            });
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("neon3-external-color-sample-bind-group"),
             layout: &source_layout,
@@ -3492,9 +3511,11 @@ impl HeadlessExternalGpu {
         }
         self.queue.submit(Some(encoder.finish()));
         let (mapped_tx, mapped_rx) = std::sync::mpsc::channel();
-        readback.slice(..).map_async(wgpu::MapMode::Read, move |result| {
-            let _ = mapped_tx.send(result);
-        });
+        readback
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                let _ = mapped_tx.send(result);
+            });
         self.device
             .poll(wgpu::PollType::Wait {
                 submission_index: None,

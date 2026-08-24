@@ -1506,17 +1506,36 @@ fn refresh_fragment_from_program(
         .into_iter()
         .map(|state| (state.node_key.clone(), state))
         .collect::<BTreeMap<_, _>>();
-    fn apply(node: &mut UiNode, states: &BTreeMap<String, UiCpuNodeState>) {
+    fn apply(
+        node: &mut UiNode,
+        states: &BTreeMap<String, UiCpuNodeState>,
+        kinds: &BTreeMap<String, UiNodeKind>,
+    ) {
         if let Some(state) = states.get(&node.node_id.0) {
             node.visible = state.visible;
             node.enabled = state.enabled;
             node.style.opacity = state.opacity;
+            // Numeric progress is renderer presentation state. Materialize its
+            // current value into the submitted fragment so a domain publication
+            // changes both the fill and the readable value in the final window.
+            if matches!(kinds.get(&node.node_id.0), Some(UiNodeKind::ProgressBar))
+                && let Some(value) = state.numeric_value
+            {
+                node.text = Some(TextRef::Literal {
+                    value: format!("{value:.0}"),
+                });
+            }
         }
         for child in &mut node.children {
-            apply(child, states);
+            apply(child, states, kinds);
         }
     }
-    apply(&mut fragment.root, &states);
+    let kinds = program
+        .nodes
+        .iter()
+        .map(|node| (node.key.clone(), node.kind.clone()))
+        .collect::<BTreeMap<_, _>>();
+    apply(&mut fragment.root, &states, &kinds);
     fragment
         .effects
         .retain(|effect| !matches!(effect, UiEffect::ControlPresentation { .. }));

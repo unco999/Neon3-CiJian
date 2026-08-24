@@ -20,6 +20,9 @@ resolver = "2"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 version = "0.1.0"
+repository = "https://github.com/unco999/Neon3-CiJian"
+homepage = "https://github.com/unco999/Neon3-CiJian"
+rust-version = "1.85"
 
 [workspace.dependencies]
 serde = { version = "1.0", features = ["derive"] }
