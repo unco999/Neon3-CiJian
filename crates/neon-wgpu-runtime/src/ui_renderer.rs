@@ -4941,6 +4941,15 @@ impl UiWgpuRenderer {
             }
             if let Some((start, count)) = image_ranges.get(&key) {
                 pass.set_pipeline(&self.image_pipeline);
+                pass.set_bind_group(
+                    1,
+                    &self
+                        .image_atlas
+                        .as_ref()
+                        .expect("resident image atlas")
+                        .bind_group,
+                    &[],
+                );
                 pass.set_vertex_buffer(0, self.image_buffer.slice(..));
                 pass.draw(0..6, *start..*start + *count);
             }
