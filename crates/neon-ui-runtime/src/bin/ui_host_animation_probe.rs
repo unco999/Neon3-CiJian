@@ -6,16 +6,16 @@ use std::time::{Duration, Instant};
 
 use neon_ipc::{RpcClient, RpcServer};
 use neon_protocol::{
-    ClientIdentity, ClientKind, RequestId, Revision, RpcRequest, RpcResponse, RpcStatus,
-    ServiceName, PROTOCOL_VERSION,
+    ClientIdentity, ClientKind, PROTOCOL_VERSION, RequestId, Revision, RpcRequest, RpcResponse,
+    RpcStatus, ServiceName,
 };
-use neon_ui_runtime::{compile_nui_flow_program, parse_nui_flow, UiHostAdapterConfig, UiRuntime};
+use neon_ui_runtime::{UiHostAdapterConfig, UiRuntime, compile_nui_flow_program, parse_nui_flow};
 use neon_ui_schema::{
     UiCommand, UiHostInbound, UiHostPublication, UiInputFrame, UiProgramCapability,
     UiProgramCapabilityOwner, UiProgramCapabilityStatus, UiProgramRevision, UiProgramSemanticEvent,
     UiProgramSemanticEventKind, UiSemanticInteractionMetadata,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 const SOURCE: &str = r#"version 1
 surface surface.multi-panel revision 1

@@ -893,6 +893,64 @@ pub struct UiTransitionState {
     pub numeric_value: Option<f32>,
 }
 
+/// Declarative visual state names. These are presentation states, not domain
+/// state; the renderer may derive hover/pressed/focus locally while selected
+/// and checked values come from typed control presentation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UiVisualState {
+    Normal,
+    Hover,
+    Pressed,
+    Focused,
+    Disabled,
+    Selected,
+    Checked,
+    Open,
+}
+
+/// Optional patch for one visual state. Omitted fields inherit from the base
+/// style; patches never participate in logical layout measurement.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct UiStylePatch {
+    pub background_color: Option<[f32; 4]>,
+    pub border_color: Option<[f32; 4]>,
+    pub text_color: Option<[f32; 4]>,
+    pub border_width: Option<f32>,
+    pub corner_radius: Option<f32>,
+    pub opacity: Option<f32>,
+}
+
+/// A complete state-style set. The renderer resolves patches in the fixed
+/// priority order documented by the UI component work plan.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct UiStyleStateSet {
+    pub hover: Option<UiStylePatch>,
+    pub pressed: Option<UiStylePatch>,
+    pub focused: Option<UiStylePatch>,
+    pub disabled: Option<UiStylePatch>,
+    pub selected: Option<UiStylePatch>,
+    pub checked: Option<UiStylePatch>,
+    pub open: Option<UiStylePatch>,
+}
+
+/// Properties supported by the renderer transition system. Layout topology,
+/// text wrapping, and child tracks are intentionally absent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UiAnimationProperty {
+    Position,
+    Size,
+    Opacity,
+    BackgroundColor,
+    BorderColor,
+    BorderWidth,
+    CornerRadius,
+    NumericValue,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum UiEffect {
@@ -922,6 +980,12 @@ pub enum UiEffect {
     },
     CameraVisibility {
         binding: UiCameraVisibilityBinding,
+    },
+    /// Binds an Image node to an external image source. The source bytes and
+    /// atlas residency stay in the WGPU runtime; this is only a stable key.
+    ImageBinding {
+        node_id: UiNodeId,
+        image_id: String,
     },
 }
 
@@ -2372,7 +2436,16 @@ impl UiFragment {
         if self.fragment_id.0.trim().is_empty() {
             return Err(UiSchemaError::EmptyFragmentId);
         }
-        self.root.validate()?;
+        let external_image_nodes = self
+            .effects
+            .iter()
+            .filter_map(|effect| match effect {
+                UiEffect::ImageBinding { node_id, .. } => Some(node_id.0.clone()),
+                _ => None,
+            })
+            .collect::<std::collections::HashSet<_>>();
+        self.root
+            .validate_with_external_images(&external_image_nodes)?;
         for effect in &self.effects {
             effect.validate()?;
         }
@@ -2413,6 +2486,16 @@ impl UiFragment {
                 {
                     return Err(UiSchemaError::InvalidProgramEvent);
                 }
+                UiEffect::ImageBinding { node_id, image_id }
+                    if !nodes.contains(&node_id.0)
+                        || image_id.trim().is_empty()
+                        || !matches!(
+                            find_node_kind(&self.root, &node_id.0),
+                            Some(UiNodeKind::Image)
+                        ) =>
+                {
+                    return Err(UiSchemaError::InvalidProgramEvent);
+                }
                 _ => {}
             }
         }
@@ -2420,8 +2503,25 @@ impl UiFragment {
     }
 }
 
+fn find_node_kind<'a>(node: &'a UiNode, id: &str) -> Option<&'a UiNodeKind> {
+    if node.node_id.0 == id {
+        return Some(&node.kind);
+    }
+    node.children
+        .iter()
+        .find_map(|child| find_node_kind(child, id))
+}
+
 impl UiNode {
+    #[cfg_attr(not(test), allow(dead_code))]
     fn validate(&self) -> Result<(), UiSchemaError> {
+        self.validate_with_external_images(&std::collections::HashSet::new())
+    }
+
+    fn validate_with_external_images(
+        &self,
+        external_image_nodes: &std::collections::HashSet<String>,
+    ) -> Result<(), UiSchemaError> {
         if self.node_id.0.trim().is_empty() {
             return Err(UiSchemaError::EmptyNodeId);
         }
@@ -2431,7 +2531,10 @@ impl UiNode {
         if !self.style.is_valid() {
             return Err(UiSchemaError::InvalidStyle);
         }
-        if self.kind == UiNodeKind::Image && self.image.is_none() {
+        if self.kind == UiNodeKind::Image
+            && self.image.is_none()
+            && !external_image_nodes.contains(&self.node_id.0)
+        {
             return Err(UiSchemaError::MissingImageAsset);
         }
         if self.kind == UiNodeKind::RenderSurface && self.surface.is_none() {
@@ -2462,7 +2565,7 @@ impl UiNode {
             return Err(UiSchemaError::InvalidTransition);
         }
         for child in &self.children {
-            child.validate()?;
+            child.validate_with_external_images(external_image_nodes)?;
         }
         Ok(())
     }
@@ -2631,6 +2734,13 @@ impl UiEffect {
                     Ok(())
                 }
             }
+            Self::ImageBinding { node_id, image_id } => {
+                if node_id.0.trim().is_empty() || image_id.trim().is_empty() {
+                    Err(UiSchemaError::InvalidProgramEvent)
+                } else {
+                    Ok(())
+                }
+            }
         }
     }
 }
@@ -2669,6 +2779,32 @@ mod tests {
         assert_eq!(
             serde_json::to_value(fragment).unwrap(),
             serde_json::from_str::<Value>(STATIC_FRAGMENT).unwrap()
+        );
+    }
+
+    #[test]
+    fn style_state_and_animation_property_contract_round_trip() {
+        let patch = UiStylePatch {
+            background_color: Some([0.1, 0.2, 0.3, 1.0]),
+            text_color: Some([1.0, 1.0, 1.0, 1.0]),
+            opacity: Some(0.8),
+            ..UiStylePatch::default()
+        };
+        let styles = UiStyleStateSet {
+            hover: Some(patch),
+            disabled: Some(UiStylePatch {
+                opacity: Some(0.5),
+                ..UiStylePatch::default()
+            }),
+            ..UiStyleStateSet::default()
+        };
+        let value = serde_json::to_value(styles).unwrap();
+        let decoded: UiStyleStateSet = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded.hover.unwrap().text_color, patch.text_color);
+        assert_eq!(UiVisualState::Pressed, UiVisualState::Pressed);
+        assert_eq!(
+            serde_json::to_string(&UiAnimationProperty::NumericValue).unwrap(),
+            "\"numeric_value\""
         );
     }
 
@@ -2946,6 +3082,7 @@ mod tests {
             style: UiStyle::default(),
             enter_transition: None,
             world_depth: None,
+            world_scale: None,
             children: vec![
                 UiNode {
                     node_id: UiNodeId("a".into()),
@@ -2969,6 +3106,7 @@ mod tests {
                     style: UiStyle::default(),
                     enter_transition: None,
                     world_depth: None,
+                    world_scale: None,
                     children: Vec::new(),
                 },
                 UiNode {
@@ -2990,6 +3128,7 @@ mod tests {
                     style: UiStyle::default(),
                     enter_transition: None,
                     world_depth: None,
+                    world_scale: None,
                     children: Vec::new(),
                 },
             ],
@@ -3028,6 +3167,26 @@ mod tests {
         let value = serde_json::to_value(node).unwrap();
         assert!(value["image"].get("path").is_none());
         assert_eq!(value["image"]["asset_id"], 81);
+    }
+
+    #[test]
+    fn external_image_binding_allows_image_without_project_asset_ref() {
+        let mut node = layout_node(UiLayoutMode::Absolute);
+        node.kind = UiNodeKind::Image;
+        let fragment = UiFragment {
+            fragment_id: UiFragmentId("external-image".into()),
+            revision: Revision(1),
+            root: node,
+            effects: vec![UiEffect::ImageBinding {
+                node_id: UiNodeId("root".into()),
+                image_id: "engine-image-01".into(),
+            }],
+        };
+        fragment.validate().unwrap();
+        let value = serde_json::to_value(&fragment).unwrap();
+        assert!(value["root"]["image"].is_null());
+        assert_eq!(value["effects"][0]["kind"], "image_binding");
+        assert_eq!(value["effects"][0]["image_id"], "engine-image-01");
     }
 
     #[test]
@@ -3293,7 +3452,13 @@ impl UiIrDocument {
         if self.schema_version != 1 || self.surface_id.0.trim().is_empty() {
             return Err(UiSchemaError::InvalidIrDocument);
         }
-        self.root.validate()?;
+        let external_image_nodes = self
+            .image_resources
+            .keys()
+            .cloned()
+            .collect::<std::collections::HashSet<_>>();
+        self.root
+            .validate_with_external_images(&external_image_nodes)?;
         if self.resource_budget.max_nodes == 0 || self.resource_budget.max_instances == 0 {
             return Err(UiSchemaError::InvalidProgramBudget);
         }

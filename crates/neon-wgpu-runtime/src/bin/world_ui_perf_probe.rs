@@ -22,7 +22,7 @@ use neon_ui_schema::{
     UI_FRAGMENT_SCHEMA_VERSION, UiBounds, UiCommand, UiFragment, UiFragmentId,
     UiFragmentSubmission, UiNode, UiNodeId, UiNodeKind, UiStyle,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 // ---------------------------------------------------------------------------
 // Probe helpers
@@ -53,7 +53,12 @@ fn request(method: &str, params: Value, sequence: u64) -> RpcRequest {
     }
 }
 
-fn call(client: &mut RpcClient, method: &str, params: Value, sequence: u64) -> Result<Value, String> {
+fn call(
+    client: &mut RpcClient,
+    method: &str,
+    params: Value,
+    sequence: u64,
+) -> Result<Value, String> {
     let req = request(method, params, sequence);
     client
         .call(&req)
@@ -119,17 +124,25 @@ fn main() {
             Ok(())
         }
         Ok(resp) => {
-            print_step("service_health", false, Some(json!({
-                "failure": "health_rejected",
-                "status": format!("{:?}", resp.status),
-            })));
+            print_step(
+                "service_health",
+                false,
+                Some(json!({
+                    "failure": "health_rejected",
+                    "status": format!("{:?}", resp.status),
+                })),
+            );
             Err(())
         }
         Err(e) => {
-            print_step("service_health", false, Some(json!({
-                "failure": "health_failed",
-                "error": e.to_string(),
-            })));
+            print_step(
+                "service_health",
+                false,
+                Some(json!({
+                    "failure": "health_failed",
+                    "error": e.to_string(),
+                })),
+            );
             Err(())
         }
     };
@@ -146,16 +159,28 @@ fn main() {
     let describe = call(&mut rpc, "service.describe", json!({}), seq);
     match &describe {
         Ok(val) => {
-            let caps = val.get("capabilities").and_then(|c| c.as_array()).map(|a| a.len()).unwrap_or(0);
-            print_step("service_describe", true, Some(json!({
-                "capabilities_count": caps,
-            })));
+            let caps = val
+                .get("capabilities")
+                .and_then(|c| c.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0);
+            print_step(
+                "service_describe",
+                true,
+                Some(json!({
+                    "capabilities_count": caps,
+                })),
+            );
         }
         Err(e) => {
-            print_step("service_describe", false, Some(json!({
-                "failure": "describe_failed",
-                "error": e,
-            })));
+            print_step(
+                "service_describe",
+                false,
+                Some(json!({
+                    "failure": "describe_failed",
+                    "error": e,
+                })),
+            );
             failures += 1;
         }
     }
@@ -180,16 +205,24 @@ fn main() {
     );
     match &surface_open {
         Ok(val) => {
-            print_step("surface_open", true, Some(json!({
-                "surface_id": "probe.screen",
-                "result": val,
-            })));
+            print_step(
+                "surface_open",
+                true,
+                Some(json!({
+                    "surface_id": "probe.screen",
+                    "result": val,
+                })),
+            );
         }
         Err(e) => {
-            print_step("surface_open", false, Some(json!({
-                "failure": "surface_open_failed",
-                "error": e,
-            })));
+            print_step(
+                "surface_open",
+                false,
+                Some(json!({
+                    "failure": "surface_open_failed",
+                    "error": e,
+                })),
+            );
             failures += 1;
         }
     }
@@ -204,7 +237,12 @@ fn main() {
         root: UiNode {
             node_id: UiNodeId("probe.root".into()),
             kind: UiNodeKind::Panel,
-            bounds: UiBounds { x: 0.0, y: 0.0, width: 1280.0, height: 720.0 },
+            bounds: UiBounds {
+                x: 0.0,
+                y: 0.0,
+                width: 1280.0,
+                height: 720.0,
+            },
             layout: None,
             visible: true,
             enabled: true,
@@ -221,7 +259,12 @@ fn main() {
                 UiNode {
                     node_id: UiNodeId("p0".into()),
                     kind: UiNodeKind::Panel,
-                    bounds: UiBounds { x: 100.0, y: 100.0, width: 200.0, height: 80.0 },
+                    bounds: UiBounds {
+                        x: 100.0,
+                        y: 100.0,
+                        width: 200.0,
+                        height: 80.0,
+                    },
                     layout: None,
                     visible: true,
                     enabled: true,
@@ -245,7 +288,12 @@ fn main() {
                 UiNode {
                     node_id: UiNodeId("p1".into()),
                     kind: UiNodeKind::Panel,
-                    bounds: UiBounds { x: 400.0, y: 100.0, width: 200.0, height: 80.0 },
+                    bounds: UiBounds {
+                        x: 400.0,
+                        y: 100.0,
+                        width: 200.0,
+                        height: 80.0,
+                    },
                     layout: None,
                     visible: true,
                     enabled: true,
@@ -282,16 +330,24 @@ fn main() {
     );
     match &fragment_submit {
         Ok(val) => {
-            print_step("submit_fragment", true, Some(json!({
-                "fragment_revision": seq,
-                "result": val,
-            })));
+            print_step(
+                "submit_fragment",
+                true,
+                Some(json!({
+                    "fragment_revision": seq,
+                    "result": val,
+                })),
+            );
         }
         Err(e) => {
-            print_step("submit_fragment", false, Some(json!({
-                "failure": "fragment_submit_failed",
-                "error": e,
-            })));
+            print_step(
+                "submit_fragment",
+                false,
+                Some(json!({
+                    "failure": "fragment_submit_failed",
+                    "error": e,
+                })),
+            );
             failures += 1;
         }
     }
@@ -309,8 +365,14 @@ fn main() {
             Ok(val) => {
                 if val.get("ready").and_then(|v| v.as_bool()).unwrap_or(false) {
                     id_frame_ready = true;
-                    id_frame_sequence = val.get("frame_sequence").and_then(|v| v.as_u64()).unwrap_or(0);
-                    id_binding_count = val.get("binding_count").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                    id_frame_sequence = val
+                        .get("frame_sequence")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    id_binding_count = val
+                        .get("binding_count")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as usize;
                     if let Some(map) = val.get("id_map").and_then(|v| v.as_array()) {
                         id_map = map.clone();
                     }
@@ -322,16 +384,24 @@ fn main() {
         std::thread::sleep(Duration::from_millis(16));
     }
     if id_frame_ready {
-        print_step("id_frame_ready", true, Some(json!({
-            "id_frame_sequence": id_frame_sequence,
-            "binding_count": id_binding_count,
-            "id_map": id_map,
-        })));
+        print_step(
+            "id_frame_ready",
+            true,
+            Some(json!({
+                "id_frame_sequence": id_frame_sequence,
+                "binding_count": id_binding_count,
+                "id_map": id_map,
+            })),
+        );
     } else {
-        print_step("id_frame_ready", false, Some(json!({
-            "failure": "id_frame_not_ready",
-            "poll_duration_ms": 2000,
-        })));
+        print_step(
+            "id_frame_ready",
+            false,
+            Some(json!({
+                "failure": "id_frame_not_ready",
+                "poll_duration_ms": 2000,
+            })),
+        );
         failures += 1;
     }
 
@@ -367,18 +437,26 @@ fn main() {
     );
     let m0_down_passed = pointer_down.is_ok();
     if m0_down_passed {
-        print_step("m0_down", true, Some(json!({
-            "monster_id": "monster.m0",
-            "pointer": [click_x, click_y],
-            "result": pointer_down.as_ref().unwrap(),
-        })));
+        print_step(
+            "m0_down",
+            true,
+            Some(json!({
+                "monster_id": "monster.m0",
+                "pointer": [click_x, click_y],
+                "result": pointer_down.as_ref().unwrap(),
+            })),
+        );
     } else {
-        print_step("m0_down", false, Some(json!({
-            "monster_id": "monster.m0",
-            "pointer": [click_x, click_y],
-            "failure": "m0_down_failed",
-            "error": pointer_down.as_ref().unwrap_err(),
-        })));
+        print_step(
+            "m0_down",
+            false,
+            Some(json!({
+                "monster_id": "monster.m0",
+                "pointer": [click_x, click_y],
+                "failure": "m0_down_failed",
+                "error": pointer_down.as_ref().unwrap_err(),
+            })),
+        );
         failures += 1;
     }
 
@@ -413,18 +491,29 @@ fn main() {
     if m0_up_passed {
         let up_result = pointer_up.as_ref().unwrap();
         // Check if semantic event was produced
-        let semantic_state = up_result.get("state").and_then(|v| v.as_str()).unwrap_or("unknown");
-        print_step("m0_up", true, Some(json!({
-            "monster_id": "monster.m0",
-            "semantic_state": semantic_state,
-            "result": up_result,
-        })));
+        let semantic_state = up_result
+            .get("state")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        print_step(
+            "m0_up",
+            true,
+            Some(json!({
+                "monster_id": "monster.m0",
+                "semantic_state": semantic_state,
+                "result": up_result,
+            })),
+        );
     } else {
-        print_step("m0_up", false, Some(json!({
-            "monster_id": "monster.m0",
-            "failure": "m0_up_failed",
-            "error": pointer_up.as_ref().unwrap_err(),
-        })));
+        print_step(
+            "m0_up",
+            false,
+            Some(json!({
+                "monster_id": "monster.m0",
+                "failure": "m0_up_failed",
+                "error": pointer_up.as_ref().unwrap_err(),
+            })),
+        );
         failures += 1;
     }
 
@@ -432,38 +521,62 @@ fn main() {
     seq += 1;
     match call(&mut rpc, "debug.unified_id.inspect", json!({}), seq) {
         Ok(val) => {
-            let map = val.get("id_map").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+            let map = val
+                .get("id_map")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
             // Check that the ID map has at least the two panel bindings
             let has_p0 = map.iter().any(|entry| {
-                entry.get("node_path").and_then(|v| v.as_str()).unwrap_or("").ends_with("/p0")
+                entry
+                    .get("node_path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .ends_with("/p0")
             });
             let has_p1 = map.iter().any(|entry| {
-                entry.get("node_path").and_then(|v| v.as_str()).unwrap_or("").ends_with("/p1")
+                entry
+                    .get("node_path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .ends_with("/p1")
             });
             let id_map_pass = has_p0 && has_p1;
             if id_map_pass {
-                print_step("id_map_verify", true, Some(json!({
-                    "id_frame_sequence": val.get("frame_sequence"),
-                    "binding_count": val.get("binding_count"),
-                    "has_p0": true,
-                    "has_p1": true,
-                    "id_map": map,
-                })));
+                print_step(
+                    "id_map_verify",
+                    true,
+                    Some(json!({
+                        "id_frame_sequence": val.get("frame_sequence"),
+                        "binding_count": val.get("binding_count"),
+                        "has_p0": true,
+                        "has_p1": true,
+                        "id_map": map,
+                    })),
+                );
             } else {
-                print_step("id_map_verify", false, Some(json!({
-                    "failure": "id_map_missing_panels",
-                    "has_p0": has_p0,
-                    "has_p1": has_p1,
-                    "id_map": map,
-                })));
+                print_step(
+                    "id_map_verify",
+                    false,
+                    Some(json!({
+                        "failure": "id_map_missing_panels",
+                        "has_p0": has_p0,
+                        "has_p1": has_p1,
+                        "id_map": map,
+                    })),
+                );
                 failures += 1;
             }
         }
         Err(e) => {
-            print_step("id_map_verify", false, Some(json!({
-                "failure": "id_map_inspect_failed",
-                "error": e,
-            })));
+            print_step(
+                "id_map_verify",
+                false,
+                Some(json!({
+                    "failure": "id_map_inspect_failed",
+                    "error": e,
+                })),
+            );
             failures += 1;
         }
     }
@@ -499,18 +612,26 @@ fn main() {
         seq,
     );
     if m1_down.is_ok() {
-        print_step("m1_click", true, Some(json!({
-            "monster_id": "monster.m1",
-            "pointer": [click_x1, click_y1],
-            "result": m1_down.as_ref().unwrap(),
-        })));
+        print_step(
+            "m1_click",
+            true,
+            Some(json!({
+                "monster_id": "monster.m1",
+                "pointer": [click_x1, click_y1],
+                "result": m1_down.as_ref().unwrap(),
+            })),
+        );
     } else {
-        print_step("m1_click", false, Some(json!({
-            "monster_id": "monster.m1",
-            "pointer": [click_x1, click_y1],
-            "failure": "m1_click_failed",
-            "error": m1_down.as_ref().unwrap_err(),
-        })));
+        print_step(
+            "m1_click",
+            false,
+            Some(json!({
+                "monster_id": "monster.m1",
+                "pointer": [click_x1, click_y1],
+                "failure": "m1_click_failed",
+                "error": m1_down.as_ref().unwrap_err(),
+            })),
+        );
         failures += 1;
     }
 
@@ -606,16 +727,24 @@ fn main() {
     // At least 2 of the 3 rapid clicks should succeed (latest-wins)
     let rapid_pass = rapid_passes >= 2;
     if rapid_pass {
-        print_step("rapid_clicks", true, Some(json!({
-            "rapid_success_count": rapid_passes,
-            "rapid_attempts": 3,
-        })));
+        print_step(
+            "rapid_clicks",
+            true,
+            Some(json!({
+                "rapid_success_count": rapid_passes,
+                "rapid_attempts": 3,
+            })),
+        );
     } else {
-        print_step("rapid_clicks", false, Some(json!({
-            "failure": "rapid_clicks_failed",
-            "rapid_success_count": rapid_passes,
-            "rapid_attempts": 3,
-        })));
+        print_step(
+            "rapid_clicks",
+            false,
+            Some(json!({
+                "failure": "rapid_clicks_failed",
+                "rapid_success_count": rapid_passes,
+                "rapid_attempts": 3,
+            })),
+        );
         failures += 1;
     }
 
@@ -624,51 +753,75 @@ fn main() {
     seq += 1;
     match call(&mut rpc, "debug.unified_id.inspect", json!({}), seq) {
         Ok(val) => {
-            let fs = val.get("frame_sequence").and_then(|v| v.as_u64()).unwrap_or(0);
-            let bc = val.get("binding_count").and_then(|v| v.as_u64()).unwrap_or(0);
+            let fs = val
+                .get("frame_sequence")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let bc = val
+                .get("binding_count")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
             // Verify that the frame sequence is > 0 (meaning the render loop has produced frames)
             // and that binding_count >= 2 (both panels have bindings)
             let frame_ok = fs > 0;
             let binding_ok = bc >= 2;
             if frame_ok && binding_ok {
-                print_step("final_id_frame", true, Some(json!({
-                    "frame_sequence": fs,
-                    "binding_count": bc,
-                })));
+                print_step(
+                    "final_id_frame",
+                    true,
+                    Some(json!({
+                        "frame_sequence": fs,
+                        "binding_count": bc,
+                    })),
+                );
             } else {
-                print_step("final_id_frame", false, Some(json!({
-                    "failure": "id_frame_invalid",
-                    "frame_sequence": fs,
-                    "binding_count": bc,
-                })));
+                print_step(
+                    "final_id_frame",
+                    false,
+                    Some(json!({
+                        "failure": "id_frame_invalid",
+                        "frame_sequence": fs,
+                        "binding_count": bc,
+                    })),
+                );
                 failures += 1;
             }
         }
         Err(e) => {
-            print_step("final_id_frame", false, Some(json!({
-                "failure": "final_id_inspect_failed",
-                "error": e,
-            })));
+            print_step(
+                "final_id_frame",
+                false,
+                Some(json!({
+                    "failure": "final_id_inspect_failed",
+                    "error": e,
+                })),
+            );
             failures += 1;
         }
     }
 
     // ------- Summary -------
     if failures == 0 {
-        println!("{}", json!({
-            "scenario": "world-ui-perf.v1",
-            "status": "passed",
-            "steps_total": seq,
-            "failures": 0,
-        }));
+        println!(
+            "{}",
+            json!({
+                "scenario": "world-ui-perf.v1",
+                "status": "passed",
+                "steps_total": seq,
+                "failures": 0,
+            })
+        );
         std::process::exit(0);
     } else {
-        println!("{}", json!({
-            "scenario": "world-ui-perf.v1",
-            "status": "failed",
-            "steps_total": seq,
-            "failures": failures,
-        }));
+        println!(
+            "{}",
+            json!({
+                "scenario": "world-ui-perf.v1",
+                "status": "failed",
+                "steps_total": seq,
+                "failures": failures,
+            })
+        );
         std::process::exit(1);
     }
 }

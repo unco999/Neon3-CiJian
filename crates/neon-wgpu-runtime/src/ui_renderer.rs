@@ -1,17 +1,18 @@
 //! Minimal GPU UI composition pass adapted from Neon2's instanced panel renderer.
 //! It deliberately consumes only Neon3's public UI schema, not old ECS state.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::Instant;
 
 use bytemuck::{Pod, Zeroable};
-use neon_protocol::{AssetBytes, AssetRef};
+use neon_protocol::{AssetBytes, AssetRef, UiImageSource, UiImageTextureRef, UiImageTextureRegion};
 use neon_ui_schema::{
     RenderSurfaceRef, TextRef, UiAlignItems, UiBounds, UiClipPolicy, UiControlPresentation,
     UiDataGridCellTarget, UiDataGridWindowRequest, UiDragAxis, UiDragBinding, UiDragBoundary,
     UiDropPlacement, UiEasing, UiFragment, UiFragmentRevision, UiIntent, UiJustifyContent,
-    UiLayout, UiLayoutMode, UiNode, UiNodeKind, UiSemanticPayloadValue, UiStyle, UiTransition,
+    UiLayout, UiLayoutMode, UiNode, UiNodeKind, UiSemanticPayloadValue, UiStyle,
+    UiStylePatch as SchemaStylePatch, UiTransition, UiTransitionState,
 };
 use serde_json::{Value, json};
 
@@ -264,7 +265,17 @@ struct VsOut { @builtin(position) position: vec4<f32>, @location(0) local: vec2<
 }
 @fragment fn fs_main(input: VsOut) -> @location(0) vec4<f32> {
  if (input.pixel.x < input.clip.x || input.pixel.y < input.clip.y || input.pixel.x > input.clip.z || input.pixel.y > input.clip.w) { discard; }
-   let sample = textureSample(image_texture, image_sampler, input.uv);
+    // External images are atlas entries with integer regions. Sample the
+    // resolved texel directly instead of relying on normalized filtering at
+    // the atlas boundary; this keeps the first/last texel visible for both
+    // tiny probes and cropped engine images.
+    let atlas_dims = vec2<i32>(textureDimensions(image_texture));
+    let texel = clamp(
+        vec2<i32>(input.uv * vec2<f32>(atlas_dims)),
+        vec2<i32>(0),
+        atlas_dims - vec2<i32>(1),
+    );
+    let sample = textureLoad(image_texture, texel, 0);
   let alpha = sample.a * input.tint.a;
   if (alpha <= 0.001) { discard; }
   let tint = select(srgb_to_linear(input.tint.rgb), input.tint.rgb, view.color_mode == 1u);
@@ -583,6 +594,7 @@ struct UiTextInstance {
 }
 
 struct ResidentImage {
+    slot: u32,
     width: u32,
     height: u32,
     bytes: Vec<u8>,
@@ -594,6 +606,7 @@ struct ResidentImageAtlas {
     _view: wgpu::TextureView,
     _sampler: wgpu::Sampler,
     bind_group: wgpu::BindGroup,
+    size: [u32; 2],
 }
 
 struct ResidentRenderSurface {
@@ -847,6 +860,82 @@ struct ActiveTransition {
     transition: UiTransition,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UiAnimationStatus {
+    Pending,
+    Running,
+    Completed,
+    Cancelled,
+    Superseded,
+    Rejected,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct UiAnimationSpec {
+    motion_key: Option<String>,
+    delay_ms: u32,
+    duration_ms: u32,
+    easing: UiEasing,
+    from: UiTransitionState,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct UiAnimationInstance {
+    node_path: String,
+    fragment_revision: neon_protocol::Revision,
+    started_at_seconds: f32,
+    spec: UiAnimationSpec,
+    status: UiAnimationStatus,
+}
+
+fn animation_instance_from_active(
+    node_path: &str,
+    active: &ActiveTransition,
+    status: UiAnimationStatus,
+) -> UiAnimationInstance {
+    UiAnimationInstance {
+        node_path: node_path.to_owned(),
+        fragment_revision: neon_protocol::Revision(0),
+        started_at_seconds: active.started_at_seconds,
+        spec: UiAnimationSpec {
+            motion_key: active.transition.motion_key.clone(),
+            delay_ms: active.transition.delay_ms,
+            duration_ms: active.transition.duration_ms,
+            easing: active.transition.easing,
+            from: active.transition.from,
+        },
+        status,
+    }
+}
+
+impl ActiveTransition {
+    fn animation_instance(
+        &self,
+        node_path: &str,
+        fragment_revision: neon_protocol::Revision,
+        time_seconds: f32,
+    ) -> UiAnimationInstance {
+        let finished = transition_finished(self, time_seconds);
+        UiAnimationInstance {
+            node_path: node_path.to_owned(),
+            fragment_revision,
+            started_at_seconds: self.started_at_seconds,
+            spec: UiAnimationSpec {
+                motion_key: self.transition.motion_key.clone(),
+                delay_ms: self.transition.delay_ms,
+                duration_ms: self.transition.duration_ms,
+                easing: self.transition.easing,
+                from: self.transition.from,
+            },
+            status: if finished {
+                UiAnimationStatus::Completed
+            } else {
+                UiAnimationStatus::Running
+            },
+        }
+    }
+}
+
 struct PlannedNode {
     id: String,
     parent_id: Option<String>,
@@ -938,6 +1027,13 @@ pub(crate) struct UiDrawStageTimings {
     pub buffer_upload_ms: f32,
 }
 
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+struct UiLayoutCounters {
+    layout_count: u64,
+    text_layout_count: u64,
+    world_transform_update_count: u64,
+}
+
 /// Which subset of the combined plan a pass should emit. The plan itself is
 /// always the full combined Flow (screen UI + projected world panels); only the
 /// instance emission is filtered so a single renderer can feed both the world
@@ -1010,6 +1106,7 @@ pub struct UiWgpuRenderer {
     view_buffer_viewport_revision: u64,
     current: HashMap<String, UiVisual>,
     active: HashMap<String, ActiveTransition>,
+    animation_history: VecDeque<UiAnimationInstance>,
     pointer_position: Option<[f32; 2]>,
     pressed_until_seconds: f32,
     hit_pipeline: wgpu::RenderPipeline,
@@ -1023,7 +1120,9 @@ pub struct UiWgpuRenderer {
     image_buffer: wgpu::Buffer,
     image_capacity: usize,
     resident_images: HashMap<(String, u64, u64), ResidentImage>,
+    external_images: HashMap<String, ResidentImage>,
     image_atlas: Option<ResidentImageAtlas>,
+    image_atlas_generation: u64,
     resident_render_surfaces: HashMap<String, ResidentRenderSurface>,
     image_texture_layout: wgpu::BindGroupLayout,
     text_pipeline: wgpu::RenderPipeline,
@@ -1060,6 +1159,7 @@ pub struct UiWgpuRenderer {
     atlas_generation: u64,
     available_cameras: HashSet<(neon_world_bridge::CameraId, neon_world_bridge::CameraKind)>,
     last_stage_timings: UiDrawStageTimings,
+    layout_counters: UiLayoutCounters,
 }
 
 impl UiWgpuRenderer {
@@ -1534,11 +1634,31 @@ impl UiWgpuRenderer {
                                 offset: 80,
                                 shader_location: 5,
                             },
-                            wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 88, shader_location: 6 },
-                            wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 104, shader_location: 7 },
-                            wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 120, shader_location: 8 },
-                            wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 136, shader_location: 9 },
-                            wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 152, shader_location: 10 },
+                            wgpu::VertexAttribute {
+                                format: wgpu::VertexFormat::Float32x4,
+                                offset: 88,
+                                shader_location: 6,
+                            },
+                            wgpu::VertexAttribute {
+                                format: wgpu::VertexFormat::Float32x4,
+                                offset: 104,
+                                shader_location: 7,
+                            },
+                            wgpu::VertexAttribute {
+                                format: wgpu::VertexFormat::Float32x4,
+                                offset: 120,
+                                shader_location: 8,
+                            },
+                            wgpu::VertexAttribute {
+                                format: wgpu::VertexFormat::Float32x4,
+                                offset: 136,
+                                shader_location: 9,
+                            },
+                            wgpu::VertexAttribute {
+                                format: wgpu::VertexFormat::Float32x4,
+                                offset: 152,
+                                shader_location: 10,
+                            },
                         ],
                     })],
                     compilation_options: Default::default(),
@@ -1592,6 +1712,7 @@ impl UiWgpuRenderer {
             view_buffer_viewport_revision: 0,
             current: HashMap::new(),
             active: HashMap::new(),
+            animation_history: VecDeque::with_capacity(64),
             pointer_position: None,
             pressed_until_seconds: 0.0,
             hit_pipeline,
@@ -1605,7 +1726,9 @@ impl UiWgpuRenderer {
             image_buffer: create_image_buffer(device, 512),
             image_capacity: 512,
             resident_images: HashMap::new(),
+            external_images: HashMap::new(),
             image_atlas: None,
+            image_atlas_generation: 0,
             resident_render_surfaces: HashMap::new(),
             image_texture_layout,
             text_pipeline,
@@ -1636,6 +1759,7 @@ impl UiWgpuRenderer {
             atlas_generation: 0,
             available_cameras: HashSet::new(),
             last_stage_timings: UiDrawStageTimings::default(),
+            layout_counters: UiLayoutCounters::default(),
         }
     }
 
@@ -1765,31 +1889,34 @@ impl UiWgpuRenderer {
     fn compose_sampled_visuals(&mut self, time_seconds: f32) -> Vec<Option<usize>> {
         self.update_scroll_metrics();
         for index in 0..self.plan.len() {
-            let node = &self.plan[index];
-            let was_active = self.active.contains_key(&node.id);
+            let node_id = self.plan[index].id.clone();
+            let target = self.plan[index].target.clone();
+            let transition = self.plan[index].transition.clone();
+            let was_active = self.active.contains_key(&node_id);
             // Always begin with a canonical transition sample. Inherited composition
             // below must never accumulate in `sampled` across renderer entry points.
-            self.sampled[index] = Self::sample(
-                &mut self.current,
-                &mut self.active,
-                &node.id,
-                &node.target,
-                node.transition.as_ref(),
-                time_seconds,
-            );
+            self.sampled[index] =
+                self.sample_with_history(&node_id, &target, transition.as_ref(), time_seconds);
+            if target.world_scale.is_some() && self.sampled[index].bounds != target.bounds {
+                self.layout_counters.world_transform_update_count = self
+                    .layout_counters
+                    .world_transform_update_count
+                    .saturating_add(1);
+            }
             if !was_active
                 && self.trace_role != "screen"
-                && is_world_panel_path(&node.id)
-                && self.active.get(&node.id).is_some_and(|active| {
-                    active.transition.motion_key.is_some()
-                })
+                && is_world_panel_path(&node_id)
+                && self
+                    .active
+                    .get(&node_id)
+                    .is_some_and(|active| active.transition.motion_key.is_some())
             {
-                if let Some(active) = self.active.get(&node.id) {
+                if let Some(active) = self.active.get(&node_id) {
                     eprintln!(
                         "{}",
                         json!({
                             "event": "world_ui_transition_begin",
-                            "node_path": node.id,
+                            "node_path": node_id,
                             "motion_key": active.transition.motion_key,
                             "start_seconds": active.started_at_seconds,
                             "duration_ms": active.transition.duration_ms,
@@ -2661,8 +2788,10 @@ impl UiWgpuRenderer {
     ) -> Option<(UiSemanticPayloadValue, LocalPresentationCommit)> {
         let index = self.plan_index_of(node_path)?;
         let visual = self.visual_at(index);
-        if !matches!(visual.kind, UiNodeKind::Checkbox | UiNodeKind::RadioButton | UiNodeKind::Selectable)
-        {
+        if !matches!(
+            visual.kind,
+            UiNodeKind::Checkbox | UiNodeKind::RadioButton | UiNodeKind::Selectable
+        ) {
             return None;
         }
         let selected = self
@@ -3555,8 +3684,49 @@ impl UiWgpuRenderer {
                     "asset": asset,
                     "bounds": visual.bounds,
                     "clip": visual.clip,
-                    "resident": self.resident_images.contains_key(&key),
-                    "uv": self.resident_images.get(&key).map(|image| image.uv),
+                    "resident": self.resident_images.contains_key(&key)
+                        || asset
+                            .project_id
+                            .strip_prefix("external:")
+                            .is_some_and(|image_id| self.external_images.contains_key(image_id)),
+                    "uv": self
+                        .resident_images
+                        .get(&key)
+                        .map(|image| image.uv)
+                        .or_else(|| {
+                            asset
+                                .project_id
+                                .strip_prefix("external:")
+                                .and_then(|image_id| self.external_images.get(image_id))
+                                .map(|image| image.uv)
+                        }),
+                })
+            })
+            .collect::<Vec<_>>();
+        let external_images = self
+            .external_images
+            .iter()
+            .map(|(image_id, image)| {
+                let atlas_size = self.image_atlas_size();
+                let region_x = atlas_size
+                    .map(|size| (image.uv[0] * size[0] as f32 - 0.5).max(0.0) as u32)
+                    .unwrap_or(0);
+                let region_y = atlas_size
+                    .map(|size| (image.uv[1] * size[1] as f32 - 0.5).max(0.0) as u32)
+                    .unwrap_or(0);
+                serde_json::json!({
+                    "image_id": image_id,
+                    "resident": true,
+                    "texture_index": image.slot,
+                    "generation": self.image_atlas_generation,
+                    "atlas_size": atlas_size,
+                    "region": {
+                        "x": region_x,
+                        "y": region_y,
+                        "width": image.width,
+                        "height": image.height,
+                    },
+                    "uv": image.uv,
                 })
             })
             .collect::<Vec<_>>();
@@ -3564,6 +3734,8 @@ impl UiWgpuRenderer {
             "atlas_ready": self.image_atlas.is_some(),
             "resident_count": self.resident_images.len(),
             "sampled_images": sampled_images,
+            "external_images": external_images,
+            "atlas_generation": self.image_atlas_generation,
         })
     }
 
@@ -3575,6 +3747,12 @@ impl UiWgpuRenderer {
             if time_seconds < end {
                 true
             } else {
+                self.animation_history
+                    .push_back(animation_instance_from_active(
+                        id,
+                        active,
+                        UiAnimationStatus::Completed,
+                    ));
                 completed.push((
                     id.clone(),
                     active.target.clone(),
@@ -3586,9 +3764,7 @@ impl UiWgpuRenderer {
             }
         });
         for (node, target, motion_key, start_seconds, duration_ms) in completed {
-            if self.trace_role != "screen"
-                && is_world_panel_path(&node)
-            {
+            if self.trace_role != "screen" && is_world_panel_path(&node) {
                 eprintln!(
                     "{}",
                     json!({
@@ -3611,6 +3787,23 @@ impl UiWgpuRenderer {
         !self.active.is_empty() || time_seconds < self.pressed_until_seconds
     }
 
+    pub(crate) fn cancel_animation(&mut self, node_path: &str) -> bool {
+        let Some(active) = self.active.remove(node_path) else {
+            return false;
+        };
+        self.animation_history
+            .push_back(animation_instance_from_active(
+                node_path,
+                &active,
+                UiAnimationStatus::Cancelled,
+            ));
+        while self.animation_history.len() > 64 {
+            self.animation_history.pop_front();
+        }
+        self.current.insert(node_path.to_owned(), active.target);
+        true
+    }
+
     /// Renderer-side snapshot of every in-flight transition. `node_key` is the
     /// stable plan path (fragment_id/node_id), `motion_key` is the Flow motion
     /// identity attached by the UI runtime (renderer never interprets it),
@@ -3622,6 +3815,11 @@ impl UiWgpuRenderer {
             .iter()
             .map(|(node_key, active)| {
                 let elapsed_ms = ((time_seconds - active.started_at_seconds) * 1000.0).max(0.0);
+                let status = if transition_finished(active, time_seconds) {
+                    UiAnimationStatus::Completed
+                } else {
+                    UiAnimationStatus::Running
+                };
                 json!({
                     "node_key": node_key,
                     "motion_key": active.transition.motion_key,
@@ -3632,6 +3830,7 @@ impl UiWgpuRenderer {
                     "progress": ((elapsed_ms - active.transition.delay_ms as f32)
                         / active.transition.duration_ms as f32)
                         .clamp(0.0, 1.0),
+                    "status": format!("{status:?}"),
                     "target": {
                         "bounds": {
                             "x": active.target.bounds.x,
@@ -3652,7 +3851,19 @@ impl UiWgpuRenderer {
             .collect::<Vec<_>>();
         transitions
             .sort_by(|left, right| left["node_key"].as_str().cmp(&right["node_key"].as_str()));
-        json!({ "count": transitions.len(), "transitions": transitions })
+        let history = self
+            .animation_history
+            .iter()
+            .map(|animation| {
+                json!({
+                    "node_key": animation.node_path,
+                    "status": format!("{:?}", animation.status),
+                    "motion_key": animation.spec.motion_key,
+                    "started_at_seconds": animation.started_at_seconds,
+                })
+            })
+            .collect::<Vec<_>>();
+        json!({ "count": transitions.len(), "transitions": transitions, "history": history })
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -3688,6 +3899,7 @@ impl UiWgpuRenderer {
                 content.asset.revision.0,
             ),
             ResidentImage {
+                slot: 0,
                 width,
                 height,
                 bytes: content.bytes.clone(),
@@ -3698,10 +3910,71 @@ impl UiWgpuRenderer {
         Ok(())
     }
 
+    /// Uploads an external-engine image into the same renderer-owned atlas as
+    /// project images. The source is not interpreted as an AssetRef.
+    pub(crate) fn preload_external_image(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        source: &UiImageSource,
+    ) -> Result<UiImageTextureRef, &'static str> {
+        let Some(byte_len) = (source.width as usize)
+            .checked_mul(source.height as usize)
+            .and_then(|pixels| pixels.checked_mul(4))
+        else {
+            return Err("invalid_image_bytes");
+        };
+        if source.image_id.trim().is_empty()
+            || source.media_type != "application/x-neon-rgba8"
+            || source.width == 0
+            || source.height == 0
+            || source.width > IMAGE_ATLAS_WIDTH - IMAGE_ATLAS_PADDING * 2
+            || source.bytes.len() != byte_len
+        {
+            return Err("invalid_image_source");
+        }
+        self.external_images.insert(
+            source.image_id.clone(),
+            ResidentImage {
+                slot: 0,
+                width: source.width,
+                height: source.height,
+                bytes: source.bytes.clone(),
+                uv: [0.0; 4],
+            },
+        );
+        self.rebuild_image_atlas(device, queue);
+        let image = self
+            .external_images
+            .get(&source.image_id)
+            .expect("external image was inserted");
+        let atlas_size = self.image_atlas_size().unwrap_or([IMAGE_ATLAS_WIDTH, 1]);
+        let region = UiImageTextureRegion {
+            x: (image.uv[0] * atlas_size[0] as f32 - 0.5).max(0.0) as u32,
+            y: (image.uv[1] * atlas_size[1] as f32 - 0.5).max(0.0) as u32,
+            width: image.width,
+            height: image.height,
+        };
+        Ok(UiImageTextureRef {
+            image_id: source.image_id.clone(),
+            texture_index: image.slot,
+            generation: self.image_atlas_generation,
+            atlas_size,
+            region,
+            uv: image.uv,
+        })
+    }
+
     fn rebuild_image_atlas(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
         let mut keys = self.resident_images.keys().cloned().collect::<Vec<_>>();
         keys.sort();
-        let mut placements = Vec::with_capacity(keys.len());
+        let mut external_keys = self.external_images.keys().cloned().collect::<Vec<_>>();
+        external_keys.sort();
+        enum ImagePlacement {
+            Project((String, u64, u64)),
+            External(String),
+        }
+        let mut placements = Vec::with_capacity(keys.len() + external_keys.len());
         let mut x = IMAGE_ATLAS_PADDING;
         let mut y = IMAGE_ATLAS_PADDING;
         let mut row_height = 0;
@@ -3712,11 +3985,23 @@ impl UiWgpuRenderer {
                 y += row_height + IMAGE_ATLAS_PADDING;
                 row_height = 0;
             }
-            placements.push((key.clone(), x, y));
+            placements.push((ImagePlacement::Project(key.clone()), x, y));
+            x += image.width + IMAGE_ATLAS_PADDING;
+            row_height = row_height.max(image.height);
+        }
+        for key in &external_keys {
+            let image = &self.external_images[key];
+            if x + image.width + IMAGE_ATLAS_PADDING > IMAGE_ATLAS_WIDTH {
+                x = IMAGE_ATLAS_PADDING;
+                y += row_height + IMAGE_ATLAS_PADDING;
+                row_height = 0;
+            }
+            placements.push((ImagePlacement::External(key.clone()), x, y));
             x += image.width + IMAGE_ATLAS_PADDING;
             row_height = row_height.max(image.height);
         }
         let atlas_height = (y + row_height + IMAGE_ATLAS_PADDING).max(1);
+        self.image_atlas_generation = self.image_atlas_generation.saturating_add(1).max(1);
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("neon3-ui-image-atlas"),
             size: wgpu::Extent3d {
@@ -3731,11 +4016,17 @@ impl UiWgpuRenderer {
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
-        for (key, x, y) in placements {
-            let image = self
-                .resident_images
-                .get_mut(&key)
-                .expect("image placement has a resident image");
+        for (placement, x, y) in placements {
+            let image = match &placement {
+                ImagePlacement::Project(key) => self
+                    .resident_images
+                    .get_mut(key)
+                    .expect("image placement has a resident image"),
+                ImagePlacement::External(key) => self
+                    .external_images
+                    .get_mut(key)
+                    .expect("external image placement has a resident image"),
+            };
             queue.write_texture(
                 wgpu::TexelCopyTextureInfo {
                     texture: &texture,
@@ -3761,6 +4052,25 @@ impl UiWgpuRenderer {
                 (image.width as f32 - 1.0) / IMAGE_ATLAS_WIDTH as f32,
                 (image.height as f32 - 1.0) / atlas_height as f32,
             ];
+        }
+        for (slot, placement) in keys
+            .into_iter()
+            .map(ImagePlacement::Project)
+            .chain(external_keys.into_iter().map(ImagePlacement::External))
+            .enumerate()
+        {
+            match placement {
+                ImagePlacement::Project(key) => {
+                    if let Some(image) = self.resident_images.get_mut(&key) {
+                        image.slot = slot as u32;
+                    }
+                }
+                ImagePlacement::External(key) => {
+                    if let Some(image) = self.external_images.get_mut(&key) {
+                        image.slot = slot as u32;
+                    }
+                }
+            }
         }
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -3788,7 +4098,12 @@ impl UiWgpuRenderer {
             _view: view,
             _sampler: sampler,
             bind_group,
+            size: [IMAGE_ATLAS_WIDTH, atlas_height],
         });
+    }
+
+    fn image_atlas_size(&self) -> Option<[u32; 2]> {
+        self.image_atlas.as_ref().map(|atlas| atlas.size)
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -3970,8 +4285,10 @@ impl UiWgpuRenderer {
         let view = atlas.create_view(&wgpu::TextureViewDescriptor::default());
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("neon3-ui-font-atlas-sampler"),
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
+            // Keep glyph edges crisp at authored logical sizes. Text layout
+            // remains unchanged; only atlas sampling becomes less blurry.
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
             ..Default::default()
         });
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -4169,16 +4486,21 @@ impl UiWgpuRenderer {
             self.uploaded_instances.clone_from(&self.instances);
             buffer_upload_ms += stage.elapsed().as_secs_f32() * 1000.0;
         }
-        let images = self
-            .sampled
-            .iter()
-            .filter_map(|visual| {
+        let mut images = Vec::new();
+        let mut popup_images = Vec::new();
+        for (index, visual) in self.sampled.iter().enumerate() {
+            let image = (|| {
                 if !sampled_in_mode(visual, mode) {
                     return None;
                 }
                 let asset = visual.image.as_ref()?;
-                let key = (asset.project_id.clone(), asset.asset_id, asset.revision.0);
-                self.resident_images.get(&key).map(|image| UiImageInstance {
+                let image = if let Some(resource_key) = asset.project_id.strip_prefix("external:") {
+                    self.external_images.get(resource_key)
+                } else {
+                    let key = (asset.project_id.clone(), asset.asset_id, asset.revision.0);
+                    self.resident_images.get(&key)
+                }?;
+                Some(UiImageInstance {
                     rect: [
                         visual.bounds.x,
                         visual.bounds.y,
@@ -4194,25 +4516,30 @@ impl UiWgpuRenderer {
                     ],
                     uv: image.uv,
                     depth: color_pass_depth(visual.world_depth),
-                    paint_group_id: self
-                        .plan
-                        .iter()
-                        .zip(self.sampled.iter())
-                        .position(|(_, candidate)| std::ptr::eq(candidate, visual))
-                        .map(|index| self.plan[index].paint_group_id)
-                        .unwrap_or(0),
+                    paint_group_id: self.plan[index].paint_group_id,
                 })
-            })
-            .collect::<Vec<_>>();
-        if !images.is_empty() {
-            if images.len() > self.image_capacity {
-                self.image_capacity = images.len().next_power_of_two();
-                self.image_buffer = create_image_buffer(device, self.image_capacity);
+            })();
+            let Some(image) = image else {
+                continue;
+            };
+            // Modal, dialog, and tooltip panels are emitted in the popup pass
+            // after the ordinary image batch. Their images must follow their
+            // own opaque panel rectangles, or those rectangles cover them.
+            if top_layer[index].is_some() {
+                popup_images.push(image);
+            } else {
+                images.push(image);
             }
-            let stage = Instant::now();
-            queue.write_buffer(&self.image_buffer, 0, bytemuck::cast_slice(&images));
-            buffer_upload_ms += stage.elapsed().as_secs_f32() * 1000.0;
         }
+        let image_capacity = images.len().max(popup_images.len());
+        if image_capacity > self.image_capacity {
+                self.image_capacity = image_capacity.next_power_of_two();
+                self.image_buffer = create_image_buffer(device, self.image_capacity);
+        }
+        // Do not upload `images` here. The sorted `ordered_images` payload below
+        // is the only image batch consumed by the render pass; uploading this
+        // unsorted vector first duplicated every image buffer write once per
+        // frame, which became expensive as soon as image UI was present.
         let surfaces = self
             .sampled
             .iter()
@@ -4323,11 +4650,15 @@ impl UiWgpuRenderer {
                         let horizontal_scroll = (visual.kind == UiNodeKind::TextInput
                             && local_text.is_some())
                         .then_some(self.editing.horizontal_scroll);
+                        let logical = visual.logical_bounds;
                         let cache_key = format!(
-                            "{node_path}:{text}:{}:{:?}:{:?}:{:?}:{:?}",
+                            "{node_path}:{text}:{}:{:?}:{:?}:{:?}:{:?}:{:?}:{:?}:{:?}",
                             self.atlas_generation,
-                            visual.logical_bounds,
-                            visual.logical_bounds.clip,
+                            logical.width,
+                            logical.height,
+                            logical.content_width,
+                            logical.content_height,
+                            logical.clip.map(|clip| [clip.width, clip.height]),
                             visual.world_scale,
                             horizontal_scroll,
                         );
@@ -4354,20 +4685,19 @@ impl UiWgpuRenderer {
                             }
                             return instances.into();
                         }
-                        let instances = layout_text(
-                            device,
-                            queue,
-                            font,
-                            visual,
-                            text,
-                            horizontal_scroll,
-                        );
+                        let instances =
+                            layout_text(device, queue, font, visual, text, horizontal_scroll);
                         if let Some(instances) = instances {
+                            self.layout_counters.text_layout_count =
+                                self.layout_counters.text_layout_count.saturating_add(1);
                             if !scroll_dynamic[index] {
-                                self.text_layout_cache.insert(cache_key, CachedTextLayout {
-                                    text_instances: instances.clone(),
-                                    visual_origin: [visual.bounds.x, visual.bounds.y],
-                                });
+                                self.text_layout_cache.insert(
+                                    cache_key,
+                                    CachedTextLayout {
+                                        text_instances: instances.clone(),
+                                        visual_origin: [visual.bounds.x, visual.bounds.y],
+                                    },
+                                );
                             }
                             Some(instances)
                         } else {
@@ -4655,6 +4985,22 @@ impl UiWgpuRenderer {
             pass.set_vertex_buffer(0, self.popup_instance_buffer.slice(..));
             pass.draw(0..6, 0..popup_instances.len() as u32);
         }
+        if !popup_images.is_empty() {
+            queue.write_buffer(&self.image_buffer, 0, bytemuck::cast_slice(&popup_images));
+            pass.set_pipeline(&self.image_pipeline);
+            pass.set_bind_group(0, &self.view_bind_group, &[]);
+            pass.set_bind_group(
+                1,
+                &self
+                    .image_atlas
+                    .as_ref()
+                    .expect("resident image atlas")
+                    .bind_group,
+                &[],
+            );
+            pass.set_vertex_buffer(0, self.image_buffer.slice(..));
+            pass.draw(0..6, 0..popup_images.len() as u32);
+        }
         if !popup_texts.is_empty() {
             queue.write_buffer(
                 &self.popup_text_buffer,
@@ -4681,6 +5027,14 @@ impl UiWgpuRenderer {
         self.last_stage_timings
     }
 
+    pub(crate) fn layout_counters(&self) -> Value {
+        json!({
+            "layout_count": self.layout_counters.layout_count,
+            "text_layout_count": self.layout_counters.text_layout_count,
+            "world_transform_update_count": self.layout_counters.world_transform_update_count,
+        })
+    }
+
     pub(crate) fn last_panel_instance_count(&self) -> usize {
         self.last_panel_instance_count
     }
@@ -4695,6 +5049,15 @@ impl UiWgpuRenderer {
         // the text positions may have shifted, so clear the cache to force
         // re-layout on the next frame (plan §7.3).
         self.text_layout_cache.clear();
+    }
+
+    /// World anchor projection changes only the translated/scaled final visual.
+    /// Preserve glyph layouts whose cache key is based on logical dimensions,
+    /// then translate their instances to the current projected origin at draw
+    /// time. A fragment revision or viewport change still uses `invalidate_plan`
+    /// and clears the cache.
+    pub(crate) fn invalidate_plan_for_world_transform(&mut self) {
+        self.plan_revisions.clear();
     }
 
     fn update_viewport(&mut self, physical_size: [u32; 2], logical_size: [f32; 2]) -> bool {
@@ -4716,7 +5079,11 @@ impl UiWgpuRenderer {
     /// separate from the 2D painter order used by the color pass. Text glyphs do
     /// not write independent sparse depth: their occlusion belongs to the owning
     /// panel surface, so a far panel's text cannot survive over a nearer panel.
-    pub(crate) fn draw_depth<'a>(&'a mut self, queue: &wgpu::Queue, pass: &mut wgpu::RenderPass<'a>) {
+    pub(crate) fn draw_depth<'a>(
+        &'a mut self,
+        queue: &wgpu::Queue,
+        pass: &mut wgpu::RenderPass<'a>,
+    ) {
         let Some(rect_pipeline) = &self.depth_pipeline else {
             return;
         };
@@ -4820,6 +5187,7 @@ impl UiWgpuRenderer {
         if matches && !data_grid_hold_changed {
             return false;
         }
+        self.layout_counters.layout_count = self.layout_counters.layout_count.saturating_add(1);
         let display_fragments = self.data_grid_display_fragments(fragments);
         self.reconcile_data_grid_text_display_cache(&display_fragments);
         let nodes = flatten_fragments_with_data_grid_display_cache(
@@ -5299,6 +5667,39 @@ impl UiWgpuRenderer {
             .collect()
     }
 
+    fn sample_with_history(
+        &mut self,
+        id: &str,
+        target: &UiVisual,
+        transition: Option<&UiTransition>,
+        time_seconds: f32,
+    ) -> UiVisual {
+        let superseded = self.active.get(id).cloned();
+        let sampled = Self::sample(
+            &mut self.current,
+            &mut self.active,
+            id,
+            target,
+            transition,
+            time_seconds,
+        );
+        if let Some(previous) = superseded
+            && transition.is_some()
+            && previous.target != *target
+        {
+            self.animation_history
+                .push_back(animation_instance_from_active(
+                    id,
+                    &previous,
+                    UiAnimationStatus::Superseded,
+                ));
+            while self.animation_history.len() > 64 {
+                self.animation_history.pop_front();
+            }
+        }
+        sampled
+    }
+
     fn sample(
         current: &mut HashMap<String, UiVisual>,
         active: &mut HashMap<String, ActiveTransition>,
@@ -5421,62 +5822,43 @@ impl UiWgpuRenderer {
     fn instance(&self, visual: &UiVisual, node_path: &str, time_seconds: f32) -> UiInstance {
         let mut visual = visual.clone();
         if let Some(UiSemanticPayloadValue::Bool { value }) = self.value_previews.get(node_path)
-            && matches!(visual.kind, UiNodeKind::Checkbox | UiNodeKind::RadioButton | UiNodeKind::Selectable)
+            && matches!(
+                visual.kind,
+                UiNodeKind::Checkbox | UiNodeKind::RadioButton | UiNodeKind::Selectable
+            )
         {
             visual.presentation = Some(UiControlPresentation::Toggle { selected: *value });
         }
-        let mut style = if visual.style == UiStyle::default() {
-            default_component_style(&visual.kind)
-        } else {
-            visual.style
-        };
-        if matches!(visual.kind, UiNodeKind::Checkbox | UiNodeKind::RadioButton)
-            && let Some(UiControlPresentation::Toggle { selected }) = &visual.presentation
-        {
-            style = if *selected {
-                UiStyle {
-                    background_color: [0.10, 0.25, 0.20, 1.0],
-                    border_color: [0.34, 0.80, 0.64, 0.95],
-                    border_width: 1.0,
-                    corner_radius: 5.0,
-                    opacity: style.opacity,
-                }
-            } else {
-                UiStyle {
-                    background_color: [0.17, 0.18, 0.20, 1.0],
-                    border_color: [0.39, 0.41, 0.45, 0.96],
-                    border_width: 1.0,
-                    corner_radius: 5.0,
-                    opacity: style.opacity,
-                }
-            };
-        }
-        let mut fill = style.background_color;
         let mut bounds = visual.bounds;
         let pointer_over = self
             .pointer_position
             .is_some_and(|position| contains(bounds, position));
-        if is_interactive_control(&visual.kind) && pointer_over {
-            let factor = if time_seconds < self.pressed_until_seconds {
-                1.28
-            } else {
-                1.14
-            };
-            fill[0] = (fill[0] * factor).min(1.0);
-            fill[1] = (fill[1] * factor).min(1.0);
-            fill[2] = (fill[2] * factor).min(1.0);
-        }
+        let selected = matches!(
+            &visual.presentation,
+            Some(UiControlPresentation::Toggle { selected: true })
+                | Some(UiControlPresentation::Choice { selected: true, .. })
+        );
+        let style = resolve_component_style(
+            &visual.kind,
+            visual.style,
+            visual.presentation.as_ref(),
+            UiStateFlags {
+                hovered: pointer_over,
+                pressed: pointer_over && time_seconds < self.pressed_until_seconds,
+                focused: self.focused_control.as_deref() == Some(node_path),
+                disabled: !visual.enabled,
+                selected,
+                checked: selected,
+                open: self.open_dropdown.as_deref() == Some(node_path),
+            },
+        );
+        let fill = style.background_color;
         if visual.kind == UiNodeKind::Button
             && pointer_over
             && time_seconds < self.pressed_until_seconds
         {
             bounds.y += 1.0;
             bounds.height = (bounds.height - 1.0).max(0.0);
-        }
-        if self.focused_control.as_deref() == Some(node_path) {
-            fill[0] = (fill[0] * 1.08).min(1.0);
-            fill[1] = (fill[1] * 1.08).min(1.0);
-            fill[2] = (fill[2] * 1.08).min(1.0);
         }
         // A child without its own transition follows its parent's GPU motion
         // through `from_rect`. Its final clip is otherwise too narrow to
@@ -5580,10 +5962,12 @@ impl UiWgpuRenderer {
     }
 
     fn parent_transition_offset(&self, node_path: &str) -> Option<[f32; 2]> {
-        self.find_parent_transition(node_path).map(|(_, active)| [
-            active.from.bounds.x - active.target.bounds.x,
-            active.from.bounds.y - active.target.bounds.y,
-        ])
+        self.find_parent_transition(node_path).map(|(_, active)| {
+            [
+                active.from.bounds.x - active.target.bounds.x,
+                active.from.bounds.y - active.target.bounds.y,
+            ]
+        })
     }
 
     fn component_chrome_instances(&self, visual: &UiVisual, node_path: &str) -> Vec<UiInstance> {
@@ -5617,6 +6001,28 @@ impl UiWgpuRenderer {
                 _ => preview.presentation,
             };
         }
+        let pointer_over = self
+            .pointer_position
+            .is_some_and(|position| contains(preview.bounds, position));
+        let selected = matches!(
+            &preview.presentation,
+            Some(UiControlPresentation::Toggle { selected: true })
+                | Some(UiControlPresentation::Choice { selected: true, .. })
+        );
+        preview.style = resolve_component_style(
+            &preview.kind,
+            preview.style,
+            preview.presentation.as_ref(),
+            UiStateFlags {
+                hovered: pointer_over,
+                pressed: pointer_over && self.pressed_until_seconds > 0.0,
+                focused: self.focused_control.as_deref() == Some(node_path),
+                disabled: !preview.enabled,
+                selected,
+                checked: selected,
+                open: self.open_dropdown.as_deref() == Some(node_path),
+            },
+        );
         let mut instances = component_chrome_instances(&preview);
         if preview.kind == UiNodeKind::Tabs
             && preview.enabled
@@ -5982,6 +6388,269 @@ fn numeric_fraction(value: f32, minimum: f32, maximum: f32) -> f32 {
         ((value - minimum) / (maximum - minimum)).clamp(0.0, 1.0)
     } else {
         0.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct UiComponentMetrics {
+    min_width: f32,
+    min_height: f32,
+    horizontal_padding: f32,
+    text_inset: f32,
+    control_glyph_width: f32,
+    control_glyph_gap: f32,
+    track_height: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct UiComponentCapabilities {
+    has_text: bool,
+    interactive: bool,
+    numeric: bool,
+    choice: bool,
+    toggle: bool,
+    popup: bool,
+    scroll: bool,
+    top_layer: bool,
+    virtualized: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct UiComponentSpec {
+    metrics: UiComponentMetrics,
+    capabilities: UiComponentCapabilities,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct UiStateFlags {
+    hovered: bool,
+    pressed: bool,
+    focused: bool,
+    disabled: bool,
+    selected: bool,
+    checked: bool,
+    open: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct UiStylePatch {
+    background_color: Option<[f32; 4]>,
+    border_color: Option<[f32; 4]>,
+    border_width: Option<f32>,
+    corner_radius: Option<f32>,
+    opacity: Option<f32>,
+}
+
+impl From<SchemaStylePatch> for UiStylePatch {
+    fn from(value: SchemaStylePatch) -> Self {
+        Self {
+            background_color: value.background_color,
+            border_color: value.border_color,
+            border_width: value.border_width,
+            corner_radius: value.corner_radius,
+            opacity: value.opacity,
+        }
+    }
+}
+
+fn apply_style_patch(mut style: UiStyle, patch: UiStylePatch) -> UiStyle {
+    if let Some(value) = patch.background_color {
+        style.background_color = value;
+    }
+    if let Some(value) = patch.border_color {
+        style.border_color = value;
+    }
+    if let Some(value) = patch.border_width {
+        style.border_width = value;
+    }
+    if let Some(value) = patch.corner_radius {
+        style.corner_radius = value;
+    }
+    if let Some(value) = patch.opacity {
+        style.opacity = value;
+    }
+    style
+}
+
+fn resolve_component_style(
+    kind: &UiNodeKind,
+    authored: UiStyle,
+    presentation: Option<&UiControlPresentation>,
+    flags: UiStateFlags,
+) -> UiStyle {
+    let mut style = if authored == UiStyle::default() {
+        default_component_style(kind)
+    } else {
+        authored
+    };
+    let selected = flags.selected || flags.checked;
+    if selected {
+        style = apply_style_patch(
+            style,
+            UiStylePatch {
+                border_color: Some([0.34, 0.80, 0.64, 0.95]),
+                ..UiStylePatch::default()
+            },
+        );
+    }
+    if flags.focused {
+        style = apply_style_patch(
+            style,
+            UiStylePatch {
+                border_color: Some([0.72, 0.92, 1.0, 1.0]),
+                border_width: Some(style.border_width.max(1.0)),
+                ..UiStylePatch::default()
+            },
+        );
+    }
+    if flags.hovered {
+        style.background_color = [
+            (style.background_color[0] * 1.14).min(1.0),
+            (style.background_color[1] * 1.14).min(1.0),
+            (style.background_color[2] * 1.14).min(1.0),
+            style.background_color[3],
+        ];
+    }
+    if flags.pressed {
+        style.background_color = [
+            style.background_color[0] * 0.88,
+            style.background_color[1] * 0.88,
+            style.background_color[2] * 0.88,
+            style.background_color[3],
+        ];
+    }
+    if flags.disabled {
+        style = apply_style_patch(
+            style,
+            UiStylePatch {
+                background_color: Some([
+                    style.background_color[0] * 0.62,
+                    style.background_color[1] * 0.62,
+                    style.background_color[2] * 0.62,
+                    style.background_color[3],
+                ]),
+                border_color: Some([
+                    style.border_color[0] * 0.62,
+                    style.border_color[1] * 0.62,
+                    style.border_color[2] * 0.62,
+                    style.border_color[3],
+                ]),
+                opacity: Some(style.opacity * 0.58),
+                ..UiStylePatch::default()
+            },
+        );
+    }
+    let _ = (kind, presentation, flags.open);
+    style
+}
+
+fn component_spec(kind: &UiNodeKind) -> UiComponentSpec {
+    let text = matches!(
+        kind,
+        UiNodeKind::Label
+            | UiNodeKind::Button
+            | UiNodeKind::TextInput
+            | UiNodeKind::Checkbox
+            | UiNodeKind::RadioButton
+            | UiNodeKind::Slider
+            | UiNodeKind::DragValue
+            | UiNodeKind::Combo
+            | UiNodeKind::Dropdown
+            | UiNodeKind::Tabs
+            | UiNodeKind::Tooltip
+            | UiNodeKind::Modal
+            | UiNodeKind::Dialog
+            | UiNodeKind::Selectable
+            | UiNodeKind::ListBox
+            | UiNodeKind::Scrollbar
+            | UiNodeKind::ProgressBar
+    );
+    let interactive = matches!(
+        kind,
+        UiNodeKind::Button
+            | UiNodeKind::TextInput
+            | UiNodeKind::Checkbox
+            | UiNodeKind::RadioButton
+            | UiNodeKind::Slider
+            | UiNodeKind::DragValue
+            | UiNodeKind::Combo
+            | UiNodeKind::Dropdown
+            | UiNodeKind::Tabs
+            | UiNodeKind::Selectable
+            | UiNodeKind::ListBox
+            | UiNodeKind::Scrollbar
+    );
+    let metrics = UiComponentMetrics {
+        min_width: 0.0,
+        min_height: match kind {
+            UiNodeKind::Button
+            | UiNodeKind::Checkbox
+            | UiNodeKind::RadioButton
+            | UiNodeKind::Slider
+            | UiNodeKind::DragValue
+            | UiNodeKind::Selectable => 30.0,
+            UiNodeKind::TextInput | UiNodeKind::Combo | UiNodeKind::Dropdown | UiNodeKind::Tabs => {
+                32.0
+            }
+            UiNodeKind::ListBox => 90.0,
+            UiNodeKind::Scrollbar => 20.0,
+            UiNodeKind::ProgressBar => 24.0,
+            _ => 0.0,
+        },
+        horizontal_padding: match kind {
+            UiNodeKind::Button => 10.0,
+            UiNodeKind::TextInput => 6.0,
+            _ => 8.0,
+        },
+        text_inset: if *kind == UiNodeKind::TextInput {
+            TEXT_INPUT_INSET * 2.0
+        } else {
+            8.0
+        },
+        control_glyph_width: matches!(
+            kind,
+            UiNodeKind::Checkbox | UiNodeKind::RadioButton | UiNodeKind::Selectable
+        )
+        .then_some(18.0)
+        .unwrap_or(0.0),
+        control_glyph_gap: 8.0,
+        track_height: match kind {
+            UiNodeKind::Slider | UiNodeKind::Scrollbar => 4.0,
+            UiNodeKind::ProgressBar => 24.0,
+            _ => 0.0,
+        },
+    };
+    UiComponentSpec {
+        metrics,
+        capabilities: UiComponentCapabilities {
+            has_text: text,
+            interactive,
+            numeric: matches!(
+                kind,
+                UiNodeKind::Slider
+                    | UiNodeKind::DragValue
+                    | UiNodeKind::ProgressBar
+                    | UiNodeKind::Scrollbar
+            ),
+            choice: matches!(
+                kind,
+                UiNodeKind::Combo | UiNodeKind::Dropdown | UiNodeKind::Tabs | UiNodeKind::ListBox
+            ),
+            toggle: matches!(
+                kind,
+                UiNodeKind::Checkbox | UiNodeKind::RadioButton | UiNodeKind::Selectable
+            ),
+            popup: matches!(kind, UiNodeKind::Combo | UiNodeKind::Dropdown),
+            scroll: matches!(
+                kind,
+                UiNodeKind::ListBox | UiNodeKind::Scrollbar | UiNodeKind::DataGrid
+            ),
+            top_layer: matches!(
+                kind,
+                UiNodeKind::Tooltip | UiNodeKind::Modal | UiNodeKind::Dialog
+            ),
+            virtualized: *kind == UiNodeKind::DataGrid,
+        },
     }
 }
 
@@ -6873,7 +7542,8 @@ fn layout_text(
     // logical safe inset is subtracted once; a WorldUi scale must not turn
     // the 8px inset into a different effective inset, and camera distance
     // cannot change how many glyphs fit on a line.
-    let wrap_width = (visual.logical_bounds.width.max(1.0) - text_safe_inset(&visual.kind)).max(1.0);
+    let wrap_width =
+        (visual.logical_bounds.width.max(1.0) - text_safe_inset(&visual.kind)).max(1.0);
     let advance = |ch: char| {
         // Use atlas glyph advance (cached) so line-breaking is identical to
         // what intrinsic_size would compute.
@@ -6931,11 +7601,7 @@ fn layout_text(
 /// Logical horizontal safe inset applied to text measurement and drawing.
 /// The same value must be used for intrinsic measurement and actual layout.
 fn text_safe_inset(kind: &UiNodeKind) -> f32 {
-    if *kind == UiNodeKind::TextInput {
-        TEXT_INPUT_INSET * 2.0
-    } else {
-        8.0
-    }
+    component_spec(kind).metrics.text_inset
 }
 
 fn text_advance(font: &fontdue::Font, value: &str, char_count: usize) -> f32 {
@@ -7038,6 +7704,16 @@ fn flatten_fragments_with_data_grid_display_cache(
                 _ => None,
             })
             .collect::<HashSet<_>>();
+        let external_image_bindings = fragment
+            .effects
+            .iter()
+            .filter_map(|effect| match effect {
+                neon_ui_schema::UiEffect::ImageBinding { node_id, image_id } => {
+                    Some((node_id.0.clone(), image_id.clone()))
+                }
+                _ => None,
+            })
+            .collect::<HashMap<_, _>>();
         let mut root = fragment.root.clone();
         // Ordinary fragment roots remain viewport-sized for compatibility with
         // surface composition. A root with an authored entry transition must
@@ -7073,6 +7749,7 @@ fn flatten_fragments_with_data_grid_display_cache(
             root_uses_viewport.then_some(viewport_logical_size),
             false,
             &hidden_world_nodes,
+            &external_image_bindings,
             None,
             None,
             None,
@@ -7290,7 +7967,8 @@ fn append_data_grid_frames(
                 presentation: None,
                 scroll: false,
                 declared_scroll_offset: [0.0; 2],
-                world_depth: None, world_scale: None,
+                world_depth: None,
+                world_scale: None,
                 paint_group_id: 0,
             };
             let mut sticky_header = vec![(
@@ -7375,7 +8053,8 @@ fn append_data_grid_frames(
                     presentation: None,
                     scroll: false,
                     declared_scroll_offset: [0.0; 2],
-                    world_depth: None, world_scale: None,
+                    world_depth: None,
+                    world_scale: None,
                     paint_group_id: grid.paint_group_id,
                 };
                 let row_path = format!("{grid_path}/data-grid-row-{}", row.stable_row_key);
@@ -7696,11 +8375,7 @@ fn collect_node_paths(fragment_id: &str, root: &UiNode) -> HashMap<String, Strin
     paths
 }
 
-fn scale_world_bounds(
-    bounds: UiBounds,
-    scale: Option<f32>,
-    origin: Option<[f32; 2]>,
-) -> UiBounds {
+fn scale_world_bounds(bounds: UiBounds, scale: Option<f32>, origin: Option<[f32; 2]>) -> UiBounds {
     let (Some(scale), Some(origin)) = (scale, origin) else {
         return bounds;
     };
@@ -7724,6 +8399,7 @@ fn flatten_node(
     assigned_size: Option<[f32; 2]>,
     inherited_top_layer: bool,
     hidden_world_nodes: &HashSet<&str>,
+    external_image_bindings: &HashMap<String, String>,
     inherited_depth: Option<f32>,
     inherited_scale: Option<f32>,
     inherited_world_origin: Option<[f32; 2]>,
@@ -7742,9 +8418,8 @@ fn flatten_node(
         ),
     };
     let world_scale = node.world_scale.or(inherited_scale);
-    let world_origin = inherited_world_origin.or_else(|| {
-        world_scale.map(|_| [bounds.x + bounds.width * 0.5, bounds.y + bounds.height])
-    });
+    let world_origin = inherited_world_origin
+        .or_else(|| world_scale.map(|_| [bounds.x + bounds.width * 0.5, bounds.y + bounds.height]));
     // Keep layout-space bounds untouched. World scale is applied once to the
     // final visual below; children continue to resolve against the stable
     // logical subtree, never against a previously scaled parent.
@@ -7791,7 +8466,8 @@ fn flatten_node(
             height: bounds.height,
             content_x: bounds.x + node_layout.padding[3],
             content_y: bounds.y + node_layout.padding[0],
-            content_width: (bounds.width - node_layout.padding[1] - node_layout.padding[3]).max(0.0),
+            content_width: (bounds.width - node_layout.padding[1] - node_layout.padding[3])
+                .max(0.0),
             content_height: (bounds.height - node_layout.padding[0] - node_layout.padding[2])
                 .max(0.0),
             clip: own_clip,
@@ -7807,7 +8483,15 @@ fn flatten_node(
                 enabled: node.enabled,
                 clip: scale_world_bounds(effective_clip, world_scale, world_origin),
                 clip_radius: own_clip_radius.unwrap_or(0.0),
-                image: node.image.clone(),
+                image: external_image_bindings
+                    .get(&node.node_id.0)
+                    .map(|image_id| AssetRef {
+                        project_id: format!("external:{image_id}"),
+                        asset_id: 0,
+                        revision: neon_protocol::Revision(0),
+                        kind: "image".into(),
+                    })
+                    .or_else(|| node.image.clone()),
                 surface: node.surface.clone(),
                 text: node.text.clone(),
                 presentation: None,
@@ -7855,6 +8539,7 @@ fn flatten_node(
             Some([child_bounds.width, child_bounds.height]),
             top_layer,
             hidden_world_nodes,
+            external_image_bindings,
             node.world_depth.or(inherited_depth),
             world_scale,
             world_origin,
@@ -7876,7 +8561,11 @@ fn resolved_dimension(
     // are translated during composition; expanding the container here would
     // collapse max_offset to zero and make the whole scroll panel grow with
     // its content.
-    if node.layout.is_some_and(|value| value.clip == UiClipPolicy::Scroll) && declared > 0.0 {
+    if node
+        .layout
+        .is_some_and(|value| value.clip == UiClipPolicy::Scroll)
+        && declared > 0.0
+    {
         return clamp_dimension(declared, layout, height);
     }
     // §4.1: explicit w/h is a minimum guarantee, not a ceiling. If the
@@ -7966,33 +8655,27 @@ fn intrinsic_size(node: &UiNode, font: Option<&ResidentFont>) -> [f32; 2] {
     let padding_height = layout.padding[0] + layout.padding[2];
     match layout.mode {
         UiLayoutMode::Row => [
-            node.bounds.width.max(children.iter().map(|size| size[0]).sum::<f32>() + gap + padding_width),
-            node.bounds.height.max(children.iter().map(|size| size[1]).fold(0.0, f32::max) + padding_height),
+            node.bounds
+                .width
+                .max(children.iter().map(|size| size[0]).sum::<f32>() + gap + padding_width),
+            node.bounds
+                .height
+                .max(children.iter().map(|size| size[1]).fold(0.0, f32::max) + padding_height),
         ],
         UiLayoutMode::Column => [
-            node.bounds.width.max(children.iter().map(|size| size[0]).fold(0.0, f32::max) + padding_width),
-            node.bounds.height.max(children.iter().map(|size| size[1]).sum::<f32>() + gap + padding_height),
+            node.bounds
+                .width
+                .max(children.iter().map(|size| size[0]).fold(0.0, f32::max) + padding_width),
+            node.bounds
+                .height
+                .max(children.iter().map(|size| size[1]).sum::<f32>() + gap + padding_height),
         ],
         _ => [0.0, 0.0],
     }
 }
 
 fn is_interactive_control(kind: &UiNodeKind) -> bool {
-    matches!(
-        kind,
-        UiNodeKind::Button
-            | UiNodeKind::TextInput
-            | UiNodeKind::Checkbox
-            | UiNodeKind::RadioButton
-            | UiNodeKind::Slider
-            | UiNodeKind::DragValue
-            | UiNodeKind::Combo
-            | UiNodeKind::Dropdown
-            | UiNodeKind::Tabs
-            | UiNodeKind::Selectable
-            | UiNodeKind::ListBox
-            | UiNodeKind::Scrollbar
-    )
+    component_spec(kind).capabilities.interactive
 }
 
 fn resolve_children(
@@ -8262,7 +8945,8 @@ fn transition_source(target: &UiVisual, transition: &UiTransition) -> UiVisual {
 fn from_bounds_clip(from: Option<UiBounds>, target: &UiVisual) -> Option<UiBounds> {
     // Logical clip follows the animated bounds box while keeping the inherited
     // projection clip unchanged.
-    from.map(|_| target.logical_bounds.clip.unwrap_or(target.clip)).or(target.logical_bounds.clip)
+    from.map(|_| target.logical_bounds.clip.unwrap_or(target.clip))
+        .or(target.logical_bounds.clip)
 }
 
 fn sample_transition(active: &ActiveTransition, time_seconds: f32) -> UiVisual {
@@ -8538,7 +9222,7 @@ mod tests {
     use super::*;
     use neon_protocol::{
         ClientIdentity, ClientKind, ProtocolVersion, RequestId, Revision, RpcRequest, RpcStatus,
-        ServiceName,
+        ServiceName, UiImageSource,
     };
     use neon_ui_runtime::{
         UiRuntime, demo_domain::DemoDragDropDomain, lower_nui_flow_effects, parse_nui_flow,
@@ -8753,7 +9437,8 @@ mod tests {
             presentation: None,
             scroll: false,
             declared_scroll_offset: [0.0; 2],
-            world_depth: None, world_scale: None,
+            world_depth: None,
+            world_scale: None,
             paint_group_id: 0,
         };
         let target_a = UiVisual {
@@ -9020,7 +9705,8 @@ mod tests {
             presentation: None,
             scroll: false,
             declared_scroll_offset: [0.0; 2],
-            world_depth: None, world_scale: None,
+            world_depth: None,
+            world_scale: None,
             paint_group_id: 0,
         };
         let node_path = "grid/assets/data-grid-row-asset-42/cell-name".to_owned();
@@ -9108,7 +9794,8 @@ mod tests {
                 presentation: None,
                 scroll: false,
                 declared_scroll_offset: [0.0; 2],
-                world_depth: None, world_scale: None,
+                world_depth: None,
+                world_scale: None,
                 paint_group_id: 0,
             },
             transition: None,
@@ -9195,7 +9882,8 @@ mod tests {
                 presentation: None,
                 scroll: false,
                 declared_scroll_offset: [0.0; 2],
-                world_depth: None, world_scale: None,
+                world_depth: None,
+                world_scale: None,
                 paint_group_id: 0,
             },
             transition: None,
@@ -9379,7 +10067,8 @@ mod tests {
                 }),
                 scroll: false,
                 declared_scroll_offset: [0.0; 2],
-                world_depth: None, world_scale: None,
+                world_depth: None,
+                world_scale: None,
                 paint_group_id: 0,
             },
             transition: None,
@@ -9467,7 +10156,8 @@ mod tests {
             }),
             scroll: false,
             declared_scroll_offset: [0.0; 2],
-            world_depth: None, world_scale: None,
+            world_depth: None,
+            world_scale: None,
             paint_group_id: 0,
         };
         let mut renderer = UiWgpuRenderer::new(&device, wgpu::TextureFormat::Rgba8Unorm);
@@ -9581,7 +10271,8 @@ mod tests {
             presentation: None,
             scroll: false,
             declared_scroll_offset: [0.0; 2],
-            world_depth: None, world_scale: None,
+            world_depth: None,
+            world_scale: None,
             paint_group_id: 0,
         };
         renderer.plan.push(PlannedNode {
@@ -9624,7 +10315,12 @@ mod tests {
         let mut renderer = UiWgpuRenderer::new(&device, wgpu::TextureFormat::Rgba8Unorm);
         let mut lower = node();
         lower.kind = UiNodeKind::Button;
-        lower.bounds = UiBounds { x: 10.0, y: 10.0, width: 60.0, height: 30.0 };
+        lower.bounds = UiBounds {
+            x: 10.0,
+            y: 10.0,
+            width: 60.0,
+            height: 30.0,
+        };
         lower.enter_transition = None;
         let mut upper = lower.clone();
         upper.node_id = UiNodeId("upper".into());
@@ -9646,7 +10342,10 @@ mod tests {
         renderer.compose_sampled_visuals(0.0);
         renderer.set_pointer_position([30.0, 20.0]);
         assert!(renderer.focus_control_at_pointer());
-        assert_eq!(renderer.focused_control.as_deref(), Some("focus-order/upper"));
+        assert_eq!(
+            renderer.focused_control.as_deref(),
+            Some("focus-order/upper")
+        );
     }
 
     #[test]
@@ -9656,7 +10355,12 @@ mod tests {
         let mut toggle = node();
         toggle.node_id = UiNodeId("feature-toggle".into());
         toggle.kind = UiNodeKind::Checkbox;
-        toggle.bounds = UiBounds { x: 10.0, y: 10.0, width: 80.0, height: 30.0 };
+        toggle.bounds = UiBounds {
+            x: 10.0,
+            y: 10.0,
+            width: 80.0,
+            height: 30.0,
+        };
         toggle.enter_transition = None;
         let mut root = node();
         root.enter_transition = None;
@@ -9675,13 +10379,113 @@ mod tests {
         renderer.refresh_plan(&fragments, [128.0, 96.0]);
         renderer.refresh_hit_bindings(&fragments);
         renderer.compose_sampled_visuals(0.0);
-        let (value, commit) = renderer.finish_toggle_control("toggle-prediction/feature-toggle").unwrap();
+        let (value, commit) = renderer
+            .finish_toggle_control("toggle-prediction/feature-toggle")
+            .unwrap();
         assert_eq!(value, UiSemanticPayloadValue::Bool { value: false });
         assert!(matches!(commit, LocalPresentationCommit::Value { .. }));
         assert!(matches!(
-            renderer.value_previews.get("toggle-prediction/feature-toggle"),
+            renderer
+                .value_previews
+                .get("toggle-prediction/feature-toggle"),
             Some(UiSemanticPayloadValue::Bool { value: false })
         ));
+    }
+
+    #[test]
+    fn component_spec_covers_all_declared_node_kinds_without_duplicate_policy() {
+        let kinds = [
+            UiNodeKind::Panel,
+            UiNodeKind::Label,
+            UiNodeKind::Button,
+            UiNodeKind::Image,
+            UiNodeKind::RenderSurface,
+            UiNodeKind::TextInput,
+            UiNodeKind::Checkbox,
+            UiNodeKind::RadioButton,
+            UiNodeKind::Slider,
+            UiNodeKind::DragValue,
+            UiNodeKind::Combo,
+            UiNodeKind::Dropdown,
+            UiNodeKind::Tabs,
+            UiNodeKind::Tooltip,
+            UiNodeKind::Modal,
+            UiNodeKind::Dialog,
+            UiNodeKind::Selectable,
+            UiNodeKind::ListBox,
+            UiNodeKind::Scrollbar,
+            UiNodeKind::ProgressBar,
+            UiNodeKind::DataGrid,
+        ];
+        for kind in kinds {
+            let spec = component_spec(&kind);
+            assert!(spec.metrics.text_inset >= 0.0);
+            if spec.capabilities.interactive {
+                assert!(is_interactive_control(&kind));
+            }
+            if spec.capabilities.popup {
+                assert!(matches!(kind, UiNodeKind::Combo | UiNodeKind::Dropdown));
+            }
+            if spec.capabilities.top_layer {
+                assert!(matches!(
+                    kind,
+                    UiNodeKind::Tooltip | UiNodeKind::Modal | UiNodeKind::Dialog
+                ));
+            }
+        }
+        assert_eq!(component_spec(&UiNodeKind::Button).metrics.min_height, 30.0);
+        assert_eq!(
+            component_spec(&UiNodeKind::TextInput).metrics.text_inset,
+            TEXT_INPUT_INSET * 2.0
+        );
+        assert_eq!(
+            component_spec(&UiNodeKind::ProgressBar).metrics.min_height,
+            24.0
+        );
+        assert!(
+            component_spec(&UiNodeKind::DataGrid)
+                .capabilities
+                .virtualized
+        );
+    }
+
+    #[test]
+    fn disabled_style_has_priority_over_hover_and_pressed_style() {
+        let normal = default_component_style(&UiNodeKind::Button);
+        let style = resolve_component_style(
+            &UiNodeKind::Button,
+            normal,
+            None,
+            UiStateFlags {
+                hovered: true,
+                pressed: true,
+                disabled: true,
+                ..UiStateFlags::default()
+            },
+        );
+        assert!(style.opacity < normal.opacity);
+        assert!(style.background_color[0] < normal.background_color[0]);
+    }
+
+    #[test]
+    fn selected_and_focus_style_are_resolved_without_changing_layout_metrics() {
+        let normal = default_component_style(&UiNodeKind::Checkbox);
+        let selected = resolve_component_style(
+            &UiNodeKind::Checkbox,
+            normal,
+            Some(&UiControlPresentation::Toggle { selected: true }),
+            UiStateFlags {
+                selected: true,
+                checked: true,
+                focused: true,
+                ..UiStateFlags::default()
+            },
+        );
+        assert_ne!(selected.border_color, normal.border_color);
+        assert_eq!(
+            component_spec(&UiNodeKind::Checkbox).metrics.min_height,
+            30.0
+        );
     }
 
     #[test]
@@ -9711,7 +10515,8 @@ mod tests {
             presentation: None,
             scroll: true,
             declared_scroll_offset: [0.0; 2],
-            world_depth: None, world_scale: None,
+            world_depth: None,
+            world_scale: None,
             paint_group_id: 0,
         };
         let child = UiVisual {
@@ -9799,7 +10604,8 @@ mod tests {
             presentation: None,
             scroll: true,
             declared_scroll_offset: [20.0, 30.0],
-            world_depth: None, world_scale: None,
+            world_depth: None,
+            world_scale: None,
             paint_group_id: 0,
         };
         let child = UiVisual {
@@ -9911,7 +10717,8 @@ mod tests {
                 opacity: 1.0,
             },
             enter_transition: None,
-            world_depth: None, world_scale: None,
+            world_depth: None,
+            world_scale: None,
             children: Vec::new(),
         });
         let pixels = render_offscreen_for_test(
@@ -9991,7 +10798,8 @@ mod tests {
                 style: UiStyle::default(),
                 enter_transition: None,
                 children: Vec::new(),
-                world_depth: None, world_scale: None,
+                world_depth: None,
+                world_scale: None,
             })
             .collect();
         root.children.push(UiNode {
@@ -10012,7 +10820,8 @@ mod tests {
             surface: None,
             style: UiStyle::default(),
             enter_transition: None,
-            world_depth: None, world_scale: None,
+            world_depth: None,
+            world_scale: None,
             children: Vec::new(),
         });
         root.children.push(UiNode {
@@ -10033,7 +10842,8 @@ mod tests {
             surface: None,
             style: UiStyle::default(),
             enter_transition: None,
-            world_depth: None, world_scale: None,
+            world_depth: None,
+            world_scale: None,
             children: Vec::new(),
         });
         let pixels = render_hit_ids_for_test(
@@ -10160,7 +10970,8 @@ mod tests {
                 },
                 enter_transition: None,
                 children: Vec::new(),
-                world_depth: None, world_scale: None,
+                world_depth: None,
+                world_scale: None,
             };
             let fragment = UiFragment {
                 fragment_id: UiFragmentId("f".into()),
@@ -10469,7 +11280,8 @@ mod tests {
                 opacity: 1.0,
             },
             enter_transition: None,
-            world_depth: None, world_scale: None,
+            world_depth: None,
+            world_scale: None,
             children: Vec::new(),
         };
         let cell = |id| neon_ui_schema::UiDataGridCell {
@@ -10650,7 +11462,8 @@ mod tests {
             surface: None,
             style: UiStyle::default(),
             enter_transition: None,
-            world_depth: None, world_scale: None,
+            world_depth: None,
+            world_scale: None,
             children: Vec::new(),
         };
         let cell = |id, presentation_override| neon_ui_schema::UiDataGridCell {
@@ -10813,7 +11626,8 @@ mod tests {
             surface: None,
             style: UiStyle::default(),
             enter_transition: None,
-            world_depth: None, world_scale: None,
+            world_depth: None,
+            world_scale: None,
             children: Vec::new(),
         };
         let declaration = neon_ui_schema::UiDataGridDeclaration {
@@ -10972,7 +11786,8 @@ mod tests {
             surface: None,
             style: UiStyle::default(),
             enter_transition: None,
-            world_depth: None, world_scale: None,
+            world_depth: None,
+            world_scale: None,
             children: Vec::new(),
         };
         let declaration = neon_ui_schema::UiDataGridDeclaration {
@@ -11202,7 +12017,8 @@ mod tests {
             surface: None,
             style: UiStyle::default(),
             enter_transition: None,
-            world_depth: None, world_scale: None,
+            world_depth: None,
+            world_scale: None,
             children: Vec::new(),
         };
         let declaration = neon_ui_schema::UiDataGridDeclaration {
@@ -11429,7 +12245,8 @@ mod tests {
                 motion_key: None,
             }),
             children: Vec::new(),
-            world_depth: None, world_scale: None,
+            world_depth: None,
+            world_scale: None,
         }
     }
 
@@ -11933,7 +12750,8 @@ mod tests {
             surface: None,
             style: UiStyle::default(),
             enter_transition: None,
-            world_depth: None, world_scale: None,
+            world_depth: None,
+            world_scale: None,
             children: Vec::new(),
         });
         let fragments = HashMap::from([(
@@ -12062,7 +12880,8 @@ mod tests {
                 style: UiStyle::default(),
                 enter_transition: None,
                 children: Vec::new(),
-                world_depth: None, world_scale: None,
+                world_depth: None,
+                world_scale: None,
             });
         }
         let fragments = HashMap::from([(
@@ -12224,7 +13043,8 @@ mod tests {
                 ..UiStyle::default()
             },
             enter_transition: None,
-            world_depth: None, world_scale: None,
+            world_depth: None,
+            world_scale: None,
             children: Vec::new(),
         };
         let mut fragment = UiFragment {
@@ -12276,7 +13096,8 @@ mod tests {
                 ..UiStyle::default()
             },
             enter_transition: None,
-            world_depth: None, world_scale: None,
+            world_depth: None,
+            world_scale: None,
             children: Vec::new(),
         };
         let fragments = HashMap::from([(
@@ -13642,7 +14463,8 @@ mod tests {
                 opacity: 1.0,
             },
             enter_transition: None,
-            world_depth: None, world_scale: None,
+            world_depth: None,
+            world_scale: None,
             children: Vec::new(),
         };
         let fragment = UiFragment {
@@ -13700,7 +14522,8 @@ mod tests {
             },
             enter_transition: None,
             children: Vec::new(),
-            world_depth: None, world_scale: None,
+            world_depth: None,
+            world_scale: None,
         };
         let fragment = UiFragment {
             fragment_id: UiFragmentId("bundled-cjk-text".into()),
@@ -13758,7 +14581,8 @@ mod tests {
             },
             enter_transition: None,
             children: Vec::new(),
-            world_depth: None, world_scale: None,
+            world_depth: None,
+            world_scale: None,
         };
         let root = UiNode {
             node_id: UiNodeId("clip-root".into()),
@@ -13788,7 +14612,8 @@ mod tests {
             },
             enter_transition: None,
             children: vec![label],
-            world_depth: None, world_scale: None,
+            world_depth: None,
+            world_scale: None,
         };
         let pixels = render_offscreen_for_test(
             &device,
@@ -13864,7 +14689,8 @@ mod tests {
                 style: UiStyle::default(),
                 enter_transition: None,
                 children: Vec::new(),
-                world_depth: None, world_scale: None,
+                world_depth: None,
+                world_scale: None,
             },
             UiNode {
                 node_id: UiNodeId("second".into()),
@@ -13885,7 +14711,8 @@ mod tests {
                 style: UiStyle::default(),
                 enter_transition: None,
                 children: Vec::new(),
-                world_depth: None, world_scale: None,
+                world_depth: None,
+                world_scale: None,
             },
         ];
         let fragments = HashMap::from([(
@@ -13910,18 +14737,37 @@ mod tests {
         let mut first = node();
         first.node_id = UiNodeId("first-label".into());
         first.kind = UiNodeKind::Label;
-        first.bounds = UiBounds { x: 0.0, y: 0.0, width: 80.0, height: 20.0 };
-        first.text = Some(TextRef::Literal { value: "First".into() });
+        first.bounds = UiBounds {
+            x: 0.0,
+            y: 0.0,
+            width: 80.0,
+            height: 20.0,
+        };
+        first.text = Some(TextRef::Literal {
+            value: "First".into(),
+        });
         first.enter_transition = None;
         let mut second = node();
         second.node_id = UiNodeId("second-label".into());
         second.kind = UiNodeKind::Label;
-        second.bounds = UiBounds { x: 0.0, y: 0.0, width: 80.0, height: 20.0 };
-        second.text = Some(TextRef::Literal { value: "Second".into() });
+        second.bounds = UiBounds {
+            x: 0.0,
+            y: 0.0,
+            width: 80.0,
+            height: 20.0,
+        };
+        second.text = Some(TextRef::Literal {
+            value: "Second".into(),
+        });
         second.enter_transition = None;
         let mut scroll = node();
         scroll.node_id = UiNodeId("scroll-panel".into());
-        scroll.bounds = UiBounds { x: 0.0, y: 0.0, width: 100.0, height: 30.0 };
+        scroll.bounds = UiBounds {
+            x: 0.0,
+            y: 0.0,
+            width: 100.0,
+            height: 30.0,
+        };
         scroll.layout = Some(UiLayout {
             mode: UiLayoutMode::Column,
             gap: 2.0,
@@ -13932,7 +14778,12 @@ mod tests {
         scroll.enter_transition = None;
         let mut root = node();
         root.node_id = UiNodeId("root".into());
-        root.bounds = UiBounds { x: 0.0, y: 0.0, width: 100.0, height: 100.0 };
+        root.bounds = UiBounds {
+            x: 0.0,
+            y: 0.0,
+            width: 100.0,
+            height: 100.0,
+        };
         root.children = vec![scroll];
         root.enter_transition = None;
         let fragment_id = UiFragmentId("scroll-regression".into());
@@ -13946,7 +14797,9 @@ mod tests {
         let mut renderer = UiWgpuRenderer::new(&device, wgpu::TextureFormat::Rgba8Unorm);
         renderer.update_viewport([100, 100], [100.0, 100.0]);
         renderer.refresh_plan(&fragments, [100.0, 100.0]);
-        renderer.scroll_offsets.insert("scroll-regression/scroll-panel".into(), [0.0, 10.0]);
+        renderer
+            .scroll_offsets
+            .insert("scroll-regression/scroll-panel".into(), [0.0, 10.0]);
         renderer.compose_sampled_visuals(0.0);
         let first = renderer
             .plan
@@ -14006,7 +14859,8 @@ mod tests {
             presentation: None,
             scroll: false,
             declared_scroll_offset: [0.0; 2],
-            world_depth: None, world_scale: None,
+            world_depth: None,
+            world_scale: None,
             paint_group_id: 0,
         };
         let transition = node().enter_transition.unwrap();
@@ -14021,6 +14875,208 @@ mod tests {
         assert!(midpoint.style.opacity > 0.5 && midpoint.style.opacity < 1.0);
         assert!(midpoint.bounds.y < 40.0 && midpoint.bounds.y > 20.0);
         assert_eq!(sample_transition(&active, 1.2).bounds, target.bounds);
+    }
+
+    #[test]
+    fn animation_instance_reports_running_and_completed_lifecycle() {
+        let target = UiVisual {
+            bounds: UiBounds {
+                x: 10.0,
+                y: 20.0,
+                width: 40.0,
+                height: 30.0,
+            },
+            logical_bounds: logical_box_from_bounds(
+                UiBounds {
+                    x: 10.0,
+                    y: 20.0,
+                    width: 40.0,
+                    height: 30.0,
+                },
+                None,
+            ),
+            style: UiStyle::default(),
+            kind: UiNodeKind::Panel,
+            enabled: true,
+            clip: UiBounds {
+                x: -1_000_000.0,
+                y: -1_000_000.0,
+                width: 2_000_000.0,
+                height: 2_000_000.0,
+            },
+            clip_radius: 0.0,
+            image: None,
+            surface: None,
+            text: None,
+            presentation: None,
+            scroll: false,
+            declared_scroll_offset: [0.0; 2],
+            world_depth: None,
+            world_scale: None,
+            paint_group_id: 0,
+        };
+        let transition = UiTransition {
+            delay_ms: 0,
+            duration_ms: 100,
+            easing: UiEasing::Linear,
+            from: UiTransitionState {
+                opacity: Some(0.0),
+                ..UiTransitionState::default()
+            },
+            motion_key: Some("test.motion".into()),
+        };
+        let active = ActiveTransition {
+            from: transition_source(&target, &transition),
+            target,
+            started_at_seconds: 1.0,
+            transition,
+        };
+        assert_eq!(
+            active
+                .animation_instance("test/node", Revision(4), 1.05)
+                .status,
+            UiAnimationStatus::Running
+        );
+        assert_eq!(
+            active
+                .animation_instance("test/node", Revision(4), 1.2)
+                .status,
+            UiAnimationStatus::Completed
+        );
+    }
+
+    #[test]
+    fn cancel_animation_records_cancelled_lifecycle_and_pins_target() {
+        let (device, _queue) = test_device("neon3-animation-cancel");
+        let mut renderer = UiWgpuRenderer::new(&device, wgpu::TextureFormat::Rgba8Unorm);
+        let target = UiVisual {
+            bounds: UiBounds {
+                x: 5.0,
+                y: 7.0,
+                width: 40.0,
+                height: 30.0,
+            },
+            logical_bounds: logical_box_from_bounds(
+                UiBounds {
+                    x: 5.0,
+                    y: 7.0,
+                    width: 40.0,
+                    height: 30.0,
+                },
+                None,
+            ),
+            style: UiStyle::default(),
+            kind: UiNodeKind::Panel,
+            enabled: true,
+            clip: UiBounds {
+                x: -1_000_000.0,
+                y: -1_000_000.0,
+                width: 2_000_000.0,
+                height: 2_000_000.0,
+            },
+            clip_radius: 0.0,
+            image: None,
+            surface: None,
+            text: None,
+            presentation: None,
+            scroll: false,
+            declared_scroll_offset: [0.0; 2],
+            world_depth: None,
+            world_scale: None,
+            paint_group_id: 0,
+        };
+        let transition = UiTransition {
+            delay_ms: 0,
+            duration_ms: 300,
+            easing: UiEasing::Linear,
+            from: UiTransitionState {
+                opacity: Some(0.0),
+                ..UiTransitionState::default()
+            },
+            motion_key: Some("cancel-test".into()),
+        };
+        renderer.active.insert(
+            "test/cancel".into(),
+            ActiveTransition {
+                from: transition_source(&target, &transition),
+                target: target.clone(),
+                started_at_seconds: 1.0,
+                transition,
+            },
+        );
+        assert!(renderer.cancel_animation("test/cancel"));
+        assert!(!renderer.active.contains_key("test/cancel"));
+        assert_eq!(renderer.current["test/cancel"], target);
+        assert!(
+            matches!(renderer.animation_history.back(), Some(animation) if animation.status == UiAnimationStatus::Cancelled)
+        );
+    }
+
+    #[test]
+    fn retarget_records_superseded_and_uses_current_sample_as_new_from() {
+        let (device, _queue) = test_device("neon3-animation-retarget");
+        let mut renderer = UiWgpuRenderer::new(&device, wgpu::TextureFormat::Rgba8Unorm);
+        let visual = |x: f32| UiVisual {
+            bounds: UiBounds {
+                x,
+                y: 0.0,
+                width: 20.0,
+                height: 20.0,
+            },
+            logical_bounds: logical_box_from_bounds(
+                UiBounds {
+                    x,
+                    y: 0.0,
+                    width: 20.0,
+                    height: 20.0,
+                },
+                None,
+            ),
+            style: UiStyle::default(),
+            kind: UiNodeKind::Panel,
+            enabled: true,
+            clip: UiBounds {
+                x: -1_000_000.0,
+                y: -1_000_000.0,
+                width: 2_000_000.0,
+                height: 2_000_000.0,
+            },
+            clip_radius: 0.0,
+            image: None,
+            surface: None,
+            text: None,
+            presentation: None,
+            scroll: false,
+            declared_scroll_offset: [0.0; 2],
+            world_depth: None,
+            world_scale: None,
+            paint_group_id: 0,
+        };
+        let transition = UiTransition {
+            delay_ms: 0,
+            duration_ms: 100,
+            easing: UiEasing::Linear,
+            from: UiTransitionState {
+                bounds: Some(UiBounds {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 20.0,
+                    height: 20.0,
+                }),
+                ..UiTransitionState::default()
+            },
+            motion_key: Some("retarget".into()),
+        };
+        let first = visual(100.0);
+        renderer.sample_with_history("retarget/node", &first, Some(&transition), 1.0);
+        let midpoint = sample_transition(renderer.active.get("retarget/node").unwrap(), 1.05);
+        let second = visual(200.0);
+        renderer.sample_with_history("retarget/node", &second, Some(&transition), 1.05);
+        let active = renderer.active.get("retarget/node").unwrap();
+        assert_eq!(active.from.bounds.x, midpoint.bounds.x);
+        assert!(
+            matches!(renderer.animation_history.back(), Some(animation) if animation.status == UiAnimationStatus::Superseded)
+        );
     }
 
     #[test]
@@ -14066,7 +15122,8 @@ mod tests {
             }),
             scroll: false,
             declared_scroll_offset: [0.0; 2],
-            world_depth: None, world_scale: None,
+            world_depth: None,
+            world_scale: None,
             paint_group_id: 0,
         };
         let target = visual(100.0);
@@ -14138,7 +15195,8 @@ mod tests {
             presentation: None,
             scroll: false,
             declared_scroll_offset: [0.0; 2],
-            world_depth: None, world_scale: None,
+            world_depth: None,
+            world_scale: None,
             paint_group_id: 0,
         };
         let target = UiVisual {
@@ -14178,7 +15236,8 @@ mod tests {
             presentation: None,
             scroll: false,
             declared_scroll_offset: [0.0; 2],
-            world_depth: None, world_scale: None,
+            world_depth: None,
+            world_scale: None,
             paint_group_id: 0,
         };
         let active = ActiveTransition {
@@ -14240,7 +15299,8 @@ mod tests {
             presentation: None,
             scroll: false,
             declared_scroll_offset: [0.0; 2],
-            world_depth: None, world_scale: None,
+            world_depth: None,
+            world_scale: None,
             paint_group_id: 0,
         };
         UiWgpuRenderer::sample(
@@ -14347,8 +15407,81 @@ mod tests {
             1.016,
         );
         assert_eq!([sampled.bounds.x, sampled.bounds.y], [700.0, 540.0]);
-        assert_eq!(active.len(), 1, "camera motion must not create a new transition");
+        assert_eq!(
+            active.len(),
+            1,
+            "camera motion must not create a new transition"
+        );
         assert!(active["world/p0"].started_at_seconds == 1.0);
+    }
+
+    #[test]
+    fn world_transform_update_does_not_relayout_static_text() {
+        let (device, queue) = test_device("neon3-world-transform-counters");
+        let mut text = node();
+        text.node_id = UiNodeId("world-label".into());
+        text.kind = UiNodeKind::Label;
+        text.bounds = UiBounds {
+            x: 0.0,
+            y: 0.0,
+            width: 100.0,
+            height: 24.0,
+        };
+        text.text = Some(TextRef::Literal {
+            value: "World label".into(),
+        });
+        text.world_scale = Some(1.0);
+        text.enter_transition = None;
+        let mut root = node();
+        root.node_id = UiNodeId("world-root".into());
+        root.bounds = UiBounds {
+            x: 0.0,
+            y: 0.0,
+            width: 200.0,
+            height: 100.0,
+        };
+        root.world_scale = Some(1.0);
+        root.world_depth = Some(0.5);
+        root.children = vec![text];
+        root.enter_transition = None;
+        let fragment_id = UiFragmentId("world-counter".into());
+        let fragment = UiFragment {
+            fragment_id: fragment_id.clone(),
+            revision: Revision(1),
+            root,
+            effects: Vec::new(),
+        };
+        let mut fragments = HashMap::from([(fragment_id.clone(), fragment)]);
+        let mut renderer = UiWgpuRenderer::new(&device, wgpu::TextureFormat::Rgba8Unorm);
+        let _ = render_renderer_offscreen_for_test(
+            &mut renderer,
+            &device,
+            &queue,
+            wgpu::TextureFormat::Rgba8Unorm,
+            &fragments,
+            [200, 100],
+            0.0,
+        );
+        let before = renderer.layout_counters();
+        let root = &mut fragments
+            .get_mut(&fragment_id)
+            .expect("world fragment exists")
+            .root;
+        root.bounds.x = 60.0;
+        root.bounds.y = 20.0;
+        renderer.invalidate_plan_for_world_transform();
+        let _ = render_renderer_offscreen_for_test(
+            &mut renderer,
+            &device,
+            &queue,
+            wgpu::TextureFormat::Rgba8Unorm,
+            &fragments,
+            [200, 100],
+            0.016,
+        );
+        let after = renderer.layout_counters();
+        assert_eq!(before["text_layout_count"], after["text_layout_count"]);
+        assert!(after["layout_count"].as_u64() > before["layout_count"].as_u64());
     }
 
     #[test]
@@ -14586,18 +15719,26 @@ mod tests {
         let node = UiNode {
             node_id: UiNodeId("fallback-test".into()),
             kind: UiNodeKind::Label,
-            bounds: UiBounds { x: 0.0, y: 0.0, width: 0.0, height: 0.0 },
+            bounds: UiBounds {
+                x: 0.0,
+                y: 0.0,
+                width: 0.0,
+                height: 0.0,
+            },
             layout: None,
             visible: true,
             enabled: true,
             text_key: None,
-            text: Some(TextRef::Literal { value: "Hello".into() }),
+            text: Some(TextRef::Literal {
+                value: "Hello".into(),
+            }),
             image: None,
             surface: None,
             style: UiStyle::default(),
             enter_transition: None,
             children: Vec::new(),
-            world_depth: None, world_scale: None,
+            world_depth: None,
+            world_scale: None,
         };
         let [width, height] = intrinsic_size(&node, None);
         // Without font, each ASCII char = FONT_RASTER_SIZE * 0.5 = 8.0
@@ -14627,15 +15768,30 @@ mod tests {
     fn column_padding_gap_affects_child_tracks() {
         let mut child1 = node();
         child1.node_id = UiNodeId("a".into());
-        child1.bounds = UiBounds { x: 0.0, y: 0.0, width: 20.0, height: 10.0 };
+        child1.bounds = UiBounds {
+            x: 0.0,
+            y: 0.0,
+            width: 20.0,
+            height: 10.0,
+        };
         child1.enter_transition = None;
         let mut child2 = node();
         child2.node_id = UiNodeId("b".into());
-        child2.bounds = UiBounds { x: 0.0, y: 0.0, width: 30.0, height: 15.0 };
+        child2.bounds = UiBounds {
+            x: 0.0,
+            y: 0.0,
+            width: 30.0,
+            height: 15.0,
+        };
         child2.enter_transition = None;
         let mut root = node();
         root.node_id = UiNodeId("col".into());
-        root.bounds = UiBounds { x: 0.0, y: 0.0, width: 0.0, height: 0.0 };
+        root.bounds = UiBounds {
+            x: 0.0,
+            y: 0.0,
+            width: 0.0,
+            height: 0.0,
+        };
         root.layout = Some(UiLayout {
             mode: UiLayoutMode::Column,
             padding: [4.0, 6.0, 4.0, 6.0], // top, right, bottom, left
@@ -14660,23 +15816,44 @@ mod tests {
         // Child B: y = padding_top + child_a_height + gap = 4 + 10 + 3 = 17
         let a = renderer.plan.iter().find(|n| n.id.ends_with("/a")).unwrap();
         let b = renderer.plan.iter().find(|n| n.id.ends_with("/b")).unwrap();
-        assert!((a.target.logical_bounds.y - 4.0).abs() < 0.001, "child A y should be padding_top");
-        assert!((b.target.logical_bounds.y - 17.0).abs() < 0.001, "child B y should include padding + height + gap");
+        assert!(
+            (a.target.logical_bounds.y - 4.0).abs() < 0.001,
+            "child A y should be padding_top"
+        );
+        assert!(
+            (b.target.logical_bounds.y - 17.0).abs() < 0.001,
+            "child B y should include padding + height + gap"
+        );
     }
 
     #[test]
     fn row_padding_gap_affects_child_tracks() {
         let mut child1 = node();
         child1.node_id = UiNodeId("a".into());
-        child1.bounds = UiBounds { x: 0.0, y: 0.0, width: 20.0, height: 10.0 };
+        child1.bounds = UiBounds {
+            x: 0.0,
+            y: 0.0,
+            width: 20.0,
+            height: 10.0,
+        };
         child1.enter_transition = None;
         let mut child2 = node();
         child2.node_id = UiNodeId("b".into());
-        child2.bounds = UiBounds { x: 0.0, y: 0.0, width: 30.0, height: 15.0 };
+        child2.bounds = UiBounds {
+            x: 0.0,
+            y: 0.0,
+            width: 30.0,
+            height: 15.0,
+        };
         child2.enter_transition = None;
         let mut root = node();
         root.node_id = UiNodeId("row".into());
-        root.bounds = UiBounds { x: 0.0, y: 0.0, width: 0.0, height: 0.0 };
+        root.bounds = UiBounds {
+            x: 0.0,
+            y: 0.0,
+            width: 0.0,
+            height: 0.0,
+        };
         root.layout = Some(UiLayout {
             mode: UiLayoutMode::Row,
             padding: [2.0, 4.0, 2.0, 4.0], // top, right, bottom, left
@@ -14709,16 +15886,31 @@ mod tests {
     fn invisible_child_does_not_occupy_track_space() {
         let mut child1 = node();
         child1.node_id = UiNodeId("visible".into());
-        child1.bounds = UiBounds { x: 0.0, y: 0.0, width: 20.0, height: 10.0 };
+        child1.bounds = UiBounds {
+            x: 0.0,
+            y: 0.0,
+            width: 20.0,
+            height: 10.0,
+        };
         child1.enter_transition = None;
         let mut child2 = node();
         child2.node_id = UiNodeId("hidden".into());
-        child2.bounds = UiBounds { x: 0.0, y: 0.0, width: 20.0, height: 10.0 };
+        child2.bounds = UiBounds {
+            x: 0.0,
+            y: 0.0,
+            width: 20.0,
+            height: 10.0,
+        };
         child2.visible = false;
         child2.enter_transition = None;
         let mut root = node();
         root.node_id = UiNodeId("col".into());
-        root.bounds = UiBounds { x: 0.0, y: 0.0, width: 0.0, height: 0.0 };
+        root.bounds = UiBounds {
+            x: 0.0,
+            y: 0.0,
+            width: 0.0,
+            height: 0.0,
+        };
         root.layout = Some(UiLayout {
             mode: UiLayoutMode::Column,
             gap: 2.0,
@@ -14749,8 +15941,15 @@ mod tests {
         let mut text_node = node();
         text_node.node_id = UiNodeId("label".into());
         text_node.kind = UiNodeKind::Label;
-        text_node.bounds = UiBounds { x: 0.0, y: 0.0, width: 200.0, height: 8.0 };
-        text_node.text = Some(TextRef::Literal { value: "Hello World".into() });
+        text_node.bounds = UiBounds {
+            x: 0.0,
+            y: 0.0,
+            width: 200.0,
+            height: 8.0,
+        };
+        text_node.text = Some(TextRef::Literal {
+            value: "Hello World".into(),
+        });
         text_node.enter_transition = None;
         let fragment = UiFragment {
             fragment_id: UiFragmentId("text-no-clip".into()),
@@ -14763,7 +15962,11 @@ mod tests {
         let mut renderer = UiWgpuRenderer::new(&device, wgpu::TextureFormat::Rgba8Unorm);
         renderer.update_viewport([256, 256], [256.0, 256.0]);
         renderer.refresh_plan(&fragments, [256.0, 256.0]);
-        let label = renderer.plan.iter().find(|n| n.id.ends_with("/label")).unwrap();
+        let label = renderer
+            .plan
+            .iter()
+            .find(|n| n.id.ends_with("/label"))
+            .unwrap();
         // §4.1: explicit height is a minimum guarantee, not a clip ceiling.
         // The label's resolved height must be >= 1 line height (~16-20px) even
         // though the declared height is only 8.
@@ -14778,7 +15981,12 @@ mod tests {
     fn margin_does_not_double_count_in_parent_track() {
         let mut child = node();
         child.node_id = UiNodeId("child".into());
-        child.bounds = UiBounds { x: 0.0, y: 0.0, width: 30.0, height: 10.0 };
+        child.bounds = UiBounds {
+            x: 0.0,
+            y: 0.0,
+            width: 30.0,
+            height: 10.0,
+        };
         child.layout = Some(UiLayout {
             margin: [2.0, 0.0, 0.0, 0.0], // top margin only
             ..UiLayout::default()
@@ -14786,7 +15994,12 @@ mod tests {
         child.enter_transition = None;
         let mut root = node();
         root.node_id = UiNodeId("col".into());
-        root.bounds = UiBounds { x: 0.0, y: 0.0, width: 0.0, height: 0.0 };
+        root.bounds = UiBounds {
+            x: 0.0,
+            y: 0.0,
+            width: 0.0,
+            height: 0.0,
+        };
         root.layout = Some(UiLayout {
             mode: UiLayoutMode::Column,
             ..UiLayout::default()
@@ -14805,14 +16018,85 @@ mod tests {
         let mut renderer = UiWgpuRenderer::new(&device, wgpu::TextureFormat::Rgba8Unorm);
         renderer.update_viewport([256, 256], [256.0, 256.0]);
         renderer.refresh_plan(&fragments, [256.0, 256.0]);
-        let child_visual = renderer.plan.iter().find(|n| n.id.ends_with("/child")).unwrap();
+        let child_visual = renderer
+            .plan
+            .iter()
+            .find(|n| n.id.ends_with("/child"))
+            .unwrap();
         // Child y should be offset by margin top (2px), but the child's own
         // height should be 10 (not 12 = 10 + 2*1). Margin is not added to
         // the child's own bounds — it's applied to the parent's track.
-        assert!((child_visual.target.logical_bounds.y - 2.0).abs() < 0.001,
-            "child y should be margin top (2), got {}", child_visual.target.logical_bounds.y);
-        assert!((child_visual.target.logical_bounds.height - 10.0).abs() < 0.001,
+        assert!(
+            (child_visual.target.logical_bounds.y - 2.0).abs() < 0.001,
+            "child y should be margin top (2), got {}",
+            child_visual.target.logical_bounds.y
+        );
+        assert!(
+            (child_visual.target.logical_bounds.height - 10.0).abs() < 0.001,
             "child height should be 10 (margin not added to bounds), got {}",
-            child_visual.target.logical_bounds.height);
+            child_visual.target.logical_bounds.height
+        );
+    }
+
+    #[test]
+    fn external_image_binding_uploads_and_renders_without_asset_ref() {
+        let _gpu_test = GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let (device, queue) = test_device("neon3-external-image");
+        let source = UiImageSource {
+            image_id: "external-test-image".into(),
+            media_type: "application/x-neon-rgba8".into(),
+            width: 2,
+            height: 2,
+            bytes: vec![
+                255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255,
+            ],
+        };
+        let mut renderer = UiWgpuRenderer::new(&device, wgpu::TextureFormat::Rgba8Unorm);
+        let texture = renderer
+            .preload_external_image(&device, &queue, &source)
+            .expect("external image must upload");
+        assert_eq!(texture.texture_index, 0);
+        assert_eq!(texture.region.width, 2);
+        assert_eq!(texture.region.height, 2);
+        let mut root = node();
+        root.node_id = UiNodeId("external-image".into());
+        root.kind = UiNodeKind::Image;
+        root.bounds = UiBounds {
+            x: 0.0,
+            y: 0.0,
+            width: 16.0,
+            height: 16.0,
+        };
+        root.image = None;
+        root.enter_transition = None;
+        let fragment_id = UiFragmentId("external-image-render".into());
+        let fragments = HashMap::from([(
+            fragment_id.clone(),
+            UiFragment {
+                fragment_id,
+                revision: Revision(1),
+                root,
+                effects: vec![UiEffect::ImageBinding {
+                    node_id: UiNodeId("external-image".into()),
+                    image_id: "external-test-image".into(),
+                }],
+            },
+        )]);
+        let pixels = render_renderer_offscreen_for_test(
+            &mut renderer,
+            &device,
+            &queue,
+            wgpu::TextureFormat::Rgba8Unorm,
+            &fragments,
+            [16, 16],
+            0.0,
+        );
+        assert!(
+            pixels
+                .chunks_exact(4)
+                .any(|pixel| pixel[0] > 0 && pixel[3] > 0)
+        );
     }
 }

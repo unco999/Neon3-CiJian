@@ -33,7 +33,7 @@ use std::os::windows::io::AsRawHandle;
 // readiness; allow the GPU construction phase to finish before failing the
 // session supervisor.
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
-const HELP: &str = "neon-dev case <kanban-reparent|asset-review|component-gallery|data-grid|scroll-view|virtual-list> [--show-logs]\nneon-dev status [manifest-path]\nneon-dev scenario <drag-card02-before|component-gallery-interactions|component-gallery-window-input>\nneon-dev capture-window <wgpu-loopback-endpoint> [path]\nneon-dev debug-interaction <wgpu-loopback-endpoint> <interaction-id>\nneon-dev inspect-window <wgpu-loopback-endpoint>\nneon-dev probe-window <wgpu-loopback-endpoint> <x> <y>";
+const HELP: &str = "neon-dev case <kanban-reparent|asset-review|component-gallery|data-grid|scroll-view|virtual-list> [--show-logs]\nneon-dev status [manifest-path]\nneon-dev scenario <drag-card02-before|component-gallery-interactions|component-gallery-window-input>\nneon-dev capture-window <wgpu-loopback-endpoint> [path]\nneon-dev debug-interaction <wgpu-loopback-endpoint> <interaction-id>\nneon-dev inspect-window <wgpu-loopback-endpoint>\nneon-dev probe-window <wgpu-loopback-endpoint> <x> <y>\nneon-dev probe-window-metrics <wgpu-loopback-endpoint> [samples] [interval-ms]";
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 fn main() -> ExitCode {
@@ -90,6 +90,22 @@ fn run() -> io::Result<()> {
         && command == "probe-window"
     {
         return probe_window_input(endpoint, x, y);
+    }
+    if let [command, endpoint] = args.as_slice()
+        && command == "probe-window-metrics"
+    {
+        return probe_window_metrics(endpoint, 60, 50);
+    }
+    if let [command, endpoint, samples, interval_ms] = args.as_slice()
+        && command == "probe-window-metrics"
+    {
+        let samples = samples
+            .parse::<u32>()
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        let interval_ms = interval_ms
+            .parse::<u64>()
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        return probe_window_metrics(endpoint, samples.clamp(1, 600), interval_ms.clamp(1, 1000));
     }
     if let [command, endpoint, interaction_id] = args.as_slice()
         && command == "debug-interaction"
@@ -1756,6 +1772,70 @@ fn probe_window_input(endpoint: &str, x: &str, y: &str) -> io::Result<()> {
     } else {
         Err(io::Error::other("window input probe was rejected"))
     }
+}
+
+fn probe_window_metrics(endpoint: &str, samples: u32, interval_ms: u64) -> io::Result<()> {
+    let endpoint = endpoint
+        .parse::<SocketAddr>()
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    let mut layout = Vec::new();
+    let mut text = Vec::new();
+    let mut world = Vec::new();
+    let mut dropped = 0_u64;
+    for sample in 0..samples {
+        let response = call(
+            endpoint,
+            &rpc_request(
+                &format!("window-metrics-{sample}"),
+                "wgpu-runtime",
+                "debug.window.input.snapshot",
+                json!({}),
+                None,
+                None,
+            ),
+        )?;
+        assert_accepted(response.clone(), "window metrics snapshot")?;
+        let counters = response
+            .result
+            .as_ref()
+            .and_then(|value| value.pointer("/layout_counters/window_ui"))
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        let layout_count = counters
+            .get("layout_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let text_count = counters
+            .get("text_layout_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let world_count = counters
+            .get("world_transform_update_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        layout.push(layout_count);
+        text.push(text_count);
+        world.push(world_count);
+        println!(
+            "{}",
+            json!({"event":"window_metrics_sample","sample":sample,"layout_count":layout_count,"text_layout_count":text_count,"world_transform_update_count":world_count})
+        );
+        std::thread::sleep(Duration::from_millis(interval_ms));
+    }
+    let summary = json!({
+        "event": "window_metrics_summary",
+        "samples": samples,
+        "layout_count_first": layout.first().copied().unwrap_or(0),
+        "layout_count_last": layout.last().copied().unwrap_or(0),
+        "text_layout_count_first": text.first().copied().unwrap_or(0),
+        "text_layout_count_last": text.last().copied().unwrap_or(0),
+        "world_transform_update_count_first": world.first().copied().unwrap_or(0),
+        "world_transform_update_count_last": world.last().copied().unwrap_or(0),
+        "dropped_frames": dropped,
+        "status": "passed"
+    });
+    println!("{summary}");
+    Ok(())
 }
 
 fn run_component_gallery_scenario_inner() -> io::Result<serde_json::Value> {

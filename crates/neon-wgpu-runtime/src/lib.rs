@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use std::time::{Duration, Instant};
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     net::{SocketAddr, UdpSocket},
     path::PathBuf,
     thread,
@@ -25,7 +25,8 @@ use neon_protocol::{
     InteractionTraceRecord, InteractionTraceStage, PROTOCOL_VERSION, RenderBackend,
     RenderBackendNegotiation, RenderSurfaceKind, RenderSurfaceOpen, RenderSurfaceTargetKind,
     RequestId, Revision, RpcError, RpcRequest, RpcResponse, RpcStatus, ServiceDescription,
-    ServiceHealth, ServiceName,
+    ServiceHealth, ServiceName, UiImageSource, UiImageTextureRef, UiImageTextureRegion,
+    UiImageUploadRequest,
 };
 #[cfg(test)]
 use neon_ui_schema::UiFragmentSubmission;
@@ -673,6 +674,15 @@ struct UiResourceRecord {
     state: UiResourceState,
 }
 
+#[derive(Clone, Debug)]
+struct ExternalImageRecord {
+    source: UiImageSource,
+    texture: UiImageTextureRef,
+}
+
+const EXTERNAL_IMAGE_ATLAS_WIDTH: u32 = 2048;
+const EXTERNAL_IMAGE_ATLAS_PADDING: u32 = 1;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum LocalInteractionState {
     Idle,
@@ -950,6 +960,10 @@ enum WindowCommand {
     },
     ImageDebugSnapshot {
         completed: std::sync::mpsc::Sender<Value>,
+    },
+    UploadExternalImage {
+        source: UiImageSource,
+        completed: std::sync::mpsc::Sender<Result<Value, String>>,
     },
     InputDebugProbe {
         logical_position: Option<[f64; 2]>,
@@ -1490,9 +1504,15 @@ impl WindowedRuntime {
             .world_ui_lab_camera
             .lock()
             .map(|camera| (camera.active(), camera.state()))
-            .unwrap_or((false, WorldUiCameraState {
-                position: [0.0; 3], yaw: 0.0, pitch: 0.0, vertical_fov: 35.0f32.to_radians(),
-            }));
+            .unwrap_or((
+                false,
+                WorldUiCameraState {
+                    position: [0.0; 3],
+                    yaw: 0.0,
+                    pitch: 0.0,
+                    vertical_fov: 35.0f32.to_radians(),
+                },
+            ));
         if lab_active {
             // The lab preview is demand-driven. When no external lab surface
             // owns focus, skip its panel, scene, and depth passes entirely so
@@ -1516,15 +1536,27 @@ impl WindowedRuntime {
                 multiview_mask: None,
             });
             gpu.ui.draw(
-                &gpu.device, &gpu.queue, &mut pass, &gpu.world_ui_lab_fragment,
+                &gpu.device,
+                &gpu.queue,
+                &mut pass,
+                &gpu.world_ui_lab_fragment,
                 WORLD_UI_LAB_PANEL_SIZE,
-                [WORLD_UI_LAB_LOGICAL_SIZE[0] as f32, WORLD_UI_LAB_LOGICAL_SIZE[1] as f32],
-                gpu.started_at.elapsed().as_secs_f32(), UiDrawMode::All,
+                [
+                    WORLD_UI_LAB_LOGICAL_SIZE[0] as f32,
+                    WORLD_UI_LAB_LOGICAL_SIZE[1] as f32,
+                ],
+                gpu.started_at.elapsed().as_secs_f32(),
+                UiDrawMode::All,
             );
             drop(pass);
             gpu.world_ui.render_lab_scene(
-                &gpu.device, &gpu.queue, &mut encoder, &gpu.world_ui_lab_surface,
-                &gpu.world_ui_lab_depth, WORLD_UI_LAB_PREVIEW_SIZE, &gpu.world_ui_lab_panel,
+                &gpu.device,
+                &gpu.queue,
+                &mut encoder,
+                &gpu.world_ui_lab_surface,
+                &gpu.world_ui_lab_depth,
+                WORLD_UI_LAB_PREVIEW_SIZE,
+                &gpu.world_ui_lab_panel,
                 world_ui_lab_camera(WORLD_UI_LAB_PREVIEW_SIZE, camera_state),
             )?;
         }
@@ -1907,6 +1939,9 @@ impl WindowedRuntime {
             "active_drag": active_drag,
             "pending_hit_readback": gpu.pending_hit_slot.is_some(),
             "pending_hit_pixel": gpu.pending_hit_pixel.is_some(),
+            "layout_counters": {
+                "window_ui": gpu.ui.layout_counters(),
+            },
             "dropdown": gpu.ui.dropdown_debug_snapshot(),
             "active_transitions": gpu
                 .ui
@@ -2405,6 +2440,11 @@ struct HeadlessExternalGpu {
     /// False until the render loop has produced at least one completed ID
     /// frame into `pointer_hit_target`.
     id_frame_ready: bool,
+    /// External image ids already preloaded into the renderer-owned atlases.
+    /// The upload RPC records residency metadata in `WgpuRuntime`; this set
+    /// tracks which of those have actually been placed into the GPU atlas so
+    /// the render loop only preloads new images once.
+    preloaded_external_images: HashSet<String>,
 }
 
 #[cfg(windows)]
@@ -2478,6 +2518,7 @@ impl HeadlessExternalGpu {
             id_frame_sequence: 0,
             id_frame_bindings: std::collections::HashMap::new(),
             id_frame_ready: false,
+            preloaded_external_images: HashSet::new(),
         })
     }
 
@@ -2558,16 +2599,16 @@ impl HeadlessExternalGpu {
                 let current_hit = ui.hit_binding_at_pointer();
                 self.input
                     .set_hover_id(current_hit.as_ref().map(|(hit_id, _)| *hit_id));
-                self.input
-                    .pointer_down()
-                    .map_err(|_| {
-                            format!(
-                            "press_without_semantic_hit:pointer=({:.1},{:.1}) cpu_hit={:?}",
-                            event.pixel[0],
-                            event.pixel[1],
-                            current_hit.as_ref().map(|(hit_id, binding)| (*hit_id, binding.node_path.clone())),
-                        )
-                    })?;
+                self.input.pointer_down().map_err(|_| {
+                    format!(
+                        "press_without_semantic_hit:pointer=({:.1},{:.1}) cpu_hit={:?}",
+                        event.pixel[0],
+                        event.pixel[1],
+                        current_hit
+                            .as_ref()
+                            .map(|(hit_id, binding)| (*hit_id, binding.node_path.clone())),
+                    )
+                })?;
                 self.captured_binding = current_hit.map(|(_, binding)| binding);
                 if self.captured_binding.is_none() {
                     let _ = self.input.pointer_up(false);
@@ -2609,8 +2650,9 @@ impl HeadlessExternalGpu {
                 if binding.node_path.ends_with("/p0")
                     || binding.node_path.contains("/p")
                         && binding.node_path.split('/').next_back().is_some_and(|key| {
-                            key.strip_prefix('p')
-                                .is_some_and(|index| !index.is_empty() && index.chars().all(|c| c.is_ascii_digit()))
+                            key.strip_prefix('p').is_some_and(|index| {
+                                !index.is_empty() && index.chars().all(|c| c.is_ascii_digit())
+                            })
                         })
                 {
                     eprintln!(
@@ -2815,6 +2857,46 @@ impl HeadlessExternalGpu {
         Ok(result)
     }
 
+    /// Places newly uploaded external images into each renderer's GPU atlas.
+    ///
+    /// `upload_external_image` on the runtime only records residency metadata
+    /// (region/uv) and returns it to the host; it never touches the GPU atlas.
+    /// This method is the headless counterpart to the window path's
+    /// `WindowCommand::UploadExternalImage`: the render loop calls it before
+    /// `render` so the color passes can actually sample the image. Idempotent
+    /// per `image_id` via `preloaded_external_images`.
+    fn preload_external_images(&mut self, images: &[UiImageSource]) {
+        for source in images {
+            if self.preloaded_external_images.contains(&source.image_id) {
+                continue;
+            }
+            // Screen and world panels render from independent atlases, so the
+            // same bytes must be placed in both. The unified ID renderer only
+            // emits hit ids and never samples image color, so it is skipped.
+            let screen = self
+                .screen_ui
+                .preload_external_image(&self.device, &self.queue, source);
+            let world = self
+                .world_ui
+                .preload_external_image(&self.device, &self.queue, source);
+            match (screen, world) {
+                (Ok(_), Ok(_)) => {
+                    self.preloaded_external_images.insert(source.image_id.clone());
+                    // The fragment tree can be unchanged while its image atlas
+                    // gains a new resident entry. A cached transparent frame
+                    // from before this upload is no longer valid.
+                    self.last_rendered_all_surfaces = false;
+                }
+                (screen, world) => {
+                    eprintln!(
+                        "[neon-wgpu-runtime] external image preload failed for {}: screen={:?} world={:?}",
+                        source.image_id, screen.err(), world.err()
+                    );
+                }
+            }
+        }
+    }
+
     fn render(
         &mut self,
         snapshots: &HashMap<RenderSurfaceKind, HashMap<UiFragmentId, UiFragment>>,
@@ -2877,8 +2959,12 @@ impl HeadlessExternalGpu {
         if !self.external_surfaces.is_empty() {
             self.ui.invalidate_plan();
         }
-        self.world_ui.invalidate_plan();
-        self.screen_ui.invalidate_plan();
+        self.world_ui.invalidate_plan_for_world_transform();
+        // World anchors change only the WorldUi snapshot. Invalidating the
+        // fixed ScreenUi plan here clears its text/layout cache every camera
+        // update and makes a static console (including image nodes) re-layout
+        // at the world-frame rate. Screen fragment revisions and viewport
+        // changes already invalidate this renderer through `refresh_plan`.
         timing.invalidate_plan_ms = stage.elapsed().as_secs_f32() * 1000.0;
         self.next_external_frame_sequence = self.next_external_frame_sequence.saturating_add(1);
         let frame_sequence = self.next_external_frame_sequence;
@@ -3100,10 +3186,8 @@ impl HeadlessExternalGpu {
                 self.perf.unified_id_passes += 1;
                 timing.hit_pass_ms += stage.elapsed().as_secs_f32() * 1000.0;
                 drop(id_pass);
-                self.perf.unified_id_instances = (self
-                    .ui
-                    .hit_binding_count() as u64)
-                    .max(self.perf.unified_id_instances);
+                self.perf.unified_id_instances =
+                    (self.ui.hit_binding_count() as u64).max(self.perf.unified_id_instances);
                 id_shared.frame_sequence = frame_sequence;
                 hal_queue.add_signal_fence(id_shared.fence.clone(), frame_sequence);
             }
@@ -3119,23 +3203,22 @@ impl HeadlessExternalGpu {
         // lookup pair to the same composition frame.
         if has_external_id_targets {
             let pointer_view = self.pointer_hit_target_view.clone();
-            let mut pointer_id_pass =
-                encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("neon3-headless-external-pointer-id-frame"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &pointer_view,
-                        depth_slice: None,
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                            store: wgpu::StoreOp::Store,
-                        },
-                    })],
-                    depth_stencil_attachment: None,
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                    multiview_mask: None,
-                });
+            let mut pointer_id_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("neon3-headless-external-pointer-id-frame"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &pointer_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
             self.ui.draw_hit_id(
                 &self.device,
                 &self.queue,
@@ -3206,6 +3289,11 @@ impl HeadlessExternalGpu {
         json!({
             "frame_sequence": self.next_external_frame_sequence,
             "last_rendered_all_surfaces": self.last_rendered_all_surfaces,
+            "layout_counters": {
+                "screen": self.screen_ui.layout_counters(),
+                "world": self.world_ui.layout_counters(),
+                "unified": self.ui.layout_counters(),
+            },
             "frames": timings,
         })
     }
@@ -3216,6 +3304,228 @@ impl HeadlessExternalGpu {
             "world_ui": self.world_ui.depth_diagnostics(),
             "screen_ui": self.screen_ui.depth_diagnostics(),
         })
+    }
+
+    /// Renderer-side external-image diagnostic for headless host integrations.
+    /// This distinguishes an accepted upload from an image that has actually
+    /// been sampled by the screen/world color renderers.
+    fn external_image_debug(&self) -> Value {
+        json!({
+            "frame_sequence": self.next_external_frame_sequence,
+            "preloaded_image_ids": self.preloaded_external_images,
+            "screen_ui": self.screen_ui.image_debug_snapshot(),
+            "world_ui": self.world_ui.image_debug_snapshot(),
+        })
+    }
+
+    /// Samples concrete pixels from the producer-owned shared color target.
+    /// This distinguishes atlas residency from a color pass that actually wrote
+    /// the image before an external host samples the D3D12 resource.
+    fn sample_external_color_target(
+        &mut self,
+        surface_id: &str,
+        points: &[[u32; 2]],
+    ) -> Result<Value, String> {
+        if points.is_empty() || points.len() > 16 {
+            return Err("color_sample_points_must_contain_1_to_16_points".into());
+        }
+        let ring = self
+            .external_surfaces
+            .get(surface_id)
+            .ok_or_else(|| "surface_not_found".to_owned())?;
+        let (buffer_index, shared) = ring
+            .iter()
+            .enumerate()
+            .filter(|(_, shared)| shared.frame_sequence != 0)
+            .max_by_key(|(_, shared)| shared.frame_sequence)
+            .ok_or_else(|| "surface_has_no_completed_frame".to_owned())?;
+        let frame_sequence = shared.frame_sequence;
+        let width = shared.width;
+        let height = shared.height;
+        let points = points
+            .iter()
+            .map(|point| [point[0].min(width.saturating_sub(1)), point[1].min(height.saturating_sub(1))])
+            .collect::<Vec<_>>();
+        let bytes_per_row = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let mirror = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("neon3-external-color-sample-mirror"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let mirror_view = mirror.create_view(&wgpu::TextureViewDescriptor::default());
+        let source_view = shared
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let source_layout = self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("neon3-external-color-sample-layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    multisampled: false,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                },
+                count: None,
+            }],
+        });
+        let shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("neon3-external-color-sample-shader"),
+            source: wgpu::ShaderSource::Wgsl(r#"
+                @group(0) @binding(0) var source: texture_2d<f32>;
+                @vertex fn vs(@builtin(vertex_index) index: u32) -> @builtin(position) vec4<f32> {
+                    var positions = array<vec2<f32>, 3>(
+                        vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0)
+                    );
+                    return vec4<f32>(positions[index], 0.0, 1.0);
+                }
+                @fragment fn fs(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
+                    return textureLoad(source, vec2<i32>(position.xy), 0);
+                }
+            "#.into()),
+        });
+        let pipeline_layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("neon3-external-color-sample-pipeline-layout"),
+            bind_group_layouts: &[Some(&source_layout)],
+            immediate_size: 0,
+        });
+        let pipeline = self.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("neon3-external-color-sample-pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("neon3-external-color-sample-bind-group"),
+            layout: &source_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&source_view),
+            }],
+        });
+        let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("neon3-external-color-sample-readback"),
+            size: u64::from(bytes_per_row) * points.len() as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("neon3-external-color-sample-encoder"),
+            });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("neon3-external-color-sample-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &mirror_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        for (index, point) in points.iter().enumerate() {
+            encoder.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &mirror,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d {
+                        x: point[0],
+                        y: point[1],
+                        z: 0,
+                    },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &readback,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: u64::from(bytes_per_row) * index as u64,
+                        bytes_per_row: Some(bytes_per_row),
+                        rows_per_image: Some(1),
+                    },
+                },
+                wgpu::Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+        self.queue.submit(Some(encoder.finish()));
+        let (mapped_tx, mapped_rx) = std::sync::mpsc::channel();
+        readback.slice(..).map_async(wgpu::MapMode::Read, move |result| {
+            let _ = mapped_tx.send(result);
+        });
+        self.device
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: None,
+            })
+            .map_err(|error| format!("wait for external color sample: {error}"))?;
+        mapped_rx
+            .recv_timeout(Duration::from_secs(5))
+            .map_err(|_| "external color sample mapping timed out".to_owned())?
+            .map_err(|error| format!("map external color sample: {error}"))?;
+        let mapped = readback
+            .slice(..)
+            .get_mapped_range()
+            .map_err(|error| format!("read external color sample: {error}"))?;
+        let samples = points
+            .iter()
+            .enumerate()
+            .map(|(index, point)| {
+                let offset = index * bytes_per_row as usize;
+                json!({"point": point, "rgba": [mapped[offset], mapped[offset + 1], mapped[offset + 2], mapped[offset + 3]]})
+            })
+            .collect::<Vec<_>>();
+        drop(mapped);
+        readback.unmap();
+        Ok(json!({
+            "surface_id": surface_id,
+            "frame_sequence": frame_sequence,
+            "buffer_index": buffer_index,
+            "size": [width, height],
+            "samples": samples,
+        }))
     }
 
     /// Returns the latest completed unified ID frame snapshot for diagnostics.
@@ -3314,8 +3624,16 @@ pub fn spawn_headless_external_server(
                         let interval_ms = (frame_start - last_frame_at).as_secs_f32() * 1000.0;
                         last_frame_at = frame_start;
                         let snapshot_start = Instant::now();
-                         let (snapshots, _combined, unified_hit_fragments) = match render_runtime.lock() {
-                             Ok(runtime) => runtime.external_surface_snapshots(),
+                        let (snapshots, _combined, unified_hit_fragments, images) = match render_runtime.lock() {
+                            Ok(runtime) => {
+                                let (snapshots, combined, unified) = runtime.external_surface_snapshots();
+                                let images = runtime
+                                    .external_images
+                                    .values()
+                                    .map(|record| record.source.clone())
+                                    .collect::<Vec<_>>();
+                                (snapshots, combined, unified, images)
+                            }
                             Err(_) => break,
                         };
                         let snapshot_ms = snapshot_start.elapsed().as_secs_f32() * 1000.0;
@@ -3328,6 +3646,7 @@ pub fn spawn_headless_external_server(
                                 Ok(mut gpu) => {
                                     let wait_ms =
                                         render_start.elapsed().as_secs_f32() * 1000.0;
+                                    gpu.preload_external_images(&images);
                                     if let Err(error) =
                                         gpu.render(
                                             &snapshots,
@@ -3474,6 +3793,59 @@ let perf = gpu.perf.clone();
                             let request_id = request.request_id;
                             let result = gpu.lock().expect("gpu lock").depth_probe();
                             runtime.lock().expect("runtime lock").accept(request_id, result)
+                        }
+                        "debug.external.images" => {
+                            let request_id = request.request_id;
+                            let result = gpu.lock().expect("gpu lock").external_image_debug();
+                            runtime.lock().expect("runtime lock").accept(request_id, result)
+                        }
+                        "debug.external.color.sample" => {
+                            let request_id = request.request_id;
+                            let surface_id = request
+                                .params
+                                .get("surface_id")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned);
+                            let points = request
+                                .params
+                                .get("points")
+                                .and_then(Value::as_array)
+                                .and_then(|points| {
+                                    points
+                                        .iter()
+                                        .map(|point| {
+                                            let point = point.as_array()?;
+                                            Some([
+                                                u32::try_from(point.first()?.as_u64()?).ok()?,
+                                                u32::try_from(point.get(1)?.as_u64()?).ok()?,
+                                            ])
+                                        })
+                                        .collect::<Option<Vec<_>>>()
+                                });
+                            match surface_id.zip(points) {
+                                Some((surface_id, points)) => match gpu
+                                    .lock()
+                                    .expect("gpu lock")
+                                    .sample_external_color_target(&surface_id, &points)
+                                {
+                                    Ok(result) => runtime
+                                        .lock()
+                                        .expect("runtime lock")
+                                        .accept(request_id, result),
+                                    Err(error) => runtime.lock().expect("runtime lock").reject(
+                                        request_id,
+                                        "external_color_sample_failed",
+                                        &error,
+                                        None,
+                                    ),
+                                },
+                                None => runtime.lock().expect("runtime lock").reject(
+                                    request_id,
+                                    "invalid_request",
+                                    "surface_id and u32 [x, y] points are required",
+                                    None,
+                                ),
+                            }
                         }
                         "debug.unified_id.inspect" => {
                             let request_id = request.request_id;
@@ -3623,10 +3995,7 @@ fn release_captured_binding(gpu: &mut WindowGpu) -> Option<ReleasedBinding> {
     let control_value = toggle_value
         .as_ref()
         .map(|(value, _)| value.clone())
-        .or_else(|| finished_value
-        .as_ref()
-        .map(|(value, _)| value.clone())
-        )
+        .or_else(|| finished_value.as_ref().map(|(value, _)| value.clone()))
         .or(initial_value);
     let local_presentation = toggle_value
         .map(|(_, presentation)| presentation)
@@ -5440,7 +5809,8 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                         // to the previous frame after scroll, resize, or a
                         // presentation update.
                         let current_hit = gpu.ui.hit_binding_at_pointer();
-                        gpu.input.set_hover_id(current_hit.as_ref().map(|(id, _)| *id));
+                        gpu.input
+                            .set_hover_id(current_hit.as_ref().map(|(id, _)| *id));
                         if gpu.input.pointer_down().is_err() {
                             gpu.last_pointer_outcome = "press_without_semantic_hit".into();
                             gpu.last_pointer_node_path = None;
@@ -6159,6 +6529,27 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                 );
                 let _ = completed.send(value);
             }
+            WindowCommand::UploadExternalImage { source, completed } => {
+                let result = self
+                    .gpu
+                    .as_mut()
+                    .ok_or_else(|| "window_gpu_unavailable".to_string())
+                    .and_then(|gpu| {
+                        gpu.ui
+                            .preload_external_image(&gpu.device, &gpu.queue, &source)
+                            .map(|texture| {
+                                json!({
+                                    "state": "ready",
+                                    "producer": "ui-runtime",
+                                    "consumer": "wgpu-runtime",
+                                    "gpu_owner": "neon-wgpu-runtime-window",
+                                    "texture": texture,
+                                })
+                            })
+                            .map_err(str::to_owned)
+                    });
+                let _ = completed.send(result);
+            }
             WindowCommand::InputDebugProbe {
                 logical_position,
                 physical_position,
@@ -6478,6 +6869,49 @@ fn handle_window_image_debug_snapshot(
             request_id,
             "window_compositor_timeout",
             "window compositor did not report image state",
+            None,
+        ),
+    }
+}
+
+fn handle_window_external_image_upload(
+    runtime: &mut WgpuRuntime,
+    proxy: &EventLoopProxy<WindowCommand>,
+    request: RpcRequest,
+) -> RpcResponse {
+    let upload = match serde_json::from_value::<UiImageUploadRequest>(request.params) {
+        Ok(upload) => upload,
+        Err(error) => {
+            return runtime.reject(
+                request.request_id,
+                "invalid_request",
+                &format!("invalid external image upload request: {error}"),
+                None,
+            );
+        }
+    };
+    let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+    if proxy
+        .send_event(WindowCommand::UploadExternalImage {
+            source: upload.source,
+            completed: completed_tx,
+        })
+        .is_err()
+    {
+        return runtime.reject(
+            request.request_id,
+            "window_compositor_unavailable",
+            "window compositor is unavailable",
+            None,
+        );
+    }
+    match completed_rx.recv_timeout(Duration::from_secs(5)) {
+        Ok(Ok(result)) => runtime.accept(request.request_id, result),
+        Ok(Err(error)) => runtime.reject(request.request_id, &error, &error, None),
+        Err(_) => runtime.reject(
+            request.request_id,
+            "window_compositor_timeout",
+            "window compositor did not upload the external image",
             None,
         ),
     }
@@ -7239,134 +7673,136 @@ fn spawn_window_server(
             move |request| {
                 let mut runtime = runtime.lock().expect("runtime lock");
                 let proxy = &handler_proxy;
-            let mutates_composition = matches!(
-                request.method.as_str(),
-                "wgpu.ui.submit_fragment"
-                    | "wgpu.ui.remove_fragment"
-                    | "wgpu.world.info.configure"
-                    | "wgpu.world.camera.submit_frame"
-                    | "wgpu.world.ui.anchor.submit"
-                    | "wgpu.world.ui.anchor.submit_batch"
-                    | "wgpu.world_ui.lab.camera.register"
-            );
-            let response = if request.method == "wgpu.ai.terrain.generate" {
-                handle_window_ai_generate(&mut runtime, &proxy, request)
-            } else if request.method == "render.surface.open" {
-                handle_window_external_surface_open(&mut runtime, &proxy, request)
-            } else if request.method == "render.surface.acquire" {
-                handle_window_external_surface_acquire(&mut runtime, &proxy, request)
-            } else if request.method == "render.surface.frame" {
-                handle_window_external_surface_frame(&mut runtime, &proxy, request)
-            } else if request.method == "ui.host.pointer_event" {
-                handle_window_external_pointer(&mut runtime, &proxy, request)
-            } else if request.method == "wgpu.ai.model.status" {
-                handle_window_ai_model_status(&mut runtime, &proxy, request.request_id)
-            } else if request.method == "debug.snapshot.get" {
-                handle_window_debug_snapshot(&mut runtime, &proxy, request.request_id)
-            } else if request.method == "debug.window.input.snapshot" {
-                handle_window_input_debug_snapshot(&mut runtime, &proxy, request.request_id)
-            } else if request.method == "debug.window.images" {
-                handle_window_image_debug_snapshot(&mut runtime, &proxy, request.request_id)
-            } else if request.method == "debug.window.input.probe" {
-                handle_window_input_debug_probe(
-                    &mut runtime,
-                    &proxy,
-                    request.request_id,
-                    request.params,
-                )
-            } else if request.method == "debug.window.input.activate" {
-                handle_window_input_debug_activate(
-                    &mut runtime,
-                    &proxy,
-                    request.request_id,
-                    request.params,
-                )
-            } else if request.method == "debug.window.input.activate_target" {
-                handle_window_input_debug_target_command(
-                    &mut runtime,
-                    &proxy,
-                    request.request_id,
-                    request.params,
-                    false,
-                )
-            } else if request.method == "debug.window.input.scroll_to_max" {
-                handle_window_input_debug_target_command(
-                    &mut runtime,
-                    &proxy,
-                    request.request_id,
-                    request.params,
-                    true,
-                )
-            } else if request.method == "debug.window.input.value_gesture" {
-                handle_window_input_debug_value_gesture(
-                    &mut runtime,
-                    &proxy,
-                    request.request_id,
-                    request.params,
-                )
-            } else if request.method == "debug.window.input.drag_gesture" {
-                handle_window_input_debug_drag_gesture(
-                    &mut runtime,
-                    &proxy,
-                    request.request_id,
-                    request.params,
-                )
-            } else if request.method == "wgpu.render.target.capture" {
-                handle_window_target_capture(
-                    &mut runtime,
-                    &proxy,
-                    request.request_id,
-                    request.params,
-                )
-            } else if request.method == "wgpu.world_ui.lab.capture" {
-                handle_world_ui_lab_capture(
-                    &mut runtime,
-                    &proxy,
-                    request.request_id,
-                    request.params,
-                )
-            } else if request.method == "wgpu.world_ui.lab.camera.register" {
-                handle_world_ui_lab_camera_register(&mut runtime, &proxy, request)
-            } else if request.method == "wgpu.world_ui.lab.camera.snapshot" {
-                let status = runtime
-                    .world_ui_lab_camera
-                    .lock()
-                    .ok()
-                    .map(|camera| world_ui_lab_camera_status(&camera));
-                match status {
-                    Some(status) => runtime.accept(request.request_id, status),
-                    None => runtime.reject(
+                let mutates_composition = matches!(
+                    request.method.as_str(),
+                    "wgpu.ui.submit_fragment"
+                        | "wgpu.ui.remove_fragment"
+                        | "wgpu.world.info.configure"
+                        | "wgpu.world.camera.submit_frame"
+                        | "wgpu.world.ui.anchor.submit"
+                        | "wgpu.world.ui.anchor.submit_batch"
+                        | "wgpu.world_ui.lab.camera.register"
+                );
+                let response = if request.method == "wgpu.ai.terrain.generate" {
+                    handle_window_ai_generate(&mut runtime, &proxy, request)
+                } else if request.method == "render.surface.open" {
+                    handle_window_external_surface_open(&mut runtime, &proxy, request)
+                } else if request.method == "render.surface.acquire" {
+                    handle_window_external_surface_acquire(&mut runtime, &proxy, request)
+                } else if request.method == "render.surface.frame" {
+                    handle_window_external_surface_frame(&mut runtime, &proxy, request)
+                } else if request.method == "ui.host.pointer_event" {
+                    handle_window_external_pointer(&mut runtime, &proxy, request)
+                } else if request.method == "wgpu.ai.model.status" {
+                    handle_window_ai_model_status(&mut runtime, &proxy, request.request_id)
+                } else if request.method == "debug.snapshot.get" {
+                    handle_window_debug_snapshot(&mut runtime, &proxy, request.request_id)
+                } else if request.method == "debug.window.input.snapshot" {
+                    handle_window_input_debug_snapshot(&mut runtime, &proxy, request.request_id)
+                } else if request.method == "debug.window.images" {
+                    handle_window_image_debug_snapshot(&mut runtime, &proxy, request.request_id)
+                } else if request.method == "wgpu.ui.image.upload" {
+                    handle_window_external_image_upload(&mut runtime, &proxy, request)
+                } else if request.method == "debug.window.input.probe" {
+                    handle_window_input_debug_probe(
+                        &mut runtime,
+                        &proxy,
                         request.request_id,
-                        "world_ui_lab_camera_unavailable",
-                        "camera controller is unavailable",
-                        None,
-                    ),
+                        request.params,
+                    )
+                } else if request.method == "debug.window.input.activate" {
+                    handle_window_input_debug_activate(
+                        &mut runtime,
+                        &proxy,
+                        request.request_id,
+                        request.params,
+                    )
+                } else if request.method == "debug.window.input.activate_target" {
+                    handle_window_input_debug_target_command(
+                        &mut runtime,
+                        &proxy,
+                        request.request_id,
+                        request.params,
+                        false,
+                    )
+                } else if request.method == "debug.window.input.scroll_to_max" {
+                    handle_window_input_debug_target_command(
+                        &mut runtime,
+                        &proxy,
+                        request.request_id,
+                        request.params,
+                        true,
+                    )
+                } else if request.method == "debug.window.input.value_gesture" {
+                    handle_window_input_debug_value_gesture(
+                        &mut runtime,
+                        &proxy,
+                        request.request_id,
+                        request.params,
+                    )
+                } else if request.method == "debug.window.input.drag_gesture" {
+                    handle_window_input_debug_drag_gesture(
+                        &mut runtime,
+                        &proxy,
+                        request.request_id,
+                        request.params,
+                    )
+                } else if request.method == "wgpu.render.target.capture" {
+                    handle_window_target_capture(
+                        &mut runtime,
+                        &proxy,
+                        request.request_id,
+                        request.params,
+                    )
+                } else if request.method == "wgpu.world_ui.lab.capture" {
+                    handle_world_ui_lab_capture(
+                        &mut runtime,
+                        &proxy,
+                        request.request_id,
+                        request.params,
+                    )
+                } else if request.method == "wgpu.world_ui.lab.camera.register" {
+                    handle_world_ui_lab_camera_register(&mut runtime, &proxy, request)
+                } else if request.method == "wgpu.world_ui.lab.camera.snapshot" {
+                    let status = runtime
+                        .world_ui_lab_camera
+                        .lock()
+                        .ok()
+                        .map(|camera| world_ui_lab_camera_status(&camera));
+                    match status {
+                        Some(status) => runtime.accept(request.request_id, status),
+                        None => runtime.reject(
+                            request.request_id,
+                            "world_ui_lab_camera_unavailable",
+                            "camera controller is unavailable",
+                            None,
+                        ),
+                    }
+                } else {
+                    runtime.handle(request)
+                };
+                if mutates_composition && response.status == RpcStatus::Accepted {
+                    let send = proxy.send_event(WindowCommand::Fragments {
+                        composition_revision: runtime.diagnostics().graph_revision,
+                        fragments: runtime.fragments_snapshot(),
+                        // Composition is applied by the window event loop. Do not
+                        // make the control-plane request wait for a frame or GPU
+                        // submission; visual feedback must continue independently
+                        // of RPC response latency.
+                        applied: None,
+                    });
+                    if send.is_err() {
+                        return runtime.reject(
+                            response.request_id,
+                            "window_compositor_unavailable",
+                            "window compositor is unavailable",
+                            None,
+                        );
+                    }
                 }
-            } else {
-                runtime.handle(request)
-            };
-            if mutates_composition && response.status == RpcStatus::Accepted {
-                let send = proxy.send_event(WindowCommand::Fragments {
-                    composition_revision: runtime.diagnostics().graph_revision,
-                    fragments: runtime.fragments_snapshot(),
-                    // Composition is applied by the window event loop. Do not
-                    // make the control-plane request wait for a frame or GPU
-                    // submission; visual feedback must continue independently
-                    // of RPC response latency.
-                    applied: None,
-                });
-                if send.is_err() {
-                    return runtime.reject(
-                        response.request_id,
-                        "window_compositor_unavailable",
-                        "window compositor is unavailable",
-                        None,
-                    );
-                }
-            }
-            response
-        },
-        |request| request.method == "service.shutdown",
+                response
+            },
+            |request| request.method == "service.shutdown",
         ) {
             eprintln!("window RPC server request failed: {error}");
         }
@@ -7737,6 +8173,8 @@ pub struct WgpuRuntime {
     receipts: HashMap<RequestId, CommandReceipt>,
     idempotent_responses: HashMap<String, RpcResponse>,
     resources: HashMap<u64, UiResourceRecord>,
+    external_images: HashMap<String, ExternalImageRecord>,
+    external_image_generation: u64,
     interaction_traces: Arc<Mutex<InteractionTraceStore>>,
     world_bridge: WorldInformationBridge,
     world_ui_lab_camera: Arc<Mutex<WorldUiLabCameraController>>,
@@ -7765,6 +8203,8 @@ impl WgpuRuntime {
             receipts: HashMap::new(),
             idempotent_responses: HashMap::new(),
             resources: HashMap::new(),
+            external_images: HashMap::new(),
+            external_image_generation: 0,
             interaction_traces: Arc::new(Mutex::new(InteractionTraceStore::new())),
             world_bridge: WorldInformationBridge::new(),
             world_ui_lab_camera: Arc::new(Mutex::new(WorldUiLabCameraController::default())),
@@ -7808,6 +8248,8 @@ impl WgpuRuntime {
             CAPABILITY_UI_SEMANTIC_EVENT.into(),
             CAPABILITY_UI_PROGRAM_SEMANTIC_EVENT.into(),
             CAPABILITY_UI_RENDER_SURFACE.into(),
+            "wgpu.ui.image.upload.v1".into(),
+            "wgpu.ui.image.inspect.v1".into(),
             CAPABILITY_EXTERNAL_HOST_BACKEND_MATCH.into(),
             "wgpu.world.info.bridge".into(),
             "wgpu.world.ui.anchor.batch.v1".into(),
@@ -8321,6 +8763,165 @@ impl WgpuRuntime {
         self.accept(request_id, json!({"job_id": job_id, "state": "ready"}))
     }
 
+    fn upload_external_image(
+        &mut self,
+        request: &RpcRequest,
+        upload: UiImageUploadRequest,
+    ) -> RpcResponse {
+        let request_id = request.request_id.clone();
+        let Some(idempotency_key) = request.idempotency_key.clone() else {
+            return self.reject(
+                request_id,
+                "invalid_request",
+                "idempotency_key is required",
+                None,
+            );
+        };
+        if let Some(response) = self.idempotent_responses.get(&idempotency_key) {
+            let mut response = response.clone();
+            response.request_id = request_id;
+            return response;
+        }
+        let source = upload.source;
+        let Some(byte_len) = (source.width as usize)
+            .checked_mul(source.height as usize)
+            .and_then(|pixels| pixels.checked_mul(4))
+        else {
+            return self.reject(
+                request_id,
+                "invalid_image_bytes",
+                "image dimensions overflow",
+                None,
+            );
+        };
+        if source.image_id.trim().is_empty()
+            || source.media_type != "application/x-neon-rgba8"
+            || source.width == 0
+            || source.height == 0
+            || source.width > EXTERNAL_IMAGE_ATLAS_WIDTH - EXTERNAL_IMAGE_ATLAS_PADDING * 2
+            || source.bytes.len() != byte_len
+        {
+            return self.reject(
+                request_id,
+                "invalid_image_source",
+                "external image must be non-empty RGBA8 with matching dimensions",
+                None,
+            );
+        }
+        let image_id = source.image_id.clone();
+        self.external_images.insert(
+            image_id.clone(),
+            ExternalImageRecord {
+                source,
+                texture: UiImageTextureRef {
+                    image_id: String::new(),
+                    texture_index: 0,
+                    generation: 0,
+                    atlas_size: [EXTERNAL_IMAGE_ATLAS_WIDTH, 1],
+                    region: UiImageTextureRegion {
+                        x: 0,
+                        y: 0,
+                        width: 0,
+                        height: 0,
+                    },
+                    uv: [0.0; 4],
+                },
+            },
+        );
+        self.rebuild_external_image_residency();
+        self.graph_revision = Revision(self.graph_revision.0.saturating_add(1));
+        let texture = self
+            .external_images
+            .get(&image_id)
+            .map(|record| record.texture.clone())
+            .expect("uploaded external image has residency");
+        let response = self.accept(
+            request_id,
+            json!({
+                "state": "ready",
+                "texture": texture,
+                "producer": "ui-runtime",
+                "consumer": "wgpu-runtime"
+            }),
+        );
+        self.idempotent_responses
+            .insert(idempotency_key, response.clone());
+        response
+    }
+
+    fn rebuild_external_image_residency(&mut self) {
+        let mut keys = self.external_images.keys().cloned().collect::<Vec<_>>();
+        keys.sort();
+        self.external_image_generation = self.external_image_generation.saturating_add(1).max(1);
+        let generation = self.external_image_generation;
+        let mut x = EXTERNAL_IMAGE_ATLAS_PADDING;
+        let mut y = EXTERNAL_IMAGE_ATLAS_PADDING;
+        let mut row_height = 0;
+        let mut placements = Vec::with_capacity(keys.len());
+        for key in &keys {
+            let source = &self.external_images[key].source;
+            if x + source.width + EXTERNAL_IMAGE_ATLAS_PADDING > EXTERNAL_IMAGE_ATLAS_WIDTH {
+                x = EXTERNAL_IMAGE_ATLAS_PADDING;
+                y = y.saturating_add(row_height + EXTERNAL_IMAGE_ATLAS_PADDING);
+                row_height = 0;
+            }
+            placements.push((key.clone(), x, y));
+            x = x.saturating_add(source.width + EXTERNAL_IMAGE_ATLAS_PADDING);
+            row_height = row_height.max(source.height);
+        }
+        let atlas_height = y
+            .saturating_add(row_height + EXTERNAL_IMAGE_ATLAS_PADDING)
+            .max(1);
+        for (texture_index, (key, x, y)) in placements.into_iter().enumerate() {
+            let source = self.external_images[&key].source.clone();
+            self.external_images
+                .get_mut(&key)
+                .expect("external image exists")
+                .texture = UiImageTextureRef {
+                image_id: key.clone(),
+                texture_index: texture_index as u32,
+                generation,
+                atlas_size: [EXTERNAL_IMAGE_ATLAS_WIDTH, atlas_height],
+                region: UiImageTextureRegion {
+                    x,
+                    y,
+                    width: source.width,
+                    height: source.height,
+                },
+                uv: [
+                    (x as f32 + 0.5) / EXTERNAL_IMAGE_ATLAS_WIDTH as f32,
+                    (y as f32 + 0.5) / atlas_height as f32,
+                    (source.width as f32 - 1.0) / EXTERNAL_IMAGE_ATLAS_WIDTH as f32,
+                    (source.height as f32 - 1.0) / atlas_height as f32,
+                ],
+            };
+        }
+    }
+
+    fn external_image_inspect(&mut self, request_id: RequestId) -> RpcResponse {
+        let mut images = self
+            .external_images
+            .values()
+            .map(|record| {
+                json!({
+                    "image_id": record.texture.image_id,
+                    "texture_index": record.texture.texture_index,
+                    "generation": record.texture.generation,
+                    "atlas_size": record.texture.atlas_size,
+                    "region": record.texture.region,
+                    "uv": record.texture.uv,
+                    "width": record.source.width,
+                    "height": record.source.height,
+                })
+            })
+            .collect::<Vec<_>>();
+        images.sort_by(|left, right| left["image_id"].as_str().cmp(&right["image_id"].as_str()));
+        self.accept(
+            request_id,
+            json!({"generation": self.external_image_generation, "images": images}),
+        )
+    }
+
     fn fail_resource(
         &mut self,
         request_id: RequestId,
@@ -8440,6 +9041,18 @@ impl WgpuRuntime {
             "wgpu.resource.inspect" => self.resource_inspect(request_id),
             "wgpu.ui.resource.preload" => self.resource_preload(request_id, request.params),
             "wgpu.resource.wait_ready" => self.resource_wait_ready(request_id, request.params),
+            "wgpu.ui.image.upload" => {
+                match serde_json::from_value::<UiImageUploadRequest>(request.params.clone()) {
+                    Ok(upload) => self.upload_external_image(&request, upload),
+                    Err(_) => self.reject(
+                        request_id,
+                        "invalid_request",
+                        "invalid external image upload request",
+                        None,
+                    ),
+                }
+            }
+            "wgpu.ui.image.inspect" => self.external_image_inspect(request_id),
             "debug.snapshot.get" => self.accept(request_id, json!(self.debug_snapshot())),
             "debug.command.get" => self.command_get(request_id, request.params),
             "debug.trace.query" => self.trace_query(request_id, request.params),
@@ -8470,6 +9083,7 @@ impl WgpuRuntime {
                 | "wgpu.world.camera.submit_frame"
                 | "wgpu.world.ui.anchor.submit"
                 | "wgpu.world.ui.anchor.submit_batch"
+                | "wgpu.ui.image.upload"
         ) && response.status == RpcStatus::Accepted
             && let Some(idempotency_key) = request.idempotency_key
         {
@@ -9926,10 +10540,8 @@ mod tests {
         assert!((bounds.y - 350.0).abs() < 0.5, "y was {}", bounds.y);
         assert!((depth - 0.05).abs() < f32::EPSILON, "depth was {depth}");
         let (device, queue) = test_device("neon3-world-ui-id-target");
-        let mut id_renderer = ui_renderer::UiWgpuRenderer::new(
-            &device,
-            wgpu::TextureFormat::Rgba8Unorm,
-        );
+        let mut id_renderer =
+            ui_renderer::UiWgpuRenderer::new(&device, wgpu::TextureFormat::Rgba8Unorm);
         let pixels = ui_renderer::render_hit_ids_with_renderer_for_test(
             &mut id_renderer,
             &device,
@@ -9939,8 +10551,7 @@ mod tests {
         );
         let hit_id = pixels[350 * 1280 + 640];
         assert_ne!(
-            hit_id,
-            RENDER_HIT_NONE,
+            hit_id, RENDER_HIT_NONE,
             "the projected WorldUi panel must write a non-clear ID"
         );
         assert_eq!(

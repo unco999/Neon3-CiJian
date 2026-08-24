@@ -23,9 +23,9 @@ use std::time::Duration;
 use neon_protocol::{RequestId, RpcError, RpcRequest, RpcResponse, RpcStatus};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, oneshot, Notify, Semaphore};
+use tokio::sync::{Notify, Semaphore, mpsc, oneshot};
 
-use crate::{encode_frame, ensure_loopback, map_io_error, TransportError, DEFAULT_MAX_FRAME_SIZE};
+use crate::{DEFAULT_MAX_FRAME_SIZE, TransportError, encode_frame, ensure_loopback, map_io_error};
 
 /// Transport-independent control-plane contract. `neon-protocol` types and the
 /// `neon3.rpc` semantics are unchanged; this trait only abstracts the transport
@@ -60,7 +60,10 @@ async fn read_frame<R: AsyncRead + Unpin>(
         });
     }
     let mut payload = vec![0_u8; length];
-    reader.read_exact(&mut payload).await.map_err(map_io_error)?;
+    reader
+        .read_exact(&mut payload)
+        .await
+        .map_err(map_io_error)?;
     Ok(payload)
 }
 
@@ -357,11 +360,7 @@ impl AsyncRpcServer {
         self.serve_inner(handler, |_| false).await
     }
 
-    async fn serve_inner<F, Fut, S>(
-        self,
-        handler: F,
-        should_stop: S,
-    ) -> Result<(), TransportError>
+    async fn serve_inner<F, Fut, S>(self, handler: F, should_stop: S) -> Result<(), TransportError>
     where
         F: Fn(RpcRequest) -> Fut + Send + Sync + Clone + 'static,
         Fut: Future<Output = RpcResponse> + Send + 'static,
@@ -380,9 +379,15 @@ impl AsyncRpcServer {
             let stop = Arc::clone(&stop);
             let max_frame_size = self.max_frame_size;
             tokio::spawn(async move {
-                let _ =
-                    handle_connection(stream, max_frame_size, handler, should_stop, stop, semaphore)
-                        .await;
+                let _ = handle_connection(
+                    stream,
+                    max_frame_size,
+                    handler,
+                    should_stop,
+                    stop,
+                    semaphore,
+                )
+                .await;
             });
         }
         Ok(())
@@ -485,8 +490,11 @@ impl BlockingRpcServer {
             .enable_all()
             .build()
             .map_err(map_io_error)?;
-        let server =
-            runtime.block_on(AsyncRpcServer::bind_with(endpoint, max_frame_size, max_concurrent))?;
+        let server = runtime.block_on(AsyncRpcServer::bind_with(
+            endpoint,
+            max_frame_size,
+            max_concurrent,
+        ))?;
         Ok(Self { runtime, server })
     }
 

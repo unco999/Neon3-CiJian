@@ -632,6 +632,24 @@ pub fn lower_nui_flow_effects(document: &NuiFlowDocument) -> Vec<UiEffect> {
             },
         })
         .collect::<Vec<_>>();
+    effects.extend(
+        document
+            .ir
+            .image_resources
+            .iter()
+            .filter(|(_, resource_key)| {
+                document
+                    .ir
+                    .resources
+                    .iter()
+                    .find(|resource| resource.key == **resource_key)
+                    .is_some_and(|resource| resource.asset_ref.is_none())
+            })
+            .map(|(node_key, resource_key)| UiEffect::ImageBinding {
+                node_id: UiNodeId(node_key.clone()),
+                image_id: resource_key.clone(),
+            }),
+    );
     effects.extend(document.drags.iter().map(|drag| UiEffect::DragBinding {
         binding: UiDragBinding {
             key: drag.key.clone(),
@@ -2018,7 +2036,6 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
         ));
     }
     let is_render_surface = kind == UiNodeKind::RenderSurface;
-    let is_image = kind == UiNodeKind::Image;
     let mut node = UiNode {
         node_id: UiNodeId(parts[key_index].into()),
         kind,
@@ -2033,12 +2050,7 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
         enabled: true,
         text_key: None,
         text: None,
-        image: is_image.then(|| AssetRef {
-            project_id: "flow-unresolved".into(),
-            asset_id: 0,
-            revision: Revision(0),
-            kind: "image".into(),
-        }),
+        image: None,
         surface: None,
         style: UiStyle::default(),
         enter_transition: None,
@@ -2095,9 +2107,9 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
             "column" => node.layout.as_mut().unwrap().mode = UiLayoutMode::Column,
             "overlay" => node.layout.as_mut().unwrap().mode = UiLayoutMode::Overlay,
             "x" | "y" | "w" | "h" | "minw" | "maxw" | "grow" | "shrink" | "basis" | "gap"
-            | "pad" | "fill" | "line" | "ink" | "value" | "checked" | "selected" | "state"
-            | "numeric" | "scroll" | "enabled" | "visible" | "event" | "token" | "align"
-            | "clip" | "justify" => {
+            | "pad" | "fill" | "line" | "ink" | "opacity" | "radius" | "border_width" | "value"
+            | "checked" | "selected" | "state" | "numeric" | "scroll" | "enabled" | "visible"
+            | "event" | "token" | "align" | "clip" | "justify" => {
                 let value = *parts.get(index + 1).ok_or_else(|| {
                     error(
                         "nui_flow_missing_value",
@@ -2803,6 +2815,15 @@ fn parse_attribute(
         }
         "line" => {
             node.style.border_color = color(value, line)?;
+        }
+        "opacity" => {
+            node.style.opacity = number(value, line)?.clamp(0.0, 1.0);
+        }
+        "radius" => {
+            node.style.corner_radius = number(value, line)?.max(0.0);
+        }
+        "border_width" => {
+            node.style.border_width = number(value, line)?.max(0.0);
         }
         "ink" => {
             if !value.starts_with("token:") {
@@ -3631,6 +3652,36 @@ panel workspace row gap 8
     }
 
     #[test]
+    fn css_like_visual_attributes_are_parsed_into_style() {
+        let document = parse_nui_flow(
+            "surface root column\n  button action w 120 h 30 fill #102030 line #80D8C0 opacity 0.75 radius 6 border_width 2 value \"Go\"\n",
+        )
+        .expect("CSS-like visual attributes must parse");
+        let button = &document.ir.root.children[0];
+        assert_eq!(
+            button.style.background_color,
+            [
+                0x10 as f32 / 255.0,
+                0x20 as f32 / 255.0,
+                0x30 as f32 / 255.0,
+                1.0
+            ]
+        );
+        assert_eq!(
+            button.style.border_color,
+            [
+                0x80 as f32 / 255.0,
+                0xD8 as f32 / 255.0,
+                0xC0 as f32 / 255.0,
+                1.0
+            ]
+        );
+        assert_eq!(button.style.opacity, 0.75);
+        assert_eq!(button.style.corner_radius, 6.0);
+        assert_eq!(button.style.border_width, 2.0);
+    }
+
+    #[test]
     fn lowers_workbench_with_stable_keys_and_bindings() {
         let document = parse_nui_flow(WORKBENCH).expect("valid Flow workbench");
         assert_eq!(document.ir.surface_id.0, "surface.editor.terrain");
@@ -3797,6 +3848,34 @@ panel workspace row gap 8
             Some(asset.clone())
         );
         assert_eq!(document.ir.resources[0].asset_ref, Some(asset));
+        assert!(
+            !lower_nui_flow_effects(&document)
+                .iter()
+                .any(|effect| matches!(effect, UiEffect::ImageBinding { .. }))
+        );
+    }
+
+    #[test]
+    fn image_resource_without_asset_ref_lowers_to_external_image_binding() {
+        let document = parse_nui_flow(
+            "resource preview image\nsurface root\n  image thumbnail resource preview\n",
+        )
+        .unwrap();
+        assert!(
+            find_node(&document.ir.root, "thumbnail")
+                .expect("image node exists")
+                .image
+                .is_none()
+        );
+        assert!(
+            lower_nui_flow_effects(&document)
+                .iter()
+                .any(|effect| matches!(
+                    effect,
+                    UiEffect::ImageBinding { node_id, image_id }
+                        if node_id.0 == "thumbnail" && image_id == "preview"
+                ))
+        );
     }
 
     #[test]

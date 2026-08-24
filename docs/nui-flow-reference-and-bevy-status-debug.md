@@ -132,6 +132,9 @@ scroll overlay branch repeat template data_grid dialog tooltip
 - `slider`、`drag_value`、`scrollbar`、`progress_bar`：numeric 状态；`progress_bar` 是 display-only，不接收 pointer input。
 - `combo`、`dropdown`、`tabs`、`list_box`：enum state。
 - `image`：绑定 `resource <key> image`。
+- 外部引擎 Image：Flow 只声明 `image` 节点；图片 bytes 通过 `ui.image.upload` 进入
+  `neon-ui-runtime`，再由 `wgpu.ui.image.upload` 进入唯一 WGPU owner。WGPU 返回
+  `texture_index`、`generation`、`region` 和 `uv`，不返回原生 GPU handle，也不经过 projectd。
 - `render`：绑定 `resource <key> render_surface`。
 - `scroll`、`overlay`、`dialog`、`tooltip`：布局和局部 presentation。
 - `repeat`、`template`：有容量上限的 bounded rows。
@@ -334,6 +337,38 @@ ui_program_stale_input_revision
 | `kanban-reparent-workbench.nui` | statechart、drag/drop、accepted/rejected presentation branch、revisioned reparent workflow |
 | `scroll-view-demo.nui` | scroll container、clip/layout overflow |
 | `virtual-list-demo.nui` | data grid、bounded capacity、row height、overscan、column schema |
+
+外部 Image 的完整协议案例：
+
+```text
+UiImageUploadRequest {
+  source: {
+    image_id: "engine-image-01",
+    media_type: "application/x-neon-rgba8",
+    width: 2,
+    height: 2,
+    bytes: [...]
+  }
+}
+
+UiEffect::ImageBinding {
+  node_id: "external-image",
+  image_id: "engine-image-01"
+}
+
+UiImageTextureRef {
+  texture_index: 0,
+  generation: 1,
+  region: { x: 1, y: 1, width: 2, height: 2 },
+  uv: [0.0007324, 0.375, 0.0004883, 0.25]
+}
+```
+
+执行验收：
+
+```powershell
+cargo run -p neon-ui-runtime --bin image_resource_probe
+```
 
 ## 推荐的 status 写法
 

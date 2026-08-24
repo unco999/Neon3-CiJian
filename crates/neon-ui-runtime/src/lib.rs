@@ -16,7 +16,7 @@ use neon_protocol::{
     InteractionSemanticTarget, InteractionTraceError, InteractionTraceOutcome,
     InteractionTraceQuery, InteractionTraceRecord, InteractionTraceStage, PROTOCOL_VERSION,
     ProtocolVersion, RequestId, Revision, RpcError, RpcRequest, RpcResponse, RpcStatus,
-    ServiceDescription, ServiceHealth, ServiceName,
+    ServiceDescription, ServiceHealth, ServiceName, UiImageUploadRequest,
 };
 use neon_ui_schema::{
     ERROR_DATA_GRID_CELL_INVALID, ERROR_FRAGMENT_REVISION_STALE, ERROR_INPUT_SEQUENCE_STALE,
@@ -1342,8 +1342,14 @@ fn apply_transitions_to_fragment(fragment: &mut UiFragment, motions: &[PendingSt
         // large active set and can turn a single panel resize into dozens of
         // unnecessary transition jobs.
         let motion = motions.iter().find(|motion| {
-            motion.previous_styles.iter().any(|style| style.node_key == node.node_id.0)
-                || motion.target_styles.iter().any(|style| style.node_key == node.node_id.0)
+            motion
+                .previous_styles
+                .iter()
+                .any(|style| style.node_key == node.node_id.0)
+                || motion
+                    .target_styles
+                    .iter()
+                    .any(|style| style.node_key == node.node_id.0)
         });
         let has_style = motion.is_some();
         let motion_scope = in_motion_scope || has_style;
@@ -2758,6 +2764,7 @@ impl UiRuntime {
             capabilities: vec![
                 "ui.static_fragment.submit.v1".into(),
                 "ui.fragment.submit.v1".into(),
+                "ui.image.upload.v1".into(),
                 "ui.semantic_input.v1".into(),
                 "ui.intent_dispatch.v1".into(),
                 "ui.surface.machine.v1".into(),
@@ -3044,6 +3051,12 @@ impl UiRuntime {
                     .unwrap_or_else(|error| {
                         runtime.rejected(request_id, "service_unavailable", &error.to_string())
                     })
+            } else if request.method == "ui.image.upload" {
+                runtime
+                    .forward_image_upload(wgpu_endpoint, request)
+                    .unwrap_or_else(|error| {
+                        runtime.rejected(request_id, "service_unavailable", &error.to_string())
+                    })
             } else if request.method == "ui.flow.submit" {
                 eprintln!(
                     "[neon-ui-runtime] received ui.flow.submit request={}",
@@ -3089,16 +3102,10 @@ impl UiRuntime {
                 // wait. Give already accepted host forwards a bounded window
                 // to publish their final fragments; pointer requests never
                 // enter this wait path.
-                let deadline = std::time::Instant::now()
-                    + std::time::Duration::from_secs(2);
-                while active_host_forwards > 0
-                    || !runtime.pending_host_forwards.is_empty()
-                {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                while active_host_forwards > 0 || !runtime.pending_host_forwards.is_empty() {
                     active_host_forwards = active_host_forwards.saturating_sub(
-                        runtime.poll_host_forward_completions(
-                            wgpu_endpoint,
-                            &host_completion_rx,
-                        ),
+                        runtime.poll_host_forward_completions(wgpu_endpoint, &host_completion_rx),
                     );
                     if active_host_forwards == 0 {
                         active_host_forwards +=
@@ -3300,7 +3307,9 @@ impl UiRuntime {
             Ok(inbound) => inbound,
             Err(_) => {
                 let event: UiSemanticEvent = serde_json::from_value(request.params.clone())
-                    .map_err(|_| TransportError::Io(std::io::Error::other("invalid UI host inbound")))?;
+                    .map_err(|_| {
+                        TransportError::Io(std::io::Error::other("invalid UI host inbound"))
+                    })?;
                 self.renderer_event_to_host_inbound_value(event)?
             }
         };
@@ -3514,15 +3523,20 @@ impl UiRuntime {
         // The state machine is advanced optimistically at enqueue time so
         // the next pointer dispatches from the post-transition state.
         if self.async_host_forward && matches!(&inbound, UiHostInbound::SemanticIntent { .. }) {
-            self.pending_host_forwards.push_back(PendingHostForward { prep });
+            self.pending_host_forwards
+                .push_back(PendingHostForward { prep });
             if let Some(next) = next_flow_state_machine {
                 self.flow_state_machine = Some(next);
             }
-            let response = self.accepted(request_id, json!({
-                "state": "accepted",
-                "semantic_intent": semantic_feedback,
-            }));
-            self.idempotent_responses.insert(idempotency_key, response.clone());
+            let response = self.accepted(
+                request_id,
+                json!({
+                    "state": "accepted",
+                    "semantic_intent": semantic_feedback,
+                }),
+            );
+            self.idempotent_responses
+                .insert(idempotency_key, response.clone());
             return Ok(response);
         }
         // Sync path: host RPC + publication application synchronously.
@@ -3762,8 +3776,7 @@ impl UiRuntime {
                     InteractionTraceOutcome::Rejected,
                     Some(InteractionTraceError {
                         code: "ui_host_invalid_fragment".into(),
-                        message: "host publication cannot be applied to the active fragment"
-                            .into(),
+                        message: "host publication cannot be applied to the active fragment".into(),
                     }),
                     None,
                 );
@@ -3852,10 +3865,7 @@ impl UiRuntime {
         Ok(response)
     }
 
-    fn start_next_pending_host_forward(
-        &mut self,
-        sender: Sender<HostForwardCompletion>,
-    ) -> usize {
+    fn start_next_pending_host_forward(&mut self, sender: Sender<HostForwardCompletion>) -> usize {
         let Some(pending) = self.pending_host_forwards.pop_front() else {
             return 0;
         };
@@ -3908,10 +3918,7 @@ impl UiRuntime {
                             program_revision: adapter.program().revision.clone(),
                             expected_input_revision: input_revision,
                             request_id: forwarded.request_id.0.clone(),
-                            idempotency_key: forwarded
-                                .idempotency_key
-                                .clone()
-                                .unwrap_or_default(),
+                            idempotency_key: forwarded.idempotency_key.clone().unwrap_or_default(),
                             changes: Vec::new(),
                         },
                         grid_inputs: Vec::new(),
@@ -4192,6 +4199,94 @@ impl UiRuntime {
                 response.error.as_ref().map(|error| error.code.clone()),
             );
             self.journal.append(TraceLevel::Warn, EVENT_COMMAND_REJECTED, Some(request.request_id.clone()), None, None, None, Some(self.debug_snapshot().revision), response.revision, json!({"target": "wgpu-runtime", "state": "rejected", "code": response.error.as_ref().map(|error| error.code.clone())}));
+        }
+        Ok(response)
+    }
+
+    /// Accepts an external image source at the UI boundary and forwards it to
+    /// the sole WGPU owner. UI Runtime does not create or retain GPU objects.
+    pub fn forward_image_upload(
+        &mut self,
+        wgpu_endpoint: SocketAddr,
+        request: RpcRequest,
+    ) -> Result<RpcResponse, TransportError> {
+        let request_id = request.request_id.clone();
+        let Some(idempotency_key) = request.idempotency_key.clone() else {
+            return Ok(self.rejected(request_id, "invalid_request", "idempotency_key is required"));
+        };
+        if let Some(cached) = self.idempotent_responses.get(&idempotency_key) {
+            let mut response = cached.clone();
+            response.request_id = request_id;
+            return Ok(response);
+        }
+        let upload: UiImageUploadRequest =
+            match serde_json::from_value::<UiImageUploadRequest>(request.params.clone()) {
+                Ok(upload) if !upload.source.image_id.trim().is_empty() => upload,
+                _ => {
+                    return Ok(self.rejected(
+                        request_id,
+                        "invalid_request",
+                        "invalid UI image upload request",
+                    ));
+                }
+            };
+        if upload.source.width == 0 || upload.source.height == 0 {
+            return Ok(self.rejected(
+                request_id,
+                "invalid_image_dimensions",
+                "image dimensions must be non-zero",
+            ));
+        }
+        self.record_receipt(&request.request_id, CommandState::Received, None);
+        self.journal.append(
+            TraceLevel::Info,
+            EVENT_COMMAND_RECEIVED,
+            Some(request.request_id.clone()),
+            None,
+            None,
+            Some(upload.source.image_id.clone()),
+            request.expected_revision,
+            None,
+            json!({
+                "method": "ui.image.upload",
+                "image_id": upload.source.image_id,
+                "width": upload.source.width,
+                "height": upload.source.height
+            }),
+        );
+        let forwarded = RpcRequest {
+            protocol: "neon3.rpc".into(),
+            version: PROTOCOL_VERSION,
+            request_id: request.request_id.clone(),
+            client: self.client.clone(),
+            target: ServiceName("wgpu-runtime".into()),
+            method: "wgpu.ui.image.upload".into(),
+            params: serde_json::to_value(upload).expect("UI image upload serializes"),
+            expected_revision: request.expected_revision,
+            idempotency_key: Some(idempotency_key.clone()),
+        };
+        let response = RpcClient::connect(wgpu_endpoint)?.call(&forwarded)?;
+        if response.status == RpcStatus::Accepted {
+            self.record_receipt(&request.request_id, CommandState::Accepted, None);
+            self.journal.append(
+                TraceLevel::Info,
+                EVENT_COMMAND_ACCEPTED,
+                Some(request.request_id.clone()),
+                None,
+                None,
+                Some("wgpu-runtime".into()),
+                request.expected_revision,
+                response.revision,
+                json!({"method": "ui.image.upload", "state": "accepted"}),
+            );
+            self.idempotent_responses
+                .insert(idempotency_key, response.clone());
+        } else {
+            self.record_receipt(
+                &request.request_id,
+                CommandState::Rejected,
+                response.error.as_ref().map(|error| error.code.clone()),
+            );
         }
         Ok(response)
     }
@@ -8045,8 +8140,22 @@ mod tests {
         };
         let motions = vec![motion("panel-a", 180), motion("panel-b", 320)];
         apply_transitions_to_fragment(&mut fragment, &motions);
-        assert_eq!(fragment.root.children[0].enter_transition.as_ref().unwrap().duration_ms, 180);
-        assert_eq!(fragment.root.children[1].enter_transition.as_ref().unwrap().duration_ms, 320);
+        assert_eq!(
+            fragment.root.children[0]
+                .enter_transition
+                .as_ref()
+                .unwrap()
+                .duration_ms,
+            180
+        );
+        assert_eq!(
+            fragment.root.children[1]
+                .enter_transition
+                .as_ref()
+                .unwrap()
+                .duration_ms,
+            320
+        );
     }
 
     #[test]
@@ -8184,12 +8293,20 @@ mod tests {
             }],
         };
         let mut pending = Vec::new();
-        for selected in [motion("panel-a", 100), motion("panel-b", 150), motion("panel-a", 200)] {
+        for selected in [
+            motion("panel-a", 100),
+            motion("panel-b", 150),
+            motion("panel-a", 200),
+        ] {
             let scope_key = selected.scope_key();
             pending.retain(|existing: &PendingStateMotion| existing.scope_key() != scope_key);
             pending.push(selected);
         }
-        assert_eq!(pending.len(), 2, "A2 and B1 must remain after A1 is replaced");
+        assert_eq!(
+            pending.len(),
+            2,
+            "A2 and B1 must remain after A1 is replaced"
+        );
         let scopes = pending
             .iter()
             .map(|motion| motion.scope_key())
@@ -8207,14 +8324,12 @@ mod tests {
 
     #[test]
     fn presentation_starts_before_host_response() {
-        use std::sync::atomic::{AtomicU64, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
         use std::time::Duration;
 
-        let document = parse_nui_flow(include_str!(
-            "../tests/fixtures/ui/state-motion.nui"
-        ))
-        .unwrap();
+        let document =
+            parse_nui_flow(include_str!("../tests/fixtures/ui/state-motion.nui")).unwrap();
         let program = compile_nui_flow_program(
             &document,
             UiProgramRevision {
@@ -8318,7 +8433,10 @@ mod tests {
                 let revision = submission.fragment.revision;
                 fn has_transition(node: &UiNode, node_id: &str) -> bool {
                     (node.node_id.0 == node_id && node.enter_transition.is_some())
-                        || node.children.iter().any(|child| has_transition(child, node_id))
+                        || node
+                            .children
+                            .iter()
+                            .any(|child| has_transition(child, node_id))
                 }
                 if revision == Revision(2) {
                     assert!(has_transition(&submission.fragment.root, "status-root"));

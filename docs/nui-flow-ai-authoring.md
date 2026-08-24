@@ -32,6 +32,33 @@ new input snapshot.
 The complex reference fixture is
 `tests/fixtures/ui/asset-review-workbench.nui`.
 
+### External Image Case
+
+An external engine does not put image bytes, file paths, or GPU handles in NUI
+Flow. It declares the Image node and a stable binding effect in the fragment,
+then sends the source bytes through the public RPC chain:
+
+```text
+external engine -> ui.image.upload { image_id, media_type, width, height, bytes }
+ui-runtime      -> wgpu.ui.image.upload
+wgpu-runtime    -> { texture_index, generation, atlas_size, region, uv }
+```
+
+The fragment binds the semantic Image node to the source without an `AssetRef`:
+
+```json
+{
+  "kind": "image_binding",
+  "node_id": "thumbnail",
+  "image_id": "engine-image-01"
+}
+```
+
+`neon-ui-runtime` validates and forwards this request only. `neon-wgpu-runtime`
+owns the atlas, upload, slot assignment, region, generation, and sampling.
+`projectd` is not involved in this path. The executable acceptance entry point
+is `cargo run -p neon-ui-runtime --bin image_resource_probe`.
+
 ## Authoring Workflow
 
 1. Define every domain-provided value as an `input` with a type and default.

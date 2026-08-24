@@ -6,6 +6,13 @@ NUI Flow V1 is a compact, line-oriented authoring and patch notation for Neon3 U
 
 `neon-ui-runtime` parses, validates, formats and lowers Flow. It does not query projects, calculate business facts, create WGPU objects, access files or execute a callback. Domain owners provide already-formatted display values and business facts through typed, defaulted input slots. `neon-wgpu-runtime` owns final measurement, hit testing, GPU resources and pixels.
 
+External Image sources are a separate control-plane path. Flow may declare the
+Image node and the fragment may carry an `ImageBinding`, but image bytes arrive
+as `UiImageUploadRequest` from an external engine. UI Runtime validates and
+forwards the request; only WGPU uploads it and returns the atlas
+`texture_index`, `generation`, integer `region`, and normalized `uv`. This path
+does not use project parsing or `AssetRef`.
+
 Flow source, source spans and diagnostics use logical units only. Stable node keys, domain IDs and source spans can be exposed by semantic inspection APIs. Renderer-local hit IDs, physical-pixel coordinates, GPU handles and instance indices cannot appear in Flow, patches, semantic events or inspection APIs.
 
 ## Lexical rules

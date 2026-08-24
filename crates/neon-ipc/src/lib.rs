@@ -13,7 +13,7 @@ pub use async_rpc::{
     AsyncRpcClient, AsyncRpcServer, BlockingRpcClient, BlockingRpcServer, RpcTransport,
 };
 
-pub const DEFAULT_MAX_FRAME_SIZE: usize = 1024 * 1024;
+pub const DEFAULT_MAX_FRAME_SIZE: usize = 128 * 1024 * 1024;
 
 #[derive(Debug)]
 pub enum TransportError {

@@ -166,6 +166,50 @@ pub struct AssetBytes {
     pub bytes: Vec<u8>,
 }
 
+/// Image content supplied by an external engine or host. This is a transient
+/// render input, not a project asset and not a GPU handle.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiImageSource {
+    pub image_id: String,
+    pub media_type: String,
+    pub width: u32,
+    pub height: u32,
+    pub bytes: Vec<u8>,
+}
+
+/// Reliable control-plane request for uploading one external image to the
+/// renderer-owned public image atlas.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiImageUploadRequest {
+    pub source: UiImageSource,
+}
+
+/// Integer atlas placement. The renderer owns the texture and may rebuild it;
+/// consumers must pair this region with `generation`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiImageTextureRegion {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Read-only image residency result. `texture_index` is an atlas slot, not a
+/// native GPU handle. `uv` is [origin_x, origin_y, size_x, size_y].
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiImageTextureRef {
+    pub image_id: String,
+    pub texture_index: u32,
+    pub generation: u64,
+    pub atlas_size: [u32; 2],
+    pub region: UiImageTextureRegion,
+    pub uv: [f32; 4],
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AiTerrainCondition {
