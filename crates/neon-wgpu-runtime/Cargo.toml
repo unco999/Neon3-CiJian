@@ -6,14 +6,15 @@ license.workspace = true
 description = "Neon3 WGPU renderer and window runtime"
 repository.workspace = true
 readme = "README.md"
+include = ["src/**", "assets/fonts/FiraMono-subset.ttf", "Cargo.toml", "README.md", "LICENSE*", "../LICENSE*", "../Cargo.toml"]
 
 [dependencies]
-neon-wgpu-ai = { version = "0.1.0", path = "../neon-wgpu-ai" }
-neon-protocol = { version = "0.1.0", path = "../neon-protocol" }
-neon-observability = { version = "0.1.0", path = "../neon-observability" }
-neon-ui-schema = { version = "0.1.0", path = "../neon-ui-schema" }
-neon-world-bridge = { version = "0.1.0", path = "../neon-world-bridge" }
-neon-ipc = { version = "0.1.0", path = "../neon-ipc" }
+neon-wgpu-ai = { version = "0.2.0", path = "../neon-wgpu-ai" }
+neon-protocol = { version = "0.2.0", path = "../neon-protocol" }
+neon-observability = { version = "0.2.0", path = "../neon-observability" }
+neon-ui-schema = { version = "0.2.0", path = "../neon-ui-schema" }
+neon-world-bridge = { version = "0.2.0", path = "../neon-world-bridge" }
+neon-ipc = { version = "0.2.0", path = "../neon-ipc" }
 bytemuck.workspace = true
 pollster.workspace = true
 png = "0.18"
@@ -25,5 +26,5 @@ fontdue.workspace = true
 windows.workspace = true
 
 [dev-dependencies]
-neon-projectd = { version = "0.1.0", path = "../neon-projectd" }
-neon-ui-runtime = { version = "0.1.0", path = "../neon-ui-runtime" }
+neon-projectd = { version = "0.2.0", path = "../neon-projectd" }
+neon-ui-runtime = { version = "0.2.0", path = "../neon-ui-runtime" }

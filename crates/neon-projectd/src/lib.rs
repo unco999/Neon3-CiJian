@@ -21,8 +21,10 @@ use serde_json::{Value, json};
 pub const SERVICE_NAME: &str = "projectd";
 pub const CAPABILITY_ASSET_BYTES: &str = "project.asset_bytes.v1";
 pub const CAPABILITY_PROJECT_SUBSCRIBE: &str = "project.subscribe.poll.v1";
-const FIXTURE_SARASA_UI_SC_LIGHT_TTF: &[u8] =
-    include_bytes!("../../../assets/fonts/SarasaUiSC-Light.ttf");
+// Keep the in-memory fixture small and registry-safe. Production projects
+// provide their own licensed font AssetBytes; projectd must not embed a large
+// third-party font in every published crate archive.
+const FIXTURE_SARASA_UI_SC_LIGHT_TTF: &[u8] = b"neon3-projectd-font-fixture";
 
 pub struct Projectd {
     epoch: u64,

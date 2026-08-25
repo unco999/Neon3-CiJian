@@ -33,6 +33,12 @@ foreach ($crate in $crates) {
     $arguments = @("publish", "-p", $crate, "--locked")
     if ($dirty) { $arguments += $dirty }
     if ($mode) { $arguments += $mode }
-    & cargo @arguments
-    if (-not $?) { throw "Publishing failed for $crate" }
+    $output = & cargo @arguments 2>&1
+    $exitCode = $LASTEXITCODE
+    $output | ForEach-Object { Write-Host $_ }
+    if ($output -match "already exists on crates\.io index") {
+        Write-Host "$crate already published; skipping"
+        continue
+    }
+    if ($exitCode -ne 0) { throw "Publishing failed for $crate (exit code $exitCode)" }
 }

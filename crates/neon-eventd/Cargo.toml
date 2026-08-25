@@ -8,8 +8,8 @@ repository.workspace = true
 readme = "README.md"
 
 [dependencies]
-neon-protocol = { version = "0.1.0", path = "../neon-protocol" }
-neon-ipc = { version = "0.1.0", path = "../neon-ipc" }
-neon-observability = { version = "0.1.0", path = "../neon-observability" }
+neon-protocol = { version = "0.2.0", path = "../neon-protocol" }
+neon-ipc = { version = "0.2.0", path = "../neon-ipc" }
+neon-observability = { version = "0.2.0", path = "../neon-observability" }
 serde_json.workspace = true
 serde.workspace = true

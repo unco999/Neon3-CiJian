@@ -1,0 +1,74 @@
+# Complex drag-and-reparent case. The domain owns actual card membership.
+version 1
+surface surface.editor.kanban revision 1
+budget nodes=160 bindings=80 instances=96 text=96 glyphs=4096 events=48 clips=128
+input board_title text default text:empty
+input selection_title text default text:empty
+input reparent_status enum:idle|pending|accepted|rejected default idle
+input can_reparent bool default true
+input backlog_count u32 default 3
+input progress_count u32 default 2
+input done_count u32 default 1
+machine board_drag initial resting
+state board_drag dragging
+state board_drag accepted
+state board_drag rejected
+on board_drag ui.drag.begin -> dragging
+on board_drag ui.drag.end -> accepted
+sync board_drag when $reparent_status=accepted -> accepted
+sync board_drag when $reparent_status=rejected -> rejected
+drag backlog-card-drag source backlog-card-01 axis both snap 8 threshold 3 within surface
+drag audit-card-drag source backlog-card-02 axis horizontal snap 16 threshold 6 within surface
+drag bindings-card-drag source backlog-card-03 axis both snap 8 threshold 3 within surface
+drop progress-drop target in-progress-panel accepts backlog-card-drag placement into present progress-template emit workspace.card.reparent
+drop done-drop target done-panel accepts backlog-card-drag placement into present accepted-template emit workspace.card.reparent
+drop progress-audit-drop target in-progress-panel accepts audit-card-drag placement before present progress-template emit workspace.card.reparent
+drop done-bindings-drop target done-panel accepts bindings-card-drag placement after present accepted-template emit workspace.card.reparent
+surface kanban-workbench column w 1280 h 760 gap 8 pad 12 align stretch fill #101820
+  panel board-toolbar row h 44 pad 8 gap 8 fill #203040 line #3F6A83
+    text board-title value $board_title
+    text selection-title value $selection_title
+    button refresh-board value "Refresh board" event workspace.board.refresh
+  panel board-columns row grow 1 gap 12 align stretch
+    panel backlog-panel column w 300 pad 10 gap 8 align stretch fill #1C2C3A line #507A93
+      text backlog-heading value "A / Backlog"
+      panel backlog-card-01 column h 72 pad 8 gap 4 fill #2A4050 line #6DA6C7
+        text backlog-card-01-title value "Card 01 / Terraform cliff"
+        text backlog-card-01-meta value "Drag this card to B"
+        button backlog-card-01-open value "Open" event workspace.card.open
+      panel backlog-card-02 column h 64 pad 8 gap 4 fill #253947
+        text backlog-card-02-title value "Card 02 / Material audit"
+        button backlog-card-02-open value "Open" event workspace.card.open
+      panel backlog-card-03 column h 64 pad 8 gap 4 fill #253947
+        text backlog-card-03-title value "Card 03 / Water bindings"
+        button backlog-card-03-open value "Open" event workspace.card.open
+      repeat backlog-template h 96 capacity 8 key row_key overflow_summary
+        text backlog-template-row value "Prepared backlog row"
+    panel in-progress-panel column w 300 pad 10 gap 8 align stretch fill #183844 line #65AFC4
+      text progress-heading value "B / In Progress"
+      text progress-drop-hint value "Drop Card 01 here to request reparent"
+      panel progress-card-01 column h 64 pad 8 fill #27535D
+        text progress-card-01-title value "Card 04 / Lighting pass"
+      panel progress-card-02 column h 64 pad 8 fill #27535D
+        text progress-card-02-title value "Card 05 / Navmesh review"
+      repeat progress-template h 96 capacity 8 key row_key overflow_summary
+        text progress-template-row value "Prepared progress row"
+    panel done-panel column grow 1 pad 10 gap 8 align stretch fill #254330 line #76C69A
+      text done-heading value "C / Accepted"
+      text done-drop-hint value "Or drop Card 01 here"
+      panel done-card-01 column h 64 pad 8 fill #326A4A
+        text done-card-01-title value "Card 06 / Terrain cache"
+      template accepted-template h 96 capacity 8 key row_key overflow_summary
+        text accepted-template-row value "Accepted card row"
+    panel blocked-panel column w 180 pad 10 gap 8 align stretch fill #422F3B line #A56778
+      text blocked-heading value "Blocked / No Drop"
+      text blocked-hint value "No drop declaration: every proposal is rejected locally"
+      panel blocked-card-01 column h 64 pad 8 fill #5C3849
+        text blocked-card-01-title value "Card 07 / Requires approval"
+  panel activity-panel h 96 pad 8 gap 6 fill #172733 line #3F6A83
+    branch reparent-pending when $reparent_status=pending
+      text reparent-pending-label value "Waiting for domain reparent acceptance"
+    branch reparent-accepted when $reparent_status=accepted
+      text reparent-accepted-label value "Card reparent accepted; program revision updated"
+    branch reparent-rejected when $reparent_status=rejected
+      text reparent-rejected-label value "Card reparent rejected; original parent retained"

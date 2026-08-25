@@ -2200,7 +2200,7 @@ fn run_drag_card02_before_scenario() -> io::Result<()> {
     wait_for_endpoint(ui_endpoint)?;
 
     let document = parse_nui_flow(include_str!(
-        "../../../tests/fixtures/ui/kanban-reparent-workbench.nui"
+        "../assets/fixtures/ui/kanban-reparent-workbench.nui"
     ))
     .map_err(|error| io::Error::other(format!("scenario fixture is invalid: {error:?}")))?;
     let effects = lower_nui_flow_effects(&document);

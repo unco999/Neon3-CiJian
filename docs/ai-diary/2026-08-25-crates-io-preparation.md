@@ -31,4 +31,15 @@ and WGPU crates.
 - `cargo search neon-protocol`: blocked by unavailable crates.io network through
   the configured proxy.
 
-No crate was uploaded.
+The local Git pack indexes were repaired with `git multi-pack-index expire`
+followed by `git repack -a -d --no-write-bitmap-index`. Cargo packaging then
+worked. Through proxy `127.0.0.1:7892`, the remaining five crates were
+published successfully: `neon-projectd`, `neon-eventd`, `neon-wgpu-ai`,
+`neon-dev`, and `neon-wgpu-runtime`, all at `0.1.0`.
+
+After discovering that the published `0.1.0` crates were not a coherent API
+snapshot for the Bevy case, all crates were version-bumped together to
+`0.2.0`. The 0.2.0 release set was published in dependency order. The WGPU
+runtime package was reduced from 24.3 MiB by replacing the large bundled CJK
+font with the small open-source Fira Mono subset; CJK fonts remain an asset
+upload concern.

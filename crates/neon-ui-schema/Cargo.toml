@@ -9,7 +9,7 @@ readme = "README.md"
 keywords = ["neon3", "ui", "schema", "game-engine"]
 
 [dependencies]
-neon-protocol = { version = "0.1.0", path = "../neon-protocol" }
-neon-world-bridge = { version = "0.1.0", path = "../neon-world-bridge" }
+neon-protocol = { version = "0.2.0", path = "../neon-protocol" }
+neon-world-bridge = { version = "0.2.0", path = "../neon-world-bridge" }
 serde.workspace = true
 serde_json.workspace = true

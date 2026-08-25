@@ -307,7 +307,7 @@ struct VsOut { @builtin(position) position: vec4<f32>, @location(0) local: vec2<
 }
 "#;
 
-const BUILTIN_UI_FONT: &[u8] = include_bytes!("../../../assets/fonts/SarasaUiSC-Light.ttf");
+const BUILTIN_UI_FONT: &[u8] = include_bytes!("../assets/fonts/FiraMono-subset.ttf");
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
@@ -1863,6 +1863,12 @@ impl UiWgpuRenderer {
         self.hit_bindings.len()
     }
 
+    /// Returns whether a local interaction changed the visual control state
+    /// without changing the authoritative fragment revision.
+    pub(crate) fn pointer_visual_dirty(&self) -> bool {
+        self.pointer_visual_dirty
+    }
+
     /// Snapshot of the binding map for the last ID pass. Used to pair a
     /// completed unified ID frame with its numeric-ID -> semantic binding map
     /// so a pointer readback and its lookup come from the same frame.
@@ -2075,6 +2081,35 @@ impl UiWgpuRenderer {
                 inherited_scroll_clip
             };
             subtree_opacity[index] = inherited_opacity * own_opacity;
+        }
+        // Local numeric gestures update the renderer presentation before an
+        // authoritative fragment revision arrives. Apply that preview to the
+        // sampled visual text as well as the chrome; otherwise the thumb moves
+        // internally while the label keeps displaying the old `0.00` value.
+        for (index, node) in self.plan.iter().enumerate() {
+            let Some(UiSemanticPayloadValue::F32 { value }) = self.value_previews.get(&node.id)
+            else {
+                continue;
+            };
+            if !matches!(node.target.kind, UiNodeKind::Slider | UiNodeKind::DragValue) {
+                continue;
+            }
+            if let Some(UiControlPresentation::Numeric { min, max, .. }) =
+                &self.sampled[index].presentation
+            {
+                self.sampled[index].presentation = Some(UiControlPresentation::Numeric {
+                    value: *value,
+                    min: *min,
+                    max: *max,
+                });
+            }
+            if node.target.kind == UiNodeKind::Slider {
+                if let Some(TextRef::Literal { value: label }) = &node.target.text {
+                    self.sampled[index].text = Some(TextRef::Literal {
+                        value: format!("{label}: {value:.2}"),
+                    });
+                }
+            }
         }
         top_layer
     }
@@ -2697,7 +2732,12 @@ impl UiWgpuRenderer {
             (UiNodeKind::Scrollbar, Some(UiControlPresentation::Scroll { .. })) => (0.0, 1.0),
             _ => return false,
         };
+        let hit_bounds = visual.bounds;
         let bounds = match &kind {
+            // Accept a pointer anywhere on the authored slider node, but use
+            // the same internal track geometry as the renderer's chrome for
+            // value conversion. This keeps the cursor, thumb, and committed
+            // value in one coordinate system.
             UiNodeKind::Slider => UiBounds {
                 x: visual.bounds.x + visual.bounds.width * 0.57,
                 y: visual.bounds.y,
@@ -2715,7 +2755,7 @@ impl UiWgpuRenderer {
         };
         if !self
             .pointer_position
-            .is_some_and(|pointer| contains(bounds, pointer))
+            .is_some_and(|pointer| contains(hit_bounds, pointer))
         {
             return false;
         }

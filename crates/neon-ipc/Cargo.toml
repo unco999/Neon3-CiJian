@@ -9,7 +9,7 @@ readme = "README.md"
 keywords = ["neon3", "rpc", "ipc", "game-engine"]
 
 [dependencies]
-neon-protocol = { version = "0.1.0", path = "../neon-protocol" }
+neon-protocol = { version = "0.2.0", path = "../neon-protocol" }
 serde_json.workspace = true
 serde.workspace = true
 tokio = { version = "1", features = ["net", "io-util", "sync", "time", "rt", "rt-multi-thread", "macros"] }

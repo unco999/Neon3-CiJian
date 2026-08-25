@@ -2567,7 +2567,7 @@ impl HeadlessExternalGpu {
         &mut self,
         event: UiPointerEvent,
         fragments: &HashMap<UiFragmentId, UiFragment>,
-        _surface_kind: RenderSurfaceKind,
+        surface_kind: RenderSurfaceKind,
     ) -> Result<Value, String> {
         if event.generation != 1 {
             return Err("ui_pointer_generation_stale".into());
@@ -2586,8 +2586,25 @@ impl HeadlessExternalGpu {
         let ui = &mut self.ui;
         ui.set_pointer_position(event.pixel);
         ui.prepare_interaction(fragments, [1280, 720], [1280.0, 720.0], now);
+        // Hit testing is unified, but the visible color pass uses the
+        // renderer for the selected surface. Value previews must live in that
+        // renderer or the semantic event succeeds while the visible control
+        // remains at the old fragment value.
+        let presentation_ui = match surface_kind {
+            RenderSurfaceKind::WorldUi => &mut self.world_ui,
+            _ => &mut self.screen_ui,
+        };
+        presentation_ui.set_pointer_position(event.pixel);
+        presentation_ui.prepare_interaction(fragments, [1280, 720], [1280.0, 720.0], now);
         match event.event_type {
             UiPointerEventType::Enter | UiPointerEventType::Move => {
+                // Headless external input still owns the same local value
+                // gesture path as the windowed renderer. Without this update,
+                // slider/drag-value moves are observed but never change the
+                // preview that is committed on pointer-up.
+                if presentation_ui.value_gesture_active() {
+                    presentation_ui.update_value_gesture();
+                }
                 self.input.set_hover_id(None);
                 Ok(json!({"state": "observed"}))
             }
@@ -2616,7 +2633,15 @@ impl HeadlessExternalGpu {
                 }
                 if let Some(binding) = self.captured_binding.clone() {
                     self.pending_control_value = binding.control_value.clone();
-                    ui.press_hovered(now);
+                    if presentation_ui.requires_value_gesture(&binding)
+                        && !presentation_ui.begin_value_gesture(&binding)
+                    {
+                        self.captured_binding = None;
+                        self.pending_control_value = None;
+                        self.input.cancel();
+                        return Err("value_gesture_not_started".into());
+                    }
+                    presentation_ui.press_hovered(now);
                 }
                 Ok(json!({"state": "captured"}))
             }
@@ -2641,11 +2666,25 @@ impl HeadlessExternalGpu {
                 let Some(intent) = binding.intent else {
                     return Ok(json!({"state": "released"}));
                 };
-                let toggle_value = ui
-                    .finish_toggle_control(&binding.node_path)
-                    .map(|(value, _)| value);
+                let finished_value = presentation_ui.finish_value_gesture();
+                let toggle_value = presentation_ui.finish_toggle_control(&binding.node_path);
+                let (control_value, local_presentation) =
+                    if let Some((value, presentation)) = finished_value {
+                        (Some(value), Some(presentation))
+                    } else if let Some((value, presentation)) = toggle_value {
+                        (Some(value), Some(presentation))
+                    } else {
+                        (control_value.or(binding.control_value), None)
+                    };
                 self.perf.semantic_clicks += 1;
                 self.next_semantic_sequence = self.next_semantic_sequence.saturating_add(1);
+                if let Some(presentation) = local_presentation {
+                    presentation_ui.retain_local_presentation(
+                        self.next_semantic_sequence,
+                        &binding.fragment,
+                        presentation,
+                    );
+                }
                 let event_id = format!("wgpu-pointer-click-{}", self.next_semantic_sequence);
                 if binding.node_path.ends_with("/p0")
                     || binding.node_path.contains("/p")
@@ -2683,7 +2722,7 @@ impl HeadlessExternalGpu {
                     focus: None,
                     data_grid_cell: binding.data_grid_cell,
                     text: None,
-                    control_value: toggle_value.or(control_value).or(binding.control_value),
+                    control_value,
                     drag_drop: None,
                 }}))
             }
@@ -2927,7 +2966,11 @@ impl HeadlessExternalGpu {
         let has_active_animation = self.screen_ui.has_active_animation(time_seconds)
             || self.world_ui.has_active_animation(time_seconds)
             || (has_external_id_targets && self.ui.has_active_animation(time_seconds));
+        let has_pointer_visual_dirty = self.screen_ui.pointer_visual_dirty()
+            || self.world_ui.pointer_visual_dirty()
+            || (has_external_id_targets && self.ui.pointer_visual_dirty());
         if !has_active_animation
+            && !has_pointer_visual_dirty
             && self.last_rendered_all_surfaces
             && self
                 .last_rendered_fragments

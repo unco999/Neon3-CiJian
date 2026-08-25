@@ -6,12 +6,13 @@ license.workspace = true
 description = "Neon3 local development and scenario tooling"
 repository.workspace = true
 readme = "README.md"
+include = ["src/**", "assets/**", "Cargo.toml", "README.md", "LICENSE*", "../LICENSE*", "../Cargo.toml"]
 
 [dependencies]
 windows-sys.workspace = true
-neon-ipc = { version = "0.1.0", path = "../neon-ipc" }
-neon-protocol = { version = "0.1.0", path = "../neon-protocol" }
-neon-ui-runtime = { version = "0.1.0", path = "../neon-ui-runtime" }
-neon-ui-schema = { version = "0.1.0", path = "../neon-ui-schema" }
+neon-ipc = { version = "0.2.0", path = "../neon-ipc" }
+neon-protocol = { version = "0.2.0", path = "../neon-protocol" }
+neon-ui-runtime = { version = "0.2.0", path = "../neon-ui-runtime" }
+neon-ui-schema = { version = "0.2.0", path = "../neon-ui-schema" }
 serde_json.workspace = true
 png = "0.18"

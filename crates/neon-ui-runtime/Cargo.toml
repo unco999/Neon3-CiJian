@@ -9,10 +9,10 @@ readme = "README.md"
 keywords = ["neon3", "ui", "declarative", "game-engine"]
 
 [dependencies]
-neon-protocol = { version = "0.1.0", path = "../neon-protocol" }
-neon-ipc = { version = "0.1.0", path = "../neon-ipc" }
-neon-observability = { version = "0.1.0", path = "../neon-observability" }
-neon-ui-schema = { version = "0.1.0", path = "../neon-ui-schema" }
-neon-world-bridge = { version = "0.1.0", path = "../neon-world-bridge" }
+neon-protocol = { version = "0.2.0", path = "../neon-protocol" }
+neon-ipc = { version = "0.2.0", path = "../neon-ipc" }
+neon-observability = { version = "0.2.0", path = "../neon-observability" }
+neon-ui-schema = { version = "0.2.0", path = "../neon-ui-schema" }
+neon-world-bridge = { version = "0.2.0", path = "../neon-world-bridge" }
 serde_json.workspace = true
 serde.workspace = true

@@ -9,6 +9,6 @@ readme = "README.md"
 keywords = ["neon3", "observability", "debug", "game-engine"]
 
 [dependencies]
-neon-protocol = { version = "0.1.0", path = "../neon-protocol" }
+neon-protocol = { version = "0.2.0", path = "../neon-protocol" }
 serde.workspace = true
 serde_json.workspace = true
