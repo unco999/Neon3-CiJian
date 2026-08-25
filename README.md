@@ -125,13 +125,10 @@ the canonical UI smoke test. Build the runtime and the dev harness, then run it:
 cargo build -p neon-ui-runtime --bins
 cargo build -p neon-wgpu-runtime --bins
 cargo build -p neon-dev
-cargo run -p neon-dev -- case component-gallery --show-logs
+cargo run -p neon-dev -- case component-gallery --show-logs --release
 ```
 
-A recorded walkthrough of this case is provided as looping GIFs under
-[`docs/media/component-gallery/`](docs/media/component-gallery). Split the source capture
-(`20260825-161109.mp4`) into short looping clips with your local screengif tooling and drop
-them in that folder; they are committed as normal repository assets.
+![component-gallery walkthrough](docs/media/component-gallery/component-gallery.gif)
 
 ## Usage Example
 
