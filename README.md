@@ -115,6 +115,24 @@ cargo run -p neon-eventd        -- --server 127.0.0.1:39101
 
 See `scripts/run-neon-services.ps1` for a ready-made headless launcher.
 
+### The `component-gallery` case
+
+This case exercises the full declarative UI control set (buttons, sliders, combos,
+dropdowns, data grids, dialogs, drag-and-drop, camera-anchored world panels, …) and is
+the canonical UI smoke test. Build the runtime and the dev harness, then run it:
+
+```bash
+cargo build -p neon-ui-runtime --bins
+cargo build -p neon-wgpu-runtime --bins
+cargo build -p neon-dev
+cargo run -p neon-dev -- case component-gallery --show-logs
+```
+
+A recorded walkthrough of this case is provided as looping GIFs under
+[`docs/media/component-gallery/`](docs/media/component-gallery). Split the source capture
+(`20260825-161109.mp4`) into short looping clips with your local screengif tooling and drop
+them in that folder; they are committed as normal repository assets.
+
 ## Usage Example
 
 Drive any service through the **same public protocol** the UI uses. From the CLI:
