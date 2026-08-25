@@ -307,7 +307,7 @@ struct VsOut { @builtin(position) position: vec4<f32>, @location(0) local: vec2<
 }
 "#;
 
-const BUILTIN_UI_FONT: &[u8] = include_bytes!("../assets/fonts/FiraMono-subset.ttf");
+const BUILTIN_UI_FONT: &[u8] = include_bytes!("../../../assets/fonts/SarasaUiSC-Light.ttf");
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
