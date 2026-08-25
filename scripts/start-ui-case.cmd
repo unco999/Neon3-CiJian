@@ -22,6 +22,12 @@ echo Root: %ROOT%
 echo UI runtime: 127.0.0.1:%UI_PORT%
 echo WGPU runtime: 127.0.0.1:%WGPU_PORT%
 
+if not exist "%ROOT%\packages\neon-ui-react-client\package.json" (
+    echo React case package is not present: %ROOT%\packages\neon-ui-react-client
+    echo Use the built-in component gallery documented in README.md, or restore the React client package before running this launcher.
+    exit /B 1
+)
+
 if defined WITH_PROJECTD (
     start "Neon3 projectd" /D "%ROOT%" cmd /K "cargo run -p neon-projectd -- --server 127.0.0.1:%PROJECT_PORT%"
     call :wait_port %PROJECT_PORT% "projectd"

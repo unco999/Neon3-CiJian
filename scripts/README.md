@@ -1,7 +1,7 @@
 # Neon3 Scripts
 
-Use `start-ui-case.cmd` to launch a UI example with one command. The script opens
-three separate CMD windows:
+`start-ui-case.cmd` launches a legacy React UI example in three separate CMD
+windows:
 
 1. `neon-wgpu-runtime`
 2. `neon-ui-runtime`
@@ -15,6 +15,11 @@ scripts\start-ui-case.cmd terrain
 scripts\start-ui-case.cmd terrain-generation --projectd
 scripts\start-ui-case.cmd ui-platform
 ```
+
+The launcher requires `packages\neon-ui-react-client`. That package is not
+included in this checkout; the script now fails before starting partial
+services when it is absent. Use the built-in `component-gallery` command in
+the repository README for a standalone windowed smoke test.
 
 The default loopback ports are:
 

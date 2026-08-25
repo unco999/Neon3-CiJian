@@ -93,7 +93,9 @@ Build:
 cargo build
 ```
 
-Run a UI example (opens the WGPU runtime, the UI runtime, and a React case in separate windows):
+The legacy React case launcher requires `packages/neon-ui-react-client`. That
+package is not included in this checkout, so the following commands are not a
+standalone smoke test until the client package is restored:
 
 ```text
 scripts\start-ui-case.cmd workbench
@@ -102,7 +104,7 @@ scripts\start-ui-case.cmd terrain-generation --projectd
 scripts\start-ui-case.cmd ui-platform
 ```
 
-Available cases: `terrain`, `terrain-generation`, `workbench`, `workbench-interactive`, `animation`,
+Available legacy cases: `terrain`, `terrain-generation`, `workbench`, `workbench-interactive`, `animation`,
 `nested-animation`, `ui-platform`.
 
 Or launch the headless service trio directly:
@@ -119,13 +121,11 @@ See `scripts/run-neon-services.ps1` for a ready-made headless launcher.
 
 This case exercises the full declarative UI control set (buttons, sliders, combos,
 dropdowns, data grids, dialogs, drag-and-drop, camera-anchored world panels, …) and is
-the canonical UI smoke test. Build the runtime and the dev harness, then run it:
+the canonical UI smoke test. Build every binary the local session starts, then run it:
 
 ```bash
-cargo build -p neon-ui-runtime --bins
-cargo build -p neon-wgpu-runtime --bins
-cargo build -p neon-dev
-cargo run -p neon-dev -- case component-gallery --show-logs --release
+cargo build -p neon-projectd -p neon-eventd -p neon-ui-runtime -p neon-wgpu-runtime -p neon-dev --bins
+cargo run -p neon-dev -- case component-gallery --show-logs
 ```
 
 ![component-gallery walkthrough](docs/media/component-gallery/component-gallery.gif)

@@ -394,7 +394,12 @@ fn key(asset: &AssetRef) -> (String, u64, u64, String) {
 mod tests {
     use super::*;
     use neon_protocol::{ClientIdentity, ClientKind, ProtocolVersion, RequestId};
-    use std::{net::TcpListener, thread, time::Duration};
+    use std::{
+        net::TcpListener,
+        sync::mpsc,
+        thread,
+        time::{Duration, Instant},
+    };
 
     fn request(id: &str, method: &str, params: Value) -> RpcRequest {
         RpcRequest {
@@ -503,12 +508,20 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = listener.local_addr().unwrap();
         drop(listener);
-        let server = thread::spawn(move || serve(endpoint, 7));
+        let (server_result_tx, server_result_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let _ = server_result_tx.send(serve(endpoint, 7));
+        });
         let call = |request: RpcRequest| {
+            let deadline = Instant::now() + Duration::from_secs(2);
             let mut client = loop {
                 match neon_ipc::RpcClient::connect(endpoint) {
                     Ok(client) => break client,
-                    Err(_) => thread::sleep(Duration::from_millis(5)),
+                    Err(error) if Instant::now() < deadline => {
+                        let _ = error;
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("projectd did not start at {endpoint}: {error}"),
                 }
             };
             client.call(&request).unwrap()
@@ -540,6 +553,10 @@ mod tests {
         );
         let shutdown = call(request("shutdown", "service.shutdown", json!({})));
         assert_eq!(shutdown.status, RpcStatus::Accepted);
-        server.join().unwrap().unwrap();
+        server_result_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("projectd did not stop after service.shutdown")
+            .unwrap();
+        server.join().unwrap();
     }
 }

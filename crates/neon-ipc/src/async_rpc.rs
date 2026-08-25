@@ -294,6 +294,11 @@ pub struct AsyncRpcServer {
     max_concurrent: usize,
 }
 
+struct ServerStop {
+    requested: AtomicBool,
+    notified: Notify,
+}
+
 impl AsyncRpcServer {
     pub async fn bind(endpoint: SocketAddr) -> Result<Self, TransportError> {
         Self::bind_with(endpoint, DEFAULT_MAX_FRAME_SIZE, 256).await
@@ -367,12 +372,23 @@ impl AsyncRpcServer {
         S: Fn(&RpcRequest) -> bool + Send + Sync + Clone + 'static,
     {
         let semaphore = Arc::new(Semaphore::new(self.max_concurrent));
-        let stop = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(ServerStop {
+            requested: AtomicBool::new(false),
+            notified: Notify::new(),
+        });
         loop {
-            if stop.load(Ordering::Relaxed) {
+            if stop.requested.load(Ordering::Relaxed) {
                 break;
             }
-            let (stream, _) = self.listener.accept().await.map_err(map_io_error)?;
+            let (stream, _) = tokio::select! {
+                _ = stop.notified.notified() => {
+                    if stop.requested.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    continue;
+                }
+                accepted = self.listener.accept() => accepted.map_err(map_io_error)?,
+            };
             let handler = handler.clone();
             let should_stop = should_stop.clone();
             let semaphore = Arc::clone(&semaphore);
@@ -399,7 +415,7 @@ async fn handle_connection<F, Fut, S>(
     max_frame_size: usize,
     handler: F,
     should_stop: S,
-    stop: Arc<AtomicBool>,
+    stop: Arc<ServerStop>,
     semaphore: Arc<Semaphore>,
 ) -> Result<(), TransportError>
 where
@@ -441,13 +457,14 @@ where
             };
             let response = handler(request).await;
             drop(permit);
-            if stop_requested {
-                stop.store(true, Ordering::Relaxed);
-            }
             if let Ok(payload) = serde_json::to_vec(&response) {
                 if let Ok(frame) = encode_frame(&payload, max_frame_size) {
                     let _ = outbound_tx.send(frame).await;
                 }
+            }
+            if stop_requested {
+                stop.requested.store(true, Ordering::Relaxed);
+                stop.notified.notify_one();
             }
         });
     }
@@ -763,8 +780,19 @@ mod tests {
         let endpoint = server.local_addr().unwrap();
         tokio::spawn(server.serve(echo));
 
-        let mut client = crate::RpcClient::connect(endpoint).unwrap();
-        let response = client.call(&request("y", "sync")).unwrap();
+        // The legacy client blocks its caller. Run it on Tokio's blocking pool
+        // so the spawned async server can accept and answer the request.
+        let response = tokio::time::timeout(
+            Duration::from_secs(2),
+            tokio::task::spawn_blocking(move || {
+                let mut client = crate::RpcClient::connect(endpoint)?;
+                client.call(&request("y", "sync"))
+            }),
+        )
+        .await
+        .expect("sync client request timed out")
+        .expect("sync client task panicked")
+        .expect("sync client request failed");
         assert_eq!(response.request_id.0, "y");
         assert_eq!(response.status, RpcStatus::Accepted);
     }
