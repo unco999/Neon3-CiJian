@@ -4716,6 +4716,17 @@ impl UiWgpuRenderer {
                                 visual.bounds.x - cached.visual_origin[0],
                                 visual.bounds.y - cached.visual_origin[1],
                             ];
+                            // Paint groups are assigned from the current
+                            // flattened plan. World panels can change order as
+                            // the camera moves, so a cached glyph layout must
+                            // not retain the previous frame's group/depth.
+                            // Keep glyph geometry cached, but refresh the
+                            // frame-dependent ordering fields here.
+                            let depth = color_pass_depth(visual.world_depth);
+                            for instance in &mut instances {
+                                instance.depth = depth;
+                                instance.paint_group_id = visual.paint_group_id;
+                            }
                             if let Some(clip) = text_clip(visual) {
                                 for instance in &mut instances {
                                     instance.rect[0] += delta[0];

@@ -8528,7 +8528,16 @@ impl WgpuRuntime {
                             0.0
                         };
                         node.world_depth = Some(occlusion_depth);
-                        let scale = (6.0 / depth).clamp(0.5, 2.0);
+                        // A billboard world panel is a screen-stable overlay:
+                        // keep its authored pixel size fixed while retaining
+                        // the real anchor distance for depth-tested occlusion.
+                        // Non-billboard compatibility paths retain the legacy
+                        // distance scale.
+                        let scale = if anchor.billboard {
+                            1.0
+                        } else {
+                            (6.0 / depth).clamp(0.5, 2.0)
+                        };
                         // Keep the authored panel topology and text layout at
                         // one stable logical size. Distance changes are a
                         // single uniform subtree scale applied by the renderer;
@@ -8561,8 +8570,8 @@ impl WgpuRuntime {
             &mut depths,
         );
         // Draw order: world panels are otherwise emitted in tree order, which
-        // lets a far panel (drawn later) cover a near one. Sort direct children
-        // by camera depth far -> near so near panels draw last and stay on top.
+        // lets a far panel (drawn later) cover a near one. `view_distance` is
+        // smaller for near panels, so sort far -> near (descending distance).
         if has_world_panel {
             filtered.root.children.sort_by(|a, b| {
                 let depth_a = depths.get(&a.node_id.0).copied().unwrap_or(f32::MAX);
