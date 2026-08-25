@@ -7,3 +7,11 @@
 /assets
 *.log
 /cases/bevy-nui-host/target
+
+# 以下为本地/私有/非开源内容，不纳入公开仓库
+/.workbuddy/
+/.plan-client/
+/docs/ai-diary/
+/docs/ai-debug-workflow.md
+/opencode.json
+/artifacts/
