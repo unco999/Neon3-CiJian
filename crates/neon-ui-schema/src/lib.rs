@@ -184,7 +184,6 @@ impl UiCanvasData {
                 !line.id.trim().is_empty()
                     && finite_position(&line.start)
                     && finite_position(&line.end)
-                    && (line.start[0] == line.end[0] || line.start[1] == line.end[1])
                     && line.width.is_finite()
                     && line.width > 0.0
                     && finite_color(&line.color)

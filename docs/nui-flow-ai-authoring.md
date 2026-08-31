@@ -131,8 +131,7 @@ surface analysis column
 `canvas_data` is persisted as `UiCanvasData { version, points, lines }` in the
 typed input snapshot. V1 points contain a stable ID, logical `[x,y]`, positive
 radius, and normalized RGBA color. V1 lines contain stable ID, logical start/end,
-positive width, and normalized RGBA color; they are intentionally limited to
-horizontal or vertical guides. Coordinates are local logical units (`x` right,
+positive width, and normalized RGBA color. Coordinates are local logical units (`x` right,
 `y` down), are clipped to the Canvas bounds, and never identify screen pixels.
 WGPU owns the conversion to composition primitives. No GPU handle, image bytes,
 path, shader, callback, pointer coordinate, or arbitrary JSON is permitted.

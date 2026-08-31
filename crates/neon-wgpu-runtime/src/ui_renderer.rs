@@ -353,6 +353,26 @@ struct VsOut { @builtin(position) position: vec4<f32>, @location(0) local: vec2<
 }
 "#;
 
+const CANVAS_SHADER: &str = r#"
+struct View { viewport: vec2<f32>, color_mode: u32, time_seconds: f32 }
+@group(0) @binding(0) var<uniform> view: View;
+struct VsIn { @location(0) start: vec2<f32>, @location(1) end: vec2<f32>, @location(2) color: vec4<f32>, @location(3) width: f32, @location(4) kind: u32, @location(5) clip: vec4<f32>, @location(6) depth: f32 }
+struct VsOut { @builtin(position) position: vec4<f32>, @location(0) pixel: vec2<f32>, @location(1) start: vec2<f32>, @location(2) end: vec2<f32>, @location(3) color: vec4<f32>, @location(4) width: f32, @location(5) @interpolate(flat) kind: u32, @location(6) clip: vec4<f32> }
+fn srgb_to_linear(value: vec3<f32>) -> vec3<f32> { let low=value/12.92; let high=pow((value+vec3<f32>(0.055))/1.055,vec3<f32>(2.4)); return select(low,high,value>vec3<f32>(0.04045)); }
+@vertex fn vs_main(@builtin(vertex_index) index: u32, input: VsIn) -> VsOut {
+ var corners=array<vec2<f32>,6>(vec2<f32>(0.0,0.0),vec2<f32>(1.0,0.0),vec2<f32>(0.0,1.0),vec2<f32>(0.0,1.0),vec2<f32>(1.0,0.0),vec2<f32>(1.0,1.0));
+ let local=corners[index]; let delta=input.end-input.start; let length=max(length(delta),0.0001); let direction=delta/length; let normal=vec2<f32>(-direction.y,direction.x); let half=input.width*0.5;
+ let point=select(input.start + direction*(local.x*length) + normal*((local.y*2.0-1.0)*half), input.start + (local-vec2<f32>(0.5))*input.width, input.kind==0u);
+ var output:VsOut; output.position=vec4<f32>(point.x/view.viewport.x*2.0-1.0,1.0-point.y/view.viewport.y*2.0,input.depth,1.0); output.pixel=point; output.start=input.start; output.end=input.end; output.color=input.color; output.width=input.width; output.kind=input.kind; output.clip=input.clip; return output;
+}
+@fragment fn fs_main(input:VsOut)->@location(0) vec4<f32> {
+ if(input.pixel.x<input.clip.x||input.pixel.y<input.clip.y||input.pixel.x>input.clip.z||input.pixel.y>input.clip.w){discard;}
+ if(input.kind==0u && length(input.pixel-input.start)>input.width*0.5){discard;}
+ if(input.color.a<=0.001){discard;}
+ return vec4<f32>(select(srgb_to_linear(input.color.rgb),input.color.rgb,view.color_mode==1u),input.color.a);
+}
+"#;
+
 const BUILTIN_UI_FONT: &[u8] = include_bytes!("../../../assets/fonts/SarasaUiSC-Light.ttf");
 
 #[repr(C)]
@@ -640,6 +660,19 @@ struct UiTextInstance {
     uv: [f32; 4],
     /// Paint-group depth inherited from the owning panel. The color shader
     /// ignores this field; the CPU uses it to keep panel and text together.
+    depth: f32,
+    paint_group_id: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
+struct UiCanvasInstance {
+    start: [f32; 2],
+    end: [f32; 2],
+    color: [f32; 4],
+    width: f32,
+    kind: u32,
+    clip: [f32; 4],
     depth: f32,
     paint_group_id: u32,
 }
@@ -1177,6 +1210,9 @@ pub struct UiWgpuRenderer {
     image_atlas_generation: u64,
     resident_render_surfaces: HashMap<String, ResidentRenderSurface>,
     image_texture_layout: wgpu::BindGroupLayout,
+    canvas_pipeline: wgpu::RenderPipeline,
+    canvas_buffer: wgpu::Buffer,
+    canvas_capacity: usize,
     text_pipeline: wgpu::RenderPipeline,
     text_buffer: wgpu::Buffer,
     text_capacity: usize,
@@ -1456,6 +1492,86 @@ impl UiWgpuRenderer {
         let image_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("neon3-ui-image-shader"),
             source: wgpu::ShaderSource::Wgsl(IMAGE_SHADER.into()),
+        });
+        let canvas_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("neon3-ui-canvas-shader"),
+            source: wgpu::ShaderSource::Wgsl(CANVAS_SHADER.into()),
+        });
+        let canvas_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("neon3-ui-canvas-layout"),
+            bind_group_layouts: &[Some(&view_layout)],
+            immediate_size: 0,
+        });
+        let canvas_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("neon3-ui-canvas-pipeline"),
+            layout: Some(&canvas_layout),
+            vertex: wgpu::VertexState {
+                module: &canvas_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[Some(wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<UiCanvasInstance>() as u64,
+                    step_mode: wgpu::VertexStepMode::Instance,
+                    attributes: &[
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x2,
+                            offset: 0,
+                            shader_location: 0,
+                        },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x2,
+                            offset: 8,
+                            shader_location: 1,
+                        },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x4,
+                            offset: 16,
+                            shader_location: 2,
+                        },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32,
+                            offset: 32,
+                            shader_location: 3,
+                        },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Uint32,
+                            offset: 36,
+                            shader_location: 4,
+                        },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x4,
+                            offset: 40,
+                            shader_location: 5,
+                        },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32,
+                            offset: 56,
+                            shader_location: 6,
+                        },
+                    ],
+                })],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &canvas_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: depth_format.map(|_| wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            multiview_mask: None,
+            cache: None,
         });
         let image_texture_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -1804,6 +1920,9 @@ impl UiWgpuRenderer {
             image_atlas_generation: 0,
             resident_render_surfaces: HashMap::new(),
             image_texture_layout,
+            canvas_pipeline,
+            canvas_buffer: create_canvas_buffer(device, 512),
+            canvas_capacity: 512,
             text_pipeline,
             text_buffer: create_text_buffer(device, 512),
             text_capacity: 512,
@@ -4749,6 +4868,76 @@ impl UiWgpuRenderer {
                     ))
             })
             .collect::<Vec<_>>();
+        // Canvas data stays declarative until this renderer-owned final draw
+        // pass. Expand it directly into point/line GPU instances, never into
+        // Panel nodes or an intermediate texture.
+        let canvas_data = fragments
+            .values()
+            .flat_map(|fragment| {
+                fragment
+                    .effects
+                    .iter()
+                    .filter_map(move |effect| match effect {
+                        neon_ui_schema::UiEffect::CanvasData { node_id, data } => {
+                            Some((format!("{}/{}", fragment.fragment_id.0, node_id.0), data))
+                        }
+                        _ => None,
+                    })
+            })
+            .collect::<HashMap<_, _>>();
+        let mut canvas = Vec::<UiCanvasInstance>::new();
+        for (index, visual) in self.sampled.iter().enumerate() {
+            if visual.kind != UiNodeKind::Canvas || !sampled_in_mode(visual, mode) {
+                continue;
+            }
+            let Some(data) = canvas_data.get(&self.plan[index].id) else {
+                continue;
+            };
+            let scale = visual.world_scale.unwrap_or(1.0);
+            let clip = [
+                visual.clip.x,
+                visual.clip.y,
+                visual.clip.x + visual.clip.width,
+                visual.clip.y + visual.clip.height,
+            ];
+            let origin = [visual.bounds.x, visual.bounds.y];
+            let depth = color_pass_depth(visual.world_depth);
+            let group = self.plan[index].paint_group_id;
+            for point in &data.points {
+                let position = [
+                    origin[0] + point.position[0] * scale,
+                    origin[1] + point.position[1] * scale,
+                ];
+                canvas.push(UiCanvasInstance {
+                    start: position,
+                    end: position,
+                    color: point.color,
+                    width: point.radius * 2.0 * scale,
+                    kind: 0,
+                    clip,
+                    depth,
+                    paint_group_id: group,
+                });
+            }
+            for line in &data.lines {
+                canvas.push(UiCanvasInstance {
+                    start: [
+                        origin[0] + line.start[0] * scale,
+                        origin[1] + line.start[1] * scale,
+                    ],
+                    end: [
+                        origin[0] + line.end[0] * scale,
+                        origin[1] + line.end[1] * scale,
+                    ],
+                    color: line.color,
+                    width: line.width * scale,
+                    kind: 1,
+                    clip,
+                    depth,
+                    paint_group_id: group,
+                });
+            }
+        }
         let dropdown_texts = self.dropdown_option_texts();
         let list_box_texts = self.list_box_option_texts();
         let tab_texts = self.tab_option_texts();
@@ -5019,11 +5208,23 @@ impl UiWgpuRenderer {
                 .or_default()
                 .push((surface_id.clone(), *surface));
         }
+        let mut canvas_groups: Vec<(u32, Vec<UiCanvasInstance>)> = Vec::new();
+        for instance in &canvas {
+            if let Some((_, group)) = canvas_groups
+                .iter_mut()
+                .find(|(key, _)| *key == instance.paint_group_id)
+            {
+                group.push(*instance);
+            } else {
+                canvas_groups.push((instance.paint_group_id, vec![*instance]));
+            }
+        }
         let mut depth_keys = rect_groups
             .iter()
             .map(|(key, _)| *key)
             .chain(image_groups.iter().map(|(key, _)| *key))
             .chain(surface_groups.keys().copied())
+            .chain(canvas_groups.iter().map(|(key, _)| *key))
             .chain(text_groups.iter().map(|(key, _)| *key))
             .collect::<Vec<_>>();
         let group_depth = |group_id: u32| {
@@ -5052,6 +5253,8 @@ impl UiWgpuRenderer {
         let mut rect_ranges = HashMap::new();
         let mut image_ranges = HashMap::new();
         let mut text_ranges = HashMap::new();
+        let mut ordered_canvas = Vec::new();
+        let mut canvas_ranges = HashMap::new();
         let group_order = depth_keys.clone();
         for key in depth_keys {
             if let Some((_, group)) = rect_groups.iter().find(|(group_key, _)| *group_key == key) {
@@ -5068,6 +5271,14 @@ impl UiWgpuRenderer {
                 let start = ordered_texts.len() as u32;
                 ordered_texts.extend_from_slice(group);
                 text_ranges.insert(key, (start, group.len() as u32));
+            }
+            if let Some((_, group)) = canvas_groups
+                .iter()
+                .find(|(group_key, _)| *group_key == key)
+            {
+                let start = ordered_canvas.len() as u32;
+                ordered_canvas.extend_from_slice(group);
+                canvas_ranges.insert(key, (start, group.len() as u32));
             }
         }
         let group_sort_ms = stage.elapsed().as_secs_f32() * 1000.0;
@@ -5091,6 +5302,10 @@ impl UiWgpuRenderer {
             self.text_capacity = ordered_texts.len().next_power_of_two();
             self.text_buffer = create_text_buffer(device, self.text_capacity);
         }
+        if ordered_canvas.len() > self.canvas_capacity {
+            self.canvas_capacity = ordered_canvas.len().next_power_of_two();
+            self.canvas_buffer = create_canvas_buffer(device, self.canvas_capacity);
+        }
         queue.write_buffer(
             &self.instance_buffer,
             0,
@@ -5112,6 +5327,13 @@ impl UiWgpuRenderer {
         }
         if !ordered_texts.is_empty() {
             queue.write_buffer(&self.text_buffer, 0, bytemuck::cast_slice(&ordered_texts));
+        }
+        if !ordered_canvas.is_empty() {
+            queue.write_buffer(
+                &self.canvas_buffer,
+                0,
+                bytemuck::cast_slice(&ordered_canvas),
+            );
         }
         buffer_upload_ms += stage.elapsed().as_secs_f32() * 1000.0;
         for key in group_order {
@@ -5147,6 +5369,12 @@ impl UiWgpuRenderer {
                     );
                     pass.draw(0..6, 0..1);
                 }
+            }
+            if let Some((start, count)) = canvas_ranges.get(&key) {
+                pass.set_pipeline(&self.canvas_pipeline);
+                pass.set_bind_group(0, &self.view_bind_group, &[]);
+                pass.set_vertex_buffer(0, self.canvas_buffer.slice(..));
+                pass.draw(0..6, *start..*start + *count);
             }
             if let Some((start, count)) = text_ranges.get(&key) {
                 pass.set_pipeline(&self.text_pipeline);
@@ -5227,6 +5455,27 @@ impl UiWgpuRenderer {
 
     pub(crate) fn last_panel_instance_count(&self) -> usize {
         self.last_panel_instance_count
+    }
+
+    pub(crate) fn canvas_diagnostics(
+        &mut self,
+        fragments: &HashMap<neon_ui_schema::UiFragmentId, UiFragment>,
+        viewport: [f32; 2],
+    ) -> Value {
+        self.refresh_plan(fragments, viewport);
+        let mut points = 0usize;
+        let mut lines = 0usize;
+        let mut canvas_nodes = 0usize;
+        for fragment in fragments.values() {
+            for effect in &fragment.effects {
+                if let neon_ui_schema::UiEffect::CanvasData { data, .. } = effect {
+                    points += data.points.len();
+                    lines += data.lines.len();
+                    canvas_nodes += 1;
+                }
+            }
+        }
+        json!({"canvas_nodes": canvas_nodes, "point_instances": points, "line_instances": lines, "total_instances": points + lines, "pipeline": "wgpu.ui.canvas.points_lines.v1"})
     }
 
     /// World-anchor projection changes node bounds without changing the UI
@@ -7538,6 +7787,15 @@ fn create_text_buffer(device: &wgpu::Device, capacity: usize) -> wgpu::Buffer {
     })
 }
 
+fn create_canvas_buffer(device: &wgpu::Device, capacity: usize) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("neon3-ui-canvas-instances"),
+        size: (capacity.max(1) * std::mem::size_of::<UiCanvasInstance>()) as u64,
+        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
+}
+
 fn text_ref_value(text: &TextRef) -> Option<&str> {
     match text {
         TextRef::Key { key, .. } => (!key.trim().is_empty()).then_some(key.as_str()),
@@ -8601,6 +8859,7 @@ fn scale_world_bounds(bounds: UiBounds, scale: Option<f32>, origin: Option<[f32;
 /// This preserves fragment/sibling painter order and prevents an accidental
 /// global overlay pass. Geometry is clipped to the Canvas bounds before it is
 /// handed to the ordinary UI panel pipeline.
+#[cfg(test)]
 fn append_canvas_marks(
     out: &mut Vec<(String, Option<String>, UiVisual, Option<UiTransition>)>,
     canvas_path: &str,
@@ -8805,21 +9064,6 @@ fn flatten_node(
             },
             node.enter_transition.clone(),
         ));
-        if node.kind == UiNodeKind::Canvas
-            && let Some(data) = canvas_data.get(&node.node_id.0)
-        {
-            append_canvas_marks(
-                out,
-                &node_path,
-                &visual_bounds,
-                &effective_clip,
-                node,
-                data,
-                world_scale,
-                world_origin,
-                node.world_depth.or(inherited_depth),
-            );
-        }
     }
     let inner = UiBounds {
         x: bounds.x + node_layout.padding[3],

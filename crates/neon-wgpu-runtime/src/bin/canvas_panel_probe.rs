@@ -3,7 +3,8 @@
 //! through public RPC, and checks the accepted composition diagnostics.
 
 use std::{
-    io,
+    fs::File,
+    io::{self, BufReader},
     net::SocketAddr,
     process::{Child, Command},
     thread,
@@ -99,10 +100,10 @@ fn canvas_fragment() -> UiFragment {
                 }],
                 lines: vec![
                     UiCanvasLine {
-                        id: "vertical".into(),
-                        start: [80.0, 16.0],
-                        end: [80.0, 150.0],
-                        width: 2.0,
+                        id: "diagonal".into(),
+                        start: [24.0, 16.0],
+                        end: [220.0, 150.0],
+                        width: 3.0,
                         color: [0.2, 0.9, 1.0, 1.0],
                     },
                     UiCanvasLine {
@@ -118,16 +119,40 @@ fn canvas_fragment() -> UiFragment {
     }
 }
 
-fn launch() -> io::Result<Child> {
+fn launch(window: bool) -> io::Result<Child> {
     let binary = std::env::current_exe()?.with_file_name("neon-wgpu-runtime.exe");
-    Command::new(binary)
-        .args(["--headless-server", ENDPOINT])
-        .spawn()
+    let mode = if window {
+        "--window-server"
+    } else {
+        "--headless-server"
+    };
+    Command::new(binary).args([mode, ENDPOINT]).spawn()
+}
+
+fn canvas_pixel_counts(path: &str) -> io::Result<(u64, u64)> {
+    let decoder = png::Decoder::new(BufReader::new(File::open(path)?));
+    let mut reader = decoder.read_info().map_err(io::Error::other)?;
+    let mut bytes = vec![0; reader.output_buffer_size().unwrap_or(0)];
+    let info = reader.next_frame(&mut bytes).map_err(io::Error::other)?;
+    let pixels = &bytes[..info.buffer_size()];
+    let mut red = 0u64;
+    let mut cyan = 0u64;
+    for pixel in pixels.chunks_exact(4) {
+        let [r, g, b, a] = [pixel[0], pixel[1], pixel[2], pixel[3]];
+        if a > 8 && r > 120 && r > g.saturating_add(35) && r > b.saturating_add(35) {
+            red += 1;
+        }
+        if a > 8 && g > 100 && b > 100 && r.saturating_add(30) < g && r.saturating_add(30) < b {
+            cyan += 1;
+        }
+    }
+    Ok((red, cyan))
 }
 
 fn main() -> io::Result<()> {
+    let window = std::env::args().skip(1).any(|arg| arg == "--window");
     let endpoint: SocketAddr = ENDPOINT.parse().expect("fixed endpoint");
-    let mut service = launch()?;
+    let mut service = launch(window)?;
     let started = Instant::now();
     let health = loop {
         match call(endpoint, "service.health", 1, json!({})) {
@@ -163,21 +188,36 @@ fn main() -> io::Result<()> {
     );
     let diagnostics =
         call(endpoint, "wgpu.render.diagnostics", 3, json!({})).map_err(io::Error::other)?;
+    let capture_path = std::env::temp_dir().join("neon3-canvas-window-probe.png");
     let capture = call(
         endpoint,
         "wgpu.render.target.capture",
         4,
-        json!({"target":"ui.color.v1"}),
+        if window {
+            json!({"target":"ui.color.v1", "path": capture_path.to_string_lossy(), "redraw": true})
+        } else {
+            json!({"target":"ui.color.v1"})
+        },
     )
     .map_err(io::Error::other)?;
+    let (red_pixels, cyan_pixels) = if window {
+        let artifact = capture
+            .get("artifact_path")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| io::Error::other("window capture did not return a PNG artifact"))?;
+        canvas_pixel_counts(artifact)?
+    } else {
+        (0, 0)
+    };
     let passed = diagnostics
         .get("fragment_count")
         .and_then(serde_json::Value::as_u64)
         == Some(1)
-        && capture.get("target").and_then(serde_json::Value::as_str) == Some("ui.color.v1");
+        && capture.get("target").and_then(serde_json::Value::as_str) == Some("ui.color.v1")
+        && (!window || (red_pixels > 12 && cyan_pixels > 100));
     println!(
         "{}",
-        json!({"callback":"canvas.result","frame_sequence":1,"producer":{"canvas_data_version":1,"point_count":1,"line_count":2},"consumer":{"fragment_count":diagnostics.get("fragment_count"),"graph_revision":diagnostics.get("graph_revision"),"capture_target":capture.get("target")},"result":if passed {"passed"} else {"failed"}})
+        json!({"callback":"canvas.result","mode":if window {"window"} else {"headless"},"frame_sequence":1,"producer":{"canvas_data_version":1,"point_count":1,"line_count":2},"consumer":{"fragment_count":diagnostics.get("fragment_count"),"graph_revision":diagnostics.get("graph_revision"),"capture_target":capture.get("target"),"capture_artifact":capture.get("artifact_path"),"red_pixels":red_pixels,"cyan_pixels":cyan_pixels},"result":if passed {"passed"} else {"failed"}})
     );
     let _ = call(endpoint, "service.shutdown", 5, json!({}));
     let deadline = Instant::now() + Duration::from_secs(2);
