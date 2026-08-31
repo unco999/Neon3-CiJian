@@ -81,6 +81,18 @@ resources.
 
 ## Getting Started
 
+## Runtime Release
+
+The current Windows x86_64 runtime bundle is published as
+[Neon3 v0.2.0](https://github.com/unco999/Neon3-CiJian/releases/tag/v0.2.0).
+It contains the three cross-process services required by SDK clients:
+`neon-eventd`, `neon-ui-runtime`, and `neon-wgpu-runtime`, plus runtime assets.
+
+The [Neon3 SDK](https://github.com/unco999/Neon3Sdk) language clients download
+and cache this bundle automatically when a local `NEON_ROOT` is not supplied.
+The bundle is separate from the SDK packages so Python/npm installation stays
+small while the WGPU/window ownership boundary remains explicit.
+
 Requirements:
 
 - Rust **1.85+** (edition 2024), pinned via `rust-version` in `Cargo.toml`.
