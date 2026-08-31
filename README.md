@@ -84,7 +84,7 @@ resources.
 ## Runtime Release
 
 The current Windows x86_64 runtime bundle is published as
-[Neon3 v0.2.0](https://github.com/unco999/Neon3-CiJian/releases/tag/v0.2.0).
+[Neon3 v0.2.1](https://github.com/unco999/Neon3-CiJian/releases/tag/v0.2.1).
 It contains the three cross-process services required by SDK clients:
 `neon-eventd`, `neon-ui-runtime`, and `neon-wgpu-runtime`, plus runtime assets.
 
