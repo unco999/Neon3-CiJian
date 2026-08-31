@@ -405,6 +405,7 @@ impl Eventd {
             "service.down",
             "camera.pose.",
             "selection.",
+            "ui.file_drop.",
         ] {
             core.register_namespace(namespace, 1);
         }

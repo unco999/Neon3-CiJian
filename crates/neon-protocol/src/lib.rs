@@ -665,6 +665,22 @@ pub struct EventPublish {
     pub idempotency_key: Option<String>,
 }
 
+/// OS file drop observation emitted by the WGPU window owner. The path is a
+/// local capability for same-machine tooling; receivers must not treat it as
+/// project truth or write through it without an explicit import workflow.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiFileDropPayload {
+    pub drop_sequence: u64,
+    pub source_path: String,
+    pub file_name: String,
+    pub extension: String,
+    pub media_type: String,
+    pub is_image: bool,
+    pub renderer_epoch: u64,
+    pub frame_sequence: u64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EventSubscribe {

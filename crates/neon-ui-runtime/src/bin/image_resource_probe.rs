@@ -115,7 +115,7 @@ fn spawn_services(
 }
 
 fn image_flow_source() -> &'static str {
-    "version 1\nsurface external-image-flow revision 1\nbudget nodes=8 bindings=0 instances=8 text=8 glyphs=64 events=0 clips=8\nresource engine-image-01 image\nsurface external-image-flow column w 64 h 64\n  image external-image resource engine-image-01 w 32 h 32\n"
+    "version 1\nsurface external-image-flow revision 1\nbudget nodes=8 bindings=0 instances=8 text=8 glyphs=64 events=0 clips=8\nresource engine-image-01 image\nsurface external-image-flow column w 96 h 96\n  panel external-panel frame engine-image-01 w 96 h 96 nine_slice 1 1 1 1 border 12 12 12 12 mode stretch fill_center true\n"
 }
 
 fn emit(step: &str, input: Value, response: Option<&RpcResponse>, pass: bool) {
@@ -180,15 +180,25 @@ fn run_probe() -> Result<(), String> {
         wait_health(ui_endpoint, "ui-runtime", ClientKind::Cli)?;
         emit("ui.health", json!({"endpoint": ui_endpoint}), None, true);
 
-        let bytes = vec![
-            255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 0, 255,
-        ];
+        let mut bytes = Vec::with_capacity(4 * 4 * 4);
+        for y in 0..4 {
+            for x in 0..4 {
+                let color = match (x, y) {
+                    (0, 0) => [255, 0, 0, 255],
+                    (3, 0) => [0, 255, 0, 255],
+                    (0, 3) => [0, 0, 255, 255],
+                    (3, 3) => [255, 255, 0, 255],
+                    _ => [32, 32, 32, 255],
+                };
+                bytes.extend_from_slice(&color);
+            }
+        }
         let upload = UiImageUploadRequest {
             source: UiImageSource {
                 image_id: "engine-image-01".into(),
                 media_type: "application/x-neon-rgba8".into(),
-                width: 2,
-                height: 2,
+                width: 4,
+                height: 4,
                 bytes: bytes.clone(),
             },
         };
@@ -209,7 +219,7 @@ fn run_probe() -> Result<(), String> {
             });
         emit(
             "ui.image.upload",
-            json!({"image_id": "engine-image-01", "width": 2, "height": 2, "bytes": bytes.len()}),
+            json!({"image_id": "engine-image-01", "width": 4, "height": 4, "bytes": bytes.len()}),
             Some(&upload_response),
             upload_pass,
         );
@@ -234,7 +244,7 @@ fn run_probe() -> Result<(), String> {
                 .is_some_and(|result| result["surface_id"] == "external-image-flow");
         emit(
             "ui.image.flow.binding",
-            json!({"node_id": "external-image", "image_id": "engine-image-01", "source": image_flow_source()}),
+            json!({"node_id": "external-panel", "image_id": "engine-image-01", "structure": "panel.frame", "source": image_flow_source()}),
             Some(&fragment_response),
             fragment_pass,
         );
@@ -267,23 +277,51 @@ fn run_probe() -> Result<(), String> {
                     && image["generation"].is_u64()
                     && image["region"]["x"] == 1
                     && image["region"]["y"] == 1
-                    && image["region"]["width"] == 2
-                    && image["region"]["height"] == 2
+                    && image["region"]["width"] == 4
+                    && image["region"]["height"] == 4
                     && image["uv"].as_array().is_some_and(|uv| uv.len() == 4)
                     && image["resident"] == true
             });
         emit(
             "wgpu.image.inspect",
-            json!({"image_id": "engine-image-01", "expected_region": {"width": 2, "height": 2}}),
+            json!({"image_id": "engine-image-01", "expected_region": {"width": 4, "height": 4}}),
             Some(&inspect_response),
             inspect_pass,
         );
         if !inspect_pass {
             return Err("WGPU image residency did not expose a valid slot/region".into());
         }
+        let render_response = call(
+            wgpu_endpoint,
+            &request(
+                "nine-slice-render-01",
+                "wgpu-runtime",
+                "wgpu.render.target.capture",
+                json!({"target": "ui.color.v1", "path": "D:\\Neon3\\artifacts\\nine-slice-probe.png", "redraw": true}),
+                None,
+                None,
+                ClientKind::Cli,
+            ),
+        )?;
+        let render_pass = render_response.status == neon_protocol::RpcStatus::Accepted
+            && render_response
+                .result
+                .as_ref()
+                .and_then(|result| result.get("frame_sequence"))
+                .and_then(Value::as_u64)
+                .is_some_and(|sequence| sequence > 0);
+        emit(
+            "wgpu.nine_slice.render",
+            json!({"frame_pair": "image-upload-01 -> nine-slice-render-01", "expected_target_size": [96, 96], "capture_path": "D:\\Neon3\\artifacts\\nine-slice-probe.png"}),
+            Some(&render_response),
+            render_pass,
+        );
+        if !render_pass {
+            return Err("nine-slice render did not advance a composed frame".into());
+        }
         println!(
             "{}",
-            json!({"scenario": "external-image-upload-bind.v1", "status": "passed"})
+            json!({"scenario": "ui.nine-slice.external-image.v1", "status": "passed"})
         );
         Ok(())
     })();
@@ -322,7 +360,7 @@ fn main() {
         Err(error) => {
             println!(
                 "{}",
-                json!({"scenario": "external-image-upload-bind.v1", "status": "failed", "error": error})
+                json!({"scenario": "ui.nine-slice.external-image.v1", "status": "failed", "error": error})
             );
             std::process::exit(1);
         }

@@ -70,6 +70,24 @@ Supported layout tokens are `row`, `column`, `overlay`, `w`, `h`, `minw`, `maxw`
 
 `token`, `fill`, `line`, and `ink` are visual declarations. `token` and `ink` require `token:<name>` references. `fill` and `line` accept an explicit `#RRGGBB` or `#RRGGBBAA` compatibility color until theme-token lowering carries those fields in canonical IR. There is no shader source or arbitrary visual expression.
 
+Images may declare a renderer-owned nine-slice mapping without creating nine
+runtime nodes:
+
+```text
+resource panel-frame image
+surface root
+  image frame resource panel-frame w 320 h 96 nine_slice 16 16 16 16 border 12 12 12 12 mode stretch fill_center true
+```
+
+The four source values and four target values use `[left, top, right, bottom]`.
+Source insets are image pixels; target insets are logical UI units. `stretch`,
+`tile`, and `mirror` are finite renderer policies, and `fill_center false`
+preserves the border while discarding the center patch. The WGPU runtime sends
+one image instance through the GPU shader, which resolves the nine patch from
+the current atlas region and generation. Tiny target rectangles compress the
+opposing target borders proportionally; invalid source insets are rejected
+rather than clamped. The canonical contract capability is `ui.nine_slice.v1`.
+
 Direct bindings use `$input_key` only. `value $name`, `enabled $can_commit`, and `visible $show_details` lower to canonical binding records. Literal `value` text is quoted. Component state uses typed forms: `checked $bool` for checkboxes, `selected $bool` for radio buttons and selectables, `numeric $i32_or_f32` for sliders, drag values, scrollbars, and progress bars, and `state $enum` for combos, dropdowns, tabs, and list boxes. V1 conditional syntax is reserved for bounded branch lowering: `when $flag`, `when !$flag`, and `when $mode=ready`; complex predicates require a domain-provided boolean or enum input and are rejected rather than evaluated.
 
 `event <dotted.intent>` declares a typed semantic intent. V1 event declarations contain no handlers and no computed payload expressions. Payload fields must be declared through the canonical event schema; Flow cannot inject pointer positions, render hit IDs, GPU handles or domain mutations.

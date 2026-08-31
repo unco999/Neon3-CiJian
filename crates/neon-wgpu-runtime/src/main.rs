@@ -68,14 +68,24 @@ fn main() {
                     .parse()
                     .expect("projectd endpoint must be a socket address")
             });
+        let eventd_endpoint = args
+            .iter()
+            .position(|argument| argument == "--eventd")
+            .and_then(|index| args.get(index + 1))
+            .map(|endpoint| {
+                endpoint
+                    .parse()
+                    .expect("eventd endpoint must be a socket address")
+            });
         let enable_world_ui_lab_camera = args
             .iter()
             .any(|argument| argument == "--enable-world-ui-lab-camera");
-        if let Err(error) = neon_wgpu_runtime::WindowedRuntime::run_server(
+        if let Err(error) = neon_wgpu_runtime::WindowedRuntime::run_server_with_eventd(
             1,
             endpoint,
             ui_endpoint,
             projectd_endpoint,
+            eventd_endpoint,
             enable_world_ui_lab_camera,
         ) {
             eprintln!("neon-wgpu-runtime failed: {error}");
@@ -84,7 +94,7 @@ fn main() {
         return;
     }
     eprintln!(
-        "usage: neon-wgpu-runtime --window | --window-server <loopback-endpoint> [ui-runtime-endpoint] [projectd-endpoint] [--enable-world-ui-lab-camera] | --headless-server <loopback-endpoint>"
+        "usage: neon-wgpu-runtime --window | --window-server <loopback-endpoint> [ui-runtime-endpoint] [projectd-endpoint] [--eventd <loopback-endpoint>] [--enable-world-ui-lab-camera] | --headless-server <loopback-endpoint>"
     );
     std::process::exit(2);
 }

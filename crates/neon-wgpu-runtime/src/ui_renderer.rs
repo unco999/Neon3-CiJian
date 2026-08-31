@@ -256,12 +256,44 @@ struct View { viewport: vec2<f32>, color_mode: u32, _pad: u32 }
 fn srgb_to_linear(value: vec3<f32>) -> vec3<f32> {
  let low = value / 12.92; let high = pow((value + vec3<f32>(0.055)) / 1.055, vec3<f32>(2.4)); return select(low, high, value > vec3<f32>(0.04045));
 }
-struct VsIn { @location(0) rect: vec4<f32>, @location(1) tint: vec4<f32>, @location(2) clip: vec4<f32>, @location(3) uv: vec4<f32>, @location(4) depth: f32 }
-struct VsOut { @builtin(position) position: vec4<f32>, @location(0) local: vec2<f32>, @location(1) tint: vec4<f32>, @location(2) clip: vec4<f32>, @location(3) pixel: vec2<f32>, @location(4) uv: vec2<f32> }
+struct VsIn { @location(0) rect: vec4<f32>, @location(1) tint: vec4<f32>, @location(2) clip: vec4<f32>, @location(3) uv: vec4<f32>, @location(4) depth: f32, @location(5) source_insets: vec4<f32>, @location(6) target_insets: vec4<f32>, @location(7) mode: u32, @location(8) fill_center: u32 }
+struct VsOut { @builtin(position) position: vec4<f32>, @location(0) local: vec2<f32>, @location(1) tint: vec4<f32>, @location(2) clip: vec4<f32>, @location(3) pixel: vec2<f32>, @location(4) uv: vec4<f32>, @location(5) source_insets: vec4<f32>, @location(6) target_insets: vec4<f32>, @location(7) @interpolate(flat) mode: u32, @location(8) @interpolate(flat) fill_center: u32, @location(9) rect_size: vec2<f32> }
 @vertex fn vs_main(@builtin(vertex_index) index: u32, input: VsIn) -> VsOut {
  var corners = array<vec2<f32>, 6>(vec2<f32>(0.0,0.0),vec2<f32>(1.0,0.0),vec2<f32>(0.0,1.0),vec2<f32>(0.0,1.0),vec2<f32>(1.0,0.0),vec2<f32>(1.0,1.0));
  let local = corners[index]; let pixel = input.rect.xy + local * input.rect.zw; var output: VsOut;
-   output.position = vec4<f32>(pixel.x / view.viewport.x * 2.0 - 1.0, 1.0 - pixel.y / view.viewport.y * 2.0, input.depth, 1.0); output.local = local; output.tint = input.tint; output.clip = input.clip; output.pixel = pixel; output.uv = input.uv.xy + local * input.uv.zw; return output;
+    output.position = vec4<f32>(pixel.x / view.viewport.x * 2.0 - 1.0, 1.0 - pixel.y / view.viewport.y * 2.0, input.depth, 1.0); output.local = local; output.tint = input.tint; output.clip = input.clip; output.pixel = pixel; output.uv = input.uv; output.source_insets = input.source_insets; output.target_insets = input.target_insets; output.mode = input.mode; output.fill_center = input.fill_center; output.rect_size = input.rect.zw; return output;
+ }
+fn compressed_insets(size: f32, left: f32, right: f32) -> vec2<f32> {
+  let total = left + right;
+  if total > size && total > 0.0 {
+    return vec2<f32>(left, right) * (size / total);
+  }
+  return vec2<f32>(left, right);
+}
+fn map_axis(distance: f32, size: f32, source_size: f32, target_edges: vec2<f32>, source_edges: vec2<f32>, mode: u32) -> f32 {
+  let target_span = compressed_insets(size, target_edges.x, target_edges.y);
+  let source = vec2<f32>(source_edges.x, source_edges.y);
+  let middle_source = max(source_size - source.x - source.y, 0.0);
+  let middle_target = max(size - target_span.x - target_span.y, 0.0);
+  if distance <= target_span.x || middle_target <= 0.0 {
+    return select(0.0, (distance / max(target_span.x, 0.0001)) * source.x, target_span.x > 0.0);
+  }
+  if distance >= size - target_span.y {
+    return source_size - source.y + ((distance - (size - target_span.y)) / max(target_span.y, 0.0001)) * source.y;
+  }
+  if middle_source <= 0.0 {
+    return source.x;
+  }
+  let middle_distance = distance - target_span.x;
+  if mode == 0u {
+    return source.x + middle_distance / middle_target * middle_source;
+  }
+  let tile_index = floor(middle_distance / middle_source);
+  let tile_offset = middle_distance - tile_index * middle_source;
+  if mode == 2u && (u32(tile_index) & 1u) == 1u {
+    return source.x + middle_source - tile_offset;
+  }
+  return source.x + tile_offset;
 }
 @fragment fn fs_main(input: VsOut) -> @location(0) vec4<f32> {
  if (input.pixel.x < input.clip.x || input.pixel.y < input.clip.y || input.pixel.x > input.clip.z || input.pixel.y > input.clip.w) { discard; }
@@ -270,11 +302,25 @@ struct VsOut { @builtin(position) position: vec4<f32>, @location(0) local: vec2<
     // the atlas boundary; this keeps the first/last texel visible for both
     // tiny probes and cropped engine images.
     let atlas_dims = vec2<i32>(textureDimensions(image_texture));
-    let texel = clamp(
-        vec2<i32>(input.uv * vec2<f32>(atlas_dims)),
-        vec2<i32>(0),
-        atlas_dims - vec2<i32>(1),
-    );
+     let source_size = input.uv.zw * vec2<f32>(atlas_dims) + vec2<f32>(1.0);
+     let distance = input.local * input.rect_size;
+     let x_edges = compressed_insets(input.rect_size.x, input.target_insets.x, input.target_insets.z);
+     let y_edges = compressed_insets(input.rect_size.y, input.target_insets.y, input.target_insets.w);
+     let source_x = map_axis(distance.x, input.rect_size.x, source_size.x, vec2<f32>(x_edges.x, x_edges.y), vec2<f32>(input.source_insets.x, input.source_insets.z), input.mode);
+     let source_y = map_axis(distance.y, input.rect_size.y, source_size.y, vec2<f32>(y_edges.x, y_edges.y), vec2<f32>(input.source_insets.y, input.source_insets.w), input.mode);
+     let in_center = distance.x >= x_edges.x && distance.x <= input.rect_size.x - x_edges.y && distance.y >= y_edges.x && distance.y <= input.rect_size.y - y_edges.y;
+     if (!in_center || input.fill_center == 1u) {
+       // Continue with the sampled texel. The condition is intentionally
+       // branch-shaped so transparent center fill remains a cheap discard.
+     } else {
+       discard;
+     }
+     let atlas_position = input.uv.xy * vec2<f32>(atlas_dims) - vec2<f32>(0.5) + vec2<f32>(source_x, source_y);
+     let texel = clamp(
+         vec2<i32>(atlas_position),
+         vec2<i32>(0),
+         atlas_dims - vec2<i32>(1),
+     );
     let sample = textureLoad(image_texture, texel, 0);
   let alpha = sample.a * input.tint.a;
   if (alpha <= 0.001) { discard; }
@@ -578,6 +624,11 @@ struct UiImageInstance {
     uv: [f32; 4],
     depth: f32,
     paint_group_id: u32,
+    source_insets: [f32; 4],
+    target_insets: [f32; 4],
+    mode: u32,
+    fill_center: u32,
+    _padding: [u32; 2],
 }
 
 #[repr(C)]
@@ -1121,6 +1172,7 @@ pub struct UiWgpuRenderer {
     image_capacity: usize,
     resident_images: HashMap<(String, u64, u64), ResidentImage>,
     external_images: HashMap<String, ResidentImage>,
+    nine_slices: HashMap<String, neon_ui_schema::UiNineSlice>,
     image_atlas: Option<ResidentImageAtlas>,
     image_atlas_generation: u64,
     resident_render_surfaces: HashMap<String, ResidentRenderSurface>,
@@ -1467,6 +1519,26 @@ impl UiWgpuRenderer {
                             offset: 64,
                             shader_location: 4,
                         },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x4,
+                            offset: 72,
+                            shader_location: 5,
+                        },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x4,
+                            offset: 88,
+                            shader_location: 6,
+                        },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Uint32,
+                            offset: 104,
+                            shader_location: 7,
+                        },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Uint32,
+                            offset: 108,
+                            shader_location: 8,
+                        },
                     ],
                 })],
                 compilation_options: Default::default(),
@@ -1727,6 +1799,7 @@ impl UiWgpuRenderer {
             image_capacity: 512,
             resident_images: HashMap::new(),
             external_images: HashMap::new(),
+            nine_slices: HashMap::new(),
             image_atlas: None,
             image_atlas_generation: 0,
             resident_render_surfaces: HashMap::new(),
@@ -3717,9 +3790,16 @@ impl UiWgpuRenderer {
         let sampled_images = self
             .sampled
             .iter()
-            .filter_map(|visual| visual.image.as_ref().map(|asset| (visual, asset)))
-            .map(|(visual, asset)| {
+            .enumerate()
+            .filter_map(|(index, visual)| visual.image.as_ref().map(|asset| (index, visual, asset)))
+            .map(|(index, visual, asset)| {
                 let key = (asset.project_id.clone(), asset.asset_id, asset.revision.0);
+                let node_key = self.plan[index]
+                    .id
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(self.plan[index].id.as_str());
+                let nine_slice = self.nine_slices.get(node_key).copied();
                 serde_json::json!({
                     "asset": asset,
                     "bounds": visual.bounds,
@@ -3740,6 +3820,17 @@ impl UiWgpuRenderer {
                                 .and_then(|image_id| self.external_images.get(image_id))
                                 .map(|image| image.uv)
                         }),
+                    "nine_slice": nine_slice,
+                    "nine_slice_valid_for_resident": nine_slice.is_none_or(|layout| {
+                        self.resident_images
+                            .get(&key)
+                            .is_none_or(|image| layout.validate_for_image(image.width, image.height))
+                            && asset.project_id.strip_prefix("external:").is_none_or(|image_id| {
+                                self.external_images
+                                    .get(image_id)
+                                    .is_none_or(|image| layout.validate_for_image(image.width, image.height))
+                            })
+                    }),
                 })
             })
             .collect::<Vec<_>>();
@@ -4540,6 +4631,35 @@ impl UiWgpuRenderer {
                     let key = (asset.project_id.clone(), asset.asset_id, asset.revision.0);
                     self.resident_images.get(&key)
                 }?;
+                let node_key = self.plan[index]
+                    .id
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(self.plan[index].id.as_str());
+                let nine_slice = self.nine_slices.get(node_key).copied();
+                if nine_slice
+                    .is_some_and(|layout| !layout.validate_for_image(image.width, image.height))
+                {
+                    return None;
+                }
+                let (source_insets, mut target_insets, mode, fill_center) = nine_slice
+                    .map(|layout| {
+                        let scale = visual.world_scale.unwrap_or(1.0);
+                        (
+                            layout.source_insets_px.map(|value| value as f32),
+                            layout.target_insets.map(|value| value * scale),
+                            match layout.mode {
+                                neon_ui_schema::UiNineSliceMode::Stretch => 0,
+                                neon_ui_schema::UiNineSliceMode::Tile => 1,
+                                neon_ui_schema::UiNineSliceMode::Mirror => 2,
+                            },
+                            u32::from(layout.fill_center),
+                        )
+                    })
+                    .unwrap_or(([0.0; 4], [0.0; 4], 0, 1));
+                for value in &mut target_insets {
+                    *value = value.max(0.0);
+                }
                 Some(UiImageInstance {
                     rect: [
                         visual.bounds.x,
@@ -4557,6 +4677,11 @@ impl UiWgpuRenderer {
                     uv: image.uv,
                     depth: color_pass_depth(visual.world_depth),
                     paint_group_id: self.plan[index].paint_group_id,
+                    source_insets,
+                    target_insets,
+                    mode,
+                    fill_center,
+                    _padding: [0; 2],
                 })
             })();
             let Some(image) = image else {
@@ -4615,6 +4740,11 @@ impl UiWgpuRenderer {
                                 .position(|(_, candidate)| std::ptr::eq(candidate, visual))
                                 .map(|index| self.plan[index].paint_group_id)
                                 .unwrap_or(0),
+                            source_insets: [0.0; 4],
+                            target_insets: [0.0; 4],
+                            mode: 0,
+                            fill_center: 1,
+                            _padding: [0; 2],
                         },
                     ))
             })
@@ -5246,6 +5376,14 @@ impl UiWgpuRenderer {
                 .all(|(id, fragment)| self.plan_revisions.get(id) == Some(&fragment.revision));
         if matches && !data_grid_hold_changed {
             return false;
+        }
+        self.nine_slices.clear();
+        for fragment in fragments.values() {
+            for effect in &fragment.effects {
+                if let neon_ui_schema::UiEffect::NineSlice { node_id, layout } = effect {
+                    self.nine_slices.insert(node_id.0.clone(), *layout);
+                }
+            }
         }
         self.layout_counters.layout_count = self.layout_counters.layout_count.saturating_add(1);
         let display_fragments = self.data_grid_display_fragments(fragments);
@@ -12427,6 +12565,96 @@ mod tests {
             "green pixel: {:?}",
             pixel(11, 3)
         );
+    }
+
+    #[test]
+    fn gpu_panel_frame_keeps_corners_fixed_and_stretches_edges() {
+        let _gpu_test = GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let (device, queue) = test_device("neon3-ui-nine-slice");
+        let mut image_node = node();
+        image_node.node_id = UiNodeId("frame".into());
+        image_node.kind = UiNodeKind::Panel;
+        image_node.bounds = UiBounds {
+            x: 0.0,
+            y: 0.0,
+            width: 32.0,
+            height: 32.0,
+        };
+        image_node.enter_transition = None;
+        image_node.style.background_color = [0.0, 0.0, 0.0, 0.0];
+        image_node.style.border_color = [0.0, 0.0, 0.0, 0.0];
+        image_node.image = Some(AssetRef {
+            project_id: "nine-slice-test".into(),
+            asset_id: 1,
+            revision: Revision(1),
+            kind: "image".into(),
+        });
+        let source_pixels = [
+            [255, 0, 0, 255],
+            [16, 16, 16, 255],
+            [16, 16, 16, 255],
+            [0, 255, 0, 255],
+            [16, 16, 16, 255],
+            [32, 32, 32, 255],
+            [32, 32, 32, 255],
+            [16, 16, 16, 255],
+            [16, 16, 16, 255],
+            [32, 32, 32, 255],
+            [32, 32, 32, 255],
+            [16, 16, 16, 255],
+            [0, 0, 255, 255],
+            [16, 16, 16, 255],
+            [16, 16, 16, 255],
+            [255, 255, 0, 255],
+        ];
+        let image_bytes = source_pixels.into_iter().flatten().collect::<Vec<_>>();
+        let fragment = UiFragment {
+            fragment_id: UiFragmentId("nine-slice-fragment".into()),
+            revision: Revision(1),
+            root: image_node,
+            effects: vec![UiEffect::NineSlice {
+                node_id: UiNodeId("frame".into()),
+                layout: neon_ui_schema::UiNineSlice {
+                    source_insets_px: [1, 1, 1, 1],
+                    target_insets: [8.0, 8.0, 8.0, 8.0],
+                    mode: neon_ui_schema::UiNineSliceMode::Stretch,
+                    fill_center: true,
+                },
+            }],
+        };
+        let asset = AssetBytes {
+            asset: AssetRef {
+                project_id: "nine-slice-test".into(),
+                asset_id: 1,
+                revision: Revision(1),
+                kind: "image".into(),
+            },
+            media_type: "application/x-neon-rgba8".into(),
+            width: Some(4),
+            height: Some(4),
+            bytes: image_bytes,
+        };
+        let pixels = render_offscreen_for_test(
+            &device,
+            &queue,
+            wgpu::TextureFormat::Rgba8Unorm,
+            &HashMap::from([(fragment.fragment_id.clone(), fragment)]),
+            [32, 32],
+            0.0,
+            &[asset],
+            Vec::new(),
+        );
+        let pixel = |x: usize, y: usize| {
+            let offset = (y * 32 + x) * 4;
+            &pixels[offset..offset + 4]
+        };
+        assert_eq!(pixel(0, 0), &[255, 0, 0, 255]);
+        assert_eq!(pixel(31, 0), &[0, 255, 0, 255]);
+        assert_eq!(pixel(0, 31), &[0, 0, 255, 255]);
+        assert_eq!(pixel(31, 31), &[255, 255, 0, 255]);
+        assert_eq!(pixel(16, 16), &[32, 32, 32, 255]);
     }
 
     #[test]

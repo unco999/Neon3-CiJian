@@ -16,9 +16,10 @@ use neon_ui_schema::{
     UiDragAxis, UiDragBinding, UiDragBoundary, UiDropBinding, UiDropPlacement, UiEasing, UiEffect,
     UiGridInputSlot, UiInputKind, UiInputPacking, UiInputSchema, UiInputSlot, UiInputUpdateClass,
     UiInputValue, UiIntent, UiIrBinding, UiIrDocument, UiIrPatch, UiIrPatchOperation,
-    UiIrPatchOperationKind, UiJustifyContent, UiLayout, UiLayoutMode, UiNode, UiNodeId, UiNodeKind,
-    UiProgram, UiProgramEventDeclaration, UiProgramRevision, UiResourceBudget, UiSourceSpan,
-    UiStyle, UiSurfaceId, UiTemplateDeclaration, UiTransition, UiTransitionState,
+    UiIrPatchOperationKind, UiJustifyContent, UiLayout, UiLayoutMode, UiNineSlice, UiNineSliceMode,
+    UiNode, UiNodeId, UiNodeKind, UiProgram, UiProgramEventDeclaration, UiProgramRevision,
+    UiResourceBudget, UiSourceSpan, UiStyle, UiSurfaceId, UiTemplateDeclaration, UiTransition,
+    UiTransitionState,
 };
 use neon_world_bridge::{CameraId, CameraKind, WorldAnchorId};
 use serde_json::json;
@@ -51,6 +52,7 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
     let mut world_panels = Vec::new();
     let mut resources = Vec::new();
     let mut image_resources = BTreeMap::new();
+    let mut panel_decorations = BTreeMap::new();
 
     for (index, raw) in source.lines().enumerate() {
         let line = (index + 1) as u32;
@@ -175,16 +177,16 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
         }
         let mut node = parse_node(content, line)?;
         if let Some(resource_key) = node.image_resource.take() {
-            if node.node.kind != UiNodeKind::Image {
+            if !matches!(node.node.kind, UiNodeKind::Image | UiNodeKind::Panel) {
                 return Err(error(
                     "nui_flow_invalid_resource",
-                    "only image nodes may reference image resources",
+                    "only image or panel nodes may reference image resources",
                     line,
                     1,
                 ));
             }
             if image_resources
-                .insert(node.node.node_id.0.clone(), resource_key)
+                .insert(node.node.node_id.0.clone(), resource_key.clone())
                 .is_some()
             {
                 return Err(error(
@@ -193,6 +195,17 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
                     line,
                     1,
                 ));
+            }
+            if node.node.kind == UiNodeKind::Panel
+                && let Some(layout) = node.nine_slice
+            {
+                panel_decorations.insert(
+                    node.node.node_id.0.clone(),
+                    neon_ui_schema::UiPanelDecoration {
+                        frame_resource: resource_key,
+                        nine_slice: layout,
+                    },
+                );
             }
         }
         if let Some(previous) = stack.last() {
@@ -525,6 +538,7 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
         events,
         resources,
         image_resources,
+        panel_decorations,
         branches,
         templates,
         data_grids,
@@ -648,6 +662,16 @@ pub fn lower_nui_flow_effects(document: &NuiFlowDocument) -> Vec<UiEffect> {
             .map(|(node_key, resource_key)| UiEffect::ImageBinding {
                 node_id: UiNodeId(node_key.clone()),
                 image_id: resource_key.clone(),
+            }),
+    );
+    effects.extend(
+        document
+            .ir
+            .panel_decorations
+            .iter()
+            .map(|(node_key, decoration)| UiEffect::NineSlice {
+                node_id: UiNodeId(node_key.clone()),
+                layout: decoration.nine_slice,
             }),
     );
     effects.extend(document.drags.iter().map(|drag| UiEffect::DragBinding {
@@ -840,6 +864,7 @@ pub fn format_nui_flow(source: &str) -> FlowResult<String> {
         &parsed.ir.events,
         &parsed.ir.data_grids,
         &parsed.ir.image_resources,
+        &parsed.ir.panel_decorations,
         &mut lines,
     );
     Ok(lines.join("\n") + "\n")
@@ -1140,6 +1165,7 @@ struct NodeBuild {
     template: Option<(u32, BTreeMap<String, UiInputKind>, String, bool)>,
     data_grid: Option<UiDataGridDeclaration>,
     image_resource: Option<String>,
+    nine_slice: Option<UiNineSlice>,
     world_panel: Option<NuiFlowWorldPanelDeclaration>,
 }
 
@@ -2088,6 +2114,7 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
     let mut data_grid_columns = None;
     let mut data_grid_source = None;
     let mut image_resource = None;
+    let mut nine_slice = None;
     let mut world_camera = None;
     let mut world_anchor = None;
     let mut used = HashSet::new();
@@ -2362,6 +2389,65 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
                 image_resource = Some(value.into());
                 index += 1;
             }
+            "frame" if component == "panel" => {
+                let value = *parts.get(index + 1).ok_or_else(|| {
+                    error(
+                        "nui_flow_invalid_resource",
+                        "panel frame requires an image resource key",
+                        line,
+                        1,
+                    )
+                })?;
+                if !valid_key(value) {
+                    return Err(error(
+                        "nui_flow_invalid_resource",
+                        "panel frame resource key is invalid",
+                        line,
+                        1,
+                    ));
+                }
+                image_resource = Some(value.into());
+                index += 1;
+            }
+            "nine_slice" if matches!(component, "image" | "panel") => {
+                let source = parse_u32_quad(&parts, index + 1, line, "source insets")?;
+                if parts.get(index + 5) != Some(&"border") {
+                    return Err(error(
+                        "nui_flow_invalid_nine_slice",
+                        "nine_slice syntax requires `border left top right bottom`",
+                        line,
+                        1,
+                    ));
+                }
+                let target = parse_f32_quad(&parts, index + 6, line, "target insets")?;
+                let mut next = index + 10;
+                let mut mode = UiNineSliceMode::Stretch;
+                let mut fill_center = true;
+                if parts.get(next) == Some(&"mode") {
+                    mode = parse_nine_slice_mode(parts.get(next + 1).copied().unwrap_or(""), line)?;
+                    next += 2;
+                }
+                if parts.get(next) == Some(&"fill_center") {
+                    fill_center = boolean(parts.get(next + 1).copied().unwrap_or(""), line)?;
+                    next += 2;
+                }
+                let layout = UiNineSlice {
+                    source_insets_px: source,
+                    target_insets: target,
+                    mode,
+                    fill_center,
+                };
+                if !layout.validate() {
+                    return Err(error(
+                        "nui_flow_invalid_nine_slice",
+                        "nine_slice target insets must be finite and nonnegative",
+                        line,
+                        1,
+                    ));
+                }
+                nine_slice = Some(layout);
+                index = next - 1;
+            }
             "key" if matches!(component, "repeat" | "template") => {
                 let value = *parts.get(index + 1).ok_or_else(|| {
                     error(
@@ -2498,6 +2584,7 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
         template,
         data_grid,
         image_resource,
+        nine_slice,
         world_panel,
     })
 }
@@ -3027,6 +3114,60 @@ fn parse_u64(value: &str, line: u32, what: &str) -> FlowResult<u64> {
         )
     })
 }
+
+fn parse_u32_quad(parts: &[&str], start: usize, line: u32, what: &str) -> FlowResult<[u32; 4]> {
+    let mut values = [0_u32; 4];
+    for (offset, value) in values.iter_mut().enumerate() {
+        let token = parts.get(start + offset).copied().ok_or_else(|| {
+            error(
+                "nui_flow_invalid_nine_slice",
+                &format!("nine_slice {what} requires four values"),
+                line,
+                1,
+            )
+        })?;
+        *value = u32::try_from(parse_u64(token, line, what)?).map_err(|_| {
+            error(
+                "nui_flow_invalid_nine_slice",
+                &format!("nine_slice {what} exceeds u32"),
+                line,
+                1,
+            )
+        })?;
+    }
+    Ok(values)
+}
+
+fn parse_f32_quad(parts: &[&str], start: usize, line: u32, what: &str) -> FlowResult<[f32; 4]> {
+    let mut values = [0.0_f32; 4];
+    for (offset, value) in values.iter_mut().enumerate() {
+        let token = parts.get(start + offset).copied().ok_or_else(|| {
+            error(
+                "nui_flow_invalid_nine_slice",
+                &format!("nine_slice {what} requires four values"),
+                line,
+                1,
+            )
+        })?;
+        *value = number(token, line)?;
+    }
+    Ok(values)
+}
+
+fn parse_nine_slice_mode(value: &str, line: u32) -> FlowResult<UiNineSliceMode> {
+    match value {
+        "stretch" => Ok(UiNineSliceMode::Stretch),
+        "tile" => Ok(UiNineSliceMode::Tile),
+        "mirror" => Ok(UiNineSliceMode::Mirror),
+        _ => Err(error(
+            "nui_flow_invalid_nine_slice",
+            "nine_slice mode must be stretch, tile, or mirror",
+            line,
+            1,
+        )),
+    }
+}
+
 fn number(value: &str, line: u32) -> FlowResult<f32> {
     value
         .parse::<f32>()
@@ -3241,6 +3382,7 @@ fn format_node(
     events: &[UiProgramEventDeclaration],
     data_grids: &[UiDataGridDeclaration],
     image_resources: &BTreeMap<String, String>,
+    panel_decorations: &BTreeMap<String, neon_ui_schema::UiPanelDecoration>,
     lines: &mut Vec<String>,
 ) {
     let kind = match &node.kind {
@@ -3292,10 +3434,30 @@ fn format_node(
             ));
         }
     }
-    if node.kind == UiNodeKind::Image
-        && let Some(resource_key) = image_resources.get(&node.node_id.0)
+    if let Some(resource_key) = image_resources.get(&node.node_id.0) {
+        if node.kind == UiNodeKind::Panel {
+            line.push_str(&format!(" frame {resource_key}"));
+        } else if node.kind == UiNodeKind::Image {
+            line.push_str(&format!(" resource {resource_key}"));
+        }
+    }
+    if matches!(node.kind, UiNodeKind::Image | UiNodeKind::Panel)
+        && let Some(decoration) = panel_decorations.get(&node.node_id.0)
     {
-        line.push_str(&format!(" resource {resource_key}"));
+        let layout = decoration.nine_slice;
+        line.push_str(&format!(
+            " nine_slice {} {} {} {} border {} {} {} {} mode {} fill_center {}",
+            layout.source_insets_px[0],
+            layout.source_insets_px[1],
+            layout.source_insets_px[2],
+            layout.source_insets_px[3],
+            layout.target_insets[0],
+            layout.target_insets[1],
+            layout.target_insets[2],
+            layout.target_insets[3],
+            format_nine_slice_mode(layout.mode),
+            layout.fill_center
+        ));
     }
     if let Some(layout) = node.layout {
         match layout.mode {
@@ -3351,8 +3513,17 @@ fn format_node(
             events,
             data_grids,
             image_resources,
+            panel_decorations,
             lines,
         );
+    }
+}
+
+fn format_nine_slice_mode(mode: UiNineSliceMode) -> &'static str {
+    match mode {
+        UiNineSliceMode::Stretch => "stretch",
+        UiNineSliceMode::Tile => "tile",
+        UiNineSliceMode::Mirror => "mirror",
     }
 }
 
@@ -3740,6 +3911,65 @@ panel workspace row gap 8
             reparsed.input_schema.emit_event_keys,
             vec!["brush_size".to_owned()]
         );
+    }
+
+    #[test]
+    fn nine_slice_parses_and_lowers_with_mainstream_border_order() {
+        let source = "version 1\nsurface external-image-flow revision 1\nbudget nodes=8 bindings=0 instances=8 text=8 glyphs=64 events=0 clips=8\nresource engine-image-01 image\nsurface external-image-flow column w 96 h 96\n  image external-image resource engine-image-01 w 64 h 64 nine_slice 1 1 1 1 border 12 12 12 12 mode stretch fill_center true\n";
+        let document = parse_nui_flow(source).unwrap();
+        assert_eq!(
+            document.ir.panel_decorations["external-image"].nine_slice,
+            UiNineSlice {
+                source_insets_px: [1, 1, 1, 1],
+                target_insets: [12.0, 12.0, 12.0, 12.0],
+                mode: UiNineSliceMode::Stretch,
+                fill_center: true,
+            }
+        );
+        assert!(matches!(
+            lower_nui_flow_effects(&document).iter().find(|effect| matches!(effect, UiEffect::NineSlice { .. })),
+            Some(UiEffect::NineSlice { node_id, layout }) if node_id.0 == "external-image" && layout.mode == UiNineSliceMode::Stretch
+        ));
+        let formatted = format_nui_flow(source).unwrap();
+        assert!(
+            formatted
+                .contains("nine_slice 1 1 1 1 border 12 12 12 12 mode stretch fill_center true")
+        );
+        assert_eq!(
+            parse_nui_flow(&formatted).unwrap().ir.panel_decorations,
+            document.ir.panel_decorations
+        );
+    }
+
+    #[test]
+    fn nine_slice_rejects_non_image_nodes_and_invalid_values() {
+        let error =
+            parse_nui_flow("surface root\n  panel frame nine_slice 1 1 1 1 border 1 1 1 1\n")
+                .unwrap_err();
+        assert_eq!(error.diagnostics[0].code, "nui_flow_unknown_attribute");
+        let error = parse_nui_flow(
+            "resource frame image\nsurface root\n  image frame resource frame nine_slice 1 1 1 1 border -1 1 1 1\n",
+        )
+        .unwrap_err();
+        assert_eq!(error.diagnostics[0].code, "nui_flow_invalid_nine_slice");
+    }
+
+    #[test]
+    fn panel_frame_owns_nine_slice_without_an_image_child() {
+        let source = "resource panel-frame image\nsurface root\n  panel card frame panel-frame w 320 h 96 nine_slice 16 16 16 16 border 12 12 12 12 mode stretch\n";
+        let document = parse_nui_flow(source).unwrap();
+        assert_eq!(document.ir.image_resources["card"], "panel-frame");
+        assert!(document.ir.root.children[0].image.is_none());
+        assert!(matches!(
+            lower_nui_flow_effects(&document).iter().find(|effect| matches!(effect, UiEffect::NineSlice { .. })),
+            Some(UiEffect::NineSlice { node_id, .. }) if node_id.0 == "card"
+        ));
+        assert!(matches!(
+            lower_nui_flow_effects(&document).iter().find(|effect| matches!(effect, UiEffect::ImageBinding { .. })),
+            Some(UiEffect::ImageBinding { node_id, image_id }) if node_id.0 == "card" && image_id == "panel-frame"
+        ));
+        let formatted = format_nui_flow(source).unwrap();
+        assert!(formatted.contains("panel card frame panel-frame"));
     }
 
     #[test]

@@ -13,7 +13,7 @@ use std::{
 #[cfg(debug_assertions)]
 use std::{io::BufWriter, path::Path};
 
-use neon_ipc::RpcClient;
+use neon_ipc::{EventClient, RpcClient};
 use neon_observability::{
     CommandJournal, CommandReceipt, CommandState, DebugSnapshot, EVENT_COMMAND_ACCEPTED,
     EVENT_COMMAND_RECEIVED, EVENT_COMMAND_REJECTED, JournalFilter, TraceLevel, TraceRecord,
@@ -25,8 +25,8 @@ use neon_protocol::{
     InteractionTraceRecord, InteractionTraceStage, PROTOCOL_VERSION, RenderBackend,
     RenderBackendNegotiation, RenderSurfaceKind, RenderSurfaceOpen, RenderSurfaceTargetKind,
     RequestId, Revision, RpcError, RpcRequest, RpcResponse, RpcStatus, ServiceDescription,
-    ServiceHealth, ServiceName, UiImageSource, UiImageTextureRef, UiImageTextureRegion,
-    UiImageUploadRequest,
+    ServiceHealth, ServiceName, UiFileDropPayload, UiImageSource, UiImageTextureRef,
+    UiImageTextureRegion, UiImageUploadRequest,
 };
 #[cfg(test)]
 use neon_ui_schema::UiFragmentSubmission;
@@ -930,6 +930,8 @@ pub struct WindowedRuntime {
     data_grid_window_delivery: Arc<Mutex<Value>>,
     initial_window_sizing: InitialWindowSizing,
     event_proxy: Option<EventLoopProxy<WindowCommand>>,
+    eventd_endpoint: Option<SocketAddr>,
+    next_file_drop_sequence: u64,
     world_ui_lab_camera: Arc<Mutex<WorldUiLabCameraController>>,
 }
 
@@ -1000,6 +1002,10 @@ enum WindowCommand {
     CaptureFinalTarget {
         artifact_path: Option<PathBuf>,
         redraw: bool,
+        completed: std::sync::mpsc::Sender<Result<Value, String>>,
+    },
+    FileDrop {
+        path: PathBuf,
         completed: std::sync::mpsc::Sender<Result<Value, String>>,
     },
     CompositionDrawCompleted {
@@ -1253,12 +1259,14 @@ impl WindowedRuntime {
             data_grid_window_delivery: Arc::new(Mutex::new(json!({"state": "idle"}))),
             initial_window_sizing: InitialWindowSizing::default(),
             event_proxy: None,
+            eventd_endpoint: None,
+            next_file_drop_sequence: 0,
             world_ui_lab_camera: Arc::new(Mutex::new(WorldUiLabCameraController::default())),
         }
     }
 
     pub fn run(epoch: u64) -> Result<(), String> {
-        Self::run_with_server(epoch, None, None, None, true, false)
+        Self::run_with_server(epoch, None, None, None, None, true, false)
     }
 
     pub fn run_server(
@@ -1268,11 +1276,30 @@ impl WindowedRuntime {
         projectd_endpoint: Option<SocketAddr>,
         enable_world_ui_lab_camera: bool,
     ) -> Result<(), String> {
+        Self::run_server_with_eventd(
+            epoch,
+            endpoint,
+            ui_endpoint,
+            projectd_endpoint,
+            None,
+            enable_world_ui_lab_camera,
+        )
+    }
+
+    pub fn run_server_with_eventd(
+        epoch: u64,
+        endpoint: SocketAddr,
+        ui_endpoint: Option<SocketAddr>,
+        projectd_endpoint: Option<SocketAddr>,
+        eventd_endpoint: Option<SocketAddr>,
+        enable_world_ui_lab_camera: bool,
+    ) -> Result<(), String> {
         Self::run_with_server(
             epoch,
             Some(endpoint),
             ui_endpoint,
             projectd_endpoint,
+            eventd_endpoint,
             false,
             enable_world_ui_lab_camera,
         )
@@ -1283,6 +1310,7 @@ impl WindowedRuntime {
         endpoint: Option<SocketAddr>,
         ui_endpoint: Option<SocketAddr>,
         projectd_endpoint: Option<SocketAddr>,
+        eventd_endpoint: Option<SocketAddr>,
         demo: bool,
         enable_world_ui_lab_camera: bool,
     ) -> Result<(), String> {
@@ -1294,6 +1322,7 @@ impl WindowedRuntime {
         runtime.event_proxy = Some(proxy.clone());
         runtime.ui_endpoint = ui_endpoint;
         runtime.projectd_endpoint = projectd_endpoint;
+        runtime.eventd_endpoint = eventd_endpoint;
         runtime
             .world_ui_lab_camera
             .lock()
@@ -1348,6 +1377,78 @@ impl WindowedRuntime {
         self.request_scripted_initial_size();
         self.redraw_pending = true;
         Ok(())
+    }
+
+    fn publish_file_drop(&mut self, path: PathBuf) {
+        let Some(endpoint) = self.eventd_endpoint else {
+            return;
+        };
+        self.next_file_drop_sequence = self.next_file_drop_sequence.saturating_add(1);
+        let drop_sequence = self.next_file_drop_sequence;
+        let source_path = path.to_string_lossy().into_owned();
+        let file_name = path
+            .file_name()
+            .map(|value| value.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let extension = path
+            .extension()
+            .map(|value| value.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_default();
+        let media_type = match extension.as_str() {
+            "png" => "image/png",
+            "jpg" | "jpeg" => "image/jpeg",
+            "webp" => "image/webp",
+            "bmp" => "image/bmp",
+            "tga" => "image/x-tga",
+            _ => "application/octet-stream",
+        };
+        let is_image = media_type.starts_with("image/");
+        let frame_sequence = self.gpu.as_ref().map_or(0, |gpu| gpu.frame_count);
+        let payload = UiFileDropPayload {
+            drop_sequence,
+            source_path,
+            file_name,
+            extension,
+            media_type: media_type.into(),
+            is_image,
+            renderer_epoch: self.epoch,
+            frame_sequence,
+        };
+        let publisher = ClientIdentity {
+            kind: ClientKind::WgpuRuntime,
+            instance_id: format!("window-{}", self.epoch),
+            pid: std::process::id(),
+            origin: "neon-wgpu-runtime".into(),
+        };
+        thread::spawn(move || {
+            let request_id = RequestId(format!(
+                "wgpu-file-drop-{}-{}",
+                payload.renderer_epoch, payload.drop_sequence
+            ));
+            let publish = neon_protocol::EventPublish {
+                protocol: "neon3.event".into(),
+                version: PROTOCOL_VERSION,
+                request_id,
+                publisher,
+                name: "ui.file_drop.accepted".into(),
+                schema_version: 1,
+                payload: serde_json::to_value(&payload).expect("file drop payload serializes"),
+                idempotency_key: Some(format!(
+                    "ui-file-drop:{}:{}",
+                    payload.renderer_epoch, payload.drop_sequence
+                )),
+            };
+            match EventClient::connect(endpoint).and_then(|mut client| client.publish(&publish)) {
+                Ok(ack) if ack.status == neon_protocol::EventAckStatus::Accepted => {}
+                Ok(ack) => eprintln!(
+                    "[neon-wgpu-runtime] file drop event rejected: {:?}",
+                    ack.error
+                ),
+                Err(error) => {
+                    eprintln!("[neon-wgpu-runtime] file drop event publish failed: {error}")
+                }
+            }
+        });
     }
 
     fn preload_fixture_image(&mut self, endpoint: SocketAddr) -> Result<(), String> {
@@ -5589,6 +5690,7 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
         }
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::DroppedFile(path) => self.publish_file_drop(path),
             WindowEvent::Resized(size) => self.resize(size),
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 if let Some(gpu) = self.gpu.as_mut() {
@@ -6665,6 +6767,14 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                     return;
                 }
                 let _ = completed.send(self.capture_final_target(artifact_path));
+            }
+            WindowCommand::FileDrop { path, completed } => {
+                self.publish_file_drop(path.clone());
+                let _ = completed.send(Ok(json!({
+                    "state": "published",
+                    "file_name": path.file_name().map(|value| value.to_string_lossy()),
+                    "event": "ui.file_drop.accepted"
+                })));
             }
             WindowCommand::CaptureWorldUiLab {
                 artifact_path,
@@ -7746,6 +7856,7 @@ fn spawn_window_server(
                         | "wgpu.world.ui.anchor.submit"
                         | "wgpu.world.ui.anchor.submit_batch"
                         | "wgpu.world_ui.lab.camera.register"
+                        | "debug.window.file_drop"
                 );
                 let response = if request.method == "wgpu.ai.terrain.generate" {
                     handle_window_ai_generate(&mut runtime, &proxy, request)
@@ -7765,6 +7876,13 @@ fn spawn_window_server(
                     handle_window_input_debug_snapshot(&mut runtime, &proxy, request.request_id)
                 } else if request.method == "debug.window.images" {
                     handle_window_image_debug_snapshot(&mut runtime, &proxy, request.request_id)
+                } else if request.method == "debug.window.file_drop" {
+                    WgpuRuntime::handle_window_file_drop(
+                        &mut runtime,
+                        &proxy,
+                        request.request_id,
+                        request.params,
+                    )
                 } else if request.method == "wgpu.ui.image.upload" {
                     handle_window_external_image_upload(&mut runtime, &proxy, request)
                 } else if request.method == "debug.window.input.probe" {
@@ -8314,6 +8432,7 @@ impl WgpuRuntime {
             CAPABILITY_UI_RENDER_SURFACE.into(),
             "wgpu.ui.image.upload.v1".into(),
             "wgpu.ui.image.inspect.v1".into(),
+            neon_ui_schema::UI_NINE_SLICE_CAPABILITY_NAME.into(),
             CAPABILITY_EXTERNAL_HOST_BACKEND_MATCH.into(),
             "wgpu.world.info.bridge".into(),
             "wgpu.world.ui.anchor.batch.v1".into(),
@@ -9561,6 +9680,55 @@ impl WgpuRuntime {
             return self.reject(request_id, "not_found", "target is not available", None);
         }
         self.accept(request_id, json!({"target": target, "format": if target == UI_HIT_TARGET { "r32uint" } else { "rgba8unorm" }, "graph_revision": self.graph_revision, "hit_target_generation": self.hit_target_generation, "test_target": true}))
+    }
+
+    fn handle_window_file_drop(
+        runtime: &mut WgpuRuntime,
+        proxy: &EventLoopProxy<WindowCommand>,
+        request_id: RequestId,
+        params: Value,
+    ) -> RpcResponse {
+        let Some(source_path) = params.get("source_path").and_then(Value::as_str) else {
+            return runtime.reject(
+                request_id,
+                "invalid_request",
+                "source_path is required",
+                None,
+            );
+        };
+        if source_path.trim().is_empty() {
+            return runtime.reject(
+                request_id,
+                "invalid_request",
+                "source_path is required",
+                None,
+            );
+        }
+        let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+        if proxy
+            .send_event(WindowCommand::FileDrop {
+                path: PathBuf::from(source_path),
+                completed: completed_tx,
+            })
+            .is_err()
+        {
+            return runtime.reject(
+                request_id,
+                "window_compositor_unavailable",
+                "window compositor is unavailable",
+                None,
+            );
+        }
+        match completed_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(Ok(result)) => runtime.accept(request_id, result),
+            Ok(Err(error)) => runtime.reject(request_id, "file_drop_event_failed", &error, None),
+            Err(_) => runtime.reject(
+                request_id,
+                "window_compositor_timeout",
+                "window compositor did not publish the file drop event",
+                None,
+            ),
+        }
     }
 
     fn resource_preload(&mut self, request_id: RequestId, params: Value) -> RpcResponse {

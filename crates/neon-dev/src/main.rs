@@ -262,6 +262,8 @@ fn run_case_session(
     if case == "component-gallery" {
         wgpu_args.push("--enable-world-ui-lab-camera");
     }
+    wgpu_args.push("--eventd");
+    wgpu_args.push(eventd_endpoint_text.as_str());
     let wgpu = spawn_service(
         executable(workspace, "neon-wgpu-runtime"),
         &wgpu_args,

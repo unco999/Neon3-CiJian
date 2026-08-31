@@ -17,6 +17,7 @@ pub const UI_PROGRAM_CAPABILITY_NAME: &str = "ui.program.v1";
 pub const UI_PROGRAM_TEXT_REGISTRY_CAPABILITY_NAME: &str = "ui.program.text_registry.v1";
 pub const UI_PROGRAM_BOUNDED_STRUCTURE_CAPABILITY_NAME: &str = "ui.program.bounded_structure.v1";
 pub const UI_PROGRAM_SEMANTIC_EVENT_CAPABILITY_NAME: &str = "ui.program.semantic_event.v1";
+pub const UI_NINE_SLICE_CAPABILITY_NAME: &str = "ui.nine_slice.v1";
 
 pub const ERROR_UI_PROGRAM_UNSUPPORTED_SCHEMA: &str = "ui_program_unsupported_schema";
 pub const ERROR_UI_PROGRAM_UNSUPPORTED_CAPABILITY: &str = "ui_program_unsupported_capability";
@@ -462,6 +463,7 @@ impl UiProgramRevision {
                     | UI_PROGRAM_TEXT_REGISTRY_CAPABILITY_NAME
                     | UI_PROGRAM_BOUNDED_STRUCTURE_CAPABILITY_NAME
                     | UI_PROGRAM_SEMANTIC_EVENT_CAPABILITY_NAME
+                    | UI_NINE_SLICE_CAPABILITY_NAME
             ) || capability.version != 1
             {
                 return Err(UiSchemaError::UnsupportedProgramCapability);
@@ -689,6 +691,62 @@ pub enum UiNodeKind {
     /// A declarative, virtualized tabular viewport. Row data is supplied by
     /// bounded `UiDataGridFrame` windows rather than by runtime topology.
     DataGrid,
+}
+
+/// Renderer-side nine-slice sampling policy. The source rectangle is expressed
+/// in image pixels; the destination insets are logical UI units.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UiNineSliceMode {
+    Stretch,
+    Tile,
+    Mirror,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiNineSlice {
+    /// [left, top, right, bottom] source borders in image pixels.
+    pub source_insets_px: [u32; 4],
+    /// [left, top, right, bottom] destination borders in logical UI units.
+    pub target_insets: [f32; 4],
+    pub mode: UiNineSliceMode,
+    /// Matches mainstream sliced-sprite settings where the center may be
+    /// transparent/unpainted while the border remains visible.
+    #[serde(default = "default_fill_center")]
+    pub fill_center: bool,
+}
+
+/// First-class decoration declaration for a panel frame. The resource key is
+/// resolved by the UI/resource owner; the renderer only receives the resulting
+/// stable AssetRef or transient image binding.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiPanelDecoration {
+    pub frame_resource: String,
+    pub nine_slice: UiNineSlice,
+}
+
+fn default_fill_center() -> bool {
+    true
+}
+
+impl UiNineSlice {
+    pub fn validate(&self) -> bool {
+        self.target_insets
+            .iter()
+            .all(|value| value.is_finite() && *value >= 0.0)
+    }
+
+    pub fn validate_for_image(&self, width: u32, height: u32) -> bool {
+        self.validate()
+            && self.source_insets_px[0] <= width
+            && self.source_insets_px[2] <= width
+            && self.source_insets_px[1] <= height
+            && self.source_insets_px[3] <= height
+            && self.source_insets_px[0].saturating_add(self.source_insets_px[2]) <= width
+            && self.source_insets_px[1].saturating_add(self.source_insets_px[3]) <= height
+    }
 }
 
 /// Source-independent text declaration. Renderers receive resolved immutable content only.
@@ -986,6 +1044,12 @@ pub enum UiEffect {
     ImageBinding {
         node_id: UiNodeId,
         image_id: String,
+    },
+    /// Declares renderer-local nine-slice geometry for one Image node. The
+    /// image bytes and atlas residency remain owned by the WGPU runtime.
+    NineSlice {
+        node_id: UiNodeId,
+        layout: UiNineSlice,
     },
 }
 
@@ -1318,6 +1382,10 @@ pub struct UiIrDocument {
     /// declarative; AssetRef values are supplied by the external owner.
     #[serde(default)]
     pub image_resources: std::collections::BTreeMap<String, String>,
+    /// First-class decoration declarations keyed by their owning Panel node.
+    /// The map is canonical IR data, not renderer topology.
+    #[serde(default)]
+    pub panel_decorations: std::collections::BTreeMap<String, UiPanelDecoration>,
     /// Finite subtrees selected by one direct input predicate. The subtree is
     /// already present in `root`; this table only supplies its runtime rule.
     #[serde(default)]
@@ -2491,7 +2559,17 @@ impl UiFragment {
                         || image_id.trim().is_empty()
                         || !matches!(
                             find_node_kind(&self.root, &node_id.0),
-                            Some(UiNodeKind::Image)
+                            Some(UiNodeKind::Image | UiNodeKind::Panel)
+                        ) =>
+                {
+                    return Err(UiSchemaError::InvalidProgramEvent);
+                }
+                UiEffect::NineSlice { node_id, layout }
+                    if !nodes.contains(&node_id.0)
+                        || !layout.validate()
+                        || !matches!(
+                            find_node_kind(&self.root, &node_id.0),
+                            Some(UiNodeKind::Image | UiNodeKind::Panel)
                         ) =>
                 {
                     return Err(UiSchemaError::InvalidProgramEvent);
@@ -2736,6 +2814,13 @@ impl UiEffect {
             }
             Self::ImageBinding { node_id, image_id } => {
                 if node_id.0.trim().is_empty() || image_id.trim().is_empty() {
+                    Err(UiSchemaError::InvalidProgramEvent)
+                } else {
+                    Ok(())
+                }
+            }
+            Self::NineSlice { node_id, layout } => {
+                if node_id.0.trim().is_empty() || !layout.validate() {
                     Err(UiSchemaError::InvalidProgramEvent)
                 } else {
                     Ok(())
@@ -3478,10 +3563,22 @@ impl UiIrDocument {
             }
         }
         if self.image_resources.iter().any(|(node_key, resource_key)| {
-            !matches!(find_ir_node(&self.root, node_key), Some(node) if node.kind == UiNodeKind::Image)
-                || !self.resources.iter().any(|resource| {
-                    resource.key == *resource_key && resource.kind == UiProgramResourceKind::Image
-                })
+            !matches!(
+                find_ir_node(&self.root, node_key),
+                Some(node) if matches!(node.kind, UiNodeKind::Image | UiNodeKind::Panel)
+            ) || !self.resources.iter().any(|resource| {
+                resource.key == *resource_key && resource.kind == UiProgramResourceKind::Image
+            })
+        }) {
+            return Err(UiSchemaError::InvalidIrDocument);
+        }
+        if self.panel_decorations.iter().any(|(node_key, decoration)| {
+            decoration.frame_resource.trim().is_empty()
+                || !decoration.nine_slice.validate()
+                || !matches!(
+                    find_ir_node(&self.root, node_key),
+                    Some(node) if node.kind == UiNodeKind::Panel
+                )
         }) {
             return Err(UiSchemaError::InvalidIrDocument);
         }

@@ -2784,6 +2784,7 @@ impl UiRuntime {
                 "ui.static_fragment.submit.v1".into(),
                 "ui.fragment.submit.v1".into(),
                 "ui.image.upload.v1".into(),
+                neon_ui_schema::UI_NINE_SLICE_CAPABILITY_NAME.into(),
                 "ui.semantic_input.v1".into(),
                 "ui.intent_dispatch.v1".into(),
                 "ui.surface.machine.v1".into(),
@@ -3183,6 +3184,7 @@ impl UiRuntime {
                 neon_ui_schema::UI_PROGRAM_TEXT_REGISTRY_CAPABILITY_NAME,
                 neon_ui_schema::UI_PROGRAM_BOUNDED_STRUCTURE_CAPABILITY_NAME,
                 neon_ui_schema::UI_PROGRAM_SEMANTIC_EVENT_CAPABILITY_NAME,
+                neon_ui_schema::UI_NINE_SLICE_CAPABILITY_NAME,
             ]
             .into_iter()
             .map(|name| UiProgramCapability {
@@ -7096,6 +7098,7 @@ mod tests {
             }],
             resources: Vec::new(),
             image_resources: BTreeMap::new(),
+            panel_decorations: BTreeMap::new(),
             branches: Vec::new(),
             templates: Vec::new(),
             data_grids: Vec::new(),

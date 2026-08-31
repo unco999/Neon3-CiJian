@@ -72,6 +72,24 @@ is `cargo run -p neon-ui-runtime --bin image_resource_probe`.
 
 ## Component Controls
 
+### Nine-slice Images
+
+Nine-slice is a renderer-owned image presentation feature. It does not create
+child nodes, hit targets, or GPU handles. Use the mainstream four-border order
+`left top right bottom`; source borders are image pixels and target borders are
+logical UI units:
+
+```text
+resource panel-frame image
+surface root
+  image frame resource panel-frame w 320 h 96 nine_slice 16 16 16 16 border 12 12 12 12 mode stretch fill_center true
+```
+
+The WGPU runtime computes the nine UV regions in the shader. `stretch`, `tile`,
+and `mirror` are supported modes. The image atlas generation remains renderer
+local and must not be persisted or sent through Flow. Nine-slice geometry is
+visual only; use the node's `pad` for content layout.
+
 The first generic control batch is `checkbox`, `radio_button`, `slider`,
 `drag_value`, `combo`, `dropdown`, `tabs`, `selectable`, `list_box`, `scrollbar`, and
 `progress_bar`. Bind control state only through typed inputs:
