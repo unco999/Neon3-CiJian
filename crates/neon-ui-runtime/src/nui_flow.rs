@@ -196,9 +196,7 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
                     1,
                 ));
             }
-            if node.node.kind == UiNodeKind::Panel
-                && let Some(layout) = node.nine_slice
-            {
+            if let Some(layout) = node.nine_slice {
                 panel_decorations.insert(
                     node.node.node_id.0.clone(),
                     neon_ui_schema::UiPanelDecoration {
@@ -207,6 +205,13 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
                     },
                 );
             }
+        } else if node.nine_slice.is_some() {
+            return Err(error(
+                "nui_flow_invalid_nine_slice",
+                "nine_slice requires an image resource or panel frame",
+                line,
+                1,
+            ));
         }
         if let Some(previous) = stack.last() {
             if indent > previous.0 + 2 {
@@ -714,6 +719,24 @@ pub fn lower_nui_flow_effects(document: &NuiFlowDocument) -> Vec<UiEffect> {
                 },
             }),
     );
+    effects.extend(document.ir.bindings.iter().filter_map(|binding| {
+        (binding.property == UiBoundProperty::CanvasData)
+            .then(|| {
+                let slot = document
+                    .input_schema
+                    .slots
+                    .iter()
+                    .find(|slot| slot.key == binding.input_key)?;
+                let UiInputValue::CanvasData { value } = &slot.default_value else {
+                    return None;
+                };
+                Some(UiEffect::CanvasData {
+                    node_id: UiNodeId(binding.node_key.clone()),
+                    data: value.clone(),
+                })
+            })
+            .flatten()
+    }));
     effects
 }
 
@@ -1882,6 +1905,44 @@ fn parse_input(text: &str, line: u32) -> FlowResult<Option<(ParsedInput, bool)>>
             false,
         )));
     }
+    if parts[2] == "canvas_data" {
+        if parts[4] != "canvas:empty" {
+            return Err(error(
+                "nui_flow_invalid_literal",
+                "canvas_data inputs require default canvas:empty",
+                line,
+                1,
+            ));
+        }
+        if emit_event {
+            return Err(error(
+                "nui_flow_invalid_input",
+                "canvas_data inputs cannot declare emitevent",
+                line,
+                1,
+            ));
+        }
+        let kind = UiInputKind::CanvasData;
+        let (alignment, lanes, representation) = kind.packing();
+        return Ok(Some((
+            ParsedInput::Scalar(UiInputSlot {
+                key: parts[1].into(),
+                kind,
+                default_value: UiInputValue::CanvasData {
+                    value: Default::default(),
+                },
+                update_class: UiInputUpdateClass::ReliableExternal,
+                semantic_label: parts[1].into(),
+                packing: UiInputPacking {
+                    alignment,
+                    lanes,
+                    offset: 0,
+                    representation,
+                },
+            }),
+            false,
+        )));
+    }
     let kind = match parts[2] {
         "bool" => UiInputKind::Bool,
         "i32" => UiInputKind::I32,
@@ -1927,7 +1988,7 @@ fn parse_input(text: &str, line: u32) -> FlowResult<Option<(ParsedInput, bool)>>
         _ => {
             return Err(error(
                 "nui_flow_unknown_input_kind",
-                "Flow supports bool, i32, u32, f32, ranged numeric kinds such as i32:0..24, text, and enum:one|two inputs",
+                "Flow supports bool, i32, u32, f32, ranged numeric kinds such as i32:0..24, text, canvas_data, and enum:one|two inputs",
                 line,
                 1,
             ));
@@ -2036,6 +2097,7 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
         "progress_bar" => UiNodeKind::ProgressBar,
         "image" => UiNodeKind::Image,
         "render" => UiNodeKind::RenderSurface,
+        "canvas" => UiNodeKind::Canvas,
         _ => {
             return Err(error(
                 "nui_flow_unknown_component",
@@ -2136,7 +2198,7 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
             "x" | "y" | "w" | "h" | "minw" | "maxw" | "grow" | "shrink" | "basis" | "gap"
             | "pad" | "fill" | "line" | "ink" | "opacity" | "radius" | "border_width" | "value"
             | "checked" | "selected" | "state" | "numeric" | "scroll" | "enabled" | "visible"
-            | "event" | "token" | "align" | "clip" | "justify" => {
+            | "event" | "token" | "align" | "clip" | "justify" | "data" => {
                 let value = *parts.get(index + 1).ok_or_else(|| {
                     error(
                         "nui_flow_missing_value",
@@ -2146,7 +2208,35 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
                     )
                 })?;
                 index += 1;
-                parse_attribute(&mut node, &mut bindings, &mut intents, token, value, line)?;
+                if token == "data" {
+                    if component != "canvas" {
+                        return Err(error(
+                            "nui_flow_unknown_attribute",
+                            "data is valid only for canvas",
+                            line,
+                            1,
+                        ));
+                    }
+                    let Some(key) = value.strip_prefix('$') else {
+                        return Err(error(
+                            "nui_flow_invalid_canvas",
+                            "canvas data must use $canvas_data_input",
+                            line,
+                            1,
+                        ));
+                    };
+                    if !valid_key(key) {
+                        return Err(error(
+                            "nui_flow_invalid_canvas",
+                            "canvas data source must name a valid input",
+                            line,
+                            1,
+                        ));
+                    }
+                    bindings.push((UiBoundProperty::CanvasData, key.into()));
+                } else {
+                    parse_attribute(&mut node, &mut bindings, &mut intents, token, value, line)?;
+                }
             }
             "camera" if is_world_panel => {
                 let value = *parts.get(index + 1).ok_or_else(|| {
@@ -2409,7 +2499,9 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
                 image_resource = Some(value.into());
                 index += 1;
             }
-            "nine_slice" if matches!(component, "image" | "panel") => {
+            "nine_slice"
+                if component == "image" || (component == "panel" && image_resource.is_some()) =>
+            {
                 let source = parse_u32_quad(&parts, index + 1, line, "source insets")?;
                 if parts.get(index + 5) != Some(&"border") {
                     return Err(error(
@@ -2493,6 +2585,18 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
         return Err(error(
             "ui_program_invalid_branch_template",
             "branch requires `when` or `in machine.state`",
+            line,
+            1,
+        ));
+    }
+    if component == "canvas"
+        && !bindings
+            .iter()
+            .any(|(property, _)| *property == UiBoundProperty::CanvasData)
+    {
+        return Err(error(
+            "nui_flow_invalid_canvas",
+            "canvas requires data $canvas_data_input",
             line,
             1,
         ));
@@ -3300,6 +3404,7 @@ fn binding_accepts(property: &UiBoundProperty, kind: &UiInputKind) -> bool {
                 | UiInputKind::U32Range { .. }
                 | UiInputKind::F32Range { .. }
         ),
+        UiBoundProperty::CanvasData => matches!(kind, UiInputKind::CanvasData),
         _ => false,
     }
 }
@@ -3363,6 +3468,7 @@ fn format_input(slot: &UiInputSlot) -> String {
         UiInputKind::F32Range { minimum, maximum } => format!("f32:{minimum}..{maximum}"),
         UiInputKind::Enum { variants } => format!("enum:{}", variants.join("|")),
         UiInputKind::TextHandle => "text".into(),
+        UiInputKind::CanvasData => "canvas_data".into(),
         _ => "unsupported".into(),
     };
     let value = match &slot.default_value {
@@ -3371,6 +3477,7 @@ fn format_input(slot: &UiInputSlot) -> String {
         UiInputValue::U32 { value } => value.to_string(),
         UiInputValue::F32 { value } => value.to_string(),
         UiInputValue::TextHandle { .. } => "text:empty".into(),
+        UiInputValue::CanvasData { .. } => "canvas:empty".into(),
         _ => "unsupported".into(),
     };
     format!("input {} {} default {}", slot.key, kind, value)
@@ -3407,6 +3514,7 @@ fn format_node(
         UiNodeKind::DataGrid => "data_grid",
         UiNodeKind::Image => "image",
         UiNodeKind::RenderSurface => "render",
+        UiNodeKind::Canvas => "canvas",
     };
     let mut line = format!("{}{} {}", " ".repeat(indent), kind, node.node_id.0);
     if node.bounds.x != 0.0 {
@@ -3432,6 +3540,13 @@ fn format_node(
                     .collect::<Vec<_>>()
                     .join(",")
             ));
+        }
+    }
+    if node.kind == UiNodeKind::Canvas {
+        if let Some(binding) = bindings.iter().find(|binding| {
+            binding.node_key == node.node_id.0 && binding.property == UiBoundProperty::CanvasData
+        }) {
+            line.push_str(&format!(" data ${}", binding.input_key));
         }
     }
     if let Some(resource_key) = image_resources.get(&node.node_id.0) {
@@ -4399,6 +4514,35 @@ panel workspace row gap 8
 
         let error = parse_nui_flow("surface root\n  data_grid assets\n").unwrap_err();
         assert_eq!(error.diagnostics[0].code, "nui_flow_invalid_data_grid");
+    }
+
+    #[test]
+    fn canvas_data_input_lowers_and_formats_deterministically() {
+        let source = "input guides canvas_data default canvas:empty\nsurface root\n  canvas overlay data $guides w 320 h 180\n";
+        let document = parse_nui_flow(source).unwrap();
+        assert!(matches!(
+            document.input_schema.slots[0].kind,
+            UiInputKind::CanvasData
+        ));
+        assert_eq!(
+            document.ir.bindings[0].property,
+            UiBoundProperty::CanvasData
+        );
+        let formatted = format_nui_flow(source).unwrap();
+        assert!(formatted.contains("input guides canvas_data default canvas:empty"));
+        assert!(formatted.contains("canvas overlay data $guides"));
+        assert_eq!(format_nui_flow(&formatted).unwrap(), formatted);
+    }
+
+    #[test]
+    fn canvas_rejects_non_canvas_or_missing_data_source() {
+        let scalar = parse_nui_flow(
+            "input value f32 default 1\nsurface root\n  canvas overlay data $value w 1 h 1\n",
+        )
+        .unwrap_err();
+        assert_eq!(scalar.diagnostics[0].code, "ui_program_input_type_mismatch");
+        let missing = parse_nui_flow("surface root\n  canvas overlay w 1 h 1\n").unwrap_err();
+        assert_eq!(missing.diagnostics[0].code, "nui_flow_invalid_canvas");
     }
 
     #[test]

@@ -115,6 +115,28 @@ value in the intent name, pointer coordinates, or a renderer-local identifier.
 The renderer keeps focus and pointer capture local, excludes disabled controls
 from hit testing, and never makes a progress bar pointer-interactive.
 
+### Point/Line Canvas
+
+`canvas` is a data-driven, read-only V1 viewport for UI analysis overlays such
+as splitter-detected borders and spacing guides. Its content must come from a
+typed, revisioned `canvas_data` input; Flow contains neither draw code nor raw
+geometry:
+
+```text
+input detected_guides canvas_data default canvas:empty
+surface analysis column
+  canvas guides data $detected_guides grow 1 clip bounds
+```
+
+`canvas_data` is persisted as `UiCanvasData { version, points, lines }` in the
+typed input snapshot. V1 points contain a stable ID, logical `[x,y]`, positive
+radius, and normalized RGBA color. V1 lines contain stable ID, logical start/end,
+positive width, and normalized RGBA color; they are intentionally limited to
+horizontal or vertical guides. Coordinates are local logical units (`x` right,
+`y` down), are clipped to the Canvas bounds, and never identify screen pixels.
+WGPU owns the conversion to composition primitives. No GPU handle, image bytes,
+path, shader, callback, pointer coordinate, or arbitrary JSON is permitted.
+
 ## Statechart Syntax
 
 Statecharts are flat declarations so the grammar remains deterministic and has

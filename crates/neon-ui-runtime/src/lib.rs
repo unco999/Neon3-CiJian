@@ -1312,6 +1312,7 @@ fn input_value_as_event_payload(value: &UiInputValue) -> Option<UiSemanticPayloa
         UiInputValue::Vec2 { .. } | UiInputValue::Vec4 { .. } | UiInputValue::Color { .. } => {
             return None;
         }
+        UiInputValue::CanvasData { .. } => return None,
     })
 }
 
@@ -1421,6 +1422,7 @@ fn ui_input_kind_name(kind: &neon_ui_schema::UiInputKind) -> String {
         UiInputKind::Enum { .. } => "enum".into(),
         UiInputKind::TextHandle => "text".into(),
         UiInputKind::AssetHandle => "asset".into(),
+        UiInputKind::CanvasData => "canvas_data".into(),
     }
 }
 
@@ -1441,6 +1443,7 @@ fn input_value_to_json(value: &UiInputValue) -> serde_json::Value {
         }
         UiInputValue::Vec2 { value } => json!({"value": value}),
         UiInputValue::Vec4 { value } | UiInputValue::Color { value } => json!({"value": value}),
+        UiInputValue::CanvasData { value } => json!({"canvas_data": value}),
     }
 }
 
@@ -1536,9 +1539,28 @@ fn refresh_fragment_from_program(
         .map(|node| (node.key.clone(), node.kind.clone()))
         .collect::<BTreeMap<_, _>>();
     apply(&mut fragment.root, &states, &kinds);
-    fragment
-        .effects
-        .retain(|effect| !matches!(effect, UiEffect::ControlPresentation { .. }));
+    fragment.effects.retain(|effect| {
+        !matches!(
+            effect,
+            UiEffect::ControlPresentation { .. } | UiEffect::CanvasData { .. }
+        )
+    });
+    for binding in &program.binding_records {
+        if binding.property != UiBoundProperty::CanvasData {
+            continue;
+        }
+        let Some(neon_ui_schema::UiResolvedInputValue {
+            value: UiInputValue::CanvasData { value },
+            ..
+        }) = inputs.values.get(&binding.input_key)
+        else {
+            continue;
+        };
+        fragment.effects.push(UiEffect::CanvasData {
+            node_id: UiNodeId(binding.node_key.clone()),
+            data: value.clone(),
+        });
+    }
     for node in &program.nodes {
         let Some(state) = states.get(&node.key) else {
             continue;
@@ -2533,6 +2555,7 @@ fn binding_accepts(property: &UiBoundProperty, kind: &neon_ui_schema::UiInputKin
         UiBoundProperty::Opacity => matches!(kind, F32),
         UiBoundProperty::StateToken => matches!(kind, Enum { .. }),
         UiBoundProperty::ScrollOffset => matches!(kind, Vec2),
+        UiBoundProperty::CanvasData => matches!(kind, CanvasData),
     }
 }
 fn apply_binding(
@@ -2573,6 +2596,9 @@ fn apply_binding(
         (UiBoundProperty::StateToken, UiInputValue::Enum { value }) => {
             state.state_token = Some(value.clone())
         }
+        // Canvas is a renderer presentation payload, not scalar CPU node state.
+        // It is materialized as UiEffect::CanvasData by refresh_fragment_from_program.
+        (UiBoundProperty::CanvasData, UiInputValue::CanvasData { .. }) => {}
         _ => diagnostics.push(cpu_diagnostic(
             "ui_program_input_type_mismatch",
             "resolved value does not match its compiled binding",

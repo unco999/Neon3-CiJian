@@ -18,6 +18,9 @@ pub const UI_PROGRAM_TEXT_REGISTRY_CAPABILITY_NAME: &str = "ui.program.text_regi
 pub const UI_PROGRAM_BOUNDED_STRUCTURE_CAPABILITY_NAME: &str = "ui.program.bounded_structure.v1";
 pub const UI_PROGRAM_SEMANTIC_EVENT_CAPABILITY_NAME: &str = "ui.program.semantic_event.v1";
 pub const UI_NINE_SLICE_CAPABILITY_NAME: &str = "ui.nine_slice.v1";
+/// Declarative, data-driven 2D point/line canvas. Canvas contents are typed
+/// UI inputs; the WGPU runtime owns their GPU expansion and final pixels.
+pub const UI_CANVAS_POINTS_LINES_CAPABILITY_NAME: &str = "ui.canvas.points_lines.v1";
 
 pub const ERROR_UI_PROGRAM_UNSUPPORTED_SCHEMA: &str = "ui_program_unsupported_schema";
 pub const ERROR_UI_PROGRAM_UNSUPPORTED_CAPABILITY: &str = "ui_program_unsupported_capability";
@@ -88,6 +91,7 @@ pub enum UiInputKind {
     I32Range { minimum: i32, maximum: i32 },
     U32Range { minimum: u32, maximum: u32 },
     F32Range { minimum: f32, maximum: f32 },
+    CanvasData,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -110,6 +114,96 @@ pub enum UiInputValue {
     Enum { value: String },
     TextHandle { value: UiTextHandle },
     AssetHandle { id: u64, generation: u32 },
+    CanvasData { value: UiCanvasData },
+}
+
+/// Bounded, persisted drawing data for a single declarative Canvas node.
+/// Coordinates are logical canvas units with x right and y down. It carries no
+/// pixels, paths, callbacks, shader source, or GPU resource identity.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiCanvasData {
+    pub version: u16,
+    pub points: Vec<UiCanvasPoint>,
+    pub lines: Vec<UiCanvasLine>,
+}
+
+impl Default for UiCanvasData {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            points: Vec::new(),
+            lines: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiCanvasPoint {
+    pub id: String,
+    pub position: [f32; 2],
+    pub radius: f32,
+    pub color: [f32; 4],
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiCanvasLine {
+    pub id: String,
+    pub start: [f32; 2],
+    pub end: [f32; 2],
+    pub width: f32,
+    pub color: [f32; 4],
+}
+
+impl UiCanvasData {
+    pub const MAX_POINTS: usize = 10_000;
+    pub const MAX_LINES: usize = 10_000;
+
+    pub fn validate(&self) -> bool {
+        fn finite_color(color: &[f32; 4]) -> bool {
+            color
+                .iter()
+                .all(|value| value.is_finite() && (0.0..=1.0).contains(value))
+        }
+        fn finite_position(position: &[f32; 2]) -> bool {
+            position.iter().all(|value| value.is_finite())
+        }
+        self.version == 1
+            && self.points.len() <= Self::MAX_POINTS
+            && self.lines.len() <= Self::MAX_LINES
+            && self.points.iter().all(|point| {
+                !point.id.trim().is_empty()
+                    && finite_position(&point.position)
+                    && point.radius.is_finite()
+                    && point.radius > 0.0
+                    && finite_color(&point.color)
+            })
+            && self.lines.iter().all(|line| {
+                !line.id.trim().is_empty()
+                    && finite_position(&line.start)
+                    && finite_position(&line.end)
+                    && (line.start[0] == line.end[0] || line.start[1] == line.end[1])
+                    && line.width.is_finite()
+                    && line.width > 0.0
+                    && finite_color(&line.color)
+            })
+            && self
+                .points
+                .iter()
+                .map(|point| point.id.as_str())
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+                == self.points.len()
+            && self
+                .lines
+                .iter()
+                .map(|line| line.id.as_str())
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+                == self.lines.len()
+    }
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -208,6 +302,9 @@ impl UiInputKind {
             Self::Vec2 => (8, 2, UiGpuScalarRepresentation::Vec2F32),
             Self::Vec4 | Self::Color => (16, 4, UiGpuScalarRepresentation::Vec4F32),
             Self::TextHandle | Self::AssetHandle => (8, 2, UiGpuScalarRepresentation::HandleUvec2),
+            // Canvas payload bytes are never packed into the scalar GPU input buffer.
+            // This sentinel slot keeps the existing revisioned input store contract.
+            Self::CanvasData => (4, 1, UiGpuScalarRepresentation::U32),
         }
     }
     pub fn accepts(&self, value: &UiInputValue) -> bool {
@@ -239,6 +336,7 @@ impl UiInputKind {
                     && *value >= *minimum
                     && *value <= *maximum
             }
+            (Self::CanvasData, UiInputValue::CanvasData { value }) => value.validate(),
             _ => false,
         }
     }
@@ -464,6 +562,7 @@ impl UiProgramRevision {
                     | UI_PROGRAM_BOUNDED_STRUCTURE_CAPABILITY_NAME
                     | UI_PROGRAM_SEMANTIC_EVENT_CAPABILITY_NAME
                     | UI_NINE_SLICE_CAPABILITY_NAME
+                    | UI_CANVAS_POINTS_LINES_CAPABILITY_NAME
             ) || capability.version != 1
             {
                 return Err(UiSchemaError::UnsupportedProgramCapability);
@@ -670,6 +769,9 @@ pub enum UiNodeKind {
     Button,
     Image,
     RenderSurface,
+    /// A typed, data-driven point/line viewport. Its content arrives through a
+    /// declared `canvas_data` input, never as a GPU handle or draw callback.
+    Canvas,
     TextInput,
     Checkbox,
     RadioButton,
@@ -1029,6 +1131,12 @@ pub enum UiEffect {
     DataGridFrame {
         declaration: UiDataGridDeclaration,
         frame: UiDataGridFrame,
+    },
+    /// Resolved content for one Canvas node. This carries only validated
+    /// declarative points and line segments; WGPU owns GPU expansion and draw.
+    CanvasData {
+        node_id: UiNodeId,
+        data: UiCanvasData,
     },
     DragBinding {
         binding: UiDragBinding,
@@ -1614,6 +1722,7 @@ pub enum UiBoundProperty {
     Opacity,
     StateToken,
     ScrollOffset,
+    CanvasData,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -2525,6 +2634,9 @@ impl UiFragment {
             }
         }
         collect(&self.root, &mut nodes);
+        if nodes.len() != count_nodes(&self.root) {
+            return Err(UiSchemaError::DuplicateNodeId);
+        }
         let drags = self
             .effects
             .iter()
@@ -2535,6 +2647,15 @@ impl UiFragment {
             .collect::<Vec<_>>();
         for effect in &self.effects {
             match effect {
+                UiEffect::CanvasData { node_id, .. }
+                    if !nodes.contains(&node_id.0)
+                        || !matches!(
+                            find_node_kind(&self.root, &node_id.0),
+                            Some(UiNodeKind::Canvas)
+                        ) =>
+                {
+                    return Err(UiSchemaError::InvalidProgramEvent);
+                }
                 UiEffect::DragBinding { binding } if !nodes.contains(&binding.source_node_id.0) => {
                     return Err(UiSchemaError::InvalidProgramEvent);
                 }
@@ -2577,8 +2698,29 @@ impl UiFragment {
                 _ => {}
             }
         }
+        let canvas_effect_nodes = self
+            .effects
+            .iter()
+            .filter_map(|effect| match effect {
+                UiEffect::CanvasData { node_id, .. } => Some(node_id.0.as_str()),
+                _ => None,
+            })
+            .collect::<std::collections::HashSet<_>>();
+        if canvas_effect_nodes.len()
+            != self
+                .effects
+                .iter()
+                .filter(|effect| matches!(effect, UiEffect::CanvasData { .. }))
+                .count()
+        {
+            return Err(UiSchemaError::InvalidProgramEvent);
+        }
         Ok(())
     }
+}
+
+fn count_nodes(node: &UiNode) -> usize {
+    1 + node.children.iter().map(count_nodes).sum::<usize>()
 }
 
 fn find_node_kind<'a>(node: &'a UiNode, id: &str) -> Option<&'a UiNodeKind> {
@@ -2777,6 +2919,13 @@ impl UiEffect {
                         .iter()
                         .any(|row| row.cells.values().any(|cell| !cell.validate()))
                 {
+                    Err(UiSchemaError::InvalidProgramEvent)
+                } else {
+                    Ok(())
+                }
+            }
+            Self::CanvasData { node_id, data } => {
+                if node_id.0.trim().is_empty() || !data.validate() {
                     Err(UiSchemaError::InvalidProgramEvent)
                 } else {
                     Ok(())
@@ -3476,6 +3625,72 @@ mod tests {
     }
 
     #[test]
+    fn canvas_data_round_trips_and_rejects_invalid_primitives() {
+        let canvas = UiCanvasData {
+            version: 1,
+            points: vec![UiCanvasPoint {
+                id: "corner.a".into(),
+                position: [10.0, 20.0],
+                radius: 3.0,
+                color: [1.0, 0.0, 0.0, 1.0],
+            }],
+            lines: vec![UiCanvasLine {
+                id: "guide.top".into(),
+                start: [0.0, 0.0],
+                end: [100.0, 0.0],
+                width: 2.0,
+                color: [0.0, 1.0, 0.0, 1.0],
+            }],
+        };
+        assert!(canvas.validate());
+        let value = UiInputValue::CanvasData {
+            value: canvas.clone(),
+        };
+        assert!(UiInputKind::CanvasData.accepts(&value));
+        assert_eq!(
+            serde_json::from_value::<UiInputValue>(serde_json::to_value(&value).unwrap()).unwrap(),
+            value
+        );
+        let mut invalid = canvas;
+        invalid.lines[0].width = f32::NAN;
+        assert!(!invalid.validate());
+    }
+
+    #[test]
+    fn canvas_effect_requires_one_declared_canvas_node() {
+        let mut fragment: UiFragment = serde_json::from_str(STATIC_FRAGMENT).unwrap();
+        let mut node = fragment.root;
+        node.node_id = UiNodeId("canvas".into());
+        node.kind = UiNodeKind::Canvas;
+        let data = UiCanvasData::default();
+        let valid = UiFragment {
+            fragment_id: UiFragmentId("canvas-test".into()),
+            revision: Revision(1),
+            root: node.clone(),
+            effects: vec![UiEffect::CanvasData {
+                node_id: UiNodeId("canvas".into()),
+                data: data.clone(),
+            }],
+        };
+        assert!(valid.validate().is_ok());
+        let mut wrong = valid.clone();
+        wrong.effects[0] = UiEffect::CanvasData {
+            node_id: UiNodeId("missing".into()),
+            data: data.clone(),
+        };
+        assert_eq!(wrong.validate(), Err(UiSchemaError::InvalidProgramEvent));
+        let mut duplicate = valid.clone();
+        duplicate.effects.push(UiEffect::CanvasData {
+            node_id: UiNodeId("canvas".into()),
+            data,
+        });
+        assert_eq!(
+            duplicate.validate(),
+            Err(UiSchemaError::InvalidProgramEvent)
+        );
+    }
+
+    #[test]
     fn text_handles_and_registry_snapshots_round_trip_without_raw_input_text() {
         let handle = UiTextHandle {
             id: 7,
@@ -3577,7 +3792,7 @@ impl UiIrDocument {
                 || !decoration.nine_slice.validate()
                 || !matches!(
                     find_ir_node(&self.root, node_key),
-                    Some(node) if node.kind == UiNodeKind::Panel
+                    Some(node) if matches!(node.kind, UiNodeKind::Image | UiNodeKind::Panel)
                 )
         }) {
             return Err(UiSchemaError::InvalidIrDocument);

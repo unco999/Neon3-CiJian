@@ -7912,6 +7912,16 @@ fn flatten_fragments_with_data_grid_display_cache(
                 _ => None,
             })
             .collect::<HashMap<_, _>>();
+        let canvas_data = fragment
+            .effects
+            .iter()
+            .filter_map(|effect| match effect {
+                neon_ui_schema::UiEffect::CanvasData { node_id, data } => {
+                    Some((node_id.0.clone(), data.clone()))
+                }
+                _ => None,
+            })
+            .collect::<HashMap<_, _>>();
         let mut root = fragment.root.clone();
         // Ordinary fragment roots remain viewport-sized for compatibility with
         // surface composition. A root with an authored entry transition must
@@ -7948,6 +7958,7 @@ fn flatten_fragments_with_data_grid_display_cache(
             false,
             &hidden_world_nodes,
             &external_image_bindings,
+            &canvas_data,
             None,
             None,
             None,
@@ -8353,6 +8364,7 @@ fn data_grid_cell_display_text(
         neon_ui_schema::UiInputValue::AssetHandle { id, generation } => {
             format!("asset#{id}:{generation}")
         }
+        neon_ui_schema::UiInputValue::CanvasData { .. } => "canvas_data".into(),
     }
 }
 
@@ -8585,6 +8597,97 @@ fn scale_world_bounds(bounds: UiBounds, scale: Option<f32>, origin: Option<[f32;
     }
 }
 
+/// Emits Canvas marks directly at their owning Canvas node's tree position.
+/// This preserves fragment/sibling painter order and prevents an accidental
+/// global overlay pass. Geometry is clipped to the Canvas bounds before it is
+/// handed to the ordinary UI panel pipeline.
+fn append_canvas_marks(
+    out: &mut Vec<(String, Option<String>, UiVisual, Option<UiTransition>)>,
+    canvas_path: &str,
+    bounds: &UiBounds,
+    inherited_clip: &UiBounds,
+    node: &UiNode,
+    data: &neon_ui_schema::UiCanvasData,
+    world_scale: Option<f32>,
+    _world_origin: Option<[f32; 2]>,
+    world_depth: Option<f32>,
+) {
+    let clip = intersect_clip(Some(*inherited_clip), *bounds);
+    let mut push = |suffix: String, rect: UiBounds, color: [f32; 4], radius: f32| {
+        let rect = intersect_clip(Some(rect), clip);
+        if rect.width <= 0.0 || rect.height <= 0.0 {
+            return;
+        }
+        let mut style = node.style;
+        style.background_color = color;
+        style.border_color = color;
+        style.border_width = 0.0;
+        style.corner_radius = radius.min(rect.width.min(rect.height) * 0.5);
+        out.push((
+            format!("{canvas_path}/{suffix}"),
+            Some(canvas_path.into()),
+            UiVisual {
+                bounds: rect,
+                logical_bounds: LogicalLayoutBox {
+                    x: rect.x,
+                    y: rect.y,
+                    width: rect.width,
+                    height: rect.height,
+                    content_x: rect.x,
+                    content_y: rect.y,
+                    content_width: rect.width,
+                    content_height: rect.height,
+                    clip: Some(clip),
+                },
+                style,
+                kind: UiNodeKind::Panel,
+                enabled: false,
+                clip,
+                clip_radius: 0.0,
+                image: None,
+                surface: None,
+                text: None,
+                presentation: None,
+                scroll: false,
+                declared_scroll_offset: [0.0; 2],
+                world_depth,
+                world_scale,
+                paint_group_id: 0,
+            },
+            None,
+        ));
+    };
+    for point in &data.points {
+        let radius = point.radius;
+        push(
+            format!("__canvas_point.{}", point.id),
+            UiBounds {
+                x: bounds.x + point.position[0] - radius,
+                y: bounds.y + point.position[1] - radius,
+                width: radius * 2.0,
+                height: radius * 2.0,
+            },
+            point.color,
+            radius,
+        );
+    }
+    for line in &data.lines {
+        let min_x = line.start[0].min(line.end[0]);
+        let min_y = line.start[1].min(line.end[1]);
+        push(
+            format!("__canvas_line.{}", line.id),
+            UiBounds {
+                x: bounds.x + min_x - line.width * 0.5,
+                y: bounds.y + min_y - line.width * 0.5,
+                width: (line.start[0] - line.end[0]).abs().max(line.width) + line.width,
+                height: (line.start[1] - line.end[1]).abs().max(line.width) + line.width,
+            },
+            line.color,
+            line.width * 0.5,
+        );
+    }
+}
+
 fn flatten_node(
     out: &mut Vec<(String, Option<String>, UiVisual, Option<UiTransition>)>,
     fragment_id: &str,
@@ -8598,6 +8701,7 @@ fn flatten_node(
     inherited_top_layer: bool,
     hidden_world_nodes: &HashSet<&str>,
     external_image_bindings: &HashMap<String, String>,
+    canvas_data: &HashMap<String, neon_ui_schema::UiCanvasData>,
     inherited_depth: Option<f32>,
     inherited_scale: Option<f32>,
     inherited_world_origin: Option<[f32; 2]>,
@@ -8701,6 +8805,21 @@ fn flatten_node(
             },
             node.enter_transition.clone(),
         ));
+        if node.kind == UiNodeKind::Canvas
+            && let Some(data) = canvas_data.get(&node.node_id.0)
+        {
+            append_canvas_marks(
+                out,
+                &node_path,
+                &visual_bounds,
+                &effective_clip,
+                node,
+                data,
+                world_scale,
+                world_origin,
+                node.world_depth.or(inherited_depth),
+            );
+        }
     }
     let inner = UiBounds {
         x: bounds.x + node_layout.padding[3],
@@ -8738,6 +8857,7 @@ fn flatten_node(
             top_layer,
             hidden_world_nodes,
             external_image_bindings,
+            canvas_data,
             node.world_depth.or(inherited_depth),
             world_scale,
             world_origin,

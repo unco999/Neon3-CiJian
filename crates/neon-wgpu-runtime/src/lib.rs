@@ -8433,6 +8433,7 @@ impl WgpuRuntime {
             "wgpu.ui.image.upload.v1".into(),
             "wgpu.ui.image.inspect.v1".into(),
             neon_ui_schema::UI_NINE_SLICE_CAPABILITY_NAME.into(),
+            neon_ui_schema::UI_CANVAS_POINTS_LINES_CAPABILITY_NAME.into(),
             CAPABILITY_EXTERNAL_HOST_BACKEND_MATCH.into(),
             "wgpu.world.info.bridge".into(),
             "wgpu.world.ui.anchor.batch.v1".into(),
