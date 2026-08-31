@@ -3211,6 +3211,7 @@ impl UiRuntime {
                 neon_ui_schema::UI_PROGRAM_BOUNDED_STRUCTURE_CAPABILITY_NAME,
                 neon_ui_schema::UI_PROGRAM_SEMANTIC_EVENT_CAPABILITY_NAME,
                 neon_ui_schema::UI_NINE_SLICE_CAPABILITY_NAME,
+                neon_ui_schema::UI_CANVAS_POINTS_LINES_CAPABILITY_NAME,
             ]
             .into_iter()
             .map(|name| UiProgramCapability {
@@ -4630,7 +4631,65 @@ impl UiRuntime {
         };
         match adapter.apply_external_input(frame) {
             Ok(result) => {
-                let response = self.accepted(request.request_id, json!(result));
+                // All external input kinds, including persisted canvas_data,
+                // must become an authoritative next fragment immediately. Do
+                // not wait for an unrelated motion or another input event.
+                let Some(active) = self.cached_fragment.clone() else {
+                    return self.rejected(
+                        request.request_id,
+                        "ui_host_fragment_unavailable",
+                        "no UI fragment has been submitted",
+                    );
+                };
+                let Some(wgpu_endpoint) = self.wgpu_endpoint else {
+                    return self.rejected(
+                        request.request_id,
+                        "service_unavailable",
+                        "WGPU endpoint is not configured",
+                    );
+                };
+                let mut updated = active.clone();
+                updated.revision = Revision(active.revision.0.saturating_add(1));
+                refresh_fragment_from_program(
+                    &mut updated,
+                    adapter.program(),
+                    &result.snapshot.scalar_inputs,
+                    adapter.input_schema(),
+                );
+                let submitted = self.forward_fragment(
+                    wgpu_endpoint,
+                    RpcRequest {
+                        protocol: "neon3.rpc".into(),
+                        version: PROTOCOL_VERSION,
+                        request_id: RequestId(format!("{}-fragment", request.request_id.0)),
+                        client: self.client.clone(),
+                        target: ServiceName(SERVICE_NAME.into()),
+                        method: "ui.fragment.submit".into(),
+                        params: json!(UiCommand::SubmitFragment {
+                            submission: UiFragmentSubmission::new(updated.clone())
+                        }),
+                        expected_revision: Some(active.revision),
+                        idempotency_key: Some(format!(
+                            "ui-input-fragment:{}",
+                            request.idempotency_key.clone().unwrap_or_default()
+                        )),
+                    },
+                );
+                let Ok(submitted) = submitted else {
+                    return self.rejected(
+                        request.request_id,
+                        "service_unavailable",
+                        "could not submit refreshed UI fragment to WGPU",
+                    );
+                };
+                if submitted.status != RpcStatus::Accepted {
+                    return submitted;
+                }
+                self.cached_fragment = Some(updated);
+                let response = self.accepted(
+                    request.request_id,
+                    json!({"input": result, "renderer": submitted.result}),
+                );
                 // If a state-machine transition selected a motion while the
                 // fragment still carried the old input values, re-submit the
                 // fragment now with the updated values and the motion applied.

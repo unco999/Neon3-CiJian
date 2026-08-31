@@ -1009,6 +1009,7 @@ dependencies = [
  "neon-protocol",
  "neon-ui-schema",
  "neon-world-bridge",
+ "png",
  "serde",
  "serde_json",
 ]

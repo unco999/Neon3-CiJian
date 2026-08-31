@@ -98,3 +98,19 @@ Canvas V1 已完成：只读、数据驱动，适用于 UI 图分割器展示边
 - 实际 JSONL 最终记录：`mode=window`，capture artifact 为 `C:\\Users\\10540\\AppData\\Local\\Temp\\neon3-canvas-window-probe.png`，`red_pixels=72`，`cyan_pixels=1213`，`result=passed`。
 - 固定输入包含一条斜线 `[24,16] -> [220,150]`，所以青色像素验证覆盖专用任意方向 line pipeline，不是 axis-aligned panel fallback。
 - Commit：`71e9653 fix: render NUI canvas with GPU primitives`。
+
+## NUI Flow 到真实窗口链路补齐
+
+### 采取的方案
+
+- `UiRuntime::handle_external_input_frame` 现在对包括 `canvas_data` 在内的外部输入，立即刷新 active fragment 并通过 `ui.fragment.submit` 转发到 WGPU；不再只更新 adapter 等待 motion 或下一次事件。
+- `neon-ui-runtime` 新增 `canvas_window_probe`，实际启动 `neon-wgpu-runtime --window-server` 与 `neon-ui-runtime --forward-server`。
+- 探针先调用 `ui.flow.submit` 发送真实 NUI Flow，再调用 `ui.input.frame` 提交持久化 `canvas_data`，读取 `debug.ui.host.snapshot`，最后请求窗口最终 composition capture 并解码 PNG 像素。
+
+### 实际验证
+
+- `cargo build -p neon-ui-runtime --bin neon-ui-runtime --bin canvas_window_probe`：通过。
+- `target\\debug\\canvas_window_probe.exe`：通过。实际日志包含 `neon-ui-runtime received ui.flow.submit request=canvas-flow`，随后 `canvas.data` 的 `response_revision=2` 与 `canvas.snapshot.snapshot_contains_canvas_data=true`。
+- 窗口最终 capture：`format=bgra8unorm-srgb`、`frame_sequence=1`、`composition_revision=2`、`red_pixels=208`、`cyan_pixels=1694`、`result=passed`。
+- 这证明完整路径为：`NUI Flow -> UI Runtime -> canvas_data UiInputFrame -> UI fragment revision 2 -> WGPU window-server -> final composition PNG`。
+- 新增 UI Runtime 依赖 `png = 0.18` 仅用于验收探针解码 renderer 生成的 PNG；不改变运行时传输协议。

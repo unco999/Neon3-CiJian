@@ -16,3 +16,4 @@ neon-ui-schema = { version = "0.2.0", path = "../neon-ui-schema" }
 neon-world-bridge = { version = "0.2.0", path = "../neon-world-bridge" }
 serde_json.workspace = true
 serde.workspace = true
+png = "0.18"
