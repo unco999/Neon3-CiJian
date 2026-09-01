@@ -1,5 +1,13 @@
 # Neon3
 
+> **📦 Examples / 完整案例：[unco999/Neon3-example](https://github.com/unco999/Neon3-example)**
+>
+> 独立案例仓库，收录 Neon3 各子系统的端到端可运行示例（服务启动、UI 声明、协议调用、
+> `neon-gpu-ecs` GPU-ECS 工作流等）。想直接看效果或基于示例起步，从那里开始。
+>
+> A companion repository of runnable end-to-end examples for every Neon3 subsystem.
+> Start here if you want working demos rather than reading the architecture first.
+
 > A multi-process, declarative **UI runtime** for Rust — UI declaration and GPU rendering live in
 > separate processes, connected by a versioned, AI-friendly RPC protocol.
 
