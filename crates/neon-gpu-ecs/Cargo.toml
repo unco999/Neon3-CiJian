@@ -1,0 +1,17 @@
+[package]
+name = "neon-gpu-ecs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+description = "IR-driven GPU ECS runtime for Neon3. Compute only; the sole caller is neon-wgpu-runtime, which owns the device."
+
+[dependencies]
+bytemuck.workspace = true
+serde.workspace = true
+wgpu.workspace = true
+
+[dev-dependencies]
+pollster.workspace = true
+serde_json.workspace = true

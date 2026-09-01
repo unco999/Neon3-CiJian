@@ -955,6 +955,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "neon-gpu-ecs"
+version = "0.2.0"
+dependencies = [
+ "bytemuck",
+ "pollster",
+ "serde",
+ "serde_json",
+ "wgpu",
+]
+
+[[package]]
 name = "neon-ipc"
 version = "0.2.0"
 dependencies = [

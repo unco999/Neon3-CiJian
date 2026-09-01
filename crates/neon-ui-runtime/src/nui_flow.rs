@@ -18,7 +18,7 @@ use neon_ui_schema::{
     UiInputValue, UiIntent, UiIrBinding, UiIrDocument, UiIrPatch, UiIrPatchOperation,
     UiIrPatchOperationKind, UiJustifyContent, UiLayout, UiLayoutMode, UiNineSlice, UiNineSliceMode,
     UiNode, UiNodeId, UiNodeKind, UiProgram, UiProgramEventDeclaration, UiProgramRevision,
-    UiResourceBudget, UiSourceSpan, UiStyle, UiSurfaceId, UiTemplateDeclaration, UiTransition,
+    UiResourceBudget, UiRichTextSpan, UiSourceSpan, UiStyle, UiSurfaceId, UiTemplateDeclaration, UiTransition,
     UiTransitionState,
 };
 use neon_world_bridge::{CameraId, CameraKind, WorldAnchorId};
@@ -177,7 +177,7 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
         }
         let mut node = parse_node(content, line)?;
         if let Some(resource_key) = node.image_resource.take() {
-            if !matches!(node.node.kind, UiNodeKind::Image | UiNodeKind::Panel) {
+            if !matches!(node.node.kind, UiNodeKind::Image | UiNodeKind::Panel | UiNodeKind::Tooltip) {
                 return Err(error(
                     "nui_flow_invalid_resource",
                     "only image or panel nodes may reference image resources",
@@ -2198,7 +2198,7 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
             "x" | "y" | "w" | "h" | "minw" | "maxw" | "grow" | "shrink" | "basis" | "gap"
             | "pad" | "fill" | "line" | "ink" | "opacity" | "radius" | "border_width" | "value"
             | "checked" | "selected" | "state" | "numeric" | "scroll" | "enabled" | "visible"
-            | "event" | "token" | "align" | "clip" | "justify" | "data" => {
+            | "event" | "token" | "align" | "clip" | "justify" | "data" | "rich" => {
                 let value = *parts.get(index + 1).ok_or_else(|| {
                     error(
                         "nui_flow_missing_value",
@@ -2208,7 +2208,19 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
                     )
                 })?;
                 index += 1;
-                if token == "data" {
+                if token == "rich" {
+                    if component != "text" {
+                        return Err(error(
+                            "nui_flow_unknown_attribute",
+                            "rich is valid only for text",
+                            line,
+                            1,
+                        ));
+                    }
+                    let spans = serde_json::from_str::<Vec<UiRichTextSpan>>(&quoted(value, line)?)
+                        .map_err(|_| error("nui_flow_invalid_rich_text", "rich requires a JSON span array", line, 1))?;
+                    node.text = Some(TextRef::Rich { spans });
+                } else if token == "data" {
                     if component != "canvas" {
                         return Err(error(
                             "nui_flow_unknown_attribute",
@@ -2479,7 +2491,7 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
                 image_resource = Some(value.into());
                 index += 1;
             }
-            "frame" if component == "panel" => {
+            "frame" if matches!(component, "panel" | "tooltip") => {
                 let value = *parts.get(index + 1).ok_or_else(|| {
                     error(
                         "nui_flow_invalid_resource",
@@ -2500,7 +2512,8 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
                 index += 1;
             }
             "nine_slice"
-                if component == "image" || (component == "panel" && image_resource.is_some()) =>
+                if component == "image"
+                    || (matches!(component, "panel" | "tooltip") && image_resource.is_some()) =>
             {
                 let source = parse_u32_quad(&parts, index + 1, line, "source insets")?;
                 if parts.get(index + 5) != Some(&"border") {
@@ -3151,9 +3164,11 @@ fn attach(
     }
 }
 fn reject_forbidden(text: &str, line: u32) -> FlowResult<()> {
-    if text
+    let rich_text_data = text.starts_with("text ") && text.contains(" rich ");
+    if (text
         .chars()
         .any(|character| matches!(character, '{' | '}' | '[' | ']'))
+        && !rich_text_data)
         || text.contains("=>")
         || text.contains("function")
         || text.contains("http:")
@@ -4497,6 +4512,26 @@ panel workspace row gap 8
             UiNodeKind::Dialog
         );
         assert!(format_nui_flow(source).unwrap().contains("tooltip hint"));
+    }
+
+    #[test]
+    fn tooltip_accepts_a_nine_slice_frame_and_structured_children() {
+        let source = "resource tooltip-frame image\nsurface root\n  image item resource tooltip-frame w 32 h 32\n    tooltip item-tooltip x 36 y 0 w 220 h 96 column pad 12 frame tooltip-frame nine_slice 4 4 4 4 border 8 8 8 8 mode stretch fill_center true\n      text title value \"Healing apple\"\n      panel divider h 1 fill #E6C36A\n      text detail value \"Restore 25 health\"\n";
+        let document = parse_nui_flow(source).unwrap();
+        let tooltip = &document.ir.root.children[0].children[0];
+        assert_eq!(tooltip.kind, UiNodeKind::Tooltip);
+        assert_eq!(document.ir.image_resources["item-tooltip"], "tooltip-frame");
+        assert_eq!(tooltip.children.len(), 3);
+    }
+
+    #[test]
+    fn rich_text_spans_are_typed_data_not_separate_text_nodes() {
+        let source = "surface root\n  text title rich \"[{\\\"value\\\":\\\"Rare \\\",\\\"color\\\":[1.0,0.8,0.2,1.0],\\\"scale\\\":1.1},{\\\"value\\\":\\\"tool\\\",\\\"color\\\":[0.5,0.9,1.0,1.0],\\\"scale\\\":0.9}]\"\n";
+        let document = parse_nui_flow(source).unwrap();
+        assert!(matches!(
+            document.ir.root.children[0].text,
+            Some(TextRef::Rich { ref spans }) if spans.len() == 2
+        ));
     }
 
     #[test]

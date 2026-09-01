@@ -50,6 +50,9 @@ use winit::{
 };
 
 #[cfg(windows)]
+use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+#[cfg(windows)]
 mod dx12_interop;
 mod gpu_preview;
 mod ui_program_gpu;
@@ -92,6 +95,74 @@ const WORLD_UI_LAB_LOGICAL_SIZE: [u32; 2] = [640, 360];
 const WORLD_UI_LAB_PANEL_SIZE: [u32; 2] = [1280, 720];
 const WORLD_UI_LAB_PREVIEW_SIZE: [u32; 2] = [640, 360];
 const HEADLESS_UI_LOGICAL_SIZE: [f32; 2] = [1280.0, 720.0];
+/// Explorer normally runs at medium integrity, so Windows blocks its drop
+/// messages to an elevated renderer window. Keep this exception inside the
+/// sole window owner and allow only the documented file-drop messages.
+#[cfg(windows)]
+fn enable_explorer_file_drop(window: &Window) -> Result<(), String> {
+    use windows::Win32::{
+        Foundation::HWND,
+        UI::WindowsAndMessaging::{
+            ChangeWindowMessageFilterEx, MSGFLT_ALLOW, WM_COPYDATA, WM_DROPFILES,
+        },
+    };
+    let handle = window
+        .window_handle()
+        .map_err(|error| format!("read native window handle: {error}"))?;
+    let RawWindowHandle::Win32(handle) = handle.as_raw() else {
+        return Err("expected a Win32 window handle".into());
+    };
+    let hwnd = HWND(handle.hwnd.get() as *mut _);
+    // WM_COPYGLOBALDATA (0x0049) is used by Explorer together with WM_COPYDATA.
+    for message in [WM_DROPFILES, WM_COPYDATA, 0x0049] {
+        unsafe { ChangeWindowMessageFilterEx(hwnd, message, MSGFLT_ALLOW, None) }
+            .map_err(|error| format!("allow Explorer message {message:#06x}: {error}"))?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn choose_image_file(window: &Window) -> Result<Option<PathBuf>, String> {
+    use windows::{
+        Win32::{
+            Foundation::HWND,
+            UI::Controls::Dialogs::{
+                CommDlgExtendedError, GetOpenFileNameW, OFN_EXPLORER, OFN_FILEMUSTEXIST,
+                OFN_NOCHANGEDIR, OFN_PATHMUSTEXIST, OPENFILENAMEW,
+            },
+        },
+        core::{PCWSTR, PWSTR},
+    };
+    let handle = window
+        .window_handle()
+        .map_err(|error| format!("read native window handle: {error}"))?;
+    let RawWindowHandle::Win32(handle) = handle.as_raw() else {
+        return Err("expected a Win32 window handle".into());
+    };
+    let mut filename = vec![0u16; 32_768];
+    let filter: Vec<u16> = "Image files (*.png;*.jpg;*.jpeg;*.webp;*.bmp;*.tga)\0*.png;*.jpg;*.jpeg;*.webp;*.bmp;*.tga\0All files (*.*)\0*.*\0\0".encode_utf16().collect();
+    let title: Vec<u16> = "Open image for Neon3 UI Slicer\0".encode_utf16().collect();
+    let mut dialog = OPENFILENAMEW {
+        lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
+        hwndOwner: HWND(handle.hwnd.get() as *mut _),
+        lpstrFilter: PCWSTR(filter.as_ptr()),
+        lpstrFile: PWSTR(filename.as_mut_ptr()),
+        nMaxFile: filename.len() as u32,
+        lpstrTitle: PCWSTR(title.as_ptr()),
+        Flags: OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR,
+        ..Default::default()
+    };
+    if unsafe { GetOpenFileNameW(&mut dialog) }.as_bool() {
+        let length = filename.iter().position(|value| *value == 0).unwrap_or(0);
+        return Ok(Some(PathBuf::from(String::from_utf16_lossy(&filename[..length]))));
+    }
+    let error = unsafe { CommDlgExtendedError() };
+    if error.0 == 0 {
+        Ok(None)
+    } else {
+        Err(format!("native image picker failed: {error:?}"))
+    }
+}
 
 #[derive(Clone, Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1090,6 +1161,7 @@ struct WindowGpu {
     next_semantic_sequence: u64,
     ime_active: bool,
     shift_down: bool,
+    control_down: bool,
     text_selection_drag: bool,
     started_at: Instant,
     last_draw_instance_count: usize,
@@ -1352,10 +1424,14 @@ impl WindowedRuntime {
         let window = event_loop
             .create_window(
                 Window::default_attributes()
-                    .with_title(format!("Neon3 - WGPU Runtime (epoch {})", self.epoch))
+                    .with_title(format!("Neon3 - WGPU Runtime (epoch {}) - Ctrl+O: Open image", self.epoch))
                     .with_inner_size(PhysicalSize::new(1280, 800)),
             )
             .map_err(|error| format!("create window: {error}"))?;
+        #[cfg(windows)]
+        if let Err(error) = enable_explorer_file_drop(&window) {
+            eprintln!("[neon-wgpu-runtime] Explorer file-drop enablement failed: {error}");
+        }
         // External host interop (DX12 shared texture/fence) requires the DX12
         // backend; forcing it avoids wgpu silently selecting Vulkan/GL and then
         // failing `as_hal::<Dx12>()` at surface creation.
@@ -2043,6 +2119,7 @@ impl WindowedRuntime {
             "layout_counters": {
                 "window_ui": gpu.ui.layout_counters(),
             },
+            "layout": gpu.ui.layout_snapshot(),
             "dropdown": gpu.ui.dropdown_debug_snapshot(),
             "active_transitions": gpu
                 .ui
@@ -4757,6 +4834,7 @@ impl WindowGpu {
             next_semantic_sequence: 0,
             ime_active: false,
             shift_down: false,
+            control_down: false,
             text_selection_drag: false,
             started_at: Instant::now(),
             last_draw_instance_count: 0,
@@ -6394,6 +6472,30 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                 if event.state != ElementState::Pressed {
                     return;
                 }
+                if self
+                    .gpu
+                    .as_ref()
+                    .is_some_and(|gpu| gpu.control_down)
+                    && matches!(event.physical_key, PhysicalKey::Code(KeyCode::KeyO))
+                {
+                    #[cfg(windows)]
+                    match self.window.as_ref().map(choose_image_file) {
+                        Some(Ok(Some(path))) => {
+                            eprintln!(
+                                "{{\"event\":\"ui.file_picker.selected\",\"source_path\":{}}}",
+                                serde_json::to_string(&path.to_string_lossy()).unwrap_or_else(|_| "\"\"".into())
+                            );
+                            self.publish_file_drop(path);
+                        }
+                        Some(Ok(None)) => eprintln!("{{\"event\":\"ui.file_picker.cancelled\"}}"),
+                        Some(Err(error)) => eprintln!(
+                            "{{\"event\":\"ui.file_picker.failed\",\"error\":{}}}",
+                            serde_json::to_string(&error).unwrap_or_else(|_| "\"unknown\"".into())
+                        ),
+                        None => {}
+                    }
+                    return;
+                }
                 if matches!(&event.logical_key, Key::Named(NamedKey::Escape)) {
                     let mut cancelled_drag = None;
                     let cancelled = self.gpu.as_mut().is_some_and(|gpu| {
@@ -6511,6 +6613,7 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
             WindowEvent::ModifiersChanged(modifiers) => {
                 if let Some(gpu) = self.gpu.as_mut() {
                     gpu.shift_down = modifiers.state().shift_key();
+                    gpu.control_down = modifiers.state().control_key();
                 }
             }
             WindowEvent::Focused(false) => {

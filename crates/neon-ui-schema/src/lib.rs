@@ -861,6 +861,24 @@ pub enum TextRef {
     Literal {
         value: String,
     },
+    Rich {
+        spans: Vec<UiRichTextSpan>,
+    },
+}
+
+/// A bounded inline text span. It carries presentation data only; no markup,
+/// executable content, or renderer-local resource handles cross the UI boundary.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiRichTextSpan {
+    pub value: String,
+    pub color: [f32; 4],
+    #[serde(default = "default_rich_text_scale")]
+    pub scale: f32,
+}
+
+fn default_rich_text_scale() -> f32 {
+    1.0
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -2679,7 +2697,7 @@ impl UiFragment {
                         || image_id.trim().is_empty()
                         || !matches!(
                             find_node_kind(&self.root, &node_id.0),
-                            Some(UiNodeKind::Image | UiNodeKind::Panel)
+                            Some(UiNodeKind::Image | UiNodeKind::Panel | UiNodeKind::Tooltip)
                         ) =>
                 {
                     return Err(UiSchemaError::InvalidProgramEvent);
@@ -2689,7 +2707,7 @@ impl UiFragment {
                         || !layout.validate()
                         || !matches!(
                             find_node_kind(&self.root, &node_id.0),
-                            Some(UiNodeKind::Image | UiNodeKind::Panel)
+                            Some(UiNodeKind::Image | UiNodeKind::Panel | UiNodeKind::Tooltip)
                         ) =>
                 {
                     return Err(UiSchemaError::InvalidProgramEvent);
@@ -2994,6 +3012,13 @@ impl TextRef {
         match self {
             Self::Key { key, .. } => !key.trim().is_empty(),
             Self::Literal { value } => !value.is_empty(),
+            Self::Rich { spans } => !spans.is_empty()
+                && spans.iter().all(|span| {
+                    !span.value.is_empty()
+                        && span.color.iter().all(|value| value.is_finite() && (0.0..=1.0).contains(value))
+                        && span.scale.is_finite()
+                        && (0.5..=2.0).contains(&span.scale)
+                }),
         }
     }
 }
@@ -3779,7 +3804,7 @@ impl UiIrDocument {
         if self.image_resources.iter().any(|(node_key, resource_key)| {
             !matches!(
                 find_ir_node(&self.root, node_key),
-                Some(node) if matches!(node.kind, UiNodeKind::Image | UiNodeKind::Panel)
+                Some(node) if matches!(node.kind, UiNodeKind::Image | UiNodeKind::Panel | UiNodeKind::Tooltip)
             ) || !self.resources.iter().any(|resource| {
                 resource.key == *resource_key && resource.kind == UiProgramResourceKind::Image
             })
@@ -3791,7 +3816,7 @@ impl UiIrDocument {
                 || !decoration.nine_slice.validate()
                 || !matches!(
                     find_ir_node(&self.root, node_key),
-                    Some(node) if matches!(node.kind, UiNodeKind::Image | UiNodeKind::Panel)
+                Some(node) if matches!(node.kind, UiNodeKind::Image | UiNodeKind::Panel | UiNodeKind::Tooltip)
                 )
         }) {
             return Err(UiSchemaError::InvalidIrDocument);

@@ -1202,6 +1202,7 @@ pub struct UiWgpuRenderer {
     hit_id_by_node: HashMap<String, u32>,
     image_pipeline: wgpu::RenderPipeline,
     image_buffer: wgpu::Buffer,
+    popup_image_buffer: wgpu::Buffer,
     image_capacity: usize,
     resident_images: HashMap<(String, u64, u64), ResidentImage>,
     external_images: HashMap<String, ResidentImage>,
@@ -1912,6 +1913,7 @@ impl UiWgpuRenderer {
             hit_id_by_node: HashMap::new(),
             image_pipeline,
             image_buffer: create_image_buffer(device, 512),
+            popup_image_buffer: create_image_buffer(device, 512),
             image_capacity: 512,
             resident_images: HashMap::new(),
             external_images: HashMap::new(),
@@ -2926,14 +2928,14 @@ impl UiWgpuRenderer {
         };
         let hit_bounds = visual.bounds;
         let bounds = match &kind {
-            // Accept a pointer anywhere on the authored slider node, but use
-            // the same internal track geometry as the renderer's chrome for
-            // value conversion. This keeps the cursor, thumb, and committed
-            // value in one coordinate system.
+            // Use the same full-width track geometry as the renderer chrome.
+            // Numeric sliders expose min/max values, so 0%, 50%, and 100%
+            // must resolve to the left, midpoint, and right of one predictable
+            // track rather than an arbitrary label-reserved subregion.
             UiNodeKind::Slider => UiBounds {
-                x: visual.bounds.x + visual.bounds.width * 0.57,
+                x: visual.bounds.x + 12.0,
                 y: visual.bounds.y,
-                width: visual.bounds.width * 0.34,
+                width: (visual.bounds.width - 24.0).max(1.0),
                 height: visual.bounds.height,
             },
             UiNodeKind::Scrollbar => UiBounds {
@@ -4611,6 +4613,14 @@ impl UiWgpuRenderer {
         self.instances.clear();
         let stage = Instant::now();
         let top_layer = self.compose_sampled_visuals(time_seconds);
+        let visible_top_layer = top_layer
+            .iter()
+            .map(|root| {
+                root.is_none_or(|root| {
+                    self.plan[root].target.kind != UiNodeKind::Tooltip || self.tooltip_hovered(root)
+                })
+            })
+            .collect::<Vec<_>>();
         let compose_visuals_ms = stage.elapsed().as_secs_f32() * 1000.0;
         let mut buffer_upload_ms = 0.0_f32;
         let plan_index = self
@@ -4619,24 +4629,27 @@ impl UiWgpuRenderer {
             .enumerate()
             .map(|(index, node)| (node.id.as_str(), index))
             .collect::<HashMap<_, _>>();
-        // Preserve document order for ordinary UI, then append the captured subtree.
-        // This gives the preview a temporary top-level z-order without changing the
-        // canonical UI tree or its declared parentage.
-        for dragged_layer in [false, true] {
-            for index in 0..self.plan.len() {
-                if self.plan[index].instance_index.is_none()
-                    || top_layer[index].is_some()
-                    || !sampled_in_mode(&self.sampled[index], mode)
-                    || self.drag_offset_for_node(index, &plan_index).is_some() != dragged_layer
-                {
-                    continue;
-                }
-                let visual = &self.sampled[index];
-                self.instances
-                    .push(self.instance(visual, &self.plan[index].id, time_seconds));
-                self.instances
-                    .extend(self.component_chrome_instances(visual, &self.plan[index].id));
+        // Ordinary UI stays in document order. The captured drag subtree is held
+        // for the final screen-space batch below so no later panel, popup, modal,
+        // or component chrome can occlude the item under the pointer.
+        let mut drag_preview_instances = Vec::new();
+        for index in 0..self.plan.len() {
+            if self.plan[index].instance_index.is_none()
+                || top_layer[index].is_some()
+                || !sampled_in_mode(&self.sampled[index], mode)
+            {
+                continue;
             }
+            let visual = &self.sampled[index];
+            let instance = self.instance(visual, &self.plan[index].id, time_seconds);
+            let chrome = self.component_chrome_instances(visual, &self.plan[index].id);
+            let destination = if self.drag_offset_for_node(index, &plan_index).is_some() {
+                &mut drag_preview_instances
+            } else {
+                &mut self.instances
+            };
+            destination.push(instance);
+            destination.extend(chrome);
         }
         // CPU first-press handling must be ready as soon as the visible frame is
         // drawn; asynchronous GPU hit readback is only supplemental.
@@ -4702,6 +4715,9 @@ impl UiWgpuRenderer {
                 );
             }
         }
+        // Drag preview is the final composited screen layer. It is intentionally
+        // renderer-local and does not mutate the canonical UI tree.
+        popup_instances.extend(drag_preview_instances);
         self.pointer_visual_dirty = false;
         if mode != UiDrawMode::World {
             self.append_text_input_overlays();
@@ -4810,6 +4826,9 @@ impl UiWgpuRenderer {
             // after the ordinary image batch. Their images must follow their
             // own opaque panel rectangles, or those rectangles cover them.
             if top_layer[index].is_some() {
+                if !visible_top_layer[index] {
+                    continue;
+                }
                 popup_images.push(image);
             } else {
                 images.push(image);
@@ -4819,6 +4838,7 @@ impl UiWgpuRenderer {
         if image_capacity > self.image_capacity {
             self.image_capacity = image_capacity.next_power_of_two();
             self.image_buffer = create_image_buffer(device, self.image_capacity);
+            self.popup_image_buffer = create_image_buffer(device, self.image_capacity);
         }
         // Do not upload `images` here. The sorted `ordered_images` payload below
         // is the only image batch consumed by the render pass; uploading this
@@ -4942,14 +4962,6 @@ impl UiWgpuRenderer {
         let list_box_texts = self.list_box_option_texts();
         let tab_texts = self.tab_option_texts();
         let drag_value_texts = self.drag_value_texts();
-        let visible_top_layer = top_layer
-            .iter()
-            .map(|root| {
-                root.is_none_or(|root| {
-                    self.plan[root].target.kind != UiNodeKind::Tooltip || self.tooltip_hovered(root)
-                })
-            })
-            .collect::<Vec<_>>();
         let scroll_dynamic = (0..self.plan.len())
             .map(|index| Self::has_scroll_ancestor_in_plan(&self.plan, index))
             .collect::<Vec<_>>();
@@ -5118,8 +5130,7 @@ impl UiWgpuRenderer {
                         if !visible_top_layer[index] {
                             continue;
                         }
-                        if let Some(text) = visual.text.as_ref().and_then(text_ref_value)
-                            && matches!(
+                        if matches!(
                                 visual.kind,
                                 UiNodeKind::Label
                                     | UiNodeKind::Button
@@ -5135,11 +5146,20 @@ impl UiWgpuRenderer {
                                     | UiNodeKind::Scrollbar
                                     | UiNodeKind::ProgressBar
                                     | UiNodeKind::Tooltip
-                            )
-                            && let Some(instances) =
-                                layout_text(device, queue, font, visual, text, None)
-                        {
-                            popup_texts.extend(instances);
+                            ) {
+                            match visual.text.as_ref() {
+                                Some(TextRef::Rich { spans }) => {
+                                    if let Some(instances) = layout_rich_text(device, queue, font, visual, spans) {
+                                        popup_texts.extend(instances);
+                                    }
+                                }
+                                Some(text) if text_ref_value(text).is_some() => {
+                                    if let Some(instances) = layout_text(device, queue, font, visual, text_ref_value(text).unwrap(), None) {
+                                        popup_texts.extend(instances);
+                                    }
+                                }
+                                _ => {}
+                            }
                         }
                     }
                 }
@@ -5297,6 +5317,7 @@ impl UiWgpuRenderer {
         if ordered_images.len() > self.image_capacity {
             self.image_capacity = ordered_images.len().next_power_of_two();
             self.image_buffer = create_image_buffer(device, self.image_capacity);
+            self.popup_image_buffer = create_image_buffer(device, self.image_capacity);
         }
         if ordered_texts.len() > self.text_capacity {
             self.text_capacity = ordered_texts.len().next_power_of_two();
@@ -5404,7 +5425,11 @@ impl UiWgpuRenderer {
             pass.draw(0..6, 0..popup_instances.len() as u32);
         }
         if !popup_images.is_empty() {
-            queue.write_buffer(&self.image_buffer, 0, bytemuck::cast_slice(&popup_images));
+            queue.write_buffer(
+                &self.popup_image_buffer,
+                0,
+                bytemuck::cast_slice(&popup_images),
+            );
             pass.set_pipeline(&self.image_pipeline);
             pass.set_bind_group(0, &self.view_bind_group, &[]);
             pass.set_bind_group(
@@ -5416,7 +5441,7 @@ impl UiWgpuRenderer {
                     .bind_group,
                 &[],
             );
-            pass.set_vertex_buffer(0, self.image_buffer.slice(..));
+            pass.set_vertex_buffer(0, self.popup_image_buffer.slice(..));
             pass.draw(0..6, 0..popup_images.len() as u32);
         }
         if !popup_texts.is_empty() {
@@ -5450,6 +5475,34 @@ impl UiWgpuRenderer {
             "layout_count": self.layout_counters.layout_count,
             "text_layout_count": self.layout_counters.text_layout_count,
             "world_transform_update_count": self.layout_counters.world_transform_update_count,
+        })
+    }
+
+    /// Renderer-final layout diagnostics. Unlike a fragment snapshot, these
+    /// values include resolved flex tracks, branch visibility, scroll/clip
+    /// transforms, and final logical bounds used for drawing and hit testing.
+    pub(crate) fn layout_snapshot(&self) -> Value {
+        json!({
+            "nodes": self.plan.iter().map(|node| {
+                let visual = &node.target;
+                json!({
+                    "path": node.id,
+                    "kind": node.target.kind,
+                    "visible": visual.enabled && visual.bounds.width > 0.0 && visual.bounds.height > 0.0,
+                    "bounds": {
+                        "x": visual.logical_bounds.x,
+                        "y": visual.logical_bounds.y,
+                        "width": visual.logical_bounds.width,
+                        "height": visual.logical_bounds.height,
+                    },
+                    "clip": {
+                        "x": visual.clip.x,
+                        "y": visual.clip.y,
+                        "width": visual.clip.width,
+                        "height": visual.clip.height,
+                    },
+                })
+            }).collect::<Vec<_>>()
         })
     }
 
@@ -7152,7 +7205,16 @@ fn default_component_style(kind: &UiNodeKind) -> UiStyle {
             corner_radius: 4.0,
             opacity: 1.0,
         },
-        _ => UiStyle::default(),
+        // Containers, labels, images, and render surfaces do not get implicit
+        // component chrome. Their authored default is a sentinel used by the
+        // component resolver, so make the renderer fallback transparent here.
+        _ => UiStyle {
+            background_color: [0.0, 0.0, 0.0, 0.0],
+            border_color: [0.0, 0.0, 0.0, 0.0],
+            border_width: 0.0,
+            corner_radius: 0.0,
+            opacity: 1.0,
+        },
     }
 }
 
@@ -7276,9 +7338,9 @@ fn component_chrome_instances(visual: &UiVisual) -> Vec<UiInstance> {
         )],
         UiNodeKind::Slider => {
             let track = UiBounds {
-                x: bounds.x + bounds.width * 0.57,
+                x: bounds.x + 12.0,
                 y: center_y - 2.0,
-                width: bounds.width * 0.34,
+                width: (bounds.width - 24.0).max(1.0),
                 height: 4.0,
             };
             vec![
@@ -7800,6 +7862,7 @@ fn text_ref_value(text: &TextRef) -> Option<&str> {
     match text {
         TextRef::Key { key, .. } => (!key.trim().is_empty()).then_some(key.as_str()),
         TextRef::Literal { value } => (!value.is_empty()).then_some(value.as_str()),
+        TextRef::Rich { .. } => None,
     }
 }
 
@@ -7896,7 +7959,10 @@ fn text_clip(visual: &UiVisual) -> Option<[f32; 4]> {
     };
     let left = visual.bounds.x.max(clip.x);
     let top = visual.bounds.y.max(clip.y);
-    let right = (visual.bounds.x + visual.bounds.width).min(clip.x + clip.width);
+    // Glyph raster bounds can extend slightly past the advance width. Keep a
+    // small logical safety allowance inside the inherited parent clip so the
+    // final glyph is not shaved by the node's nominal right edge.
+    let right = (visual.bounds.x + visual.bounds.width + 2.0).min(clip.x + clip.width);
     let bottom = (visual.bounds.y + visual.bounds.height).min(clip.y + clip.height);
     (left < right && top < bottom).then_some([left, top, right, bottom])
 }
@@ -8049,6 +8115,44 @@ fn layout_text(
                 paint_group_id: visual.paint_group_id,
             });
             x += glyph.advance * text_scale;
+        }
+    }
+    Some(result)
+}
+
+fn layout_rich_text(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    font: &mut ResidentFont,
+    visual: &UiVisual,
+    spans: &[neon_ui_schema::UiRichTextSpan],
+) -> Option<Vec<UiTextInstance>> {
+    let clip = text_clip(visual)?;
+    let world_scale = visual.world_scale.unwrap_or(1.0);
+    let max_scale = spans.iter().map(|span| span.scale).fold(1.0_f32, f32::max);
+    let line_height = font.line_height * world_scale * max_scale;
+    let top = visual.bounds.y + ((visual.bounds.height - line_height).max(0.0) * 0.5);
+    let baseline = top + font.ascent * world_scale * max_scale;
+    let mut x = visual.bounds.x + 10.0;
+    let mut result = Vec::new();
+    for span in spans {
+        let scale = world_scale * span.scale;
+        for ch in span.value.chars() {
+            let glyph = ensure_glyph(device, queue, font, ch).ok()?;
+            result.push(UiTextInstance {
+                rect: [
+                    x + glyph.xmin * scale,
+                    baseline + glyph.plane_min_y * scale,
+                    glyph.width * scale,
+                    glyph.height * scale,
+                ],
+                color: [span.color[0], span.color[1], span.color[2], span.color[3] * visual.style.opacity],
+                clip,
+                uv: glyph.uv,
+                depth: color_pass_depth(visual.world_depth),
+                paint_group_id: visual.paint_group_id,
+            });
+            x += glyph.advance * scale;
         }
     }
     Some(result)
@@ -9167,7 +9271,18 @@ fn clamp_dimension(value: f32, layout: &UiLayout, height: bool) -> f32 {
 }
 
 fn intrinsic_size(node: &UiNode, font: Option<&ResidentFont>) -> [f32; 2] {
-    if let Some(text) = node.text.as_ref().and_then(text_ref_value) {
+    if let Some(text_ref) = node.text.as_ref() {
+        let rich_text;
+        let text = match text_ref {
+            TextRef::Rich { spans } => {
+                rich_text = spans.iter().map(|span| span.value.as_str()).collect::<String>();
+                rich_text.as_str()
+            }
+            _ => match text_ref_value(text_ref) {
+                Some(text) => text,
+                None => return [0.0, 0.0],
+            },
+        };
         let line_height = font.map_or(FONT_RASTER_SIZE, |font| font.line_height);
         let advance = |ch: char| {
             font.map_or_else(
@@ -9242,7 +9357,7 @@ fn is_interactive_control(kind: &UiNodeKind) -> bool {
 
 fn resolve_children(
     node: &UiNode,
-    bounds: UiBounds,
+    _bounds: UiBounds,
     parent_layout: UiLayout,
     inner: UiBounds,
     font: Option<&ResidentFont>,
@@ -9271,8 +9386,8 @@ fn resolve_children(
                     // layout coordinates stable here so track calculation,
                     // text layout, hit geometry, and composition all share
                     // one logical coordinate system.
-                    x: bounds.x + child.bounds.x,
-                    y: bounds.y + child.bounds.y,
+                    x: inner.x + child.bounds.x,
+                    y: inner.y + child.bounds.y,
                     width,
                     height,
                 }
@@ -9281,12 +9396,21 @@ fn resolve_children(
     }
     let row = parent_layout.mode == UiLayoutMode::Row;
     let available = if row { inner.width } else { inner.height };
-    let participating_count = node.children.iter().filter(|child| child.visible).count();
+    // Flow containers support two intentional child modes. The ordinary case
+    // has no authored offset and participates in the row/column track. A child
+    // with an authored x or y is positioned relative to the parent's content
+    // box, does not consume a flex track, and therefore cannot shift siblings.
+    // Previously offsets were silently ignored by row/column layout, which made
+    // expanded branch content overlap at the flow origin.
+    let participates_in_flow = |child: &UiNode| {
+        child.visible && child.bounds.x == 0.0 && child.bounds.y == 0.0
+    };
+    let participating_count = node.children.iter().filter(|child| participates_in_flow(child)).count();
     let mut main_sizes = node
         .children
         .iter()
         .map(|child| {
-            if !child.visible {
+            if !participates_in_flow(child) {
                 return 0.0;
             }
             let layout = child.layout.unwrap_or_default();
@@ -9309,7 +9433,7 @@ fn resolve_children(
         .children
         .iter()
         .map(|child| {
-            if !child.visible {
+            if !participates_in_flow(child) {
                 return 0.0;
             }
             let margin = child.layout.unwrap_or_default().margin;
@@ -9321,7 +9445,7 @@ fn resolve_children(
         })
         .collect::<Vec<_>>();
     for (size, child) in main_sizes.iter_mut().zip(&node.children) {
-        if child.visible {
+        if participates_in_flow(child) {
             *size = clamp_dimension(*size, &child.layout.unwrap_or_default(), !row);
         }
     }
@@ -9341,7 +9465,7 @@ fn resolve_children(
             .iter()
             .zip(&main_sizes)
             .map(|(child, size)| {
-                if !child.visible {
+                if !participates_in_flow(child) {
                     return 0.0;
                 }
                 let layout = child.layout.unwrap_or_default();
@@ -9402,6 +9526,14 @@ fn resolve_children(
                 };
             }
             let layout = child.layout.unwrap_or_default();
+            if !participates_in_flow(child) {
+                return UiBounds {
+                    x: inner.x + child.bounds.x,
+                    y: inner.y + child.bounds.y,
+                    width: resolved_dimension(child.bounds.width, child, &layout, font, false),
+                    height: resolved_dimension(child.bounds.height, child, &layout, font, true),
+                };
+            }
             let margin = layout.margin;
             let cross_available = if row { inner.height } else { inner.width };
             let declared_cross = if row {
@@ -16476,6 +16608,77 @@ mod tests {
             (b.target.logical_bounds.y - 17.0).abs() < 0.001,
             "child B y should include padding + height + gap"
         );
+    }
+
+    #[test]
+    fn flow_children_with_authored_offsets_are_absolute_and_do_not_consume_tracks() {
+        let child = |id: &str, x: f32, y: f32, height: f32| UiNode {
+            node_id: UiNodeId(id.into()),
+            kind: UiNodeKind::Panel,
+            bounds: UiBounds { x, y, width: 40.0, height },
+            layout: Some(UiLayout::default()),
+            visible: true,
+            enabled: true,
+            text_key: None,
+            text: None,
+            image: None,
+            surface: None,
+            style: UiStyle::default(),
+            enter_transition: None,
+            world_depth: None,
+            world_scale: None,
+            children: Vec::new(),
+        };
+        let root = UiNode {
+            node_id: UiNodeId("root".into()),
+            kind: UiNodeKind::Panel,
+            bounds: UiBounds { x: 0.0, y: 0.0, width: 200.0, height: 160.0 },
+            layout: Some(UiLayout { mode: UiLayoutMode::Column, gap: 6.0, padding: [4.0, 4.0, 4.0, 4.0], ..UiLayout::default() }),
+            visible: true,
+            enabled: true,
+            text_key: None,
+            text: None,
+            image: None,
+            surface: None,
+            style: UiStyle::default(),
+            enter_transition: None,
+            world_depth: None,
+            world_scale: None,
+            children: vec![child("first", 0.0, 0.0, 20.0), child("overlay", 60.0, 48.0, 30.0), child("second", 0.0, 0.0, 20.0)],
+        };
+        let bounds = resolve_children(
+            &root,
+            root.bounds,
+            root.layout.unwrap(),
+            UiBounds { x: 4.0, y: 4.0, width: 192.0, height: 152.0 },
+            None,
+        );
+        assert_eq!(bounds[0].y, 4.0);
+        assert_eq!(bounds[1].x, 64.0);
+        assert_eq!(bounds[1].y, 52.0);
+        assert_eq!(bounds[2].y, 30.0);
+    }
+
+    #[test]
+    fn absolute_children_use_parent_content_origin() {
+        let mut child = node();
+        child.node_id = UiNodeId("child".into());
+        child.bounds = UiBounds { x: 0.0, y: 0.0, width: 20.0, height: 10.0 };
+        child.enter_transition = None;
+        let mut root = node();
+        root.node_id = UiNodeId("root".into());
+        root.bounds = UiBounds { x: 100.0, y: 50.0, width: 200.0, height: 160.0 };
+        root.layout = Some(UiLayout { padding: [11.0, 13.0, 17.0, 19.0], ..UiLayout::default() });
+        root.children = vec![child];
+        let bounds = resolve_children(
+            &root,
+            root.bounds,
+            root.layout.unwrap(),
+            UiBounds { x: 119.0, y: 61.0, width: 168.0, height: 132.0 },
+            None,
+        );
+        assert_eq!(bounds[0].x, 119.0);
+        assert_eq!(bounds[0].y, 61.0);
     }
 
     #[test]
