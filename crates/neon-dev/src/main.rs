@@ -1783,7 +1783,7 @@ fn probe_window_metrics(endpoint: &str, samples: u32, interval_ms: u64) -> io::R
     let mut layout = Vec::new();
     let mut text = Vec::new();
     let mut world = Vec::new();
-    let mut dropped = 0_u64;
+    let dropped = 0_u64;
     for sample in 0..samples {
         let response = call(
             endpoint,

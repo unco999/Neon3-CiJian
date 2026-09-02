@@ -1242,6 +1242,35 @@ impl WindowedRuntime {
                 if !matches!(event.button, Some(neon_ui_schema::UiPointerButton::Primary)) {
                     return Err("ui_pointer_button_unsupported".into());
                 }
+                // Popup rows are renderer-local overlays, so they do not have
+                // ordinary hit IDs. Resolve them before the generic hit path;
+                // otherwise a public UiPointerEvent sees an open choice menu as
+                // `press_without_semantic_hit` and leaves the host unusable.
+                if let Some((binding, value)) = gpu.ui.dropdown_option_at_pointer() {
+                    gpu.input.set_hover_id(Some(0));
+                    gpu.input
+                        .pointer_down()
+                        .map_err(|_| "choice_option_capture_failed".to_owned())?;
+                    gpu.captured_binding = Some(binding);
+                    gpu.pending_control_value = Some(value);
+                    gpu.ui.close_dropdown();
+                    self.redraw_pending = true;
+                    return Ok(json!({"state": "choice_option_captured"}));
+                }
+                if gpu.ui.dismiss_dropdown_at_pointer() {
+                    gpu.captured_binding = None;
+                    gpu.pending_control_value = None;
+                    gpu.input.cancel();
+                    self.redraw_pending = true;
+                    return Ok(json!({"state": "choice_popup_dismissed"}));
+                }
+                if gpu.ui.toggle_dropdown_at_pointer() {
+                    gpu.captured_binding = None;
+                    gpu.pending_control_value = None;
+                    gpu.input.cancel();
+                    self.redraw_pending = true;
+                    return Ok(json!({"state": "choice_popup_toggled"}));
+                }
                 gpu.input.set_hover_id(gpu.ui.hit_id_at_pointer());
                 gpu.input
                     .pointer_down()
@@ -2121,6 +2150,7 @@ impl WindowedRuntime {
             },
             "layout": gpu.ui.layout_snapshot(),
             "dropdown": gpu.ui.dropdown_debug_snapshot(),
+            "text_input": gpu.ui.text_input_debug_snapshot(),
             "active_transitions": gpu
                 .ui
                 .active_transition_debug_snapshot(gpu.started_at.elapsed().as_secs_f32()),
@@ -2790,6 +2820,28 @@ impl HeadlessExternalGpu {
                 self.perf.pointer_down_received += 1;
                 if !matches!(event.button, Some(neon_ui_schema::UiPointerButton::Primary)) {
                     return Err("ui_pointer_button_unsupported".into());
+                }
+                if let Some((binding, value)) = presentation_ui.dropdown_option_at_pointer() {
+                    self.input.set_hover_id(Some(0));
+                    self.input
+                        .pointer_down()
+                        .map_err(|_| "choice_option_capture_failed".to_owned())?;
+                    self.captured_binding = Some(binding);
+                    self.pending_control_value = Some(value);
+                    presentation_ui.close_dropdown();
+                    return Ok(json!({"state": "choice_option_captured"}));
+                }
+                if presentation_ui.dismiss_dropdown_at_pointer() {
+                    self.captured_binding = None;
+                    self.pending_control_value = None;
+                    self.input.cancel();
+                    return Ok(json!({"state": "choice_popup_dismissed"}));
+                }
+                if presentation_ui.toggle_dropdown_at_pointer() {
+                    self.captured_binding = None;
+                    self.pending_control_value = None;
+                    self.input.cancel();
+                    return Ok(json!({"state": "choice_popup_toggled"}));
                 }
                 let current_hit = ui.hit_binding_at_pointer();
                 self.input
@@ -5963,6 +6015,14 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                 }
                 let text_input = self.gpu.as_mut().and_then(|gpu| {
                     let input = gpu.ui.text_input_at_pointer()?;
+                    // Text selection is renderer-local and must not inherit a
+                    // stale semantic pointer capture from the preceding
+                    // control. Reset the local pointer state before focusing
+                    // the virtual-list cell.
+                    gpu.input.cancel();
+                    gpu.captured_binding = None;
+                    gpu.active_interaction_id = None;
+                    gpu.pending_control_value = None;
                     gpu.ui.focus_text_input(input.clone());
                     if let Some(pointer) = gpu.ui.pointer_position() {
                         gpu.ui.set_text_input_caret_from_pointer(pointer, false);
@@ -6264,6 +6324,8 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                     if text_binding {
                         let binding = gpu.captured_binding.take()?;
                         gpu.input.pointer_up(true).ok()?;
+                        gpu.active_interaction_id = None;
+                        gpu.pending_control_value = None;
                         return Some(Err(binding));
                     }
                     release_captured_binding(gpu).map(Ok)
@@ -6506,14 +6568,21 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                                     .map(|(source, fragment)| (id, source, fragment.revision))
                             });
                         }
-                        let active = gpu.ui.drag_active() || gpu.ui.value_gesture_active();
+                        let active = gpu.ui.drag_active()
+                            || gpu.ui.value_gesture_active()
+                            || gpu.ui.data_grid_text_input_active();
                         let cancelled = gpu.ui.cancel_pending_local_presentations() || active;
                         gpu.ui.cancel_drag();
                         gpu.ui.cancel_value_gesture();
+                        let cancelled_text = gpu.ui.cancel_data_grid_text_input();
                         if cancelled {
                             gpu.captured_binding = None;
                             gpu.pending_control_value = None;
+                            gpu.text_selection_drag = false;
                             gpu.input.cancel();
+                        }
+                        if cancelled_text {
+                            gpu.text_selection_drag = false;
                         }
                         cancelled
                     });
@@ -6534,6 +6603,9 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                         );
                     }
                     if cancelled {
+                        if let Some(window) = self.window.as_ref() {
+                            window.set_ime_allowed(false);
+                        }
                         self.redraw_pending = true;
                         return;
                     }
@@ -6551,6 +6623,7 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                     }
                     if matches!(&event.logical_key, Key::Named(NamedKey::Escape)) {
                         gpu.ui.cancel_data_grid_text_input();
+                        gpu.text_selection_drag = false;
                         return None;
                     }
                     let result = match &event.logical_key {

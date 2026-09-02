@@ -2535,9 +2535,11 @@ impl UiWgpuRenderer {
         let (bounds, current_fraction) = match (&visual.kind, &visual.presentation) {
             (UiNodeKind::Slider, Some(UiControlPresentation::Numeric { value, min, max })) => (
                 UiBounds {
-                    x: visual.bounds.x + visual.bounds.width * 0.57,
+                    // Keep debug producer points on the same track geometry
+                    // consumed by begin_value_gesture/update_value_gesture.
+                    x: visual.bounds.x + 12.0,
                     y: visual.bounds.y,
-                    width: visual.bounds.width * 0.34,
+                    width: (visual.bounds.width - 24.0).max(1.0),
                     height: visual.bounds.height,
                 },
                 numeric_fraction(*value, *min, *max),
@@ -3074,7 +3076,7 @@ impl UiWgpuRenderer {
             .iter()
             .enumerate()
             .find(|(index, node)| {
-                node.target.kind == UiNodeKind::Dropdown
+                matches!(node.target.kind, UiNodeKind::Combo | UiNodeKind::Dropdown)
                     && contains(self.visual_at(*index).bounds, pointer)
                     && contains(self.visual_at(*index).clip, pointer)
             })
@@ -3177,7 +3179,7 @@ impl UiWgpuRenderer {
         let diagnostic_node_path = |node_path: &str| {
             self.hit_bindings
                 .values()
-                .find(|binding| binding.node_path == node_path && binding.data_grid_cell.is_none())
+                .find(|binding| binding.node_path == node_path)
                 .map(|binding| binding.node_path.as_str())
         };
         let popup = self.dropdown_popup_layout().map(|(plan_index, rows)| {
@@ -3788,6 +3790,19 @@ impl UiWgpuRenderer {
 
     pub(crate) fn active_text_input_path(&self) -> Option<&str> {
         self.editing.node_path.as_deref()
+    }
+
+    pub(crate) fn text_input_debug_snapshot(&self) -> serde_json::Value {
+        serde_json::json!({
+            "active": self.editing.node_path.is_some(),
+            "node_path": self.editing.node_path.as_deref(),
+            "cursor": self.editing.cursor,
+            "selection_anchor": self.editing.selection_anchor,
+            "committed_chars": self.editing.committed.chars().count(),
+            "preedit_chars": self.editing.preedit.chars().count(),
+            "horizontal_scroll": self.editing.horizontal_scroll,
+            "ime_rect": self.text_input_ime_rect(),
+        })
     }
 
     pub(crate) fn finish_data_grid_text_input(&mut self) -> Option<(UiHitBinding, String)> {
@@ -4720,7 +4735,10 @@ impl UiWgpuRenderer {
         popup_instances.extend(drag_preview_instances);
         self.pointer_visual_dirty = false;
         if mode != UiDrawMode::World {
-            self.append_text_input_overlays();
+            // Text is drawn after ordinary rect instances. Keep the caret and
+            // selection above glyphs so a focused virtual-list cell has a
+            // visible insertion point.
+            popup_instances.extend(self.text_input_overlay_instances());
         }
         self.last_panel_instance_count = self.instances.len();
         if self.instances.len() > self.instance_capacity {
@@ -6077,16 +6095,17 @@ impl UiWgpuRenderer {
         }
     }
 
-    fn append_text_input_overlays(&mut self) {
+    fn text_input_overlay_instances(&self) -> Vec<UiInstance> {
+        let mut overlays = Vec::new();
         let Some(node_path) = self.editing.node_path.as_ref() else {
-            return;
+            return overlays;
         };
         let Some(index) = self.plan.iter().position(|node| &node.id == node_path) else {
-            return;
+            return overlays;
         };
         let visual = &self.sampled[index];
         let Some(font) = self.resident_font.as_ref() else {
-            return;
+            return overlays;
         };
         let range = self.editing.selection_range();
         if !range.is_empty() {
@@ -6094,7 +6113,7 @@ impl UiWgpuRenderer {
                 - self.editing.horizontal_scroll;
             let end = text_advance(&font.font, &self.editing.committed, range.end)
                 - self.editing.horizontal_scroll;
-            self.instances.push(overlay_instance(
+            overlays.push(overlay_instance(
                 UiBounds {
                     x: visual.bounds.x + TEXT_INPUT_INSET + start,
                     y: visual.bounds.y + 3.0,
@@ -6106,12 +6125,13 @@ impl UiWgpuRenderer {
             ));
         }
         if let Some(caret) = self.text_input_ime_rect() {
-            self.instances.push(overlay_instance(
+            overlays.push(overlay_instance(
                 caret,
                 input_clip(visual),
                 [0.84, 0.98, 0.96, 1.0],
             ));
         }
+        overlays
     }
 
     fn scroll_chrome_instances(&self, visual: &UiVisual, node_path: &str) -> Vec<UiInstance> {
@@ -10525,6 +10545,8 @@ mod tests {
         );
         renderer.focus_text_input(input.clone());
         assert!(renderer.data_grid_text_input_active());
+        assert_eq!(renderer.text_input_debug_snapshot()["active"], true);
+        assert_eq!(renderer.text_input_debug_snapshot()["cursor"], 7);
         assert!(renderer.commit_ime_text("X").is_none());
         assert_eq!(renderer.editing.committed, "displayX");
         renderer.focus_text_input(input.clone());
@@ -10533,6 +10555,7 @@ mod tests {
         assert_eq!(value, "displayX");
         assert_eq!(binding.data_grid_cell.unwrap().column_key, "name");
         assert!(!renderer.data_grid_text_input_active());
+        assert_eq!(renderer.text_input_debug_snapshot()["active"], false);
 
         renderer.focus_text_input(input);
         assert!(renderer.commit_ime_text("Y").is_none());
@@ -10802,6 +10825,13 @@ mod tests {
                 value: "review".into()
             }
         );
+        renderer.close_dropdown();
+        renderer.plan[0].target.kind = UiNodeKind::Combo;
+        renderer.set_pointer_position([30.0, 40.0]);
+        assert!(renderer.toggle_dropdown_at_pointer());
+        assert!(renderer.dropdown_debug_snapshot()["popup"]["rows"]
+            .as_array()
+            .is_some_and(|rows| rows.len() == 2));
     }
 
     #[test]

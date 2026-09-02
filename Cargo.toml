@@ -20,7 +20,7 @@ resolver = "2"
 [workspace.package]
 edition = "2024"
 license = "MIT OR Apache-2.0"
-version = "0.2.0"
+version = "0.2.4"
 repository = "https://github.com/unco999/Neon3-CiJian"
 homepage = "https://github.com/unco999/Neon3-CiJian"
 rust-version = "1.85"

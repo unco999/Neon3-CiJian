@@ -3852,7 +3852,7 @@ impl UiRuntime {
             target: ServiceName(SERVICE_NAME.into()),
             method: "ui.fragment.submit".into(),
             params: json!(UiCommand::SubmitFragment {
-                submission: UiFragmentSubmission::new(updated)
+                submission: UiFragmentSubmission::new(updated.clone())
             }),
             expected_revision: Some(fragment.revision),
             idempotency_key: Some(format!("ui-host-fragment:{idempotency_key}")),
@@ -3892,6 +3892,11 @@ impl UiRuntime {
         }
         if response.status == RpcStatus::Accepted {
             self.host_adapter = Some(candidate);
+            // The renderer now owns `updated.revision`; cache that same
+            // authoritative fragment before accepting another interaction.
+            // Retaining the old fragment here made every subsequent control
+            // event carry a stale revision after the first publication.
+            self.cached_fragment = Some(updated);
             // Deferred pointer-lane completion passes `None` because the
             // state machine was already advanced when the request was
             // enqueued. Do not erase it here: doing so made the next panel
