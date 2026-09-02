@@ -8,6 +8,8 @@
 <p align="center"><strong>独立 UI 渲染 Runtime、进程架构与公共协议</strong><br />
 窗口与 GPU 由 Neon3 Runtime 统一负责；应用可以使用任意语言通过公共协议提交 UI、状态和交互。</p>
 
+<p align="center"><img src="readme.png" width="1120" alt="Neon3 Runtime 与协议总览" /></p>
+
 ## 从案例开始
 
 | 案例 | 用途 | 启动 |

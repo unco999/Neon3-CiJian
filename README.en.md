@@ -8,6 +8,8 @@
 <p align="center"><strong>An independent UI rendering runtime, process architecture, and public protocol</strong><br />
 Neon3 owns the window and GPU. Applications in any language submit UI, state, and interactions through one public protocol.</p>
 
+<p align="center"><img src="readme.png" width="1120" alt="Neon3 runtime and protocol overview" /></p>
+
 ## Start With Examples
 
 | Example | What it covers | Run |
