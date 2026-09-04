@@ -22,7 +22,8 @@ $crates = @(
     "neon-ui",
     "neon-cli",
     "neon-dev",
-    "neon-wgpu-runtime"
+    "neon-wgpu-runtime",
+    "neon-android-host"
 )
 
 $dirty = if ($AllowDirty) { "--allow-dirty" } else { $null }

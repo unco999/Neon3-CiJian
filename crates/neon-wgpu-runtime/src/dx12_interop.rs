@@ -61,26 +61,19 @@ pub struct AdapterInfo {
     pub name: String,
 }
 
+/// Windows-only interop handles for a cross-process shared surface.
+///
+/// On non-Windows platforms a shared surface is an ordinary wgpu texture and
+/// has no native handles; see `crate::SharedSurface`.
 #[derive(Debug)]
-pub struct SharedSurface {
-    pub texture: wgpu::Texture,
+pub struct SharedSurfaceInterop {
     pub texture_handle: HANDLE,
     pub fence: ID3D12Fence,
     pub fence_handle: HANDLE,
     pub consumer_fence: ID3D12Fence,
     pub consumer_fence_handle: HANDLE,
     pub adapter: AdapterInfo,
-    pub width: u32,
-    pub height: u32,
-    pub frame_sequence: u64,
 }
-
-// `HANDLE` wraps a raw pointer and is therefore not auto-`Send`/`Sync`, but it
-// is just a process-scoped kernel handle value (safe to move between threads in
-// the same process). The owning `HeadlessExternalGpu` serializes access through
-// a `Mutex`, so this is sound.
-unsafe impl Send for SharedSurface {}
-unsafe impl Sync for SharedSurface {}
 
 pub fn duplicate_handle_to_process(handle: HANDLE, target_pid: u32) -> Result<usize, Error> {
     let target = unsafe { OpenProcess(PROCESS_DUP_HANDLE, false, target_pid) }
@@ -126,7 +119,7 @@ pub fn create_shared_surface(
     width: u32,
     height: u32,
     format: wgpu::TextureFormat,
-) -> Result<SharedSurface, Error> {
+) -> Result<crate::SharedSurface, Error> {
     let adapter_info = adapter_info(adapter)?;
     let hal_device =
         unsafe { device.as_hal::<wgpu::hal::api::Dx12>() }.ok_or(Error::MissingHalDevice)?;
@@ -240,17 +233,19 @@ pub fn create_shared_surface(
             wgpu::TextureUses::COLOR_TARGET,
         )
     };
-    Ok(SharedSurface {
+    Ok(crate::SharedSurface {
         texture,
-        texture_handle,
-        fence,
-        fence_handle,
-        consumer_fence,
-        consumer_fence_handle,
-        adapter: adapter_info,
         width,
         height,
         frame_sequence: 0,
+        interop: Some(SharedSurfaceInterop {
+            texture_handle,
+            fence,
+            fence_handle,
+            consumer_fence,
+            consumer_fence_handle,
+            adapter: adapter_info,
+        }),
     })
 }
 

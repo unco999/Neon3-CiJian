@@ -32,6 +32,29 @@ fn main() {
             .expect("headless server request must complete");
         return;
     }
+    #[cfg(windows)]
+    if args
+        .get(1)
+        .is_some_and(|argument| argument == "--headless-external-server")
+    {
+        let endpoint = args
+            .get(2)
+            .expect("headless external server endpoint is required")
+            .parse()
+            .expect("headless external server endpoint must be a socket address");
+        let server = neon_wgpu_runtime::spawn_headless_external_server(endpoint);
+        match server.join() {
+            Ok(Ok(())) => return,
+            Ok(Err(error)) => {
+                eprintln!("neon-wgpu-runtime headless external server failed: {error}");
+                std::process::exit(1);
+            }
+            Err(_) => {
+                eprintln!("neon-wgpu-runtime headless external server thread panicked");
+                std::process::exit(1);
+            }
+        }
+    }
     if args.get(1).is_some_and(|argument| argument == "--window") {
         if args
             .iter()
@@ -94,7 +117,7 @@ fn main() {
         return;
     }
     eprintln!(
-        "usage: neon-wgpu-runtime --window | --window-server <loopback-endpoint> [ui-runtime-endpoint] [projectd-endpoint] [--eventd <loopback-endpoint>] [--enable-world-ui-lab-camera] | --headless-server <loopback-endpoint>"
+        "usage: neon-wgpu-runtime --window | --window-server <loopback-endpoint> [ui-runtime-endpoint] [projectd-endpoint] [--eventd <loopback-endpoint>] [--enable-world-ui-lab-camera] | --headless-server <loopback-endpoint> | --headless-external-server <loopback-endpoint> (windows only)"
     );
     std::process::exit(2);
 }

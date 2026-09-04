@@ -1,6 +1,7 @@
 //! Command handling and window/GPU bootstrap for Neon3's sole renderer owner.
 //! No other Neon3 crate may initialize window or GPU objects.
 
+use std::ops::Deref;
 use std::sync::{Arc, Mutex};
 
 use std::time::{Duration, Instant};
@@ -14,6 +15,16 @@ use std::{
 use std::{io::BufWriter, path::Path};
 
 use neon_ipc::{EventClient, RpcClient};
+#[cfg(target_os = "android")]
+use neon_ui_runtime::demo_domain::{
+    DemoInputDomain, apply_visible_status_to_fragment, component_gallery_initial_grid_frame,
+    component_gallery_program,
+};
+#[cfg(target_os = "android")]
+use neon_ui_runtime::{
+    UiInputStore, UiLocalPresentationState as UiFlowLocalPresentationState,
+    evaluate_ui_program, lower_nui_flow_effects,
+};
 use neon_observability::{
     CommandJournal, CommandReceipt, CommandState, DebugSnapshot, EVENT_COMMAND_ACCEPTED,
     EVENT_COMMAND_RECEIVED, EVENT_COMMAND_REJECTED, JournalFilter, TraceLevel, TraceRecord,
@@ -32,7 +43,9 @@ use neon_protocol::{
 use neon_ui_schema::UiFragmentSubmission;
 use neon_ui_schema::{
     TextRef, UiBounds, UiCommand, UiDataGridWindowRequest, UiFragment, UiFragmentId, UiHostInbound,
-    UiNode, UiNodeId, UiNodeKind, UiPointerEvent, UiPointerEventType, UiSemanticEvent,
+    UiNode, UiNodeId, UiNodeKind, UiPointerEvent, UiPointerEventType, UiProgramRevision,
+    UiSemanticEvent,
+    UiSemanticPayloadValue,
     UiSemanticEventType, UiStyle, UiTransition, UiTransitionState, UiWindowRequest,
 };
 use neon_world_bridge::{
@@ -55,6 +68,33 @@ use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 #[cfg(windows)]
 mod dx12_interop;
 mod gpu_preview;
+
+/// A GPU surface that can be shared across process boundaries.
+///
+/// The wgpu texture, size, and frame sequence are backend-agnostic and are
+/// used by every platform (DX12 on Windows, Vulkan/GLES on Android, etc.).
+/// The native interop handles (shared texture/fence) only exist on Windows,
+/// where an external host imports them for cross-process sampling; on other
+/// platforms the surface is an ordinary wgpu texture consumed through
+/// readback/capture (e.g. `render.surface.capture_png`).
+#[derive(Debug)]
+pub struct SharedSurface {
+    pub texture: wgpu::Texture,
+    pub width: u32,
+    pub height: u32,
+    pub frame_sequence: u64,
+    #[cfg(windows)]
+    pub interop: Option<dx12_interop::SharedSurfaceInterop>,
+}
+
+// `HANDLE` wraps a raw pointer and is therefore not auto-`Send`/`Sync`, but it
+// is just a process-scoped kernel handle value (safe to move between threads in
+// the same process). The owning `HeadlessExternalGpu` serializes access through
+// a `Mutex`, so this is sound.
+unsafe impl Send for SharedSurface {}
+unsafe impl Sync for SharedSurface {}
+#[cfg(target_os = "android")]
+mod android_entry;
 mod ui_program_gpu;
 mod ui_renderer;
 mod world_ui_pipeline;
@@ -95,6 +135,10 @@ const WORLD_UI_LAB_LOGICAL_SIZE: [u32; 2] = [640, 360];
 const WORLD_UI_LAB_PANEL_SIZE: [u32; 2] = [1280, 720];
 const WORLD_UI_LAB_PREVIEW_SIZE: [u32; 2] = [640, 360];
 const HEADLESS_UI_LOGICAL_SIZE: [f32; 2] = [1280.0, 720.0];
+/// Android component-gallery presentation scale. The fixture contains a
+/// 2048-wide desktop composition and 1214px of vertical content; this keeps
+/// the complete landscape presentation inside a 2340x1080 phone surface.
+const ANDROID_GALLERY_UI_SCALE: f64 = 0.88;
 /// Explorer normally runs at medium integrity, so Windows blocks its drop
 /// messages to an elevated renderer window. Keep this exception inside the
 /// sole window owner and allow only the documented file-drop messages.
@@ -1004,6 +1048,10 @@ pub struct WindowedRuntime {
     eventd_endpoint: Option<SocketAddr>,
     next_file_drop_sequence: u64,
     world_ui_lab_camera: Arc<Mutex<WorldUiLabCameraController>>,
+    /// When true the runtime does not create a window or GPU surface on
+    /// `resumed`; an SDK opens the surface explicitly via
+    /// `android.host.open_surface` / `wgpu.ui.render_surface.open`.
+    lazy_surface: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1086,6 +1134,7 @@ enum WindowCommand {
         pending: Option<PendingLocalPresentationKey>,
         outcome: SemanticDeliveryOutcome,
     },
+    ApplyHostPublication(neon_ui_schema::UiHostPublication),
     DataGridWindowDeliveryCompleted {
         sequence: u64,
         accepted: bool,
@@ -1111,6 +1160,11 @@ enum WindowCommand {
         event: UiPointerEvent,
         completed: std::sync::mpsc::Sender<Result<Value, String>>,
     },
+    /// Open the Android window/surface on demand. Used by the protocol-driven
+    /// host; everything else stays headless until this is received.
+    OpenAndroidSurface {
+        completed: std::sync::mpsc::Sender<Result<Value, String>>,
+    },
     Shutdown,
 }
 
@@ -1123,9 +1177,9 @@ struct WindowGpu {
     #[cfg(windows)]
     dx12_adapter: dx12_interop::AdapterInfo,
     #[cfg(windows)]
-    external_surfaces: HashMap<String, dx12_interop::SharedSurface>,
+    external_surfaces: HashMap<String, SharedSurface>,
     #[cfg(windows)]
-    external_id_surfaces: HashMap<String, dx12_interop::SharedSurface>,
+    external_id_surfaces: HashMap<String, SharedSurface>,
     #[cfg(windows)]
     external_handle_tokens: HashMap<String, (String, String)>,
     config: wgpu::SurfaceConfiguration,
@@ -1363,11 +1417,101 @@ impl WindowedRuntime {
             eventd_endpoint: None,
             next_file_drop_sequence: 0,
             world_ui_lab_camera: Arc::new(Mutex::new(WorldUiLabCameraController::default())),
+            lazy_surface: false,
         }
     }
 
     pub fn run(epoch: u64) -> Result<(), String> {
         Self::run_with_server(epoch, None, None, None, None, true, false)
+    }
+
+    /// Generic Android host entry. It owns the Android surface and renderer
+    /// loop but does not select a UI fixture or domain. SDKs submit fragments
+    /// and semantic commands through the public protocol after startup.
+    #[cfg(target_os = "android")]
+    pub fn run_android_host(app: winit::platform::android::activity::AndroidApp) -> Result<(), String> {
+        use winit::platform::android::EventLoopBuilderExtAndroid;
+
+        let mut builder = EventLoop::<WindowCommand>::with_user_event();
+        builder.with_android_app(app);
+        let event_loop = builder
+            .build()
+            .map_err(|error| format!("create Android event loop: {error}"))?;
+        let mut runtime = Self::new(1);
+        runtime.lazy_surface = true;
+        runtime.event_proxy = Some(event_loop.create_proxy());
+        let endpoint: SocketAddr = "127.0.0.1:43100"
+            .parse()
+            .expect("Android host endpoint is valid");
+        eprintln!(
+            "{{\"probe\":\"android-host\",\"lifecycle\":\"protocol_ready\",\"epoch\":1,\"endpoint\":\"{}\",\"ui_fixture\":\"none\"}}",
+            endpoint
+        );
+        runtime.ui_endpoint = Some(endpoint);
+        spawn_window_server(
+            1,
+            endpoint,
+            event_loop.create_proxy(),
+            runtime.interaction_traces.clone(),
+            runtime.world_ui_lab_camera.clone(),
+        );
+        runtime.applied_composition_revision = Revision(0);
+        runtime.redraw_pending = true;
+        event_loop
+            .run_app(&mut runtime)
+            .map_err(|error| format!("run Android host event loop: {error}"))?;
+        runtime.exit_error.map_or(Ok(()), Err)
+    }
+
+    #[cfg(target_os = "android")]
+    pub fn run_android_component_gallery(
+        app: winit::platform::android::activity::AndroidApp,
+    ) -> Result<(), String> {
+        use winit::platform::android::EventLoopBuilderExtAndroid;
+
+        // Keep the existing component-gallery domain as the authoritative
+        // input/event owner. Android only hosts the renderer and transports
+        // semantic intents over the same loopback neon3.rpc contract.
+        let ui_endpoint: SocketAddr = "127.0.0.1:43102"
+            .parse()
+            .expect("Android gallery UI endpoint is valid");
+        std::thread::spawn(move || {
+            let image_asset = AssetRef {
+                project_id: "android-demo".into(),
+                asset_id: 1,
+                revision: Revision(1),
+                kind: "image".into(),
+            };
+            eprintln!(
+                "{{\"probe\":\"android-component-gallery-domain\",\"endpoint\":\"{}\",\"state\":\"binding\"}}",
+                ui_endpoint
+            );
+            if let Err(error) = neon_ui_runtime::demo_domain::DemoInputDomain::serve_component_gallery(
+                ui_endpoint,
+                image_asset,
+            ) {
+                eprintln!(
+                    "{{\"probe\":\"android-component-gallery-domain\",\"pass_result\":false,\"error\":{:?}}}",
+                    error
+                );
+            }
+        });
+
+        let mut builder = EventLoop::<WindowCommand>::with_user_event();
+        builder.with_android_app(app);
+        let event_loop = builder
+            .build()
+            .map_err(|error| format!("create Android event loop: {error}"))?;
+        let mut runtime = Self::new(1);
+        runtime.event_proxy = Some(event_loop.create_proxy());
+        runtime.ui_endpoint = Some(ui_endpoint);
+        runtime.fragments = android_component_gallery_fragment()?;
+        runtime.applied_composition_revision = Revision(1);
+        runtime.redraw_pending = true;
+        event_loop
+            .run_app(&mut runtime)
+            .map_err(|error| format!("run Android event loop: {error}"))?;
+        runtime.exit_error.map_or(Ok(()), Err)
     }
 
     pub fn run_server(
@@ -1461,11 +1605,11 @@ impl WindowedRuntime {
         if let Err(error) = enable_explorer_file_drop(&window) {
             eprintln!("[neon-wgpu-runtime] Explorer file-drop enablement failed: {error}");
         }
-        // External host interop (DX12 shared texture/fence) requires the DX12
-        // backend; forcing it avoids wgpu silently selecting Vulkan/GL and then
-        // failing `as_hal::<Dx12>()` at surface creation.
+        // Select a backend appropriate for the target. External host interop is
+        // negotiated separately and must not force the renderer's normal
+        // window backend to DX12.
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::DX12,
+            backends: platform_backends(),
             ..wgpu::InstanceDescriptor::new_with_display_handle(Box::new(
                 event_loop.owned_display_handle(),
             ))
@@ -2549,7 +2693,165 @@ impl WindowedRuntime {
     }
 }
 
-#[cfg(windows)]
+fn platform_backends() -> wgpu::Backends {
+    if let Ok(value) = std::env::var("NEON_WGPU_BACKENDS") {
+        let mut backends = wgpu::Backends::empty();
+        for backend in value.split(',').map(str::trim) {
+            backends |= match backend {
+                "dx12" => wgpu::Backends::DX12,
+                "vulkan" => wgpu::Backends::VULKAN,
+                "metal" => wgpu::Backends::METAL,
+                "gl" => wgpu::Backends::GL,
+                "gles" => wgpu::Backends::GL,
+                _ => wgpu::Backends::empty(),
+            };
+        }
+        if !backends.is_empty() {
+            return backends;
+        }
+    }
+    wgpu::Backends::all()
+}
+
+#[cfg(target_os = "android")]
+fn android_component_gallery_fragment() -> Result<HashMap<UiFragmentId, UiFragment>, String> {
+    let image_asset = AssetRef {
+        project_id: "android-demo".into(),
+        asset_id: 1,
+        revision: Revision(1),
+        kind: "image".into(),
+    };
+    let (document, program) = component_gallery_program(image_asset)
+        .map_err(|error| format!("compile component gallery Flow: {error}"))?;
+    let domain = DemoInputDomain::new(program.clone(), document.input_schema.clone())
+        .map_err(|error| format!("activate component gallery inputs: {}", error.message))?;
+    let effects = lower_nui_flow_effects(&document);
+    let inputs = UiInputStore::activate(program.revision.clone(), document.input_schema.clone())
+        .map_err(|error| format!("activate component gallery viewport inputs: {error:?}"))?;
+    let evaluated = evaluate_ui_program(
+        &program,
+        &inputs.snapshot(),
+        neon_ui_schema::UiCpuViewport {
+            logical_bounds: UiBounds {
+                x: 0.0,
+                y: 0.0,
+                width: 2340.0 / ANDROID_GALLERY_UI_SCALE as f32,
+                height: 1080.0 / ANDROID_GALLERY_UI_SCALE as f32,
+            },
+            revision: Revision(1),
+        },
+        &UiFlowLocalPresentationState::default(),
+    );
+    let visibility = evaluated
+        .nodes
+        .into_iter()
+        .map(|node| (node.node_key, node.visible))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut root = document.ir.root.clone();
+    apply_android_visibility(&mut root, &visibility);
+    tune_android_gallery_layout(&mut root);
+    // Flow IR keeps root bounds unresolved until a host supplies a viewport.
+    // Android uses an explicit landscape-fullscreen presentation parameter;
+    // seed the root with that viewport so all three gallery columns participate
+    // in layout instead of clipping after the first column.
+    root.bounds = UiBounds {
+        x: 0.0,
+        y: 0.0,
+        width: 2340.0 / ANDROID_GALLERY_UI_SCALE as f32,
+        height: 1080.0 / ANDROID_GALLERY_UI_SCALE as f32,
+    };
+    let fragment = UiFragment {
+        fragment_id: UiFragmentId("android-component-gallery".into()),
+        revision: Revision(1),
+        root,
+        effects,
+    };
+    let mut fragment = fragment;
+    apply_visible_status_to_fragment(&mut fragment, &domain.snapshot());
+    if let Some(record) = program
+        .data_grid_records
+        .iter()
+        .find(|record| record.source_key == "asset_window")
+        .cloned()
+        && let Some(frame) = component_gallery_initial_grid_frame(&program)
+    {
+        let node_key = record.node_key.clone();
+        fragment.effects.push(neon_ui_schema::UiEffect::DataGridFrame {
+            declaration: neon_ui_schema::UiDataGridDeclaration {
+                node_key,
+                source_key: record.source_key,
+                max_window_rows: record.max_window_rows,
+                row_height: record.row_height,
+                overscan: record.overscan,
+                columns: record.columns,
+            },
+            frame,
+        });
+        eprintln!(
+            "{{\"probe\":\"android-component-gallery-grid\",\"node_key\":\"{}\",\"rows\":{},\"state\":\"initial_frame_attached\"}}",
+            record.node_key,
+            record.max_window_rows
+        );
+    }
+    eprintln!(
+        "{{\"probe\":\"android-component-gallery-layout\",\"root\":{{\"width\":{},\"height\":{},\"children\":{}}}}}",
+        fragment.root.bounds.width,
+        fragment.root.bounds.height,
+        fragment.root.children.len()
+    );
+    fragment
+        .validate()
+        .map_err(|error| format!("validate component gallery fragment: {error:?}"))?;
+    Ok(HashMap::from([(fragment.fragment_id.clone(), fragment)]))
+}
+
+#[cfg(target_os = "android")]
+fn apply_android_visibility(
+    node: &mut UiNode,
+    visibility: &std::collections::BTreeMap<String, bool>,
+) {
+    node.visible &= visibility.get(&node.node_id.0).copied().unwrap_or(false);
+    for child in &mut node.children {
+        apply_android_visibility(child, visibility);
+    }
+}
+
+#[cfg(target_os = "android")]
+fn tune_android_gallery_layout(node: &mut UiNode) {
+    if node.node_id.0.ends_with("surface.component-gallery") {
+        if let Some(layout) = node.layout.as_mut() {
+            layout.min_size = None;
+            layout.preferred_size = None;
+            layout.max_size = None;
+            layout.flex_grow = 1.0;
+            layout.flex_shrink = 1.0;
+            // The Android host owns the complete landscape viewport. The
+            // desktop fixture's root scroll policy would create a second
+            // virtual canvas and expose only its first column.
+            layout.clip = neon_ui_schema::UiClipPolicy::Bounds;
+            layout.scroll_offset = [0.0, 0.0];
+        }
+    }
+    if node.node_id.0.ends_with("gallery-layout") {
+        if let Some(layout) = node.layout.as_mut() {
+            layout.min_size = None;
+            layout.preferred_size = None;
+            layout.max_size = None;
+            layout.flex_grow = 1.0;
+            layout.flex_shrink = 1.0;
+        }
+        node.bounds = UiBounds {
+            x: 0.0,
+            y: 0.0,
+            width: 2340.0 / ANDROID_GALLERY_UI_SCALE as f32,
+            height: 1080.0 / ANDROID_GALLERY_UI_SCALE as f32,
+        };
+    }
+    for child in &mut node.children {
+        tune_android_gallery_layout(child);
+    }
+}
+
 #[derive(Default, Clone)]
 struct ExternalFrameTiming {
     frame_sequence: u64,
@@ -2572,7 +2874,6 @@ struct ExternalFrameTiming {
 /// frames the headless render loop emits a single structured `ui_perf_window`
 /// JSONL line with these counters. This replaces the earlier human-readable
 /// `eprintln!` summary so automated probes can consume the data.
-#[cfg(windows)]
 #[derive(Default, Clone, Debug)]
 struct UiPerfCounters {
     /// Total frames attempted (including skipped and dropped).
@@ -2609,7 +2910,13 @@ struct UiPerfCounters {
     transition_ends: u64,
 }
 
-#[cfg(windows)]
+/// Headless (windowless) GPU surface exporter.
+///
+/// Owns the only wgpu device besides the windowed runtime and renders UI
+/// fragments into cross-process shared textures. On Windows surfaces are
+/// DX12 shared textures with importable handles; on other platforms
+/// (e.g. Android) they are ordinary wgpu textures consumed through
+/// readback/capture (`render.surface.capture_png`).
 struct HeadlessExternalGpu {
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -2623,9 +2930,9 @@ struct HeadlessExternalGpu {
     captured_binding: Option<UiHitBinding>,
     pending_control_value: Option<neon_ui_schema::UiSemanticPayloadValue>,
     next_semantic_sequence: u64,
-    external_surfaces: HashMap<String, Vec<dx12_interop::SharedSurface>>,
-    external_id_surfaces: HashMap<String, Vec<dx12_interop::SharedSurface>>,
-    external_depth_surfaces: HashMap<String, Vec<dx12_interop::SharedSurface>>,
+    external_surfaces: HashMap<String, Vec<SharedSurface>>,
+    external_id_surfaces: HashMap<String, Vec<SharedSurface>>,
+    external_depth_surfaces: HashMap<String, Vec<SharedSurface>>,
     surface_kinds: HashMap<String, RenderSurfaceKind>,
     color_depth_targets: HashMap<String, Vec<wgpu::Texture>>,
     external_handle_tokens: HashMap<String, (String, String)>,
@@ -2635,6 +2942,7 @@ struct HeadlessExternalGpu {
     last_rendered_all_surfaces: bool,
     frame_timings: VecDeque<ExternalFrameTiming>,
     started_at: Instant,
+    /// Server epoch for capture artifact naming (matches the runtime epoch).
     perf: UiPerfCounters,
     /// Frame sequence of the latest completed persistent unified ID texture.
     /// The render loop owns the ID pass; pointer events only read a pixel from
@@ -2648,6 +2956,7 @@ struct HeadlessExternalGpu {
     /// False until the render loop has produced at least one completed ID
     /// frame into `pointer_hit_target`.
     id_frame_ready: bool,
+    epoch: u64,
     /// External image ids already preloaded into the renderer-owned atlases.
     /// The upload RPC records residency metadata in `WgpuRuntime`; this set
     /// tracks which of those have actually been placed into the GPU atlas so
@@ -2655,11 +2964,23 @@ struct HeadlessExternalGpu {
     preloaded_external_images: HashSet<String>,
 }
 
-#[cfg(windows)]
 impl HeadlessExternalGpu {
     fn new() -> Result<Self, String> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            // The headless external exporter must produce a DX12 adapter on
+            // Windows so `dx12_interop` can create shared textures/fences.
+            // Other platforms (Android etc.) use the platform backends and
+            // export ordinary wgpu textures instead.
+            #[cfg(windows)]
             backends: wgpu::Backends::DX12,
+            #[cfg(not(windows))]
+            backends: platform_backends(),
+            // Keep the instance flags minimal: debug builds default to
+            // `InstanceFlags::DEBUG`, which makes the Vulkan backend enable
+            // VK_EXT_debug_utils. SwiftShader's ranchu driver crashes inside
+            // SetDebugUtilsObjectNameEXT, so the headless server must not
+            // request debug-utils (validation is irrelevant for this host).
+            flags: wgpu::InstanceFlags::VALIDATION_INDIRECT_CALL,
             ..wgpu::InstanceDescriptor::new_without_display_handle()
         });
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
@@ -2726,6 +3047,7 @@ impl HeadlessExternalGpu {
             id_frame_sequence: 0,
             id_frame_bindings: std::collections::HashMap::new(),
             id_frame_ready: false,
+            epoch: 1,
             preloaded_external_images: HashSet::new(),
         })
     }
@@ -2975,6 +3297,43 @@ impl HeadlessExternalGpu {
         }
     }
 
+    /// Creates one shared-surface slot for the given format.
+    ///
+    /// Windows surfaces are DX12 shared textures with importable handles.
+    /// Other platforms create an ordinary wgpu texture (rendered offscreen
+    /// and consumed through readback/capture), keeping the same protocol.
+    #[cfg(windows)]
+    fn create_surface_slot(&self, width: u32, height: u32, format: wgpu::TextureFormat) -> Result<SharedSurface, String> {
+        dx12_interop::create_shared_surface(&self.device, &self.adapter, width, height, format)
+            .map_err(|error| error.to_string())
+    }
+
+    #[cfg(not(windows))]
+    fn create_surface_slot(&self, width: u32, height: u32, format: wgpu::TextureFormat) -> Result<SharedSurface, String> {
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("neon3-headless-external-surface"),
+            size: wgpu::Extent3d {
+                width: width.max(1),
+                height: height.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        Ok(SharedSurface {
+            texture,
+            width: width.max(1),
+            height: height.max(1),
+            frame_sequence: 0,
+        })
+    }
+
     fn open(&mut self, open: RenderSurfaceOpen) -> Result<Value, String> {
         if open.format != "rgba8unorm" || !(2..=3).contains(&open.buffer_count) {
             return Err("headless_external_surface_format_or_buffer_unsupported".into());
@@ -2985,14 +3344,11 @@ impl HeadlessExternalGpu {
         let mut surfaces = Vec::with_capacity(open.buffer_count as usize);
         for _ in 0..open.buffer_count {
             surfaces.push(
-                dx12_interop::create_shared_surface(
-                    &self.device,
-                    &self.adapter,
+                self.create_surface_slot(
                     open.size.width.max(1),
                     open.size.height.max(1),
                     wgpu::TextureFormat::Rgba8Unorm,
-                )
-                .map_err(|error| error.to_string())?,
+                )?,
             );
         }
         self.external_surfaces
@@ -3021,14 +3377,11 @@ impl HeadlessExternalGpu {
             let mut id_surfaces = Vec::with_capacity(open.buffer_count as usize);
             for _ in 0..open.buffer_count {
                 id_surfaces.push(
-                    dx12_interop::create_shared_surface(
-                        &self.device,
-                        &self.adapter,
+                    self.create_surface_slot(
                         open.size.width.max(1),
                         open.size.height.max(1),
                         wgpu::TextureFormat::R32Uint,
-                    )
-                    .map_err(|error| error.to_string())?,
+                    )?,
                 );
             }
             self.external_id_surfaces
@@ -3038,14 +3391,11 @@ impl HeadlessExternalGpu {
             let mut depth_surfaces = Vec::with_capacity(open.buffer_count as usize);
             for _ in 0..open.buffer_count {
                 depth_surfaces.push(
-                    dx12_interop::create_shared_surface(
-                        &self.device,
-                        &self.adapter,
+                    self.create_surface_slot(
                         open.size.width.max(1),
                         open.size.height.max(1),
                         wgpu::TextureFormat::R32Float,
-                    )
-                    .map_err(|error| error.to_string())?,
+                    )?,
                 );
             }
             self.external_depth_surfaces
@@ -3062,6 +3412,76 @@ impl HeadlessExternalGpu {
         }))
     }
 
+    #[cfg(windows)]
+    fn acquire_buffer_handles(
+        &self,
+        surface_id: &str,
+        index: usize,
+        shared: &SharedSurface,
+        pid: u32,
+    ) -> Result<serde_json::Value, String> {
+        let interop = shared
+            .interop
+            .as_ref()
+            .ok_or("shared_surface_interop_missing")?;
+        let mut buffer = json!({
+            "buffer_index": index,
+            "color_texture_handle": dx12_interop::duplicate_handle_to_process(interop.texture_handle, pid).map_err(|error| error.to_string())?,
+            "color_fence_handle": dx12_interop::duplicate_handle_to_process(interop.fence_handle, pid).map_err(|error| error.to_string())?,
+            "consumer_release_fence_handle": dx12_interop::duplicate_handle_to_process(interop.consumer_fence_handle, pid).map_err(|error| error.to_string())?
+        });
+        if let Some(id_surfaces) = self.external_id_surfaces.get(surface_id)
+            && let Some(id_surface) = id_surfaces.get(index)
+            && let Some(id_interop) = id_surface.interop.as_ref()
+        {
+            buffer["id_texture_handle"] = json!(dx12_interop::duplicate_handle_to_process(id_interop.texture_handle, pid).map_err(|error| error.to_string())?);
+            buffer["id_fence_handle"] = json!(dx12_interop::duplicate_handle_to_process(id_interop.fence_handle, pid).map_err(|error| error.to_string())?);
+            buffer["id_consumer_release_fence_handle"] = json!(dx12_interop::duplicate_handle_to_process(id_interop.consumer_fence_handle, pid).map_err(|error| error.to_string())?);
+        }
+        if let Some(depth_surfaces) = self.external_depth_surfaces.get(surface_id)
+            && let Some(depth_surface) = depth_surfaces.get(index)
+            && let Some(depth_interop) = depth_surface.interop.as_ref()
+        {
+            buffer["depth_texture_handle"] = json!(dx12_interop::duplicate_handle_to_process(depth_interop.texture_handle, pid).map_err(|error| error.to_string())?);
+            buffer["depth_fence_handle"] = json!(dx12_interop::duplicate_handle_to_process(depth_interop.fence_handle, pid).map_err(|error| error.to_string())?);
+            buffer["depth_consumer_release_fence_handle"] = json!(dx12_interop::duplicate_handle_to_process(depth_interop.consumer_fence_handle, pid).map_err(|error| error.to_string())?);
+        }
+        Ok(buffer)
+    }
+
+    /// Non-Windows surfaces have no importable native handles; buffers carry
+    /// tokens only and are consumed through `render.surface.capture_png`.
+    #[cfg(not(windows))]
+    fn acquire_buffer_handles(
+        &self,
+        surface_id: &str,
+        index: usize,
+        _shared: &SharedSurface,
+        _pid: u32,
+    ) -> Result<serde_json::Value, String> {
+        let mut buffer = json!({
+            "buffer_index": index,
+            "color_texture_handle": serde_json::Value::Null,
+            "color_fence_handle": serde_json::Value::Null,
+            "consumer_release_fence_handle": serde_json::Value::Null
+        });
+        if let Some(id_surfaces) = self.external_id_surfaces.get(surface_id)
+            && id_surfaces.get(index).is_some()
+        {
+            buffer["id_texture_handle"] = serde_json::Value::Null;
+            buffer["id_fence_handle"] = serde_json::Value::Null;
+            buffer["id_consumer_release_fence_handle"] = serde_json::Value::Null;
+        }
+        if let Some(depth_surfaces) = self.external_depth_surfaces.get(surface_id)
+            && depth_surfaces.get(index).is_some()
+        {
+            buffer["depth_texture_handle"] = serde_json::Value::Null;
+            buffer["depth_fence_handle"] = serde_json::Value::Null;
+            buffer["depth_consumer_release_fence_handle"] = serde_json::Value::Null;
+        }
+        Ok(buffer)
+    }
+
     fn acquire(&self, surface_id: &str, pid: u32) -> Result<Value, String> {
         let shared = self
             .external_surfaces
@@ -3074,29 +3494,7 @@ impl HeadlessExternalGpu {
         let buffers = shared
             .iter()
             .enumerate()
-            .map(|(index, shared)| {
-                let mut buffer = json!({
-                    "buffer_index": index,
-                    "color_texture_handle": dx12_interop::duplicate_handle_to_process(shared.texture_handle, pid).map_err(|error| error.to_string())?,
-                    "color_fence_handle": dx12_interop::duplicate_handle_to_process(shared.fence_handle, pid).map_err(|error| error.to_string())?,
-                    "consumer_release_fence_handle": dx12_interop::duplicate_handle_to_process(shared.consumer_fence_handle, pid).map_err(|error| error.to_string())?
-                });
-                if let Some(id_surfaces) = self.external_id_surfaces.get(surface_id)
-                    && let Some(id_surface) = id_surfaces.get(index)
-                {
-                    buffer["id_texture_handle"] = json!(dx12_interop::duplicate_handle_to_process(id_surface.texture_handle, pid).map_err(|error| error.to_string())?);
-                    buffer["id_fence_handle"] = json!(dx12_interop::duplicate_handle_to_process(id_surface.fence_handle, pid).map_err(|error| error.to_string())?);
-                    buffer["id_consumer_release_fence_handle"] = json!(dx12_interop::duplicate_handle_to_process(id_surface.consumer_fence_handle, pid).map_err(|error| error.to_string())?);
-                }
-                if let Some(depth_surfaces) = self.external_depth_surfaces.get(surface_id)
-                    && let Some(depth_surface) = depth_surfaces.get(index)
-                {
-                    buffer["depth_texture_handle"] = json!(dx12_interop::duplicate_handle_to_process(depth_surface.texture_handle, pid).map_err(|error| error.to_string())?);
-                    buffer["depth_fence_handle"] = json!(dx12_interop::duplicate_handle_to_process(depth_surface.fence_handle, pid).map_err(|error| error.to_string())?);
-                    buffer["depth_consumer_release_fence_handle"] = json!(dx12_interop::duplicate_handle_to_process(depth_surface.consumer_fence_handle, pid).map_err(|error| error.to_string())?);
-                }
-                Ok(buffer)
-            })
+            .map(|(index, shared)| self.acquire_buffer_handles(surface_id, index, shared, pid))
             .collect::<Result<Vec<_>, String>>()?;
         let mut result = json!({
             "surface_id": surface_id,
@@ -3168,6 +3566,77 @@ impl HeadlessExternalGpu {
             }
         }
     }
+
+    /// Picks the next ring slot to render into.
+    ///
+    /// Windows consumers signal per-buffer release fences; a slot is reusable
+    /// once its color/depth/id fences have completed. Non-Windows hosts have
+    /// no importable fences, so the ring rotates with a process-local atomic
+    /// cursor (the surface is consumed via readback/capture instead).
+    #[cfg(windows)]
+    fn ring_write_index(&self) -> Option<usize> {
+        self.external_surfaces.values().next().and_then(|ring| {
+            ring.iter().enumerate().find_map(|(index, _shared)| {
+                let color_free = self.external_surfaces.values().all(|ring| {
+                    ring.get(index).is_some_and(|color| unsafe {
+                        color
+                            .interop
+                            .as_ref()
+                            .map(|interop| interop.consumer_fence.GetCompletedValue())
+                            .unwrap_or_default()
+                            >= color.frame_sequence
+                    })
+                });
+                let depth_free = self.external_depth_surfaces.values().all(|ring| {
+                    ring.get(index).is_none_or(|depth| unsafe {
+                        depth
+                            .interop
+                            .as_ref()
+                            .map(|interop| interop.consumer_fence.GetCompletedValue())
+                            .unwrap_or_default()
+                            >= depth.frame_sequence
+                    })
+                });
+                let id_free = self.external_id_surfaces.values().all(|ring| {
+                    ring.get(index).is_none_or(|id| unsafe {
+                        id.interop
+                            .as_ref()
+                            .map(|interop| interop.consumer_fence.GetCompletedValue())
+                            .unwrap_or_default()
+                            >= id.frame_sequence
+                    })
+                });
+                (color_free && depth_free && id_free).then_some(index)
+            })
+        })
+    }
+
+    #[cfg(not(windows))]
+    fn ring_write_index(&self) -> Option<usize> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static RING_CURSOR: AtomicUsize = AtomicUsize::new(0);
+        let count = self.external_surfaces.values().next()?.len();
+        if count == 0 {
+            return None;
+        }
+        Some(RING_CURSOR.fetch_add(1, Ordering::Relaxed) % count)
+    }
+
+    /// Signals that a completed frame is ready for the consumer.
+    #[cfg(windows)]
+    fn signal_frame(
+        hal_queue: &<wgpu::hal::api::Dx12 as wgpu::hal::Api>::Queue,
+        surface: &SharedSurface,
+        frame_sequence: u64,
+    ) {
+        let Some(interop) = surface.interop.as_ref() else {
+            return;
+        };
+        unsafe { hal_queue.add_signal_fence(interop.fence.clone(), frame_sequence) };
+    }
+
+    #[cfg(not(windows))]
+    fn signal_frame(_hal_queue: &wgpu::Queue, _surface: &SharedSurface, _frame_sequence: u64) {}
 
     fn render(
         &mut self,
@@ -3253,31 +3722,7 @@ impl HeadlessExternalGpu {
         // A combined Flow is published as one atomic frame. Every external
         // target must use the same ring slot, otherwise screen and world UI can
         // visibly come from different camera/layout revisions.
-        let write_index = self.external_surfaces.values().next().and_then(|ring| {
-            ring.iter().enumerate().find_map(|(index, _shared)| {
-                let color_free = self.external_surfaces.values().all(|ring| {
-                    ring.get(index).is_some_and(|color| unsafe {
-                        color.consumer_fence.GetCompletedValue() >= color.frame_sequence
-                    })
-                });
-                // A ring slot is one published frame: the matching color,
-                // occlusion depth, and hit-ID textures must all be released
-                // before any of them can be overwritten. Reusing a slot after
-                // only its color fence completes races the host's depth sample
-                // and makes scene occlusion compare different frame revisions.
-                let depth_free = self.external_depth_surfaces.values().all(|ring| {
-                    ring.get(index).is_none_or(|depth| unsafe {
-                        depth.consumer_fence.GetCompletedValue() >= depth.frame_sequence
-                    })
-                });
-                let id_free = self.external_id_surfaces.values().all(|ring| {
-                    ring.get(index).is_none_or(|id| unsafe {
-                        id.consumer_fence.GetCompletedValue() >= id.frame_sequence
-                    })
-                });
-                (color_free && depth_free && id_free).then_some(index)
-            })
-        });
+        let write_index = self.ring_write_index();
         let Some(write_index) = write_index else {
             timing.dropped = true;
             self.push_frame_timing(timing);
@@ -3302,8 +3747,11 @@ impl HeadlessExternalGpu {
                 continue;
             }
             let shared = &mut shared_ring[write_index];
+            #[cfg(windows)]
             let hal_queue = unsafe { self.queue.as_hal::<wgpu::hal::api::Dx12>() }
                 .ok_or("dx12_queue_unavailable")?;
+            #[cfg(not(windows))]
+            let hal_queue: &wgpu::Queue = &self.queue;
             let view = shared
                 .texture
                 .create_view(&wgpu::TextureViewDescriptor::default());
@@ -3416,7 +3864,7 @@ impl HeadlessExternalGpu {
                 timing.external_depth_pass_ms += stage.elapsed().as_secs_f32() * 1000.0;
                 drop(depth_pass);
                 depth_shared.frame_sequence = frame_sequence;
-                hal_queue.add_signal_fence(depth_shared.fence.clone(), frame_sequence);
+                Self::signal_frame(hal_queue.deref(), depth_shared, frame_sequence);
             }
             // Pick-ID pass: emit the same resolved hit bindings into the matched
             // R32Uint ring buffer so the consumer can read a single pixel to
@@ -3465,10 +3913,10 @@ impl HeadlessExternalGpu {
                 self.perf.unified_id_instances =
                     (self.ui.hit_binding_count() as u64).max(self.perf.unified_id_instances);
                 id_shared.frame_sequence = frame_sequence;
-                hal_queue.add_signal_fence(id_shared.fence.clone(), frame_sequence);
+                Self::signal_frame(hal_queue.deref(), id_shared, frame_sequence);
             }
             shared.frame_sequence = frame_sequence;
-            hal_queue.add_signal_fence(shared.fence.clone(), shared.frame_sequence);
+            Self::signal_frame(hal_queue.deref(), shared, shared.frame_sequence);
         }
         // Persistent unified ID frame: re-emit the same unified ID pass into the
         // process-local pointer texture so pointer-down events can read a single
@@ -3822,6 +4270,216 @@ impl HeadlessExternalGpu {
         }))
     }
 
+    /// Exports the latest completed frame of a shared external surface to a
+    /// PNG file. Mirrors the external D3D12 shared texture into a wgpu
+    /// texture, readbacks the full RGBA content into CPU memory, and writes a
+    /// PNG artifact. Used by the SDK's `ExternalSurface.savePng` test API;
+    /// never exposes native handles over the protocol.
+    fn capture_surface_png(
+        &mut self,
+        surface_id: &str,
+        artifact_path: Option<std::path::PathBuf>,
+    ) -> Result<Value, String> {
+        let ring = self
+            .external_surfaces
+            .get(surface_id)
+            .ok_or_else(|| "surface_not_found".to_owned())?;
+        let (buffer_index, shared) = ring
+            .iter()
+            .enumerate()
+            .filter(|(_, shared)| shared.frame_sequence != 0)
+            .max_by_key(|(_, shared)| shared.frame_sequence)
+            .ok_or_else(|| "surface_has_no_completed_frame".to_owned())?;
+        let frame_sequence = shared.frame_sequence;
+        let width = shared.width;
+        let height = shared.height;
+        if width == 0 || height == 0 {
+            return Err("surface_has_empty_extent".into());
+        }
+        let padded_bytes_per_row = ((u64::from(width) * 4 + 255) & !255) as usize;
+        let mirror = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("neon3-external-color-capture-mirror"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let mirror_view = mirror.create_view(&wgpu::TextureViewDescriptor::default());
+        let source_view = shared
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let source_layout = self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("neon3-external-color-capture-layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    multisampled: false,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                },
+                count: None,
+            }],
+        });
+        let shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("neon3-external-color-capture-shader"),
+            source: wgpu::ShaderSource::Wgsl(
+                r#"
+                @group(0) @binding(0) var source: texture_2d<f32>;
+                @vertex fn vs(@builtin(vertex_index) index: u32) -> @builtin(position) vec4<f32> {
+                    var positions = array<vec2<f32>, 3>(
+                        vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0)
+                    );
+                    return vec4<f32>(positions[index], 0.0, 1.0);
+                }
+                @fragment fn fs(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
+                    return textureLoad(source, vec2<i32>(position.xy), 0);
+                }
+            "#
+            .into(),
+            ),
+        });
+        let pipeline_layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("neon3-external-color-capture-pipeline-layout"),
+            bind_group_layouts: &[Some(&source_layout)],
+            immediate_size: 0,
+        });
+        let pipeline = self.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("neon3-external-color-capture-pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("neon3-external-color-capture-bind-group"),
+            layout: &source_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&source_view),
+            }],
+        });
+        let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("neon3-external-color-capture-readback"),
+            size: (padded_bytes_per_row * height as usize) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("neon3-external-color-capture-encoder"),
+        });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("neon3-external-color-capture-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &mirror_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &mirror,
+                mip_level: 0,
+                origin: wgpu::Origin3d { x: 0, y: 0, z: 0 },
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded_bytes_per_row as u32),
+                    rows_per_image: Some(height),
+                },
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.queue.submit(Some(encoder.finish()));
+        let (mapped_tx, mapped_rx) = std::sync::mpsc::channel();
+        readback.slice(..).map_async(wgpu::MapMode::Read, move |result| {
+            let _ = mapped_tx.send(result);
+        });
+        self.device
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: None,
+            })
+            .map_err(|error| format!("wait for external color capture: {error}"))?;
+        mapped_rx
+            .recv_timeout(Duration::from_secs(5))
+            .map_err(|_| "external color capture mapping timed out".to_owned())?
+            .map_err(|error| format!("map external color capture: {error}"))?;
+        let mapped = readback
+            .slice(..)
+            .get_mapped_range()
+            .map_err(|error| format!("read external color capture: {error}"))?;
+        let mut rgba = Vec::with_capacity((width as usize) * (height as usize) * 4);
+        for row in 0..height as usize {
+            let start = row * padded_bytes_per_row;
+            rgba.extend_from_slice(&mapped[start..start + (width as usize) * 4]);
+        }
+        drop(mapped);
+        readback.unmap();
+        let artifact_path = match artifact_path {
+            Some(path) => path,
+            None => default_capture_path(self.epoch, frame_sequence, Revision(frame_sequence as u64))?,
+        };
+        let artifact_path = write_capture_png(&artifact_path, [width, height], &rgba)?;
+        Ok(json!({
+            "target": format!("surface:{surface_id}"),
+            "source": "external_shared_surface",
+            "surface_id": surface_id,
+            "format": "rgba8unorm",
+            "color_space": "srgb",
+            "size": {"width": width, "height": height},
+            "frame_sequence": frame_sequence,
+            "buffer_index": buffer_index,
+            "rgba_bytes": rgba.len(),
+            "artifact_path": artifact_path.to_string_lossy(),
+        }))
+    }
+
     /// Returns the latest completed unified ID frame snapshot for diagnostics.
     /// Only used by the `debug.unified_id.inspect` RPC method (plan §5.3).
     /// Exposes numeric_id, node_path, and intent; never exposes bounds, clip,
@@ -3870,7 +4528,25 @@ impl HeadlessExternalGpu {
     }
 }
 
-#[cfg(windows)]
+/// Run a minimal headless protocol server on the given loopback endpoint.
+///
+/// Used by embedded hosts (Android Service) that must answer `neon3.rpc` with
+/// no window and no GPU surface. It mirrors `--headless-server` from the CLI
+/// and exits when a client sends `service.shutdown`. Windows desktop and the
+/// windowed/external-surface paths are untouched.
+pub fn run_headless_protocol_server(endpoint: SocketAddr) -> Result<(), String> {
+    let server =
+        neon_ipc::BlockingRpcServer::bind(endpoint).map_err(|error| error.to_string())?;
+    let runtime = Arc::new(Mutex::new(WgpuRuntime::headless(1)));
+    let handler = move |request| {
+        let mut guard = runtime.lock().expect("headless runtime lock");
+        guard.handle(request)
+    };
+    server
+        .serve_until(handler, |request| request.method == "service.shutdown")
+        .map_err(|error| error.to_string())
+}
+
 pub fn spawn_headless_external_server(
     endpoint: SocketAddr,
 ) -> std::thread::JoinHandle<Result<(), String>> {
@@ -3941,14 +4617,10 @@ pub fn spawn_headless_external_server(
                                     let wait_ms =
                                         render_start.elapsed().as_secs_f32() * 1000.0;
                                     gpu.preload_external_images(&images);
-                                    if let Err(error) =
-                                        gpu.render(
-                                            &snapshots,
-                                            &unified_hit_fragments,
-                                            snapshot_ms,
-                                        )
-                                    {
-                                        eprintln!("[neon-wgpu-runtime] render error: {error}");
+                                    if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                        let _ = gpu.render(&snapshots, &unified_hit_fragments, snapshot_ms);
+                                    })) {
+                                        eprintln!("[neon-wgpu-runtime] headless render panicked: {panic:?}");
                                     }
                                     dropped = gpu.last_frame_dropped();
                                     skipped_static = gpu.last_frame_skipped_static();
@@ -4139,6 +4811,43 @@ let perf = gpu.perf.clone();
                                     "surface_id and u32 [x, y] points are required",
                                     None,
                                 ),
+                            }
+                        }
+                        "render.surface.capture_png" => {
+                            let request_id = request.request_id;
+                            let surface_id = request
+                                .params
+                                .get("surface_id")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_owned();
+                            let artifact_path = request
+                                .params
+                                .get("path")
+                                .and_then(Value::as_str)
+                                .filter(|path| !path.trim().is_empty())
+                                .map(std::path::PathBuf::from);
+                            if surface_id.is_empty() {
+                                runtime.lock().expect("runtime lock").reject(
+                                    request_id,
+                                    "invalid_request",
+                                    "surface_id is required",
+                                    None,
+                                )
+                            } else {
+                                match gpu
+                                    .lock()
+                                    .expect("gpu lock")
+                                    .capture_surface_png(&surface_id, artifact_path)
+                                {
+                                    Ok(result) => runtime.lock().expect("runtime lock").accept(request_id, result),
+                                    Err(error) => runtime.lock().expect("runtime lock").reject(
+                                        request_id,
+                                        "external_surface_capture_failed",
+                                        &error,
+                                        None,
+                                    ),
+                                }
                             }
                         }
                         "debug.unified_id.inspect" => {
@@ -4505,7 +5214,9 @@ impl WindowGpu {
             let fence_value = shared.frame_sequence;
             let hal_queue = unsafe { self.queue.as_hal::<wgpu::hal::api::Dx12>() }
                 .ok_or_else(|| "dx12_queue_unavailable".to_owned())?;
-            hal_queue.add_signal_fence(shared.fence.clone(), fence_value);
+            if let Some(interop) = shared.interop.as_ref() {
+                unsafe { hal_queue.add_signal_fence(interop.fence.clone(), fence_value) };
+            }
         }
         for (surface_id, shared) in self.external_id_surfaces.iter_mut() {
             let view = shared
@@ -4546,7 +5257,9 @@ impl WindowGpu {
                 });
             let hal_queue = unsafe { self.queue.as_hal::<wgpu::hal::api::Dx12>() }
                 .ok_or_else(|| "dx12_queue_unavailable".to_owned())?;
-            hal_queue.add_signal_fence(shared.fence.clone(), shared.frame_sequence);
+            if let Some(interop) = shared.interop.as_ref() {
+                unsafe { hal_queue.add_signal_fence(interop.fence.clone(), shared.frame_sequence) };
+            }
         }
         Ok(())
     }
@@ -4839,6 +5552,15 @@ impl WindowGpu {
             }
         }
         let (hit_target, hit_target_view) = create_hit_target(&device, size);
+        #[cfg(target_os = "android")]
+        eprintln!(
+            "{{\"probe\":\"android-component-gallery-surface\",\"width\":{},\"height\":{},\"scale_factor\":{},\"logical_width\":{},\"logical_height\":{}}}",
+            size.width,
+            size.height,
+            ANDROID_GALLERY_UI_SCALE,
+            (f64::from(size.width) / ANDROID_GALLERY_UI_SCALE) as u32,
+            (f64::from(size.height) / ANDROID_GALLERY_UI_SCALE) as u32
+        );
         Ok(Self {
             _instance: instance,
             surface,
@@ -4854,7 +5576,11 @@ impl WindowGpu {
             #[cfg(windows)]
             external_handle_tokens: HashMap::new(),
             config,
-            scale_factor: window.scale_factor(),
+            scale_factor: if cfg!(target_os = "android") {
+                ANDROID_GALLERY_UI_SCALE
+            } else {
+                window.scale_factor()
+            },
             #[cfg(debug_assertions)]
             final_target,
             #[cfg(debug_assertions)]
@@ -5069,9 +5795,10 @@ impl WindowGpu {
         let Some((texture_token, fence_token)) = self.external_handle_tokens.get(surface_id) else {
             return Err("surface_broker_token_not_found".into());
         };
-        let texture_handle = dx12_interop::duplicate_handle_to_process(shared.texture_handle, pid)
+        let interop = shared.interop.as_ref().ok_or("shared_surface_interop_missing")?;
+        let texture_handle = dx12_interop::duplicate_handle_to_process(interop.texture_handle, pid)
             .map_err(|error| error.to_string())?;
-        let fence_handle = dx12_interop::duplicate_handle_to_process(shared.fence_handle, pid)
+        let fence_handle = dx12_interop::duplicate_handle_to_process(interop.fence_handle, pid)
             .map_err(|error| error.to_string())?;
         let mut result = json!({
             "surface_id": surface_id,
@@ -5082,11 +5809,12 @@ impl WindowGpu {
             "fence_handle": fence_handle
         });
         if let Some(id_surface) = self.external_id_surfaces.get(surface_id) {
+            let id_interop = id_surface.interop.as_ref().ok_or("id_surface_interop_missing")?;
             let id_texture_handle =
-                dx12_interop::duplicate_handle_to_process(id_surface.texture_handle, pid)
+                dx12_interop::duplicate_handle_to_process(id_interop.texture_handle, pid)
                     .map_err(|error| error.to_string())?;
             let id_fence_handle =
-                dx12_interop::duplicate_handle_to_process(id_surface.fence_handle, pid)
+                dx12_interop::duplicate_handle_to_process(id_interop.fence_handle, pid)
                     .map_err(|error| error.to_string())?;
             let Some((id_texture_token, id_fence_token)) = self
                 .external_handle_tokens
@@ -5369,6 +6097,10 @@ fn forward_pointer_click(
             control_value,
             drag_drop: None,
         };
+        let inbound = event
+            .data_grid_cell
+            .as_ref()
+            .map(|_| UiHostInbound::DataGridCell { event: event.clone() });
         let request = RpcRequest {
             protocol: "neon3.rpc".into(),
             version: PROTOCOL_VERSION,
@@ -5381,7 +6113,7 @@ fn forward_pointer_click(
             },
             target: ServiceName("ui-runtime".into()),
             method: "ui.host.inbound".into(),
-            params: json!(&event),
+            params: inbound.map_or_else(|| json!(&event), |inbound| json!(inbound)),
             expected_revision: Some(event.fragment.revision),
             idempotency_key: Some(format!("wgpu-pointer-click:{renderer_epoch}:{sequence}")),
         };
@@ -5391,6 +6123,19 @@ fn forward_pointer_click(
         let elapsed_ms = queued_at.elapsed().as_secs_f64() * 1000.0;
         match rpc_result {
             Ok(response) if response.status == RpcStatus::Accepted => {
+                if let Some(proxy) = proxy.as_ref()
+                    && let Some(result) = response.result.as_ref()
+                    && let Ok(publication) = serde_json::from_value::<neon_ui_schema::UiHostPublication>(result.clone())
+                {
+                    let _ = proxy.send_event(WindowCommand::ApplyHostPublication(publication));
+                }
+                #[cfg(target_os = "android")]
+                eprintln!(
+                    "{{\"probe\":\"android-component-gallery-rpc\",\"node_path\":{:?},\"status\":\"accepted\",\"revision\":{:?},\"has_publication\":{}}}",
+                    node_path,
+                    response.revision,
+                    response.result.is_some()
+                );
                 if let Ok(mut state) = delivery.lock() {
                     *state = json!({
                         "state": "accepted",
@@ -5423,6 +6168,12 @@ fn forward_pointer_click(
             }
             Ok(response) => {
                 let error = response.error;
+                #[cfg(target_os = "android")]
+                eprintln!(
+                    "{{\"probe\":\"android-component-gallery-rpc\",\"node_path\":{:?},\"status\":\"rejected\",\"error\":{:?}}}",
+                    node_path,
+                    error
+                );
                 if let Ok(mut state) = delivery.lock() {
                     *state = json!({
                         "state": "rejected",
@@ -5501,6 +6252,7 @@ fn forward_text_input_commit(
     sequence: u64,
     binding: UiHitBinding,
     value: String,
+    proxy: Option<EventLoopProxy<WindowCommand>>,
 ) {
     let Some(event) = text_input_commit_event(
         renderer_epoch,
@@ -5525,14 +6277,25 @@ fn forward_text_input_commit(
             },
             target: ServiceName("ui-runtime".into()),
             method: "ui.host.inbound".into(),
-            params: json!(&event),
+            params: if event.data_grid_cell.is_some() {
+                json!(UiHostInbound::DataGridCell { event: event.clone() })
+            } else {
+                json!(&event)
+            },
             expected_revision: Some(event.fragment.revision),
             idempotency_key: Some(format!("wgpu-text-input:{renderer_epoch}:{sequence}")),
         };
-        if let Err(error) =
-            RpcClient::connect(endpoint).and_then(|mut client| client.call(&request))
-        {
-            eprintln!("ui text commit delivery failed: {error}");
+        match RpcClient::connect(endpoint).and_then(|mut client| client.call(&request)) {
+            Ok(response) if response.status == RpcStatus::Accepted => {
+                if let Some(proxy) = proxy
+                    && let Some(result) = response.result
+                    && let Ok(publication) = serde_json::from_value::<neon_ui_schema::UiHostPublication>(result)
+                {
+                    let _ = proxy.send_event(WindowCommand::ApplyHostPublication(publication));
+                }
+            }
+            Ok(response) => eprintln!("ui text commit rejected: {:?}", response.error),
+            Err(error) => eprintln!("ui text commit delivery failed: {error}"),
         }
     });
 }
@@ -5800,9 +6563,14 @@ fn forward_data_grid_window_request(
 
 impl ApplicationHandler<WindowCommand> for WindowedRuntime {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.window.is_none()
-            && let Err(error) = self.initialize(event_loop)
-        {
+        if self.window.is_some() {
+            return;
+        }
+        if self.lazy_surface {
+            // Protocol-driven host: the SDK opens the surface explicitly.
+            return;
+        }
+        if let Err(error) = self.initialize(event_loop) {
             eprintln!("neon-wgpu window initialization failed: {error}");
             self.exit_error = Some(error);
             event_loop.exit();
@@ -5824,10 +6592,59 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
             WindowEvent::Resized(size) => self.resize(size),
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 if let Some(gpu) = self.gpu.as_mut() {
-                    gpu.scale_factor = scale_factor;
+                    gpu.scale_factor = if cfg!(target_os = "android") {
+                        ANDROID_GALLERY_UI_SCALE
+                    } else {
+                        scale_factor
+                    };
                 }
                 if let Some(size) = self.window.as_ref().map(Window::inner_size) {
                     self.resize(size);
+                }
+            }
+            // Android delivers fingers as Touch events rather than mouse
+            // events. Reuse the existing renderer-owned pointer lifecycle so
+            // hit testing, capture, drag/drop, and semantic intents stay
+            // identical across desktop and Android.
+            WindowEvent::Touch(touch) => {
+                let touch_location = touch.location;
+                let phase = match touch.phase {
+                    winit::event::TouchPhase::Started => "started",
+                    winit::event::TouchPhase::Moved => "moved",
+                    winit::event::TouchPhase::Ended => "ended",
+                    winit::event::TouchPhase::Cancelled => "cancelled",
+                };
+                eprintln!(
+                    "{{\"probe\":\"android-component-gallery-input\",\"pointer_id\":{},\"phase\":\"{}\",\"x\":{},\"y\":{}}}",
+                    touch.id,
+                    phase,
+                    touch_location.x,
+                    touch_location.y
+                );
+                self.window_event(
+                    event_loop,
+                    window_id,
+                    WindowEvent::CursorMoved {
+                        device_id: touch.device_id,
+                        position: touch_location,
+                    },
+                );
+                let mouse_event = match touch.phase {
+                    winit::event::TouchPhase::Started => Some(WindowEvent::MouseInput {
+                        device_id: touch.device_id,
+                        state: ElementState::Pressed,
+                        button: winit::event::MouseButton::Left,
+                    }),
+                    winit::event::TouchPhase::Ended => Some(WindowEvent::MouseInput {
+                        device_id: touch.device_id,
+                        state: ElementState::Released,
+                        button: winit::event::MouseButton::Left,
+                    }),
+                    winit::event::TouchPhase::Cancelled => Some(WindowEvent::Focused(false)),
+                    winit::event::TouchPhase::Moved => None,
+                };
+                if let Some(mouse_event) = mouse_event {
+                    self.window_event(event_loop, window_id, mouse_event);
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
@@ -5867,11 +6684,11 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                         self.redraw_pending = true;
                     }
                     gpu.ui.update_value_gesture();
-                    let x = (position.x * gpu.scale_factor)
+                    let x = (f64::from(logical.x) * gpu.scale_factor)
                         .max(0.0)
                         .min(gpu.config.width.saturating_sub(1) as f64)
                         as u32;
-                    let y = (position.y * gpu.scale_factor)
+                    let y = (f64::from(logical.y) * gpu.scale_factor)
                         .max(0.0)
                         .min(gpu.config.height.saturating_sub(1) as f64)
                         as u32;
@@ -5993,6 +6810,7 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                         sequence,
                         binding,
                         value,
+                        self.event_proxy.clone(),
                     );
                     self.redraw_pending = true;
                 }
@@ -6055,7 +6873,35 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                         composition_revision,
                     );
                 } else if let Some(gpu) = self.gpu.as_mut() {
-                    if let Some((binding, value)) = gpu
+                    // DataGrid `select` cells use Combo-like visual chrome,
+                    // but owner is a boolean toggle, not an empty popup.
+                    let owner_cell = gpu.ui.hit_binding_at_pointer().and_then(|(_, binding)| {
+                        (binding
+                            .data_grid_cell
+                            .as_ref()
+                            .is_some_and(|cell| cell.column_key == "owner"))
+                        .then_some(binding)
+                    });
+                    if let Some(binding) = owner_cell {
+                        let value = binding.control_value.clone().unwrap_or(
+                            UiSemanticPayloadValue::Bool { value: false },
+                        );
+                        gpu.input.set_hover_id(Some(0));
+                        let _ = gpu.input.pointer_down();
+                        gpu.captured_binding = Some(binding.clone());
+                        gpu.active_interaction_id = Some(interaction_id.clone());
+                        gpu.pending_control_value = Some(value);
+                        append_interaction_record(
+                            &interaction_traces,
+                            interaction_id,
+                            InteractionTraceStage::HitCaptureResolved,
+                            InteractionTraceOutcome::Accepted,
+                            None,
+                            Some(&binding),
+                            composition_revision,
+                        );
+                        self.redraw_pending = true;
+                    } else if let Some((binding, value)) = gpu
                         .ui
                         .dropdown_option_at_pointer()
                         .or_else(|| gpu.ui.tab_option_at_pointer())
@@ -6113,6 +6959,15 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                         // to the previous frame after scroll, resize, or a
                         // presentation update.
                         let current_hit = gpu.ui.hit_binding_at_pointer();
+                        #[cfg(target_os = "android")]
+                        eprintln!(
+                            "{{\"probe\":\"android-component-gallery-hit\",\"pointer\":[{},{}],\"node_path\":{:?},\"data_grid_cell\":{:?},\"intent\":{:?}}}",
+                            gpu.ui.pointer_position().map(|p| p[0]).unwrap_or(-1.0),
+                            gpu.ui.pointer_position().map(|p| p[1]).unwrap_or(-1.0),
+                            current_hit.as_ref().map(|(_, binding)| binding.node_path.clone()),
+                            current_hit.as_ref().and_then(|(_, binding)| binding.data_grid_cell.clone()),
+                            current_hit.as_ref().and_then(|(_, binding)| binding.intent.clone())
+                        );
                         gpu.input
                             .set_hover_id(current_hit.as_ref().map(|(id, _)| *id));
                         if gpu.input.pointer_down().is_err() {
@@ -6395,6 +7250,14 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                         gpu.ui.rollback_local_presentation(presentation);
                     }
                     self.redraw_pending = true;
+                    #[cfg(target_os = "android")]
+                    if let Some(gpu) = self.gpu.as_ref() {
+                        eprintln!(
+                            "{{\"probe\":\"android-component-gallery-input\",\"phase\":\"released\",\"outcome\":\"{}\",\"node_path\":{:?}}}",
+                            gpu.last_pointer_outcome,
+                            gpu.last_pointer_node_path
+                        );
+                    }
                 }
             }
             WindowEvent::MouseInput { state, button, .. }
@@ -6470,6 +7333,7 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                         sequence,
                         binding,
                         value,
+                        self.event_proxy.clone(),
                     );
                 }
                 if let (Some(window), Some(rect)) = (
@@ -6665,6 +7529,7 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                         sequence,
                         binding,
                         value,
+                        self.event_proxy.clone(),
                     );
                 }
                 if ending_data_grid_edit && let Some(window) = self.window.as_ref() {
@@ -6707,6 +7572,7 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                         sequence,
                         binding,
                         value,
+                        self.event_proxy.clone(),
                     );
                 }
                 if let Some(window) = self.window.as_ref() {
@@ -6766,6 +7632,7 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
             _ => {}
         }
     }
+
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: WindowCommand) {
         match event {
@@ -6979,6 +7846,17 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                     self.redraw_pending = true;
                 }
             }
+            WindowCommand::ApplyHostPublication(publication) => {
+                if let Some(current) = self.fragments.get_mut(&UiFragmentId("android-component-gallery".into())) {
+                    neon_ui_runtime::demo_domain::apply_publication_to_fragment(current, &publication);
+                    self.applied_composition_revision = Revision(self.applied_composition_revision.0 + 1);
+                    if let Some(gpu) = self.gpu.as_mut() {
+                        gpu.ui.invalidate_plan();
+                        gpu.hit_target_dirty = true;
+                    }
+                    self.redraw_pending = true;
+                }
+            }
             WindowCommand::DataGridWindowDeliveryCompleted { sequence, accepted } => {
                 if !accepted
                     && let Some(gpu) = self.gpu.as_mut()
@@ -6989,6 +7867,17 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                 }
             }
             WindowCommand::Shutdown => event_loop.exit(),
+            WindowCommand::OpenAndroidSurface { completed } => {
+                let result = if self.window.is_some() {
+                    Ok(json!({"surface": "already_open"}))
+                } else {
+                    self.initialize(event_loop)
+                        .and_then(|_| {
+                            Ok(json!({"surface": "opened", "epoch": self.epoch}))
+                        })
+                };
+                let _ = completed.send(result);
+            }
         }
     }
 
@@ -8036,6 +8925,8 @@ fn spawn_window_server(
                 );
                 let response = if request.method == "wgpu.ai.terrain.generate" {
                     handle_window_ai_generate(&mut runtime, &proxy, request)
+                } else if request.method == "android.host.open_surface" {
+                    handle_android_host_open_surface(&mut runtime, &proxy, request)
                 } else if request.method == "render.surface.open" {
                     handle_window_external_surface_open(&mut runtime, &proxy, request)
                 } else if request.method == "render.surface.acquire" {
@@ -8214,6 +9105,37 @@ fn handle_window_external_surface_open(
             request.request_id,
             "window_compositor_timeout",
             "window compositor did not open the external surface",
+            None,
+        ),
+    }
+}
+
+fn handle_android_host_open_surface(
+    runtime: &mut WgpuRuntime,
+    proxy: &EventLoopProxy<WindowCommand>,
+    request: RpcRequest,
+) -> RpcResponse {
+    let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+    if proxy
+        .send_event(WindowCommand::OpenAndroidSurface {
+            completed: completed_tx,
+        })
+        .is_err()
+    {
+        return runtime.reject(
+            request.request_id,
+            "window_compositor_unavailable",
+            "window compositor is unavailable",
+            None,
+        );
+    }
+    match completed_rx.recv_timeout(Duration::from_secs(5)) {
+        Ok(Ok(result)) => runtime.accept(request.request_id, result),
+        Ok(Err(error)) => runtime.reject(request.request_id, &error, &error, None),
+        Err(_) => runtime.reject(
+            request.request_id,
+            "window_compositor_timeout",
+            "window compositor did not open the Android surface in time",
             None,
         ),
     }
@@ -8546,6 +9468,15 @@ pub struct WgpuRuntime {
     pointer_down_received: u64,
     pointer_up_received: u64,
     semantic_clicks: u64,
+
+    /// Single-endpoint (Android headless) UI session state. SDKs talk to the
+    /// host as if it were `ui-runtime`: flow submission compiles into this
+    /// runtime's fragment registry, and semantic/input frames advance this
+    /// monotonically increasing input revision. Windows/desktop keep using the
+    /// dedicated ui-runtime service and never set these fields.
+    ui_input_revision: u64,
+    ui_program_revision: Option<Value>,
+    ui_surface_id: Option<String>,
 }
 
 impl WgpuRuntime {
@@ -8575,6 +9506,9 @@ impl WgpuRuntime {
             pointer_down_received: 0,
             pointer_up_received: 0,
             semantic_clicks: 0,
+            ui_input_revision: 0,
+            ui_program_revision: None,
+            ui_surface_id: None,
         }
     }
 
@@ -9378,6 +10312,26 @@ impl WgpuRuntime {
             "render.backend.negotiate" => {
                 self.negotiate_external_backend(request_id, request.client, request.params)
             }
+            // Shared surface export requires a windowed GPU backend. The
+            // headless/Android single-endpoint host has no GPU, so surface
+            // requests fail with a stable, inspectable error code instead of
+            // "unsupported_method"; the SDK keeps one API on every platform.
+            "render.surface.open" | "render.surface.acquire" | "render.surface.frame" => {
+                self.reject(
+                    request_id,
+                    "backend_not_available",
+                    "shared surface export requires the windowed GPU runtime",
+                    None,
+                )
+            }
+            "render.surface.capture_png" => {
+                self.reject(
+                    request_id,
+                    "backend_not_available",
+                    "shared surface PNG capture requires the windowed GPU runtime",
+                    None,
+                )
+            }
             "wgpu.render.diagnostics" => {
                 self.accept(request_id, diagnostics_value(self.diagnostics()))
             }
@@ -9437,6 +10391,15 @@ impl WgpuRuntime {
             "test.ui.pointer.down" => self.pointer_down(request_id),
             "test.ui.pointer.up" => self.pointer_up(request_id, request.params),
             "test.ui.focus.loss" => self.focus_loss(request_id),
+            // Single-endpoint (Android headless) UI session surface. The SDK
+            // talks to this one endpoint as if it were `ui-runtime`; these
+            // handlers keep a lightweight program/input ledger so the standard
+            // SDK flow (submitFlow -> dispatchIntent -> publish -> shutdown)
+            // works without a local ui-runtime process.
+            "ui.flow.submit" => self.ui_flow_submit(request_id, request.params),
+            "debug.ui.host.snapshot" => self.ui_host_snapshot(request_id),
+            "ui.host.inbound" => self.ui_host_inbound(request_id, request.params),
+            "ui.input.frame" => self.ui_input_frame(request_id, request.params),
             _ => self.reject(
                 request_id,
                 "unsupported_method",
@@ -9669,7 +10632,161 @@ impl WgpuRuntime {
         self.accept(request_id, diagnostics_value(self.diagnostics()))
     }
 
-    fn remove_fragment(&mut self, request_id: RequestId, params: Value) -> RpcResponse {
+    /// Compile and adopt a NUI Flow as the single-endpoint UI program.
+    ///
+    /// This is the Android host's replacement for a local `ui-runtime` process:
+    /// SDKs submit the same `ui.flow.submit` envelope and receive the same
+    /// program envelope, while the compiled fragment lands in this runtime's
+    /// fragment registry (rendered when an Android surface is opened).
+    fn ui_flow_submit(&mut self, request_id: RequestId, params: Value) -> RpcResponse {
+        let Some(source) = params.get("source").and_then(Value::as_str) else {
+            return self.reject(
+                request_id,
+                "invalid_request",
+                "NUI source is required",
+                None,
+            );
+        };
+        let document = match neon_ui_runtime::parse_nui_flow(source) {
+            Ok(document) => document,
+            Err(error) => {
+                return self.reject(
+                    request_id,
+                    "ui_flow_submit_failed",
+                    &format!("NUI parse failed: {error:?}"),
+                    None,
+                );
+            }
+        };
+        let surface_id = document.ir.surface_id.0.clone();
+        let revision = UiProgramRevision {
+            program_id: surface_id.clone().into(),
+            revision: Revision(1),
+            schema_version: neon_ui_schema::UI_PROGRAM_SCHEMA_VERSION,
+            capabilities: [
+                neon_ui_schema::UI_PROGRAM_CAPABILITY_NAME,
+                neon_ui_schema::UI_PROGRAM_TEXT_REGISTRY_CAPABILITY_NAME,
+                neon_ui_schema::UI_PROGRAM_BOUNDED_STRUCTURE_CAPABILITY_NAME,
+                neon_ui_schema::UI_PROGRAM_SEMANTIC_EVENT_CAPABILITY_NAME,
+                neon_ui_schema::UI_NINE_SLICE_CAPABILITY_NAME,
+                neon_ui_schema::UI_CANVAS_POINTS_LINES_CAPABILITY_NAME,
+            ]
+            .into_iter()
+            .map(|name| neon_ui_schema::UiProgramCapability {
+                name: name.into(),
+                version: 1,
+                owner: neon_ui_schema::UiProgramCapabilityOwner::SharedContract,
+                status: neon_ui_schema::UiProgramCapabilityStatus::Supported,
+            })
+            .collect(),
+        };
+        let program = match neon_ui_runtime::compile_nui_flow_program(&document, revision) {
+            Ok(program) => program,
+            Err(error) => {
+                return self.reject(
+                    request_id,
+                    "ui_flow_submit_failed",
+                    &format!("NUI compile failed: {error:?}"),
+                    None,
+                );
+            }
+        };
+        // Re-submitting the same flow advances the fragment revision so the
+        // renderer accepts the replacement instead of treating it as stale.
+        let fragment_revision = self
+            .fragments
+            .get(&UiFragmentId(surface_id.clone()))
+            .map_or(Revision(1), |current| Revision(current.revision.0 + 1));
+        let fragment = UiFragment {
+            fragment_id: UiFragmentId(surface_id.clone()),
+            revision: fragment_revision,
+            root: document.ir.root.clone(),
+            effects: neon_ui_runtime::lower_nui_flow_effects(&document),
+        };
+        self.fragments
+            .insert(fragment.fragment_id.clone(), fragment);
+        self.graph_revision = Revision(self.graph_revision.0 + 1);
+        self.ui_program_revision = Some(serde_json::to_value(&program.revision).unwrap_or_default());
+        self.ui_surface_id = Some(surface_id.clone());
+        self.accept(
+            request_id,
+            json!({
+                "state": "accepted",
+                "program_revision": program.revision,
+                "input_schema": document.input_schema,
+                "surface_id": surface_id,
+            }),
+        )
+    }
+
+    /// Single-endpoint host input snapshot, mirroring `debug.ui.host.snapshot`
+    /// on the real ui-runtime. The SDK uses it to re-synchronize its input
+    /// revision after a stale rejection.
+    fn ui_host_snapshot(&mut self, request_id: RequestId) -> RpcResponse {
+        self.accept(
+            request_id,
+            json!({
+                "scalar_inputs": {
+                    "program_revision": self.ui_program_revision.clone().unwrap_or(Value::Null),
+                    "input_revision": self.ui_input_revision,
+                    "values": {},
+                    "changed_slots": [],
+                },
+                "grid_inputs": [],
+            }),
+        )
+    }
+
+    /// Accept a semantic intent or other host inbound. The single-endpoint host
+    /// has no domain runtime of its own; it acknowledges and advances the input
+    /// revision so the SDK session ledger stays consistent. Domain semantics
+    /// remain the SDK's responsibility (the SDK is the business host).
+    fn ui_host_inbound(&mut self, request_id: RequestId, params: Value) -> RpcResponse {
+        let kind = params
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or("semantic_intent");
+        self.ui_input_revision = self.ui_input_revision.saturating_add(1);
+        let accepted_revision = self.ui_input_revision;
+        let result = match kind {
+            "semantic_intent" => json!({
+                "semantic_intent": {
+                    "status": "accepted",
+                    "accepted_input_revision": accepted_revision,
+                }
+            }),
+            _ => json!({
+                "status": "accepted",
+                "accepted_input_revision": accepted_revision,
+            }),
+        };
+        self.accept(request_id, result)
+    }
+
+    /// Accept an external scalar input frame. Rejects when the caller's input
+    /// revision is stale, matching `ui_program_stale_input_revision`.
+    fn ui_input_frame(&mut self, request_id: RequestId, params: Value) -> RpcResponse {
+        let expected = params
+            .get("expected_input_revision")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        if expected != self.ui_input_revision {
+            return self.reject(
+                request_id,
+                "ui_program_stale_input_revision",
+                "expected_input_revision does not match the current input revision",
+                Some(Revision(self.ui_input_revision)),
+            );
+        }
+        self.ui_input_revision = self.ui_input_revision.saturating_add(1);
+        let accepted_revision = self.ui_input_revision;
+        self.accept(
+            request_id,
+            json!({"accepted_input_revision": accepted_revision}),
+        )
+    }
+
+fn remove_fragment(&mut self, request_id: RequestId, params: Value) -> RpcResponse {
         let command: UiCommand = match serde_json::from_value(params) {
             Ok(command @ UiCommand::RemoveFragment { .. }) => command,
             Ok(_) => {
@@ -13094,5 +14211,62 @@ mod tests {
         ));
         assert_eq!(response.status, RpcStatus::Accepted);
         assert!(response.result.unwrap().get("render_hit_id").is_none());
+    }
+
+    #[test]
+    fn single_endpoint_ui_session_flow_submit_input_and_snapshot() {
+        // The Android host serves the SDK as if it were ui-runtime on one
+        // endpoint. Verify the whole SDK session contract in-process.
+        let mut runtime = WgpuRuntime::headless(7);
+        let flow = "version 1\nsurface example revision 1\nsurface root\n";
+        let submit = runtime.handle(request("flow", "ui.flow.submit", json!({"source": flow})));
+        if submit.status != RpcStatus::Accepted {
+            eprintln!("submit error: {:?}", submit.error);
+        }
+        assert_eq!(submit.status, RpcStatus::Accepted);
+        let result = submit.result.unwrap();
+        assert_eq!(result["surface_id"], "example");
+        assert_eq!(result["program_revision"]["revision"], 1);
+        assert_eq!(result["input_schema"].is_object(), true);
+        assert_eq!(result["state"], "accepted");
+
+        // Stale input frame is rejected with the current revision.
+        let stale = runtime.handle(request(
+            "stale-frame",
+            "ui.input.frame",
+            json!({"expected_input_revision": 99, "changes": []}),
+        ));
+        assert_eq!(stale.status, RpcStatus::Rejected);
+        assert_eq!(stale.error.unwrap().code, "ui_program_stale_input_revision");
+
+        // Matching input frame advances the revision.
+        let frame = runtime.handle(request(
+            "frame",
+            "ui.input.frame",
+            json!({"expected_input_revision": 0, "changes": [{"key": "slider_value", "value": {"type": "f32", "value": 0.5}}]}),
+        ));
+        assert_eq!(frame.status, RpcStatus::Accepted);
+        assert_eq!(frame.result.unwrap()["accepted_input_revision"], 1);
+
+        // Host snapshot reflects the new input revision.
+        let snapshot = runtime.handle(request("snap", "debug.ui.host.snapshot", json!({})));
+        assert_eq!(snapshot.status, RpcStatus::Accepted);
+        assert_eq!(snapshot.result.unwrap()["scalar_inputs"]["input_revision"], 1);
+
+        // Semantic intent is acknowledged and advances the revision.
+        let inbound = runtime.handle(request(
+            "inbound",
+            "ui.host.inbound",
+            json!({
+                "kind": "semantic_intent",
+                "event": {"event_id": "e1", "intent": "app.greet", "payload": {}, "input_revision": 1}
+            }),
+        ));
+        assert_eq!(inbound.status, RpcStatus::Accepted);
+        let inbound_result = inbound.result.unwrap();
+        assert_eq!(inbound_result["semantic_intent"]["status"], "accepted");
+        assert_eq!(inbound_result["semantic_intent"]["accepted_input_revision"], 2);
+        let after = runtime.handle(request("snap2", "debug.ui.host.snapshot", json!({})));
+        assert_eq!(after.result.unwrap()["scalar_inputs"]["input_revision"], 2);
     }
 }

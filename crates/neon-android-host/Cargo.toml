@@ -1,0 +1,23 @@
+[package]
+name = "neon-android-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Platform-neutral Android host contract and bootstrap probe for Neon3"
+repository.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+neon-protocol = { version = "0.2.0", path = "../neon-protocol" }
+neon-ipc = { version = "0.2.0", path = "../neon-ipc" }
+neon-wgpu-runtime = { version = "0.2.5", path = "../neon-wgpu-runtime" }
+serde.workspace = true
+serde_json.workspace = true
+jni = "0.21"
+winit.workspace = true
+
+[[bin]]
+name = "android-platform-probe"
+path = "src/bin/android_platform_probe.rs"

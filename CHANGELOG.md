@@ -2,6 +2,82 @@
 
 All notable changes to Neon3 are recorded in this file.
 
+## v0.2.5 — 2026-09-04
+
+### Added
+
+- **Android Host GPU surface export.** The Android Host foreground service now
+  runs the GPU-backed headless server (`spawn_headless_external_server`) instead
+  of the no-GPU protocol server. SDKs can call `render.surface.open` and
+  `render.surface.capture_png` on the device, producing a real PNG artifact
+  (verified: 1280x720, 9082 bytes, valid PNG signature).
+- **Cross-platform shared surfaces.** `SharedSurface` is now backend-agnostic:
+  the wgpu texture, size, and frame sequence are available on every platform,
+  while the DX12 shared texture/fence interop handles are Windows-only. The
+  headless GPU exporter (`HeadlessExternalGpu`) no longer requires Windows:
+  non-Windows hosts create ordinary wgpu textures (with `TEXTURE_BINDING` for
+  readback sampling) and rotate ring slots with an atomic cursor instead of
+  consumer fences.
+- **`render.surface.capture_png`** on the headless external server: mirrors the
+  latest completed shared surface into an offscreen render target and writes a
+  PNG artifact (debug builds), enabling automated visual acceptance for the
+  shared surface path on every platform.
+- **`neon-android-host` workspace crate** with the `android-platform-probe` bin
+  and the JNI `hostStart`/`hostStop` contract. `hostStart` joins the GPU
+  headless server until `service.shutdown`, then invokes
+  `onHostServerStopped()` so the foreground service can stop itself.
+- **Single-endpoint UI session methods on the headless host**:
+  `ui.flow.submit`, `debug.ui.host.snapshot`, `ui.host.inbound`, and
+  `ui.input.frame`, so the Node/Python SDK `UiSession` flow works against the
+  Android host without a local ui-runtime process.
+- `--headless-external-server <endpoint>` entry point in
+  `neon-wgpu-runtime` (Windows only).
+
+### Changed
+
+- `neon-wgpu-runtime` builds as both `rlib` and `cdylib` (needed by the
+  Android host JNI library).
+- The headless external instance uses minimal `InstanceFlags`
+  (`VALIDATION_INDIRECT_CALL`, no `DEBUG`) to avoid SwiftShader/ranchu crashes
+  in `SetDebugUtilsObjectNameEXT`.
+- The headless render loop wraps `gpu.render` in `catch_unwind` so a render
+  panic cannot poison the shared gpu mutex (previously every later handler
+  failed with `handler_panicked`).
+
+### Verification
+
+- `cargo check` passes for both Windows and `x86_64-linux-android` targets.
+- `neon-wgpu-runtime` single-endpoint UI session contract test passes.
+- Windows: `render.surface.open` (d3d12_shared_texture_v1) ->
+  `render.surface.capture_png` produces a 704-byte valid PNG.
+- Android emulator (API 36 x86_64, SwiftShader): `ui.flow.submit` ->
+  `render.surface.open` -> `render.surface.capture_png` (frame_sequence=1) ->
+  `service.shutdown`; PNG pulled back via `run-as` and verified.
+- Node SDK 77 tests and Python SDK 92 tests pass with integration gates;
+  desktop behavior unchanged.
+
+## v0.2.4 — 2026-09-02
+
+### Added
+
+- Renderer text-input diagnostic state to the window input snapshot.
+
+### Fixed
+
+- UI host cache now uses the renderer-accepted fragment revision for
+  subsequent control events instead of a stale revision.
+- Dropdown and combo popup pointer handling: option selection, toggling, and
+  dismiss resolve before generic hit routing.
+- DataGrid text-input focus, caret, and selection cleanup after pointer and
+  keyboard cancellation.
+- Slider hit geometry aligned with the visible full-width inset track.
+
+### Verification
+
+- neon-ui-runtime library tests: 114 passed.
+- component-gallery launched as a real windowed multi-process session.
+- Windows x86_64 release binaries built.
+
 ## v0.2.3 — 2026-09-01
 
 ### Added

@@ -6,7 +6,10 @@ license.workspace = true
 description = "Neon3 WGPU renderer and window runtime"
 repository.workspace = true
 readme = "README.md"
-include = ["src/**", "assets/fonts/FiraMono-subset.ttf", "Cargo.toml", "README.md", "LICENSE*", "../LICENSE*", "../Cargo.toml"]
+include = ["src/**", "assets/fonts/SarasaUiSC-Light.ttf", "assets/fonts/LICENSE-Sarasa-Gothic-OFL-1.1.txt", "assets/fonts/SarasaUiSC-Light.NOTICE", "Cargo.toml", "README.md", "LICENSE*", "../LICENSE*", "../Cargo.toml"]
+
+[lib]
+crate-type = ["rlib", "cdylib"]
 
 [dependencies]
 neon-wgpu-ai = { version = "0.2.0", path = "../neon-wgpu-ai" }
@@ -15,6 +18,7 @@ neon-observability = { version = "0.2.0", path = "../neon-observability" }
 neon-ui-schema = { version = "0.2.0", path = "../neon-ui-schema" }
 neon-world-bridge = { version = "0.2.0", path = "../neon-world-bridge" }
 neon-ipc = { version = "0.2.0", path = "../neon-ipc" }
+neon-ui-runtime = { version = "0.2.0", path = "../neon-ui-runtime" }
 bytemuck.workspace = true
 pollster.workspace = true
 png = "0.18"
@@ -23,7 +27,12 @@ serde.workspace = true
 wgpu.workspace = true
 winit.workspace = true
 fontdue.workspace = true
+
+[target.'cfg(windows)'.dependencies]
 windows.workspace = true
+
+[target.'cfg(target_os = "android")'.dependencies]
+winit = { workspace = true, features = ["android-native-activity"] }
 
 [dev-dependencies]
 neon-projectd = { version = "0.2.0", path = "../neon-projectd" }

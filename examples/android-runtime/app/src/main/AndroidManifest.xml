@@ -1,0 +1,41 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+
+    <application
+        android:label="Neon3 Android Runtime"
+        android:theme="@style/Theme.Neon3">
+        <!-- Invisible launcher: starts the headless host service and finishes. -->
+        <activity
+            android:name=".MainActivity"
+            android:theme="@style/Theme.Neon3.Launcher"
+            android:exported="true"
+            android:excludeFromRecents="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- Headless protocol host. No window, no WGPU surface. -->
+        <service
+            android:name=".Neon3HostService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+
+        <!-- Optional windowed host. Not a launcher; an SDK routes a surface
+             request here through the protocol when windowed UI is needed. -->
+        <activity
+            android:name="android.app.NativeActivity"
+            android:screenOrientation="landscape"
+            android:configChanges="orientation|screenSize|keyboardHidden"
+            android:resizeableActivity="false"
+            android:immersive="true"
+            android:exported="true">
+            <meta-data
+                android:name="android.app.lib_name"
+                android:value="neon_android_host" />
+        </activity>
+    </application>
+</manifest>

@@ -12,7 +12,18 @@
 /.workbuddy/
 /.plan-client/
 /docs/ai-diary/
+/examples/android-runtime/local.properties
+/examples/android-runtime/.gradle/
+/examples/android-runtime/build/
+/examples/android-runtime/app/build/
 /docs/ai-debug-workflow.md
 /opencode.json
 /artifacts/
 /.release-tmp
+
+# Android example: local build outputs never enter the repository.
+# libneon_android_host.so is produced by `cargo build --target ...` and copied
+# into jniLibs; 38-241 MB debug binaries must not be committed.
+/examples/android-runtime/app/src/main/jniLibs/
+/examples/android-runtime/.idea/
+/examples/android-runtime/*.iml

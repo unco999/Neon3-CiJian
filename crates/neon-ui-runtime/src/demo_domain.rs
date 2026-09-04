@@ -14,7 +14,7 @@ use neon_ui_schema::{
     UiDataGridFrame, UiDataGridInputFrame, UiDataGridWindowRequest, UiDataGridWindowRow,
     UiDropPlacement, UiEffect, UiFragment, UiHostInbound, UiHostPresentationUpdate,
     UiHostPublication, UiInputChange, UiInputFrame, UiInputKind, UiInputSchema, UiInputValue,
-    UiNode, UiNodeId, UiProgram, UiProgramCapability, UiProgramCapabilityOwner,
+    UiIntent, UiNode, UiNodeId, UiProgram, UiProgramCapability, UiProgramCapabilityOwner,
     UiProgramCapabilityStatus, UiProgramRevision, UiProgramSemanticEvent,
     UiProgramSemanticEventKind, UiProgramSemanticEventStatus, UiResolvedInputs, UiSemanticEvent,
     UiSemanticEventType, UiSemanticPayloadValue,
@@ -24,7 +24,7 @@ use serde_json::{Value, json};
 use crate::{
     UiInputStore, UiInputStoreError, UiInputWriter, UiProgramSemanticEventRouter,
     UiVariableEventPublisher, compile_nui_flow_program, host_adapter::UiHostAdapterConfig,
-    instantiate_ui_template, parse_nui_flow,
+    input_value_as_event_payload, instantiate_ui_template, parse_nui_flow,
 };
 
 /// Generic controlled-input demo domain. It resolves the slot from the program
@@ -235,7 +235,54 @@ impl DemoInputDomain {
                     program: program.clone(), input_schema: input_schema.clone(),
                 }))
             } else if request.method == "ui.host.inbound" {
-                let inbound = serde_json::from_value::<UiHostInbound>(request.params.clone());
+                let inbound = match serde_json::from_value::<UiHostInbound>(request.params.clone()) {
+                    Ok(inbound) => Ok(inbound),
+                    Err(_) => (|| -> Result<UiHostInbound, ()> {
+                        // Older renderer callers may provide the renderer
+                        // semantic event directly. Normalize it at the host
+                        // boundary into the same typed inbound variants used
+                        // by the desktop component-gallery scenario.
+                        let event = serde_json::from_value::<UiSemanticEvent>(request.params.clone())
+                            .map_err(|_| ())?;
+                        if event.data_grid_cell.is_some() {
+                            return Ok(UiHostInbound::DataGridCell { event });
+                        }
+                        let UiIntent::Invoke { action, .. } = &event.intent;
+                        let declaration = program
+                            .event_records
+                            .iter()
+                            .find(|declaration| declaration.intent == *action)
+                            .ok_or(())?;
+                        let mut payload = declaration.literal_payload.clone();
+                        let snapshot = domain.snapshot();
+                        for key in &declaration.bound_input_keys {
+                            let value = snapshot.inputs.values.get(key).ok_or(())?;
+                            payload.insert(
+                                key.clone(),
+                                input_value_as_event_payload(&value.value).ok_or(())?,
+                            );
+                        }
+                        Ok(UiHostInbound::SemanticIntent {
+                            event: UiProgramSemanticEvent {
+                                event_id: event.event_id.clone(),
+                                kind: gallery_event_kind(&declaration.node_key),
+                                intent: action.clone(),
+                                source_node_key: declaration.node_key.clone(),
+                                payload,
+                                program_revision: program.revision.clone(),
+                                input_revision: snapshot.inputs.input_revision,
+                                request_id: event.event_id.clone(),
+                                idempotency_key: event.event_id.clone(),
+                                requested_value: event.control_value,
+                                interaction: neon_ui_schema::UiSemanticInteractionMetadata {
+                                    interaction_id: event.event_id,
+                                    sequence: event.pointer.map_or(1, |pointer| pointer.sequence),
+                                    renderer_epoch: event.renderer_epoch,
+                                },
+                            },
+                        })
+                    })()
+                };
                 match inbound {
                     Ok(UiHostInbound::SemanticIntent { event }) => {
                         let validation = router.validate(&event);
@@ -430,6 +477,31 @@ pub fn component_gallery_program(
     Ok((document, program))
 }
 
+/// Deterministic first window for the component gallery. The renderer may use
+/// this frame for its initial composition; later windows still come through
+/// `ui.host.inbound` and the normal DataGrid window request protocol.
+pub fn component_gallery_initial_grid_frame(
+    program: &UiProgram,
+) -> Option<UiDataGridFrame> {
+    let record = program
+        .data_grid_records
+        .iter()
+        .find(|record| record.source_key == "asset_window")?;
+    let columns = record
+        .columns
+        .iter()
+        .map(|column| column.key.as_str())
+        .collect::<Vec<_>>();
+    Some(
+        DemoDragDropDomain::new().virtual_list_window_frame(
+            0,
+            record.max_window_rows,
+            program.revision.clone(),
+            &columns,
+        ),
+    )
+}
+
 /// Applies a domain-produced display snapshot to declared status labels. Status
 /// node keys name input slots, so the renderer remains unaware of control kinds.
 pub fn apply_visible_status_to_fragment(
@@ -526,6 +598,78 @@ pub fn apply_visible_status_to_fragment(
             "gallery-scroll",
             UiControlPresentation::Scroll { position: *value },
         ));
+    }
+}
+
+/// Applies an accepted host publication to an already mounted presentation.
+/// This is used by embedded hosts as well as the desktop UI runtime; acceptance
+/// alone must never leave the renderer displaying the old controlled value.
+pub fn apply_publication_to_fragment(
+    fragment: &mut UiFragment,
+    publication: &UiHostPublication,
+) {
+    let mut changed = std::collections::BTreeMap::new();
+    for change in &publication.scalar_frame.changes {
+        changed.insert(change.key.as_str(), &change.value);
+    }
+    fn visit(node: &mut UiNode, changed: &std::collections::BTreeMap<&str, &UiInputValue>) {
+        if let Some(key) = node.node_id.0.strip_prefix("status-")
+            && let Some(value) = changed.get(key)
+        {
+            node.text = Some(TextRef::Literal {
+                value: format!("{key}: {}", display_value(value)),
+            });
+        }
+        for child in &mut node.children {
+            visit(child, changed);
+        }
+    }
+    visit(&mut fragment.root, &changed);
+
+    for input in &publication.scalar_frame.changes {
+        let presentation = match (input.key.as_str(), &input.value) {
+            ("feature_enabled", UiInputValue::Bool { value }) => Some((
+                "feature-toggle",
+                UiControlPresentation::Toggle { selected: *value },
+            )),
+            ("radio_selected", UiInputValue::Bool { value }) => Some((
+                "mode-radio",
+                UiControlPresentation::Toggle { selected: *value },
+            )),
+            ("slider_value", UiInputValue::F32 { value }) => Some((
+                "exposure-slider",
+                UiControlPresentation::Numeric { value: *value, min: 0.0, max: 1.0 },
+            )),
+            ("drag_value", UiInputValue::I32 { value }) => Some((
+                "count-drag",
+                UiControlPresentation::Numeric { value: *value as f32, min: 0.0, max: 24.0 },
+            )),
+            _ => None,
+        };
+        if let Some((node_id, state)) = presentation {
+            fragment.effects.retain(|effect| {
+                !matches!(effect, UiEffect::ControlPresentation { node_id: id, .. } if id.0 == node_id)
+            });
+            fragment.effects.push(UiEffect::ControlPresentation {
+                node_id: UiNodeId(node_id.into()),
+                state,
+            });
+        }
+    }
+    for grid in &publication.grid_inputs {
+        let existing = fragment.effects.iter().find_map(|effect| {
+            let UiEffect::DataGridFrame { declaration, .. } = effect else { return None };
+            (declaration.source_key == grid.source_key).then_some(declaration.clone())
+        });
+        fragment.effects.retain(|effect| {
+            !matches!(effect, UiEffect::DataGridFrame { declaration, .. } if declaration.source_key == grid.source_key)
+        });
+        if let Some(existing) = existing {
+            fragment.effects.push(UiEffect::DataGridFrame {
+                declaration: existing,
+                frame: grid.frame.clone(),
+            });
+        }
     }
 }
 

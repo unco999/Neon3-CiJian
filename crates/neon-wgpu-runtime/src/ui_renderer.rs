@@ -373,7 +373,7 @@ fn srgb_to_linear(value: vec3<f32>) -> vec3<f32> { let low=value/12.92; let high
 }
 "#;
 
-const BUILTIN_UI_FONT: &[u8] = include_bytes!("../../../assets/fonts/SarasaUiSC-Light.ttf");
+const BUILTIN_UI_FONT: &[u8] = include_bytes!("../assets/fonts/SarasaUiSC-Light.ttf");
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
@@ -5715,6 +5715,32 @@ impl UiWgpuRenderer {
             &self.data_grid_text_display_cache,
             &self.available_cameras,
         );
+        #[cfg(target_os = "android")]
+        {
+            let layout_probe = nodes
+                .iter()
+                .filter(|(id, _, _, _)| {
+                    id.ends_with("/gallery-layout")
+                        || id.ends_with("/gallery-controls")
+                        || id.ends_with("/asset-grid")
+                        || id.ends_with("/field-pack")
+                })
+                .map(|(id, _, visual, _)| {
+                    format!(
+                        "{{\"id\":{:?},\"x\":{},\"y\":{},\"width\":{},\"height\":{}}}",
+                        id,
+                        visual.bounds.x,
+                        visual.bounds.y,
+                        visual.bounds.width,
+                        visual.bounds.height
+                    )
+                })
+                .collect::<Vec<_>>();
+            eprintln!(
+                "{{\"probe\":\"android-component-gallery-visual-layout\",\"nodes\":[{}]}}",
+                layout_probe.join(",")
+            );
+        }
         let live: HashSet<_> = nodes.iter().map(|(id, _, _, _)| id.clone()).collect();
         if viewport_changed {
             self.current.clear();
@@ -8663,11 +8689,28 @@ fn append_data_grid_frames(
                             height: row_height,
                         };
                         label.style = UiStyle::default();
-                        let presentation = cell
+                        let mut presentation = cell
                             .presentation_override
                             .as_ref()
                             .map(data_grid_cell_presentation)
                             .unwrap_or_else(|| data_grid_column_presentation(&column.presentation));
+                        // A Select column backed by a Bool is the gallery's
+                        // owner toggle. It must be a toggle presentation, not
+                        // a Combo with an empty option list.
+                        if matches!(
+                            column.presentation,
+                            neon_ui_schema::UiDataGridPresentation::Select { .. }
+                        ) && matches!(cell.value, neon_ui_schema::UiInputValue::Bool { .. }) {
+                            presentation = (
+                                UiNodeKind::Selectable,
+                                Some(UiControlPresentation::Toggle {
+                                    selected: matches!(
+                                        cell.value,
+                                        neon_ui_schema::UiInputValue::Bool { value: true }
+                                    ),
+                                }),
+                            );
+                        }
                         if matches!(
                             column.presentation,
                             neon_ui_schema::UiDataGridPresentation::Select { .. }
@@ -9962,7 +10005,7 @@ mod tests {
             media_type: "font/ttf".into(),
             width: None,
             height: None,
-            bytes: include_bytes!("../../../assets/fonts/SarasaUiSC-Light.ttf").to_vec(),
+            bytes: include_bytes!("../assets/fonts/SarasaUiSC-Light.ttf").to_vec(),
         }
     }
 

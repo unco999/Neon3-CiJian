@@ -1,0 +1,25 @@
+<resources>
+    <!-- Invisible launcher. Starts the headless host service and finishes
+         immediately; no window is shown and the runtime stays backgrounded
+         until an SDK requests a surface. -->
+    <style name="Theme.Neon3.Launcher" parent="android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:windowIsTranslucent">true</item>
+        <item name="android:windowBackground">@android:color/transparent</item>
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:windowContentOverlay">@null</item>
+        <item name="android:backgroundDimEnabled">false</item>
+    </style>
+
+    <!-- Rendered (windowed) host theme when an SDK opens a surface. -->
+    <style name="Theme.Neon3" parent="android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:fontFamily">sans</item>
+        <item name="android:colorAccent">#00A6A6</item>
+        <item name="android:windowFullscreen">true</item>
+        <item name="android:windowActionModeOverlay">true</item>
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowLightNavigationBar">false</item>
+        <item name="android:navigationBarColor">#101820</item>
+        <item name="android:statusBarColor">#101820</item>
+    </style>
+</resources>
