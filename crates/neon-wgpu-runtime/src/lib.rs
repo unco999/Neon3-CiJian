@@ -11,7 +11,6 @@ use std::{
     path::PathBuf,
     thread,
 };
-#[cfg(debug_assertions)]
 use std::{io::BufWriter, path::Path};
 
 use neon_ipc::{EventClient, RpcClient};
@@ -5106,7 +5105,6 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
     })
 }
 
-#[cfg(debug_assertions)]
 fn default_capture_path(epoch: u64, frame: u64, revision: Revision) -> Result<PathBuf, String> {
     let executable = std::env::current_exe()
         .map_err(|error| format!("resolve capture artifact directory: {error}"))?;
@@ -5124,7 +5122,6 @@ fn default_capture_path(epoch: u64, frame: u64, revision: Revision) -> Result<Pa
     )))
 }
 
-#[cfg(debug_assertions)]
 fn write_capture_png(path: &Path, size: [u32; 2], rgba: &[u8]) -> Result<PathBuf, String> {
     if path.extension().and_then(|extension| extension.to_str()) != Some("png") {
         return Err("window capture artifact path must use the .png extension".into());
