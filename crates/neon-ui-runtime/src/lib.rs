@@ -3190,6 +3190,14 @@ impl UiRuntime {
         wgpu_endpoint: SocketAddr,
         request: RpcRequest,
     ) -> Result<RpcResponse, TransportError> {
+        eprintln!(
+            "{}",
+            json!({
+                "event": "ui.flow.received",
+                "request_id": request.request_id,
+                "endpoint": wgpu_endpoint.to_string()
+            })
+        );
         let source = request
             .params
             .get("source")
@@ -3201,6 +3209,14 @@ impl UiRuntime {
                 "NUI parse failed: {error:?}"
             )))
         })?;
+        eprintln!(
+            "{}",
+            json!({
+                "event": "ui.flow.parsed",
+                "request_id": request.request_id,
+                "surface_id": document.ir.surface_id
+            })
+        );
         let revision = UiProgramRevision {
             program_id: document.ir.surface_id.0.clone(),
             revision: Revision(1),
@@ -3233,7 +3249,7 @@ impl UiRuntime {
             .cached_fragment
             .as_ref()
             .map_or(Revision(1), |current| Revision(current.revision.0 + 1));
-        let fragment = UiFragment {
+        let mut fragment = UiFragment {
             fragment_id: UiFragmentId(document.ir.surface_id.0.clone()),
             revision: fragment_revision,
             root: document.ir.root.clone(),
@@ -3243,6 +3259,16 @@ impl UiRuntime {
             UiHostAdapter::activate(program.clone(), document.input_schema.clone(), self.epoch)
                 .map_err(|error| TransportError::Io(std::io::Error::other(error.message)))?
                 .with_event_publisher(self.eventd_endpoint, self.client.clone());
+        // Resolve branch visibility against schema defaults before the first
+        // fragment reaches WGPU. Otherwise mutually exclusive branches all
+        // render until the first input publication arrives.
+        let initial_inputs = adapter.snapshot().scalar_inputs;
+        refresh_fragment_from_program(
+            &mut fragment,
+            &program,
+            &initial_inputs,
+            &document.input_schema,
+        );
         self.host_adapter = Some(adapter);
         let forwarded = RpcRequest {
             protocol: "neon3.rpc".into(),
@@ -3258,6 +3284,14 @@ impl UiRuntime {
             idempotency_key: request.idempotency_key.clone(),
         };
         let response = self.forward_fragment(wgpu_endpoint, forwarded)?;
+        eprintln!(
+            "{}",
+            json!({
+                "event": "ui.flow.forwarded",
+                "request_id": request.request_id,
+                "status": response.status
+            })
+        );
         if response.status == RpcStatus::Accepted {
             self.flow_state_machine = Some(NuiFlowStateMachineRuntime::new(&document));
             self.flow_document = Some(document.clone());
@@ -4187,6 +4221,7 @@ impl UiRuntime {
                 request_id: event.event_id.clone(),
                 idempotency_key: event.event_id.clone(),
                 requested_value: event.control_value,
+                committed_text: event.text.clone(),
                 interaction: UiSemanticInteractionMetadata {
                     interaction_id: event.event_id,
                     sequence: event.pointer.map_or(1, |pointer| pointer.sequence),
@@ -5714,6 +5749,7 @@ mod tests {
             request_id: "rejected-event".into(),
             idempotency_key: "rejected-event".into(),
             requested_value: None,
+            committed_text: None,
             interaction: UiSemanticInteractionMetadata {
                 interaction_id: "generic-host-interaction".into(),
                 sequence: 1,
@@ -6570,6 +6606,7 @@ mod tests {
                 request_id: format!("gallery-request-{index}"),
                 idempotency_key: format!("gallery-key-{index}"),
                 requested_value: None,
+                committed_text: None,
                 interaction: neon_ui_schema::UiSemanticInteractionMetadata {
                     interaction_id: format!("gallery-interaction-{index}"),
                     sequence: index as u64 + 1,
@@ -6716,6 +6753,7 @@ mod tests {
                 request_id: format!("gallery-disabled-request-{index}"),
                 idempotency_key: format!("gallery-disabled-key-{index}"),
                 requested_value: None,
+                committed_text: None,
                 interaction: neon_ui_schema::UiSemanticInteractionMetadata {
                     interaction_id: format!("gallery-disabled-interaction-{index}"),
                     sequence: index as u64 + 1,
@@ -7122,6 +7160,31 @@ mod tests {
             flow_name: String::new(),
             emit_event_keys: Vec::new(),
         }
+    }
+
+    #[test]
+    fn empty_input_frame_does_not_advance_revision() {
+        let revision = compiler_program_revision();
+        let schema = compiler_schema(true);
+        let mut store = UiInputStore::activate(revision.clone(), schema).unwrap();
+        let frame = |request_id: &str, idempotency_key: &str| UiInputFrame {
+            program_revision: revision.clone(),
+            expected_input_revision: Revision(0),
+            request_id: request_id.into(),
+            idempotency_key: idempotency_key.into(),
+            changes: Vec::new(),
+        };
+
+        let first = store
+            .apply(UiInputWriter::External, frame("request-1", "key-1"))
+            .unwrap();
+        let second = store
+            .apply(UiInputWriter::External, frame("request-2", "key-2"))
+            .unwrap();
+
+        assert_eq!(first.input_revision, Revision(0));
+        assert_eq!(second.input_revision, Revision(0));
+        assert_eq!(store.snapshot().input_revision, Revision(0));
     }
 
     fn compiler_document() -> UiIrDocument {
@@ -7536,6 +7599,7 @@ mod tests {
             request_id: "replace-event".into(),
             idempotency_key: "replace-event".into(),
             requested_value: None,
+            committed_text: None,
             interaction: UiSemanticInteractionMetadata {
                 interaction_id: "replace-interaction".into(),
                 sequence: 1,
@@ -7715,6 +7779,7 @@ mod tests {
             request_id: "request-1".into(),
             idempotency_key: "key-1".into(),
             requested_value: None,
+            committed_text: None,
             interaction: UiSemanticInteractionMetadata {
                 interaction_id: "interaction-1".into(),
                 sequence: 1,

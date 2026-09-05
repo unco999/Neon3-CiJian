@@ -4030,6 +4030,45 @@ panel workspace row gap 8
     }
 
     #[test]
+    fn unsupported_branch_expressions_and_text_handles_are_rejected() {
+        let numeric_comparison = parse_nui_flow(
+            "input progress i32 default 1\nsurface root\n  branch status when $progress >= 1\n",
+        )
+        .unwrap_err();
+        assert_eq!(
+            numeric_comparison.diagnostics[0].code,
+            "nui_flow_unknown_attribute"
+        );
+
+        let text_handle = parse_nui_flow(
+            "input title text_handle default none\nsurface root\n  text label value $title\n",
+        )
+        .unwrap_err();
+        assert_eq!(
+            text_handle.diagnostics[0].code,
+            "nui_flow_unknown_input_kind"
+        );
+    }
+
+    #[test]
+    fn semantic_source_key_must_be_declared_by_the_flow_node() {
+        let error = parse_nui_flow(
+            "surface root\n  button gamma-up value \"+\" event settings.gamma.commit\n",
+        )
+        .unwrap();
+        assert!(error
+            .ir
+            .events
+            .iter()
+            .any(|event| event.node_key == "gamma-up"));
+        assert!(!error
+            .ir
+            .events
+            .iter()
+            .any(|event| event.node_key == "gamma"));
+    }
+
+    #[test]
     fn formatting_preserves_flow_and_emitevent_declarations() {
         let source = "version 1\nsurface surface.editor.terrain revision 12\nflow terrain-workbench\ninput can_commit bool default false\ninput brush_size i32 default 4 emitevent\nsurface root column\n";
         let formatted = format_nui_flow(source).unwrap();

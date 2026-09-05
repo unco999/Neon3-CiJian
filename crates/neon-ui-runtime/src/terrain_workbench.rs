@@ -194,6 +194,7 @@ mod tests {
             request_id: "tool-request".into(),
             idempotency_key: "tool-select-1".into(),
             requested_value: None,
+            committed_text: None,
             interaction: UiSemanticInteractionMetadata {
                 interaction_id: "pointer-capture-1".into(),
                 sequence: 1,

@@ -274,6 +274,7 @@ impl DemoInputDomain {
                                 request_id: event.event_id.clone(),
                                 idempotency_key: event.event_id.clone(),
                                 requested_value: event.control_value,
+                                committed_text: event.text.clone(),
                                 interaction: neon_ui_schema::UiSemanticInteractionMetadata {
                                     interaction_id: event.event_id,
                                     sequence: event.pointer.map_or(1, |pointer| pointer.sequence),
@@ -2082,6 +2083,7 @@ mod tests {
                 request_id: format!("gallery-request-{index}"),
                 idempotency_key: format!("gallery-key-{index}"),
                 requested_value: None,
+                committed_text: None,
                 interaction: neon_ui_schema::UiSemanticInteractionMetadata {
                     interaction_id: format!("gallery-interaction-{index}"),
                     sequence: index as u64 + 1,
@@ -2229,6 +2231,7 @@ mod tests {
             request_id: "gallery-publish-request".into(),
             idempotency_key: "gallery-publish-key".into(),
             requested_value: Some(neon_ui_schema::UiSemanticPayloadValue::Bool { value: false }),
+            committed_text: None,
             interaction: neon_ui_schema::UiSemanticInteractionMetadata {
                 interaction_id: "gallery-publish-interaction".into(),
                 sequence: 1,

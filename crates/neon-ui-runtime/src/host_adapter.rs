@@ -1055,6 +1055,7 @@ mod tests {
             request_id: "request".into(),
             idempotency_key: "event-key".into(),
             requested_value: None,
+            committed_text: None,
             interaction: UiSemanticInteractionMetadata {
                 interaction_id: "interaction".into(),
                 sequence: 1,

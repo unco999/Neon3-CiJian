@@ -1604,11 +1604,13 @@ impl WindowedRuntime {
         if let Err(error) = enable_explorer_file_drop(&window) {
             eprintln!("[neon-wgpu-runtime] Explorer file-drop enablement failed: {error}");
         }
-        // Select a backend appropriate for the target. External host interop is
-        // negotiated separately and must not force the renderer's normal
-        // window backend to DX12.
+        // Windowed rendering exports D3D12 shared surfaces to external hosts, so
+        // the selected adapter must be DX12. `Backends::all()` is not valid here:
+        // wgpu may choose Vulkan/GL first, after which the DX12 handle broker
+        // cannot open the adapter even though a DX12 adapter is present.
+        let backends = windowed_backends()?;
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: platform_backends(),
+            backends,
             ..wgpu::InstanceDescriptor::new_with_display_handle(Box::new(
                 event_loop.owned_display_handle(),
             ))
@@ -2710,6 +2712,43 @@ fn platform_backends() -> wgpu::Backends {
         }
     }
     wgpu::Backends::all()
+}
+
+/// Select the backend for the windowed renderer.
+///
+/// On Windows, windowed mode is also the producer for the D3D12 shared-surface
+/// contract. It therefore cannot use the generic `platform_backends()` policy:
+/// a non-DX12 adapter would make window creation appear successful but would
+/// fail when the external-host interop layer asks for the DX12 HAL.
+fn windowed_backends() -> Result<wgpu::Backends, String> {
+    #[cfg(windows)]
+    {
+        if let Ok(value) = std::env::var("NEON_WGPU_BACKENDS") {
+            let requested = value
+                .split(',')
+                .map(str::trim)
+                .filter(|backend| !backend.is_empty())
+                .collect::<Vec<_>>();
+            if !requested.iter().any(|backend| *backend == "dx12") {
+                return Err(format!(
+                    "windowed rendering requires the dx12 backend for D3D12 shared surfaces; requested={value}"
+                ));
+            }
+        }
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "event": "wgpu.backend.selected",
+                "mode": "windowed",
+                "backend": "dx12",
+                "reason": "d3d12_shared_texture_v1"
+            })
+        );
+        return Ok(wgpu::Backends::DX12);
+    }
+
+    #[cfg(not(windows))]
+    Ok(platform_backends())
 }
 
 #[cfg(target_os = "android")]
@@ -5428,6 +5467,16 @@ impl WindowGpu {
         #[cfg(windows)]
         let dx12_adapter = dx12_interop::adapter_info(&adapter)
             .map_err(|error| format!("inspect DX12 adapter for external host interop: {error}"))?;
+        #[cfg(windows)]
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "event": "wgpu.adapter.selected",
+                "backend": "dx12",
+                "adapter": &dx12_adapter.name,
+                "luid": &dx12_adapter.luid
+            })
+        );
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("neon3-wgpu-runtime-device"),
             required_features: wgpu::Features::empty(),
@@ -6784,15 +6833,18 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                 let blur_commit = self.gpu.as_mut().and_then(|gpu| {
                     let next_input = gpu.ui.text_input_at_pointer();
                     let active_path = gpu.ui.active_text_input_path();
-                    if gpu.ui.data_grid_text_input_active()
-                        && next_input
-                            .as_ref()
-                            .is_none_or(|input| Some(input.node_path.as_str()) != active_path)
+                    if next_input
+                        .as_ref()
+                        .is_none_or(|input| Some(input.node_path.as_str()) != active_path)
                     {
-                        take_data_grid_text_commit(gpu)
-                    } else {
-                        None
-                    }
+                        if gpu.ui.data_grid_text_input_active() {
+                            take_data_grid_text_commit(gpu)
+                        } else {
+                            let (binding, value) = gpu.ui.finish_text_input()?;
+                            gpu.next_semantic_sequence += 1;
+                            Some((gpu.next_semantic_sequence, binding, value))
+                        }
+                    } else { None }
                 });
                 if let (Some(endpoint), Some((sequence, binding, value))) =
                     (self.ui_endpoint, blur_commit)

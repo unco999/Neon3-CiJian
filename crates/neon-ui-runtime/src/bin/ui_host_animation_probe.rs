@@ -239,6 +239,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             request_id: event_id.into(),
             idempotency_key: event_id.into(),
             requested_value: None,
+            committed_text: None,
             interaction: UiSemanticInteractionMetadata {
                 interaction_id: format!("{event_id}-interaction"),
                 sequence,

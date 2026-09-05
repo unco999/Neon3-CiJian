@@ -2169,6 +2169,10 @@ pub struct UiProgramSemanticEvent {
     pub idempotency_key: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requested_value: Option<UiSemanticPayloadValue>,
+    /// Text commits retain their typed commit envelope alongside the stable
+    /// control handle so an external domain host can consume the user text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub committed_text: Option<UiTextInputCommit>,
     pub interaction: UiSemanticInteractionMetadata,
 }
 

@@ -3825,6 +3825,15 @@ impl UiWgpuRenderer {
         Some((binding, value))
     }
 
+    pub(crate) fn finish_text_input(&mut self) -> Option<(UiHitBinding, String)> {
+        let node_path = self.editing.node_path.clone()?;
+        let binding = self.text_input_binding(&node_path)?;
+        let value = self.editing.committed.clone();
+        self.editing.clear();
+        self.pointer_visual_dirty = true;
+        Some((binding, value))
+    }
+
     pub(crate) fn cancel_data_grid_text_input(&mut self) -> bool {
         if !self.data_grid_text_input_active() {
             return false;
