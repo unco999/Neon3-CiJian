@@ -138,3 +138,9 @@ All notable changes to Neon3 are recorded in this file.
   `neon-ui-runtime`, `neon-wgpu-runtime`, font assets, release manifest).
 - `neon-gpu-ecs` is a workspace crate only; crates.io registry publication
   (`scripts/publish-crates.ps1`) is a separate step and was not run for this tag.
+## v0.2.6 — 2026-09-06
+
+- 修复 NUI Flow 动态状态重挂后的完整 input 恢复。
+- 增加 TextInput 提交事件的 typed 文本传递，支持外部 host 发送聊天消息。
+- 修复窗口输入失焦提交、聊天发送按钮和多控件布局问题。
+- 增加可执行 Flow submit probe。

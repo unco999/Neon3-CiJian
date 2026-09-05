@@ -12,7 +12,7 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 neon-protocol = { version = "0.2.0", path = "../neon-protocol" }
 neon-ipc = { version = "0.2.0", path = "../neon-ipc" }
-neon-wgpu-runtime = { version = "0.2.5", path = "../neon-wgpu-runtime" }
+neon-wgpu-runtime = { version = "0.2.6", path = "../neon-wgpu-runtime" }
 serde.workspace = true
 serde_json.workspace = true
 jni = "0.21"

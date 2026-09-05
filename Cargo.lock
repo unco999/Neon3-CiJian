@@ -944,7 +944,7 @@ dependencies = [
 
 [[package]]
 name = "neon-android-host"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "jni 0.21.1",
  "neon-ipc",
@@ -957,7 +957,7 @@ dependencies = [
 
 [[package]]
 name = "neon-cli"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "neon-ipc",
  "neon-protocol",
@@ -967,7 +967,7 @@ dependencies = [
 
 [[package]]
 name = "neon-dev"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "neon-ipc",
  "neon-protocol",
@@ -980,7 +980,7 @@ dependencies = [
 
 [[package]]
 name = "neon-eventd"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "neon-ipc",
  "neon-observability",
@@ -991,7 +991,7 @@ dependencies = [
 
 [[package]]
 name = "neon-gpu-ecs"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "bytemuck",
  "pollster",
@@ -1002,7 +1002,7 @@ dependencies = [
 
 [[package]]
 name = "neon-ipc"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "neon-protocol",
  "serde",
@@ -1012,7 +1012,7 @@ dependencies = [
 
 [[package]]
 name = "neon-observability"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "neon-protocol",
  "serde",
@@ -1021,7 +1021,7 @@ dependencies = [
 
 [[package]]
 name = "neon-projectd"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "neon-ipc",
  "neon-observability",
@@ -1031,7 +1031,7 @@ dependencies = [
 
 [[package]]
 name = "neon-protocol"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "serde",
  "serde_json",
@@ -1039,7 +1039,7 @@ dependencies = [
 
 [[package]]
 name = "neon-ui"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "neon-ipc",
  "neon-ui-runtime",
@@ -1048,7 +1048,7 @@ dependencies = [
 
 [[package]]
 name = "neon-ui-runtime"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "neon-ipc",
  "neon-observability",
@@ -1062,7 +1062,7 @@ dependencies = [
 
 [[package]]
 name = "neon-ui-schema"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "neon-protocol",
  "neon-world-bridge",
@@ -1072,7 +1072,7 @@ dependencies = [
 
 [[package]]
 name = "neon-wgpu-ai"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "bytemuck",
  "pollster",
@@ -1083,7 +1083,7 @@ dependencies = [
 
 [[package]]
 name = "neon-wgpu-runtime"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "bytemuck",
  "fontdue",
@@ -1106,7 +1106,7 @@ dependencies = [
 
 [[package]]
 name = "neon-world-bridge"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "neon-protocol",
  "serde",
