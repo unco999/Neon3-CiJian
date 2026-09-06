@@ -138,6 +138,7 @@ unsafe impl Send for SharedSurface {}
 unsafe impl Sync for SharedSurface {}
 #[cfg(target_os = "android")]
 mod android_entry;
+mod shader_registry;
 mod ui_program_gpu;
 mod ui_renderer;
 mod world_ui_pipeline;
@@ -9893,6 +9894,9 @@ pub struct WgpuRuntime {
     ui_input_revision: u64,
     ui_program_revision: Option<Value>,
     ui_surface_id: Option<String>,
+    /// Custom shader package registry (`wgpu.shader.register`). Control-plane
+    /// only: entries are validated and WGSL-parsed before adoption.
+    shader_registry: shader_registry::ShaderRegistry,
 }
 
 impl WgpuRuntime {
@@ -9925,6 +9929,7 @@ impl WgpuRuntime {
             ui_input_revision: 0,
             ui_program_revision: None,
             ui_surface_id: None,
+            shader_registry: shader_registry::ShaderRegistry::new(),
         }
     }
 
@@ -9961,6 +9966,9 @@ impl WgpuRuntime {
             neon_ui_schema::UI_NINE_SLICE_CAPABILITY_NAME.into(),
             neon_ui_schema::UI_COMPONENT_SKIN_CAPABILITY_NAME.into(),
             neon_ui_schema::UI_CANVAS_POINTS_LINES_CAPABILITY_NAME.into(),
+            neon_ui_schema::UI_GEOMETRY_CUT_CAPABILITY_NAME.into(),
+            neon_ui_schema::UI_SHADER_PACKAGE_CAPABILITY_NAME.into(),
+            neon_ui_schema::UI_SHADER_MATERIAL_CAPABILITY_NAME.into(),
             CAPABILITY_EXTERNAL_HOST_BACKEND_MATCH.into(),
             "wgpu.world.info.bridge".into(),
             "wgpu.world.ui.anchor.batch.v1".into(),
@@ -10800,6 +10808,10 @@ impl WgpuRuntime {
             "debug.interaction.query" => self.interaction_query(request_id, request.params),
             "wgpu.ui.submit_fragment" => self.submit_fragment(request_id, request.params),
             "wgpu.ui.remove_fragment" => self.remove_fragment(request_id, request.params),
+            "wgpu.shader.register" => self.shader_register(request_id, request.params),
+            "wgpu.shader.state" => {
+                self.accept(request_id, self.shader_registry.snapshot())
+            }
             "wgpu.ui.semantic_event.validate" | "test.ui.semantic_event.inject" => {
                 self.inject_semantic_event(request_id, request.params)
             }
@@ -11047,6 +11059,67 @@ impl WgpuRuntime {
         self.graph_revision = Revision(self.graph_revision.0 + 1);
         self.hit_target_generation += 1;
         self.accept(request_id, diagnostics_value(self.diagnostics()))
+    }
+
+    /// `wgpu.shader.register`: adopt a validated custom shader package.
+    ///
+    /// The request carries a `UiShaderPackage` with WGSL source bytes and a
+    /// source digest. The runtime re-computes the digest, rejects packages over
+    /// the budget, and performs a real WGSL parse with the live device so a
+    /// broken shader fails at registration instead of at bind time.
+    fn shader_register(&mut self, request_id: RequestId, params: Value) -> RpcResponse {
+        let package = match serde_json::from_value::<neon_ui_schema::UiShaderPackage>(
+            params.get("package").cloned().unwrap_or(Value::Null),
+        ) {
+            Ok(package) => package,
+            Err(error) => {
+                return self.reject(
+                    request_id,
+                    "invalid_shader_package",
+                    &format!("shader package payload is invalid: {error}"),
+                    None,
+                );
+            }
+        };
+        let computed = shader_registry::shader_source_digest(&package.source_bytes);
+        if package.source_digest != computed {
+            return self.reject(
+                request_id,
+                "ui_shader_source_digest_mismatch",
+                &format!(
+                    "shader source digest mismatch: expected {}, computed {}",
+                    package.source_digest, computed
+                ),
+                None,
+            );
+        }
+        if !package.validate().is_ok() {
+            return self.reject(
+                request_id,
+                "ui_shader_source_too_large",
+                "shader package failed budget or parameter validation",
+                None,
+            );
+        }
+        match self.shader_registry.register(&package) {
+            Ok(entry) => self.accept(
+                request_id,
+                json!({
+                    "status": "registered",
+                    "package_id": entry.package.package_id,
+                    "version": entry.package.version,
+                    "source_digest": entry.package.source_digest,
+                    "fallback": entry.package.fallback,
+                    "validated": entry.validated,
+                }),
+            ),
+            Err(error) => self.reject(
+                request_id,
+                "ui_shader_compile_failed",
+                &error,
+                None,
+            ),
+        }
     }
 
     /// Compile and adopt a NUI Flow as the single-endpoint UI program.
@@ -12141,8 +12214,57 @@ mod tests {
     }
 
     #[test]
-    fn headless_health_and_describe_are_available() {
-        let mut runtime = WgpuRuntime::headless(7);
+    fn shader_register_validates_digest_and_exposes_state() {
+        let mut runtime = WgpuRuntime::headless(1);
+        let source = b"@fragment fn material() -> @location(0) vec4<f32> { return vec4(0.0); }";
+        let package = neon_ui_schema::UiShaderPackage {
+            package_id: "pulse-glow".into(),
+            version: 1,
+            source_digest: shader_registry::shader_source_digest(source),
+            source_bytes: source.to_vec(),
+            entry_point: "material".into(),
+            fallback: "standard_ui".into(),
+            parameters: Vec::new(),
+        };
+        let registered = runtime.handle(request(
+            "shader-register",
+            "wgpu.shader.register",
+            json!({ "package": package }),
+        ));
+        assert_eq!(registered.status, RpcStatus::Accepted);
+        assert_eq!(registered.result.unwrap()["status"], "registered");
+        let state = runtime.handle(request("shader-state", "wgpu.shader.state", json!({})));
+        assert_eq!(state.status, RpcStatus::Accepted);
+        assert_eq!(state.result.unwrap()["count"], 1);
+    }
+
+    #[test]
+    fn shader_register_rejects_digest_mismatch() {
+        let mut runtime = WgpuRuntime::headless(1);
+        let source = b"@fragment fn material() -> @location(0) vec4<f32> { return vec4(0.0); }";
+        let package = neon_ui_schema::UiShaderPackage {
+            package_id: "pulse-glow".into(),
+            version: 1,
+            source_digest: "deadbeef".into(),
+            source_bytes: source.to_vec(),
+            entry_point: "material".into(),
+            fallback: "standard_ui".into(),
+            parameters: Vec::new(),
+        };
+        let response = runtime.handle(request(
+            "shader-bad-digest",
+            "wgpu.shader.register",
+            json!({ "package": package }),
+        ));
+        assert_eq!(response.status, RpcStatus::Rejected);
+        assert_eq!(
+            response.error.unwrap().code,
+            "ui_shader_source_digest_mismatch"
+        );
+    }
+
+    #[test]
+    fn headless_health_and_describe_are_available() {        let mut runtime = WgpuRuntime::headless(7);
         let health = runtime.handle(request("health", "service.health", json!({})));
         let describe = runtime.handle(request("describe", "service.describe", json!({})));
         let snapshot = runtime.handle(request("snapshot", "debug.snapshot.get", json!({})));

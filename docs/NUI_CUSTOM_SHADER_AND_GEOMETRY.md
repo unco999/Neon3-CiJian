@@ -200,15 +200,21 @@ The SDK sends a typed control-plane request equivalent to:
 wgpu.shader.register
   package_id: pulse-glass
   version: 1
-  source_digest: sha256:...
+  source_digest: fnv1a64 hex of the WGSL source (16 hex chars)
   source_bytes: bounded binary payload, never a JSON GPU handle
   entry_point: material
   fallback: standard_ui
 ```
 
-The runtime replies with `registered`, `rejected`, or `fallback`. A Flow that
-uses an unregistered shader is rejected with a stable error code. Node can then
-submit a revised Flow after registration succeeds.
+The runtime recomputes the digest with the same FNV-1a 64-bit fingerprint
+(`shader_source_digest` in `neon-wgpu-runtime::shader_registry` and the Node SDK
+`shaderSourceDigest`), rejects packages over the source budget, and stores the
+package in the control-plane `ShaderRegistry`. A real WGSL parse/bind happens
+later in the renderer with the live device, matching wgpu's lazy pipeline model;
+registration itself is device-independent so both headless and windowed hosts
+accept it. The runtime replies with `registered`, `rejected`, or a stable error
+code. A Flow that uses an unregistered shader is rejected with a stable error
+code. Node can then submit a revised Flow after registration succeeds.
 
 For development, the SDK may read a local file and calculate the digest. The
 runtime remains responsible for the final source validation and compilation.
@@ -220,11 +226,19 @@ Allowed:
 
 ```text
 shader pulse-glass
-material pulse-glass
-material pulse-glass overflow 24 8 24 16 parameter rim_strength 0.22
-geometry cut top-left 18 top-right 12 bottom-right 18 bottom-left 12
+panel hero x 10 y 20 w 200 h 100
+  geometry cut 18 10 18 10
+  material pulse-glass overflow 24 8 24 16 parameter rim_strength 0.22
 parameter sweep_speed $glass_sweep_speed
 ```
+
+`geometry` and `material` are sub-line declarations attached to a node (two
+spaces deeper than the node line), mirroring `slot` under `skin`. `geometry cut`
+takes `[bottom-left, bottom-right, top-right, top-left]` logical pixels;
+`material` takes a registered package key followed by optional `overflow
+[left top right bottom]` and `parameter <key> <value>` clauses. The renderer
+clips both the color pass and the hit pass to the same polygon, so a corner
+that is visually cut away is also not hit-testable.
 
 Forbidden:
 
@@ -319,12 +333,20 @@ Focused acceptance probes must cover:
 
 ## Implementation Order
 
-1. Add `UiGeometry` and `UiMaterialRef` to `neon-ui-schema` with validation.
+1. Add `UiGeometry` and `UiMaterialRef` to `neon-ui-schema` with validation. ✅
 2. Add parser support for `geometry cut`, `shader`, `material`, and bounded
-   parameters.
-3. Add `wgpu.shader.register` to the public protocol and Node SDK.
-4. Add a renderer material registry with standard fallback and JSONL diagnostics.
-5. Implement cut geometry in the UI vertex/clip path and align hit testing.
+   parameters. ✅ (sub-line declarations; document-level maps)
+3. Add `wgpu.shader.register` to the public protocol and Node SDK. ✅
+   (`ShaderRegistry` control-plane registry; digest + budget validation;
+   `wgpu.shader.register`/`wgpu.shader.state`; SDK `RenderClient.registerShader`
+   and `NeonApp.registerShader`; `ClientKind::AppHost` accepted so SDK defaults
+   deserialize.)
+4. Add a renderer material registry with standard fallback and JSONL
+   diagnostics. (Next: real WGSL compile+bind on the live device and the
+   standard fallback path.)
+5. Implement cut geometry in the UI vertex/clip path and align hit testing. ✅
+   (color pass and hit pass share `outside_cut`; `UiInstance`/`UiHitInstance`
+   carry `cut`.)
 6. Implement `pulse-glass.wgsl` and `pulse-neon-edge.wgsl`.
 7. Apply the packages to the Pulse Flow and validate the supplied design.
 8. Add the equalizer material only after the static material path is stable.

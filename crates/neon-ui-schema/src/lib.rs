@@ -1502,6 +1502,13 @@ pub enum UiEffect {
         node_id: UiNodeId,
         layout: UiNineSlice,
     },
+    /// Cut-corner panel style for one visual node. The renderer clips the node
+    /// and its hit region to the same deterministic polygon; values are logical
+    /// pixels removed from [bottom-left, bottom-right, top-right, top-left].
+    Geometry {
+        node_id: UiNodeId,
+        geometry: UiGeometry,
+    },
     /// A validated finite skin recipe. Resource resolution and drawing remain
     /// renderer-owned; this effect contains no GPU identity.
     ControlSkin {
@@ -3412,6 +3419,13 @@ impl UiEffect {
                     Ok(())
                 }
             }
+            Self::Geometry { node_id, geometry } => {
+                if node_id.0.trim().is_empty() {
+                    Err(UiSchemaError::InvalidProgramEvent)
+                } else {
+                    geometry.validate()
+                }
+            }
             Self::ControlSkin { skin } => skin.validate(),
             Self::SkinReference { node_id, skin_key } => {
                 if node_id.0.trim().is_empty() || skin_key.trim().is_empty() {
@@ -3549,6 +3563,32 @@ mod tests {
             ..package.clone()
         };
         assert_eq!(over_budget.validate(), Err(UiSchemaError::InvalidShaderBudget));
+    }
+
+    #[test]
+    fn geometry_effect_validates_cut_and_node() {
+        let valid = UiEffect::Geometry {
+            node_id: UiNodeId("hero".into()),
+            geometry: UiGeometry {
+                cut: [18.0, 10.0, 18.0, 10.0],
+            },
+        };
+        assert_eq!(valid.validate(), Ok(()));
+        let invalid_cut = UiEffect::Geometry {
+            node_id: UiNodeId("hero".into()),
+            geometry: UiGeometry {
+                cut: [-4.0, 0.0, 0.0, 0.0],
+            },
+        };
+        assert_eq!(invalid_cut.validate(), Err(UiSchemaError::InvalidGeometry));
+        let empty_node = UiEffect::Geometry {
+            node_id: UiNodeId("".into()),
+            geometry: UiGeometry { cut: [0.0; 4] },
+        };
+        assert_eq!(
+            empty_node.validate(),
+            Err(UiSchemaError::InvalidProgramEvent)
+        );
     }
 
     #[test]

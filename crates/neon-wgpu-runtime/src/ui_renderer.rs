@@ -76,6 +76,22 @@ fn outside_clip(pixel: vec2<f32>, clip: vec4<f32>, radius: f32) -> bool {
     return length(max(abs(point) - extent, vec2<f32>(0.0))) > r;
 }
 
+fn outside_cut(local: vec2<f32>, size: vec2<f32>, cut: vec4<f32>) -> bool {
+    // cut = [bl, br, tr, tl] logical pixels removed from each corner.
+    let p = local * size;
+    let bl = min(cut.x, min(size.x, size.y));
+    let br = min(cut.y, min(size.x, size.y));
+    let tr = min(cut.z, min(size.x, size.y));
+    let tl = min(cut.w, min(size.x, size.y));
+    if (bl > 0.0 && p.x < bl && p.y < bl && p.x + p.y < bl) { return true; }
+    let rx = size.x - p.x;
+    if (br > 0.0 && rx < br && p.y < br && rx + p.y < br) { return true; }
+    let ty = size.y - p.y;
+    if (tr > 0.0 && rx < tr && ty < tr && rx + ty < tr) { return true; }
+    if (tl > 0.0 && p.x < tl && ty < tl && p.x + ty < tl) { return true; }
+    return false;
+}
+
 struct VsIn {
     @location(0) rect: vec4<f32>,
     @location(1) fill: vec4<f32>,
@@ -88,6 +104,7 @@ struct VsIn {
     @location(8) from_border: vec4<f32>,
     @location(9) from_params: vec4<f32>,
     @location(10) animation: vec4<f32>,
+    @location(11) cut: vec4<f32>,
 }
 
 struct VsOut {
@@ -99,6 +116,7 @@ struct VsOut {
     @location(4) params: vec4<f32>,
     @location(5) clip: vec4<f32>,
     @location(6) pixel: vec2<f32>,
+    @location(7) cut: vec4<f32>,
 }
 
 @vertex
@@ -123,12 +141,14 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32, input: VsIn) -> VsOut {
     output.params = params;
     output.clip = input.clip;
     output.pixel = pixel;
+    output.cut = input.cut;
     return output;
 }
 
 @fragment
 fn fs_main(input: VsOut) -> @location(0) vec4<f32> {
     if (outside_clip(input.pixel, input.clip, input.params.w)) { discard; }
+    if (outside_cut(input.local, input.size, input.cut)) { discard; }
     if (input.params.y < 0.0) {
         let cut = min(-input.params.y, input.size.x * 0.25);
         let point = input.local * input.size;
@@ -172,15 +192,17 @@ struct View { viewport: vec2<f32>, color_mode: u32, time_seconds: f32 }
 @group(0) @binding(0) var<uniform> view: View;
 fn animation_progress(animation: vec4<f32>) -> f32 { if (animation.w == 0.0 || animation.y <= 0.0) { return 1.0; } let t=clamp((view.time_seconds-animation.x)/animation.y,0.0,1.0); if(animation.z==1.0){return t*t;} if(animation.z==2.0){return 1.0-(1.0-t)*(1.0-t);} if(animation.z==3.0){return select(2.0*t*t,1.0-pow(-2.0*t+2.0,2.0)/2.0,t>=0.5);} return t; }
 fn outside_clip(pixel: vec2<f32>, clip: vec4<f32>, radius: f32) -> bool { if (pixel.x < clip.x || pixel.y < clip.y || pixel.x > clip.z || pixel.y > clip.w) { return true; } if (radius <= 0.0) { return false; } let size=clip.zw-clip.xy; let r=min(radius,min(size.x,size.y)*0.5); let point=pixel-(clip.xy+size*0.5); let extent=max(size*0.5-vec2<f32>(r),vec2<f32>(0.0)); return length(max(abs(point)-extent,vec2<f32>(0.0)))>r; }
-struct VsIn { @location(0) rect: vec4<f32>, @location(1) params: vec4<f32>, @location(2) hit_id: u32, @location(3) clip: vec4<f32> }
-struct VsOut { @builtin(position) position: vec4<f32>, @location(0) local: vec2<f32>, @location(1) size: vec2<f32>, @location(2) params: vec4<f32>, @location(3) @interpolate(flat) hit_id: u32, @location(4) clip: vec4<f32>, @location(5) pixel: vec2<f32> }
+fn outside_cut(local: vec2<f32>, size: vec2<f32>, cut: vec4<f32>) -> bool { let p = local * size; let bl = min(cut.x, min(size.x, size.y)); let br = min(cut.y, min(size.x, size.y)); let tr = min(cut.z, min(size.x, size.y)); let tl = min(cut.w, min(size.x, size.y)); if (bl > 0.0 && p.x < bl && p.y < bl && p.x + p.y < bl) { return true; } let rx = size.x - p.x; if (br > 0.0 && rx < br && p.y < br && rx + p.y < br) { return true; } let ty = size.y - p.y; if (tr > 0.0 && rx < tr && ty < tr && rx + ty < tr) { return true; } if (tl > 0.0 && p.x < tl && ty < tl && p.x + ty < tl) { return true; } return false; }
+struct VsIn { @location(0) rect: vec4<f32>, @location(1) params: vec4<f32>, @location(2) hit_id: u32, @location(3) clip: vec4<f32>, @location(4) cut: vec4<f32> }
+struct VsOut { @builtin(position) position: vec4<f32>, @location(0) local: vec2<f32>, @location(1) size: vec2<f32>, @location(2) params: vec4<f32>, @location(3) @interpolate(flat) hit_id: u32, @location(4) clip: vec4<f32>, @location(5) pixel: vec2<f32>, @location(6) cut: vec4<f32> }
 @vertex fn vs_main(@builtin(vertex_index) vertex_index: u32, input: VsIn) -> VsOut {
  var corners = array<vec2<f32>, 6>(vec2<f32>(0.0,0.0),vec2<f32>(1.0,0.0),vec2<f32>(0.0,1.0),vec2<f32>(0.0,1.0),vec2<f32>(1.0,0.0),vec2<f32>(1.0,1.0));
  let local = corners[vertex_index]; let pixel = input.rect.xy + local * input.rect.zw; var output: VsOut;
- output.position = vec4<f32>(pixel.x / view.viewport.x * 2.0 - 1.0, 1.0 - pixel.y / view.viewport.y * 2.0, 0.0, 1.0); output.local = local; output.size = input.rect.zw; output.params = input.params; output.hit_id = input.hit_id; output.clip = input.clip; output.pixel = pixel; return output;
+ output.position = vec4<f32>(pixel.x / view.viewport.x * 2.0 - 1.0, 1.0 - pixel.y / view.viewport.y * 2.0, 0.0, 1.0); output.local = local; output.size = input.rect.zw; output.params = input.params; output.hit_id = input.hit_id; output.clip = input.clip; output.pixel = pixel; output.cut = input.cut; return output;
 }
 @fragment fn fs_main(input: VsOut) -> @location(0) u32 {
    if (outside_clip(input.pixel, input.clip, input.params.w)) { discard; }
+  if (outside_cut(input.local, input.size, input.cut)) { discard; }
   if (input.params.y < 0.0) {
    let cut=min(-input.params.y,input.size.x*0.25); let point=input.local*input.size;
    let left=cut*(1.0-input.local.y); let right=input.size.x-cut*input.local.y;
@@ -428,6 +450,10 @@ struct UiInstance {
     from_params: [f32; 4],
     /// start seconds, duration seconds, easing code, enabled.
     animation: [f32; 4],
+    /// Cut-corner panel style in logical pixels: [bl, br, tr, tl]. Zero when
+    /// the node has no cut geometry. The fragment shader clips to the same
+    /// polygon used by the hit pass.
+    cut: [f32; 4],
 }
 
 #[repr(C)]
@@ -446,6 +472,8 @@ struct UiHitInstance {
     hit_id: u32,
     _pad: [u32; 3],
     clip: [f32; 4],
+    /// Cut-corner panel style in logical pixels: [bl, br, tr, tl].
+    cut: [f32; 4],
 }
 
 #[derive(Clone, Debug)]
@@ -1243,6 +1271,9 @@ pub struct UiWgpuRenderer {
     resident_images: HashMap<(String, u64, u64), ResidentImage>,
     external_images: HashMap<String, ResidentImage>,
     nine_slices: HashMap<String, neon_ui_schema::UiNineSlice>,
+    /// Cut-corner panel styles keyed by the short node id (matches the
+    /// `nine_slices` pattern). Zero cut means no corner removal.
+    node_cuts: HashMap<String, [f32; 4]>,
     image_fits: HashMap<String, UiImageFit>,
     skins: HashMap<String, UiControlSkin>,
     skin_references: HashMap<String, String>,
@@ -1431,6 +1462,11 @@ impl UiWgpuRenderer {
                             offset: 152,
                             shader_location: 10,
                         },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x4,
+                            offset: 168,
+                            shader_location: 11,
+                        },
                     ],
                 })],
                 compilation_options: Default::default(),
@@ -1497,6 +1533,11 @@ impl UiWgpuRenderer {
                             format: wgpu::VertexFormat::Float32x4,
                             offset: 48,
                             shader_location: 3,
+                        },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x4,
+                            offset: 64,
+                            shader_location: 4,
                         },
                     ],
                 })],
@@ -1971,6 +2012,7 @@ impl UiWgpuRenderer {
             resident_images: HashMap::new(),
             external_images: HashMap::new(),
             nine_slices: HashMap::new(),
+            node_cuts: HashMap::new(),
             image_fits: HashMap::new(),
             skins: HashMap::new(),
             skin_references: HashMap::new(),
@@ -2034,6 +2076,11 @@ impl UiWgpuRenderer {
         let mut instances = Vec::new();
         for (hit_id, index) in hit_nodes {
             let visual = self.visual_at(index);
+            let short_key = self.plan[index]
+                .id
+                .rsplit('/')
+                .next()
+                .unwrap_or(&self.plan[index].id);
             instances.push(UiHitInstance {
                 rect: [
                     visual.bounds.x,
@@ -2055,6 +2102,7 @@ impl UiWgpuRenderer {
                     visual.clip.x + visual.clip.width,
                     visual.clip.y + visual.clip.height,
                 ],
+                cut: self.node_cuts.get(short_key).copied().unwrap_or([0.0; 4]),
             });
         }
         if instances.is_empty() {
@@ -5853,6 +5901,7 @@ impl UiWgpuRenderer {
             return false;
         }
         self.nine_slices.clear();
+        self.node_cuts.clear();
         self.image_fits.clear();
         self.skins.clear();
         self.skin_references.clear();
@@ -5863,6 +5912,11 @@ impl UiWgpuRenderer {
                 match effect {
                     neon_ui_schema::UiEffect::NineSlice { node_id, layout } => {
                         self.nine_slices.insert(node_id.0.clone(), *layout);
+                    }
+                    neon_ui_schema::UiEffect::Geometry { node_id, geometry } => {
+                        if !geometry.is_default() {
+                            self.node_cuts.insert(node_id.0.clone(), geometry.cut);
+                        }
                     }
                     neon_ui_schema::UiEffect::ControlSkin { skin } => {
                         self.skins.insert(skin.key.clone(), skin.clone());
@@ -6629,7 +6683,16 @@ impl UiWgpuRenderer {
                 visual.clip_radius,
             ],
             animation: [0.0; 4],
+            cut: [0.0; 4],
         };
+        if let Some(cut) = self.node_cuts.get(
+            node_path
+                .rsplit('/')
+                .next()
+                .unwrap_or(node_path),
+        ) {
+            instance.cut = *cut;
+        }
         if let Some(active) = self.active.get(node_path) {
             let from_style = if active.from.style == UiStyle::default() {
                 default_component_style(&active.from.kind)
@@ -16776,11 +16839,11 @@ mod tests {
 
     #[test]
     fn ui_instance_abi_matches_vertex_attributes() {
-        // The color/depth vertex buffer layout encodes offsets 0..=152 and the
-        // WGSL `VsIn` reads locations 0..=10 as Float32x4/Float32. Freeze the
+        // The color/depth vertex buffer layout encodes offsets 0..=168 and the
+        // WGSL `VsIn` reads locations 0..=11 as Float32x4/Float32. Freeze the
         // `#[repr(C)]` layout so a future field reorder cannot silently break
         // the shader bindings.
-        assert_eq!(std::mem::size_of::<UiInstance>(), 168);
+        assert_eq!(std::mem::size_of::<UiInstance>(), 184);
         assert_eq!(std::mem::align_of::<UiInstance>(), 4);
         #[rustfmt::skip]
         let offsets = [
@@ -16796,6 +16859,7 @@ mod tests {
             (120, 16), // from_border
             (136, 16), // from_params
             (152, 16), // animation
+            (168, 16), // cut
         ];
         let mut cursor = 0usize;
         for (offset, size) in offsets {
@@ -16805,6 +16869,7 @@ mod tests {
         assert_eq!(cursor, std::mem::size_of::<UiInstance>());
         let instance = UiInstance::zeroed();
         assert_eq!(instance.animation, [0.0; 4]);
+        assert_eq!(instance.cut, [0.0; 4]);
         assert_eq!(instance.depth, 0.0);
         assert_eq!(instance.paint_group_id, 0);
     }

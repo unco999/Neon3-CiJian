@@ -24,6 +24,10 @@ pub struct RequestId(pub String);
 #[serde(rename_all = "snake_case")]
 pub enum ClientKind {
     Cli,
+    /// Node SDK wrapper clients before the visual entry point re-identifies as
+    /// `external_host`/`ui_runtime`. Accepted by the protocol so a control-plane
+    /// request is never silently dropped during deserialization.
+    AppHost,
     UiReactClient,
     UiRuntime,
     TerrainRuntime,

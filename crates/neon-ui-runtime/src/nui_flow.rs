@@ -843,6 +843,16 @@ pub fn lower_nui_flow_effects(document: &NuiFlowDocument) -> Vec<UiEffect> {
                 layout: decoration.nine_slice,
             }),
     );
+    effects.extend(
+        document
+            .ir
+            .geometry_records
+            .iter()
+            .map(|(node_key, geometry)| UiEffect::Geometry {
+                node_id: UiNodeId(node_key.clone()),
+                geometry: *geometry,
+            }),
+    );
     effects.extend(document.ir.skins.iter().cloned().map(|skin| UiEffect::ControlSkin { skin }));
     effects.extend(document.ir.skin_references.iter().map(|(node_id, skin_key)| UiEffect::SkinReference {
         node_id: UiNodeId(node_id.clone()),
@@ -2533,8 +2543,8 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
     let mut image_resource = None;
     let mut nine_slice = None;
     let mut skin_key = None;
-    let mut geometry = None;
-    let mut material = None;
+    let geometry = None;
+    let material = None;
     let mut world_camera = None;
     let mut world_anchor = None;
     let mut used = HashSet::new();
