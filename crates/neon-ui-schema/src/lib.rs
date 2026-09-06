@@ -22,6 +22,15 @@ pub const UI_COMPONENT_SKIN_CAPABILITY_NAME: &str = "ui.component_skin.v1";
 /// Declarative, data-driven 2D point/line canvas. Canvas contents are typed
 /// UI inputs; the WGPU runtime owns their GPU expansion and final pixels.
 pub const UI_CANVAS_POINTS_LINES_CAPABILITY_NAME: &str = "ui.canvas.points_lines.v1";
+/// Cut-corner geometry for panels and interaction regions. The renderer turns
+/// the declaration into a deterministic convex polygon used for both clipping
+/// and hit testing.
+pub const UI_GEOMETRY_CUT_CAPABILITY_NAME: &str = "ui.geometry.cut.v1";
+/// Bounded custom-shader material packages. Node registers immutable WGSL;
+/// the runtime compiles, caches, and binds the material.
+pub const UI_SHADER_PACKAGE_CAPABILITY_NAME: &str = "ui.shader.package.v1";
+/// Per-node material references resolved against registered packages.
+pub const UI_SHADER_MATERIAL_CAPABILITY_NAME: &str = "ui.shader.material.v1";
 
 pub const ERROR_UI_PROGRAM_UNSUPPORTED_SCHEMA: &str = "ui_program_unsupported_schema";
 pub const ERROR_UI_PROGRAM_UNSUPPORTED_CAPABILITY: &str = "ui_program_unsupported_capability";
@@ -56,6 +65,14 @@ pub const ERROR_NUI_FLOW_PARSE: &str = "nui_flow_parse";
 pub const ERROR_NUI_FLOW_FORBIDDEN_FEATURE: &str = "nui_flow_forbidden_feature";
 pub const ERROR_NUI_FLOW_INVALID_PATCH: &str = "nui_flow_invalid_patch";
 pub const ERROR_NUI_FLOW_STALE_PATCH_REVISION: &str = "nui_flow_stale_patch_revision";
+pub const ERROR_NUI_FLOW_UNKNOWN_SHADER: &str = "nui_flow_unknown_shader";
+pub const ERROR_NUI_FLOW_INVALID_GEOMETRY: &str = "nui_flow_invalid_geometry";
+pub const ERROR_UI_SHADER_UNREGISTERED_PACKAGE: &str = "ui_shader_unregistered_package";
+pub const ERROR_UI_SHADER_SOURCE_TOO_LARGE: &str = "ui_shader_source_too_large";
+pub const ERROR_UI_SHADER_VALIDATION_FAILED: &str = "ui_shader_validation_failed";
+pub const ERROR_UI_SHADER_COMPILE_FAILED: &str = "ui_shader_compile_failed";
+pub const ERROR_UI_SHADER_PARAMETER_OUT_OF_RANGE: &str = "ui_shader_parameter_out_of_range";
+pub const ERROR_UI_SHADER_UNSUPPORTED_BACKEND: &str = "ui_shader_unsupported_backend";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1046,6 +1063,205 @@ impl UiImageFit {
     fn is_stretch(value: &Self) -> bool { *value == Self::Stretch }
 }
 
+/// Visual corner geometry for a panel or interaction region. Values are logical
+/// UI pixels removed from each corner of a rectangular node. The renderer builds
+/// a deterministic convex polygon from this declaration and uses it for both
+/// visual clipping and pointer hit testing.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct UiGeometry {
+    /// removed pixels: [bottom-left, bottom-right, top-right, top-left],
+    /// matching common CSS-style cut-corner ordering.
+    pub cut: [f32; 4],
+}
+
+impl Default for UiGeometry {
+    fn default() -> Self {
+        Self { cut: [0.0; 4] }
+    }
+}
+
+impl UiGeometry {
+    pub const MAX_CUT: f32 = 512.0;
+
+    pub fn is_default(&self) -> bool {
+        self.cut == [0.0; 4]
+    }
+
+    pub fn validate(&self) -> Result<(), UiSchemaError> {
+        if self.cut.iter().any(|value| !value.is_finite() || *value < 0.0 || *value > Self::MAX_CUT) {
+            return Err(UiSchemaError::InvalidGeometry);
+        }
+        Ok(())
+    }
+}
+
+/// Shader parameter kind supported by the first material ABI.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UiShaderParameterKind {
+    F32,
+    Vec2,
+    Vec4,
+    Color,
+}
+
+/// Bounded, typed material parameter. Values must stay in range; the renderer
+/// rejects out-of-range bindings with a stable error code.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiShaderParameter {
+    pub key: String,
+    pub kind: UiShaderParameterKind,
+    #[serde(default)]
+    pub default_value: serde_json::Value,
+    #[serde(default)]
+    pub range: Option<[f32; 2]>,
+}
+
+impl UiShaderParameter {
+    pub fn validate(&self) -> Result<(), UiSchemaError> {
+        if self.key.trim().is_empty() {
+            return Err(UiSchemaError::EmptyShaderKey);
+        }
+        if let Some(range) = self.range {
+            if !range[0].is_finite() || !range[1].is_finite() || range[0] > range[1] {
+                return Err(UiSchemaError::InvalidShaderParameterRange);
+            }
+        } else if self.kind == UiShaderParameterKind::F32
+            && let Some(value) = self.default_value.as_f64()
+            && (!value.is_finite() || value.is_nan())
+        {
+            return Err(UiSchemaError::InvalidShaderParameter);
+        }
+        Ok(())
+    }
+}
+
+/// Bounded, immutable custom material package. The register request carries a
+/// digest and the WGSL source; the renderer owns compilation, caching, and
+/// binding. Fragment IR only carries the stable key and version.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiShaderPackage {
+    pub package_id: String,
+    pub version: u32,
+    pub source_digest: String,
+    pub source_bytes: Vec<u8>,
+    pub entry_point: String,
+    pub fallback: String,
+    #[serde(default)]
+    pub parameters: Vec<UiShaderParameter>,
+}
+
+impl UiShaderPackage {
+    pub const MAX_SOURCE_BYTES: usize = 256 * 1024;
+    pub const MAX_PARAMETERS: usize = 16;
+
+    pub fn validate(&self) -> Result<(), UiSchemaError> {
+        if self.package_id.trim().is_empty() {
+            return Err(UiSchemaError::EmptyShaderKey);
+        }
+        if self.entry_point.trim().is_empty() {
+            return Err(UiSchemaError::InvalidShaderSource);
+        }
+        if self.fallback.trim().is_empty() {
+            return Err(UiSchemaError::InvalidShaderSource);
+        }
+        if self.source_bytes.is_empty() || self.source_bytes.len() > Self::MAX_SOURCE_BYTES {
+            return Err(UiSchemaError::InvalidShaderBudget);
+        }
+        if self.source_digest.len() < 16 {
+            return Err(UiSchemaError::InvalidShaderSource);
+        }
+        if self.parameters.len() > Self::MAX_PARAMETERS {
+            return Err(UiSchemaError::InvalidShaderBudget);
+        }
+        let mut keys = std::collections::HashSet::new();
+        for parameter in &self.parameters {
+            if !keys.insert(parameter.key.as_str()) {
+                return Err(UiSchemaError::InvalidShaderParameter);
+            }
+            parameter.validate()?;
+        }
+        Ok(())
+    }
+}
+
+/// Renderer-independent material reference attached to a visual node. It
+/// references a registered shader package and optional bounded parameter
+/// overrides.
+///
+/// The runtime renders the material on a transparent draw layer stacked at the
+/// same z-order directly above the host panel. The layer never participates in
+/// layout or hit testing; pointer routing stays on the host logical bounds.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiMaterialRef {
+    pub package_id: String,
+    #[serde(default)]
+    pub version: u32,
+    #[serde(default)]
+    pub fallback: String,
+    /// Logical-pixel expansion of the transparent material layer beyond the
+    /// host panel bounds: [left, top, right, bottom]. Positive values let the
+    /// material paint outside the host rectangle (glow, light sweep, halo)
+    /// while the host panel keeps its original interaction region.
+    #[serde(default)]
+    pub overflow: [f32; 4],
+    #[serde(default)]
+    pub parameters: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+impl Default for UiMaterialRef {
+    fn default() -> Self {
+        Self {
+            package_id: String::new(),
+            version: 1,
+            fallback: "standard_ui".into(),
+            overflow: [0.0; 4],
+            parameters: std::collections::BTreeMap::new(),
+        }
+    }
+}
+
+impl UiMaterialRef {
+    pub const MAX_OVERFLOW: f32 = 512.0;
+
+    pub fn validate(&self) -> Result<(), UiSchemaError> {
+        if self.package_id.trim().is_empty() {
+            return Err(UiSchemaError::EmptyShaderKey);
+        }
+        if self
+            .overflow
+            .iter()
+            .any(|value| !value.is_finite() || *value < 0.0 || *value > Self::MAX_OVERFLOW)
+        {
+            return Err(UiSchemaError::InvalidGeometry);
+        }
+        for (key, value) in &self.parameters {
+            if key.trim().is_empty() {
+                return Err(UiSchemaError::InvalidShaderParameter);
+            }
+            if value.is_null() {
+                return Err(UiSchemaError::InvalidShaderParameter);
+            }
+        }
+        Ok(())
+    }
+
+    /// Material draw-layer bounds in logical UI units. The host bounds are
+    /// expanded by `overflow` on each side, clamped to sane limits.
+    pub fn draw_bounds(&self, host: UiBounds) -> UiBounds {
+        UiBounds {
+            x: host.x - self.overflow[0],
+            y: host.y - self.overflow[1],
+            width: host.width + self.overflow[0] + self.overflow[2],
+            height: host.height + self.overflow[1] + self.overflow[3],
+        }
+    }
+}
+
 impl UiAlignItems {
     fn is_start(value: &Self) -> bool {
         *value == Self::Start
@@ -1617,6 +1833,13 @@ pub enum UiSchemaError {
     InvalidProgramEvent,
     MissingProgramResource,
     InvalidControlSkin,
+    InvalidGeometry,
+    UnknownShaderPackage,
+    InvalidShaderParameter,
+    InvalidShaderParameterRange,
+    EmptyShaderKey,
+    InvalidShaderSource,
+    InvalidShaderBudget,
 }
 
 /// Canonical, versioned authoring document. It remains data-only: bindings are
@@ -1645,6 +1868,19 @@ pub struct UiIrDocument {
     /// Stable control-node key to top-level skin key references.
     #[serde(default)]
     pub skin_references: std::collections::BTreeMap<String, String>,
+    /// Graphical node key to cut-corner geometry. The renderer builds the same
+    /// deterministic polygon from this map as it would from a node field.
+    #[serde(default)]
+    pub geometry_records: std::collections::BTreeMap<String, UiGeometry>,
+    /// Graphical node key to material reference. The material paints on a
+    /// transparent draw layer above the host node; the map keeps `UiNode`
+    /// layout-only and mirrors the `skin_references` pattern.
+    #[serde(default)]
+    pub material_records: std::collections::BTreeMap<String, UiMaterialRef>,
+    /// Immutable shader packages declared by the document (control-plane
+    /// registration data). Fragment IR never carries raw WGSL source.
+    #[serde(default)]
+    pub shader_packages: Vec<UiShaderPackage>,
     #[serde(default)]
     pub skins: Vec<UiControlSkin>,
     /// Finite subtrees selected by one direct input predicate. The subtree is
@@ -2381,7 +2617,7 @@ pub struct UiResourceBudget {
     pub max_clips: u32,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UiProgramNode {
     pub key: String,
@@ -2500,6 +2736,17 @@ pub struct UiProgram {
     pub event_records: Vec<UiProgramEventDeclaration>,
     #[serde(default)]
     pub skins: Vec<UiControlSkin>,
+    /// Immutable registered shader packages referenced by materials. The
+    /// fragment carries no shader source; registration is a separate
+    /// control-plane request.
+    #[serde(default)]
+    pub shader_packages: Vec<UiShaderPackage>,
+    /// Graphical node key to cut-corner geometry.
+    #[serde(default)]
+    pub geometry_records: std::collections::BTreeMap<String, UiGeometry>,
+    /// Graphical node key to material reference.
+    #[serde(default)]
+    pub material_records: std::collections::BTreeMap<String, UiMaterialRef>,
     pub resource_budget: UiResourceBudget,
     pub dependency_index: UiDependencyIndex,
     pub layout_hash: String,
@@ -3240,8 +3487,72 @@ mod tests {
     }
 
     #[test]
-    fn style_state_and_animation_property_contract_round_trip() {
-        let patch = UiStylePatch {
+    fn material_overflow_validates_and_expands_draw_bounds() {
+        let material = UiMaterialRef {
+            package_id: "pulse-glass".into(),
+            version: 1,
+            fallback: "standard_ui".into(),
+            overflow: [24.0, 8.0, 24.0, 16.0],
+            parameters: [("rim_strength".into(), serde_json::json!(0.22))].into(),
+        };
+        material.validate().unwrap();
+        let host = UiBounds {
+            x: 10.0,
+            y: 20.0,
+            width: 100.0,
+            height: 50.0,
+        };
+        let draw = material.draw_bounds(host);
+        assert_eq!(draw.x, -14.0);
+        assert_eq!(draw.y, 12.0);
+        assert_eq!(draw.width, 148.0);
+        assert_eq!(draw.height, 74.0);
+        let bad = UiMaterialRef {
+            overflow: [-4.0, 0.0, 0.0, 0.0],
+            ..material.clone()
+        };
+        assert_eq!(bad.validate(), Err(UiSchemaError::InvalidGeometry));
+        let empty = UiMaterialRef {
+            package_id: "".into(),
+            ..material.clone()
+        };
+        assert_eq!(empty.validate(), Err(UiSchemaError::EmptyShaderKey));
+    }
+
+    #[test]
+    fn shader_package_validates_budget_and_parameters() {
+        let package = UiShaderPackage {
+            package_id: "pulse-glass".into(),
+            version: 1,
+            source_digest: "sha256:0123456789abcdef0123456789abcdef".into(),
+            source_bytes: b"@fragment fn material() -> @location(0) vec4<f32> { return vec4(1.0); }".to_vec(),
+            entry_point: "material".into(),
+            fallback: "standard_ui".into(),
+            parameters: vec![UiShaderParameter {
+                key: "rim_strength".into(),
+                kind: UiShaderParameterKind::F32,
+                default_value: serde_json::json!(0.18),
+                range: Some([0.0, 1.0]),
+            }],
+        };
+        package.validate().unwrap();
+        let dup = UiShaderPackage {
+            parameters: vec![
+                package.parameters[0].clone(),
+                package.parameters[0].clone(),
+            ],
+            ..package.clone()
+        };
+        assert_eq!(dup.validate(), Err(UiSchemaError::InvalidShaderParameter));
+        let over_budget = UiShaderPackage {
+            source_bytes: vec![0u8; UiShaderPackage::MAX_SOURCE_BYTES + 1],
+            ..package.clone()
+        };
+        assert_eq!(over_budget.validate(), Err(UiSchemaError::InvalidShaderBudget));
+    }
+
+    #[test]
+    fn style_state_and_animation_property_contract_round_trip() {        let patch = UiStylePatch {
             background_color: Some([0.1, 0.2, 0.3, 1.0]),
             text_color: Some([1.0, 1.0, 1.0, 1.0]),
             opacity: Some(0.8),
@@ -4113,6 +4424,46 @@ impl UiIrDocument {
                 )
         }) {
             return Err(UiSchemaError::InvalidIrDocument);
+        }
+        let shader_keys = self
+            .shader_packages
+            .iter()
+            .map(|package| package.package_id.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        let mut geometry_material_valid = true;
+        for (node_key, geometry) in &self.geometry_records {
+            if geometry.validate().is_err()
+                || find_ir_node(&self.root, node_key).is_none()
+            {
+                geometry_material_valid = false;
+            }
+        }
+        for (node_key, material) in &self.material_records {
+            if material.validate().is_err()
+                || !shader_keys.contains(material.package_id.as_str())
+                || find_ir_node(&self.root, node_key).is_none()
+            {
+                geometry_material_valid = false;
+            }
+        }
+        // Flow-level `shader` declarations are placeholder registrations: the
+        // digest/source are supplied by the later control-plane register
+        // request. Only key validity and uniqueness are enforced here.
+        let mut package_keys = std::collections::HashSet::new();
+        for package in &self.shader_packages {
+            if package.package_id.trim().is_empty()
+                || !package_keys.insert(&package.package_id)
+                || package.fallback.trim().is_empty()
+                || package.entry_point.trim().is_empty()
+            {
+                geometry_material_valid = false;
+            }
+        }
+        if self.shader_packages.len() > 32 {
+            return Err(UiSchemaError::InvalidShaderBudget);
+        }
+        if !geometry_material_valid {
+            return Err(UiSchemaError::UnknownShaderPackage);
         }
         let mut branch_keys = std::collections::HashSet::new();
         for branch in &self.branches {

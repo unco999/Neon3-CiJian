@@ -14,12 +14,12 @@ use neon_ui_schema::{
     UiBranchLayoutParticipation, UiBranchPredicate, UiCameraVisibilityBinding, UiClipPolicy,
     UiDataGridColumn, UiDataGridDeclaration, UiDataGridPresentation, UiDiagnosticSeverity,
     UiDragAxis, UiDragBinding, UiDragBoundary, UiDropBinding, UiDropPlacement, UiEasing, UiEffect,
-    UiGridInputSlot, UiInputKind, UiInputPacking, UiInputSchema, UiInputSlot, UiInputUpdateClass,
+    UiGridInputSlot, UiGeometry, UiInputKind, UiInputPacking, UiInputSchema, UiInputSlot, UiInputUpdateClass,
     UiInputValue, UiIntent, UiIrBinding, UiIrDocument, UiIrPatch, UiIrPatchOperation,
-    UiIrPatchOperationKind, UiJustifyContent, UiLayout, UiLayoutMode, UiNineSlice, UiNineSliceMode,
+    UiIrPatchOperationKind, UiJustifyContent, UiLayout, UiLayoutMode, UiMaterialRef, UiNineSlice, UiNineSliceMode,
     UiNode, UiNodeId, UiNodeKind, UiProgram, UiProgramEventDeclaration, UiProgramRevision,
-    UiResourceBudget, UiRichTextSpan, UiSourceSpan, UiStyle, UiSurfaceId, UiTemplateDeclaration, UiTransition,
-    UiTransitionState,
+    UiResourceBudget, UiRichTextSpan, UiShaderPackage,
+    UiSourceSpan, UiStyle, UiSurfaceId, UiTemplateDeclaration, UiTransition, UiTransitionState,
 };
 use neon_world_bridge::{CameraId, CameraKind, WorldAnchorId};
 use serde_json::json;
@@ -54,7 +54,10 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
     let mut image_resources = BTreeMap::new();
     let mut panel_decorations = BTreeMap::new();
     let mut skin_references = BTreeMap::new();
+    let mut geometry_records = BTreeMap::new();
+    let mut material_records = BTreeMap::new();
     let mut skins = Vec::new();
+    let mut shader_packages = Vec::new();
     let mut current_skin: Option<neon_ui_schema::UiControlSkin> = None;
 
     for (index, raw) in source.lines().enumerate() {
@@ -122,6 +125,21 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
                     ));
                 }
                 resources.push(resource);
+                continue;
+            }
+            if let Some(shader) = parse_shader_declaration(content, line)? {
+                if shader_packages
+                    .iter()
+                    .any(|existing: &UiShaderPackage| existing.package_id == shader.package_id)
+                {
+                    return Err(error(
+                        "nui_flow_duplicate_shader",
+                        "shader keys must be unique",
+                        line,
+                        1,
+                    ));
+                }
+                shader_packages.push(shader);
                 continue;
             }
             if let Some(drop) = parse_drop_declaration(content, line)? {
@@ -198,6 +216,22 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
                 continue;
             }
         }
+        if indent >= 2 && (content.starts_with("geometry ") || content.starts_with("material ")) {
+            let parent = stack.last_mut().ok_or_else(|| {
+                error(
+                    "nui_flow_orphan_geometry",
+                    "geometry/material declarations require a parent node",
+                    line,
+                    1,
+                )
+            })?;
+            if content.starts_with("geometry ") {
+                parent.1.geometry = Some(parse_geometry_line(content, line)?);
+            } else {
+                parent.1.material = Some(parse_material_line(content, line)?);
+            }
+            continue;
+        }
         let mut node = parse_node(content, line)?;
         if let Some(resource_key) = node.image_resource.take() {
             if !matches!(node.node.kind, UiNodeKind::Image | UiNodeKind::Panel | UiNodeKind::Tooltip) {
@@ -251,7 +285,14 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
         }
         while stack.last().is_some_and(|(level, _)| *level >= indent) {
             let (_, complete) = stack.pop().expect("stack checked");
-            attach(complete, &mut stack, &mut root, line)?;
+            attach(
+                complete,
+                &mut stack,
+                &mut root,
+                &mut geometry_records,
+                &mut material_records,
+                line,
+            )?;
         }
         if indent > 0 && stack.is_empty() {
             return Err(error(
@@ -346,7 +387,14 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
         stack.push((indent, node));
     }
     while let Some((_, node)) = stack.pop() {
-        attach(node, &mut stack, &mut root, 0)?;
+        attach(
+            node,
+            &mut stack,
+            &mut root,
+            &mut geometry_records,
+            &mut material_records,
+            0,
+        )?;
     }
     if let Some(skin) = current_skin.take() {
         skins.push(skin);
@@ -361,6 +409,12 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
     })?;
     if header.surface_id.is_empty() {
         header.surface_id = format!("surface.{}", root.node.node_id.0);
+    }
+    if let Some(geometry) = root.geometry.take() {
+        geometry_records.insert(root.node.node_id.0.clone(), geometry);
+    }
+    if let Some(material) = root.material.take() {
+        material_records.insert(root.node.node_id.0.clone(), material);
     }
     let mut offset = 0;
     for slot in &mut input_slots {
@@ -602,27 +656,49 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
         panel_decorations,
         skin_references,
         skins,
+        shader_packages,
+        geometry_records,
+        material_records,
         branches,
         templates,
         data_grids,
         resource_budget: header.budget,
     };
-    ir.validate().map_err(|validation_error| {
-        let message = match validation_error {
-            neon_ui_schema::UiSchemaError::MissingImageAsset => "Flow lowering produced an invalid UI IR document: image node has no declared resource".to_string(),
-            neon_ui_schema::UiSchemaError::InvalidLayout => "Flow lowering produced an invalid UI IR document: a node layout is invalid".to_string(),
-            neon_ui_schema::UiSchemaError::InvalidStyle => "Flow lowering produced an invalid UI IR document: a node style is invalid".to_string(),
-            neon_ui_schema::UiSchemaError::DuplicateNodeId => "Flow lowering produced an invalid UI IR document: sibling node keys must be unique".to_string(),
-            neon_ui_schema::UiSchemaError::InvalidProgramBudget => "Flow lowering produced an invalid UI IR document: resource budget is invalid".to_string(),
-            _ => format!("Flow lowering produced an invalid UI IR document: {validation_error:?}"),
-        };
-        error(
-            "nui_flow_invalid_ir",
-            message,
-            1,
-            1,
-        )
-    })?;
+    match ir.validate() {
+        Ok(()) => {}
+        Err(neon_ui_schema::UiSchemaError::UnknownShaderPackage) => {
+            return Err(error(
+                "nui_flow_unknown_shader",
+                "material references a shader package that is not declared",
+                1,
+                1,
+            ));
+        }
+        Err(neon_ui_schema::UiSchemaError::InvalidGeometry) => {
+            return Err(error(
+                "nui_flow_invalid_geometry",
+                "geometry records are invalid or reference an unknown node",
+                1,
+                1,
+            ));
+        }
+        Err(validation_error) => {
+            let message = match validation_error {
+                neon_ui_schema::UiSchemaError::MissingImageAsset => "Flow lowering produced an invalid UI IR document: image node has no declared resource".to_string(),
+                neon_ui_schema::UiSchemaError::InvalidLayout => "Flow lowering produced an invalid UI IR document: a node layout is invalid".to_string(),
+                neon_ui_schema::UiSchemaError::InvalidStyle => "Flow lowering produced an invalid UI IR document: a node style is invalid".to_string(),
+                neon_ui_schema::UiSchemaError::DuplicateNodeId => "Flow lowering produced an invalid UI IR document: sibling node keys must be unique".to_string(),
+                neon_ui_schema::UiSchemaError::InvalidProgramBudget => "Flow lowering produced an invalid UI IR document: resource budget is invalid".to_string(),
+                other => format!("Flow lowering produced an invalid UI IR document: {other:?}"),
+            };
+            return Err(error(
+                "nui_flow_invalid_ir",
+                message,
+                1,
+                1,
+            ));
+        }
+    }
     Ok(NuiFlowDocument {
         version: 1,
         source: source.into(),
@@ -1000,6 +1076,12 @@ pub fn format_nui_flow(source: &str) -> FlowResult<String> {
         };
         lines.push(format!("resource {} {kind}", resource.key));
     }
+    for shader in &parsed.ir.shader_packages {
+        lines.push(format!(
+            "shader {} version {} fallback {}",
+            shader.package_id, shader.version, shader.fallback
+        ));
+    }
     for skin in &parsed.ir.skins {
         lines.push(format!("skin {} {}", skin.key, format_skin_component(&skin.component_kind)));
         for slot in &skin.slots {
@@ -1015,6 +1097,8 @@ pub fn format_nui_flow(source: &str) -> FlowResult<String> {
         &parsed.ir.image_resources,
         &parsed.ir.panel_decorations,
         &parsed.ir.skin_references,
+        &parsed.ir.geometry_records,
+        &parsed.ir.material_records,
         &mut lines,
     );
     Ok(lines.join("\n") + "\n")
@@ -1341,6 +1425,8 @@ struct NodeBuild {
     nine_slice: Option<UiNineSlice>,
     world_panel: Option<NuiFlowWorldPanelDeclaration>,
     skin_key: Option<String>,
+    geometry: Option<UiGeometry>,
+    material: Option<UiMaterialRef>,
 }
 
 fn parse_skin_header(text: &str, line: u32) -> FlowResult<neon_ui_schema::UiControlSkin> {
@@ -1427,6 +1513,74 @@ fn parse_resource_declaration(
         kind,
         has_fallback: false,
         asset_ref: None,
+    }))
+}
+
+/// Top-level `shader <key> version <n> fallback <key>` declaration. Source
+/// bytes are NOT embedded in Flow: registration is a separate control-plane
+/// request carrying a digest. This declaration only reserves the stable key
+/// so a Flow referencing it can be validated before registration.
+fn parse_shader_declaration(
+    text: &str,
+    line: u32,
+) -> FlowResult<Option<neon_ui_schema::UiShaderPackage>> {
+    let parts = text.split_whitespace().collect::<Vec<_>>();
+    if parts.first() != Some(&"shader") {
+        return Ok(None);
+    }
+    if parts.len() < 2 || !valid_key(parts[1]) {
+        return Err(error(
+            "nui_flow_invalid_shader",
+            "shader syntax is: shader <key> version <n> fallback <key>",
+            line,
+            1,
+        ));
+    }
+    let mut version = 1u32;
+    let mut fallback = "standard_ui".to_string();
+    let mut index = 2;
+    while index < parts.len() {
+        match parts[index] {
+            "version" => {
+                let raw = parts.get(index + 1).ok_or_else(|| {
+                    error("nui_flow_invalid_shader", "shader version requires a value", line, 1)
+                })?;
+                version = parse_u64(raw, line, "shader version")? as u32;
+                index += 2;
+            }
+            "fallback" => {
+                let raw = parts.get(index + 1).ok_or_else(|| {
+                    error("nui_flow_invalid_shader", "shader fallback requires a key", line, 1)
+                })?;
+                if !valid_key(raw) {
+                    return Err(error(
+                        "nui_flow_invalid_shader",
+                        "shader fallback must be a stable key",
+                        line,
+                        1,
+                    ));
+                }
+                fallback = (*raw).into();
+                index += 2;
+            }
+            _ => {
+                return Err(error(
+                    "nui_flow_invalid_shader",
+                    "shader supports only version and fallback clauses",
+                    line,
+                    1,
+                ));
+            }
+        }
+    }
+    Ok(Some(neon_ui_schema::UiShaderPackage {
+        package_id: parts[1].into(),
+        version,
+        source_digest: "pending-registration".into(),
+        source_bytes: Vec::new(),
+        entry_point: "material".into(),
+        fallback,
+        parameters: Vec::new(),
     }))
 }
 
@@ -2379,6 +2533,8 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
     let mut image_resource = None;
     let mut nine_slice = None;
     let mut skin_key = None;
+    let mut geometry = None;
+    let mut material = None;
     let mut world_camera = None;
     let mut world_anchor = None;
     let mut used = HashSet::new();
@@ -2913,6 +3069,8 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
         nine_slice,
         world_panel,
         skin_key,
+        geometry,
+        material,
     })
 }
 
@@ -3191,6 +3349,159 @@ fn parse_machine_state_predicate(value: &str, line: u32) -> FlowResult<UiBranchP
     })
 }
 
+fn parse_geometry_line(text: &str, line: u32) -> FlowResult<UiGeometry> {
+    let mut parts = text.split_whitespace();
+    if parts.next() != Some("geometry") {
+        return Err(error(
+            "nui_flow_invalid_geometry",
+            "geometry line must start with geometry",
+            line,
+            1,
+        ));
+    }
+    let kind = parts.next().unwrap_or_default();
+    if kind != "cut" {
+        return Err(error(
+            "nui_flow_invalid_geometry",
+            "geometry supports only the cut form: geometry cut <bl> <br> <tr> <tl>",
+            line,
+            1,
+        ));
+    }
+    let mut cut = [0.0_f32; 4];
+    for slot in cut.iter_mut() {
+        let token = parts.next().ok_or_else(|| {
+            error(
+                "nui_flow_invalid_geometry",
+                "geometry cut requires four corner values",
+                line,
+                1,
+            )
+        })?;
+        *slot = number(token, line)?.max(0.0);
+    }
+    if parts.next().is_some() {
+        return Err(error(
+            "nui_flow_invalid_geometry",
+            "geometry cut accepts exactly four corner values",
+            line,
+            1,
+        ));
+    }
+    let geometry = UiGeometry { cut };
+    geometry.validate().map_err(|_| {
+        error(
+            "nui_flow_invalid_geometry",
+            "geometry cut values must be finite and bounded",
+            line,
+            1,
+        )
+    })?;
+    Ok(geometry)
+}
+
+fn parse_material_line(text: &str, line: u32) -> FlowResult<UiMaterialRef> {
+    let mut parts = text.split_whitespace();
+    if parts.next() != Some("material") {
+        return Err(error(
+            "nui_flow_invalid_material",
+            "material line must start with material",
+            line,
+            1,
+        ));
+    }
+    let package_id = parts.next().ok_or_else(|| {
+        error(
+            "nui_flow_invalid_material",
+            "material requires a registered shader package key",
+            line,
+            1,
+        )
+    })?;
+    if !valid_key(package_id) {
+        return Err(error(
+            "nui_flow_invalid_material",
+            "material package key uses letters, digits, '.', '_' and '-'",
+            line,
+            1,
+        ));
+    }
+    let mut material = UiMaterialRef {
+        package_id: package_id.into(),
+        ..UiMaterialRef::default()
+    };
+    while let Some(token) = parts.next() {
+        match token {
+            "overflow" => {
+                for slot in material.overflow.iter_mut() {
+                    let value = parts.next().ok_or_else(|| {
+                        error(
+                            "nui_flow_invalid_material",
+                            "material overflow requires [left, top, right, bottom]",
+                            line,
+                            1,
+                        )
+                    })?;
+                    *slot = number(value, line)?.max(0.0);
+                }
+            }
+            "parameter" => {
+                let key = parts.next().ok_or_else(|| {
+                    error(
+                        "nui_flow_invalid_material",
+                        "material parameter requires a key",
+                        line,
+                        1,
+                    )
+                })?;
+                let raw = parts.next().ok_or_else(|| {
+                    error(
+                        "nui_flow_invalid_material",
+                        "material parameter requires a value",
+                        line,
+                        1,
+                    )
+                })?;
+                if raw.starts_with('$') {
+                    return Err(error(
+                        "nui_flow_invalid_material",
+                        "material parameters must be literal values",
+                        line,
+                        1,
+                    ));
+                }
+                if let Ok(value) = raw.parse::<f64>() {
+                    material.parameters.insert(key.into(), serde_json::json!(value));
+                } else if raw.starts_with('#') {
+                    let [r, g, b, a] = color(raw, line)?;
+                    material
+                        .parameters
+                        .insert(key.into(), serde_json::json!([r, g, b, a]));
+                } else {
+                    material.parameters.insert(key.into(), serde_json::json!(raw));
+                }
+            }
+            _ => {
+                return Err(error(
+                    "nui_flow_invalid_material",
+                    "material supports only overflow and parameter clauses",
+                    line,
+                    1,
+                ));
+            }
+        }
+    }
+    material.validate().map_err(|_| {
+        error(
+            "nui_flow_invalid_material",
+            "material overflow or parameters are out of range",
+            line,
+            1,
+        )
+    })?;
+    Ok(material)
+}
+
 fn parse_attribute(
     node: &mut UiNode,
     bindings: &mut Vec<(UiBoundProperty, String)>,
@@ -3367,8 +3678,17 @@ fn attach(
     child: NodeBuild,
     stack: &mut Vec<(usize, NodeBuild)>,
     root: &mut Option<NodeBuild>,
+    geometry_records: &mut BTreeMap<String, UiGeometry>,
+    material_records: &mut BTreeMap<String, UiMaterialRef>,
     line: u32,
 ) -> FlowResult<()> {
+    let mut child = child;
+    if let Some(geometry) = child.geometry.take() {
+        geometry_records.insert(child.node.node_id.0.clone(), geometry);
+    }
+    if let Some(material) = child.material.take() {
+        material_records.insert(child.node.node_id.0.clone(), material);
+    }
     if let Some((_, parent)) = stack.last_mut() {
         parent.node.children.push(child.node);
         Ok(())
@@ -3727,6 +4047,8 @@ fn format_node(
     image_resources: &BTreeMap<String, String>,
     panel_decorations: &BTreeMap<String, neon_ui_schema::UiPanelDecoration>,
     skin_references: &BTreeMap<String, String>,
+    geometry_records: &BTreeMap<String, UiGeometry>,
+    material_records: &BTreeMap<String, UiMaterialRef>,
     lines: &mut Vec<String>,
 ) {
     let kind = match &node.kind {
@@ -3864,16 +4186,60 @@ fn format_node(
         line.push_str(&format!(" event {}", event.intent));
     }
     lines.push(line);
+    let child_indent = indent + 2;
+    if let Some(geometry) = geometry_records.get(&node.node_id.0) {
+        lines.push(format!(
+            "{}geometry cut {} {} {} {}",
+            " ".repeat(child_indent),
+            geometry.cut[0],
+            geometry.cut[1],
+            geometry.cut[2],
+            geometry.cut[3]
+        ));
+    }
+    if let Some(material) = material_records.get(&node.node_id.0) {
+        let mut material_text = format!("{}material {}", " ".repeat(child_indent), material.package_id);
+        if material.overflow != [0.0; 4] {
+            material_text.push_str(&format!(
+                " overflow {} {} {} {}",
+                material.overflow[0],
+                material.overflow[1],
+                material.overflow[2],
+                material.overflow[3]
+            ));
+        }
+        for (key, value) in &material.parameters {
+            if let Some(number) = value.as_f64() {
+                material_text.push_str(&format!(" parameter {key} {number}"));
+            } else if let Some(array) = value.as_array()
+                && array.len() == 4
+                && array.iter().all(|item| item.as_f64().is_some())
+            {
+                let color = format_color([
+                    array[0].as_f64().unwrap_or(0.0) as f32,
+                    array[1].as_f64().unwrap_or(0.0) as f32,
+                    array[2].as_f64().unwrap_or(0.0) as f32,
+                    array[3].as_f64().unwrap_or(0.0) as f32,
+                ]);
+                material_text.push_str(&format!(" parameter {key} {color}"));
+            } else if let Some(text) = value.as_str() {
+                material_text.push_str(&format!(" parameter {key} \"{text}\""));
+            }
+        }
+        lines.push(material_text);
+    }
     for child in &node.children {
         format_node(
             child,
-            indent + 2,
+            child_indent,
             bindings,
             events,
             data_grids,
             image_resources,
             panel_decorations,
             skin_references,
+            geometry_records,
+            material_records,
             lines,
         );
     }
@@ -5167,5 +5533,57 @@ panel workspace row gap 8
         }
         let error = parse_nui_flow("drag demo source panel axis both snap 0 threshold 0 within column\nsurface root\n  panel panel\n").unwrap_err();
         assert_eq!(error.diagnostics[0].code, "nui_flow_invalid_drag");
+    }
+
+    #[test]
+    fn geometry_cut_and_material_parse_into_document_records() {
+        let document = parse_nui_flow(
+            "shader pulse-glass version 1 fallback standard_ui\nsurface root w 400 h 300\n  panel hero x 10 y 20 w 200 h 100\n    geometry cut 18 10 18 10\n    material pulse-glass overflow 24 8 24 16 parameter rim_strength 0.22\n",
+        )
+        .expect("geometry and material must parse");
+        assert_eq!(document.ir.shader_packages.len(), 1);
+        assert_eq!(document.ir.shader_packages[0].package_id, "pulse-glass");
+        assert_eq!(document.ir.shader_packages[0].fallback, "standard_ui");
+        let hero_key = "hero";
+        let geometry = document
+            .ir
+            .geometry_records
+            .get(hero_key)
+            .expect("geometry record must exist");
+        assert_eq!(geometry.cut, [18.0, 10.0, 18.0, 10.0]);
+        let material = document
+            .ir
+            .material_records
+            .get(hero_key)
+            .expect("material record must exist");
+        assert_eq!(material.package_id, "pulse-glass");
+        assert_eq!(material.overflow, [24.0, 8.0, 24.0, 16.0]);
+        assert_eq!(
+            material.parameters.get("rim_strength").and_then(|v| v.as_f64()),
+            Some(0.22)
+        );
+        let formatted = format_nui_flow(
+            "shader pulse-glass version 1 fallback standard_ui\nsurface root w 400 h 300\n  panel hero x 10 y 20 w 200 h 100\n    geometry cut 18 10 18 10\n    material pulse-glass overflow 24 8 24 16 parameter rim_strength 0.22\n",
+        )
+        .expect("round trip must format");
+        assert!(formatted.contains("geometry cut 18 10 18 10"));
+        assert!(formatted.contains("material pulse-glass overflow 24 8 24 16"));
+    }
+
+    #[test]
+    fn geometry_and_material_reject_invalid_declarations() {
+        let geometry_error = parse_nui_flow(
+            "surface root\n  panel hero w 100 h 50\n    geometry skew 10\n",
+        )
+        .unwrap_err();
+        assert_eq!(geometry_error.diagnostics[0].code, "nui_flow_invalid_geometry");
+        let missing_material_key = parse_nui_flow(
+            "surface root\n  panel hero w 100 h 50\n    material pulse-glass\n",
+        )
+        .unwrap_err();
+        assert_eq!(
+            missing_material_key.diagnostics[0].code,
+            "nui_flow_unknown_shader"
+        );
     }
 }

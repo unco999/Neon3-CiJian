@@ -726,6 +726,9 @@ mod tests {
                 bound_input_keys: Vec::new(),
             }],
             skins: Vec::new(),
+            shader_packages: Vec::new(),
+            geometry_records: BTreeMap::new(),
+            material_records: BTreeMap::new(),
             resource_budget: UiResourceBudget {
                 max_nodes: 2,
                 max_bindings: 0,
@@ -1241,6 +1244,9 @@ mod tests {
             drop_records: Vec::new(),
             event_records: Vec::new(),
             skins: Vec::new(),
+            shader_packages: Vec::new(),
+            geometry_records: BTreeMap::new(),
+            material_records: BTreeMap::new(),
             resource_budget: UiResourceBudget {
                 max_nodes: 0,
                 max_bindings: 0,

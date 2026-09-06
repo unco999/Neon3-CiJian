@@ -46,6 +46,43 @@ logical bounds
   -> final window/composition surface
 ```
 
+### Material Draw Layer
+
+A `material` declaration does not replace the host panel. The runtime creates a
+transparent draw layer that is stacked at the **same z-order directly above** the
+host panel. The layer:
+
+- has the same logical position and size as the host panel by default;
+- never participates in layout measurement;
+- never participates in hit testing or pointer routing;
+- is the only surface the custom shader paints onto;
+- receives the expanded bounds as its shader input.
+
+This keeps the material authoring surface separate from the interaction
+surface. A glow, halo, or light sweep can paint outside the panel without
+changing where clicks land.
+
+The layer can be larger than the host panel through an explicit `overflow`
+declaration:
+
+```text
+material pulse-glass overflow 24 8 24 16
+```
+
+`overflow` is `[left, top, right, bottom]` in logical pixels. The draw bounds
+passed to the shader are the host bounds expanded by those amounts:
+
+```json
+{
+  "material": {
+    "package_id": "pulse-glass",
+    "version": 1,
+    "overflow": [24, 8, 24, 16],
+    "parameters": {"rim_strength": 0.18}
+  }
+}
+```
+
 The standard UI path remains available for every node. A custom shader is an
 optional material attached to a node or a skin slot. If compilation, validation,
 or capability negotiation fails, the renderer uses the declared fallback
@@ -103,7 +140,7 @@ shader pulse-glass version 1 fallback standard_ui
 surface surface.music-player-demo revision 1
   panel hero-card x 24 y 88 w 746 h 230
     geometry cut top-left 20 top-right 16 bottom-right 20 bottom-left 16
-    material pulse-glass
+    material pulse-glass overflow 24 8 24 16 parameter rim_strength 0.22
 ```
 
 `source` is resolved by the Node shader registry and becomes an immutable
@@ -184,6 +221,7 @@ Allowed:
 ```text
 shader pulse-glass
 material pulse-glass
+material pulse-glass overflow 24 8 24 16 parameter rim_strength 0.22
 geometry cut top-left 18 top-right 12 bottom-right 18 bottom-left 12
 parameter sweep_speed $glass_sweep_speed
 ```
@@ -269,13 +307,15 @@ The runtime diagnostic stream must report JSONL records containing:
 Focused acceptance probes must cover:
 
 1. package registration and digest mismatch;
-2. parser round trip for shader and geometry declarations;
-3. invalid geometry and out-of-range parameters;
+2. parser round trip for shader, geometry, and material-overflow declarations;
+3. invalid geometry, negative overflow, and out-of-range parameters;
 4. shader compilation and deterministic fallback;
 5. visual polygon and rectangular hit-test agreement;
-6. transparent premultiplied output;
-7. resize, hover, pressed, and animation state;
-8. final PNG capture with non-empty UI and no unexpected opaque background.
+6. material draw layer larger than the host panel while hit routing stays on
+   the host logical bounds;
+7. transparent premultiplied output;
+8. resize, hover, pressed, and animation state;
+9. final PNG capture with non-empty UI and no unexpected opaque background.
 
 ## Implementation Order
 
