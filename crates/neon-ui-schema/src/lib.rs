@@ -18,6 +18,7 @@ pub const UI_PROGRAM_TEXT_REGISTRY_CAPABILITY_NAME: &str = "ui.program.text_regi
 pub const UI_PROGRAM_BOUNDED_STRUCTURE_CAPABILITY_NAME: &str = "ui.program.bounded_structure.v1";
 pub const UI_PROGRAM_SEMANTIC_EVENT_CAPABILITY_NAME: &str = "ui.program.semantic_event.v1";
 pub const UI_NINE_SLICE_CAPABILITY_NAME: &str = "ui.nine_slice.v1";
+pub const UI_COMPONENT_SKIN_CAPABILITY_NAME: &str = "ui.component_skin.v1";
 /// Declarative, data-driven 2D point/line canvas. Canvas contents are typed
 /// UI inputs; the WGPU runtime owns their GPU expansion and final pixels.
 pub const UI_CANVAS_POINTS_LINES_CAPABILITY_NAME: &str = "ui.canvas.points_lines.v1";
@@ -561,6 +562,7 @@ impl UiProgramRevision {
                     | UI_PROGRAM_BOUNDED_STRUCTURE_CAPABILITY_NAME
                     | UI_PROGRAM_SEMANTIC_EVENT_CAPABILITY_NAME
                     | UI_NINE_SLICE_CAPABILITY_NAME
+                    | UI_COMPONENT_SKIN_CAPABILITY_NAME
                     | UI_CANVAS_POINTS_LINES_CAPABILITY_NAME
             ) || capability.version != 1
             {
@@ -760,6 +762,95 @@ pub struct UiNode {
     pub children: Vec<UiNode>,
 }
 
+/// A finite renderer-owned visual recipe for one standard control type.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiControlSkin {
+    pub key: String,
+    pub component_kind: UiNodeKind,
+    pub slots: Vec<UiSkinSlot>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UiSkinSlotKind {
+    Body,
+    Label,
+    FocusRing,
+    Track,
+    Fill,
+    Thumb,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum UiSkinPresentation {
+    Solid { color: [f32; 4] },
+    Image { resource_key: String, fit: UiImageFit },
+    NineSlice { resource_key: String, layout: UiNineSlice },
+    Default,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiSkinSlot {
+    pub slot_kind: UiSkinSlotKind,
+    pub state: UiVisualState,
+    pub presentation: UiSkinPresentation,
+}
+
+impl UiControlSkin {
+    pub fn validate(&self) -> Result<(), UiSchemaError> {
+        if self.key.trim().is_empty()
+            || !matches!(self.component_kind, UiNodeKind::Button | UiNodeKind::Slider)
+        {
+            return Err(UiSchemaError::InvalidControlSkin);
+        }
+        let mut keys = std::collections::HashSet::new();
+        for slot in &self.slots {
+            if !keys.insert((slot.slot_kind, slot.state)) {
+                return Err(UiSchemaError::InvalidControlSkin);
+            }
+            match &slot.presentation {
+                UiSkinPresentation::Solid { color }
+                    if color.iter().all(|value| value.is_finite() && (0.0..=1.0).contains(value)) => {}
+                UiSkinPresentation::Image { resource_key, .. }
+                    if !resource_key.trim().is_empty() => {}
+                UiSkinPresentation::NineSlice { resource_key, layout }
+                    if !resource_key.trim().is_empty() && layout.validate() => {}
+                UiSkinPresentation::Default => {}
+                _ => return Err(UiSchemaError::InvalidControlSkin),
+            }
+        }
+        let required = match self.component_kind {
+            UiNodeKind::Button => &[
+                (UiSkinSlotKind::Body, UiVisualState::Normal),
+            ][..],
+            UiNodeKind::Slider => &[
+                (UiSkinSlotKind::Track, UiVisualState::Normal),
+                (UiSkinSlotKind::Fill, UiVisualState::Active),
+                (UiSkinSlotKind::Thumb, UiVisualState::Normal),
+            ][..],
+            _ => &[][..],
+        };
+        if required.iter().any(|(kind, state)| {
+            !self.slots.iter().any(|slot| slot.slot_kind == *kind && slot.state == *state)
+        }) {
+            return Err(UiSchemaError::InvalidControlSkin);
+        }
+        Ok(())
+    }
+
+    pub fn validate_for_image(&self, resource_key: &str, width: u32, height: u32) -> bool {
+        self.validate().is_ok()
+            && self.slots.iter().all(|slot| match &slot.presentation {
+                UiSkinPresentation::NineSlice { resource_key: key, layout }
+                    if key == resource_key => layout.validate_for_image(width, height),
+                _ => true,
+            })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UiNodeKind {
@@ -940,6 +1031,21 @@ pub enum UiAlignItems {
     Stretch,
 }
 
+/// Aspect-ratio policy for image nodes. The renderer adjusts atlas UVs; layout
+/// bounds remain owned by the normal Flow layout engine.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UiImageFit {
+    #[default]
+    Stretch,
+    Cover,
+    Contain,
+}
+
+impl UiImageFit {
+    fn is_stretch(value: &Self) -> bool { *value == Self::Stretch }
+}
+
 impl UiAlignItems {
     fn is_start(value: &Self) -> bool {
         *value == Self::Start
@@ -972,6 +1078,8 @@ pub struct UiLayout {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub align_self: Option<UiAlignItems>,
     pub clip: UiClipPolicy,
+    #[serde(default, skip_serializing_if = "UiImageFit::is_stretch")]
+    pub image_fit: UiImageFit,
     pub scroll_offset: [f32; 2],
 }
 
@@ -996,6 +1104,7 @@ impl Default for UiLayout {
             align_items: UiAlignItems::Start,
             align_self: None,
             clip: UiClipPolicy::Bounds,
+            image_fit: UiImageFit::Stretch,
             scroll_offset: [0.0; 2],
         }
     }
@@ -1084,6 +1193,7 @@ pub enum UiVisualState {
     Selected,
     Checked,
     Open,
+    Active,
 }
 
 /// Optional patch for one visual state. Omitted fields inherit from the base
@@ -1175,6 +1285,26 @@ pub enum UiEffect {
     NineSlice {
         node_id: UiNodeId,
         layout: UiNineSlice,
+    },
+    /// A validated finite skin recipe. Resource resolution and drawing remain
+    /// renderer-owned; this effect contains no GPU identity.
+    ControlSkin {
+        skin: UiControlSkin,
+    },
+    /// Associates a declared control with a stable top-level skin key.
+    SkinReference {
+        node_id: UiNodeId,
+        skin_key: String,
+    },
+    /// Resolves one skin resource key to either a project image or an external
+    /// transient image. The renderer owns the atlas and residency lifecycle.
+    SkinResourceBinding {
+        skin_key: String,
+        resource_key: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        asset_ref: Option<AssetRef>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        image_id: Option<String>,
     },
 }
 
@@ -1486,6 +1616,7 @@ pub enum UiSchemaError {
     InvalidProgramBudget,
     InvalidProgramEvent,
     MissingProgramResource,
+    InvalidControlSkin,
 }
 
 /// Canonical, versioned authoring document. It remains data-only: bindings are
@@ -1511,6 +1642,11 @@ pub struct UiIrDocument {
     /// The map is canonical IR data, not renderer topology.
     #[serde(default)]
     pub panel_decorations: std::collections::BTreeMap<String, UiPanelDecoration>,
+    /// Stable control-node key to top-level skin key references.
+    #[serde(default)]
+    pub skin_references: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pub skins: Vec<UiControlSkin>,
     /// Finite subtrees selected by one direct input predicate. The subtree is
     /// already present in `root`; this table only supplies its runtime rule.
     #[serde(default)]
@@ -2252,6 +2388,8 @@ pub struct UiProgramNode {
     pub parent_key: Option<String>,
     pub kind: UiNodeKind,
     pub source_span: Option<UiSourceSpan>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skin_key: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -2360,6 +2498,8 @@ pub struct UiProgram {
     #[serde(default)]
     pub drop_records: Vec<UiProgramDropRecord>,
     pub event_records: Vec<UiProgramEventDeclaration>,
+    #[serde(default)]
+    pub skins: Vec<UiControlSkin>,
     pub resource_budget: UiResourceBudget,
     pub dependency_index: UiDependencyIndex,
     pub layout_hash: String,
@@ -2657,6 +2797,35 @@ impl UiFragment {
         collect(&self.root, &mut nodes);
         if nodes.len() != count_nodes(&self.root) {
             return Err(UiSchemaError::DuplicateNodeId);
+        }
+        let mut skins = std::collections::HashMap::new();
+        for effect in &self.effects {
+            if let UiEffect::ControlSkin { skin } = effect {
+                if skins.insert(skin.key.as_str(), skin).is_some() {
+                    return Err(UiSchemaError::InvalidControlSkin);
+                }
+            }
+        }
+        for effect in &self.effects {
+            match effect {
+                UiEffect::SkinReference { node_id, skin_key } => {
+                    let Some(node_kind) = find_node_kind(&self.root, &node_id.0) else {
+                        return Err(UiSchemaError::InvalidControlSkin);
+                    };
+                    let Some(skin) = skins.get(skin_key.as_str()) else {
+                        return Err(UiSchemaError::InvalidControlSkin);
+                    };
+                    if *node_kind != skin.component_kind {
+                        return Err(UiSchemaError::InvalidControlSkin);
+                    }
+                }
+                UiEffect::SkinResourceBinding { skin_key, .. }
+                    if !skins.contains_key(skin_key.as_str()) =>
+                {
+                    return Err(UiSchemaError::InvalidControlSkin);
+                }
+                _ => {}
+            }
         }
         let drags = self
             .effects
@@ -2996,6 +3165,32 @@ impl UiEffect {
                     Ok(())
                 }
             }
+            Self::ControlSkin { skin } => skin.validate(),
+            Self::SkinReference { node_id, skin_key } => {
+                if node_id.0.trim().is_empty() || skin_key.trim().is_empty() {
+                    Err(UiSchemaError::InvalidControlSkin)
+                } else {
+                    Ok(())
+                }
+            }
+            Self::SkinResourceBinding {
+                skin_key,
+                resource_key,
+                asset_ref,
+                image_id,
+            } => {
+                if skin_key.trim().is_empty()
+                    || resource_key.trim().is_empty()
+                    || image_id.as_ref().is_some_and(|id| id.trim().is_empty())
+                    || asset_ref
+                        .as_ref()
+                        .is_some_and(|asset| asset.kind != "image")
+                {
+                    Err(UiSchemaError::InvalidControlSkin)
+                } else {
+                    Ok(())
+                }
+            }
         }
     }
 }
@@ -3068,6 +3263,77 @@ mod tests {
             serde_json::to_string(&UiAnimationProperty::NumericValue).unwrap(),
             "\"numeric_value\""
         );
+    }
+
+    #[test]
+    fn button_skin_requires_idle_body_and_valid_nine_slice() {
+        let skin = UiControlSkin {
+            key: "pulse".into(),
+            component_kind: UiNodeKind::Button,
+            slots: vec![UiSkinSlot {
+                slot_kind: UiSkinSlotKind::Body,
+                state: UiVisualState::Normal,
+                presentation: UiSkinPresentation::NineSlice {
+                    resource_key: "idle".into(),
+                    layout: UiNineSlice {
+                        source_insets_px: [2, 2, 2, 2],
+                        target_insets: [4.0, 4.0, 4.0, 4.0],
+                        mode: UiNineSliceMode::Stretch,
+                        fill_center: true,
+                    },
+                },
+            }],
+        };
+        assert!(skin.validate().is_ok());
+        assert!(skin.validate_for_image("idle", 8, 8));
+        assert!(!skin.validate_for_image("idle", 3, 8));
+        let invalid = UiControlSkin { slots: Vec::new(), ..skin };
+        assert_eq!(invalid.validate(), Err(UiSchemaError::InvalidControlSkin));
+    }
+
+    #[test]
+    fn slider_skin_requires_track_fill_and_thumb_and_matches_slider() {
+        let skin = UiControlSkin {
+            key: "volume".into(),
+            component_kind: UiNodeKind::Slider,
+            slots: vec![
+                UiSkinSlot { slot_kind: UiSkinSlotKind::Track, state: UiVisualState::Normal, presentation: UiSkinPresentation::Default },
+                UiSkinSlot { slot_kind: UiSkinSlotKind::Fill, state: UiVisualState::Active, presentation: UiSkinPresentation::Default },
+                UiSkinSlot { slot_kind: UiSkinSlotKind::Thumb, state: UiVisualState::Normal, presentation: UiSkinPresentation::Default },
+            ],
+        };
+        assert!(skin.validate().is_ok());
+        assert_eq!(UiControlSkin { slots: skin.slots[..2].to_vec(), ..skin.clone() }.validate(), Err(UiSchemaError::InvalidControlSkin));
+        assert_eq!(UiControlSkin { component_kind: UiNodeKind::Button, ..skin }.validate(), Err(UiSchemaError::InvalidControlSkin));
+    }
+
+    #[test]
+    fn fragment_accepts_slider_skin_reference_only_for_matching_control_kind() {
+        let mut root: UiNode = serde_json::from_str::<UiFragment>(STATIC_FRAGMENT).unwrap().root;
+        root.node_id = UiNodeId("volume".into());
+        root.kind = UiNodeKind::Slider;
+        let skin = UiControlSkin {
+            key: "volume".into(),
+            component_kind: UiNodeKind::Slider,
+            slots: vec![
+                UiSkinSlot { slot_kind: UiSkinSlotKind::Track, state: UiVisualState::Normal, presentation: UiSkinPresentation::Default },
+                UiSkinSlot { slot_kind: UiSkinSlotKind::Fill, state: UiVisualState::Active, presentation: UiSkinPresentation::Default },
+                UiSkinSlot { slot_kind: UiSkinSlotKind::Thumb, state: UiVisualState::Normal, presentation: UiSkinPresentation::Default },
+            ],
+        };
+        let fragment = UiFragment {
+            fragment_id: UiFragmentId("slider-skin".into()),
+            revision: Revision(1),
+            root,
+            effects: vec![
+                UiEffect::ControlSkin { skin },
+                UiEffect::SkinReference { node_id: UiNodeId("volume".into()), skin_key: "volume".into() },
+            ],
+        };
+        assert!(fragment.validate().is_ok());
+        let mut wrong_kind = fragment.clone();
+        wrong_kind.root.kind = UiNodeKind::Button;
+        assert_eq!(wrong_kind.validate(), Err(UiSchemaError::InvalidControlSkin));
     }
 
     #[test]
@@ -3821,6 +4087,29 @@ impl UiIrDocument {
                 || !matches!(
                     find_ir_node(&self.root, node_key),
                 Some(node) if matches!(node.kind, UiNodeKind::Image | UiNodeKind::Panel | UiNodeKind::Tooltip)
+                )
+        }) {
+            return Err(UiSchemaError::InvalidIrDocument);
+        }
+        let mut skin_keys = std::collections::HashSet::new();
+        for skin in &self.skins {
+            skin.validate()?;
+            if !skin_keys.insert(&skin.key)
+                || skin.slots.iter().any(|slot| match &slot.presentation {
+                    UiSkinPresentation::Image { resource_key, .. }
+                    | UiSkinPresentation::NineSlice { resource_key, .. } => !self.resources.iter().any(|resource| resource.key == *resource_key && resource.kind == UiProgramResourceKind::Image),
+                    _ => false,
+                })
+            {
+                return Err(UiSchemaError::InvalidIrDocument);
+            }
+        }
+        if self.skin_references.iter().any(|(node_key, skin_key)| {
+            !matches!(find_ir_node(&self.root, node_key), Some(node) if matches!(node.kind, UiNodeKind::Button | UiNodeKind::Slider))
+                || !skin_keys.contains(skin_key)
+                || !matches!(
+                    (find_ir_node(&self.root, node_key), self.skins.iter().find(|skin| skin.key == *skin_key)),
+                    (Some(node), Some(skin)) if node.kind == skin.component_kind
                 )
         }) {
             return Err(UiSchemaError::InvalidIrDocument);

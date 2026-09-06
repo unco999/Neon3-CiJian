@@ -53,6 +53,9 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
     let mut resources = Vec::new();
     let mut image_resources = BTreeMap::new();
     let mut panel_decorations = BTreeMap::new();
+    let mut skin_references = BTreeMap::new();
+    let mut skins = Vec::new();
+    let mut current_skin: Option<neon_ui_schema::UiControlSkin> = None;
 
     for (index, raw) in source.lines().enumerate() {
         let line = (index + 1) as u32;
@@ -83,6 +86,26 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
         }
         let content = without_comment.trim();
         reject_forbidden(content, line)?;
+        if indent == 0 && content.starts_with("skin ") {
+            if let Some(skin) = current_skin.take() {
+                skins.push(skin);
+            }
+            current_skin = Some(parse_skin_header(content, line)?);
+            continue;
+        }
+        if indent == 2 && content.starts_with("slot ") {
+            let skin = current_skin.as_mut().ok_or_else(|| {
+                error("nui_flow_invalid_skin", "skin slots require a preceding skin declaration", line, 1)
+            })?;
+            skin.slots.push(parse_skin_slot(content, line)?);
+            continue;
+        }
+        if current_skin.is_some() && indent != 0 {
+            return Err(error("nui_flow_invalid_skin", "skin slots must use exactly two spaces of indentation", line, 1));
+        }
+        if current_skin.is_some() && indent == 0 {
+            skins.push(current_skin.take().expect("skin is present"));
+        }
         if indent == 0 {
             if let Some(resource) = parse_resource_declaration(content, line)? {
                 if resources
@@ -213,6 +236,9 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
                 1,
             ));
         }
+        if let Some(skin_key) = node.skin_key.take() {
+            skin_references.insert(node.node.node_id.0.clone(), skin_key);
+        }
         if let Some(previous) = stack.last() {
             if indent > previous.0 + 2 {
                 return Err(error(
@@ -321,6 +347,9 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
     }
     while let Some((_, node)) = stack.pop() {
         attach(node, &mut stack, &mut root, 0)?;
+    }
+    if let Some(skin) = current_skin.take() {
+        skins.push(skin);
     }
     let mut root = root.ok_or_else(|| {
         error(
@@ -449,6 +478,33 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
             ));
         }
     }
+    let mut skin_keys = HashSet::new();
+    for skin in &skins {
+        skin.validate().map_err(|_| error("nui_flow_invalid_skin", "control skin is invalid", 1, 1))?;
+        if !skin_keys.insert(skin.key.clone()) {
+            return Err(error("nui_flow_duplicate_skin", "skin keys must be unique", 1, 1));
+        }
+        for slot in &skin.slots {
+            let resource_key = match &slot.presentation {
+                neon_ui_schema::UiSkinPresentation::Image { resource_key, .. }
+                | neon_ui_schema::UiSkinPresentation::NineSlice { resource_key, .. } => Some(resource_key),
+                _ => None,
+            };
+            if let Some(resource_key) = resource_key
+                && !resources.iter().any(|resource| resource.key == *resource_key && resource.kind == neon_ui_schema::UiProgramResourceKind::Image)
+            {
+                return Err(error("nui_flow_unknown_resource", "skin image resource is not declared", 1, 1));
+            }
+        }
+    }
+    for (node_key, skin_key) in &skin_references {
+        if !matches!(find_node(&root.node, node_key), Some(node) if matches!(node.kind, UiNodeKind::Button | UiNodeKind::Slider))
+            || !skin_keys.contains(skin_key)
+            || !matches!((find_node(&root.node, node_key), skins.iter().find(|skin| skin.key == *skin_key)), (Some(node), Some(skin)) if node.kind == skin.component_kind)
+        {
+            return Err(error("nui_flow_invalid_skin", "button skin reference must target a declared button skin", 1, 1));
+        }
+    }
     apply_boolean_binding_defaults(&mut root.node, &bindings, &schema);
     for grid in &data_grids {
         if !schema
@@ -544,15 +600,25 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
         resources,
         image_resources,
         panel_decorations,
+        skin_references,
+        skins,
         branches,
         templates,
         data_grids,
         resource_budget: header.budget,
     };
-    ir.validate().map_err(|_| {
+    ir.validate().map_err(|validation_error| {
+        let message = match validation_error {
+            neon_ui_schema::UiSchemaError::MissingImageAsset => "Flow lowering produced an invalid UI IR document: image node has no declared resource".to_string(),
+            neon_ui_schema::UiSchemaError::InvalidLayout => "Flow lowering produced an invalid UI IR document: a node layout is invalid".to_string(),
+            neon_ui_schema::UiSchemaError::InvalidStyle => "Flow lowering produced an invalid UI IR document: a node style is invalid".to_string(),
+            neon_ui_schema::UiSchemaError::DuplicateNodeId => "Flow lowering produced an invalid UI IR document: sibling node keys must be unique".to_string(),
+            neon_ui_schema::UiSchemaError::InvalidProgramBudget => "Flow lowering produced an invalid UI IR document: resource budget is invalid".to_string(),
+            _ => format!("Flow lowering produced an invalid UI IR document: {validation_error:?}"),
+        };
         error(
             "nui_flow_invalid_ir",
-            "Flow lowering produced an invalid UI IR document",
+            message,
             1,
             1,
         )
@@ -633,6 +699,28 @@ pub fn bind_nui_flow_resources(
         })?;
         node.image = Some(asset);
     }
+    for skin in &mut document.ir.skins {
+        for slot in &mut skin.slots {
+            let resource_key = match &slot.presentation {
+                neon_ui_schema::UiSkinPresentation::Image { resource_key, .. }
+                | neon_ui_schema::UiSkinPresentation::NineSlice { resource_key, .. } => resource_key,
+                _ => continue,
+            };
+            let resource = document
+                .ir
+                .resources
+                .iter_mut()
+                .find(|resource| resource.key == *resource_key)
+                .ok_or_else(|| error("nui_flow_unknown_resource", "skin references an undeclared resource", 1, 1))?;
+            let asset = snapshot.get(resource_key).ok_or_else(|| {
+                error("nui_flow_unresolved_resource", "skin resource binding is missing from the external snapshot", 1, 1)
+            })?;
+            if resource.kind != neon_ui_schema::UiProgramResourceKind::Image || asset.kind != "image" {
+                return Err(error("nui_flow_invalid_resource", "skin resource must bind an image AssetRef", 1, 1));
+            }
+            resource.asset_ref = Some(asset.clone());
+        }
+    }
     Ok(())
 }
 
@@ -679,6 +767,38 @@ pub fn lower_nui_flow_effects(document: &NuiFlowDocument) -> Vec<UiEffect> {
                 layout: decoration.nine_slice,
             }),
     );
+    effects.extend(document.ir.skins.iter().cloned().map(|skin| UiEffect::ControlSkin { skin }));
+    effects.extend(document.ir.skin_references.iter().map(|(node_id, skin_key)| UiEffect::SkinReference {
+        node_id: UiNodeId(node_id.clone()),
+        skin_key: skin_key.clone(),
+    }));
+    for skin in &document.ir.skins {
+        let mut resource_keys = HashSet::new();
+        for slot in &skin.slots {
+            let Some(resource_key) = (match &slot.presentation {
+                neon_ui_schema::UiSkinPresentation::Image { resource_key, .. }
+                | neon_ui_schema::UiSkinPresentation::NineSlice { resource_key, .. } => Some(resource_key),
+                _ => None,
+            }) else {
+                continue;
+            };
+            if !resource_keys.insert(resource_key) {
+                continue;
+            }
+            let asset_ref = document
+                .ir
+                .resources
+                .iter()
+                .find(|resource| resource.key == *resource_key)
+                .and_then(|resource| resource.asset_ref.clone());
+            effects.push(UiEffect::SkinResourceBinding {
+                skin_key: skin.key.clone(),
+                resource_key: resource_key.clone(),
+                asset_ref,
+                image_id: Some(resource_key.clone()),
+            });
+        }
+    }
     effects.extend(document.drags.iter().map(|drag| UiEffect::DragBinding {
         binding: UiDragBinding {
             key: drag.key.clone(),
@@ -880,6 +1000,12 @@ pub fn format_nui_flow(source: &str) -> FlowResult<String> {
         };
         lines.push(format!("resource {} {kind}", resource.key));
     }
+    for skin in &parsed.ir.skins {
+        lines.push(format!("skin {} {}", skin.key, format_skin_component(&skin.component_kind)));
+        for slot in &skin.slots {
+            lines.push(format!("  slot {} {} {}", format_skin_slot_kind(slot.slot_kind), format_skin_state(slot.state), format_skin_presentation(&slot.presentation)));
+        }
+    }
     format_node(
         &parsed.ir.root,
         0,
@@ -888,9 +1014,33 @@ pub fn format_nui_flow(source: &str) -> FlowResult<String> {
         &parsed.ir.data_grids,
         &parsed.ir.image_resources,
         &parsed.ir.panel_decorations,
+        &parsed.ir.skin_references,
         &mut lines,
     );
     Ok(lines.join("\n") + "\n")
+}
+
+fn format_skin_state(state: neon_ui_schema::UiVisualState) -> &'static str {
+    match state { neon_ui_schema::UiVisualState::Normal => "idle", neon_ui_schema::UiVisualState::Hover => "hover", neon_ui_schema::UiVisualState::Pressed => "pressed", neon_ui_schema::UiVisualState::Active => "active", _ => "idle" }
+}
+
+fn format_skin_component(kind: &neon_ui_schema::UiNodeKind) -> &'static str {
+    match kind { neon_ui_schema::UiNodeKind::Button => "button", neon_ui_schema::UiNodeKind::Slider => "slider", _ => "unsupported" }
+}
+
+fn format_skin_slot_kind(kind: neon_ui_schema::UiSkinSlotKind) -> &'static str {
+    match kind { neon_ui_schema::UiSkinSlotKind::Body => "body", neon_ui_schema::UiSkinSlotKind::Label => "label", neon_ui_schema::UiSkinSlotKind::FocusRing => "focus_ring", neon_ui_schema::UiSkinSlotKind::Track => "track", neon_ui_schema::UiSkinSlotKind::Fill => "fill", neon_ui_schema::UiSkinSlotKind::Thumb => "thumb" }
+}
+
+fn format_skin_presentation(presentation: &neon_ui_schema::UiSkinPresentation) -> String {
+    match presentation {
+        neon_ui_schema::UiSkinPresentation::Image { resource_key, fit } => {
+            let fit = match fit { neon_ui_schema::UiImageFit::Stretch => "stretch", neon_ui_schema::UiImageFit::Cover => "cover", neon_ui_schema::UiImageFit::Contain => "contain" };
+            if fit == "stretch" { format!("resource {resource_key}") } else { format!("resource {resource_key} fit {fit}") }
+        }
+        neon_ui_schema::UiSkinPresentation::NineSlice { resource_key, layout } => format!("resource {resource_key} nine_slice {} {} {} {} border {} {} {} {}", layout.source_insets_px[0], layout.source_insets_px[1], layout.source_insets_px[2], layout.source_insets_px[3], layout.target_insets[0], layout.target_insets[1], layout.target_insets[2], layout.target_insets[3]),
+        _ => "resource missing".into(),
+    }
 }
 
 fn format_easing(easing: UiEasing) -> &'static str {
@@ -1190,6 +1340,57 @@ struct NodeBuild {
     image_resource: Option<String>,
     nine_slice: Option<UiNineSlice>,
     world_panel: Option<NuiFlowWorldPanelDeclaration>,
+    skin_key: Option<String>,
+}
+
+fn parse_skin_header(text: &str, line: u32) -> FlowResult<neon_ui_schema::UiControlSkin> {
+    let parts = text.split_whitespace().collect::<Vec<_>>();
+    if parts.len() != 3 || parts[0] != "skin" || !valid_key(parts[1]) || !matches!(parts[2], "button" | "slider") {
+        return Err(error("nui_flow_invalid_skin", "skin syntax is: skin <key> button|slider", line, 1));
+    }
+    Ok(neon_ui_schema::UiControlSkin {
+        key: parts[1].into(),
+        component_kind: if parts[2] == "slider" { neon_ui_schema::UiNodeKind::Slider } else { neon_ui_schema::UiNodeKind::Button },
+        slots: Vec::new(),
+    })
+}
+
+fn parse_skin_slot(text: &str, line: u32) -> FlowResult<neon_ui_schema::UiSkinSlot> {
+    let parts = text.split_whitespace().collect::<Vec<_>>();
+    if parts.len() < 5 || parts[0] != "slot" || !matches!(parts[1], "body" | "track" | "fill" | "thumb" | "label" | "focus_ring") {
+        return Err(error("nui_flow_invalid_skin", "skin slots require a supported slot kind and resource", line, 1));
+    }
+    let slot_kind = match parts[1] { "body" => neon_ui_schema::UiSkinSlotKind::Body, "track" => neon_ui_schema::UiSkinSlotKind::Track, "fill" => neon_ui_schema::UiSkinSlotKind::Fill, "thumb" => neon_ui_schema::UiSkinSlotKind::Thumb, "label" => neon_ui_schema::UiSkinSlotKind::Label, "focus_ring" => neon_ui_schema::UiSkinSlotKind::FocusRing, _ => unreachable!() };
+    let state = match parts[2] {
+        "idle" => neon_ui_schema::UiVisualState::Normal,
+        "hover" => neon_ui_schema::UiVisualState::Hover,
+        "pressed" => neon_ui_schema::UiVisualState::Pressed,
+        "active" => neon_ui_schema::UiVisualState::Active,
+        _ => return Err(error("nui_flow_invalid_skin", "skin state must be idle, hover, pressed, or active", line, 1)),
+    };
+    if parts[3] != "resource" || !valid_key(parts[4]) {
+        return Err(error("nui_flow_invalid_skin", "skin body requires a resource key", line, 1));
+    }
+    let presentation = if parts.len() == 5 {
+        neon_ui_schema::UiSkinPresentation::Image { resource_key: parts[4].into(), fit: neon_ui_schema::UiImageFit::Stretch }
+    } else if parts.len() == 7 && parts[5] == "fit" {
+        let fit = match parts[6] { "stretch" => neon_ui_schema::UiImageFit::Stretch, "cover" => neon_ui_schema::UiImageFit::Cover, "contain" => neon_ui_schema::UiImageFit::Contain, _ => return Err(error("nui_flow_invalid_skin", "skin fit must be stretch, cover, or contain", line, 1)) };
+        neon_ui_schema::UiSkinPresentation::Image { resource_key: parts[4].into(), fit }
+    } else if parts.get(5) == Some(&"nine_slice") {
+        let source = parse_u32_quad(&parts, 6, line, "source insets")?;
+        if parts.get(10) != Some(&"border") {
+            return Err(error("nui_flow_invalid_nine_slice", "skin nine_slice requires border insets", line, 1));
+        }
+        let target = parse_f32_quad(&parts, 11, line, "target insets")?;
+        let layout = neon_ui_schema::UiNineSlice { source_insets_px: source, target_insets: target, mode: neon_ui_schema::UiNineSliceMode::Stretch, fill_center: true };
+        if !layout.validate() || parts.len() != 15 {
+            return Err(error("nui_flow_invalid_nine_slice", "skin nine_slice syntax is resource <key> nine_slice l t r b border l t r b", line, 1));
+        }
+        neon_ui_schema::UiSkinPresentation::NineSlice { resource_key: parts[4].into(), layout }
+    } else {
+        return Err(error("nui_flow_invalid_skin", "unsupported skin presentation", line, 1));
+    };
+    Ok(neon_ui_schema::UiSkinSlot { slot_kind, state, presentation })
 }
 
 fn parse_resource_declaration(
@@ -2177,6 +2378,7 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
     let mut data_grid_source = None;
     let mut image_resource = None;
     let mut nine_slice = None;
+    let mut skin_key = None;
     let mut world_camera = None;
     let mut world_anchor = None;
     let mut used = HashSet::new();
@@ -2198,7 +2400,7 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
             "x" | "y" | "w" | "h" | "minw" | "maxw" | "grow" | "shrink" | "basis" | "gap"
             | "pad" | "fill" | "line" | "ink" | "opacity" | "radius" | "border_width" | "value"
             | "checked" | "selected" | "state" | "numeric" | "scroll" | "enabled" | "visible"
-            | "event" | "token" | "align" | "clip" | "justify" | "data" | "rich" => {
+            | "event" | "token" | "align" | "clip" | "fit" | "justify" | "data" | "rich" | "skin" => {
                 let value = *parts.get(index + 1).ok_or_else(|| {
                     error(
                         "nui_flow_missing_value",
@@ -2247,7 +2449,14 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
                     }
                     bindings.push((UiBoundProperty::CanvasData, key.into()));
                 } else {
-                    parse_attribute(&mut node, &mut bindings, &mut intents, token, value, line)?;
+                    if token == "skin" {
+                        if !matches!(component, "button" | "slider") || !valid_key(value) {
+                            return Err(error("nui_flow_invalid_skin", "skin reference is valid only for button or slider and requires a stable key", line, 1));
+                        }
+                        skin_key = Some(value.into());
+                    } else {
+                        parse_attribute(&mut node, &mut bindings, &mut intents, token, value, line)?;
+                    }
                 }
             }
             "camera" if is_world_panel => {
@@ -2703,6 +2912,7 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
         image_resource,
         nine_slice,
         world_panel,
+        skin_key,
     })
 }
 
@@ -3066,6 +3276,17 @@ fn parse_attribute(
                 }
             }
         }
+        "fit" => {
+            if node.kind != UiNodeKind::Image {
+                return Err(error("nui_flow_invalid_image_fit", "fit is valid only for image nodes", line, 1));
+            }
+            layout.image_fit = match value {
+                "stretch" => neon_ui_schema::UiImageFit::Stretch,
+                "cover" => neon_ui_schema::UiImageFit::Cover,
+                "contain" => neon_ui_schema::UiImageFit::Contain,
+                _ => return Err(error("nui_flow_invalid_image_fit", "fit must be stretch, cover, or contain", line, 1)),
+            };
+        }
         "justify" => layout.justify_content = justify(value, line)?,
         "value" => {
             if let Some(input) = direct_binding(UiBoundProperty::TextValue) {
@@ -3196,7 +3417,7 @@ fn span(line: u32, column: u32, text: &str) -> NuiSourceSpan {
         end_column: column + text.chars().count() as u32,
     }
 }
-fn error(code: &str, message: &str, line: u32, column: u32) -> NuiFlowError {
+fn error(code: &str, message: impl Into<String>, line: u32, column: u32) -> NuiFlowError {
     NuiFlowError {
         diagnostics: vec![NuiFlowParseDiagnostic {
             code: code.into(),
@@ -3505,6 +3726,7 @@ fn format_node(
     data_grids: &[UiDataGridDeclaration],
     image_resources: &BTreeMap<String, String>,
     panel_decorations: &BTreeMap<String, neon_ui_schema::UiPanelDecoration>,
+    skin_references: &BTreeMap<String, String>,
     lines: &mut Vec<String>,
 ) {
     let kind = match &node.kind {
@@ -3532,6 +3754,9 @@ fn format_node(
         UiNodeKind::Canvas => "canvas",
     };
     let mut line = format!("{}{} {}", " ".repeat(indent), kind, node.node_id.0);
+    if let Some(skin) = skin_references.get(&node.node_id.0) {
+        line.push_str(&format!(" skin {skin}"));
+    }
     if node.bounds.x != 0.0 {
         line.push_str(&format!(" x {}", node.bounds.x));
     }
@@ -3608,6 +3833,10 @@ fn format_node(
             };
             line.push_str(&format!(" clip {policy}"));
         }
+        if node.kind == UiNodeKind::Image && layout.image_fit != neon_ui_schema::UiImageFit::Stretch {
+            let fit = match layout.image_fit { neon_ui_schema::UiImageFit::Stretch => "stretch", neon_ui_schema::UiImageFit::Cover => "cover", neon_ui_schema::UiImageFit::Contain => "contain" };
+            line.push_str(&format!(" fit {fit}"));
+        }
     }
     if let Some(TextRef::Literal { value }) = &node.text {
         line.push_str(&format!(" value \"{}\"", value.replace('"', "\\\"")));
@@ -3644,6 +3873,7 @@ fn format_node(
             data_grids,
             image_resources,
             panel_decorations,
+            skin_references,
             lines,
         );
     }
@@ -4255,6 +4485,19 @@ panel workspace row gap 8
     }
 
     #[test]
+    fn image_fit_is_typed_and_image_only() {
+        let document = parse_nui_flow(
+            "resource cover image\nsurface root\n  image artwork resource cover fit cover\n  image logo resource cover fit contain\n",
+        )
+        .unwrap();
+        assert_eq!(find_node(&document.ir.root, "artwork").unwrap().layout.unwrap().image_fit, neon_ui_schema::UiImageFit::Cover);
+        assert_eq!(find_node(&document.ir.root, "logo").unwrap().layout.unwrap().image_fit, neon_ui_schema::UiImageFit::Contain);
+        assert!(format_nui_flow(&document.source).unwrap().contains("fit cover"));
+        let error = parse_nui_flow("surface root\n  panel card fit cover\n").unwrap_err();
+        assert_eq!(error.diagnostics[0].code, "nui_flow_invalid_image_fit");
+    }
+
+    #[test]
     fn image_resource_without_asset_ref_lowers_to_external_image_binding() {
         let document = parse_nui_flow(
             "resource preview image\nsurface root\n  image thumbnail resource preview\n",
@@ -4295,6 +4538,38 @@ panel workspace row gap 8
         assert!(formatted.contains("image thumbnail resource preview"));
         assert_eq!(format_nui_flow(&formatted).unwrap(), formatted);
         assert!(!formatted.contains("project_id"));
+    }
+
+    #[test]
+    fn button_skin_round_trips_and_lowers_to_renderer_effects() {
+        let source = "resource idle image\nresource hover image\nskin pulse button\n  slot body idle resource idle nine_slice 2 2 2 2 border 4 4 4 4\n  slot body hover resource hover\nsurface root\n  button play skin pulse value \"Play\" event transport.play\n";
+        let document = parse_nui_flow(source).unwrap();
+        assert_eq!(document.ir.skins.len(), 1);
+        assert_eq!(document.ir.skin_references["play"], "pulse");
+        let effects = lower_nui_flow_effects(&document);
+        assert!(effects.iter().any(|effect| matches!(effect, UiEffect::ControlSkin { skin } if skin.key == "pulse")));
+        assert!(effects.iter().any(|effect| matches!(effect, UiEffect::SkinReference { node_id, skin_key } if node_id.0 == "play" && skin_key == "pulse")));
+        assert_eq!(format_nui_flow(source).unwrap(), format_nui_flow(&format_nui_flow(source).unwrap()).unwrap());
+    }
+
+    #[test]
+    fn button_skin_rejects_unknown_resource_and_non_button_reference() {
+        let unknown = parse_nui_flow("skin pulse button\n  slot body idle resource missing\nsurface root\n  button play skin pulse\n").unwrap_err();
+        assert_eq!(unknown.diagnostics[0].code, "nui_flow_unknown_resource");
+        let target = parse_nui_flow("resource idle image\nskin pulse button\n  slot body idle resource idle\nsurface root\n  panel card skin pulse\n").unwrap_err();
+        assert_eq!(target.diagnostics[0].code, "nui_flow_invalid_skin");
+    }
+
+    #[test]
+    fn slider_skin_flow_round_trips_slots_and_fit() {
+        let source = "resource track image\nresource fill image\nresource thumb image\nskin volume slider\n  slot track idle resource track nine_slice 2 2 2 2 border 3 3 3 3\n  slot fill active resource fill\n  slot thumb idle resource thumb fit contain\ninput amount f32:0..1 default 0.5\nsurface root\n  slider volume numeric $amount skin volume event settings.volume.commit\n";
+        let document = parse_nui_flow(source).unwrap();
+        assert_eq!(document.ir.skins[0].component_kind, UiNodeKind::Slider);
+        assert_eq!(document.ir.skins[0].slots.len(), 3);
+        let formatted = format_nui_flow(source).unwrap();
+        assert!(formatted.contains("skin volume slider"));
+        assert!(formatted.contains("slot thumb idle resource thumb fit contain"));
+        assert_eq!(format_nui_flow(&formatted).unwrap(), formatted);
     }
 
     #[test]

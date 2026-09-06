@@ -10,9 +10,10 @@ use neon_protocol::{AssetBytes, AssetRef, UiImageSource, UiImageTextureRef, UiIm
 use neon_ui_schema::{
     RenderSurfaceRef, TextRef, UiAlignItems, UiBounds, UiClipPolicy, UiControlPresentation,
     UiDataGridCellTarget, UiDataGridWindowRequest, UiDragAxis, UiDragBinding, UiDragBoundary,
-    UiDropPlacement, UiEasing, UiFragment, UiFragmentRevision, UiIntent, UiJustifyContent,
+    UiDropPlacement, UiEasing, UiFragment, UiFragmentRevision, UiImageFit, UiIntent, UiJustifyContent,
     UiLayout, UiLayoutMode, UiNode, UiNodeKind, UiSemanticPayloadValue, UiStyle,
-    UiStylePatch as SchemaStylePatch, UiTransition, UiTransitionState,
+    UiStylePatch as SchemaStylePatch, UiTransition, UiTransitionState, UiControlSkin,
+    UiSkinSlot, UiSkinSlotKind, UiVisualState, UiSkinPresentation,
 };
 use serde_json::{Value, json};
 
@@ -35,6 +36,37 @@ fn srgb_to_linear(value: vec3<f32>) -> vec3<f32> {
     let low = value / 12.92;
     let high = pow((value + vec3<f32>(0.055)) / 1.055, vec3<f32>(2.4));
     return select(low, high, value > vec3<f32>(0.04045));
+}
+fn hash2(p: vec2<f32>) -> f32 {
+    var q = vec3<f32>(p, 17.31);
+    q = fract(q * 0.1031);
+    q += dot(q, q.yzx + 33.33);
+    return fract((q.x + q.y) * q.z);
+}
+
+fn value_noise(p: vec2<f32>) -> f32 {
+    let i = floor(p);
+    let f = fract(p);
+    let u = f * f * (3.0 - 2.0 * f);
+    let a = hash2(i);
+    let b = hash2(i + vec2<f32>(1.0, 0.0));
+    let c = hash2(i + vec2<f32>(0.0, 1.0));
+    let d = hash2(i + vec2<f32>(1.0, 1.0));
+    return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+}
+
+fn liquid_glass(color: vec4<f32>, pixel: vec2<f32>, local: vec2<f32>) -> vec4<f32> {
+    // Windows Composition supplies the real backdrop blur. This shader adds
+    // only the material response: a restrained white transmission tint, a
+    // moving light band, and a thin rim highlight. The returned RGB remains
+    // straight here and is premultiplied by the caller before blending.
+    let edge = min(min(local.x, 1.0 - local.x), min(local.y, 1.0 - local.y));
+    let rim = 1.0 - smoothstep(0.0, 0.08, edge);
+    let flow = value_noise(pixel * 0.006 + vec2<f32>(view.time_seconds * 0.025, view.time_seconds * -0.018));
+    let transmission = 0.035 + flow * 0.025;
+    let highlight = rim * 0.16 + smoothstep(0.72, 0.98, flow) * 0.025;
+    let tint = mix(color.rgb, vec3<f32>(1.0), transmission);
+    return vec4<f32>(min(tint + vec3<f32>(highlight), vec3<f32>(1.0)), color.a);
 }
 fn outside_clip(pixel: vec2<f32>, clip: vec4<f32>, radius: f32) -> bool {
     if (pixel.x < clip.x || pixel.y < clip.y || pixel.x > clip.z || pixel.y > clip.w) { return true; }
@@ -112,13 +144,14 @@ fn fs_main(input: VsOut) -> @location(0) vec4<f32> {
             input.params.x + 1.0,
             edge_distance
         );
-        let color = mix(input.fill, input.border, border_alpha);
+let color = mix(input.fill, input.border, border_alpha);
         let alpha = color.a * input.params.z * shape_alpha;
         // A transparent structural container must not populate the color depth
         // attachment. Otherwise its near depth rejects all visible World UI
         // children while contributing no color itself.
         if (alpha <= 0.001) { discard; }
-        return vec4<f32>(select(srgb_to_linear(color.rgb), color.rgb, view.color_mode == 1u), alpha);
+        let glass = select(liquid_glass(color, input.pixel, input.local), color, alpha >= 0.99);
+        return vec4<f32>(select(srgb_to_linear(glass.rgb), glass.rgb, view.color_mode == 1u) * alpha, alpha);
     }
     let radius = min(input.params.y, min(input.size.x, input.size.y) * 0.5);
     let point = input.local * input.size - input.size * 0.5;
@@ -129,7 +162,8 @@ fn fs_main(input: VsOut) -> @location(0) vec4<f32> {
     let color = mix(input.fill, input.border, border_alpha);
     let alpha = color.a * input.params.z * shape_alpha;
     if (alpha <= 0.001) { discard; }
-    return vec4<f32>(select(srgb_to_linear(color.rgb), color.rgb, view.color_mode == 1u), alpha);
+    let glass = select(liquid_glass(color, input.pixel, input.local), color, alpha >= 0.99);
+    return vec4<f32>(select(srgb_to_linear(glass.rgb), glass.rgb, view.color_mode == 1u) * alpha, alpha);
 }
 "#;
 
@@ -325,7 +359,7 @@ fn map_axis(distance: f32, size: f32, source_size: f32, target_edges: vec2<f32>,
   let alpha = sample.a * input.tint.a;
   if (alpha <= 0.001) { discard; }
   let tint = select(srgb_to_linear(input.tint.rgb), input.tint.rgb, view.color_mode == 1u);
-  return vec4<f32>(sample.rgb * tint, alpha);
+     return vec4<f32>(sample.rgb * tint * alpha, alpha);
 }
 "#;
 
@@ -349,7 +383,8 @@ struct VsOut { @builtin(position) position: vec4<f32>, @location(0) local: vec2<
  let coverage = textureSample(glyph_atlas, glyph_sampler, input.uv).a;
  if (coverage <= 0.001) { discard; }
   let color = select(srgb_to_linear(input.color.rgb), input.color.rgb, view.color_mode == 1u);
-  return vec4<f32>(color, input.color.a * coverage);
+   let alpha = input.color.a * coverage;
+   return vec4<f32>(color * alpha, alpha);
 }
 "#;
 
@@ -369,7 +404,8 @@ fn srgb_to_linear(value: vec3<f32>) -> vec3<f32> { let low=value/12.92; let high
  if(input.pixel.x<input.clip.x||input.pixel.y<input.clip.y||input.pixel.x>input.clip.z||input.pixel.y>input.clip.w){discard;}
  if(input.kind==0u && length(input.pixel-input.start)>input.width*0.5){discard;}
  if(input.color.a<=0.001){discard;}
- return vec4<f32>(select(srgb_to_linear(input.color.rgb),input.color.rgb,view.color_mode==1u),input.color.a);
+  let alpha = input.color.a;
+  return vec4<f32>(select(srgb_to_linear(input.color.rgb),input.color.rgb,view.color_mode==1u) * alpha, alpha);
 }
 "#;
 
@@ -1207,6 +1243,11 @@ pub struct UiWgpuRenderer {
     resident_images: HashMap<(String, u64, u64), ResidentImage>,
     external_images: HashMap<String, ResidentImage>,
     nine_slices: HashMap<String, neon_ui_schema::UiNineSlice>,
+    image_fits: HashMap<String, UiImageFit>,
+    skins: HashMap<String, UiControlSkin>,
+    skin_references: HashMap<String, String>,
+    skin_image_ids: HashMap<String, String>,
+    skin_assets: HashMap<String, AssetRef>,
     image_atlas: Option<ResidentImageAtlas>,
     image_atlas_generation: u64,
     resident_render_surfaces: HashMap<String, ResidentRenderSurface>,
@@ -1313,6 +1354,18 @@ impl UiWgpuRenderer {
             bind_group_layouts: &[Some(&view_layout)],
             immediate_size: 0,
         });
+        let premultiplied_blend = wgpu::BlendState {
+            color: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::One,
+                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                operation: wgpu::BlendOperation::Add,
+            },
+            alpha: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::One,
+                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                operation: wgpu::BlendOperation::Add,
+            },
+        };
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("neon3-ui-panel-pipeline"),
             layout: Some(&layout),
@@ -1387,7 +1440,7 @@ impl UiWgpuRenderer {
                 entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
                     format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    blend: Some(premultiplied_blend),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
                 compilation_options: Default::default(),
@@ -1557,7 +1610,7 @@ impl UiWgpuRenderer {
                 entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
                     format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    blend: Some(premultiplied_blend),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
                 compilation_options: Default::default(),
@@ -1665,7 +1718,7 @@ impl UiWgpuRenderer {
                 entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
                     format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    blend: Some(premultiplied_blend),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
                 compilation_options: Default::default(),
@@ -1761,7 +1814,7 @@ impl UiWgpuRenderer {
                 entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
                     format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    blend: Some(premultiplied_blend),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
                 compilation_options: Default::default(),
@@ -1918,6 +1971,11 @@ impl UiWgpuRenderer {
             resident_images: HashMap::new(),
             external_images: HashMap::new(),
             nine_slices: HashMap::new(),
+            image_fits: HashMap::new(),
+            skins: HashMap::new(),
+            skin_references: HashMap::new(),
+            skin_image_ids: HashMap::new(),
+            skin_assets: HashMap::new(),
             image_atlas: None,
             image_atlas_generation: 0,
             resident_render_surfaces: HashMap::new(),
@@ -4822,13 +4880,10 @@ impl UiWgpuRenderer {
                 for value in &mut target_insets {
                     *value = value.max(0.0);
                 }
+                let fit = self.image_fits.get(node_key).copied().unwrap_or(UiImageFit::Stretch);
+                let (rect, uv) = fit_image_rect_and_uv(visual.bounds, image.uv, image.width, image.height, fit);
                 Some(UiImageInstance {
-                    rect: [
-                        visual.bounds.x,
-                        visual.bounds.y,
-                        visual.bounds.width,
-                        visual.bounds.height,
-                    ],
+                    rect,
                     tint: [1.0, 1.0, 1.0, visual.style.opacity],
                     clip: [
                         visual.clip.x,
@@ -4836,7 +4891,7 @@ impl UiWgpuRenderer {
                         visual.clip.x + visual.clip.width,
                         visual.clip.y + visual.clip.height,
                     ],
-                    uv: image.uv,
+                    uv,
                     depth: color_pass_depth(visual.world_depth),
                     paint_group_id: self.plan[index].paint_group_id,
                     source_insets,
@@ -4859,6 +4914,97 @@ impl UiWgpuRenderer {
                 popup_images.push(image);
             } else {
                 images.push(image);
+            }
+        }
+        // Skin bodies paint after the standard control rectangle, replacing its
+        // visual treatment without changing the logical button bounds or hits.
+        for (index, visual) in self.sampled.iter().enumerate() {
+            if visual.kind != UiNodeKind::Button || !sampled_in_mode(visual, mode) {
+                continue;
+            }
+            let node_path = &self.plan[index].id;
+            let Some(skin_key) = self.skin_references.get(node_path) else {
+                continue;
+            };
+            let Some(skin) = self.skins.get(skin_key) else {
+                continue;
+            };
+            let hovered = self.pointer_position.is_some_and(|position| contains(visual.bounds, position));
+            let pressed = hovered && time_seconds < self.pressed_until_seconds;
+            let Some(slot) = select_button_skin_slot(skin, hovered, pressed) else {
+                continue;
+            };
+            let (resource_key, fit, nine_slice) = match &slot.presentation {
+                UiSkinPresentation::Image { resource_key, fit } => (resource_key, *fit, None),
+                UiSkinPresentation::NineSlice { resource_key, layout } => {
+                    (resource_key, UiImageFit::Stretch, Some(*layout))
+                }
+                _ => continue,
+            };
+            let binding_key = format!("{skin_key}/{resource_key}");
+            let image = self.skin_assets.get(&binding_key).and_then(|asset| {
+                self.resident_images.get(&(asset.project_id.clone(), asset.asset_id, asset.revision.0))
+            }).or_else(|| {
+                self.skin_image_ids.get(&binding_key).and_then(|image_id| self.external_images.get(image_id))
+            });
+            let Some(image) = image else {
+                continue;
+            };
+            if nine_slice.is_some_and(|layout| !layout.validate_for_image(image.width, image.height)) {
+                continue;
+            }
+            let (source_insets, target_insets, slice_mode, fill_center) = nine_slice.map(|layout| (
+                layout.source_insets_px.map(|value| value as f32),
+                layout.target_insets,
+                match layout.mode { neon_ui_schema::UiNineSliceMode::Stretch => 0, neon_ui_schema::UiNineSliceMode::Tile => 1, neon_ui_schema::UiNineSliceMode::Mirror => 2 },
+                u32::from(layout.fill_center),
+            )).unwrap_or(([0.0; 4], [0.0; 4], 0, 1));
+            let (rect, uv) = fit_image_rect_and_uv(visual.bounds, image.uv, image.width, image.height, fit);
+            images.push(UiImageInstance {
+                rect,
+                tint: [1.0, 1.0, 1.0, visual.style.opacity],
+                clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height],
+                uv,
+                depth: color_pass_depth(visual.world_depth),
+                paint_group_id: self.plan[index].paint_group_id,
+                source_insets,
+                target_insets,
+                mode: slice_mode,
+                fill_center,
+                _padding: [0; 2],
+            });
+        }
+        // Slider skins replace the standard track/fill/thumb chrome only. The
+        // slider visual and its hit bounds remain the authored logical bounds.
+        for (index, visual) in self.sampled.iter().enumerate() {
+            if visual.kind != UiNodeKind::Slider || !sampled_in_mode(visual, mode) {
+                continue;
+            }
+            let Some(skin_key) = self.skin_references.get(&self.plan[index].id) else { continue };
+            let Some(skin) = self.skins.get(skin_key) else { continue };
+            let normalized = match &visual.presentation {
+                Some(UiControlPresentation::Numeric { value, min, max }) => ((value - min) / (max - min)).clamp(0.0, 1.0),
+                _ => continue,
+            };
+            let hovered = self.pointer_position.is_some_and(|position| contains(visual.bounds, position));
+            let pressed = hovered && time_seconds < self.pressed_until_seconds;
+            let track = UiBounds { x: visual.bounds.x + 12.0, y: visual.bounds.y + visual.bounds.height * 0.5 - 2.0, width: (visual.bounds.width - 24.0).max(1.0), height: 4.0 };
+            let fill = UiBounds { x: track.x, y: track.y, width: track.width * normalized, height: track.height };
+            let thumb = UiBounds { x: track.x + track.width * normalized - 6.0, y: track.y - 4.0, width: 12.0, height: 12.0 };
+            for (slot_kind, bounds) in [(UiSkinSlotKind::Track, track), (UiSkinSlotKind::Fill, fill), (UiSkinSlotKind::Thumb, thumb)] {
+                let Some(slot) = select_slider_skin_slot(skin, slot_kind, hovered, pressed) else { continue };
+                let (resource_key, fit, nine_slice) = match &slot.presentation {
+                    UiSkinPresentation::Image { resource_key, fit } => (resource_key, *fit, None),
+                    UiSkinPresentation::NineSlice { resource_key, layout } => (resource_key, UiImageFit::Stretch, Some(*layout)),
+                    _ => continue,
+                };
+                let binding_key = format!("{skin_key}/{resource_key}");
+                let image = self.skin_assets.get(&binding_key).and_then(|asset| self.resident_images.get(&(asset.project_id.clone(), asset.asset_id, asset.revision.0))).or_else(|| self.skin_image_ids.get(&binding_key).and_then(|image_id| self.external_images.get(image_id)));
+                let Some(image) = image else { continue };
+                if nine_slice.is_some_and(|layout| !layout.validate_for_image(image.width, image.height)) { continue; }
+                let (source_insets, target_insets, slice_mode, fill_center) = nine_slice.map(|layout| (layout.source_insets_px.map(|value| value as f32), layout.target_insets, match layout.mode { neon_ui_schema::UiNineSliceMode::Stretch => 0, neon_ui_schema::UiNineSliceMode::Tile => 1, neon_ui_schema::UiNineSliceMode::Mirror => 2 }, u32::from(layout.fill_center))).unwrap_or(([0.0; 4], [0.0; 4], 0, 1));
+                let (rect, uv) = fit_image_rect_and_uv(bounds, image.uv, image.width, image.height, fit);
+                images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, _padding: [0; 2] });
             }
         }
         let image_capacity = images.len().max(popup_images.len());
@@ -5707,12 +5853,44 @@ impl UiWgpuRenderer {
             return false;
         }
         self.nine_slices.clear();
+        self.image_fits.clear();
+        self.skins.clear();
+        self.skin_references.clear();
+        self.skin_image_ids.clear();
+        self.skin_assets.clear();
         for fragment in fragments.values() {
             for effect in &fragment.effects {
-                if let neon_ui_schema::UiEffect::NineSlice { node_id, layout } = effect {
-                    self.nine_slices.insert(node_id.0.clone(), *layout);
+                match effect {
+                    neon_ui_schema::UiEffect::NineSlice { node_id, layout } => {
+                        self.nine_slices.insert(node_id.0.clone(), *layout);
+                    }
+                    neon_ui_schema::UiEffect::ControlSkin { skin } => {
+                        self.skins.insert(skin.key.clone(), skin.clone());
+                    }
+                    neon_ui_schema::UiEffect::SkinReference { node_id, skin_key } => {
+                        self.skin_references.insert(
+                            format!("{}/{}", fragment.fragment_id.0, node_id.0),
+                            skin_key.clone(),
+                        );
+                    }
+                    neon_ui_schema::UiEffect::SkinResourceBinding {
+                        skin_key,
+                        resource_key,
+                        asset_ref,
+                        image_id,
+                    } => {
+                        let key = format!("{skin_key}/{resource_key}");
+                        if let Some(image_id) = image_id {
+                            self.skin_image_ids.insert(key.clone(), image_id.clone());
+                        }
+                        if let Some(asset_ref) = asset_ref {
+                            self.skin_assets.insert(key, asset_ref.clone());
+                        }
+                    }
+                    _ => {}
                 }
             }
+            collect_image_fits(&fragment.root, &mut self.image_fits);
         }
         self.layout_counters.layout_count = self.layout_counters.layout_count.saturating_add(1);
         let display_fragments = self.data_grid_display_fragments(fragments);
@@ -6578,7 +6756,13 @@ impl UiWgpuRenderer {
                 open: self.open_dropdown.as_deref() == Some(node_path),
             },
         );
-        let mut instances = component_chrome_instances(&preview);
+        let mut instances = if matches!(preview.kind, UiNodeKind::Button | UiNodeKind::Slider)
+            && self.skin_references.contains_key(node_path)
+        {
+            Vec::new()
+        } else {
+            component_chrome_instances(&preview)
+        };
         if preview.kind == UiNodeKind::Tabs
             && preview.enabled
             && let Some(pointer) = self.pointer_position
@@ -7207,6 +7391,83 @@ fn component_spec(kind: &UiNodeKind) -> UiComponentSpec {
             virtualized: *kind == UiNodeKind::DataGrid,
         },
     }
+}
+
+fn collect_image_fits(node: &UiNode, output: &mut HashMap<String, UiImageFit>) {
+    if node.kind == UiNodeKind::Image {
+        if let Some(layout) = node.layout {
+            output.insert(node.node_id.0.clone(), layout.image_fit);
+        }
+    }
+    for child in &node.children {
+        collect_image_fits(child, output);
+    }
+}
+
+fn select_button_skin_slot<'a>(skin: &'a UiControlSkin, hovered: bool, pressed: bool) -> Option<&'a UiSkinSlot> {
+    let states = if pressed {
+        [UiVisualState::Pressed, UiVisualState::Hover, UiVisualState::Normal]
+    } else if hovered {
+        [UiVisualState::Hover, UiVisualState::Normal, UiVisualState::Normal]
+    } else {
+        [UiVisualState::Normal, UiVisualState::Normal, UiVisualState::Normal]
+    };
+    states.iter().find_map(|state| {
+        skin.slots.iter().find(|slot| slot.slot_kind == UiSkinSlotKind::Body && slot.state == *state)
+    })
+}
+
+fn select_slider_skin_slot<'a>(skin: &'a UiControlSkin, kind: UiSkinSlotKind, hovered: bool, pressed: bool) -> Option<&'a UiSkinSlot> {
+    let states = match kind {
+        UiSkinSlotKind::Fill => [UiVisualState::Active, UiVisualState::Normal, UiVisualState::Normal],
+        _ if pressed => [UiVisualState::Pressed, UiVisualState::Hover, UiVisualState::Normal],
+        _ if hovered => [UiVisualState::Hover, UiVisualState::Normal, UiVisualState::Normal],
+        _ => [UiVisualState::Normal, UiVisualState::Normal, UiVisualState::Normal],
+    };
+    states.iter().find_map(|state| skin.slots.iter().find(|slot| slot.slot_kind == kind && slot.state == *state))
+}
+
+fn fit_image_rect_and_uv(
+    bounds: UiBounds,
+    mut uv: [f32; 4],
+    image_width: u32,
+    image_height: u32,
+    fit: UiImageFit,
+) -> ([f32; 4], [f32; 4]) {
+    let mut rect = [bounds.x, bounds.y, bounds.width, bounds.height];
+    if image_width == 0 || image_height == 0 || bounds.width <= 0.0 || bounds.height <= 0.0 || fit == UiImageFit::Stretch {
+        return (rect, uv);
+    }
+    let source_aspect = image_width as f32 / image_height as f32;
+    let target_aspect = bounds.width / bounds.height;
+    match fit {
+        UiImageFit::Cover if source_aspect > target_aspect => {
+            let visible = target_aspect / source_aspect;
+            let inset = (1.0 - visible) * 0.5;
+            let width = uv[2] - uv[0];
+            uv[0] += width * inset;
+            uv[2] -= width * inset;
+        }
+        UiImageFit::Cover => {
+            let visible = source_aspect / target_aspect;
+            let inset = (1.0 - visible) * 0.5;
+            let height = uv[3] - uv[1];
+            uv[1] += height * inset;
+            uv[3] -= height * inset;
+        }
+        UiImageFit::Contain if source_aspect > target_aspect => {
+            let height = bounds.width / source_aspect;
+            rect[1] += (bounds.height - height) * 0.5;
+            rect[3] = height;
+        }
+        UiImageFit::Contain => {
+            let width = bounds.height * source_aspect;
+            rect[0] += (bounds.width - width) * 0.5;
+            rect[2] = width;
+        }
+        UiImageFit::Stretch => {}
+    }
+    (rect, uv)
 }
 
 fn default_component_style(kind: &UiNodeKind) -> UiStyle {
@@ -10041,6 +10302,49 @@ mod tests {
         assert_eq!(editing.backspace(), Some("地形A".into()));
         assert_eq!(editing.delete(), Some("地形".into()));
         assert_eq!(editing.cursor, 2);
+    }
+
+    #[test]
+    fn button_skin_selection_uses_local_pressed_hover_idle_fallback() {
+        let skin = UiControlSkin {
+            key: "pulse".into(),
+            component_kind: UiNodeKind::Button,
+            slots: vec![
+                UiSkinSlot {
+                    slot_kind: UiSkinSlotKind::Body,
+                    state: UiVisualState::Normal,
+                    presentation: UiSkinPresentation::Image { resource_key: "idle".into(), fit: UiImageFit::Stretch },
+                },
+                UiSkinSlot {
+                    slot_kind: UiSkinSlotKind::Body,
+                    state: UiVisualState::Hover,
+                    presentation: UiSkinPresentation::Image { resource_key: "hover".into(), fit: UiImageFit::Stretch },
+                },
+            ],
+        };
+        let resource = |hovered, pressed| match &select_button_skin_slot(&skin, hovered, pressed).unwrap().presentation {
+            UiSkinPresentation::Image { resource_key, .. } => resource_key.as_str(),
+            _ => unreachable!(),
+        };
+        assert_eq!(resource(false, false), "idle");
+        assert_eq!(resource(true, false), "hover");
+        assert_eq!(resource(true, true), "hover");
+    }
+
+    #[test]
+    fn slider_skin_selection_uses_required_slots_and_local_state_fallback() {
+        let skin = UiControlSkin {
+            key: "volume".into(),
+            component_kind: UiNodeKind::Slider,
+            slots: vec![
+                UiSkinSlot { slot_kind: UiSkinSlotKind::Track, state: UiVisualState::Normal, presentation: UiSkinPresentation::Default },
+                UiSkinSlot { slot_kind: UiSkinSlotKind::Fill, state: UiVisualState::Active, presentation: UiSkinPresentation::Default },
+                UiSkinSlot { slot_kind: UiSkinSlotKind::Thumb, state: UiVisualState::Hover, presentation: UiSkinPresentation::Default },
+            ],
+        };
+        assert_eq!(select_slider_skin_slot(&skin, UiSkinSlotKind::Track, false, false).unwrap().slot_kind, UiSkinSlotKind::Track);
+        assert_eq!(select_slider_skin_slot(&skin, UiSkinSlotKind::Fill, true, true).unwrap().state, UiVisualState::Active);
+        assert_eq!(select_slider_skin_slot(&skin, UiSkinSlotKind::Thumb, true, true).unwrap().state, UiVisualState::Hover);
     }
 
     #[test]

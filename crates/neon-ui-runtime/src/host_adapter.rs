@@ -687,12 +687,14 @@ mod tests {
                     parent_key: None,
                     kind: neon_ui_schema::UiNodeKind::Button,
                     source_span: None,
+                    skin_key: None,
                 },
                 UiProgramNode {
                     key: "grid_node".into(),
                     parent_key: None,
                     kind: neon_ui_schema::UiNodeKind::DataGrid,
                     source_span: None,
+                    skin_key: None,
                 },
             ],
             node_templates: Vec::new(),
@@ -723,6 +725,7 @@ mod tests {
                 literal_payload: BTreeMap::new(),
                 bound_input_keys: Vec::new(),
             }],
+            skins: Vec::new(),
             resource_budget: UiResourceBudget {
                 max_nodes: 2,
                 max_bindings: 0,
@@ -1237,6 +1240,7 @@ mod tests {
             drag_records: Vec::new(),
             drop_records: Vec::new(),
             event_records: Vec::new(),
+            skins: Vec::new(),
             resource_budget: UiResourceBudget {
                 max_nodes: 0,
                 max_bindings: 0,

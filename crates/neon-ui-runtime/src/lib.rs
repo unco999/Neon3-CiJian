@@ -1952,6 +1952,17 @@ pub fn compile_ui_program(
     revision.validate_baseline().map_err(schema_compile_error)?;
     schema.validate().map_err(schema_compile_error)?;
     document.validate().map_err(schema_compile_error)?;
+    if !document.skins.is_empty()
+        && !revision.capabilities.iter().any(|capability| {
+            capability.name == neon_ui_schema::UI_COMPONENT_SKIN_CAPABILITY_NAME
+                && capability.version == 1
+        })
+    {
+        return Err(compile_error(
+            neon_ui_schema::ERROR_UI_PROGRAM_UNSUPPORTED_CAPABILITY,
+            "control skins require ui.component_skin.v1",
+        ));
+    }
     let mut templates = Vec::new();
     let mut nodes = Vec::new();
     let mut layouts = Vec::new();
@@ -1963,6 +1974,7 @@ pub fn compile_ui_program(
         &mut nodes,
         &mut layouts,
         &mut node_keys,
+        &document.skin_references,
     )?;
     if nodes.len() as u32 > document.resource_budget.max_nodes
         || nodes.len() as u32 > document.resource_budget.max_instances
@@ -2168,6 +2180,7 @@ pub fn compile_ui_program(
         drag_records: Vec::new(),
         drop_records: Vec::new(),
         event_records: document.events.clone(),
+        skins: document.skins.clone(),
         resource_budget: document.resource_budget.clone(),
         dependency_index: dependencies,
         layout_hash,
@@ -2400,6 +2413,7 @@ fn collect_program_nodes(
     nodes: &mut Vec<UiProgramNode>,
     layouts: &mut Vec<UiProgramLayoutRecord>,
     keys: &mut HashSet<String>,
+    skin_references: &BTreeMap<String, String>,
 ) -> Result<(), UiProgramCompileError> {
     if node.node_id.0.trim().is_empty() || !keys.insert(node.node_id.0.clone()) {
         return Err(compile_error(
@@ -2412,6 +2426,7 @@ fn collect_program_nodes(
         parent_key: parent.clone(),
         kind: node.kind.clone(),
         source_span: None,
+        skin_key: skin_references.get(&node.node_id.0).cloned(),
     });
     templates.push(node.clone());
     layouts.push(UiProgramLayoutRecord {
@@ -2427,6 +2442,7 @@ fn collect_program_nodes(
             nodes,
             layouts,
             keys,
+            skin_references,
         )?;
     }
     Ok(())
@@ -2811,6 +2827,7 @@ impl UiRuntime {
                 "ui.fragment.submit.v1".into(),
                 "ui.image.upload.v1".into(),
                 neon_ui_schema::UI_NINE_SLICE_CAPABILITY_NAME.into(),
+                neon_ui_schema::UI_COMPONENT_SKIN_CAPABILITY_NAME.into(),
                 "ui.semantic_input.v1".into(),
                 "ui.intent_dispatch.v1".into(),
                 "ui.surface.machine.v1".into(),
@@ -3227,6 +3244,7 @@ impl UiRuntime {
                 neon_ui_schema::UI_PROGRAM_BOUNDED_STRUCTURE_CAPABILITY_NAME,
                 neon_ui_schema::UI_PROGRAM_SEMANTIC_EVENT_CAPABILITY_NAME,
                 neon_ui_schema::UI_NINE_SLICE_CAPABILITY_NAME,
+                neon_ui_schema::UI_COMPONENT_SKIN_CAPABILITY_NAME,
                 neon_ui_schema::UI_CANVAS_POINTS_LINES_CAPABILITY_NAME,
             ]
             .into_iter()
@@ -7252,6 +7270,8 @@ mod tests {
             resources: Vec::new(),
             image_resources: BTreeMap::new(),
             panel_decorations: BTreeMap::new(),
+            skin_references: BTreeMap::new(),
+            skins: Vec::new(),
             branches: Vec::new(),
             templates: Vec::new(),
             data_grids: Vec::new(),

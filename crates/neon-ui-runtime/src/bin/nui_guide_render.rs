@@ -51,37 +51,37 @@ const EXAMPLES: &[GuideExample] = &[
     // 1. Minimal document shape.
     ex(
         "01-minimal",
-        "version 1\nsurface minimal column w 360 h 200 gap 8 pad 12 align stretch fill #17201E\n  text title h 24 value \"Hello NUI Flow\"\n  text subtitle h 18 value \"One surface. One panel. One text.\"\n",
+        "version 1\nsurface guide column w 360 h 200 gap 8 pad 12 align stretch fill #17201E\n  text title h 24 value \"Hello NUI Flow\"\n  text subtitle h 18 value \"One surface. One panel. One text.\"\n",
     ),
     // 2. Layout primitives: row vs column + gap/pad/align.
     ex(
         "02-layout",
-        "version 1\nsurface layout column w 480 h 220 gap 10 pad 12 align stretch fill #1B2530\n  panel left row w 200 h 40 gap 6 pad 6 fill #2E4255\n    text a value \"A\"\n    text b value \"B\"\n    text c value \"C\"\n  panel right row w 200 h 40 gap 6 pad 6 fill #3B5066\n    text x value \"X\"\n    text y value \"Y\"\n  text note value \"row lays children left-to-right; gap separates them\"\n",
+        "version 1\nsurface guide column w 480 h 220 gap 10 pad 12 align stretch fill #1B2530\n  panel left row w 200 h 40 gap 6 pad 6 fill #2E4255\n    text a value \"A\"\n    text b value \"B\"\n    text c value \"C\"\n  panel right row w 200 h 40 gap 6 pad 6 fill #3B5066\n    text x value \"X\"\n    text y value \"Y\"\n  text note value \"row lays children left-to-right; gap separates them\"\n",
     ),
     // 3. Typed inputs: the only way domain data reaches the UI.
     ex(
         "03-inputs",
-        "version 1\ninput health f32:0..100 default 82\ninput name text default text:empty\nsurface inputs column w 400 h 200 gap 8 pad 12 align stretch fill #17201E\n  text health-label value \"Health:\"\n  progress_bar health_bar numeric $health\n  text name-label value \"Name:\"\n  text name-value value $name\n",
+        "version 1\ninput health f32:0..100 default 82\ninput name text default text:empty\nsurface guide column w 400 h 200 gap 8 pad 12 align stretch fill #17201E\n  text health-label value \"Health:\"\n  progress_bar health_bar numeric $health\n  text name-label value \"Name:\"\n  text name-value value $name\n",
     ),
     // 4. Controls and semantic events.
     ex(
         "04-events",
-        "version 1\ninput volume f32:0..100 default 50\nsurface events column w 420 h 230 gap 8 pad 12 align stretch fill #17201E\n  text title h 24 value \"Controls\"\n  button primary h 36 value \"Save\" event app.save\n  button danger h 36 value \"Delete\" event app.delete\n  slider volume numeric $volume\n  text hint value \"button -> semantic intent; slider drag -> value_commit\"\n",
+        "version 1\ninput volume f32:0..100 default 50\nsurface guide column w 420 h 230 gap 8 pad 12 align stretch fill #17201E\n  text title h 24 value \"Controls\"\n  button primary h 36 value \"Save\" event app.save\n  button danger h 36 value \"Delete\" event app.delete\n  slider volume numeric $volume\n  text hint value \"button -> semantic intent; slider drag -> value_commit\"\n",
     ),
     // 5. Scroll + overflow.
     ex(
         "05-scroll",
-        "version 1\nsurface scroll column w 400 h 240 gap 8 pad 12 align stretch fill #17201E\n  text title h 24 value \"Inspector\"\n  scroll inspector column h 160 gap 4 pad 8 fill #22302D\n    text p1 value \"Material: Oak\"\n    text p2 value \"Roughness: 0.42\"\n    text p3 value \"Metallic: 0.00\"\n    text p4 value \"Opacity: 1.00\"\n    text p5 value \"Scale: 2.00 m\"\n    text p6 value \"Revision: 14\"\n    text p7 value \"Author: Studio\"\n    text p8 value \"Note: overflow scrolls\"\n",
+        "version 1\nsurface guide column w 400 h 240 gap 8 pad 12 align stretch fill #17201E\n  text title h 24 value \"Inspector\"\n  scroll inspector column h 160 gap 4 pad 8 fill #22302D\n    text p1 value \"Material: Oak\"\n    text p2 value \"Roughness: 0.42\"\n    text p3 value \"Metallic: 0.00\"\n    text p4 value \"Opacity: 1.00\"\n    text p5 value \"Scale: 2.00 m\"\n    text p6 value \"Revision: 14\"\n    text p7 value \"Author: Studio\"\n    text p8 value \"Note: overflow scrolls\"\n",
     ),
     // 6. DataGrid with bound columns.
     ex(
         "06-datagrid",
-        "version 1\ninput assets grid default grid:empty\nsurface datagrid column w 520 h 260 gap 8 pad 12 align stretch fill #17201E\n  text title h 24 value \"Assets\"\n  data_grid assets-grid h 180 source $assets capacity 4 row_height 28 overscan 1 columns \"id:80:text,name:180:edit:64:asset.name.commit,status:120:dropdown:draft|ready:asset.status.set\"\n  text hint value \"grid data arrives as a typed input frame from the domain service\"\n",
+        "version 1\ninput assets grid default grid:empty\nsurface guide column w 520 h 260 gap 8 pad 12 align stretch fill #17201E\n  text title h 24 value \"Assets\"\n  data_grid assets-grid h 180 source $assets capacity 4 row_height 28 overscan 1 columns \"id:80:text,name:180:edit:64:asset.name.commit,status:120:dropdown:draft|ready:asset.status.set\"\n  text hint value \"grid data arrives as a typed input frame from the domain service\"\n",
     ),
     // 7. Complete workbench: everything composed.
     ex(
         "07-workbench",
-        "version 1\ninput health f32:0..100 default 64\ninput name text default text:empty\nsurface workbench column w 560 h 300 gap 8 pad 12 align stretch fill #1B2530\n  text title h 24 value \"Terrain Workbench\"\n  panel summary row w 536 h 56 gap 8 pad 8 fill #22384C\n    text terrain-name value $name\n    progress_bar hp numeric $health\n  panel tools row w 536 h 44 gap 6 pad 6 fill #2E4255\n    button t1 h 32 value \"Sculpt\" event terrain.tool.select\n    button t2 h 32 value \"Water\" event terrain.tool.select\n    button t3 h 32 value \"Material\" event terrain.tool.select\n  text status value \"mode sculpt, brush round\"\n",
+        "version 1\ninput health f32:0..100 default 64\ninput name text default text:empty\nsurface guide column w 560 h 300 gap 8 pad 12 align stretch fill #1B2530\n  text title h 24 value \"Terrain Workbench\"\n  panel summary row w 536 h 56 gap 8 pad 8 fill #22384C\n    text terrain-name value $name\n    progress_bar hp numeric $health\n  panel tools row w 536 h 44 gap 6 pad 6 fill #2E4255\n    button t1 h 32 value \"Sculpt\" event terrain.tool.select\n    button t2 h 32 value \"Water\" event terrain.tool.select\n    button t3 h 32 value \"Material\" event terrain.tool.select\n  text status value \"mode sculpt, brush round\"\n",
     ),
 ];
 

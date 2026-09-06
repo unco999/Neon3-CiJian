@@ -65,8 +65,52 @@ use winit::{
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 #[cfg(windows)]
+use winit::platform::windows::WindowAttributesExtWindows;
+
+#[cfg(windows)]
 mod dx12_interop;
 mod gpu_preview;
+#[cfg(windows)]
+mod acrylic_backdrop;
+
+/// Read the Win32 HWND from a winit window handle (Windows only).
+#[cfg(windows)]
+fn window_hwnd_win32(window: &Window) -> Option<windows::Win32::Foundation::HWND> {
+    let handle = window.window_handle().ok()?;
+    let RawWindowHandle::Win32(win32) = handle.as_raw() else {
+        return None;
+    };
+    Some(windows::Win32::Foundation::HWND(win32.hwnd.get() as *mut _))
+}
+
+/// Initialise COM (STA) and a DispatcherQueue bound to the calling thread.
+/// Required by `Windows.UI.Composition.Compositor` on the desktop. Must run
+/// before the winit event loop creates its own COM apartment.
+#[cfg(windows)]
+fn init_dispatcher_queue(
+) -> Result<windows::System::DispatcherQueueController, String> {
+    use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
+    use windows::Win32::System::WinRT::{
+        CreateDispatcherQueueController, DispatcherQueueOptions, DQTAT_COM_STA,
+        DQTYPE_THREAD_CURRENT,
+    };
+    let co_result = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+    if co_result.is_err() {
+        return Err(format!("CoInitializeEx(STA) failed: {co_result:?}"));
+    }
+    let dq_options = DispatcherQueueOptions {
+        dwSize: std::mem::size_of::<DispatcherQueueOptions>() as u32,
+        threadType: DQTYPE_THREAD_CURRENT,
+        apartmentType: DQTAT_COM_STA,
+    };
+    let controller = unsafe { CreateDispatcherQueueController(dq_options) }
+        .map_err(|error| format!("CreateDispatcherQueueController: {error:?}"))?;
+    let present = windows::System::DispatcherQueue::GetForCurrentThread().is_ok();
+    if !present {
+        return Err("DispatcherQueue did not bind to the current thread".into());
+    }
+    Ok(controller)
+}
 
 /// A GPU surface that can be shared across process boundaries.
 ///
@@ -138,6 +182,69 @@ const HEADLESS_UI_LOGICAL_SIZE: [f32; 2] = [1280.0, 720.0];
 /// 2048-wide desktop composition and 1214px of vertical content; this keeps
 /// the complete landscape presentation inside a 2340x1080 phone surface.
 const ANDROID_GALLERY_UI_SCALE: f64 = 0.88;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum WindowBackdrop {
+    None,
+    Acrylic,
+}
+
+#[derive(Clone, Debug)]
+struct WindowBackdropState {
+    requested: String,
+    active: String,
+    detail: Option<String>,
+}
+
+impl WindowBackdrop {
+    fn from_environment() -> (Self, WindowBackdropState) {
+        let requested = std::env::var("NEON_WINDOW_BACKDROP")
+            .unwrap_or_else(|_| "none".into())
+            .trim()
+            .to_ascii_lowercase();
+        Self::from_value(&requested)
+    }
+
+    fn from_value(requested: &str) -> (Self, WindowBackdropState) {
+        let requested = requested.trim().to_ascii_lowercase();
+        match requested.as_str() {
+            "" | "none" => (Self::None, WindowBackdropState {
+                requested: "none".into(), active: "none".into(), detail: None,
+            }),
+            "acrylic" => (Self::Acrylic, WindowBackdropState {
+                requested, active: "pending".into(), detail: None,
+            }),
+            _ => (Self::None, WindowBackdropState {
+                requested: requested.clone(), active: "none".into(),
+                detail: Some("unsupported backdrop; supported values are none and acrylic".into()),
+            }),
+        }
+    }
+
+    fn requests_transparency(&self) -> bool {
+        matches!(self, Self::Acrylic)
+    }
+}
+
+#[cfg(windows)]
+fn apply_windows_backdrop(_window: &Window, backdrop: &WindowBackdrop, state: &mut WindowBackdropState) {
+    if matches!(backdrop, WindowBackdrop::Acrylic) {
+        // Keep the stable transparent wgpu presentation path. Native DWM
+        // accent changes the same HWND after DxgiFromVisual is initialized and
+        // can remove the wgpu visual after its first frame.
+        state.active = "transparent-wgpu".into();
+        state.detail = Some("native acrylic disabled; composition swapchain remains opt-in".into());
+    }
+}
+
+#[cfg(not(windows))]
+fn apply_windows_backdrop(_window: &Window, backdrop: &WindowBackdrop, state: &mut WindowBackdropState) {
+    if matches!(backdrop, WindowBackdrop::Acrylic) {
+        state.active = "none".into();
+        state.detail = Some("Windows transparency is unavailable on this platform".into());
+    }
+}
+
 /// Explorer normally runs at medium integrity, so Windows blocks its drop
 /// messages to an elevated renderer window. Keep this exception inside the
 /// sole window owner and allow only the documented file-drop messages.
@@ -1045,6 +1152,7 @@ pub struct WindowedRuntime {
     initial_window_sizing: InitialWindowSizing,
     event_proxy: Option<EventLoopProxy<WindowCommand>>,
     eventd_endpoint: Option<SocketAddr>,
+    window_backdrop: WindowBackdropState,
     next_file_drop_sequence: u64,
     world_ui_lab_camera: Arc<Mutex<WorldUiLabCameraController>>,
     /// When true the runtime does not create a window or GPU surface on
@@ -1169,7 +1277,7 @@ enum WindowCommand {
 
 struct WindowGpu {
     _instance: wgpu::Instance,
-    surface: wgpu::Surface<'static>,
+    surface: Option<wgpu::Surface<'static>>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     adapter: wgpu::Adapter,
@@ -1193,6 +1301,15 @@ struct WindowGpu {
     final_target_valid: bool,
     #[cfg(debug_assertions)]
     final_composition_revision: Revision,
+    /// Windows-only acrylic (frosted-glass backdrop) host. When present, the
+    /// final presentation goes through the WinRT composition tree instead of
+    /// the wgpu swapchain: wgpu renders into `acrylic_target` (a shared D3D12
+    /// texture) and `acrylic.present_frame()` proxy-copies it into a
+    /// `CompositionDrawingSurface` on every frame.
+    #[cfg(windows)]
+    acrylic: Option<acrylic_backdrop::AcrylicHost>,
+    #[cfg(windows)]
+    acrylic_target: Option<acrylic_backdrop::WgpuSharedTarget>,
     ui: UiWgpuRenderer,
     world_ui: WorldUiPipeline,
     world_ui_lab_panel: wgpu::TextureView,
@@ -1414,6 +1531,11 @@ impl WindowedRuntime {
             initial_window_sizing: InitialWindowSizing::default(),
             event_proxy: None,
             eventd_endpoint: None,
+            window_backdrop: WindowBackdropState {
+                requested: "none".into(),
+                active: "none".into(),
+                detail: None,
+            },
             next_file_drop_sequence: 0,
             world_ui_lab_camera: Arc::new(Mutex::new(WorldUiLabCameraController::default())),
             lazy_surface: false,
@@ -1558,6 +1680,13 @@ impl WindowedRuntime {
         demo: bool,
         enable_world_ui_lab_camera: bool,
     ) -> Result<(), String> {
+        // Windows.UI.Composition on the desktop requires an STA thread with a
+        // DispatcherQueue bound to the current thread BEFORE the winit event
+        // loop (which initialises COM itself). Without this, the acrylic
+        // `Compositor::new()` fails with 0x80070005. The controller must be
+        // kept alive for the whole session (field `_dispatcher_queue`).
+        #[cfg(windows)]
+        let _dispatcher_queue = init_dispatcher_queue()?;
         let event_loop = EventLoop::<WindowCommand>::with_user_event()
             .build()
             .map_err(|error| format!("create event loop: {error}"))?;
@@ -1593,13 +1722,29 @@ impl WindowedRuntime {
     }
 
     fn initialize(&mut self, event_loop: &ActiveEventLoop) -> Result<(), String> {
+        let (backdrop, mut backdrop_state) = WindowBackdrop::from_environment();
+        let window_attributes = Window::default_attributes()
+            .with_title(format!("Neon3 - WGPU Runtime (epoch {}) - Ctrl+O: Open image", self.epoch))
+            .with_inner_size(PhysicalSize::new(1280, 800))
+            .with_transparent(backdrop.requests_transparency())
+            .with_no_redirection_bitmap(backdrop.requests_transparency())
+            .with_decorations(!matches!(std::env::var("NEON_WINDOW_CHROME").as_deref(), Ok("borderless")));
         let window = event_loop
-            .create_window(
-                Window::default_attributes()
-                    .with_title(format!("Neon3 - WGPU Runtime (epoch {}) - Ctrl+O: Open image", self.epoch))
-                    .with_inner_size(PhysicalSize::new(1280, 800)),
+            .create_window(window_attributes)
+.map_err(|error| format!("create window: {error}"))?;
+        #[cfg(windows)]
+        let composition_surface_handle = if matches!(backdrop, WindowBackdrop::Acrylic) {
+            use windows::Win32::Graphics::DirectComposition::DCompositionCreateSurfaceHandle;
+            Some(
+                unsafe { DCompositionCreateSurfaceHandle(3, None) }
+                    .map_err(|error| format!("DCompositionCreateSurfaceHandle: {error:?}"))?
+                    .0 as isize,
             )
-            .map_err(|error| format!("create window: {error}"))?;
+        } else {
+            None
+        };
+        #[cfg(not(windows))]
+        let composition_surface_handle = None;
         #[cfg(windows)]
         if let Err(error) = enable_explorer_file_drop(&window) {
             eprintln!("[neon-wgpu-runtime] Explorer file-drop enablement failed: {error}");
@@ -1611,11 +1756,50 @@ impl WindowedRuntime {
         let backends = windowed_backends()?;
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends,
+            // Acrylic needs a premultiplied-alpha swapchain. On DX12 wgpu only
+            // offers that through its own DirectComposition presentation path
+            // (`DxgiFromVisual`), which manages the composition visual for the
+            // whole window. This is the same mechanism the Neon2 loading
+            // window relies on, and it must be selected before instance
+            // creation; it cannot be changed per surface.
+            backend_options: wgpu::BackendOptions {
+                dx12: wgpu::Dx12BackendOptions {
+                    presentation_system: if backdrop.requests_transparency() {
+                        wgpu::Dx12SwapchainKind::DxgiFromVisual
+                    } else {
+                        wgpu::Dx12SwapchainKind::DxgiFromHwnd
+                    },
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
             ..wgpu::InstanceDescriptor::new_with_display_handle(Box::new(
                 event_loop.owned_display_handle(),
             ))
         });
-        let gpu = WindowGpu::new(&window, instance, self.world_ui_lab_camera.clone())?;
+        let gpu = WindowGpu::new(
+            &window,
+            instance,
+            self.world_ui_lab_camera.clone(),
+            backdrop.requests_transparency(),
+            matches!(backdrop, WindowBackdrop::Acrylic),
+            composition_surface_handle,
+        )?;
+        // Apply Acrylic after DxgiFromVisual has created the wgpu presentation
+        // visual. Applying it before surface creation is overwritten by the
+        // presentation setup and only produces a transient startup blur.
+        #[cfg(windows)]
+        apply_windows_backdrop(&window, &backdrop, &mut backdrop_state);
+        self.window_backdrop = backdrop_state;
+        if backdrop.requests_transparency()
+            && gpu.config.alpha_mode != wgpu::CompositeAlphaMode::PreMultiplied
+        {
+            self.window_backdrop.active = "unavailable".into();
+            self.window_backdrop.detail = Some(format!(
+                "the current HWND swapchain exposes {:?}; visible Acrylic requires the experimental DirectComposition surface",
+                gpu.config.alpha_mode
+            ));
+        }
         if let Ok(mut camera) = self.world_ui_lab_camera.lock() {
             camera.window_focused = window.has_focus();
         }
@@ -1750,10 +1934,16 @@ impl WindowedRuntime {
             return;
         }
         self.initial_window_sizing.resize_accepted();
-        if let Some(gpu) = self.gpu.as_mut() {
+if let Some(gpu) = self.gpu.as_mut() {
             gpu.config.width = size.width;
             gpu.config.height = size.height;
-            gpu.surface.configure(&gpu.device, &gpu.config);
+            if let Some(surface) = gpu.surface.as_ref() {
+                surface.configure(&gpu.device, &gpu.config);
+            }
+            #[cfg(windows)]
+            if let Some(acrylic) = gpu.acrylic.as_ref() {
+                let _ = acrylic.resize(size.width, size.height);
+            }
             #[cfg(debug_assertions)]
             {
                 let (final_target, final_target_view) =
@@ -1824,28 +2014,59 @@ impl WindowedRuntime {
                 Err(_) => gpu.input.cancel(),
             }
         }
-        let surface_texture = match gpu.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(texture)
-            | wgpu::CurrentSurfaceTexture::Suboptimal(texture) => texture,
-            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
-                return Ok(());
-            }
-            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
-                gpu.surface.configure(&gpu.device, &gpu.config);
-                return Ok(());
-            }
-            wgpu::CurrentSurfaceTexture::Validation => {
-                return Err("acquire surface texture: validation error".to_owned());
-            }
+        let has_acrylic = false;
+        // In acrylic mode the WinRT composition tree owns all window pixels;
+        // wgpu has no window surface and renders into the shared texture that
+        // `AcrylicHost::present_frame` proxy-copies into the drawing surface.
+        let surface_texture = if has_acrylic {
+            None
+        } else {
+            let surface = gpu.surface.as_ref().expect("window surface missing");
+            let texture = match surface.get_current_texture() {
+                wgpu::CurrentSurfaceTexture::Success(texture)
+                | wgpu::CurrentSurfaceTexture::Suboptimal(texture) => texture,
+                wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
+                    return Ok(());
+                }
+                wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
+                    surface.configure(&gpu.device, &gpu.config);
+                    return Ok(());
+                }
+                wgpu::CurrentSurfaceTexture::Validation => {
+                    return Err("acquire surface texture: validation error".to_owned());
+                }
+            };
+            Some(texture)
         };
         let acquired_at = Instant::now();
-        let surface_view = surface_texture
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
+        #[cfg(windows)]
+        let acrylic_view = gpu.acrylic_target.as_ref().map(|target| {
+            target
+                .texture
+                .create_view(&wgpu::TextureViewDescriptor::default())
+        });
+        #[cfg(not(windows))]
+        let acrylic_view: Option<wgpu::TextureView> = None;
+        // Choose the final composition target: the offscreen final target in
+        // debug builds, the window surface in normal builds, or the shared
+        // acrylic texture when the WinRT tree owns the window.
+        let surface_view = surface_texture.as_ref().map(|texture| {
+            texture
+                .texture
+                .create_view(&wgpu::TextureViewDescriptor::default())
+        });
         #[cfg(debug_assertions)]
-        let composition_view = &gpu.final_target_view;
+        let composition_view = if has_acrylic {
+            acrylic_view.as_ref().expect("acrylic target missing")
+        } else {
+            &gpu.final_target_view
+        };
         #[cfg(not(debug_assertions))]
-        let composition_view = &surface_view;
+        let composition_view = if has_acrylic {
+            acrylic_view.as_ref().expect("acrylic target missing")
+        } else {
+            surface_view.as_ref().expect("surface view missing")
+        };
         let mut encoder = gpu
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -1910,7 +2131,7 @@ impl WindowedRuntime {
                 &gpu.world_ui_lab_panel,
                 world_ui_lab_camera(WORLD_UI_LAB_PREVIEW_SIZE, camera_state),
             )?;
-        }
+}
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("neon3-final-clear-pass"),
@@ -1919,11 +2140,22 @@ impl WindowedRuntime {
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.025,
-                            g: 0.028,
-                            b: 0.034,
-                            a: 1.0,
+                        load: wgpu::LoadOp::Clear({
+                            if gpu.config.alpha_mode == wgpu::CompositeAlphaMode::PreMultiplied {
+                                // Premultiplied transparent pixels must have
+                                // zero RGB as well as zero alpha. A non-zero
+                                // RGB clear with alpha 0 can make a DXGI
+                                // composition swapchain appear opaque after
+                                // its first UI draw.
+                                wgpu::Color::TRANSPARENT
+                            } else {
+                                wgpu::Color {
+                                    r: 0.025,
+                                    g: 0.028,
+                                    b: 0.034,
+                                    a: 1.0,
+                                }
+                            }
                         }),
                         store: wgpu::StoreOp::Store,
                     },
@@ -1976,12 +2208,14 @@ impl WindowedRuntime {
         }
         gpu.encode_external_surfaces(&mut encoder, &self.fragments)?;
         #[cfg(debug_assertions)]
-        gpu.final_target_blitter.copy(
-            &gpu.device,
-            &mut encoder,
-            &gpu.final_target_view,
-            &surface_view,
-        );
+        if !has_acrylic {
+            gpu.final_target_blitter.copy(
+                &gpu.device,
+                &mut encoder,
+                &gpu.final_target_view,
+                surface_view.as_ref().expect("surface view missing"),
+            );
+        }
         let queued_readback = gpu.pending_hit_pixel.take().and_then(|pixel| {
             gpu.ui
                 .enqueue_hit_readback(&mut encoder, &gpu.hit_target, pixel)
@@ -2001,7 +2235,9 @@ impl WindowedRuntime {
                 gpu.pending_hit_slot = Some((slot, gpu.next_input_sequence));
             }
         }
-        gpu.queue.present(surface_texture);
+        if let Some(surface_texture) = surface_texture {
+            gpu.queue.present(surface_texture);
+        }
         let now = Instant::now();
         let frame_gap_ms = now.duration_since(gpu.last_present).as_secs_f32() * 1000.0;
         gpu.longest_frame_gap_ms = gpu.longest_frame_gap_ms.max(frame_gap_ms);
@@ -2265,6 +2501,12 @@ impl WindowedRuntime {
             });
         json!({
             "state": gpu.input.state_name(),
+            "window_backdrop": {
+                "requested": &self.window_backdrop.requested,
+                "active": &self.window_backdrop.active,
+                "detail": &self.window_backdrop.detail,
+                "surface_alpha_mode": format!("{:?}", gpu.config.alpha_mode),
+            },
             "world_ui_lab_camera": self.world_ui_lab_camera.lock().ok().map(|camera| world_ui_lab_camera_status(&camera)),
             "applied_composition_revision": self.applied_composition_revision.0,
             "viewport": {
@@ -2712,6 +2954,9 @@ fn platform_backends() -> wgpu::Backends {
         }
     }
     wgpu::Backends::all()
+}
+
+impl WindowGpu {
 }
 
 /// Select the backend for the windowed renderer.
@@ -5446,20 +5691,48 @@ impl WindowGpu {
         window: &Window,
         instance: wgpu::Instance,
         world_ui_lab_camera: Arc<Mutex<WorldUiLabCameraController>>,
+        transparent_window: bool,
+        #[allow(unused_variables)] acrylic_requested: bool,
+        composition_surface_handle: Option<isize>,
     ) -> Result<Self, String> {
+        // Acrylic mode (Windows-only): the window's final presentation is owned
+        // by the WinRT composition tree (`AcrylicHost`), so wgpu must NOT create
+        // or bind a window surface (one HWND can only have one composition
+        // root). wgpu renders into a shared D3D12 texture that is proxy-copied
+        // into the composition drawing surface every frame.
+        // The formal window path always keeps the wgpu surface. A separate
+        // WinRT composition target cannot safely share this HWND with the
+        // wgpu presentation visual; the old proxy-copy path produced a blank
+        // content layer. Backdrop styling is applied to the HWND itself.
+        // The WinRT composition-tree bridge remains experimental. Until its
+        // D3D12 producer -> D3D11 drawing-surface handoff is proven with a
+        // real frame readback, keep the player on the stable wgpu swapchain so
+        // a backdrop experiment cannot hide the entire UI.
+        #[cfg(windows)]
+        let acrylic_active = acrylic_requested
+            && std::env::var("NEON_EXPERIMENTAL_COMPOSITION_SWAPCHAIN").as_deref() == Ok("1");
+        #[cfg(not(windows))]
+        let acrylic_active = false;
+
         // SAFETY: `WindowedRuntime` declares `gpu` before `window`, so the surface is dropped
         // before the window handle it references.
-        let surface = unsafe {
-            instance
-                .create_surface_unsafe(
+        let surface = {
+            let surface = unsafe {
+                let target = if let Some(handle) = composition_surface_handle {
+                    wgpu::SurfaceTargetUnsafe::SurfaceHandle(handle as *mut std::ffi::c_void)
+                } else {
                     wgpu::SurfaceTargetUnsafe::from_window(window)
-                        .map_err(|error| format!("create surface target: {error}"))?,
-                )
-                .map_err(|error| format!("create surface: {error}"))?
+                        .map_err(|error| format!("create surface target: {error}"))?
+                };
+                instance
+                    .create_surface_unsafe(target)
+                    .map_err(|error| format!("create surface: {error}"))?
+            };
+            Some(surface)
         };
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
-            compatible_surface: Some(&surface),
+            compatible_surface: surface.as_ref(),
             force_fallback_adapter: false,
             apply_limit_buckets: false,
         }))
@@ -5486,41 +5759,69 @@ impl WindowGpu {
             trace: wgpu::Trace::Off,
         }))
         .map_err(|error| format!("request device: {error}"))?;
-        let capabilities = surface.get_capabilities(&adapter);
+let capabilities = surface.as_ref().map(|s| s.get_capabilities(&adapter));
         #[cfg(debug_assertions)]
-        let format = capabilities
-            .formats
-            .iter()
-            .copied()
-            .find(|format| format.is_srgb() && capture_format_supported(*format))
-            .or_else(|| {
+        let format = match &capabilities {
+            Some(capabilities) => capabilities
+                .formats
+                .iter()
+                .copied()
+                .find(|format| format.is_srgb() && capture_format_supported(*format))
+                .or_else(|| {
+                    capabilities
+                        .formats
+                        .iter()
+                        .copied()
+                        .find(|format| capture_format_supported(*format))
+                })
+                .ok_or_else(|| "surface reported no capturable 8-bit RGBA/BGRA format".to_owned())?,
+            // Acrylic mode has no window surface; render through the shared
+            // texture that backs the composition drawing surface.
+            None => wgpu::TextureFormat::Rgba8Unorm,
+        };
+        #[cfg(not(debug_assertions))]
+        let format = match &capabilities {
+            Some(capabilities) => capabilities
+                .formats
+                .iter()
+                .copied()
+                .find(wgpu::TextureFormat::is_srgb)
+                .or_else(|| capabilities.formats.first().copied())
+                .ok_or_else(|| "surface reported no supported texture formats".to_owned())?,
+            // Acrylic mode has no window surface; render through the shared
+            // texture that backs the composition drawing surface.
+            None => wgpu::TextureFormat::Rgba8Unorm,
+        };
+        let alpha_mode = if acrylic_active {
+            // A composition-surface swapchain must use premultiplied alpha.
+            // SurfaceHandle capabilities may advertise only the generic
+            // opaque mode even though the DXGI composition swapchain accepts
+            // PREMULTIPLIED; selecting the advertised fallback makes the
+            // first transparent frame turn into an opaque frame as soon as UI
+            // pixels are written.
+            wgpu::CompositeAlphaMode::PreMultiplied
+        } else { match &capabilities {
+            Some(capabilities) => capabilities
+                .alpha_modes
+                .iter()
+                .copied()
+                .find(|mode| transparent_window && *mode == wgpu::CompositeAlphaMode::PreMultiplied)
+                .or_else(|| capabilities.alpha_modes.iter().copied().find(|mode| *mode == wgpu::CompositeAlphaMode::PostMultiplied))
+                .or_else(|| capabilities.alpha_modes.first().copied())
+                .ok_or_else(|| "surface reported no supported alpha modes".to_owned())?,
+            // Composition drawing surfaces are always premultiplied.
+            None => wgpu::CompositeAlphaMode::PreMultiplied,
+        } };
+        let present_mode = capabilities
+            .as_ref()
+            .and_then(|capabilities| {
                 capabilities
-                    .formats
+                    .present_modes
                     .iter()
                     .copied()
-                    .find(|format| capture_format_supported(*format))
+                    .find(|mode| *mode == wgpu::PresentMode::Mailbox)
+                    .or_else(|| capabilities.present_modes.first().copied())
             })
-            .ok_or_else(|| "surface reported no capturable 8-bit RGBA/BGRA format".to_owned())?;
-        #[cfg(not(debug_assertions))]
-        let format = capabilities
-            .formats
-            .iter()
-            .copied()
-            .find(wgpu::TextureFormat::is_srgb)
-            .or_else(|| capabilities.formats.first().copied())
-            .ok_or_else(|| "surface reported no supported texture formats".to_owned())?;
-        let alpha_mode = capabilities
-            .alpha_modes
-            .iter()
-            .copied()
-            .find(|mode| *mode == wgpu::CompositeAlphaMode::Opaque)
-            .or_else(|| capabilities.alpha_modes.first().copied())
-            .ok_or_else(|| "surface reported no supported alpha modes".to_owned())?;
-        let present_mode = capabilities
-            .present_modes
-            .iter()
-            .copied()
-            .find(|mode| *mode == wgpu::PresentMode::Mailbox)
             .unwrap_or(wgpu::PresentMode::Fifo);
         let size = window.inner_size();
         let config = wgpu::SurfaceConfiguration {
@@ -5534,7 +5835,20 @@ impl WindowGpu {
             view_formats: Vec::new(),
             desired_maximum_frame_latency: 1,
         };
-        surface.configure(&device, &config);
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "event": "neon.window.surface.configured",
+                "composition_swapchain": acrylic_active,
+                "alpha_mode": format!("{alpha_mode:?}"),
+                "format": format!("{format:?}"),
+                "width": config.width,
+                "height": config.height
+            })
+        );
+        if let Some(surface) = surface.as_ref() {
+            surface.configure(&device, &config);
+        }
         eprintln!("neon-wgpu surface present mode: {:?}", config.present_mode);
         #[cfg(debug_assertions)]
         let (final_target, final_target_view) = create_final_target(&device, &config);
@@ -5607,9 +5921,27 @@ impl WindowGpu {
             (f64::from(size.width) / ANDROID_GALLERY_UI_SCALE) as u32,
             (f64::from(size.height) / ANDROID_GALLERY_UI_SCALE) as u32
         );
+        #[cfg(windows)]
+        let (mut acrylic, acrylic_target) = if acrylic_active {
+            let hwnd = crate::window_hwnd_win32(window)
+                .ok_or_else(|| "acrylic requires a Win32 window".to_owned())?;
+            let mut host = acrylic_backdrop::AcrylicHost::new(hwnd, size.width, size.height)
+                .map_err(|error| format!("acrylic host: {error}"))?;
+            let swapchain = unsafe { surface.as_ref().and_then(|surface| surface.as_hal::<wgpu::hal::api::Dx12>()) }
+                .and_then(|hal_surface| hal_surface.swap_chain())
+                .ok_or_else(|| "acrylic requires a configured DX12 swapchain".to_owned())?;
+            host.attach_swapchain(&swapchain)
+                .map_err(|error| format!("attach swapchain composition surface: {error}"))?;
+            (Some(host), None)
+        } else {
+            (None, None)
+        };
+        #[cfg(not(windows))]
+        let (mut acrylic, acrylic_target) = (None::<u8>, None::<u8>);
         Ok(Self {
             _instance: instance,
             surface,
+            #[cfg(windows)]
             device,
             queue,
             adapter,
@@ -5637,6 +5969,10 @@ impl WindowGpu {
             final_target_valid: false,
             #[cfg(debug_assertions)]
             final_composition_revision: Revision(0),
+            #[cfg(windows)]
+            acrylic,
+            #[cfg(windows)]
+            acrylic_target,
             ui,
             world_ui,
             world_ui_lab_panel,
@@ -6779,6 +7115,17 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                 if state == winit::event::ElementState::Pressed
                     && button == winit::event::MouseButton::Left =>
             {
+                // Borderless windows let the app background act as a native drag
+                // region. Any semantic control keeps priority and never starts a
+                // window drag, so domain UI interaction remains intact.
+                if matches!(std::env::var("NEON_WINDOW_CHROME").as_deref(), Ok("borderless"))
+                    && self.gpu.as_ref().is_some_and(|gpu| gpu.ui.hit_binding_at_pointer().is_none())
+                {
+                    if let Some(window) = self.window.as_ref() {
+                        let _ = window.drag_window();
+                    }
+                    return;
+                }
                 if let Some(gpu) = self.gpu.as_ref()
                     && let Some(pointer) = gpu.ui.pointer_position()
                     && let Ok(mut camera) = self.world_ui_lab_camera.lock()
@@ -7250,6 +7597,26 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                     );
                 }
                 if let Some(Ok(released)) = binding {
+                    let local_window_action = released.binding.intent.as_ref().and_then(|intent| {
+                        let neon_ui_schema::UiIntent::Invoke { action, .. } = intent;
+                        matches!(action.as_str(), "window.minimize" | "window.maximize" | "window.close").then_some(action.as_str())
+                    });
+                    if let Some(action) = local_window_action {
+                        if let Some(window) = self.window.as_ref() {
+                            match action {
+                                "window.minimize" => window.set_minimized(true),
+                                "window.maximize" => window.set_maximized(!window.is_maximized()),
+                                "window.close" => event_loop.exit(),
+                                _ => unreachable!("validated local window action"),
+                            }
+                        }
+                        if let Some(gpu) = self.gpu.as_mut() {
+                            gpu.last_pointer_outcome = format!("local_{action}");
+                            gpu.last_pointer_node_path = diagnostic_node_path(&released.binding);
+                        }
+                        self.redraw_pending = true;
+                        return;
+                    }
                     if let Some(window) = self.window.as_ref() {
                         window.set_ime_allowed(false);
                     }
@@ -9592,6 +9959,7 @@ impl WgpuRuntime {
             "wgpu.ui.image.upload.v1".into(),
             "wgpu.ui.image.inspect.v1".into(),
             neon_ui_schema::UI_NINE_SLICE_CAPABILITY_NAME.into(),
+            neon_ui_schema::UI_COMPONENT_SKIN_CAPABILITY_NAME.into(),
             neon_ui_schema::UI_CANVAS_POINTS_LINES_CAPABILITY_NAME.into(),
             CAPABILITY_EXTERNAL_HOST_BACKEND_MATCH.into(),
             "wgpu.world.info.bridge".into(),
@@ -11553,6 +11921,20 @@ mod tests {
             probe_position(&json!({"logical_position": {"x": "bad", "y": 1.0}})),
             Err("position x must be a number")
         );
+    }
+
+    #[test]
+    fn window_backdrop_configuration_is_closed_and_reports_fallbacks() {
+        let (acrylic, state) = WindowBackdrop::from_value("AcRyLiC");
+        assert_eq!(acrylic, WindowBackdrop::Acrylic);
+        assert!(acrylic.requests_transparency());
+        assert_eq!(state.requested, "acrylic");
+        assert_eq!(state.active, "pending");
+        let (unsupported, state) = WindowBackdrop::from_value("mica");
+        assert_eq!(unsupported, WindowBackdrop::None);
+        assert_eq!(state.requested, "mica");
+        assert_eq!(state.active, "none");
+        assert!(state.detail.unwrap().contains("supported values"));
     }
 
     #[test]
