@@ -853,6 +853,16 @@ pub fn lower_nui_flow_effects(document: &NuiFlowDocument) -> Vec<UiEffect> {
                 geometry: *geometry,
             }),
     );
+    effects.extend(
+        document
+            .ir
+            .material_records
+            .iter()
+            .map(|(node_key, material)| UiEffect::Material {
+                node_id: UiNodeId(node_key.clone()),
+                material: material.clone(),
+            }),
+    );
     effects.extend(document.ir.skins.iter().cloned().map(|skin| UiEffect::ControlSkin { skin }));
     effects.extend(document.ir.skin_references.iter().map(|(node_id, skin_key)| UiEffect::SkinReference {
         node_id: UiNodeId(node_id.clone()),
@@ -5572,6 +5582,10 @@ panel workspace row gap 8
             material.parameters.get("rim_strength").and_then(|v| v.as_f64()),
             Some(0.22)
         );
+        assert!(lower_nui_flow_effects(&document).iter().any(|effect| {
+            matches!(effect, UiEffect::Material { node_id, material }
+                if node_id.0 == "hero" && material.package_id == "pulse-glass")
+        }));
         let formatted = format_nui_flow(
             "shader pulse-glass version 1 fallback standard_ui\nsurface root w 400 h 300\n  panel hero x 10 y 20 w 200 h 100\n    geometry cut 18 10 18 10\n    material pulse-glass overflow 24 8 24 16 parameter rim_strength 0.22\n",
         )

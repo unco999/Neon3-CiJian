@@ -83,6 +83,42 @@ fn window_hwnd_win32(window: &Window) -> Option<windows::Win32::Foundation::HWND
     Some(windows::Win32::Foundation::HWND(win32.hwnd.get() as *mut _))
 }
 
+/// Applies the renderer-resolved cut shell as the native HWND region. This is
+/// the final system-level mask, so no DWM/Composition visual can paint outside
+/// the player shell. `SetWindowRgn` owns the region after a successful call.
+#[cfg(windows)]
+fn apply_window_shell_region(
+    window: &Window,
+    bounds: UiBounds,
+    cut: [f32; 4],
+    scale_factor: f64,
+) -> Result<(), String> {
+    use windows::Win32::{
+        Foundation::POINT,
+        Graphics::Gdi::{CreatePolygonRgn, WINDING},
+        UI::WindowsAndMessaging::SetWindowRgn,
+    };
+    let hwnd = window_hwnd_win32(window).ok_or("read Win32 HWND")?;
+    let scale = scale_factor as f32;
+    let x = (bounds.x * scale).round() as i32;
+    let y = (bounds.y * scale).round() as i32;
+    let width = (bounds.width * scale).round().max(1.0) as i32;
+    let height = (bounds.height * scale).round().max(1.0) as i32;
+    let [bl, br, tr, tl] = cut.map(|value| (value * scale).round() as i32);
+    let points = [
+        POINT { x: x + tl, y }, POINT { x: x + width - tr, y },
+        POINT { x: x + width, y: y + tr }, POINT { x: x + width, y: y + height - br },
+        POINT { x: x + width - br, y: y + height }, POINT { x: x + bl, y: y + height },
+        POINT { x, y: y + height - bl }, POINT { x, y: y + tl },
+    ];
+    let region = unsafe { CreatePolygonRgn(&points, WINDING) }
+        .map_err(|error| format!("CreatePolygonRgn: {error}"))?;
+    if unsafe { SetWindowRgn(hwnd, Some(region), true) } == 0 {
+        return Err("SetWindowRgn rejected shell region".into());
+    }
+    Ok(())
+}
+
 /// Initialise COM (STA) and a DispatcherQueue bound to the calling thread.
 /// Required by `Windows.UI.Composition.Compositor` on the desktop. Must run
 /// before the winit event loop creates its own COM apartment.
@@ -187,6 +223,7 @@ const ANDROID_GALLERY_UI_SCALE: f64 = 0.88;
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum WindowBackdrop {
     None,
+    Transparent,
     Acrylic,
 }
 
@@ -212,6 +249,9 @@ impl WindowBackdrop {
             "" | "none" => (Self::None, WindowBackdropState {
                 requested: "none".into(), active: "none".into(), detail: None,
             }),
+            "transparent" => (Self::Transparent, WindowBackdropState {
+                requested, active: "transparent-wgpu".into(), detail: None,
+            }),
             "acrylic" => (Self::Acrylic, WindowBackdropState {
                 requested, active: "pending".into(), detail: None,
             }),
@@ -223,19 +263,57 @@ impl WindowBackdrop {
     }
 
     fn requests_transparency(&self) -> bool {
-        matches!(self, Self::Acrylic)
+        matches!(self, Self::Transparent | Self::Acrylic)
     }
 }
 
 #[cfg(windows)]
 fn apply_windows_backdrop(_window: &Window, backdrop: &WindowBackdrop, state: &mut WindowBackdropState) {
-    if matches!(backdrop, WindowBackdrop::Acrylic) {
+    if matches!(backdrop, WindowBackdrop::Transparent) {
+        state.active = "transparent-wgpu".into();
+        state.detail = Some("no native backdrop; transparent premultiplied surface".into());
+    } else if matches!(backdrop, WindowBackdrop::Acrylic) {
         // Keep the stable transparent wgpu presentation path. Native DWM
         // accent changes the same HWND after DxgiFromVisual is initialized and
         // can remove the wgpu visual after its first frame.
-        state.active = "transparent-wgpu".into();
-        state.detail = Some("native acrylic disabled; composition swapchain remains opt-in".into());
+        if std::env::var("NEON_EXPERIMENTAL_COMPOSITION_SWAPCHAIN").as_deref() == Ok("1") {
+            state.active = "masked-acrylic".into();
+            state.detail = Some("WinRT backdrop is masked by swapchain alpha".into());
+        } else {
+            state.active = "transparent-wgpu".into();
+            state.detail = Some("native acrylic disabled; composition swapchain remains opt-in".into());
+        }
     }
+}
+
+#[cfg(windows)]
+fn clear_transparent_window_backdrop(window: &Window) -> Result<(), String> {
+    use windows::Win32::{
+        Foundation::HWND,
+        Graphics::Dwm::{DwmSetWindowAttribute, DWMWINDOWATTRIBUTE},
+    };
+    let handle = window.window_handle().map_err(|error| error.to_string())?;
+    let RawWindowHandle::Win32(handle) = handle.as_raw() else {
+        return Err("expected a Win32 window handle".into());
+    };
+    // DWMWA_SYSTEMBACKDROP_TYPE = 38; value 1 is DWMSBT_NONE. This is
+    // intentionally applied only to the explicit transparent mode. Acrylic
+    // remains a separate opt-in backdrop and must not leak into Pulse.
+    let backdrop_type: i32 = 1;
+    let non_client_policy: i32 = 1;
+    let hwnd = HWND(handle.hwnd.get() as *mut _);
+    unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWINDOWATTRIBUTE(38),
+            &backdrop_type as *const i32 as *const std::ffi::c_void,
+            std::mem::size_of_val(&backdrop_type) as u32,
+        )
+    }
+    .map_err(|error| format!("clear DWM backdrop: {error}"))?;
+    unsafe { DwmSetWindowAttribute(hwnd, DWMWINDOWATTRIBUTE(2), &non_client_policy as *const i32 as *const std::ffi::c_void, std::mem::size_of_val(&non_client_policy) as u32) }
+        .map_err(|error| format!("disable DWM non-client rendering: {error}"))?;
+    Ok(())
 }
 
 #[cfg(not(windows))]
@@ -1176,6 +1254,9 @@ enum WindowCommand {
         fragments: HashMap<UiFragmentId, UiFragment>,
         applied: Option<std::sync::mpsc::Sender<()>>,
     },
+    ShaderPackages {
+        packages: Vec<neon_ui_schema::UiShaderPackage>,
+    },
     GenerateTerrainPreview {
         command: AiTerrainGenerateCommand,
         job_id: String,
@@ -1734,6 +1815,12 @@ impl WindowedRuntime {
             .create_window(window_attributes)
 .map_err(|error| format!("create window: {error}"))?;
         #[cfg(windows)]
+        if matches!(backdrop, WindowBackdrop::Transparent) {
+            if let Err(error) = clear_transparent_window_backdrop(&window) {
+                eprintln!("[neon-wgpu-runtime] transparent window backdrop clear failed: {error}");
+            }
+        }
+        #[cfg(windows)]
         let composition_surface_handle = if matches!(backdrop, WindowBackdrop::Acrylic) {
             use windows::Win32::Graphics::DirectComposition::DCompositionCreateSurfaceHandle;
             Some(
@@ -1765,7 +1852,11 @@ impl WindowedRuntime {
             // creation; it cannot be changed per surface.
             backend_options: wgpu::BackendOptions {
                 dx12: wgpu::Dx12BackendOptions {
-                    presentation_system: if backdrop.requests_transparency() {
+                    // Only Acrylic owns a DirectComposition visual. A plain
+                    // transparent window must use the HWND swapchain path;
+                    // DxgiFromVisual creates a full-window composition visual
+                    // even when the rendered surface pixels are transparent.
+                    presentation_system: if matches!(backdrop, WindowBackdrop::Acrylic) {
                         wgpu::Dx12SwapchainKind::DxgiFromVisual
                     } else {
                         wgpu::Dx12SwapchainKind::DxgiFromHwnd
@@ -2177,6 +2268,21 @@ if let Some(gpu) = self.gpu.as_mut() {
                 UiDrawMode::All,
             );
             drop(pass);
+            #[cfg(windows)]
+            if let (Some(acrylic), Some((bounds, _cut))) =
+                (gpu.acrylic.as_ref(), gpu.ui.primary_material_shell())
+            {
+                acrylic
+                    .set_backdrop_shell_bounds(bounds.x, bounds.y, bounds.width, bounds.height)
+                    .map_err(|error| format!("set acrylic shell bounds: {error}"))?;
+            }
+            #[cfg(windows)]
+            if let (Some(window), Some((bounds, cut))) =
+                (self.window.as_ref(), gpu.ui.primary_material_shell())
+            {
+                apply_window_shell_region(window, bounds, cut, gpu.scale_factor)
+                    .map_err(|error| format!("apply native shell region: {error}"))?;
+            }
             gpu.last_draw_instance_count = gpu.ui.last_panel_instance_count();
         }
         if gpu.hit_target_dirty || gpu.pending_hit_pixel.is_some() {
@@ -8068,6 +8174,12 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                     self.request_scripted_initial_size();
                 }
             }
+            WindowCommand::ShaderPackages { packages } => {
+                if let Some(gpu) = self.gpu.as_mut() {
+                    gpu.ui.sync_material_packages(&gpu.device, &packages);
+                    self.redraw_pending = true;
+                }
+            }
             WindowCommand::GenerateTerrainPreview {
                 command,
                 job_id,
@@ -9329,6 +9441,7 @@ fn spawn_window_server(
             move |request| {
                 let mut runtime = runtime.lock().expect("runtime lock");
                 let proxy = &handler_proxy;
+                let registering_shader = request.method == "wgpu.shader.register";
                 let mutates_composition = matches!(
                     request.method.as_str(),
                     "wgpu.ui.submit_fragment"
@@ -9465,6 +9578,11 @@ fn spawn_window_server(
                             None,
                         );
                     }
+                }
+                if registering_shader && response.status == RpcStatus::Accepted {
+                    let _ = proxy.send_event(WindowCommand::ShaderPackages {
+                        packages: runtime.shader_registry.packages(),
+                    });
                 }
                 response
             },

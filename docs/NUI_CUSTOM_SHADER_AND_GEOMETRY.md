@@ -342,8 +342,11 @@ Focused acceptance probes must cover:
    and `NeonApp.registerShader`; `ClientKind::AppHost` accepted so SDK defaults
    deserialize.)
 4. Add a renderer material registry with standard fallback and JSONL
-   diagnostics. (Next: real WGSL compile+bind on the live device and the
-   standard fallback path.)
+   diagnostics. In progress: `UiEffect::Material` now reaches the renderer and
+   emits a separate transparent, overflow-aware, non-hit-testable draw layer
+   after its host panel. The package source is registered and observable, but
+   real WGSL compile+bind on the live device and per-frame JSONL diagnostics
+   remain required before custom source replaces the standard fallback.
 5. Implement cut geometry in the UI vertex/clip path and align hit testing. ✅
    (color pass and hit pass share `outside_cut`; `UiInstance`/`UiHitInstance`
    carry `cut`.)

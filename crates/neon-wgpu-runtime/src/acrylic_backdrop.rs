@@ -22,6 +22,7 @@ use windows::Graphics::Effects::{
 use windows::UI::Composition::Desktop::DesktopWindowTarget;
 use windows::UI::Composition::{
     Compositor, CompositionBackdropBrush, CompositionDrawingSurface, CompositionEffectBrush,
+    CompositionMaskBrush,
     CompositionEffectSourceParameter, CompositionGraphicsDevice, CompositionStretch,
     ContainerVisual, SpriteVisual,
 };
@@ -47,7 +48,7 @@ use windows::Win32::System::WinRT::Graphics::Direct2D::{
     GRAPHICS_EFFECT_PROPERTY_MAPPING, GRAPHICS_EFFECT_PROPERTY_MAPPING_DIRECT,
     IGraphicsEffectD2D1Interop, IGraphicsEffectD2D1Interop_Impl,
 };
-use windows_numerics::Vector2;
+use windows_numerics::{Vector2, Vector3};
 
 // ---------------------------------------------------------------------------
 // GaussianBlur effect (hand-rolled; CLSID_D2D1GaussianBlur from d2d1effects.h)
@@ -153,6 +154,7 @@ pub struct AcrylicHost {
     _compositor: Compositor,
     _target: DesktopWindowTarget,
     _effect_brush: CompositionEffectBrush,
+    _mask_brush: Option<CompositionMaskBrush>,
     _backdrop_brush: CompositionBackdropBrush,
     _blur_sprite: SpriteVisual,
     _graphics_device: CompositionGraphicsDevice,
@@ -325,6 +327,7 @@ impl AcrylicHost {
             _compositor: compositor,
             _target: target,
             _effect_brush: effect_brush,
+            _mask_brush: None,
             _backdrop_brush: backdrop_brush,
             _blur_sprite: blur_sprite,
             _graphics_device: graphics_device,
@@ -365,6 +368,24 @@ impl AcrylicHost {
         brush
             .SetStretch(CompositionStretch::Fill)
             .map_err(|e| AcrylicError::Message(format!("swapchain brush stretch: {e:?}")))?;
+        // The compositor backdrop is inherently a full-window rectangle. Use
+        // the alpha channel of the actual wgpu swapchain as its mask so the
+        // system blur exists only where the root shell produces pixels. This
+        // keeps the outside of a cut shell genuinely transparent while still
+        // allowing the OS backdrop to show through the shell interior.
+        let mask_brush = self
+            ._compositor
+            .CreateMaskBrush()
+            .map_err(|e| AcrylicError::Message(format!("CreateMaskBrush: {e:?}")))?;
+        mask_brush
+            .SetSource(&self._effect_brush)
+            .map_err(|e| AcrylicError::Message(format!("mask.SetSource: {e:?}")))?;
+        mask_brush
+            .SetMask(&brush)
+            .map_err(|e| AcrylicError::Message(format!("mask.SetMask: {e:?}")))?;
+        self._blur_sprite
+            .SetBrush(&mask_brush)
+            .map_err(|e| AcrylicError::Message(format!("blur sprite.SetBrush mask: {e:?}")))?;
         let sprite = self
             ._compositor
             .CreateSpriteVisual()
@@ -381,7 +402,36 @@ impl AcrylicHost {
             .InsertAtTop(&sprite)
             .map_err(|e| AcrylicError::Message(format!("insert swapchain sprite: {e:?}")))?;
         self._swapchain_sprite = Some(sprite);
+        self._mask_brush = Some(mask_brush);
         Ok(())
+    }
+
+    /// Bounds the system backdrop visual to the renderer-resolved shell. The
+    /// final cut polygon is applied by the alpha-mask surface; constraining the
+    /// source first prevents any full-window backdrop from leaking while that
+    /// mask is updated.
+    pub fn set_backdrop_shell_bounds(
+        &self,
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+    ) -> Result<(), AcrylicError> {
+        self._blur_sprite
+            .SetOffset(Vector3::new(x, y, 0.0))
+            .map_err(|error| AcrylicError::Message(format!("set backdrop shell offset: {error:?}")))?;
+        self._blur_sprite
+            .SetSize(Vector2::new(width.max(1.0), height.max(1.0)))
+            .map_err(|error| AcrylicError::Message(format!("set backdrop shell size: {error:?}")))?;
+        // Current DesktopWindowTarget/DXGI composition can retain the backdrop
+        // visual as a full-window rectangle even after a mask-brush update.
+        // Never leave that rectangle visible around a shaped shell. The shell's
+        // own translucent material remains visible; a dedicated alpha drawing
+        // surface will re-enable system blur only once its polygon mask is
+        // uploaded and verified.
+        self._blur_sprite
+            .SetOpacity(0.0)
+            .map_err(|error| AcrylicError::Message(format!("hide legacy full-window backdrop: {error:?}")))
     }
 
     /// Update the shared texture handle wgpu renders into (set after the wgpu

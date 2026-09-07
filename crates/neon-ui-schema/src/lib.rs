@@ -1509,6 +1509,13 @@ pub enum UiEffect {
         node_id: UiNodeId,
         geometry: UiGeometry,
     },
+    /// Transparent, renderer-owned material layer for one visual node. The
+    /// layer may paint outside the host bounds but never changes layout or hit
+    /// routing.
+    Material {
+        node_id: UiNodeId,
+        material: UiMaterialRef,
+    },
     /// A validated finite skin recipe. Resource resolution and drawing remain
     /// renderer-owned; this effect contains no GPU identity.
     ControlSkin {
@@ -3424,6 +3431,13 @@ impl UiEffect {
                     Err(UiSchemaError::InvalidProgramEvent)
                 } else {
                     geometry.validate()
+                }
+            }
+            Self::Material { node_id, material } => {
+                if node_id.0.trim().is_empty() {
+                    Err(UiSchemaError::InvalidProgramEvent)
+                } else {
+                    material.validate()
                 }
             }
             Self::ControlSkin { skin } => skin.validate(),

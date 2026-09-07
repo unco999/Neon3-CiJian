@@ -1,7 +1,7 @@
 //! Minimal GPU UI composition pass adapted from Neon2's instanced panel renderer.
 //! It deliberately consumes only Neon3's public UI schema, not old ECS state.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::Instant;
 
@@ -13,7 +13,7 @@ use neon_ui_schema::{
     UiDropPlacement, UiEasing, UiFragment, UiFragmentRevision, UiImageFit, UiIntent, UiJustifyContent,
     UiLayout, UiLayoutMode, UiNode, UiNodeKind, UiSemanticPayloadValue, UiStyle,
     UiStylePatch as SchemaStylePatch, UiTransition, UiTransitionState, UiControlSkin,
-    UiSkinSlot, UiSkinSlotKind, UiVisualState, UiSkinPresentation,
+    UiSkinSlot, UiSkinSlotKind, UiVisualState, UiSkinPresentation, UiMaterialRef, UiShaderPackage,
 };
 use serde_json::{Value, json};
 
@@ -220,6 +220,24 @@ const HIT_CLEAR_SHADER: &str = r#"
  return vec4<f32>(vertices[index], 0.0, 1.0);
 }
 @fragment fn fs_main() -> @location(0) u32 { return 0xffffffffu; }
+"#;
+
+// Package sources provide only `fn material(input: MaterialInput) -> vec4<f32>`
+// plus private helper functions. The renderer owns this wrapper, its vertex
+// ABI, clipping, blend contract, and all GPU bindings.
+const MATERIAL_SHADER_PREFIX: &str = r#"
+struct View { viewport: vec2<f32>, color_mode: u32, time_seconds: f32 }
+@group(0) @binding(0) var<uniform> view: View;
+fn srgb_to_linear(value: vec3<f32>) -> vec3<f32> { let low=value/12.92; let high=pow((value+vec3<f32>(0.055))/1.055,vec3<f32>(2.4)); return select(low,high,value>vec3<f32>(0.04045)); }
+fn outside_clip(pixel: vec2<f32>, clip: vec4<f32>, radius: f32) -> bool { if (pixel.x < clip.x || pixel.y < clip.y || pixel.x > clip.z || pixel.y > clip.w) { return true; } if (radius <= 0.0) { return false; } let size=clip.zw-clip.xy; let r=min(radius,min(size.x,size.y)*0.5); let point=pixel-(clip.xy+size*0.5); let extent=max(size*0.5-vec2<f32>(r),vec2<f32>(0.0)); return length(max(abs(point)-extent,vec2<f32>(0.0)))>r; }
+fn outside_cut(local: vec2<f32>, size: vec2<f32>, cut: vec4<f32>) -> bool { let p=local*size; let bl=min(cut.x,min(size.x,size.y)); let br=min(cut.y,min(size.x,size.y)); let tr=min(cut.z,min(size.x,size.y)); let tl=min(cut.w,min(size.x,size.y)); if(bl>0.0&&p.x<bl&&p.y<bl&&p.x+p.y<bl){return true;} let rx=size.x-p.x; if(br>0.0&&rx<br&&p.y<br&&rx+p.y<br){return true;} let ty=size.y-p.y; if(tr>0.0&&rx<tr&&ty<tr&&rx+ty<tr){return true;} if(tl>0.0&&p.x<tl&&ty<tl&&p.x+ty<tl){return true;} return false; }
+struct VsIn { @location(0) rect: vec4<f32>, @location(1) fill: vec4<f32>, @location(2) border: vec4<f32>, @location(3) params: vec4<f32>, @location(4) clip: vec4<f32>, @location(5) depth: f32, @location(6) from_rect: vec4<f32>, @location(7) from_fill: vec4<f32>, @location(8) from_border: vec4<f32>, @location(9) from_params: vec4<f32>, @location(10) animation: vec4<f32>, @location(11) cut: vec4<f32> }
+struct VsOut { @builtin(position) position: vec4<f32>, @location(0) local: vec2<f32>, @location(1) size: vec2<f32>, @location(2) fill: vec4<f32>, @location(3) border: vec4<f32>, @location(4) params: vec4<f32>, @location(5) clip: vec4<f32>, @location(6) pixel: vec2<f32>, @location(7) cut: vec4<f32> }
+@vertex fn vs_main(@builtin(vertex_index) index: u32, input: VsIn) -> VsOut { var corners=array<vec2<f32>,6>(vec2<f32>(0.0,0.0),vec2<f32>(1.0,0.0),vec2<f32>(0.0,1.0),vec2<f32>(0.0,1.0),vec2<f32>(1.0,0.0),vec2<f32>(1.0,1.0)); let local=corners[index]; let pixel=input.rect.xy+local*input.rect.zw; var output:VsOut; output.position=vec4<f32>(pixel.x/view.viewport.x*2.0-1.0,1.0-pixel.y/view.viewport.y*2.0,input.depth,1.0); output.local=local; output.size=input.rect.zw; output.fill=input.fill; output.border=input.border; output.params=input.params; output.clip=input.clip; output.pixel=pixel; output.cut=input.cut; return output; }
+struct MaterialInput { local_position: vec2<f32>, bounds: vec4<f32>, base_color: vec4<f32>, border_color: vec4<f32>, time_seconds: f32, opacity: f32, geometry_edge: f32, state_flags: u32 }
+"#;
+const MATERIAL_SHADER_SUFFIX: &str = r#"
+@fragment fn fs_material(input: VsOut) -> @location(0) vec4<f32> { if(outside_clip(input.pixel,input.clip,input.params.w)||outside_cut(input.local,input.size,input.cut)){discard;} let edge=min(min(input.local.x,1.0-input.local.x),min(input.local.y,1.0-input.local.y)); let color=material(MaterialInput(input.local,vec4<f32>(input.pixel,input.size),input.fill,input.border,view.time_seconds,input.params.z,edge,0u)); let alpha=clamp(color.a,0.0,1.0); if(alpha<=0.001){discard;} let rgb=select(srgb_to_linear(color.rgb),color.rgb,view.color_mode==1u); return vec4<f32>(rgb*alpha,alpha); }
 "#;
 
 const DEPTH_SHADER: &str = r#"
@@ -1225,12 +1243,32 @@ fn transition_finished(active: &ActiveTransition, time_seconds: f32) -> bool {
             + (active.transition.delay_ms + active.transition.duration_ms) as f32 / 1000.0
 }
 
+/// Resolves the final shell polygon from authored corner cuts and final panel
+/// bounds. Adjacent cuts are proportionally compressed when a responsive shell
+/// becomes too narrow; every visual pass and hit pass must consume this result.
+fn resolve_shell_cut(size: [f32; 2], declared: [f32; 4]) -> [f32; 4] {
+    let width = size[0].max(0.0);
+    let height = size[1].max(0.0);
+    let max_corner = (width.min(height) * 0.5).max(0.0);
+    let mut cut = declared.map(|value| value.max(0.0).min(max_corner));
+    for (a, b, limit) in [(0usize, 3usize, width), (3, 2, width), (2, 1, width), (1, 0, width), (0, 1, height), (1, 2, height), (2, 3, height), (3, 0, height)] {
+        let total = cut[a] + cut[b];
+        if total > limit && total > 0.0 {
+            let scale = limit / total;
+            cut[a] *= scale;
+            cut[b] *= scale;
+        }
+    }
+    cut
+}
+
 pub struct UiWgpuRenderer {
     trace_role: &'static str,
     color_format: wgpu::TextureFormat,
     pipeline: wgpu::RenderPipeline,
     depth_format: Option<wgpu::TextureFormat>,
     depth_pipeline: Option<wgpu::RenderPipeline>,
+    view_layout: wgpu::BindGroupLayout,
     view_buffer: wgpu::Buffer,
     view_bind_group: wgpu::BindGroup,
     instance_buffer: wgpu::Buffer,
@@ -1274,6 +1312,11 @@ pub struct UiWgpuRenderer {
     /// Cut-corner panel styles keyed by the short node id (matches the
     /// `nine_slices` pattern). Zero cut means no corner removal.
     node_cuts: HashMap<String, [f32; 4]>,
+    /// Declarative material overlays keyed by the node's stable short id.
+    /// These are emitted after their host rect and before its children; they do
+    /// not enter the hit-id pass.
+    node_materials: HashMap<String, UiMaterialRef>,
+    material_pipelines: BTreeMap<String, wgpu::RenderPipeline>,
     image_fits: HashMap<String, UiImageFit>,
     skins: HashMap<String, UiControlSkin>,
     skin_references: HashMap<String, String>,
@@ -1324,6 +1367,73 @@ pub struct UiWgpuRenderer {
 }
 
 impl UiWgpuRenderer {
+    /// Compiles package-local fragment functions into renderer-owned material
+    /// pipelines. Sources never receive a device, texture, sampler, or bind
+    /// group: the fixed wrapper supplies the only ABI and GPU bindings.
+    pub(crate) fn sync_material_packages(
+        &mut self,
+        device: &wgpu::Device,
+        packages: &[UiShaderPackage],
+    ) {
+        for package in packages {
+            if self.material_pipelines.contains_key(&package.package_id) {
+                continue;
+            }
+            let Ok(source) = std::str::from_utf8(&package.source_bytes) else {
+                continue;
+            };
+            let source = format!("{MATERIAL_SHADER_PREFIX}\n{source}\n{MATERIAL_SHADER_SUFFIX}");
+            let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some(&format!("neon3-ui-material-{}", package.package_id)),
+                source: wgpu::ShaderSource::Wgsl(source.into()),
+            });
+            let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("neon3-ui-material-layout"),
+                bind_group_layouts: &[Some(&self.view_layout)],
+                immediate_size: 0,
+            });
+            let attributes = [
+                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 0, shader_location: 0 },
+                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 16, shader_location: 1 },
+                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 32, shader_location: 2 },
+                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 48, shader_location: 3 },
+                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 64, shader_location: 4 },
+                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32, offset: 80, shader_location: 5 },
+                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 88, shader_location: 6 },
+                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 104, shader_location: 7 },
+                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 120, shader_location: 8 },
+                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 136, shader_location: 9 },
+                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 152, shader_location: 10 },
+                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 168, shader_location: 11 },
+            ];
+            let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(&format!("neon3-ui-material-pipeline-{}", package.package_id)),
+                layout: Some(&layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_main"),
+                    buffers: &[Some(wgpu::VertexBufferLayout { array_stride: std::mem::size_of::<UiInstance>() as u64, step_mode: wgpu::VertexStepMode::Instance, attributes: &attributes })],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_material"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: self.color_format,
+                        blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            });
+            self.material_pipelines.insert(package.package_id.clone(), pipeline);
+        }
+    }
     pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
         Self::new_internal(device, format, None, "screen")
     }
@@ -1969,6 +2079,7 @@ impl UiWgpuRenderer {
             pipeline,
             depth_format,
             depth_pipeline,
+            view_layout,
             view_buffer,
             view_bind_group,
             // Pre-allocate GPU buffers to the plan's known budget (512 nodes,
@@ -2013,6 +2124,8 @@ impl UiWgpuRenderer {
             external_images: HashMap::new(),
             nine_slices: HashMap::new(),
             node_cuts: HashMap::new(),
+            node_materials: HashMap::new(),
+            material_pipelines: BTreeMap::new(),
             image_fits: HashMap::new(),
             skins: HashMap::new(),
             skin_references: HashMap::new(),
@@ -4763,6 +4876,7 @@ impl UiWgpuRenderer {
         // for the final screen-space batch below so no later panel, popup, modal,
         // or component chrome can occlude the item under the pointer.
         let mut drag_preview_instances = Vec::new();
+        let mut material_instances = BTreeMap::<u32, BTreeMap<String, Vec<UiInstance>>>::new();
         for index in 0..self.plan.len() {
             if self.plan[index].instance_index.is_none()
                 || top_layer[index].is_some()
@@ -4773,12 +4887,24 @@ impl UiWgpuRenderer {
             let visual = &self.sampled[index];
             let instance = self.instance(visual, &self.plan[index].id, time_seconds);
             let chrome = self.component_chrome_instances(visual, &self.plan[index].id);
+            let material_instance = self.node_materials.get(
+                self.plan[index].id.rsplit('/').next().unwrap_or(self.plan[index].id.as_str()),
+            ).and_then(|material| self.material_pipelines.contains_key(&material.package_id)
+                .then(|| (material.package_id.clone(), self.material_instance(visual, &self.plan[index].id, material, time_seconds))));
             let destination = if self.drag_offset_for_node(index, &plan_index).is_some() {
                 &mut drag_preview_instances
             } else {
                 &mut self.instances
             };
             destination.push(instance);
+            if let Some((package_id, material)) = material_instance {
+                material_instances
+                    .entry(visual.paint_group_id)
+                    .or_default()
+                    .entry(package_id)
+                    .or_default()
+                    .push(material);
+            }
             destination.extend(chrome);
         }
         // CPU first-press handling must be ready as soon as the visible frame is
@@ -4867,8 +4993,13 @@ impl UiWgpuRenderer {
                 create_instance_buffer(device, self.depth_instance_capacity);
             self.uploaded_depth_instances.clear();
         }
-        if popup_instances.len() > self.popup_instance_capacity {
-            self.popup_instance_capacity = popup_instances.len().next_power_of_two();
+        let material_capacity = material_instances
+            .values()
+            .flat_map(|packages| packages.values().map(Vec::len))
+            .max()
+            .unwrap_or(0);
+        if popup_instances.len().max(material_capacity) > self.popup_instance_capacity {
+            self.popup_instance_capacity = popup_instances.len().max(material_capacity).next_power_of_two();
             self.popup_instance_buffer =
                 create_instance_buffer(device, self.popup_instance_capacity);
         }
@@ -5584,6 +5715,21 @@ impl UiWgpuRenderer {
                 pass.set_vertex_buffer(0, self.instance_buffer.slice(..));
                 pass.draw(0..6, *start..*start + *count);
             }
+            // Each material is composited immediately after its host panel
+            // group, before the group's imagery and glyphs. This makes glass
+            // response read as a surface treatment instead of a foreground
+            // filter over the player artwork and controls.
+            if let Some(packages) = material_instances.get(&key) {
+                for (package_id, instances) in packages {
+                    let Some(pipeline) = self.material_pipelines.get(package_id) else { continue };
+                    if instances.is_empty() { continue; }
+                    queue.write_buffer(&self.popup_instance_buffer, 0, bytemuck::cast_slice(instances));
+                    pass.set_pipeline(pipeline);
+                    pass.set_bind_group(0, &self.view_bind_group, &[]);
+                    pass.set_vertex_buffer(0, self.popup_instance_buffer.slice(..));
+                    pass.draw(0..6, 0..instances.len() as u32);
+                }
+            }
             if let Some((start, count)) = image_ranges.get(&key) {
                 pass.set_pipeline(&self.image_pipeline);
                 pass.set_bind_group(
@@ -5902,6 +6048,7 @@ impl UiWgpuRenderer {
         }
         self.nine_slices.clear();
         self.node_cuts.clear();
+        self.node_materials.clear();
         self.image_fits.clear();
         self.skins.clear();
         self.skin_references.clear();
@@ -5917,6 +6064,9 @@ impl UiWgpuRenderer {
                         if !geometry.is_default() {
                             self.node_cuts.insert(node_id.0.clone(), geometry.cut);
                         }
+                    }
+                    neon_ui_schema::UiEffect::Material { node_id, material } => {
+                        self.node_materials.insert(node_id.0.clone(), material.clone());
                     }
                     neon_ui_schema::UiEffect::ControlSkin { skin } => {
                         self.skins.insert(skin.key.clone(), skin.clone());
@@ -6691,7 +6841,7 @@ impl UiWgpuRenderer {
                 .next()
                 .unwrap_or(node_path),
         ) {
-            instance.cut = *cut;
+            instance.cut = resolve_shell_cut([bounds.width, bounds.height], *cut);
         }
         if let Some(active) = self.active.get(node_path) {
             let from_style = if active.from.style == UiStyle::default() {
@@ -6735,6 +6885,68 @@ impl UiWgpuRenderer {
                 ];
             }
         }
+        instance.cut = resolve_shell_cut([bounds.width, bounds.height], instance.cut);
+        instance
+    }
+
+    /// Largest material-bearing panel after final layout. Windows Composition
+    /// uses this as the bounded source region for its system backdrop; it is
+    /// renderer-derived rather than authored as an HWND rectangle.
+    pub(crate) fn primary_material_shell(&self) -> Option<(UiBounds, [f32; 4])> {
+        self.plan
+            .iter()
+            .filter_map(|node| {
+                let key = node.id.rsplit('/').next()?;
+                self.node_materials.get(key).map(|_| {
+                    let bounds = node.target.bounds;
+                    let cut = self.node_cuts.get(key).copied().unwrap_or([0.0; 4]);
+                    (bounds, resolve_shell_cut([bounds.width, bounds.height], cut))
+                })
+            })
+            .max_by(|(left, _), (right, _)| {
+                (left.width * left.height)
+                    .partial_cmp(&(right.width * right.height))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+    }
+
+    /// Creates the visual-only draw layer declared by `material`. It reuses the
+    /// panel vertex ABI so material overflow stays in logical coordinates while
+    /// the hit pass continues to emit only the host node.
+    fn material_instance(
+        &self,
+        visual: &UiVisual,
+        node_path: &str,
+        material: &UiMaterialRef,
+        time_seconds: f32,
+    ) -> UiInstance {
+        let mut instance = self.instance(visual, node_path, time_seconds);
+        let bounds = material.draw_bounds(visual.bounds);
+        instance.rect = [bounds.x, bounds.y, bounds.width, bounds.height];
+        instance.from_rect = instance.rect;
+        // Material layers are purposefully translucent. The normal panel
+        // shader supplies the composition-safe fallback when a custom package
+        // is not resident yet; package-specific pipelines replace this record
+        // in the material pass.
+        let (fill, border) = match material.package_id.as_str() {
+            "pulse-neon-edge" => ([0.56, 1.0, 0.04, 0.045], [0.72, 1.0, 0.10, 0.92]),
+            "pulse-equalizer" => ([0.42, 1.0, 0.05, 0.10], [0.65, 1.0, 0.12, 0.80]),
+            _ => ([0.92, 1.0, 0.78, 0.10], [0.74, 1.0, 0.22, 0.55]),
+        };
+        instance.fill = fill;
+        instance.border = border;
+        instance.from_fill = fill;
+        instance.from_border = border;
+        instance.params[0] = if material.package_id == "pulse-neon-edge" { 1.25 } else { 0.8 };
+        instance.params[1] = 0.0;
+        instance.params[2] = 1.0;
+        instance.from_params = instance.params;
+        instance.clip = [
+            bounds.x,
+            bounds.y,
+            bounds.x + bounds.width,
+            bounds.y + bounds.height,
+        ];
         instance
     }
 
@@ -13351,6 +13563,42 @@ mod tests {
             trace: wgpu::Trace::Off,
         }))
         .expect("a device is required")
+    }
+
+    #[test]
+    fn registered_material_source_compiles_into_an_isolated_pipeline() {
+        let _gpu_test = GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let (device, _queue) = test_device("neon3-ui-material-pipeline");
+        let mut renderer = UiWgpuRenderer::new(&device, wgpu::TextureFormat::Rgba8Unorm);
+        let source = br#"
+            fn material(input: MaterialInput) -> vec4<f32> {
+                let edge = 1.0 - smoothstep(0.0, 0.1, input.geometry_edge);
+                return vec4<f32>(0.5 + edge * 0.2, 0.9, 0.1, 0.2 + edge * 0.4);
+            }
+        "#;
+        renderer.sync_material_packages(&device, &[UiShaderPackage {
+            package_id: "test-pulse-material".into(),
+            version: 1,
+            source_digest: "0000000000000000".into(),
+            source_bytes: source.to_vec(),
+            entry_point: "material".into(),
+            fallback: "standard_ui".into(),
+            parameters: Vec::new(),
+        }]);
+        assert!(renderer.material_pipelines.contains_key("test-pulse-material"));
+        assert_eq!(renderer.material_pipelines.len(), 1);
+    }
+
+    #[test]
+    fn shell_resolver_keeps_cut_polygon_convex_on_narrow_bounds() {
+        let cut = resolve_shell_cut([100.0, 40.0], [40.0, 40.0, 40.0, 40.0]);
+        assert_eq!(cut, [20.0, 20.0, 20.0, 20.0]);
+        assert!(cut[0] + cut[3] <= 100.0);
+        assert!(cut[3] + cut[2] <= 100.0);
+        assert!(cut[0] + cut[1] <= 40.0);
+        assert!(cut[2] + cut[3] <= 40.0);
     }
 
     fn node() -> UiNode {

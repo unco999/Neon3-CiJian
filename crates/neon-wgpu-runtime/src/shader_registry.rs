@@ -94,6 +94,15 @@ impl ShaderRegistry {
         self.packages.get(package_id)
     }
 
+    /// Immutable packages suitable for transfer to the renderer-owned device
+    /// thread. The caller receives source bytes, never a GPU handle.
+    pub fn packages(&self) -> Vec<UiShaderPackage> {
+        self.packages
+            .values()
+            .map(|entry| entry.package.clone())
+            .collect()
+    }
+
     /// Structured snapshot for `wgpu.shader.state` and `debug.snapshot.get`.
     pub fn snapshot(&self) -> serde_json::Value {
         json!({
