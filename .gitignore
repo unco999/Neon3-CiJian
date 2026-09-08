@@ -28,3 +28,6 @@
 /examples/android-runtime/.idea/
 /examples/android-runtime/*.iml
 /shots
+/.target-v026-live-fixed
+/.target-v026-debug-fixed
+/.target-v026-live

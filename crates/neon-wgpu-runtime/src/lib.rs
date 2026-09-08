@@ -2517,7 +2517,11 @@ impl WindowedRuntime {
                 gpu.physical_viewport_size(),
                 gpu.logical_viewport_size(),
                 gpu.started_at.elapsed().as_secs_f32(),
-                UiDrawMode::All,
+                // BehindGlass has already been rendered into the dedicated
+                // composition surface above. Drawing All here duplicates the
+                // light layer into the opaque content surface and covers the
+                // acrylic result with a silver-looking panel.
+                UiDrawMode::Screen,
             );
             drop(pass);
             let shell = gpu.ui.primary_material_shell();
