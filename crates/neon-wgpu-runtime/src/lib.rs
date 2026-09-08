@@ -457,6 +457,58 @@ fn clear_transparent_window_backdrop(window: &Window) -> Result<(), String> {
         )
     }
     .map_err(|error| format!("disable DWM non-client rendering: {error}"))?;
+    // DWMWA_BORDER_COLOR = 36 (Windows 11 22000+). Force the window border to
+    // black so DWM does not paint a light 1px frame around a borderless
+    // layered window. Value 0x00000000 is black in DWMCOLOR (0x00BBGGRR).
+    let border_color: u32 = 0x00000000;
+    unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWINDOWATTRIBUTE(36),
+            &border_color as *const u32 as *const std::ffi::c_void,
+            std::mem::size_of_val(&border_color) as u32,
+        )
+    }
+    .unwrap_or_else(|error| eprintln!("[neon-wgpu-runtime] DWM border color unavailable (pre-Win11): {error}"));
+    // DWMWA_WINDOW_CORNER_PREFERENCE = 33. DWMWCP_DONOTROUND = 1 stops Win11
+    // from applying its rounded-corner mask, which otherwise adds a 1px
+    // lighter ring where the region and the rounded frame disagree.
+    let corner_preference: i32 = 1;
+    unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWINDOWATTRIBUTE(33),
+            &corner_preference as *const i32 as *const std::ffi::c_void,
+            std::mem::size_of_val(&corner_preference) as u32,
+        )
+    }
+    .unwrap_or_else(|error| eprintln!("[neon-wgpu-runtime] DWM corner preference unavailable: {error}"));
+    // Strip every frame/caption style so DWM has nothing to draw around the
+    // shell. winit borderless still leaves WS_BORDER / WS_SYSMENU / min/max
+    // boxes on this path, and a layered window keeps painting the theme
+    // border for those styles even with DWMWA_NCRENDERING_POLICY disabled.
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetWindowLongPtrW, SetWindowLongPtrW, SetWindowPos, GWL_STYLE, SWP_FRAMECHANGED,
+        SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WS_BORDER, WS_CAPTION, WS_DLGFRAME,
+        WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_SYSMENU, WS_THICKFRAME,
+    };
+    let frame_mask = WS_BORDER.0
+        | WS_CAPTION.0
+        | WS_DLGFRAME.0
+        | WS_THICKFRAME.0
+        | WS_SYSMENU.0
+        | WS_MINIMIZEBOX.0
+        | WS_MAXIMIZEBOX.0;
+    let style = unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) } as u32;
+    let stripped = style & !frame_mask;
+    if stripped != style {
+        unsafe { SetWindowLongPtrW(hwnd, GWL_STYLE, stripped as isize) };
+        // Style changes only take effect after the frame is re-evaluated;
+        // without SWP_FRAMECHANGED DWM keeps painting the old resize border.
+        let _ = unsafe {
+            SetWindowPos(hwnd, None, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER)
+        };
+    }
     Ok(())
 }
 

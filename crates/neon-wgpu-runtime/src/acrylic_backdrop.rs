@@ -258,7 +258,7 @@ impl AcrylicHost {
         let effect = GaussianBlurEffect {
             name: std::cell::RefCell::new(windows::core::HSTRING::from("GaussianBlurEffect")),
             blur_amount: std::env::var("NEON_BLUR_AMOUNT").ok().and_then(|s| s.parse().ok()).unwrap_or(8.0),
-            optimization: 1, border_mode: 0, source,
+            optimization: 1, border_mode: 1, source,
         };
         let effect_interface: IGraphicsEffect = effect.into();
         let factory = compositor.CreateEffectFactory(&effect_interface).map_err(|e| AcrylicError::Message(format!("effect factory: {e:?}")))?;
@@ -288,7 +288,7 @@ impl AcrylicHost {
         let behind_effect = GaussianBlurEffect {
             name: std::cell::RefCell::new(windows::core::HSTRING::from("BehindGlassBlurEffect")),
             blur_amount: std::env::var("NEON_BLUR_AMOUNT").ok().and_then(|s| s.parse().ok()).unwrap_or(8.0),
-            optimization: 1, border_mode: 0, source: behind_source,
+            optimization: 1, border_mode: 1, source: behind_source,
         };
         let behind_effect_interface: IGraphicsEffect = behind_effect.into();
         let behind_factory = compositor.CreateEffectFactory(&behind_effect_interface).map_err(|e| AcrylicError::Message(format!("behind blur factory: {e:?}")))?;
@@ -309,27 +309,40 @@ impl AcrylicHost {
 
     pub fn set_backdrop_shell_bounds(&self, x: f32, y: f32, width: f32, height: f32, cut: [f32; 4]) -> Result<(), AcrylicError> {
         let bounds = [x, y, width.max(1.0), height.max(1.0)];
+        // Cache the shell geometry so the composition clip stays in lockstep
+        // with the HWND `SetWindowRgn` polygon: both use the exact same
+        // eight-vertex cut shape.
         let cached = { self.shell_geometry.borrow().clone() };
-        let clip = match cached {
-            Some(cached) if cached.bounds == bounds && cached.cut == cut => cached.clip,
-            _ => {
-                let clip = create_shell_clip(&self._compositor, bounds, cut)?;
-                *self.shell_geometry.borrow_mut() = Some(ShellGeometryCache {
-                    bounds,
-                    cut,
-                    clip: clip.clone(),
-                });
-                clip
-            }
+        let clip = if cached.as_ref().is_some_and(|cached| cached.bounds == bounds && cached.cut == cut) {
+            cached.unwrap().clip
+        } else {
+            let clip = create_shell_clip(&self._compositor, bounds, cut)?;
+            *self.shell_geometry.borrow_mut() = Some(ShellGeometryCache {
+                bounds,
+                cut,
+                clip: clip.clone(),
+            });
+            clip
         };
         let offset = Vector3::new(x, y, 0.0);
         let size = Vector2::new(width.max(1.0), height.max(1.0));
-        self._blur_sprite.SetOffset(offset)
-            .and_then(|_| self._blur_sprite.SetSize(size))
-            .and_then(|_| self._behind_blur_sprite.SetOffset(offset))
-            .and_then(|_| self._behind_blur_sprite.SetSize(size))
-            .and_then(|_| self._tint_sprite.SetOffset(offset))
-            .and_then(|_| self._tint_sprite.SetSize(size))
+        // Every wgpu composition surface has a transparent outermost 1px
+        // column/row. Overscan every visual by two physical pixels so their
+        // transparent boundary lands outside the visible shell; the
+        // CompositionGeometricClip (same polygon as SetWindowRgn) is applied
+        // to the root so no visual can light up the shell edge.
+        let bleed = 2.0_f32;
+        let bleed_offset = Vector3::new(x - bleed, y - bleed, 0.0);
+        let bleed_size =
+            Vector2::new(width.max(1.0) + bleed * 2.0, height.max(1.0) + bleed * 2.0);
+        self._blur_sprite.SetOffset(bleed_offset)
+            .and_then(|_| self._blur_sprite.SetSize(bleed_size))
+            .and_then(|_| self._behind_blur_sprite.SetOffset(bleed_offset))
+            .and_then(|_| self._behind_blur_sprite.SetSize(bleed_size))
+            .and_then(|_| self._tint_sprite.SetOffset(bleed_offset))
+            .and_then(|_| self._tint_sprite.SetSize(bleed_size))
+            .and_then(|_| self._content_sprite.SetOffset(bleed_offset))
+            .and_then(|_| self._content_sprite.SetSize(bleed_size))
             .and_then(|_| self._root.SetClip(&clip))
             .map_err(|e| AcrylicError::Message(format!("set backdrop shell bounds: {e:?}")))
     }
@@ -342,15 +355,18 @@ impl AcrylicHost {
             // visual or lose an asymmetric cut.
             let bounds = cached.bounds;
             let clip = cached.clip;
-            let offset = Vector3::new(bounds[0], bounds[1], 0.0);
+            let bleed = 2.0_f32;
+            let bleed_offset = Vector3::new(bounds[0] - bleed, bounds[1] - bleed, 0.0);
             let shell_size = Vector2::new(bounds[2], bounds[3]);
-            self._blur_sprite.SetOffset(offset)
-                .and_then(|_| self._blur_sprite.SetSize(shell_size))
-                .and_then(|_| self._behind_blur_sprite.SetOffset(offset))
-                .and_then(|_| self._behind_blur_sprite.SetSize(shell_size))
-                .and_then(|_| self._tint_sprite.SetOffset(offset))
-                .and_then(|_| self._tint_sprite.SetSize(shell_size))
-                .and_then(|_| self._content_sprite.SetSize(size))
+            let bleed_size = Vector2::new(bounds[2] + bleed * 2.0, bounds[3] + bleed * 2.0);
+            self._blur_sprite.SetOffset(bleed_offset)
+                .and_then(|_| self._blur_sprite.SetSize(bleed_size))
+                .and_then(|_| self._behind_blur_sprite.SetOffset(bleed_offset))
+                .and_then(|_| self._behind_blur_sprite.SetSize(bleed_size))
+                .and_then(|_| self._tint_sprite.SetOffset(bleed_offset))
+                .and_then(|_| self._tint_sprite.SetSize(bleed_size))
+                .and_then(|_| self._content_sprite.SetOffset(bleed_offset))
+                .and_then(|_| self._content_sprite.SetSize(bleed_size))
                 .and_then(|_| self._root.SetClip(&clip))
         } else {
             self._blur_sprite.SetSize(size)

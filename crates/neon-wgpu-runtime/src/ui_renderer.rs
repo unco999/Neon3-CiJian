@@ -56,17 +56,11 @@ fn value_noise(p: vec2<f32>) -> f32 {
 }
 
 fn liquid_glass(color: vec4<f32>, pixel: vec2<f32>, local: vec2<f32>) -> vec4<f32> {
-    // Windows Composition supplies the real backdrop blur. This shader adds
-    // only the material response: a restrained white transmission tint, a
-    // moving light band, and a thin rim highlight. The returned RGB remains
-    // straight here and is premultiplied by the caller before blending.
-    let edge = min(min(local.x, 1.0 - local.x), min(local.y, 1.0 - local.y));
-    let rim = 1.0 - smoothstep(0.0, 0.08, edge);
-    let flow = value_noise(pixel * 0.006 + vec2<f32>(view.time_seconds * 0.025, view.time_seconds * -0.018));
-    let transmission = 0.035 + flow * 0.025;
-    let highlight = rim * 0.16 + smoothstep(0.72, 0.98, flow) * 0.025;
-    let tint = mix(color.rgb, vec3<f32>(1.0), transmission);
-    return vec4<f32>(min(tint + vec3<f32>(highlight), vec3<f32>(1.0)), color.a);
+    // Windows Composition supplies the real backdrop blur and tint. The panel
+    // color passes through unchanged; the previous white rim highlight and
+    // transmission tint produced an unwanted light border around cut-corner
+    // shells.
+    return color;
 }
 fn outside_clip(pixel: vec2<f32>, clip: vec4<f32>, radius: f32) -> bool {
     if (pixel.x < clip.x || pixel.y < clip.y || pixel.x > clip.z || pixel.y > clip.w) { return true; }
@@ -6933,6 +6927,18 @@ impl UiWgpuRenderer {
         self.plan
             .iter()
             .filter_map(|node| {
+                // Nodes in the behind_glass composition layer are render
+                // layers, not shell containers. They must never be selected
+                // as the primary shell, otherwise their (typically absent)
+                // cut geometry replaces the real shell's cut corners.
+                let layer = self
+                    .composition_layers
+                    .get(&node.id)
+                    .copied()
+                    .unwrap_or_default();
+                if layer == neon_ui_schema::UiCompositionLayer::BehindGlass {
+                    return None;
+                }
                 let key = node.id.rsplit('/').next()?;
                 self.node_materials.get(key).map(|_| {
                     let bounds = node.target.bounds;
