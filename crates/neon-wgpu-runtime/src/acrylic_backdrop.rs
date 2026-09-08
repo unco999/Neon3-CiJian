@@ -299,7 +299,14 @@ impl AcrylicHost {
         behind_blur_sprite.SetBrush(&behind_effect_brush).and_then(|_| behind_blur_sprite.SetSize(size)).map_err(|e| AcrylicError::Message(format!("behind blur visual setup: {e:?}")))?;
         let root = compositor.CreateContainerVisual().map_err(|e| AcrylicError::Message(format!("root: {e:?}")))?;
         let children = root.Children().map_err(|e| AcrylicError::Message(format!("root children: {e:?}")))?;
-        children.InsertAtTop(&blur_sprite).and_then(|_| children.InsertAtTop(&behind_blur_sprite)).and_then(|_| children.InsertAtTop(&tint_sprite)).and_then(|_| children.InsertAtTop(&content_sprite)).map_err(|e| AcrylicError::Message(format!("root children insert: {e:?}")))?;
+        // The dark tint is the glass body and must sit below the animated
+        // behind-glass surface. Putting tint above it attenuates the lime
+        // emission and makes the shell read as a flat silver panel.
+        children.InsertAtTop(&blur_sprite)
+            .and_then(|_| children.InsertAtTop(&tint_sprite))
+            .and_then(|_| children.InsertAtTop(&behind_blur_sprite))
+            .and_then(|_| children.InsertAtTop(&content_sprite))
+            .map_err(|e| AcrylicError::Message(format!("root children insert: {e:?}")))?;
         target.SetRoot(&root).map_err(|e| AcrylicError::Message(format!("target root: {e:?}")))?;
         Ok(Self { _compositor: compositor, _target: target, _effect_brush: effect_brush, _behind_effect_brush: behind_effect_brush, _blur_sprite: blur_sprite, _behind_blur_sprite: behind_blur_sprite, _tint_sprite: tint_sprite, _content_brush: content_brush, _content_sprite: content_sprite, _behind_brush: behind_brush, _root: root, surface_handle: handle, behind_surface_handle: behind_handle, shell_geometry: std::cell::RefCell::new(None) })
     }
