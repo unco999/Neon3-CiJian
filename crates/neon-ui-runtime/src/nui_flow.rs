@@ -17,7 +17,7 @@ use neon_ui_schema::{
     UiGridInputSlot, UiGeometry, UiInputKind, UiInputPacking, UiInputSchema, UiInputSlot, UiInputUpdateClass,
     UiInputValue, UiIntent, UiIrBinding, UiIrDocument, UiIrPatch, UiIrPatchOperation,
     UiIrPatchOperationKind, UiJustifyContent, UiLayout, UiLayoutMode, UiMaterialRef, UiNineSlice, UiNineSliceMode,
-    UiNode, UiNodeId, UiNodeKind, UiProgram, UiProgramEventDeclaration, UiProgramRevision,
+    UiCompositionLayer, UiNode, UiNodeId, UiNodeKind, UiProgram, UiProgramEventDeclaration, UiProgramRevision,
     UiResourceBudget, UiRichTextSpan, UiShaderPackage,
     UiSourceSpan, UiStyle, UiSurfaceId, UiTemplateDeclaration, UiTransition, UiTransitionState,
 };
@@ -56,6 +56,7 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
     let mut skin_references = BTreeMap::new();
     let mut geometry_records = BTreeMap::new();
     let mut material_records = BTreeMap::new();
+    let mut composition_layer_records = BTreeMap::new();
     let mut skins = Vec::new();
     let mut shader_packages = Vec::new();
     let mut current_skin: Option<neon_ui_schema::UiControlSkin> = None;
@@ -291,6 +292,7 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
                 &mut root,
                 &mut geometry_records,
                 &mut material_records,
+                &mut composition_layer_records,
                 line,
             )?;
         }
@@ -393,6 +395,7 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
             &mut root,
             &mut geometry_records,
             &mut material_records,
+            &mut composition_layer_records,
             0,
         )?;
     }
@@ -415,6 +418,9 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
     }
     if let Some(material) = root.material.take() {
         material_records.insert(root.node.node_id.0.clone(), material);
+    }
+    if root.composition_layer != UiCompositionLayer::Normal {
+        composition_layer_records.insert(root.node.node_id.0.clone(), root.composition_layer);
     }
     let mut offset = 0;
     for slot in &mut input_slots {
@@ -659,6 +665,7 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
         shader_packages,
         geometry_records,
         material_records,
+        composition_layer_records,
         branches,
         templates,
         data_grids,
@@ -863,6 +870,12 @@ pub fn lower_nui_flow_effects(document: &NuiFlowDocument) -> Vec<UiEffect> {
                 material: material.clone(),
             }),
     );
+    effects.extend(document.ir.composition_layer_records.iter().map(|(node_key, layer)| {
+        UiEffect::CompositionLayer {
+            node_id: UiNodeId(node_key.clone()),
+            layer: *layer,
+        }
+    }));
     effects.extend(document.ir.skins.iter().cloned().map(|skin| UiEffect::ControlSkin { skin }));
     effects.extend(document.ir.skin_references.iter().map(|(node_id, skin_key)| UiEffect::SkinReference {
         node_id: UiNodeId(node_id.clone()),
@@ -1119,6 +1132,7 @@ pub fn format_nui_flow(source: &str) -> FlowResult<String> {
         &parsed.ir.skin_references,
         &parsed.ir.geometry_records,
         &parsed.ir.material_records,
+        &parsed.ir.composition_layer_records,
         &mut lines,
     );
     Ok(lines.join("\n") + "\n")
@@ -1447,6 +1461,7 @@ struct NodeBuild {
     skin_key: Option<String>,
     geometry: Option<UiGeometry>,
     material: Option<UiMaterialRef>,
+    composition_layer: UiCompositionLayer,
 }
 
 fn parse_skin_header(text: &str, line: u32) -> FlowResult<neon_ui_schema::UiControlSkin> {
@@ -2555,6 +2570,7 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
     let mut skin_key = None;
     let geometry = None;
     let material = None;
+    let mut composition_layer = UiCompositionLayer::Normal;
     let mut world_camera = None;
     let mut world_anchor = None;
     let mut used = HashSet::new();
@@ -2576,7 +2592,8 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
             "x" | "y" | "w" | "h" | "minw" | "maxw" | "grow" | "shrink" | "basis" | "gap"
             | "pad" | "fill" | "line" | "ink" | "opacity" | "radius" | "border_width" | "value"
             | "checked" | "selected" | "state" | "numeric" | "scroll" | "enabled" | "visible"
-            | "event" | "token" | "align" | "clip" | "fit" | "justify" | "data" | "rich" | "skin" => {
+            | "event" | "token" | "align" | "clip" | "fit" | "justify" | "data" | "rich" | "skin"
+            | "composition_layer" | "layer" => {
                 let value = *parts.get(index + 1).ok_or_else(|| {
                     error(
                         "nui_flow_missing_value",
@@ -2624,6 +2641,17 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
                         ));
                     }
                     bindings.push((UiBoundProperty::CanvasData, key.into()));
+                } else if matches!(token, "composition_layer" | "layer") {
+                    composition_layer = match (token, value) {
+                        ("composition_layer", "behind_glass") | ("layer", "behind_glass") => UiCompositionLayer::BehindGlass,
+                        ("composition_layer", "overlay") | ("layer", "top") => UiCompositionLayer::Top,
+                        _ => return Err(error(
+                            "nui_flow_invalid_composition_layer",
+                            "composition layer must be behind_glass, overlay, or top",
+                            line,
+                            1,
+                        )),
+                    };
                 } else {
                     if token == "skin" {
                         if !matches!(component, "button" | "slider") || !valid_key(value) {
@@ -3091,6 +3119,7 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
         skin_key,
         geometry,
         material,
+        composition_layer,
     })
 }
 
@@ -3700,6 +3729,7 @@ fn attach(
     root: &mut Option<NodeBuild>,
     geometry_records: &mut BTreeMap<String, UiGeometry>,
     material_records: &mut BTreeMap<String, UiMaterialRef>,
+    composition_layer_records: &mut BTreeMap<String, UiCompositionLayer>,
     line: u32,
 ) -> FlowResult<()> {
     let mut child = child;
@@ -3708,6 +3738,9 @@ fn attach(
     }
     if let Some(material) = child.material.take() {
         material_records.insert(child.node.node_id.0.clone(), material);
+    }
+    if child.composition_layer != UiCompositionLayer::Normal {
+        composition_layer_records.insert(child.node.node_id.0.clone(), child.composition_layer);
     }
     if let Some((_, parent)) = stack.last_mut() {
         parent.node.children.push(child.node);
@@ -4069,6 +4102,7 @@ fn format_node(
     skin_references: &BTreeMap<String, String>,
     geometry_records: &BTreeMap<String, UiGeometry>,
     material_records: &BTreeMap<String, UiMaterialRef>,
+    composition_layer_records: &BTreeMap<String, UiCompositionLayer>,
     lines: &mut Vec<String>,
 ) {
     let kind = match &node.kind {
@@ -4180,6 +4214,13 @@ fn format_node(
             line.push_str(&format!(" fit {fit}"));
         }
     }
+    if let Some(layer) = composition_layer_records.get(&node.node_id.0) {
+        line.push_str(match layer {
+            UiCompositionLayer::BehindGlass => " composition_layer behind_glass",
+            UiCompositionLayer::Top => " composition_layer overlay",
+            UiCompositionLayer::Normal => "",
+        });
+    }
     if let Some(TextRef::Literal { value }) = &node.text {
         line.push_str(&format!(" value \"{}\"", value.replace('"', "\\\"")));
     }
@@ -4260,6 +4301,7 @@ fn format_node(
             skin_references,
             geometry_records,
             material_records,
+            composition_layer_records,
             lines,
         );
     }

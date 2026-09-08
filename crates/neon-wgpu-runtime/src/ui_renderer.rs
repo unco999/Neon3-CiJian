@@ -88,7 +88,7 @@ fn outside_cut(local: vec2<f32>, size: vec2<f32>, cut: vec4<f32>) -> bool {
     if (br > 0.0 && rx < br && p.y < br && rx + p.y < br) { return true; }
     let ty = size.y - p.y;
     if (tr > 0.0 && rx < tr && ty < tr && rx + ty < tr) { return true; }
-    if (tl > 0.0 && p.x < tl && ty < tl && p.x + ty < tl) { return true; }
+    if (tl > 0.0 && p.x < tl && p.y < tl && p.x + p.y < tl) { return true; }
     return false;
 }
 
@@ -170,7 +170,7 @@ let color = mix(input.fill, input.border, border_alpha);
         // attachment. Otherwise its near depth rejects all visible World UI
         // children while contributing no color itself.
         if (alpha <= 0.001) { discard; }
-        let glass = select(liquid_glass(color, input.pixel, input.local), color, alpha >= 0.99);
+        let glass = liquid_glass(color, input.pixel, input.local);
         return vec4<f32>(select(srgb_to_linear(glass.rgb), glass.rgb, view.color_mode == 1u) * alpha, alpha);
     }
     let radius = min(input.params.y, min(input.size.x, input.size.y) * 0.5);
@@ -178,11 +178,12 @@ let color = mix(input.fill, input.border, border_alpha);
     let extent = max(input.size * 0.5 - vec2<f32>(radius), vec2<f32>(0.0));
     let corner_distance = length(max(abs(point) - extent, vec2<f32>(0.0))) - radius;
     let shape_alpha = 1.0 - smoothstep(0.0, 1.0, corner_distance);
-    let border_alpha = 1.0 - smoothstep(-input.params.x - 1.0, -input.params.x + 1.0, corner_distance);
+    let edge_distance = select(min(extent.x - abs(point.x), extent.y - abs(point.y)), -corner_distance, radius > 0.0);
+    let border_alpha = 1.0 - smoothstep(input.params.x - 1.0, input.params.x + 1.0, edge_distance);
     let color = mix(input.fill, input.border, border_alpha);
     let alpha = color.a * input.params.z * shape_alpha;
     if (alpha <= 0.001) { discard; }
-    let glass = select(liquid_glass(color, input.pixel, input.local), color, alpha >= 0.99);
+    let glass = liquid_glass(color, input.pixel, input.local);
     return vec4<f32>(select(srgb_to_linear(glass.rgb), glass.rgb, view.color_mode == 1u) * alpha, alpha);
 }
 "#;
@@ -192,7 +193,7 @@ struct View { viewport: vec2<f32>, color_mode: u32, time_seconds: f32 }
 @group(0) @binding(0) var<uniform> view: View;
 fn animation_progress(animation: vec4<f32>) -> f32 { if (animation.w == 0.0 || animation.y <= 0.0) { return 1.0; } let t=clamp((view.time_seconds-animation.x)/animation.y,0.0,1.0); if(animation.z==1.0){return t*t;} if(animation.z==2.0){return 1.0-(1.0-t)*(1.0-t);} if(animation.z==3.0){return select(2.0*t*t,1.0-pow(-2.0*t+2.0,2.0)/2.0,t>=0.5);} return t; }
 fn outside_clip(pixel: vec2<f32>, clip: vec4<f32>, radius: f32) -> bool { if (pixel.x < clip.x || pixel.y < clip.y || pixel.x > clip.z || pixel.y > clip.w) { return true; } if (radius <= 0.0) { return false; } let size=clip.zw-clip.xy; let r=min(radius,min(size.x,size.y)*0.5); let point=pixel-(clip.xy+size*0.5); let extent=max(size*0.5-vec2<f32>(r),vec2<f32>(0.0)); return length(max(abs(point)-extent,vec2<f32>(0.0)))>r; }
-fn outside_cut(local: vec2<f32>, size: vec2<f32>, cut: vec4<f32>) -> bool { let p = local * size; let bl = min(cut.x, min(size.x, size.y)); let br = min(cut.y, min(size.x, size.y)); let tr = min(cut.z, min(size.x, size.y)); let tl = min(cut.w, min(size.x, size.y)); if (bl > 0.0 && p.x < bl && p.y < bl && p.x + p.y < bl) { return true; } let rx = size.x - p.x; if (br > 0.0 && rx < br && p.y < br && rx + p.y < br) { return true; } let ty = size.y - p.y; if (tr > 0.0 && rx < tr && ty < tr && rx + ty < tr) { return true; } if (tl > 0.0 && p.x < tl && ty < tl && p.x + ty < tl) { return true; } return false; }
+fn outside_cut(local: vec2<f32>, size: vec2<f32>, cut: vec4<f32>) -> bool { let p = local * size; let bl = min(cut.x, min(size.x, size.y)); let br = min(cut.y, min(size.x, size.y)); let tr = min(cut.z, min(size.x, size.y)); let tl = min(cut.w, min(size.x, size.y)); if (bl > 0.0 && p.x < bl && p.y < bl && p.x + p.y < bl) { return true; } let rx = size.x - p.x; if (br > 0.0 && rx < br && p.y < br && rx + p.y < br) { return true; } let ty = size.y - p.y; if (tr > 0.0 && rx < tr && ty < tr && rx + ty < tr) { return true; } if (tl > 0.0 && p.x < tl && p.y < tl && p.x + p.y < tl) { return true; } return false; }
 struct VsIn { @location(0) rect: vec4<f32>, @location(1) params: vec4<f32>, @location(2) hit_id: u32, @location(3) clip: vec4<f32>, @location(4) cut: vec4<f32> }
 struct VsOut { @builtin(position) position: vec4<f32>, @location(0) local: vec2<f32>, @location(1) size: vec2<f32>, @location(2) params: vec4<f32>, @location(3) @interpolate(flat) hit_id: u32, @location(4) clip: vec4<f32>, @location(5) pixel: vec2<f32>, @location(6) cut: vec4<f32> }
 @vertex fn vs_main(@builtin(vertex_index) vertex_index: u32, input: VsIn) -> VsOut {
@@ -230,7 +231,7 @@ struct View { viewport: vec2<f32>, color_mode: u32, time_seconds: f32 }
 @group(0) @binding(0) var<uniform> view: View;
 fn srgb_to_linear(value: vec3<f32>) -> vec3<f32> { let low=value/12.92; let high=pow((value+vec3<f32>(0.055))/1.055,vec3<f32>(2.4)); return select(low,high,value>vec3<f32>(0.04045)); }
 fn outside_clip(pixel: vec2<f32>, clip: vec4<f32>, radius: f32) -> bool { if (pixel.x < clip.x || pixel.y < clip.y || pixel.x > clip.z || pixel.y > clip.w) { return true; } if (radius <= 0.0) { return false; } let size=clip.zw-clip.xy; let r=min(radius,min(size.x,size.y)*0.5); let point=pixel-(clip.xy+size*0.5); let extent=max(size*0.5-vec2<f32>(r),vec2<f32>(0.0)); return length(max(abs(point)-extent,vec2<f32>(0.0)))>r; }
-fn outside_cut(local: vec2<f32>, size: vec2<f32>, cut: vec4<f32>) -> bool { let p=local*size; let bl=min(cut.x,min(size.x,size.y)); let br=min(cut.y,min(size.x,size.y)); let tr=min(cut.z,min(size.x,size.y)); let tl=min(cut.w,min(size.x,size.y)); if(bl>0.0&&p.x<bl&&p.y<bl&&p.x+p.y<bl){return true;} let rx=size.x-p.x; if(br>0.0&&rx<br&&p.y<br&&rx+p.y<br){return true;} let ty=size.y-p.y; if(tr>0.0&&rx<tr&&ty<tr&&rx+ty<tr){return true;} if(tl>0.0&&p.x<tl&&ty<tl&&p.x+ty<tl){return true;} return false; }
+fn outside_cut(local: vec2<f32>, size: vec2<f32>, cut: vec4<f32>) -> bool { let p=local*size; let bl=min(cut.x,min(size.x,size.y)); let br=min(cut.y,min(size.x,size.y)); let tr=min(cut.z,min(size.x,size.y)); let tl=min(cut.w,min(size.x,size.y)); if(bl>0.0&&p.x<bl&&p.y<bl&&p.x+p.y<bl){return true;} let rx=size.x-p.x; if(br>0.0&&rx<br&&p.y<br&&rx+p.y<br){return true;} let ty=size.y-p.y; if(tr>0.0&&rx<tr&&ty<tr&&rx+ty<tr){return true;} if(tl>0.0&&p.x<tl&&p.y<tl&&p.x+p.y<tl){return true;} return false; }
 struct VsIn { @location(0) rect: vec4<f32>, @location(1) fill: vec4<f32>, @location(2) border: vec4<f32>, @location(3) params: vec4<f32>, @location(4) clip: vec4<f32>, @location(5) depth: f32, @location(6) from_rect: vec4<f32>, @location(7) from_fill: vec4<f32>, @location(8) from_border: vec4<f32>, @location(9) from_params: vec4<f32>, @location(10) animation: vec4<f32>, @location(11) cut: vec4<f32> }
 struct VsOut { @builtin(position) position: vec4<f32>, @location(0) local: vec2<f32>, @location(1) size: vec2<f32>, @location(2) fill: vec4<f32>, @location(3) border: vec4<f32>, @location(4) params: vec4<f32>, @location(5) clip: vec4<f32>, @location(6) pixel: vec2<f32>, @location(7) cut: vec4<f32> }
 @vertex fn vs_main(@builtin(vertex_index) index: u32, input: VsIn) -> VsOut { var corners=array<vec2<f32>,6>(vec2<f32>(0.0,0.0),vec2<f32>(1.0,0.0),vec2<f32>(0.0,1.0),vec2<f32>(0.0,1.0),vec2<f32>(1.0,0.0),vec2<f32>(1.0,1.0)); let local=corners[index]; let pixel=input.rect.xy+local*input.rect.zw; var output:VsOut; output.position=vec4<f32>(pixel.x/view.viewport.x*2.0-1.0,1.0-pixel.y/view.viewport.y*2.0,input.depth,1.0); output.local=local; output.size=input.rect.zw; output.fill=input.fill; output.border=input.border; output.params=input.params; output.clip=input.clip; output.pixel=pixel; output.cut=input.cut; return output; }
@@ -1213,6 +1214,16 @@ pub(crate) enum UiDrawMode {
     World,
     /// Only ordinary screen UI (nodes without a world depth).
     Screen,
+    /// Nodes declared `composition_layer behind_glass` and descendants.
+    BehindGlass,
+}
+
+fn composition_layer_is(layer: neon_ui_schema::UiCompositionLayer, mode: UiDrawMode) -> bool {
+    match mode {
+        UiDrawMode::BehindGlass => layer == neon_ui_schema::UiCompositionLayer::BehindGlass,
+        UiDrawMode::All => true,
+        UiDrawMode::Screen | UiDrawMode::World => layer != neon_ui_schema::UiCompositionLayer::BehindGlass,
+    }
 }
 
 fn color_pass_depth(world_depth: Option<f32>) -> f32 {
@@ -1280,6 +1291,7 @@ pub struct UiWgpuRenderer {
     plan_revisions: HashMap<neon_ui_schema::UiFragmentId, neon_protocol::Revision>,
     plan: Vec<PlannedNode>,
     plan_index: HashMap<String, usize>,
+    composition_layers: HashMap<String, neon_ui_schema::UiCompositionLayer>,
     debug_semantic_nodes: Vec<DebugSemanticNode>,
     sampled: Vec<UiVisual>,
     instances: Vec<UiInstance>,
@@ -2094,6 +2106,7 @@ impl UiWgpuRenderer {
             plan_revisions: HashMap::new(),
             plan: Vec::new(),
             plan_index: HashMap::new(),
+            composition_layers: HashMap::new(),
             debug_semantic_nodes: Vec::new(),
             sampled: Vec::new(),
             instances: Vec::new(),
@@ -4831,6 +4844,7 @@ impl UiWgpuRenderer {
                 UiDrawMode::All => true,
                 UiDrawMode::World => visual.world_depth.is_some(),
                 UiDrawMode::Screen => visual.world_depth.is_none(),
+                UiDrawMode::BehindGlass => visual.world_depth.is_none(),
             }
         }
         self.ensure_builtin_font(device, queue);
@@ -4881,6 +4895,13 @@ impl UiWgpuRenderer {
             if self.plan[index].instance_index.is_none()
                 || top_layer[index].is_some()
                 || !sampled_in_mode(&self.sampled[index], mode)
+                || !composition_layer_is(
+                    self.composition_layers
+                        .get(&self.plan[index].id)
+                        .copied()
+                        .unwrap_or_default(),
+                    mode,
+                )
             {
                 continue;
             }
@@ -6049,6 +6070,7 @@ impl UiWgpuRenderer {
         self.nine_slices.clear();
         self.node_cuts.clear();
         self.node_materials.clear();
+        self.composition_layers.clear();
         self.image_fits.clear();
         self.skins.clear();
         self.skin_references.clear();
@@ -6067,6 +6089,12 @@ impl UiWgpuRenderer {
                     }
                     neon_ui_schema::UiEffect::Material { node_id, material } => {
                         self.node_materials.insert(node_id.0.clone(), material.clone());
+                    }
+                    neon_ui_schema::UiEffect::CompositionLayer { node_id, layer } => {
+                        self.composition_layers.insert(
+                            format!("{}/{}", fragment.fragment_id.0, node_id.0),
+                            *layer,
+                        );
                     }
                     neon_ui_schema::UiEffect::ControlSkin { skin } => {
                         self.skins.insert(skin.key.clone(), skin.clone());
@@ -6169,6 +6197,15 @@ impl UiWgpuRenderer {
                 .enumerate()
                 .map(|(index, node)| (node.id.clone(), index)),
         );
+        for index in 0..self.plan.len() {
+            let id = self.plan[index].id.clone();
+            let inherited = self.plan[index]
+                .parent_id
+                .as_deref()
+                .and_then(|parent| self.composition_layers.get(parent).copied())
+                .unwrap_or_default();
+            self.composition_layers.entry(id).or_insert(inherited);
+        }
         // World snapshots have already had CameraVisibility effects consumed
         // by the host-side projection filter. Identify each projected panel by
         // its own inherited world depth instead of relying on those removed

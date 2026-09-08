@@ -16,7 +16,7 @@ use neon_protocol::{
 };
 use serde_json::{Value, json};
 
-const ENDPOINT: &str = "127.0.0.1:39261";
+const DEFAULT_ENDPOINT: &str = "127.0.0.1:39261";
 const TIMEOUT: Duration = Duration::from_secs(12);
 
 fn request(method: &str, sequence: u64) -> RpcRequest {
@@ -48,18 +48,21 @@ fn call(endpoint: SocketAddr, method: &str, sequence: u64) -> Result<Value, Stri
     Ok(response.result.unwrap_or_else(|| json!({})))
 }
 
-fn launch() -> io::Result<Child> {
+fn launch(endpoint: SocketAddr) -> io::Result<Child> {
     let binary = std::env::current_exe()?.with_file_name("neon-wgpu-runtime.exe");
     Command::new(binary)
         .env("NEON_WINDOW_CHROME", "borderless")
         .env("NEON_WINDOW_BACKDROP", "acrylic")
-        .args(["--window-server", ENDPOINT])
+        .args(["--window-server", &endpoint.to_string()])
         .spawn()
 }
 
 fn main() -> io::Result<()> {
-    let endpoint: SocketAddr = ENDPOINT.parse().expect("fixed endpoint");
-    let mut service = launch()?;
+    let endpoint: SocketAddr = std::env::var("NEON_PROBE_ENDPOINT")
+        .unwrap_or_else(|_| DEFAULT_ENDPOINT.into())
+        .parse()
+        .map_err(|error| io::Error::other(format!("invalid NEON_PROBE_ENDPOINT: {error}")))?;
+    let mut service = launch(endpoint)?;
     let started = Instant::now();
     let health = loop {
         match call(endpoint, "service.health", 1) {
@@ -78,16 +81,30 @@ fn main() -> io::Result<()> {
     let backdrop = snapshot.get("window_backdrop").cloned().unwrap_or_else(|| json!({}));
     let active = backdrop.get("active").and_then(Value::as_str);
     let alpha_mode = backdrop.get("surface_alpha_mode").and_then(Value::as_str);
-    let pass = active == Some("acrylic") && alpha_mode == Some("PreMultiplied");
+    let shell = snapshot.get("shell_frame").cloned().unwrap_or(Value::Null);
+    let shell_status = shell.get("status").and_then(Value::as_str);
+    let producer = shell.get("producer_bounds_logical").and_then(Value::as_array);
+    let consumer = shell.get("consumer_region_physical").and_then(Value::as_array);
+    let frame = shell.get("frame").and_then(Value::as_u64);
+    let scale = shell.get("scale_factor").and_then(Value::as_f64);
+    let geometry_pass = shell_status == Some("paired")
+        && producer.is_some_and(|bounds| bounds.len() == 4 && bounds.iter().all(Value::is_number))
+        && consumer.is_some_and(|region| region.len() == 8)
+        && frame.is_some_and(|value| value > 0)
+        && scale.is_some_and(|value| value > 0.0);
+    let pass = matches!(active, Some("native-accent-glass") | Some("acrylic"))
+        && alpha_mode == Some("PreMultiplied")
+        && geometry_pass;
     println!(
         "{}",
         json!({
             "probe":"window-backdrop",
             "stage":"result",
-            "endpoint":ENDPOINT,
+            "endpoint":endpoint,
             "input":{"NEON_WINDOW_CHROME":"borderless","NEON_WINDOW_BACKDROP":"acrylic"},
             "producer":{"health":health},
             "consumer":{"window_backdrop":backdrop},
+            "geometry":{"shell_frame":shell,"production_bounds_present":producer.is_some(),"consumer_region_present":consumer.is_some(),"frame_pair":frame.is_some(),"scale":scale,"status":if geometry_pass { "paired" } else { "missing-or-stale-or-coordinate-mismatch" }},
             "pass":pass,
         })
     );

@@ -729,6 +729,7 @@ mod tests {
             shader_packages: Vec::new(),
             geometry_records: BTreeMap::new(),
             material_records: BTreeMap::new(),
+            composition_layer_records: BTreeMap::new(),
             resource_budget: UiResourceBudget {
                 max_nodes: 2,
                 max_bindings: 0,
@@ -1247,6 +1248,7 @@ mod tests {
             shader_packages: Vec::new(),
             geometry_records: BTreeMap::new(),
             material_records: BTreeMap::new(),
+            composition_layer_records: BTreeMap::new(),
             resource_budget: UiResourceBudget {
                 max_nodes: 0,
                 max_bindings: 0,

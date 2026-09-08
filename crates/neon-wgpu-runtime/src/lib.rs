@@ -14,16 +14,6 @@ use std::{
 use std::{io::BufWriter, path::Path};
 
 use neon_ipc::{EventClient, RpcClient};
-#[cfg(target_os = "android")]
-use neon_ui_runtime::demo_domain::{
-    DemoInputDomain, apply_visible_status_to_fragment, component_gallery_initial_grid_frame,
-    component_gallery_program,
-};
-#[cfg(target_os = "android")]
-use neon_ui_runtime::{
-    UiInputStore, UiLocalPresentationState as UiFlowLocalPresentationState,
-    evaluate_ui_program, lower_nui_flow_effects,
-};
 use neon_observability::{
     CommandJournal, CommandReceipt, CommandState, DebugSnapshot, EVENT_COMMAND_ACCEPTED,
     EVENT_COMMAND_RECEIVED, EVENT_COMMAND_REJECTED, JournalFilter, TraceLevel, TraceRecord,
@@ -38,14 +28,23 @@ use neon_protocol::{
     ServiceHealth, ServiceName, UiFileDropPayload, UiImageSource, UiImageTextureRef,
     UiImageTextureRegion, UiImageUploadRequest,
 };
+#[cfg(target_os = "android")]
+use neon_ui_runtime::demo_domain::{
+    DemoInputDomain, apply_visible_status_to_fragment, component_gallery_initial_grid_frame,
+    component_gallery_program,
+};
+#[cfg(target_os = "android")]
+use neon_ui_runtime::{
+    UiInputStore, UiLocalPresentationState as UiFlowLocalPresentationState, evaluate_ui_program,
+    lower_nui_flow_effects,
+};
 #[cfg(test)]
 use neon_ui_schema::UiFragmentSubmission;
 use neon_ui_schema::{
     TextRef, UiBounds, UiCommand, UiDataGridWindowRequest, UiFragment, UiFragmentId, UiHostInbound,
     UiNode, UiNodeId, UiNodeKind, UiPointerEvent, UiPointerEventType, UiProgramRevision,
-    UiSemanticEvent,
-    UiSemanticPayloadValue,
-    UiSemanticEventType, UiStyle, UiTransition, UiTransitionState, UiWindowRequest,
+    UiSemanticEvent, UiSemanticEventType, UiSemanticPayloadValue, UiStyle, UiTransition,
+    UiTransitionState, UiWindowRequest,
 };
 use neon_world_bridge::{
     CameraControlSample, CameraFrame, CameraFramePayload, CameraId, WorldInformationBridge,
@@ -68,10 +67,10 @@ use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::platform::windows::WindowAttributesExtWindows;
 
 #[cfg(windows)]
+pub mod acrylic_backdrop;
+#[cfg(windows)]
 mod dx12_interop;
 mod gpu_preview;
-#[cfg(windows)]
-mod acrylic_backdrop;
 
 /// Read the Win32 HWND from a winit window handle (Windows only).
 #[cfg(windows)]
@@ -83,39 +82,98 @@ fn window_hwnd_win32(window: &Window) -> Option<windows::Win32::Foundation::HWND
     Some(windows::Win32::Foundation::HWND(win32.hwnd.get() as *mut _))
 }
 
+/// Forces WS_EX_LAYERED on the HWND before the swapchain is configured.
+/// winit's `with_transparent(true)` can drop the layered style when it is
+/// combined with `with_no_redirection_bitmap(true)`, leaving a non-layered HWND
+/// whose DXGI swapchain only advertises the opaque alpha mode. Without the
+/// layered style the surface can never show the DWM backdrop and the final
+/// clear stays opaque.
+#[cfg(windows)]
+fn ensure_layered_transparency(window: &Window) -> Result<(), String> {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GWL_EXSTYLE, GetWindowLongPtrW, SetWindowLongPtrW, WS_EX_LAYERED,
+    };
+    let hwnd = window_hwnd_win32(window).ok_or("read Win32 HWND")?;
+    let current = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) };
+    if current as u32 & WS_EX_LAYERED.0 != 0 {
+        return Ok(());
+    }
+    let next = current | WS_EX_LAYERED.0 as isize;
+    let result = unsafe { SetWindowLongPtrW(hwnd, GWL_EXSTYLE, next) };
+    if result == 0 {
+        return Err("SetWindowLongPtrW(GWL_EXSTYLE) failed".into());
+    }
+    Ok(())
+}
+
 /// Applies the renderer-resolved cut shell as the native HWND region. This is
 /// the final system-level mask, so no DWM/Composition visual can paint outside
 /// the player shell. `SetWindowRgn` owns the region after a successful call.
+///
+/// The polygon is cached in `applied` so the GDI region is only rebuilt and
+/// re-applied when the resolved shell geometry (or scale factor) actually
+/// changes; calling `SetWindowRgn` every frame would force a full repaint of
+/// the region on each redraw.
+#[cfg(windows)]
+fn shell_region_polygon(
+    bounds: UiBounds,
+    cut: [f32; 4],
+    scale_factor: f64,
+    window_matches_shell: bool,
+) -> [[i32; 2]; 8] {
+    let scale = scale_factor as f32;
+    let origin = if window_matches_shell {
+        [0.0, 0.0]
+    } else {
+        [bounds.x, bounds.y]
+    };
+    let x = (origin[0] * scale).round() as i32;
+    let y = (origin[1] * scale).round() as i32;
+    let width = (bounds.width * scale).round().max(1.0) as i32;
+    let height = (bounds.height * scale).round().max(1.0) as i32;
+    let [bl, br, tr, tl] = cut.map(|value| (value.max(0.0) * scale).round() as i32);
+    [
+        [x + tl, y],
+        [x + width - tr, y],
+        [x + width, y + tr],
+        [x + width, y + height - br],
+        [x + width - br, y + height],
+        [x + bl, y + height],
+        [x, y + height - bl],
+        [x, y + tl],
+    ]
+}
+
 #[cfg(windows)]
 fn apply_window_shell_region(
     window: &Window,
     bounds: UiBounds,
     cut: [f32; 4],
     scale_factor: f64,
+    window_matches_shell: bool,
+    applied: &mut Option<[[i32; 2]; 8]>,
 ) -> Result<(), String> {
     use windows::Win32::{
         Foundation::POINT,
-        Graphics::Gdi::{CreatePolygonRgn, WINDING},
-        UI::WindowsAndMessaging::SetWindowRgn,
+        Graphics::Gdi::{CreatePolygonRgn, DeleteObject, SetWindowRgn, WINDING},
     };
     let hwnd = window_hwnd_win32(window).ok_or("read Win32 HWND")?;
-    let scale = scale_factor as f32;
-    let x = (bounds.x * scale).round() as i32;
-    let y = (bounds.y * scale).round() as i32;
-    let width = (bounds.width * scale).round().max(1.0) as i32;
-    let height = (bounds.height * scale).round().max(1.0) as i32;
-    let [bl, br, tr, tl] = cut.map(|value| (value * scale).round() as i32);
-    let points = [
-        POINT { x: x + tl, y }, POINT { x: x + width - tr, y },
-        POINT { x: x + width, y: y + tr }, POINT { x: x + width, y: y + height - br },
-        POINT { x: x + width - br, y: y + height }, POINT { x: x + bl, y: y + height },
-        POINT { x, y: y + height - bl }, POINT { x, y: y + tl },
-    ];
-    let region = unsafe { CreatePolygonRgn(&points, WINDING) }
-        .map_err(|error| format!("CreatePolygonRgn: {error}"))?;
+    let polygon = shell_region_polygon(bounds, cut, scale_factor, window_matches_shell);
+    if *applied == Some(polygon) {
+        return Ok(());
+    }
+    let points: [POINT; 8] = polygon.map(|[px, py]| POINT { x: px, y: py });
+    let region = unsafe { CreatePolygonRgn(&points, WINDING) };
+    if region.0.is_null() {
+        return Err("CreatePolygonRgn returned a null region".into());
+    }
     if unsafe { SetWindowRgn(hwnd, Some(region), true) } == 0 {
+        unsafe {
+            let _ = DeleteObject(region.into());
+        }
         return Err("SetWindowRgn rejected shell region".into());
     }
+    *applied = Some(polygon);
     Ok(())
 }
 
@@ -123,12 +181,11 @@ fn apply_window_shell_region(
 /// Required by `Windows.UI.Composition.Compositor` on the desktop. Must run
 /// before the winit event loop creates its own COM apartment.
 #[cfg(windows)]
-fn init_dispatcher_queue(
-) -> Result<windows::System::DispatcherQueueController, String> {
-    use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
+fn init_dispatcher_queue() -> Result<windows::System::DispatcherQueueController, String> {
+    use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
     use windows::Win32::System::WinRT::{
-        CreateDispatcherQueueController, DispatcherQueueOptions, DQTAT_COM_STA,
-        DQTYPE_THREAD_CURRENT,
+        CreateDispatcherQueueController, DQTAT_COM_STA, DQTYPE_THREAD_CURRENT,
+        DispatcherQueueOptions,
     };
     let co_result = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
     if co_result.is_err() {
@@ -232,6 +289,9 @@ struct WindowBackdropState {
     requested: String,
     active: String,
     detail: Option<String>,
+    glass_tint: Option<String>,
+    glass_tint_opacity: Option<f64>,
+    glass_blur_amount: Option<f64>,
 }
 
 impl WindowBackdrop {
@@ -246,19 +306,66 @@ impl WindowBackdrop {
     fn from_value(requested: &str) -> (Self, WindowBackdropState) {
         let requested = requested.trim().to_ascii_lowercase();
         match requested.as_str() {
-            "" | "none" => (Self::None, WindowBackdropState {
-                requested: "none".into(), active: "none".into(), detail: None,
-            }),
-            "transparent" => (Self::Transparent, WindowBackdropState {
-                requested, active: "transparent-wgpu".into(), detail: None,
-            }),
-            "acrylic" => (Self::Acrylic, WindowBackdropState {
-                requested, active: "pending".into(), detail: None,
-            }),
-            _ => (Self::None, WindowBackdropState {
-                requested: requested.clone(), active: "none".into(),
-                detail: Some("unsupported backdrop; supported values are none and acrylic".into()),
-            }),
+            "" | "none" => (
+                Self::None,
+                WindowBackdropState {
+                    requested: "none".into(),
+                    active: "none".into(),
+                    detail: None,
+                    glass_tint: None,
+                    glass_tint_opacity: None,
+                    glass_blur_amount: None,
+                },
+            ),
+            "transparent" => (
+                Self::Transparent,
+                WindowBackdropState {
+                    requested,
+                    active: "transparent-wgpu".into(),
+                    detail: None,
+                    glass_tint: None,
+                    glass_tint_opacity: None,
+                    glass_blur_amount: None,
+                },
+            ),
+            "acrylic" => (
+                Self::Acrylic,
+                WindowBackdropState {
+                    requested,
+                    active: "pending".into(),
+                    detail: None,
+                    glass_tint: Some(
+                        std::env::var("NEON_BACKDROP_TINT").unwrap_or_else(|_| "#000000".into()),
+                    ),
+                    glass_tint_opacity: Some(
+                        std::env::var("NEON_BACKDROP_TINT_OPACITY")
+                            .ok()
+                            .and_then(|value| value.parse::<f64>().ok())
+                            .unwrap_or(0.28)
+                            .clamp(0.0, 1.0),
+                    ),
+                    glass_blur_amount: Some(
+                        std::env::var("NEON_BLUR_AMOUNT")
+                            .ok()
+                            .and_then(|value| value.parse::<f64>().ok())
+                            .unwrap_or(8.0)
+                            .clamp(0.0, 64.0),
+                    ),
+                },
+            ),
+            _ => (
+                Self::None,
+                WindowBackdropState {
+                    requested: requested.clone(),
+                    active: "none".into(),
+                    detail: Some(
+                        "unsupported backdrop; supported values are none and acrylic".into(),
+                    ),
+                    glass_tint: None,
+                    glass_tint_opacity: None,
+                    glass_blur_amount: None,
+                },
+            ),
         }
     }
 
@@ -267,22 +374,52 @@ impl WindowBackdrop {
     }
 }
 
+/// The WGPU DXGI visual is above a DesktopWindowTarget tree on the current
+/// `DxgiFromVisual` path. Keep the glass absorption in the renderer's final
+/// premultiplied clear so it is below transparent UI pixels but in the visual
+/// that actually reaches the screen.
+fn native_glass_clear_color() -> wgpu::Color {
+    let tint = std::env::var("NEON_BACKDROP_TINT").unwrap_or_else(|_| "#000000".into());
+    let rgb = tint
+        .strip_prefix('#')
+        .and_then(|value| {
+            (value.len() == 6)
+                .then(|| u32::from_str_radix(value, 16).ok())
+                .flatten()
+        })
+        .unwrap_or(0);
+    let opacity = std::env::var("NEON_BACKDROP_TINT_OPACITY")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .unwrap_or(0.28)
+        .clamp(0.0, 1.0);
+    let channel = |shift| f64::from((rgb >> shift) as u8) / 255.0 * opacity;
+    wgpu::Color {
+        r: channel(16),
+        g: channel(8),
+        b: channel(0),
+        a: opacity,
+    }
+}
+
 #[cfg(windows)]
-fn apply_windows_backdrop(_window: &Window, backdrop: &WindowBackdrop, state: &mut WindowBackdropState) {
+fn apply_windows_backdrop(
+    _window: &Window,
+    backdrop: &WindowBackdrop,
+    state: &mut WindowBackdropState,
+) {
     if matches!(backdrop, WindowBackdrop::Transparent) {
         state.active = "transparent-wgpu".into();
         state.detail = Some("no native backdrop; transparent premultiplied surface".into());
     } else if matches!(backdrop, WindowBackdrop::Acrylic) {
-        // Keep the stable transparent wgpu presentation path. Native DWM
-        // accent changes the same HWND after DxgiFromVisual is initialized and
-        // can remove the wgpu visual after its first frame.
-        if std::env::var("NEON_EXPERIMENTAL_COMPOSITION_SWAPCHAIN").as_deref() == Ok("1") {
-            state.active = "masked-acrylic".into();
-            state.detail = Some("WinRT backdrop is masked by swapchain alpha".into());
-        } else {
-            state.active = "transparent-wgpu".into();
-            state.detail = Some("native acrylic disabled; composition swapchain remains opt-in".into());
-        }
+        // Acrylic is owned exclusively by AcrylicHost's WinRT Composition
+        // blur/tint visuals and their root geometric clip. Do not apply
+        // SetWindowCompositionAttribute here: ACCENT_ENABLE_BLURBEHIND is an
+        // HWND-sized rectangle and would add glass outside the shell polygon.
+        state.active = "composition-geometric-acrylic".into();
+        state.detail = Some(
+            "WinRT blur/tint is constrained by the shell polygon; no HWND accent layer".into(),
+        );
     }
 }
 
@@ -290,7 +427,7 @@ fn apply_windows_backdrop(_window: &Window, backdrop: &WindowBackdrop, state: &m
 fn clear_transparent_window_backdrop(window: &Window) -> Result<(), String> {
     use windows::Win32::{
         Foundation::HWND,
-        Graphics::Dwm::{DwmSetWindowAttribute, DWMWINDOWATTRIBUTE},
+        Graphics::Dwm::{DWMWINDOWATTRIBUTE, DwmSetWindowAttribute},
     };
     let handle = window.window_handle().map_err(|error| error.to_string())?;
     let RawWindowHandle::Win32(handle) = handle.as_raw() else {
@@ -311,13 +448,24 @@ fn clear_transparent_window_backdrop(window: &Window) -> Result<(), String> {
         )
     }
     .map_err(|error| format!("clear DWM backdrop: {error}"))?;
-    unsafe { DwmSetWindowAttribute(hwnd, DWMWINDOWATTRIBUTE(2), &non_client_policy as *const i32 as *const std::ffi::c_void, std::mem::size_of_val(&non_client_policy) as u32) }
-        .map_err(|error| format!("disable DWM non-client rendering: {error}"))?;
+    unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWINDOWATTRIBUTE(2),
+            &non_client_policy as *const i32 as *const std::ffi::c_void,
+            std::mem::size_of_val(&non_client_policy) as u32,
+        )
+    }
+    .map_err(|error| format!("disable DWM non-client rendering: {error}"))?;
     Ok(())
 }
 
 #[cfg(not(windows))]
-fn apply_windows_backdrop(_window: &Window, backdrop: &WindowBackdrop, state: &mut WindowBackdropState) {
+fn apply_windows_backdrop(
+    _window: &Window,
+    backdrop: &WindowBackdrop,
+    state: &mut WindowBackdropState,
+) {
     if matches!(backdrop, WindowBackdrop::Acrylic) {
         state.active = "none".into();
         state.detail = Some("Windows transparency is unavailable on this platform".into());
@@ -383,7 +531,9 @@ fn choose_image_file(window: &Window) -> Result<Option<PathBuf>, String> {
     };
     if unsafe { GetOpenFileNameW(&mut dialog) }.as_bool() {
         let length = filename.iter().position(|value| *value == 0).unwrap_or(0);
-        return Ok(Some(PathBuf::from(String::from_utf16_lossy(&filename[..length]))));
+        return Ok(Some(PathBuf::from(String::from_utf16_lossy(
+            &filename[..length],
+        ))));
     }
     let error = unsafe { CommDlgExtendedError() };
     if error.0 == 0 {
@@ -1207,6 +1357,45 @@ fn aggregate_root_viewport_requirement(
         )
 }
 
+/// Fits the windowed runtime HWND to the renderer-resolved material shell once
+/// the first shell is available. Pulse is a 360x700 vertical player; keeping
+/// the window at the 1280x800 default would leave a transparent canvas around
+/// it that a full-window system backdrop can still paint. Converging the HWND
+/// to the shell size (together with `SetWindowRgn` on the cut polygon) makes
+/// the only visible window area the shell itself.
+#[derive(Clone, Copy, Debug, Default)]
+struct ShellWindowFit {
+    /// Logical shell size already requested but not yet confirmed by a resize.
+    requested_logical: Option<[f32; 2]>,
+    /// Set once the window logical size matches the shell within tolerance.
+    resolved: bool,
+}
+
+impl ShellWindowFit {
+    /// Returns the logical size to request, or `None` when the window already
+    /// matches the shell or a request is still in flight.
+    fn observe(&mut self, shell_size: [f32; 2], current_logical: [f32; 2]) -> Option<[f32; 2]> {
+        if self.resolved {
+            return None;
+        }
+        let converged = |a: f32, b: f32| (a - b).abs() <= 1.0;
+        if converged(current_logical[0], shell_size[0])
+            && converged(current_logical[1], shell_size[1])
+        {
+            self.requested_logical = None;
+            self.resolved = true;
+            return None;
+        }
+        if self.requested_logical.is_some() {
+            // A request is already in flight; the `Resized` event will land and
+            // the next redraw re-checks convergence.
+            return None;
+        }
+        self.requested_logical = Some(shell_size);
+        Some(shell_size)
+    }
+}
+
 /// The only process-local home for Winit and WGPU objects in Neon3.
 /// Domain runtimes communicate with this process through the public RPC protocol.
 pub struct WindowedRuntime {
@@ -1229,6 +1418,13 @@ pub struct WindowedRuntime {
     next_data_grid_window_sequence: u64,
     data_grid_window_delivery: Arc<Mutex<Value>>,
     initial_window_sizing: InitialWindowSizing,
+    /// Fits the HWND to the renderer shell size once the first shell resolves.
+    shell_window_fit: ShellWindowFit,
+    /// Last cut-corner polygon applied via SetWindowRgn (physical pixels).
+    applied_shell_region: Option<[[i32; 2]; 8]>,
+    /// Same-frame producer/consumer shell evidence exposed through the debug
+    /// IPC snapshot. This is telemetry only and does not affect rendering.
+    shell_frame_telemetry: Value,
     event_proxy: Option<EventLoopProxy<WindowCommand>>,
     eventd_endpoint: Option<SocketAddr>,
     window_backdrop: WindowBackdropState,
@@ -1360,6 +1556,7 @@ enum WindowCommand {
 struct WindowGpu {
     _instance: wgpu::Instance,
     surface: Option<wgpu::Surface<'static>>,
+    behind_surface: Option<wgpu::Surface<'static>>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     adapter: wgpu::Adapter,
@@ -1383,16 +1580,12 @@ struct WindowGpu {
     final_target_valid: bool,
     #[cfg(debug_assertions)]
     final_composition_revision: Revision,
-    /// Windows-only acrylic (frosted-glass backdrop) host. When present, the
-    /// final presentation goes through the WinRT composition tree instead of
-    /// the wgpu swapchain: wgpu renders into `acrylic_target` (a shared D3D12
-    /// texture) and `acrylic.present_frame()` proxy-copies it into a
-    /// `CompositionDrawingSurface` on every frame.
+    /// Windows-only acrylic composition tree. Its surface handle is used by
+    /// the wgpu composition swapchain and the content visual in the same tree.
     #[cfg(windows)]
     acrylic: Option<acrylic_backdrop::AcrylicHost>,
-    #[cfg(windows)]
-    acrylic_target: Option<acrylic_backdrop::WgpuSharedTarget>,
     ui: UiWgpuRenderer,
+    behind_ui: UiWgpuRenderer,
     world_ui: WorldUiPipeline,
     world_ui_lab_panel: wgpu::TextureView,
     world_ui_lab_surface: wgpu::TextureView,
@@ -1611,12 +1804,18 @@ impl WindowedRuntime {
             next_data_grid_window_sequence: 0,
             data_grid_window_delivery: Arc::new(Mutex::new(json!({"state": "idle"}))),
             initial_window_sizing: InitialWindowSizing::default(),
+            shell_window_fit: ShellWindowFit::default(),
+            applied_shell_region: None,
+            shell_frame_telemetry: Value::Null,
             event_proxy: None,
             eventd_endpoint: None,
             window_backdrop: WindowBackdropState {
                 requested: "none".into(),
                 active: "none".into(),
                 detail: None,
+                glass_tint: None,
+                glass_tint_opacity: None,
+                glass_blur_amount: None,
             },
             next_file_drop_sequence: 0,
             world_ui_lab_camera: Arc::new(Mutex::new(WorldUiLabCameraController::default())),
@@ -1632,7 +1831,9 @@ impl WindowedRuntime {
     /// loop but does not select a UI fixture or domain. SDKs submit fragments
     /// and semantic commands through the public protocol after startup.
     #[cfg(target_os = "android")]
-    pub fn run_android_host(app: winit::platform::android::activity::AndroidApp) -> Result<(), String> {
+    pub fn run_android_host(
+        app: winit::platform::android::activity::AndroidApp,
+    ) -> Result<(), String> {
         use winit::platform::android::EventLoopBuilderExtAndroid;
 
         let mut builder = EventLoop::<WindowCommand>::with_user_event();
@@ -1689,10 +1890,12 @@ impl WindowedRuntime {
                 "{{\"probe\":\"android-component-gallery-domain\",\"endpoint\":\"{}\",\"state\":\"binding\"}}",
                 ui_endpoint
             );
-            if let Err(error) = neon_ui_runtime::demo_domain::DemoInputDomain::serve_component_gallery(
-                ui_endpoint,
-                image_asset,
-            ) {
+            if let Err(error) =
+                neon_ui_runtime::demo_domain::DemoInputDomain::serve_component_gallery(
+                    ui_endpoint,
+                    image_asset,
+                )
+            {
                 eprintln!(
                     "{{\"probe\":\"android-component-gallery-domain\",\"pass_result\":false,\"error\":{:?}}}",
                     error
@@ -1806,33 +2009,32 @@ impl WindowedRuntime {
     fn initialize(&mut self, event_loop: &ActiveEventLoop) -> Result<(), String> {
         let (backdrop, mut backdrop_state) = WindowBackdrop::from_environment();
         let window_attributes = Window::default_attributes()
-            .with_title(format!("Neon3 - WGPU Runtime (epoch {}) - Ctrl+O: Open image", self.epoch))
+            .with_title(format!(
+                "Neon3 - WGPU Runtime (epoch {}) - Ctrl+O: Open image",
+                self.epoch
+            ))
             .with_inner_size(PhysicalSize::new(1280, 800))
             .with_transparent(backdrop.requests_transparency())
             .with_no_redirection_bitmap(backdrop.requests_transparency())
-            .with_decorations(!matches!(std::env::var("NEON_WINDOW_CHROME").as_deref(), Ok("borderless")));
+            .with_decorations(!matches!(
+                std::env::var("NEON_WINDOW_CHROME").as_deref(),
+                Ok("borderless")
+            ));
         let window = event_loop
             .create_window(window_attributes)
-.map_err(|error| format!("create window: {error}"))?;
+            .map_err(|error| format!("create window: {error}"))?;
         #[cfg(windows)]
-        if matches!(backdrop, WindowBackdrop::Transparent) {
-            if let Err(error) = clear_transparent_window_backdrop(&window) {
-                eprintln!("[neon-wgpu-runtime] transparent window backdrop clear failed: {error}");
+        if backdrop.requests_transparency() {
+            if let Err(error) = ensure_layered_transparency(&window) {
+                eprintln!("[neon-wgpu-runtime] layered transparency failed: {error}");
             }
         }
         #[cfg(windows)]
-        let composition_surface_handle = if matches!(backdrop, WindowBackdrop::Acrylic) {
-            use windows::Win32::Graphics::DirectComposition::DCompositionCreateSurfaceHandle;
-            Some(
-                unsafe { DCompositionCreateSurfaceHandle(3, None) }
-                    .map_err(|error| format!("DCompositionCreateSurfaceHandle: {error:?}"))?
-                    .0 as isize,
-            )
-        } else {
-            None
-        };
-        #[cfg(not(windows))]
-        let composition_surface_handle = None;
+        if backdrop.requests_transparency() {
+            if let Err(error) = clear_transparent_window_backdrop(&window) {
+                eprintln!("[neon-wgpu-runtime] transparent window non-client clear failed: {error}");
+            }
+        }
         #[cfg(windows)]
         if let Err(error) = enable_explorer_file_drop(&window) {
             eprintln!("[neon-wgpu-runtime] Explorer file-drop enablement failed: {error}");
@@ -1844,23 +2046,16 @@ impl WindowedRuntime {
         let backends = windowed_backends()?;
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends,
-            // Acrylic needs a premultiplied-alpha swapchain. On DX12 wgpu only
-            // offers that through its own DirectComposition presentation path
-            // (`DxgiFromVisual`), which manages the composition visual for the
-            // whole window. This is the same mechanism the Neon2 loading
-            // window relies on, and it must be selected before instance
-            // creation; it cannot be changed per surface.
+            // The acrylic surface is supplied explicitly as a DirectComposition
+            // surface handle below; this option remains the fallback for any
+            // non-acrylic window surface created by this instance.
             backend_options: wgpu::BackendOptions {
                 dx12: wgpu::Dx12BackendOptions {
                     // Only Acrylic owns a DirectComposition visual. A plain
                     // transparent window must use the HWND swapchain path;
                     // DxgiFromVisual creates a full-window composition visual
                     // even when the rendered surface pixels are transparent.
-                    presentation_system: if matches!(backdrop, WindowBackdrop::Acrylic) {
-                        wgpu::Dx12SwapchainKind::DxgiFromVisual
-                    } else {
-                        wgpu::Dx12SwapchainKind::DxgiFromHwnd
-                    },
+                    presentation_system: wgpu::Dx12SwapchainKind::DxgiFromHwnd,
                     ..Default::default()
                 },
                 ..Default::default()
@@ -1874,12 +2069,10 @@ impl WindowedRuntime {
             instance,
             self.world_ui_lab_camera.clone(),
             backdrop.requests_transparency(),
-            matches!(backdrop, WindowBackdrop::Acrylic),
-            composition_surface_handle,
+            true, // acrylic_requested: the composition surface path
         )?;
-        // Apply Acrylic after DxgiFromVisual has created the wgpu presentation
-        // visual. Applying it before surface creation is overwritten by the
-        // presentation setup and only produces a transient startup blur.
+        // Apply any HWND-level fallback attributes after the composition tree
+        // has been created. The actual glass and content are WinRT visuals.
         #[cfg(windows)]
         apply_windows_backdrop(&window, &backdrop, &mut backdrop_state);
         self.window_backdrop = backdrop_state;
@@ -2018,7 +2211,10 @@ impl WindowedRuntime {
         let gpu = self.gpu.as_mut().ok_or("GPU is not initialized")?;
         gpu.ui
             .preload_image(&gpu.device, &gpu.queue, &content)
-            .map_err(|error| format!("fixture image preload failed: {error}"))
+            .map_err(|error| format!("fixture image preload failed: {error}"))?;
+        gpu.behind_ui
+            .preload_image(&gpu.device, &gpu.queue, &content)
+            .map_err(|error| format!("behind fixture image preload failed: {error}"))
     }
 
     fn resize(&mut self, size: PhysicalSize<u32>) {
@@ -2026,10 +2222,13 @@ impl WindowedRuntime {
             return;
         }
         self.initial_window_sizing.resize_accepted();
-if let Some(gpu) = self.gpu.as_mut() {
+        if let Some(gpu) = self.gpu.as_mut() {
             gpu.config.width = size.width;
             gpu.config.height = size.height;
             if let Some(surface) = gpu.surface.as_ref() {
+                surface.configure(&gpu.device, &gpu.config);
+            }
+            if let Some(surface) = gpu.behind_surface.as_ref() {
                 surface.configure(&gpu.device, &gpu.config);
             }
             #[cfg(windows)]
@@ -2081,6 +2280,9 @@ if let Some(gpu) = self.gpu.as_mut() {
     }
 
     fn redraw(&mut self) -> Result<(), String> {
+        // The shell-fit resize is deferred until the `gpu` borrow is released
+        // at the end of this frame (see below).
+        let mut pending_window_resize: Option<winit::dpi::PhysicalSize<u32>> = None;
         let Some(gpu) = self.gpu.as_mut() else {
             return Ok(());
         };
@@ -2106,13 +2308,8 @@ if let Some(gpu) = self.gpu.as_mut() {
                 Err(_) => gpu.input.cancel(),
             }
         }
-        let has_acrylic = false;
-        // In acrylic mode the WinRT composition tree owns all window pixels;
-        // wgpu has no window surface and renders into the shared texture that
-        // `AcrylicHost::present_frame` proxy-copies into the drawing surface.
-        let surface_texture = if has_acrylic {
-            None
-        } else {
+        // When an Acrylic shared target exists, wgpu renders into it and
+        let surface_texture = {
             let surface = gpu.surface.as_ref().expect("window surface missing");
             let texture = match surface.get_current_texture() {
                 wgpu::CurrentSurfaceTexture::Success(texture)
@@ -2130,15 +2327,21 @@ if let Some(gpu) = self.gpu.as_mut() {
             };
             Some(texture)
         };
+        let behind_surface_texture = if let Some(surface) = gpu.behind_surface.as_ref() {
+            match surface.get_current_texture() {
+                wgpu::CurrentSurfaceTexture::Success(texture)
+                | wgpu::CurrentSurfaceTexture::Suboptimal(texture) => Some(texture),
+                wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => return Ok(()),
+                wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
+                    surface.configure(&gpu.device, &gpu.config);
+                    return Ok(());
+                }
+                wgpu::CurrentSurfaceTexture::Validation => return Err("acquire behind composition surface: validation error".into()),
+            }
+        } else {
+            None
+        };
         let acquired_at = Instant::now();
-        #[cfg(windows)]
-        let acrylic_view = gpu.acrylic_target.as_ref().map(|target| {
-            target
-                .texture
-                .create_view(&wgpu::TextureViewDescriptor::default())
-        });
-        #[cfg(not(windows))]
-        let acrylic_view: Option<wgpu::TextureView> = None;
         // Choose the final composition target: the offscreen final target in
         // debug builds, the window surface in normal builds, or the shared
         // acrylic texture when the WinRT tree owns the window.
@@ -2148,22 +2351,35 @@ if let Some(gpu) = self.gpu.as_mut() {
                 .create_view(&wgpu::TextureViewDescriptor::default())
         });
         #[cfg(debug_assertions)]
-        let composition_view = if has_acrylic {
-            acrylic_view.as_ref().expect("acrylic target missing")
-        } else {
-            &gpu.final_target_view
-        };
+        let composition_view = &gpu.final_target_view;
         #[cfg(not(debug_assertions))]
-        let composition_view = if has_acrylic {
-            acrylic_view.as_ref().expect("acrylic target missing")
-        } else {
-            surface_view.as_ref().expect("surface view missing")
-        };
+        let composition_view = surface_view.as_ref().expect("surface view missing");
         let mut encoder = gpu
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("neon3-final-composition"),
             });
+        if let Some(behind_texture) = behind_surface_texture.as_ref() {
+            let behind_view = behind_texture.texture.create_view(&Default::default());
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("neon3-behind-glass-ui-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &behind_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            gpu.behind_ui.draw(
+                &gpu.device, &gpu.queue, &mut pass, &self.fragments,
+                gpu.physical_viewport_size(), gpu.logical_viewport_size(),
+                gpu.started_at.elapsed().as_secs_f32(), UiDrawMode::BehindGlass,
+            );
+        }
         let (lab_active, camera_state) = gpu
             .world_ui_lab_camera
             .lock()
@@ -2223,7 +2439,7 @@ if let Some(gpu) = self.gpu.as_mut() {
                 &gpu.world_ui_lab_panel,
                 world_ui_lab_camera(WORLD_UI_LAB_PREVIEW_SIZE, camera_state),
             )?;
-}
+        }
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("neon3-final-clear-pass"),
@@ -2232,23 +2448,7 @@ if let Some(gpu) = self.gpu.as_mut() {
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear({
-                            if gpu.config.alpha_mode == wgpu::CompositeAlphaMode::PreMultiplied {
-                                // Premultiplied transparent pixels must have
-                                // zero RGB as well as zero alpha. A non-zero
-                                // RGB clear with alpha 0 can make a DXGI
-                                // composition swapchain appear opaque after
-                                // its first UI draw.
-                                wgpu::Color::TRANSPARENT
-                            } else {
-                                wgpu::Color {
-                                    r: 0.025,
-                                    g: 0.028,
-                                    b: 0.034,
-                                    a: 1.0,
-                                }
-                            }
-                        }),
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -2268,20 +2468,92 @@ if let Some(gpu) = self.gpu.as_mut() {
                 UiDrawMode::All,
             );
             drop(pass);
+            let shell = gpu.ui.primary_material_shell();
+            let logical = gpu.logical_viewport_size();
+            let window_matches_shell = shell.is_some_and(|(bounds, _)| {
+                self.shell_window_fit.resolved
+                    || ((logical[0] - bounds.width).abs() <= 1.0
+                        && (logical[1] - bounds.height).abs() <= 1.0)
+            });
             #[cfg(windows)]
-            if let (Some(acrylic), Some((bounds, _cut))) =
-                (gpu.acrylic.as_ref(), gpu.ui.primary_material_shell())
-            {
+            if let (Some(acrylic), Some((bounds, cut))) = (gpu.acrylic.as_ref(), shell) {
+                let scale = gpu.scale_factor as f32;
+                let origin = if window_matches_shell {
+                    [0.0, 0.0]
+                } else {
+                    [bounds.x, bounds.y]
+                };
                 acrylic
-                    .set_backdrop_shell_bounds(bounds.x, bounds.y, bounds.width, bounds.height)
+                    .set_backdrop_shell_bounds(
+                        origin[0] * scale,
+                        origin[1] * scale,
+                        bounds.width * scale,
+                        bounds.height * scale,
+                        cut.map(|value| value * scale),
+                    )
                     .map_err(|error| format!("set acrylic shell bounds: {error}"))?;
             }
             #[cfg(windows)]
-            if let (Some(window), Some((bounds, cut))) =
-                (self.window.as_ref(), gpu.ui.primary_material_shell())
-            {
-                apply_window_shell_region(window, bounds, cut, gpu.scale_factor)
-                    .map_err(|error| format!("apply native shell region: {error}"))?;
+            if let (Some(window), Some((bounds, cut))) = (self.window.as_ref(), shell) {
+                // The window only converges to the shell size after the first
+                // fragment resolves; a 1280x800 default canvas around the shell
+                // would still expose the full-window system backdrop.
+                if let Some([fit_w, fit_h]) = self
+                    .shell_window_fit
+                    .observe([bounds.width, bounds.height], [logical[0], logical[1]])
+                {
+                    if let Some(accepted) = window.request_inner_size(winit::dpi::LogicalSize::new(
+                        f64::from(fit_w),
+                        f64::from(fit_h),
+                    )) {
+                        pending_window_resize = Some(accepted);
+                    } else {
+                        // The window manager did not apply the request; stop
+                        // asking so the region clip still takes effect.
+                        self.shell_window_fit.requested_logical = None;
+                        self.shell_window_fit.resolved = true;
+                    }
+                }
+                apply_window_shell_region(
+                    window,
+                    bounds,
+                    cut,
+                    gpu.scale_factor,
+                    window_matches_shell || self.shell_window_fit.resolved,
+                    &mut self.applied_shell_region,
+                )
+                .map_err(|error| format!("apply native shell region: {error}"))?;
+                let scale = gpu.scale_factor as f32;
+                let consumer_window_local = window_matches_shell || self.shell_window_fit.resolved;
+                let origin = if consumer_window_local {
+                    [0.0, 0.0]
+                } else {
+                    [bounds.x, bounds.y]
+                };
+                self.shell_frame_telemetry = serde_json::json!({
+                    "frame": gpu.frame_count + 1,
+                    "producer_frame": gpu.frame_count + 1,
+                    "consumer_frame": gpu.frame_count + 1,
+                    "producer_bounds_logical": [bounds.x, bounds.y, bounds.width, bounds.height],
+                    "acrylic_bounds_physical": [
+                        origin[0] * scale,
+                        origin[1] * scale,
+                        bounds.width * scale,
+                        bounds.height * scale,
+                    ],
+                    "acrylic_cut_physical": cut.map(|value| value * scale),
+                    "acrylic_clip_vertices_physical": shell_region_polygon(
+                        bounds,
+                        cut,
+                        gpu.scale_factor,
+                        consumer_window_local,
+                    ),
+                    "consumer_region_physical": self.applied_shell_region,
+                    "scale_factor": gpu.scale_factor,
+                    "window_logical_size": gpu.logical_viewport_size(),
+                    "consumer_coordinate_space": if consumer_window_local { "window-local" } else { "renderer-logical" },
+                    "status": "paired",
+                });
             }
             gpu.last_draw_instance_count = gpu.ui.last_panel_instance_count();
         }
@@ -2315,14 +2587,12 @@ if let Some(gpu) = self.gpu.as_mut() {
         }
         gpu.encode_external_surfaces(&mut encoder, &self.fragments)?;
         #[cfg(debug_assertions)]
-        if !has_acrylic {
-            gpu.final_target_blitter.copy(
-                &gpu.device,
-                &mut encoder,
-                &gpu.final_target_view,
-                surface_view.as_ref().expect("surface view missing"),
-            );
-        }
+        gpu.final_target_blitter.copy(
+            &gpu.device,
+            &mut encoder,
+            &gpu.final_target_view,
+            surface_view.as_ref().expect("surface view missing"),
+        );
         let queued_readback = gpu.pending_hit_pixel.take().and_then(|pixel| {
             gpu.ui
                 .enqueue_hit_readback(&mut encoder, &gpu.hit_target, pixel)
@@ -2343,6 +2613,9 @@ if let Some(gpu) = self.gpu.as_mut() {
             }
         }
         if let Some(surface_texture) = surface_texture {
+            gpu.queue.present(surface_texture);
+        }
+        if let Some(surface_texture) = behind_surface_texture {
             gpu.queue.present(surface_texture);
         }
         let now = Instant::now();
@@ -2395,6 +2668,9 @@ if let Some(gpu) = self.gpu.as_mut() {
             if let Some(window) = self.window.as_ref() {
                 window.request_redraw();
             }
+        }
+        if let Some(size) = pending_window_resize {
+            self.resize(size);
         }
         Ok(())
     }
@@ -2613,9 +2889,13 @@ if let Some(gpu) = self.gpu.as_mut() {
                 "active": &self.window_backdrop.active,
                 "detail": &self.window_backdrop.detail,
                 "surface_alpha_mode": format!("{:?}", gpu.config.alpha_mode),
+                "glass_tint": &self.window_backdrop.glass_tint,
+                "glass_tint_opacity": self.window_backdrop.glass_tint_opacity,
+                "glass_blur_amount": self.window_backdrop.glass_blur_amount,
             },
             "world_ui_lab_camera": self.world_ui_lab_camera.lock().ok().map(|camera| world_ui_lab_camera_status(&camera)),
-            "applied_composition_revision": self.applied_composition_revision.0,
+                "applied_composition_revision": self.applied_composition_revision.0,
+                "shell_frame": &self.shell_frame_telemetry,
             "viewport": {
                 "physical_size": {"width": physical_size[0], "height": physical_size[1]},
                 "logical_size": {"width": logical_size[0], "height": logical_size[1]},
@@ -3063,8 +3343,7 @@ fn platform_backends() -> wgpu::Backends {
     wgpu::Backends::all()
 }
 
-impl WindowGpu {
-}
+impl WindowGpu {}
 
 /// Select the backend for the windowed renderer.
 ///
@@ -3166,21 +3445,22 @@ fn android_component_gallery_fragment() -> Result<HashMap<UiFragmentId, UiFragme
         && let Some(frame) = component_gallery_initial_grid_frame(&program)
     {
         let node_key = record.node_key.clone();
-        fragment.effects.push(neon_ui_schema::UiEffect::DataGridFrame {
-            declaration: neon_ui_schema::UiDataGridDeclaration {
-                node_key,
-                source_key: record.source_key,
-                max_window_rows: record.max_window_rows,
-                row_height: record.row_height,
-                overscan: record.overscan,
-                columns: record.columns,
-            },
-            frame,
-        });
+        fragment
+            .effects
+            .push(neon_ui_schema::UiEffect::DataGridFrame {
+                declaration: neon_ui_schema::UiDataGridDeclaration {
+                    node_key,
+                    source_key: record.source_key,
+                    max_window_rows: record.max_window_rows,
+                    row_height: record.row_height,
+                    overscan: record.overscan,
+                    columns: record.columns,
+                },
+                frame,
+            });
         eprintln!(
             "{{\"probe\":\"android-component-gallery-grid\",\"node_key\":\"{}\",\"rows\":{},\"state\":\"initial_frame_attached\"}}",
-            record.node_key,
-            record.max_window_rows
+            record.node_key, record.max_window_rows
         );
     }
     eprintln!(
@@ -3693,13 +3973,23 @@ impl HeadlessExternalGpu {
     /// Other platforms create an ordinary wgpu texture (rendered offscreen
     /// and consumed through readback/capture), keeping the same protocol.
     #[cfg(windows)]
-    fn create_surface_slot(&self, width: u32, height: u32, format: wgpu::TextureFormat) -> Result<SharedSurface, String> {
+    fn create_surface_slot(
+        &self,
+        width: u32,
+        height: u32,
+        format: wgpu::TextureFormat,
+    ) -> Result<SharedSurface, String> {
         dx12_interop::create_shared_surface(&self.device, &self.adapter, width, height, format)
             .map_err(|error| error.to_string())
     }
 
     #[cfg(not(windows))]
-    fn create_surface_slot(&self, width: u32, height: u32, format: wgpu::TextureFormat) -> Result<SharedSurface, String> {
+    fn create_surface_slot(
+        &self,
+        width: u32,
+        height: u32,
+        format: wgpu::TextureFormat,
+    ) -> Result<SharedSurface, String> {
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("neon3-headless-external-surface"),
             size: wgpu::Extent3d {
@@ -3733,13 +4023,11 @@ impl HeadlessExternalGpu {
         }
         let mut surfaces = Vec::with_capacity(open.buffer_count as usize);
         for _ in 0..open.buffer_count {
-            surfaces.push(
-                self.create_surface_slot(
-                    open.size.width.max(1),
-                    open.size.height.max(1),
-                    wgpu::TextureFormat::Rgba8Unorm,
-                )?,
-            );
+            surfaces.push(self.create_surface_slot(
+                open.size.width.max(1),
+                open.size.height.max(1),
+                wgpu::TextureFormat::Rgba8Unorm,
+            )?);
         }
         self.external_surfaces
             .insert(open.surface_id.clone(), surfaces);
@@ -3766,13 +4054,11 @@ impl HeadlessExternalGpu {
         {
             let mut id_surfaces = Vec::with_capacity(open.buffer_count as usize);
             for _ in 0..open.buffer_count {
-                id_surfaces.push(
-                    self.create_surface_slot(
-                        open.size.width.max(1),
-                        open.size.height.max(1),
-                        wgpu::TextureFormat::R32Uint,
-                    )?,
-                );
+                id_surfaces.push(self.create_surface_slot(
+                    open.size.width.max(1),
+                    open.size.height.max(1),
+                    wgpu::TextureFormat::R32Uint,
+                )?);
             }
             self.external_id_surfaces
                 .insert(open.surface_id.clone(), id_surfaces);
@@ -3780,13 +4066,11 @@ impl HeadlessExternalGpu {
         if open.depth {
             let mut depth_surfaces = Vec::with_capacity(open.buffer_count as usize);
             for _ in 0..open.buffer_count {
-                depth_surfaces.push(
-                    self.create_surface_slot(
-                        open.size.width.max(1),
-                        open.size.height.max(1),
-                        wgpu::TextureFormat::R32Float,
-                    )?,
-                );
+                depth_surfaces.push(self.create_surface_slot(
+                    open.size.width.max(1),
+                    open.size.height.max(1),
+                    wgpu::TextureFormat::R32Float,
+                )?);
             }
             self.external_depth_surfaces
                 .insert(open.surface_id.clone(), depth_surfaces);
@@ -3824,17 +4108,35 @@ impl HeadlessExternalGpu {
             && let Some(id_surface) = id_surfaces.get(index)
             && let Some(id_interop) = id_surface.interop.as_ref()
         {
-            buffer["id_texture_handle"] = json!(dx12_interop::duplicate_handle_to_process(id_interop.texture_handle, pid).map_err(|error| error.to_string())?);
-            buffer["id_fence_handle"] = json!(dx12_interop::duplicate_handle_to_process(id_interop.fence_handle, pid).map_err(|error| error.to_string())?);
-            buffer["id_consumer_release_fence_handle"] = json!(dx12_interop::duplicate_handle_to_process(id_interop.consumer_fence_handle, pid).map_err(|error| error.to_string())?);
+            buffer["id_texture_handle"] = json!(
+                dx12_interop::duplicate_handle_to_process(id_interop.texture_handle, pid)
+                    .map_err(|error| error.to_string())?
+            );
+            buffer["id_fence_handle"] = json!(
+                dx12_interop::duplicate_handle_to_process(id_interop.fence_handle, pid)
+                    .map_err(|error| error.to_string())?
+            );
+            buffer["id_consumer_release_fence_handle"] = json!(
+                dx12_interop::duplicate_handle_to_process(id_interop.consumer_fence_handle, pid)
+                    .map_err(|error| error.to_string())?
+            );
         }
         if let Some(depth_surfaces) = self.external_depth_surfaces.get(surface_id)
             && let Some(depth_surface) = depth_surfaces.get(index)
             && let Some(depth_interop) = depth_surface.interop.as_ref()
         {
-            buffer["depth_texture_handle"] = json!(dx12_interop::duplicate_handle_to_process(depth_interop.texture_handle, pid).map_err(|error| error.to_string())?);
-            buffer["depth_fence_handle"] = json!(dx12_interop::duplicate_handle_to_process(depth_interop.fence_handle, pid).map_err(|error| error.to_string())?);
-            buffer["depth_consumer_release_fence_handle"] = json!(dx12_interop::duplicate_handle_to_process(depth_interop.consumer_fence_handle, pid).map_err(|error| error.to_string())?);
+            buffer["depth_texture_handle"] = json!(
+                dx12_interop::duplicate_handle_to_process(depth_interop.texture_handle, pid)
+                    .map_err(|error| error.to_string())?
+            );
+            buffer["depth_fence_handle"] = json!(
+                dx12_interop::duplicate_handle_to_process(depth_interop.fence_handle, pid)
+                    .map_err(|error| error.to_string())?
+            );
+            buffer["depth_consumer_release_fence_handle"] = json!(
+                dx12_interop::duplicate_handle_to_process(depth_interop.consumer_fence_handle, pid)
+                    .map_err(|error| error.to_string())?
+            );
         }
         Ok(buffer)
     }
@@ -4198,6 +4500,7 @@ impl HeadlessExternalGpu {
                     UiDrawMode::World => &mut self.world_ui,
                     UiDrawMode::Screen => &mut self.screen_ui,
                     UiDrawMode::All => &mut self.ui,
+                    UiDrawMode::BehindGlass => &mut self.screen_ui,
                 };
                 renderer.draw(
                     &self.device,
@@ -4705,23 +5008,27 @@ impl HeadlessExternalGpu {
         let source_view = shared
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
-        let source_layout = self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("neon3-external-color-capture-layout"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Texture {
-                    multisampled: false,
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                },
-                count: None,
-            }],
-        });
-        let shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("neon3-external-color-capture-shader"),
-            source: wgpu::ShaderSource::Wgsl(
-                r#"
+        let source_layout =
+            self.device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("neon3-external-color-capture-layout"),
+                    entries: &[wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            multisampled: false,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        },
+                        count: None,
+                    }],
+                });
+        let shader = self
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("neon3-external-color-capture-shader"),
+                source: wgpu::ShaderSource::Wgsl(
+                    r#"
                 @group(0) @binding(0) var source: texture_2d<f32>;
                 @vertex fn vs(@builtin(vertex_index) index: u32) -> @builtin(position) vec4<f32> {
                     var positions = array<vec2<f32>, 3>(
@@ -4733,39 +5040,43 @@ impl HeadlessExternalGpu {
                     return textureLoad(source, vec2<i32>(position.xy), 0);
                 }
             "#
-            .into(),
-            ),
-        });
-        let pipeline_layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("neon3-external-color-capture-pipeline-layout"),
-            bind_group_layouts: &[Some(&source_layout)],
-            immediate_size: 0,
-        });
-        let pipeline = self.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("neon3-external-color-capture-pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs"),
-                buffers: &[],
-                compilation_options: Default::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::Rgba8Unorm,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
+                    .into(),
+                ),
+            });
+        let pipeline_layout = self
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("neon3-external-color-capture-pipeline-layout"),
+                bind_group_layouts: &[Some(&source_layout)],
+                immediate_size: 0,
+            });
+        let pipeline = self
+            .device
+            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("neon3-external-color-capture-pipeline"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs"),
+                    buffers: &[],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Rgba8Unorm,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            });
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("neon3-external-color-capture-bind-group"),
             layout: &source_layout,
@@ -4780,9 +5091,11 @@ impl HeadlessExternalGpu {
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("neon3-external-color-capture-encoder"),
-        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("neon3-external-color-capture-encoder"),
+            });
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("neon3-external-color-capture-pass"),
@@ -4827,9 +5140,11 @@ impl HeadlessExternalGpu {
         );
         self.queue.submit(Some(encoder.finish()));
         let (mapped_tx, mapped_rx) = std::sync::mpsc::channel();
-        readback.slice(..).map_async(wgpu::MapMode::Read, move |result| {
-            let _ = mapped_tx.send(result);
-        });
+        readback
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                let _ = mapped_tx.send(result);
+            });
         self.device
             .poll(wgpu::PollType::Wait {
                 submission_index: None,
@@ -4853,7 +5168,9 @@ impl HeadlessExternalGpu {
         readback.unmap();
         let artifact_path = match artifact_path {
             Some(path) => path,
-            None => default_capture_path(self.epoch, frame_sequence, Revision(frame_sequence as u64))?,
+            None => {
+                default_capture_path(self.epoch, frame_sequence, Revision(frame_sequence as u64))?
+            }
         };
         let artifact_path = write_capture_png(&artifact_path, [width, height], &rgba)?;
         Ok(json!({
@@ -4925,8 +5242,7 @@ impl HeadlessExternalGpu {
 /// and exits when a client sends `service.shutdown`. Windows desktop and the
 /// windowed/external-surface paths are untouched.
 pub fn run_headless_protocol_server(endpoint: SocketAddr) -> Result<(), String> {
-    let server =
-        neon_ipc::BlockingRpcServer::bind(endpoint).map_err(|error| error.to_string())?;
+    let server = neon_ipc::BlockingRpcServer::bind(endpoint).map_err(|error| error.to_string())?;
     let runtime = Arc::new(Mutex::new(WgpuRuntime::headless(1)));
     let handler = move |request| {
         let mut guard = runtime.lock().expect("headless runtime lock");
@@ -5800,26 +6116,39 @@ impl WindowGpu {
         world_ui_lab_camera: Arc<Mutex<WorldUiLabCameraController>>,
         transparent_window: bool,
         #[allow(unused_variables)] acrylic_requested: bool,
-        composition_surface_handle: Option<isize>,
     ) -> Result<Self, String> {
-        // Acrylic mode (Windows-only): the window's final presentation is owned
-        // by the WinRT composition tree (`AcrylicHost`), so wgpu must NOT create
-        // or bind a window surface (one HWND can only have one composition
-        // root). wgpu renders into a shared D3D12 texture that is proxy-copied
-        // into the composition drawing surface every frame.
-        // The formal window path always keeps the wgpu surface. A separate
-        // WinRT composition target cannot safely share this HWND with the
-        // wgpu presentation visual; the old proxy-copy path produced a blank
-        // content layer. Backdrop styling is applied to the HWND itself.
-        // The WinRT composition-tree bridge remains experimental. Until its
-        // D3D12 producer -> D3D11 drawing-surface handoff is proven with a
-        // real frame readback, keep the player on the stable wgpu swapchain so
-        // a backdrop experiment cannot hide the entire UI.
+        // Create the composition surface handle before wgpu creates its
+        // swapchain. The handle is retained by AcrylicHost until the surface is
+        // dropped, and WinRT consumes the same surface in its content visual.
         #[cfg(windows)]
-        let acrylic_active = acrylic_requested
-            && std::env::var("NEON_EXPERIMENTAL_COMPOSITION_SWAPCHAIN").as_deref() == Ok("1");
+        let acrylic = if acrylic_requested {
+            let hwnd = crate::window_hwnd_win32(window)
+                .ok_or_else(|| "acrylic requires a Win32 window".to_owned())?;
+            Some(
+                acrylic_backdrop::AcrylicHost::new(
+                    hwnd,
+                    window.inner_size().width,
+                    window.inner_size().height,
+                )
+                .map_err(|error| format!("acrylic host: {error}"))?,
+            )
+        } else {
+            None
+        };
         #[cfg(not(windows))]
-        let acrylic_active = false;
+        let acrylic = None::<u8>;
+        #[cfg(windows)]
+        let composition_surface_handle = acrylic
+            .as_ref()
+            .map(|host| host.surface_handle().0 as isize);
+        #[cfg(not(windows))]
+        let composition_surface_handle: Option<isize> = None;
+        #[cfg(windows)]
+        let behind_composition_surface_handle = acrylic
+            .as_ref()
+            .map(|host| host.behind_surface_handle().0 as isize);
+        #[cfg(not(windows))]
+        let behind_composition_surface_handle: Option<isize> = None;
 
         // SAFETY: `WindowedRuntime` declares `gpu` before `window`, so the surface is dropped
         // before the window handle it references.
@@ -5837,6 +6166,15 @@ impl WindowGpu {
             };
             Some(surface)
         };
+        let behind_surface = behind_composition_surface_handle
+            .map(|handle| unsafe {
+                instance
+                    .create_surface_unsafe(wgpu::SurfaceTargetUnsafe::SurfaceHandle(
+                        handle as *mut std::ffi::c_void,
+                    ))
+                    .map_err(|error| format!("create behind composition surface: {error}"))
+            })
+            .transpose()?;
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
             compatible_surface: surface.as_ref(),
@@ -5866,7 +6204,7 @@ impl WindowGpu {
             trace: wgpu::Trace::Off,
         }))
         .map_err(|error| format!("request device: {error}"))?;
-let capabilities = surface.as_ref().map(|s| s.get_capabilities(&adapter));
+        let capabilities = surface.as_ref().map(|s| s.get_capabilities(&adapter));
         #[cfg(debug_assertions)]
         let format = match &capabilities {
             Some(capabilities) => capabilities
@@ -5881,7 +6219,9 @@ let capabilities = surface.as_ref().map(|s| s.get_capabilities(&adapter));
                         .copied()
                         .find(|format| capture_format_supported(*format))
                 })
-                .ok_or_else(|| "surface reported no capturable 8-bit RGBA/BGRA format".to_owned())?,
+                .ok_or_else(|| {
+                    "surface reported no capturable 8-bit RGBA/BGRA format".to_owned()
+                })?,
             // Acrylic mode has no window surface; render through the shared
             // texture that backs the composition drawing surface.
             None => wgpu::TextureFormat::Rgba8Unorm,
@@ -5899,26 +6239,48 @@ let capabilities = surface.as_ref().map(|s| s.get_capabilities(&adapter));
             // texture that backs the composition drawing surface.
             None => wgpu::TextureFormat::Rgba8Unorm,
         };
-        let alpha_mode = if acrylic_active {
-            // A composition-surface swapchain must use premultiplied alpha.
-            // SurfaceHandle capabilities may advertise only the generic
-            // opaque mode even though the DXGI composition swapchain accepts
-            // PREMULTIPLIED; selecting the advertised fallback makes the
-            // first transparent frame turn into an opaque frame as soon as UI
-            // pixels are written.
-            wgpu::CompositeAlphaMode::PreMultiplied
-        } else { match &capabilities {
-            Some(capabilities) => capabilities
-                .alpha_modes
-                .iter()
-                .copied()
-                .find(|mode| transparent_window && *mode == wgpu::CompositeAlphaMode::PreMultiplied)
-                .or_else(|| capabilities.alpha_modes.iter().copied().find(|mode| *mode == wgpu::CompositeAlphaMode::PostMultiplied))
-                .or_else(|| capabilities.alpha_modes.first().copied())
-                .ok_or_else(|| "surface reported no supported alpha modes".to_owned())?,
-            // Composition drawing surfaces are always premultiplied.
-            None => wgpu::CompositeAlphaMode::PreMultiplied,
-        } };
+        let alpha_mode = if acrylic.is_some() {
+            capabilities
+                .as_ref()
+                .and_then(|caps| {
+                    caps.alpha_modes
+                        .iter()
+                        .copied()
+                        .find(|mode| *mode == wgpu::CompositeAlphaMode::PreMultiplied)
+                })
+                .ok_or_else(|| {
+                    "composition surface does not advertise premultiplied alpha".to_owned()
+                })?
+        } else {
+            match &capabilities {
+                Some(capabilities) => {
+                    // Prefer premultiplied alpha on layered transparent windows so
+                    // the system BLURBEHIND backdrop can show through the wgpu
+                    // surface. If DXGI does not advertise it, fall back to the
+                    // first supported mode instead of forcing an unsupported one
+                    // (wgpu reports configure errors through the device handler).
+                    let first = capabilities.alpha_modes.first().copied();
+                    if transparent_window {
+                        capabilities
+                            .alpha_modes
+                            .iter()
+                            .copied()
+                            .find(|mode| *mode == wgpu::CompositeAlphaMode::PreMultiplied)
+                            .or(first)
+                    } else {
+                        capabilities
+                            .alpha_modes
+                            .iter()
+                            .copied()
+                            .find(|mode| *mode == wgpu::CompositeAlphaMode::PostMultiplied)
+                            .or(first)
+                    }
+                    .ok_or_else(|| "surface reported no supported alpha modes".to_owned())?
+                }
+                // Composition drawing surfaces are always premultiplied.
+                None => wgpu::CompositeAlphaMode::PreMultiplied,
+            }
+        };
         let present_mode = capabilities
             .as_ref()
             .and_then(|capabilities| {
@@ -5932,7 +6294,7 @@ let capabilities = surface.as_ref().map(|s| s.get_capabilities(&adapter));
             .unwrap_or(wgpu::PresentMode::Fifo);
         let size = window.inner_size();
         let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
             format,
             color_space: wgpu::SurfaceColorSpace::Auto,
             width: size.width.max(1),
@@ -5946,7 +6308,7 @@ let capabilities = surface.as_ref().map(|s| s.get_capabilities(&adapter));
             "{}",
             serde_json::json!({
                 "event": "neon.window.surface.configured",
-                "composition_swapchain": acrylic_active,
+                "composition_swapchain": acrylic.is_some(),
                 "alpha_mode": format!("{alpha_mode:?}"),
                 "format": format!("{format:?}"),
                 "width": config.width,
@@ -5956,6 +6318,9 @@ let capabilities = surface.as_ref().map(|s| s.get_capabilities(&adapter));
         if let Some(surface) = surface.as_ref() {
             surface.configure(&device, &config);
         }
+        if let Some(surface) = behind_surface.as_ref() {
+            surface.configure(&device, &config);
+        }
         eprintln!("neon-wgpu surface present mode: {:?}", config.present_mode);
         #[cfg(debug_assertions)]
         let (final_target, final_target_view) = create_final_target(&device, &config);
@@ -5963,6 +6328,7 @@ let capabilities = surface.as_ref().map(|s| s.get_capabilities(&adapter));
         let final_target_blitter = wgpu::util::TextureBlitter::new(&device, config.format);
         let ui = UiWgpuRenderer::new(&device, config.format);
         let mut ui = ui;
+        let behind_ui = UiWgpuRenderer::new(&device, config.format);
         // Keep the normal UI pipeline in logical units while supersampling its private
         // transparent texture for the world quad's linear sampler.
         let world_ui_lab_panel = ui.ensure_ui_render_surface(
@@ -6028,26 +6394,10 @@ let capabilities = surface.as_ref().map(|s| s.get_capabilities(&adapter));
             (f64::from(size.width) / ANDROID_GALLERY_UI_SCALE) as u32,
             (f64::from(size.height) / ANDROID_GALLERY_UI_SCALE) as u32
         );
-        #[cfg(windows)]
-        let (mut acrylic, acrylic_target) = if acrylic_active {
-            let hwnd = crate::window_hwnd_win32(window)
-                .ok_or_else(|| "acrylic requires a Win32 window".to_owned())?;
-            let mut host = acrylic_backdrop::AcrylicHost::new(hwnd, size.width, size.height)
-                .map_err(|error| format!("acrylic host: {error}"))?;
-            let swapchain = unsafe { surface.as_ref().and_then(|surface| surface.as_hal::<wgpu::hal::api::Dx12>()) }
-                .and_then(|hal_surface| hal_surface.swap_chain())
-                .ok_or_else(|| "acrylic requires a configured DX12 swapchain".to_owned())?;
-            host.attach_swapchain(&swapchain)
-                .map_err(|error| format!("attach swapchain composition surface: {error}"))?;
-            (Some(host), None)
-        } else {
-            (None, None)
-        };
-        #[cfg(not(windows))]
-        let (mut acrylic, acrylic_target) = (None::<u8>, None::<u8>);
         Ok(Self {
             _instance: instance,
             surface,
+            behind_surface,
             #[cfg(windows)]
             device,
             queue,
@@ -6078,9 +6428,8 @@ let capabilities = surface.as_ref().map(|s| s.get_capabilities(&adapter));
             final_composition_revision: Revision(0),
             #[cfg(windows)]
             acrylic,
-            #[cfg(windows)]
-            acrylic_target,
             ui,
+            behind_ui,
             world_ui,
             world_ui_lab_panel,
             world_ui_lab_surface,
@@ -6284,7 +6633,10 @@ let capabilities = surface.as_ref().map(|s| s.get_capabilities(&adapter));
         let Some((texture_token, fence_token)) = self.external_handle_tokens.get(surface_id) else {
             return Err("surface_broker_token_not_found".into());
         };
-        let interop = shared.interop.as_ref().ok_or("shared_surface_interop_missing")?;
+        let interop = shared
+            .interop
+            .as_ref()
+            .ok_or("shared_surface_interop_missing")?;
         let texture_handle = dx12_interop::duplicate_handle_to_process(interop.texture_handle, pid)
             .map_err(|error| error.to_string())?;
         let fence_handle = dx12_interop::duplicate_handle_to_process(interop.fence_handle, pid)
@@ -6298,7 +6650,10 @@ let capabilities = surface.as_ref().map(|s| s.get_capabilities(&adapter));
             "fence_handle": fence_handle
         });
         if let Some(id_surface) = self.external_id_surfaces.get(surface_id) {
-            let id_interop = id_surface.interop.as_ref().ok_or("id_surface_interop_missing")?;
+            let id_interop = id_surface
+                .interop
+                .as_ref()
+                .ok_or("id_surface_interop_missing")?;
             let id_texture_handle =
                 dx12_interop::duplicate_handle_to_process(id_interop.texture_handle, pid)
                     .map_err(|error| error.to_string())?;
@@ -6589,7 +6944,9 @@ fn forward_pointer_click(
         let inbound = event
             .data_grid_cell
             .as_ref()
-            .map(|_| UiHostInbound::DataGridCell { event: event.clone() });
+            .map(|_| UiHostInbound::DataGridCell {
+                event: event.clone(),
+            });
         let request = RpcRequest {
             protocol: "neon3.rpc".into(),
             version: PROTOCOL_VERSION,
@@ -6614,7 +6971,8 @@ fn forward_pointer_click(
             Ok(response) if response.status == RpcStatus::Accepted => {
                 if let Some(proxy) = proxy.as_ref()
                     && let Some(result) = response.result.as_ref()
-                    && let Ok(publication) = serde_json::from_value::<neon_ui_schema::UiHostPublication>(result.clone())
+                    && let Ok(publication) =
+                        serde_json::from_value::<neon_ui_schema::UiHostPublication>(result.clone())
                 {
                     let _ = proxy.send_event(WindowCommand::ApplyHostPublication(publication));
                 }
@@ -6660,8 +7018,7 @@ fn forward_pointer_click(
                 #[cfg(target_os = "android")]
                 eprintln!(
                     "{{\"probe\":\"android-component-gallery-rpc\",\"node_path\":{:?},\"status\":\"rejected\",\"error\":{:?}}}",
-                    node_path,
-                    error
+                    node_path, error
                 );
                 if let Ok(mut state) = delivery.lock() {
                     *state = json!({
@@ -6767,7 +7124,9 @@ fn forward_text_input_commit(
             target: ServiceName("ui-runtime".into()),
             method: "ui.host.inbound".into(),
             params: if event.data_grid_cell.is_some() {
-                json!(UiHostInbound::DataGridCell { event: event.clone() })
+                json!(UiHostInbound::DataGridCell {
+                    event: event.clone()
+                })
             } else {
                 json!(&event)
             },
@@ -6778,7 +7137,8 @@ fn forward_text_input_commit(
             Ok(response) if response.status == RpcStatus::Accepted => {
                 if let Some(proxy) = proxy
                     && let Some(result) = response.result
-                    && let Ok(publication) = serde_json::from_value::<neon_ui_schema::UiHostPublication>(result)
+                    && let Ok(publication) =
+                        serde_json::from_value::<neon_ui_schema::UiHostPublication>(result)
                 {
                     let _ = proxy.send_event(WindowCommand::ApplyHostPublication(publication));
                 }
@@ -7105,10 +7465,7 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                 };
                 eprintln!(
                     "{{\"probe\":\"android-component-gallery-input\",\"pointer_id\":{},\"phase\":\"{}\",\"x\":{},\"y\":{}}}",
-                    touch.id,
-                    phase,
-                    touch_location.x,
-                    touch_location.y
+                    touch.id, phase, touch_location.x, touch_location.y
                 );
                 self.window_event(
                     event_loop,
@@ -7225,8 +7582,13 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                 // Borderless windows let the app background act as a native drag
                 // region. Any semantic control keeps priority and never starts a
                 // window drag, so domain UI interaction remains intact.
-                if matches!(std::env::var("NEON_WINDOW_CHROME").as_deref(), Ok("borderless"))
-                    && self.gpu.as_ref().is_some_and(|gpu| gpu.ui.hit_binding_at_pointer().is_none())
+                if matches!(
+                    std::env::var("NEON_WINDOW_CHROME").as_deref(),
+                    Ok("borderless")
+                ) && self
+                    .gpu
+                    .as_ref()
+                    .is_some_and(|gpu| gpu.ui.hit_binding_at_pointer().is_none())
                 {
                     if let Some(window) = self.window.as_ref() {
                         let _ = window.drag_window();
@@ -7298,7 +7660,9 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                             gpu.next_semantic_sequence += 1;
                             Some((gpu.next_semantic_sequence, binding, value))
                         }
-                    } else { None }
+                    } else {
+                        None
+                    }
                 });
                 if let (Some(endpoint), Some((sequence, binding, value))) =
                     (self.ui_endpoint, blur_commit)
@@ -7386,9 +7750,10 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                         .then_some(binding)
                     });
                     if let Some(binding) = owner_cell {
-                        let value = binding.control_value.clone().unwrap_or(
-                            UiSemanticPayloadValue::Bool { value: false },
-                        );
+                        let value = binding
+                            .control_value
+                            .clone()
+                            .unwrap_or(UiSemanticPayloadValue::Bool { value: false });
                         gpu.input.set_hover_id(Some(0));
                         let _ = gpu.input.pointer_down();
                         gpu.captured_binding = Some(binding.clone());
@@ -7467,9 +7832,15 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                             "{{\"probe\":\"android-component-gallery-hit\",\"pointer\":[{},{}],\"node_path\":{:?},\"data_grid_cell\":{:?},\"intent\":{:?}}}",
                             gpu.ui.pointer_position().map(|p| p[0]).unwrap_or(-1.0),
                             gpu.ui.pointer_position().map(|p| p[1]).unwrap_or(-1.0),
-                            current_hit.as_ref().map(|(_, binding)| binding.node_path.clone()),
-                            current_hit.as_ref().and_then(|(_, binding)| binding.data_grid_cell.clone()),
-                            current_hit.as_ref().and_then(|(_, binding)| binding.intent.clone())
+                            current_hit
+                                .as_ref()
+                                .map(|(_, binding)| binding.node_path.clone()),
+                            current_hit
+                                .as_ref()
+                                .and_then(|(_, binding)| binding.data_grid_cell.clone()),
+                            current_hit
+                                .as_ref()
+                                .and_then(|(_, binding)| binding.intent.clone())
                         );
                         gpu.input
                             .set_hover_id(current_hit.as_ref().map(|(id, _)| *id));
@@ -7706,7 +8077,11 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                 if let Some(Ok(released)) = binding {
                     let local_window_action = released.binding.intent.as_ref().and_then(|intent| {
                         let neon_ui_schema::UiIntent::Invoke { action, .. } = intent;
-                        matches!(action.as_str(), "window.minimize" | "window.maximize" | "window.close").then_some(action.as_str())
+                        matches!(
+                            action.as_str(),
+                            "window.minimize" | "window.maximize" | "window.close"
+                        )
+                        .then_some(action.as_str())
                     });
                     if let Some(action) = local_window_action {
                         if let Some(window) = self.window.as_ref() {
@@ -7777,8 +8152,7 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                     if let Some(gpu) = self.gpu.as_ref() {
                         eprintln!(
                             "{{\"probe\":\"android-component-gallery-input\",\"phase\":\"released\",\"outcome\":\"{}\",\"node_path\":{:?}}}",
-                            gpu.last_pointer_outcome,
-                            gpu.last_pointer_node_path
+                            gpu.last_pointer_outcome, gpu.last_pointer_node_path
                         );
                     }
                 }
@@ -7921,10 +8295,7 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                 if event.state != ElementState::Pressed {
                     return;
                 }
-                if self
-                    .gpu
-                    .as_ref()
-                    .is_some_and(|gpu| gpu.control_down)
+                if self.gpu.as_ref().is_some_and(|gpu| gpu.control_down)
                     && matches!(event.physical_key, PhysicalKey::Code(KeyCode::KeyO))
                 {
                     #[cfg(windows)]
@@ -7932,7 +8303,8 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                         Some(Ok(Some(path))) => {
                             eprintln!(
                                 "{{\"event\":\"ui.file_picker.selected\",\"source_path\":{}}}",
-                                serde_json::to_string(&path.to_string_lossy()).unwrap_or_else(|_| "\"\"".into())
+                                serde_json::to_string(&path.to_string_lossy())
+                                    .unwrap_or_else(|_| "\"\"".into())
                             );
                             self.publish_file_drop(path);
                         }
@@ -8156,7 +8528,6 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
         }
     }
 
-
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: WindowCommand) {
         match event {
             WindowCommand::Fragments {
@@ -8177,6 +8548,7 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
             WindowCommand::ShaderPackages { packages } => {
                 if let Some(gpu) = self.gpu.as_mut() {
                     gpu.ui.sync_material_packages(&gpu.device, &packages);
+                    gpu.behind_ui.sync_material_packages(&gpu.device, &packages);
                     self.redraw_pending = true;
                 }
             }
@@ -8376,9 +8748,16 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                 }
             }
             WindowCommand::ApplyHostPublication(publication) => {
-                if let Some(current) = self.fragments.get_mut(&UiFragmentId("android-component-gallery".into())) {
-                    neon_ui_runtime::demo_domain::apply_publication_to_fragment(current, &publication);
-                    self.applied_composition_revision = Revision(self.applied_composition_revision.0 + 1);
+                if let Some(current) = self
+                    .fragments
+                    .get_mut(&UiFragmentId("android-component-gallery".into()))
+                {
+                    neon_ui_runtime::demo_domain::apply_publication_to_fragment(
+                        current,
+                        &publication,
+                    );
+                    self.applied_composition_revision =
+                        Revision(self.applied_composition_revision.0 + 1);
                     if let Some(gpu) = self.gpu.as_mut() {
                         gpu.ui.invalidate_plan();
                         gpu.hit_target_dirty = true;
@@ -8401,9 +8780,7 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                     Ok(json!({"surface": "already_open"}))
                 } else {
                     self.initialize(event_loop)
-                        .and_then(|_| {
-                            Ok(json!({"surface": "opened", "epoch": self.epoch}))
-                        })
+                        .and_then(|_| Ok(json!({"surface": "opened", "epoch": self.epoch})))
                 };
                 let _ = completed.send(result);
             }
@@ -10859,22 +11236,19 @@ impl WgpuRuntime {
             // headless/Android single-endpoint host has no GPU, so surface
             // requests fail with a stable, inspectable error code instead of
             // "unsupported_method"; the SDK keeps one API on every platform.
-            "render.surface.open" | "render.surface.acquire" | "render.surface.frame" => {
-                self.reject(
+            "render.surface.open" | "render.surface.acquire" | "render.surface.frame" => self
+                .reject(
                     request_id,
                     "backend_not_available",
                     "shared surface export requires the windowed GPU runtime",
                     None,
-                )
-            }
-            "render.surface.capture_png" => {
-                self.reject(
-                    request_id,
-                    "backend_not_available",
-                    "shared surface PNG capture requires the windowed GPU runtime",
-                    None,
-                )
-            }
+                ),
+            "render.surface.capture_png" => self.reject(
+                request_id,
+                "backend_not_available",
+                "shared surface PNG capture requires the windowed GPU runtime",
+                None,
+            ),
             "wgpu.render.diagnostics" => {
                 self.accept(request_id, diagnostics_value(self.diagnostics()))
             }
@@ -10927,9 +11301,7 @@ impl WgpuRuntime {
             "wgpu.ui.submit_fragment" => self.submit_fragment(request_id, request.params),
             "wgpu.ui.remove_fragment" => self.remove_fragment(request_id, request.params),
             "wgpu.shader.register" => self.shader_register(request_id, request.params),
-            "wgpu.shader.state" => {
-                self.accept(request_id, self.shader_registry.snapshot())
-            }
+            "wgpu.shader.state" => self.accept(request_id, self.shader_registry.snapshot()),
             "wgpu.ui.semantic_event.validate" | "test.ui.semantic_event.inject" => {
                 self.inject_semantic_event(request_id, request.params)
             }
@@ -11231,12 +11603,7 @@ impl WgpuRuntime {
                     "validated": entry.validated,
                 }),
             ),
-            Err(error) => self.reject(
-                request_id,
-                "ui_shader_compile_failed",
-                &error,
-                None,
-            ),
+            Err(error) => self.reject(request_id, "ui_shader_compile_failed", &error, None),
         }
     }
 
@@ -11314,7 +11681,8 @@ impl WgpuRuntime {
         self.fragments
             .insert(fragment.fragment_id.clone(), fragment);
         self.graph_revision = Revision(self.graph_revision.0 + 1);
-        self.ui_program_revision = Some(serde_json::to_value(&program.revision).unwrap_or_default());
+        self.ui_program_revision =
+            Some(serde_json::to_value(&program.revision).unwrap_or_default());
         self.ui_surface_id = Some(surface_id.clone());
         self.accept(
             request_id,
@@ -11394,7 +11762,7 @@ impl WgpuRuntime {
         )
     }
 
-fn remove_fragment(&mut self, request_id: RequestId, params: Value) -> RpcResponse {
+    fn remove_fragment(&mut self, request_id: RequestId, params: Value) -> RpcResponse {
         let command: UiCommand = match serde_json::from_value(params) {
             Ok(command @ UiCommand::RemoveFragment { .. }) => command,
             Ok(_) => {
@@ -12382,7 +12750,8 @@ mod tests {
     }
 
     #[test]
-    fn headless_health_and_describe_are_available() {        let mut runtime = WgpuRuntime::headless(7);
+    fn headless_health_and_describe_are_available() {
+        let mut runtime = WgpuRuntime::headless(7);
         let health = runtime.handle(request("health", "service.health", json!({})));
         let describe = runtime.handle(request("describe", "service.describe", json!({})));
         let snapshot = runtime.handle(request("snapshot", "debug.snapshot.get", json!({})));
@@ -13006,6 +13375,76 @@ mod tests {
             ),
             None,
             "later compositions must not fight a user's resize for an already handled requirement"
+        );
+    }
+
+    #[test]
+    fn shell_window_fit_converges_1280x800_canvas_down_to_a_360x700_player() {
+        let mut fit = ShellWindowFit::default();
+        // The Pulse player shell is 360x700 while the runtime default canvas is
+        // 1280x800. The fit must request the shell size once and then resolve.
+        assert_eq!(
+            fit.observe([360.0, 700.0], [1280.0, 800.0]),
+            Some([360.0, 700.0])
+        );
+        // A request is in flight; do not re-request on the next frame.
+        assert_eq!(fit.observe([360.0, 700.0], [1280.0, 800.0]), None);
+        // The OS has not resized yet; still hold the in-flight request.
+        assert_eq!(fit.observe([360.0, 700.0], [1280.0, 800.0]), None);
+        // The Resized event lands and the viewport converges to the shell.
+        assert_eq!(fit.observe([360.0, 700.0], [360.0, 700.0]), None);
+        assert!(fit.resolved);
+        // Once resolved, never ask again even if a later frame reports a stale
+        // logical size (e.g. before the surface reconfiguration is visible).
+        assert_eq!(fit.observe([360.0, 700.0], [360.0, 700.0]), None);
+    }
+
+    #[test]
+    fn shell_window_fit_keeps_a_window_that_already_matches_the_shell() {
+        let mut fit = ShellWindowFit::default();
+        assert_eq!(fit.observe([360.0, 700.0], [360.0, 700.0]), None);
+        assert!(fit.resolved);
+        assert_eq!(fit.observe([360.0, 700.0], [360.0, 700.0]), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn shell_region_polygon_uses_physical_dpi_for_asymmetric_cuts() {
+        let bounds = UiBounds {
+            x: 10.0,
+            y: 20.0,
+            width: 100.0,
+            height: 60.0,
+        };
+        let polygon = shell_region_polygon(bounds, [3.0, 7.0, 11.0, 13.0], 1.5, false);
+        assert_eq!(polygon[0], [35, 30]);
+        assert_eq!(polygon[1], [148, 30]);
+        assert_eq!(polygon[2], [165, 47]);
+        assert_eq!(polygon[5], [20, 120]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn shell_region_polygon_zero_cut_is_the_full_physical_bounds() {
+        let bounds = UiBounds {
+            x: 10.0,
+            y: 20.0,
+            width: 100.0,
+            height: 60.0,
+        };
+        let polygon = shell_region_polygon(bounds, [0.0; 4], 1.25, true);
+        assert_eq!(
+            polygon,
+            [
+                [0, 0],
+                [125, 0],
+                [125, 0],
+                [125, 75],
+                [125, 75],
+                [0, 75],
+                [0, 75],
+                [0, 0]
+            ]
         );
     }
 
@@ -14922,7 +15361,10 @@ mod tests {
         // Host snapshot reflects the new input revision.
         let snapshot = runtime.handle(request("snap", "debug.ui.host.snapshot", json!({})));
         assert_eq!(snapshot.status, RpcStatus::Accepted);
-        assert_eq!(snapshot.result.unwrap()["scalar_inputs"]["input_revision"], 1);
+        assert_eq!(
+            snapshot.result.unwrap()["scalar_inputs"]["input_revision"],
+            1
+        );
 
         // Semantic intent is acknowledged and advances the revision.
         let inbound = runtime.handle(request(
@@ -14936,7 +15378,10 @@ mod tests {
         assert_eq!(inbound.status, RpcStatus::Accepted);
         let inbound_result = inbound.result.unwrap();
         assert_eq!(inbound_result["semantic_intent"]["status"], "accepted");
-        assert_eq!(inbound_result["semantic_intent"]["accepted_input_revision"], 2);
+        assert_eq!(
+            inbound_result["semantic_intent"]["accepted_input_revision"],
+            2
+        );
         let after = runtime.handle(request("snap2", "debug.ui.host.snapshot", json!({})));
         assert_eq!(after.result.unwrap()["scalar_inputs"]["input_revision"], 2);
     }
