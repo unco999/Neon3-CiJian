@@ -33,3 +33,13 @@
 /.target-v026-live
 /.target-v026-live-fixed2
 /.runtime-v026-debug-fixed
+/.runtime-v026-live-fixed2
+/.runtime-v026-live-fixed
+/.runtime-v026-live
+/current_state.png
+/music-player-render-probe.png
+/add_flow_light_shader.py
+/implement_parser.py
+/implement_schema.py
+/update_flow_behind.py
+/crates/neon-wgpu-runtime/src/lib.rs.broken-backup
