@@ -2338,6 +2338,20 @@ impl WindowedRuntime {
         let Some(gpu) = self.gpu.as_mut() else {
             return Ok(());
         };
+        // Debug: log frame count and time_seconds when continuous render is on.
+        if std::env::var("NEON_CONTINUOUS_RENDER").is_ok_and(|v| v == "1" || v == "true") {
+            static FRAME_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let count = FRAME_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if count % 120 == 0 {
+                let t = gpu.started_at.elapsed().as_secs_f32();
+                if let Ok(home) = std::env::var("USERPROFILE") {
+                    let _ = std::fs::write(
+                        format!("{}\\AppData\\Local\\Temp\\neon_frame_debug.txt", home),
+                        format!("frame={} time_seconds={}\n", count, t),
+                    );
+                }
+            }
+        }
         let was_animation_active = self.animation_active;
         let frame_started = Instant::now();
         if gpu.pending_hit_slot.is_some() {
@@ -2901,6 +2915,10 @@ impl WindowedRuntime {
         self.redraw_pending
             || self.animation_active
             || self.composition_ack_in_flight
+            // Continuous render mode: keeps the shader pipeline (time_seconds)
+            // advancing every frame without requiring UI events or transitions.
+            // Set NEON_CONTINUOUS_RENDER=1 for cases with animated custom materials.
+            || std::env::var("NEON_CONTINUOUS_RENDER").is_ok_and(|v| v == "1" || v == "true")
             || self
                 .gpu
                 .as_ref()
@@ -8847,6 +8865,15 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
         self.dispatch_ready_data_grid_window_requests();
         if let Some(deadline) = self.data_grid_window_requests.next_deadline() {
             event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
+        }
+        let continuous = std::env::var("NEON_CONTINUOUS_RENDER")
+            .is_ok_and(|v| v == "1" || v == "true");
+        if continuous {
+            static CONTINUOUS_LOGGED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !CONTINUOUS_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!("[neon-wgpu] NEON_CONTINUOUS_RENDER=1 active, continuous redraw enabled");
+            }
         }
         if let Some(window) = self.window.as_ref()
             && self.needs_redraw()

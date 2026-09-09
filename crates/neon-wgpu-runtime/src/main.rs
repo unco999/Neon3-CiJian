@@ -1,7 +1,15 @@
 //! The sole Neon3 process permitted to own windows and GPU objects.
 
 fn main() {
+    let env_val = std::env::var("NEON_CONTINUOUS_RENDER");
     let args: Vec<_> = std::env::args().collect();
+    if let Ok(home) = std::env::var("USERPROFILE") {
+        let _ = std::fs::write(
+            format!("{}\\AppData\\Local\\Temp\\neon_env_debug.txt", home),
+            format!("NEON_CONTINUOUS_RENDER={:?}\nargs={:?}\n", env_val, args),
+        );
+    }
+    eprintln!("[neon-wgpu] startup: NEON_CONTINUOUS_RENDER={:?}, args={:?}", env_val, args);
     if args
         .get(1)
         .is_some_and(|argument| argument == "--headless-server")
