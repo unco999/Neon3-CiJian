@@ -18,8 +18,12 @@ use neon_ui_schema::{
 use serde_json::{Value, json};
 
 const SHADER: &str = r#"
-struct View { viewport: vec2<f32>, color_mode: u32, time_seconds: f32 }
+struct View { viewport: vec2<f32>, color_mode: u32, time_seconds: f32, extras: array<vec4<f32>, 10> }
 @group(0) @binding(0) var<uniform> view: View;
+struct ShaderEvent { event_id: u32, payload: vec4<f32> }
+struct ShaderEventBuffer { counter: atomic<u32>, events: array<ShaderEvent> }
+@group(0) @binding(1) var<storage, read_write> shader_events: ShaderEventBuffer;
+fn emit_shader_event(event_id: u32, payload: vec4<f32>) { let slot = atomicAdd(&shader_events.counter, 1u); if (slot < 256u) { shader_events.events[slot].event_id = event_id; shader_events.events[slot].payload = payload; } }
 
 fn animation_progress(animation: vec4<f32>) -> f32 {
     if (animation.w == 0.0 || animation.y <= 0.0) { return 1.0; }
@@ -183,7 +187,7 @@ let color = mix(input.fill, input.border, border_alpha);
 "#;
 
 const HIT_SHADER: &str = r#"
-struct View { viewport: vec2<f32>, color_mode: u32, time_seconds: f32 }
+struct View { viewport: vec2<f32>, color_mode: u32, time_seconds: f32, extras: array<vec4<f32>, 10> }
 @group(0) @binding(0) var<uniform> view: View;
 fn animation_progress(animation: vec4<f32>) -> f32 { if (animation.w == 0.0 || animation.y <= 0.0) { return 1.0; } let t=clamp((view.time_seconds-animation.x)/animation.y,0.0,1.0); if(animation.z==1.0){return t*t;} if(animation.z==2.0){return 1.0-(1.0-t)*(1.0-t);} if(animation.z==3.0){return select(2.0*t*t,1.0-pow(-2.0*t+2.0,2.0)/2.0,t>=0.5);} return t; }
 fn outside_clip(pixel: vec2<f32>, clip: vec4<f32>, radius: f32) -> bool { if (pixel.x < clip.x || pixel.y < clip.y || pixel.x > clip.z || pixel.y > clip.w) { return true; } if (radius <= 0.0) { return false; } let size=clip.zw-clip.xy; let r=min(radius,min(size.x,size.y)*0.5); let point=pixel-(clip.xy+size*0.5); let extent=max(size*0.5-vec2<f32>(r),vec2<f32>(0.0)); return length(max(abs(point)-extent,vec2<f32>(0.0)))>r; }
@@ -217,12 +221,22 @@ const HIT_CLEAR_SHADER: &str = r#"
 @fragment fn fs_main() -> @location(0) u32 { return 0xffffffffu; }
 "#;
 
+/// GPU→CPU shader event ring buffer. Layout: 4-byte atomic counter +
+/// 12-byte padding + 256 × 32-byte `ShaderEvent` slots (u32 id + vec4 payload,
+/// aligned to 16). Rounded up to 256-byte MAP_READ alignment.
+const SHADER_EVENT_BUFFER_SIZE: u64 = 16384;
+const SHADER_EVENT_CAPACITY: usize = 256;
+
 // Package sources provide only `fn material(input: MaterialInput) -> vec4<f32>`
 // plus private helper functions. The renderer owns this wrapper, its vertex
 // ABI, clipping, blend contract, and all GPU bindings.
 const MATERIAL_SHADER_PREFIX: &str = r#"
-struct View { viewport: vec2<f32>, color_mode: u32, time_seconds: f32 }
+struct View { viewport: vec2<f32>, color_mode: u32, time_seconds: f32, extras: array<vec4<f32>, 10> }
 @group(0) @binding(0) var<uniform> view: View;
+struct ShaderEvent { event_id: u32, payload: vec4<f32> }
+struct ShaderEventBuffer { counter: atomic<u32>, events: array<ShaderEvent> }
+@group(0) @binding(1) var<storage, read_write> shader_events: ShaderEventBuffer;
+fn emit_shader_event(event_id: u32, payload: vec4<f32>) { let slot = atomicAdd(&shader_events.counter, 1u); if (slot < 256u) { shader_events.events[slot].event_id = event_id; shader_events.events[slot].payload = payload; } }
 fn srgb_to_linear(value: vec3<f32>) -> vec3<f32> { let low=value/12.92; let high=pow((value+vec3<f32>(0.055))/1.055,vec3<f32>(2.4)); return select(low,high,value>vec3<f32>(0.04045)); }
 fn outside_clip(pixel: vec2<f32>, clip: vec4<f32>, radius: f32) -> bool { if (pixel.x < clip.x || pixel.y < clip.y || pixel.x > clip.z || pixel.y > clip.w) { return true; } if (radius <= 0.0) { return false; } let size=clip.zw-clip.xy; let r=min(radius,min(size.x,size.y)*0.5); let point=pixel-(clip.xy+size*0.5); let extent=max(size*0.5-vec2<f32>(r),vec2<f32>(0.0)); return length(max(abs(point)-extent,vec2<f32>(0.0)))>r; }
 fn outside_cut(local: vec2<f32>, size: vec2<f32>, cut: vec4<f32>) -> bool { let p=local*size; let bl=min(cut.x,min(size.x,size.y)); let br=min(cut.y,min(size.x,size.y)); let tr=min(cut.z,min(size.x,size.y)); let tl=min(cut.w,min(size.x,size.y)); if(bl>0.0&&p.x<bl&&p.y<bl&&p.x+p.y<bl){return true;} let rx=size.x-p.x; if(br>0.0&&rx<br&&p.y<br&&rx+p.y<br){return true;} let ty=size.y-p.y; if(tr>0.0&&rx<tr&&ty<tr&&rx+ty<tr){return true;} if(tl>0.0&&p.x<tl&&p.y<tl&&p.x+p.y<tl){return true;} return false; }
@@ -236,7 +250,7 @@ const MATERIAL_SHADER_SUFFIX: &str = r#"
 "#;
 
 const DEPTH_SHADER: &str = r#"
-struct View { viewport: vec2<f32>, color_mode: u32, time_seconds: f32 }
+struct View { viewport: vec2<f32>, color_mode: u32, time_seconds: f32, extras: array<vec4<f32>, 10> }
 @group(0) @binding(0) var<uniform> view: View;
 fn animation_progress(animation: vec4<f32>) -> f32 { if (animation.w == 0.0 || animation.y <= 0.0) { return 1.0; } let t=clamp((view.time_seconds-animation.x)/animation.y,0.0,1.0); if(animation.z==1.0){return t*t;} if(animation.z==2.0){return 1.0-(1.0-t)*(1.0-t);} if(animation.z==3.0){return select(2.0*t*t,1.0-pow(-2.0*t+2.0,2.0)/2.0,t>=0.5);} return t; }
 fn outside_clip(pixel: vec2<f32>, clip: vec4<f32>, radius: f32) -> bool {
@@ -318,7 +332,7 @@ struct VsOut {
 "#;
 
 const IMAGE_SHADER: &str = r#"
-struct View { viewport: vec2<f32>, color_mode: u32, _pad: u32 }
+struct View { viewport: vec2<f32>, color_mode: u32, time_seconds: f32, extras: array<vec4<f32>, 10> }
 @group(0) @binding(0) var<uniform> view: View;
 @group(1) @binding(0) var image_texture: texture_2d<f32>;
 @group(1) @binding(1) var image_sampler: sampler;
@@ -399,7 +413,7 @@ fn map_axis(distance: f32, size: f32, source_size: f32, target_edges: vec2<f32>,
 "#;
 
 const TEXT_SHADER: &str = r#"
-struct View { viewport: vec2<f32>, color_mode: u32, _pad: u32 }
+struct View { viewport: vec2<f32>, color_mode: u32, time_seconds: f32, extras: array<vec4<f32>, 10> }
 @group(0) @binding(0) var<uniform> view: View;
 @group(1) @binding(0) var glyph_atlas: texture_2d<f32>;
 @group(1) @binding(1) var glyph_sampler: sampler;
@@ -424,7 +438,7 @@ struct VsOut { @builtin(position) position: vec4<f32>, @location(0) local: vec2<
 "#;
 
 const CANVAS_SHADER: &str = r#"
-struct View { viewport: vec2<f32>, color_mode: u32, time_seconds: f32 }
+struct View { viewport: vec2<f32>, color_mode: u32, time_seconds: f32, extras: array<vec4<f32>, 10> }
 @group(0) @binding(0) var<uniform> view: View;
 struct VsIn { @location(0) start: vec2<f32>, @location(1) end: vec2<f32>, @location(2) color: vec4<f32>, @location(3) width: f32, @location(4) kind: u32, @location(5) clip: vec4<f32>, @location(6) depth: f32 }
 struct VsOut { @builtin(position) position: vec4<f32>, @location(0) pixel: vec2<f32>, @location(1) start: vec2<f32>, @location(2) end: vec2<f32>, @location(3) color: vec4<f32>, @location(4) width: f32, @location(5) @interpolate(flat) kind: u32, @location(6) clip: vec4<f32> }
@@ -475,7 +489,27 @@ struct UiView {
     viewport: [f32; 2],
     color_mode: u32,
     time_seconds: f32,
+    extras: [[f32; 4]; 10],
 }
+
+/// Generic per-view extra uniform data (10 x vec4 = 160 bytes).
+/// Written by the `wgpu.ui.set_view_extras` RPC handler and read by the
+/// render loop. The runtime never interprets the content — shaders are
+/// free to use the 40 f32 slots for audio spectrum, sensor data, IRC
+/// counters, or any other per-frame data.
+static GLOBAL_VIEW_EXTRAS: std::sync::Mutex<[[f32; 4]; 10]> =
+    std::sync::Mutex::new([[0.0; 4]; 10]);
+
+pub(crate) fn set_global_view_extras(extras: [[f32; 4]; 10]) {
+    if let Ok(mut guard) = GLOBAL_VIEW_EXTRAS.lock() {
+        *guard = extras;
+    }
+}
+
+pub(crate) fn get_global_view_extras() -> [[f32; 4]; 10] {
+    GLOBAL_VIEW_EXTRAS.lock().map(|g| *g).unwrap_or([[0.0; 4]; 10])
+}
+
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -1226,6 +1260,83 @@ fn color_pass_depth(world_depth: Option<f32>) -> f32 {
     world_depth.map_or(0.0, |depth| 1.0 - depth)
 }
 
+fn compare_paint_group_order(
+    left_group: u32,
+    right_group: u32,
+    group_depths: &HashMap<u32, Option<f32>>,
+) -> std::cmp::Ordering {
+    let left_depth = group_depths.get(&left_group).copied().flatten();
+    let right_depth = group_depths.get(&right_group).copied().flatten();
+    match (left_depth, right_depth) {
+        // The external color target is emitted far-to-near. Under the exported
+        // reversed-Z convention larger source depth is nearer, so ascending
+        // source depth emits far groups first. Equal-depth groups still need a
+        // total order.
+        (Some(left), Some(right)) => left
+            .partial_cmp(&right)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left_group.cmp(&right_group)),
+        // Screen groups have no GPU depth and are always above projected world
+        // groups in the combined color pass.
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        // Group IDs are assigned by flattened declaration order for Screen UI.
+        (None, None) => left_group.cmp(&right_group),
+    }
+}
+
+fn paint_group_root_ids(plan: &[PlannedNode]) -> HashSet<String> {
+    let indices = plan
+        .iter()
+        .enumerate()
+        .map(|(index, node)| (node.id.as_str(), index))
+        .collect::<HashMap<_, _>>();
+    plan.iter()
+        .filter_map(|node| {
+            let parent = node
+                .parent_id
+                .as_deref()
+                .and_then(|parent_id| indices.get(parent_id).copied());
+            let is_root = if node.target.world_depth.is_some() {
+                // A projected panel starts a depth group when its parent is not
+                // projected. Descendants inherit the same world depth/group.
+                parent.map_or(true, |parent| plan[parent].target.world_depth.is_none())
+            } else {
+                // Screen UI has no depth buffer. Keep the surface root and each
+                // direct child as atomic painter groups so panel backgrounds,
+                // images and text cannot be split across sibling panels.
+                parent.map_or(true, |parent| plan[parent].parent_id.is_none())
+            };
+            is_root.then(|| node.id.clone())
+        })
+        .collect()
+}
+
+fn assign_paint_group_ids(plan: &mut [PlannedNode]) {
+    let roots = paint_group_root_ids(plan);
+    let mut group_ids = HashMap::<String, u32>::new();
+    let mut next_group_id = 1_u32;
+    for index in 0..plan.len() {
+        let mut root = index;
+        while !roots.contains(&plan[root].id) {
+            let Some(parent_id) = plan[root].parent_id.as_deref() else {
+                break;
+            };
+            let Some(parent) = plan.iter().position(|node| node.id == parent_id) else {
+                break;
+            };
+            root = parent;
+        }
+        let root_id = plan[root].id.clone();
+        let group_id = *group_ids.entry(root_id).or_insert_with(|| {
+            let id = next_group_id;
+            next_group_id = next_group_id.saturating_add(1);
+            id
+        });
+        plan[index].paint_group_id = group_id;
+    }
+}
+
 fn gpu_easing(easing: UiEasing) -> f32 {
     match easing {
         UiEasing::Linear => 0.0,
@@ -1276,10 +1387,21 @@ pub struct UiWgpuRenderer {
     view_layout: wgpu::BindGroupLayout,
     view_buffer: wgpu::Buffer,
     view_bind_group: wgpu::BindGroup,
+    /// GPU→CPU shader event ring (storage buffer, written by material shaders).
+    event_buffer: wgpu::Buffer,
+    /// Staging buffer for `event_buffer` readback.
+    event_staging_buffer: wgpu::Buffer,
+    /// Events read back from the previous frame; drained by `take_shader_events`.
+    pending_shader_events: Vec<(u32, [f32; 4])>,
+    /// Generic per-view extra uniform data (10 x vec4 = 160 bytes).
+    /// Host writes via wgpu.ui.set_view_extras; runtime does not interpret content.
+    view_extras: [[f32; 4]; 10],
     instance_buffer: wgpu::Buffer,
     instance_capacity: usize,
     depth_instance_buffer: wgpu::Buffer,
     depth_instance_capacity: usize,
+    material_instance_buffer: wgpu::Buffer,
+    material_instance_capacity: usize,
     popup_instance_buffer: wgpu::Buffer,
     popup_instance_capacity: usize,
     plan_revisions: HashMap<neon_ui_schema::UiFragmentId, neon_protocol::Revision>,
@@ -1467,16 +1589,28 @@ impl UiWgpuRenderer {
     ) -> Self {
         let view_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("neon3-ui-view-layout"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
                 },
-                count: None,
-            }],
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
         });
         let view_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("neon3-ui-view"),
@@ -1484,13 +1618,31 @@ impl UiWgpuRenderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let event_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("neon3-ui-shader-events"),
+            size: SHADER_EVENT_BUFFER_SIZE,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let event_staging_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("neon3-ui-shader-events-staging"),
+            size: SHADER_EVENT_BUFFER_SIZE,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let view_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("neon3-ui-view-bind-group"),
             layout: &view_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: view_buffer.as_entire_binding(),
-            }],
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: view_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: event_buffer.as_entire_binding(),
+                },
+            ],
         });
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("neon3-ui-panel-shader"),
@@ -2088,6 +2240,10 @@ impl UiWgpuRenderer {
             view_layout,
             view_buffer,
             view_bind_group,
+            event_buffer,
+            event_staging_buffer,
+            pending_shader_events: Vec::new(),
+            view_extras: [[0.0; 4]; 10],
             // Pre-allocate GPU buffers to the plan's known budget (512 nodes,
             // 512 bindings) so the render loop never re-creates buffers on the
             // hot path. The growth path still exists as a safety net.
@@ -2095,6 +2251,8 @@ impl UiWgpuRenderer {
             instance_capacity: 512,
             depth_instance_buffer: create_instance_buffer(device, 512),
             depth_instance_capacity: 512,
+            material_instance_buffer: create_instance_buffer(device, 512),
+            material_instance_capacity: 512,
             popup_instance_buffer: create_instance_buffer(device, 512),
             popup_instance_capacity: 512,
             plan_revisions: HashMap::new(),
@@ -2240,6 +2398,7 @@ impl UiWgpuRenderer {
                 viewport: self.viewport_logical_size,
                 color_mode: 0,
                 time_seconds,
+                extras: get_global_view_extras(),
             }),
         );
         self.view_buffer_viewport_revision = self.viewport_revision;
@@ -4577,8 +4736,8 @@ impl UiWgpuRenderer {
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("neon3-ui-image-atlas-sampler"),
-            mag_filter: wgpu::FilterMode::Nearest,
-            min_filter: wgpu::FilterMode::Nearest,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -4855,6 +5014,7 @@ impl UiWgpuRenderer {
                 // display space until the final surface encode.
                 color_mode: 0,
                 time_seconds,
+                extras: get_global_view_extras(),
             }),
         );
         self.view_buffer_viewport_revision = self.viewport_revision;
@@ -4921,6 +5081,26 @@ impl UiWgpuRenderer {
                     .push(material);
             }
             destination.extend(chrome);
+        }
+        // Material draws are recorded into one command buffer, so each package
+        // needs a stable range in a single upload. Writing different package
+        // instances repeatedly into one buffer would leave earlier draws
+        // observing the last write when the GPU executes the submitted frame.
+        let mut material_batches = BTreeMap::<u32, Vec<(String, u32, u32)>>::new();
+        let mut material_payload = Vec::<UiInstance>::new();
+        for (group_id, packages) in &material_instances {
+            for (package_id, instances) in packages {
+                if instances.is_empty() {
+                    continue;
+                }
+                let start = material_payload.len() as u32;
+                material_payload.extend_from_slice(instances);
+                material_batches.entry(*group_id).or_default().push((
+                    package_id.clone(),
+                    start,
+                    instances.len() as u32,
+                ));
+            }
         }
         // CPU first-press handling must be ready as soon as the visible frame is
         // drawn; asynchronous GPU hit readback is only supplemental.
@@ -5008,13 +5188,13 @@ impl UiWgpuRenderer {
                 create_instance_buffer(device, self.depth_instance_capacity);
             self.uploaded_depth_instances.clear();
         }
-        let material_capacity = material_instances
-            .values()
-            .flat_map(|packages| packages.values().map(Vec::len))
-            .max()
-            .unwrap_or(0);
-        if popup_instances.len().max(material_capacity) > self.popup_instance_capacity {
-            self.popup_instance_capacity = popup_instances.len().max(material_capacity).next_power_of_two();
+        if material_payload.len() > self.material_instance_capacity {
+            self.material_instance_capacity = material_payload.len().next_power_of_two();
+            self.material_instance_buffer =
+                create_instance_buffer(device, self.material_instance_capacity);
+        }
+        if popup_instances.len() > self.popup_instance_capacity {
+            self.popup_instance_capacity = popup_instances.len().next_power_of_two();
             self.popup_instance_buffer =
                 create_instance_buffer(device, self.popup_instance_capacity);
         }
@@ -5029,6 +5209,15 @@ impl UiWgpuRenderer {
                 bytemuck::cast_slice(&self.instances),
             );
             self.uploaded_instances.clone_from(&self.instances);
+            buffer_upload_ms += stage.elapsed().as_secs_f32() * 1000.0;
+        }
+        if !material_payload.is_empty() {
+            let stage = Instant::now();
+            queue.write_buffer(
+                &self.material_instance_buffer,
+                0,
+                bytemuck::cast_slice(&material_payload),
+            );
             buffer_upload_ms += stage.elapsed().as_secs_f32() * 1000.0;
         }
         let mut images = Vec::new();
@@ -5614,25 +5803,16 @@ impl UiWgpuRenderer {
             .chain(canvas_groups.iter().map(|(key, _)| *key))
             .chain(text_groups.iter().map(|(key, _)| *key))
             .collect::<Vec<_>>();
-        let group_depth = |group_id: u32| {
-            self.plan
-                .iter()
-                .filter(|node| node.paint_group_id == group_id)
-                .find_map(|node| node.target.world_depth)
-        };
-        depth_keys.sort_by(|a, b| {
-            match (group_depth(*a), group_depth(*b)) {
-                // The external color target's effective overlay order is
-                // near-to-far: the later group is the visible top layer.
-                // Reversed-Z values are larger nearer the camera. Fixed screen UI is
-                // always painted after every world group, independently of
-                // its color-pass position.z value.
-                (Some(a), Some(b)) => a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal),
-                (Some(_), None) => std::cmp::Ordering::Less,
-                (None, Some(_)) => std::cmp::Ordering::Greater,
-                (None, None) => std::cmp::Ordering::Equal,
-            }
-        });
+        let group_depths = self
+            .plan
+            .iter()
+            .fold(HashMap::<u32, Option<f32>>::new(), |mut depths, node| {
+                depths.entry(node.paint_group_id).or_insert(node.target.world_depth);
+                depths
+            });
+        // World groups are emitted far-to-near. Screen groups have no GPU depth,
+        // so their stable declaration order is the group-id tie-breaker.
+        depth_keys.sort_by(|a, b| compare_paint_group_order(*a, *b, &group_depths));
         depth_keys.dedup();
         let mut ordered_rects = Vec::new();
         let mut ordered_images = Vec::new();
@@ -5734,15 +5914,13 @@ impl UiWgpuRenderer {
             // group, before the group's imagery and glyphs. This makes glass
             // response read as a surface treatment instead of a foreground
             // filter over the player artwork and controls.
-            if let Some(packages) = material_instances.get(&key) {
-                for (package_id, instances) in packages {
+            if let Some(packages) = material_batches.get(&key) {
+                for (package_id, start, count) in packages {
                     let Some(pipeline) = self.material_pipelines.get(package_id) else { continue };
-                    if instances.is_empty() { continue; }
-                    queue.write_buffer(&self.popup_instance_buffer, 0, bytemuck::cast_slice(instances));
                     pass.set_pipeline(pipeline);
                     pass.set_bind_group(0, &self.view_bind_group, &[]);
-                    pass.set_vertex_buffer(0, self.popup_instance_buffer.slice(..));
-                    pass.draw(0..6, 0..instances.len() as u32);
+                    pass.set_vertex_buffer(0, self.material_instance_buffer.slice(..));
+                    pass.draw(0..6, *start..*start + *count);
                 }
             }
             if let Some((start, count)) = image_ranges.get(&key) {
@@ -5846,6 +6024,84 @@ impl UiWgpuRenderer {
             group_sort_ms,
             buffer_upload_ms,
         };
+    }
+
+    /// Zero the event ring counter before this frame's material passes write to it.
+    pub(crate) fn begin_shader_event_frame(&self, queue: &wgpu::Queue) {
+        queue.write_buffer(&self.event_buffer, 0, &0u32.to_le_bytes());
+    }
+
+    /// Copy the event ring into the staging buffer after all render passes.
+    pub(crate) fn finish_shader_event_frame(&self, encoder: &mut wgpu::CommandEncoder) {
+        encoder.copy_buffer_to_buffer(
+            &self.event_buffer,
+            0,
+            &self.event_staging_buffer,
+            0,
+            SHADER_EVENT_BUFFER_SIZE,
+        );
+    }
+
+    /// Map the staging buffer, parse emitted events, and store them for
+    /// `take_shader_events`. Blocks until the GPU readback completes.
+    pub(crate) fn read_shader_events(&mut self, device: &wgpu::Device) {
+        let staging = &self.event_staging_buffer;
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = tx.send(result);
+        });
+        let _ = device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: Some(std::time::Duration::from_secs(1)),
+        });
+        let Ok(Ok(())) = rx.recv() else {
+            return;
+        };
+        let data = match slice.get_mapped_range() {
+            Ok(range) => range,
+            Err(_) => return,
+        };
+        if data.len() < 4 {
+            drop(data);
+            staging.unmap();
+            return;
+        }
+        let counter = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+        let _ = counter;
+        let count = counter.min(SHADER_EVENT_CAPACITY);
+        // WGSL layout: counter at 0, 12-byte pad, then events stride 32
+        // (u32 id at +0, 12-byte pad, vec4 payload at +16).
+        for i in 0..count {
+            let base = 16 + i * 32;
+            if base + 32 > data.len() {
+                break;
+            }
+            let event_id = u32::from_le_bytes([
+                data[base], data[base + 1], data[base + 2], data[base + 3],
+            ]);
+            let mut payload = [0.0f32; 4];
+            for j in 0..4 {
+                let p = base + 16 + j * 4;
+                payload[j] = f32::from_le_bytes([
+                    data[p], data[p + 1], data[p + 2], data[p + 3],
+                ]);
+            }
+            self.pending_shader_events.push((event_id, payload));
+        }
+        drop(data);
+        staging.unmap();
+    }
+
+    /// Drain and return all shader events read back since the last call.
+    pub(crate) fn take_shader_events(&mut self) -> Vec<(u32, [f32; 4])> {
+        std::mem::take(&mut self.pending_shader_events)
+    }
+
+    /// Update generic view-extras uniform data. Runtime does not interpret
+    /// the content; shaders are free to use the 10 x vec4 slots as needed.
+    pub(crate) fn set_view_extras(&mut self, extras: [[f32; 4]; 10]) {
+        self.view_extras = extras;
     }
 
     pub(crate) fn last_stage_timings(&self) -> UiDrawStageTimings {
@@ -5975,24 +6231,23 @@ impl UiWgpuRenderer {
                 .push(*instance);
         }
         let mut group_ids = groups.keys().copied().collect::<Vec<_>>();
-        let group_depth = |group_id: u32| {
-            self.plan
-                .iter()
-                .filter(|node| node.paint_group_id == group_id)
-                .find_map(|node| node.target.world_depth)
-        };
-        let group_depth_value = |group_id: u32| group_depth(group_id).unwrap_or(0.0);
-        group_ids.sort_by(|a, b| match (group_depth(*a), group_depth(*b)) {
-            (Some(a), Some(b)) => a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal),
-            (Some(_), None) => std::cmp::Ordering::Less,
-            (None, Some(_)) => std::cmp::Ordering::Greater,
-            (None, None) => std::cmp::Ordering::Equal,
-        });
+        let group_depths = self
+            .plan
+            .iter()
+            .fold(HashMap::<u32, Option<f32>>::new(), |mut depths, node| {
+                depths.entry(node.paint_group_id).or_insert(node.target.world_depth);
+                depths
+            });
+        group_ids.sort_by(|a, b| compare_paint_group_order(*a, *b, &group_depths));
         let mut ordered_depth_instances = Vec::new();
         let mut ranges = Vec::new();
         for group_id in group_ids {
             if let Some(group) = groups.get(&group_id) {
-                let external_depth = group_depth_value(group_id);
+                let external_depth = group_depths
+                    .get(&group_id)
+                    .copied()
+                    .flatten()
+                    .unwrap_or(0.0);
                 let start = ordered_depth_instances.len() as u32;
                 ordered_depth_instances.extend(group.iter().map(|instance| UiInstance {
                     depth: external_depth,
@@ -6036,6 +6291,54 @@ impl UiWgpuRenderer {
             "min_depth": depths.first().copied().unwrap_or(0.0),
             "max_depth": depths.last().copied().unwrap_or(0.0),
             "depths": depths,
+        })
+    }
+
+    /// Reports the renderer-owned paint groups after flattening and before the
+    /// GPU batch ranges are consumed. This is intentionally diagnostic-only: it
+    /// exposes the producer's group/depth/order values without making numeric
+    /// renderer IDs part of the UI protocol.
+    pub(crate) fn paint_order_diagnostics(&self) -> Value {
+        let mut group_depths = HashMap::<u32, Option<f32>>::new();
+        let mut group_nodes = BTreeMap::<u32, Vec<Value>>::new();
+        for node in &self.plan {
+            group_depths
+                .entry(node.paint_group_id)
+                .or_insert(node.target.world_depth);
+            group_nodes
+                .entry(node.paint_group_id)
+                .or_default()
+                .push(json!({
+                    "id": node.id,
+                    "parent_id": node.parent_id,
+                    "kind": node.target.kind,
+                    "world_depth": node.target.world_depth,
+                }));
+        }
+        let mut group_order = group_nodes.keys().copied().collect::<Vec<_>>();
+        group_order.sort_by(|left, right| {
+            compare_paint_group_order(*left, *right, &group_depths)
+        });
+        let groups = group_order
+            .iter()
+            .filter_map(|group_id| {
+                group_nodes.get(group_id).map(|nodes| {
+                    json!({
+                        "group_id": group_id,
+                        "world_depth": group_depths.get(group_id).copied().flatten(),
+                        "nodes": nodes,
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+        json!({
+            "policy": {
+                "world": "far_to_near",
+                "screen": "surface_declaration_order",
+                "within_group": ["rect", "material", "image", "surface", "canvas", "text"],
+            },
+            "group_order": group_order,
+            "groups": groups,
         })
     }
 
@@ -6204,43 +6507,12 @@ impl UiWgpuRenderer {
         // by the host-side projection filter. Identify each projected panel by
         // its own inherited world depth instead of relying on those removed
         // effects; otherwise every panel collapses into one paint group and the
-        // exported depth ring contains a single value.
-        let world_group_roots = self
-            .plan
-            .iter()
-            .filter(|node| {
-                if node.target.world_depth.is_none() {
-                    return false;
-                }
-                node.parent_id.as_deref().is_none_or(|parent_id| {
-                    self.plan
-                        .iter()
-                        .find(|parent| parent.id == parent_id)
-                        .is_none_or(|parent| parent.target.world_depth.is_none())
-                })
-            })
-            .map(|node| node.id.clone())
-            .collect::<HashSet<_>>();
-        let mut group_ids = HashMap::<String, u32>::new();
-        let mut next_group_id = 1_u32;
+        // exported depth ring contains a single value. Screen roots are also
+        // explicit: the fragment surface and each direct child are independent
+        // painter groups, so a later panel carries its image/text with it.
+        assign_paint_group_ids(&mut self.plan);
         for index in 0..self.plan.len() {
-            let mut root = index;
-            while !world_group_roots.contains(&self.plan[root].id) {
-                let Some(parent_id) = self.plan[root].parent_id.as_deref() else {
-                    break;
-                };
-                let Some(parent) = self.plan.iter().position(|node| node.id == parent_id) else {
-                    break;
-                };
-                root = parent;
-            }
-            let root_id = self.plan[root].id.clone();
-            let group_id = *group_ids.entry(root_id).or_insert_with(|| {
-                let id = next_group_id;
-                next_group_id = next_group_id.saturating_add(1);
-                id
-            });
-            self.plan[index].paint_group_id = group_id;
+            let group_id = self.plan[index].paint_group_id;
             self.plan[index].target.paint_group_id = group_id;
             self.sampled[index].paint_group_id = group_id;
         }
@@ -6946,10 +7218,20 @@ impl UiWgpuRenderer {
                     (bounds, resolve_shell_cut([bounds.width, bounds.height], cut))
                 })
             })
-            .max_by(|(left, _), (right, _)| {
-                (left.width * left.height)
-                    .partial_cmp(&(right.width * right.height))
-                    .unwrap_or(std::cmp::Ordering::Equal)
+            .max_by(|(left_bounds, left_cut), (right_bounds, right_cut)| {
+                let left_area = left_bounds.width * left_bounds.height;
+                let right_area = right_bounds.width * right_bounds.height;
+                match left_area.partial_cmp(&right_area).unwrap_or(std::cmp::Ordering::Equal) {
+                    // Equal area: prefer the node that actually declares cut
+                    // corners so rectangular splash/transition overlays cannot
+                    // win the shell selection on the first frame.
+                    std::cmp::Ordering::Equal => {
+                        let left_cut_sum: f32 = left_cut.iter().sum();
+                        let right_cut_sum: f32 = right_cut.iter().sum();
+                        left_cut_sum.partial_cmp(&right_cut_sum).unwrap_or(std::cmp::Ordering::Equal)
+                    }
+                    other => other,
+                }
             })
     }
 
@@ -7550,7 +7832,7 @@ fn resolve_component_style(
             },
         );
     }
-    if flags.focused {
+    if flags.focused && style.border_width > 0.0 {
         style = apply_style_patch(
             style,
             UiStylePatch {
@@ -7805,10 +8087,10 @@ fn default_component_style(kind: &UiNodeKind) -> UiStyle {
             opacity: 1.0,
         },
         UiNodeKind::Button => UiStyle {
-            background_color: [0.12, 0.32, 0.31, 1.0],
-            border_color: [0.43, 0.78, 0.73, 1.0],
-            border_width: 1.0,
-            corner_radius: 4.0,
+            background_color: [0.0, 0.0, 0.0, 0.0],
+            border_color: [0.0, 0.0, 0.0, 0.0],
+            border_width: 0.0,
+            corner_radius: 0.0,
             opacity: 1.0,
         },
         UiNodeKind::Slider | UiNodeKind::DragValue | UiNodeKind::Scrollbar => UiStyle {
@@ -7901,30 +8183,7 @@ fn component_chrome_instances(visual: &UiVisual) -> Vec<UiInstance> {
         _ => mint,
     };
     match visual.kind {
-        UiNodeKind::Button => vec![
-            chrome(
-                UiBounds {
-                    x: bounds.x + 1.0,
-                    y: bounds.y + bounds.height - 4.0,
-                    width: (bounds.width - 2.0).max(0.0),
-                    height: 3.0,
-                },
-                [0.035, 0.11, 0.11, 0.95],
-                [0.035, 0.11, 0.11, 0.95],
-                2.0,
-            ),
-            chrome(
-                UiBounds {
-                    x: bounds.x + 2.0,
-                    y: bounds.y + 2.0,
-                    width: (bounds.width - 4.0).max(0.0),
-                    height: 1.0,
-                },
-                [0.68, 0.95, 0.88, 0.56],
-                [0.68, 0.95, 0.88, 0.56],
-                1.0,
-            ),
-        ],
+        UiNodeKind::Button => vec![],
         UiNodeKind::Checkbox => vec![chrome(
             UiBounds {
                 x: bounds.x + 8.0,
@@ -14298,6 +14557,480 @@ mod tests {
                 height: 24.0
             }
         );
+    }
+
+    #[test]
+    fn screen_paint_groups_follow_surface_children_and_total_order() {
+        let mut root = node();
+        root.node_id = UiNodeId("surface".into());
+        root.bounds = UiBounds {
+            x: 0.0,
+            y: 0.0,
+            width: 200.0,
+            height: 100.0,
+        };
+        root.layout = Some(UiLayout {
+            mode: UiLayoutMode::Overlay,
+            ..UiLayout::default()
+        });
+        root.enter_transition = None;
+
+        let mut lower = node();
+        lower.node_id = UiNodeId("lower".into());
+        lower.enter_transition = None;
+        let mut nested = node();
+        nested.node_id = UiNodeId("nested".into());
+        nested.enter_transition = None;
+        lower.children = vec![nested];
+
+        let mut upper = node();
+        upper.node_id = UiNodeId("upper".into());
+        upper.enter_transition = None;
+        root.children = vec![lower, upper];
+
+        let fragment_id = UiFragmentId("screen-order".into());
+        let flattened = flatten_fragments(
+            &HashMap::from([(
+                fragment_id.clone(),
+                UiFragment {
+                    fragment_id,
+                    revision: Revision(1),
+                    root,
+                    effects: Vec::new(),
+                },
+            )]),
+            [200.0, 100.0],
+            None,
+        );
+        let mut plan = flattened
+            .into_iter()
+            .enumerate()
+            .map(|(index, (id, parent_id, target, transition))| PlannedNode {
+                id,
+                parent_id,
+                target,
+                transition,
+                instance_index: Some(index),
+                paint_group_id: 0,
+            })
+            .collect::<Vec<_>>();
+        assign_paint_group_ids(&mut plan);
+
+        let group = |suffix: &str| {
+            plan.iter()
+                .find(|node| node.id.ends_with(suffix))
+                .expect("screen-order node exists")
+                .paint_group_id
+        };
+        assert_eq!(group("/surface"), 1);
+        assert_eq!(group("/lower"), 2);
+        assert_eq!(group("/nested"), 2);
+        assert_eq!(group("/upper"), 3);
+
+        let no_depth = HashMap::from([(1, None), (2, None), (3, None)]);
+        assert_eq!(
+            compare_paint_group_order(1, 2, &no_depth),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            compare_paint_group_order(2, 3, &no_depth),
+            std::cmp::Ordering::Less
+        );
+        let mixed_depth = HashMap::from([(1, Some(0.8)), (2, Some(0.2)), (3, None)]);
+        assert_eq!(
+            compare_paint_group_order(2, 1, &mixed_depth),
+            std::cmp::Ordering::Less,
+            "far World group must be emitted before near World group"
+        );
+        assert_eq!(
+            compare_paint_group_order(2, 3, &mixed_depth),
+            std::cmp::Ordering::Less,
+            "World groups must be emitted before Screen groups"
+        );
+    }
+
+    #[test]
+    fn screen_overlay_cannot_reveal_lower_group_text_or_image() {
+        let _gpu_test = GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let (device, queue) = test_device("neon3-screen-paint-order");
+        let transparent = UiStyle {
+            background_color: [0.0, 0.0, 0.0, 0.0],
+            border_color: [0.0, 0.0, 0.0, 0.0],
+            border_width: 0.0,
+            corner_radius: 0.0,
+            opacity: 1.0,
+        };
+        let mut root = node();
+        root.node_id = UiNodeId("surface".into());
+        root.bounds = UiBounds {
+            x: 0.0,
+            y: 0.0,
+            width: 128.0,
+            height: 96.0,
+        };
+        root.layout = Some(UiLayout {
+            mode: UiLayoutMode::Overlay,
+            ..UiLayout::default()
+        });
+        root.style = transparent;
+        root.enter_transition = None;
+
+        let mut lower = node();
+        lower.node_id = UiNodeId("lower-panel".into());
+        lower.bounds = UiBounds {
+            x: 0.0,
+            y: 0.0,
+            width: 128.0,
+            height: 96.0,
+        };
+        lower.style = UiStyle {
+            background_color: [0.24, 0.02, 0.02, 1.0],
+            border_color: [0.0, 0.0, 0.0, 0.0],
+            border_width: 0.0,
+            corner_radius: 0.0,
+            opacity: 1.0,
+        };
+        lower.enter_transition = None;
+        let image_asset = AssetRef {
+            project_id: "screen-order-gpu".into(),
+            asset_id: 1,
+            revision: Revision(1),
+            kind: "image".into(),
+        };
+        let image_node = |id: &str, x: f32, y: f32| {
+            let mut value = node();
+            value.node_id = UiNodeId(id.into());
+            value.kind = UiNodeKind::Image;
+            value.bounds = UiBounds {
+                x,
+                y,
+                width: 16.0,
+                height: 16.0,
+            };
+            value.style = transparent;
+            value.image = Some(image_asset.clone());
+            value.enter_transition = None;
+            value
+        };
+        let mut lower_text = node();
+        lower_text.node_id = UiNodeId("lower-text".into());
+        lower_text.kind = UiNodeKind::Label;
+        lower_text.bounds = UiBounds {
+            x: 0.0,
+            y: 30.0,
+            width: 96.0,
+            height: 24.0,
+        };
+        lower_text.style = transparent;
+        lower_text.text = Some(TextRef::Literal {
+            value: "LOWER".into(),
+        });
+        lower_text.enter_transition = None;
+        lower.children = vec![
+            image_node("lower-image-visible", 8.0, 0.0),
+            image_node("lower-image-covered", 56.0, 30.0),
+            lower_text,
+        ];
+
+        let mut upper = node();
+        upper.node_id = UiNodeId("upper-panel".into());
+        upper.bounds = UiBounds {
+            x: 48.0,
+            y: 16.0,
+            width: 64.0,
+            height: 64.0,
+        };
+        upper.style = UiStyle {
+            background_color: [0.0, 0.0, 0.0, 1.0],
+            border_color: [0.0, 0.0, 0.0, 0.0],
+            border_width: 0.0,
+            corner_radius: 0.0,
+            opacity: 1.0,
+        };
+        upper.enter_transition = None;
+        root.children = vec![lower, upper];
+
+        let fragment_id = UiFragmentId("screen-order-gpu".into());
+        let fragments = HashMap::from([(
+            fragment_id.clone(),
+            UiFragment {
+                fragment_id,
+                revision: Revision(1),
+                root,
+                effects: Vec::new(),
+            },
+        )]);
+        let mut renderer = UiWgpuRenderer::new(&device, wgpu::TextureFormat::Rgba8Unorm);
+        renderer
+            .preload_image(
+                &device,
+                &queue,
+                &AssetBytes {
+                    asset: image_asset,
+                    media_type: "application/x-neon-rgba8".into(),
+                    width: Some(2),
+                    height: Some(2),
+                    bytes: vec![255; 2 * 2 * 4],
+                },
+            )
+            .expect("screen-order image must upload");
+        let pixels = render_renderer_offscreen_for_test(
+            &mut renderer,
+            &device,
+            &queue,
+            wgpu::TextureFormat::Rgba8Unorm,
+            &fragments,
+            [128, 96],
+            1.0,
+        );
+        let bright = |x: u32, y: u32| {
+            let offset = ((y * 128 + x) * 4) as usize;
+            let pixel = &pixels[offset..offset + 4];
+            pixel[0] > 120 && pixel[1] > 120 && pixel[2] > 120 && pixel[3] > 100
+        };
+        let white = |x: u32, y: u32| {
+            let offset = ((y * 128 + x) * 4) as usize;
+            let pixel = &pixels[offset..offset + 4];
+            pixel[0] > 220 && pixel[1] > 220 && pixel[2] > 220 && pixel[3] > 220
+        };
+        let visible_image_pixels = (8..24)
+            .flat_map(|x| (0..16).map(move |y| (x, y)))
+            .filter(|(x, y)| white(*x, *y))
+            .count();
+        let covered_image_pixels = (56..72)
+            .flat_map(|x| (30..46).map(move |y| (x, y)))
+            .filter(|(x, y)| white(*x, *y))
+            .count();
+        let visible_text_pixels = (8..48)
+            .flat_map(|x| (26..58).map(move |y| (x, y)))
+            .filter(|(x, y)| bright(*x, *y))
+            .count();
+        let covered_text_pixels = (48..112)
+            .flat_map(|x| (26..70).map(move |y| (x, y)))
+            .filter(|(x, y)| bright(*x, *y))
+            .count();
+        let diagnostics = renderer.paint_order_diagnostics();
+        let lower_group = renderer
+            .plan
+            .iter()
+            .find(|node| node.id.ends_with("/lower-panel"))
+            .expect("lower panel is planned")
+            .paint_group_id;
+        let upper_group = renderer
+            .plan
+            .iter()
+            .find(|node| node.id.ends_with("/upper-panel"))
+            .expect("upper panel is planned")
+            .paint_group_id;
+        let pass = lower_group < upper_group
+            && visible_image_pixels > 0
+            && covered_image_pixels == 0
+            && visible_text_pixels > 0
+            && covered_text_pixels == 0;
+        println!(
+            "{}",
+            json!({
+                "probe": "screen-ui-paint-order.v1",
+                "frame_sequence": 1,
+                "input": {
+                    "surface": "screen-order-gpu",
+                    "lower_panel": "lower-panel",
+                    "upper_panel": "upper-panel",
+                    "image": "lower-image-covered",
+                    "overlap": {"x": [48, 112], "y": [26, 70]},
+                },
+                "producer": {
+                    "group_order": diagnostics.get("group_order"),
+                    "lower_group": lower_group,
+                    "upper_group": upper_group,
+                    "world_depth": null,
+                },
+                "consumer": {
+                    "buffer_id": "offscreen:screen-order-gpu:f1",
+                    "coordinate_space": "logical-pixel",
+                    "visible_image_pixels": visible_image_pixels,
+                    "covered_image_pixels": covered_image_pixels,
+                    "visible_text_pixels": visible_text_pixels,
+                    "covered_text_pixels": covered_text_pixels,
+                },
+                "diagnostic": {
+                    "missing_data": visible_image_pixels == 0 || visible_text_pixels == 0,
+                    "stale_data": false,
+                    "coordinate_mismatch": false,
+                    "comparison_direction_error": covered_image_pixels > 0 || covered_text_pixels > 0,
+                },
+                "result": if pass { "passed" } else { "failed" },
+                "pass": pass,
+            })
+        );
+        assert!(pass, "Screen UI overlay order must cover lower text");
+    }
+
+    #[test]
+    fn material_instances_keep_their_own_gpu_ranges() {
+        let _gpu_test = GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let (device, queue) = test_device("neon3-material-instance-ranges");
+        let transparent = UiStyle {
+            background_color: [0.0, 0.0, 0.0, 0.0],
+            border_color: [0.0, 0.0, 0.0, 0.0],
+            border_width: 0.0,
+            corner_radius: 0.0,
+            opacity: 1.0,
+        };
+        let mut root = node();
+        root.node_id = UiNodeId("surface".into());
+        root.bounds = UiBounds {
+            x: 0.0,
+            y: 0.0,
+            width: 128.0,
+            height: 96.0,
+        };
+        root.layout = Some(UiLayout {
+            mode: UiLayoutMode::Overlay,
+            ..UiLayout::default()
+        });
+        root.style = transparent;
+        root.enter_transition = None;
+
+        let package = |package_id: &str, color: &str| UiShaderPackage {
+            package_id: package_id.into(),
+            version: 1,
+            source_digest: format!("test-{package_id}"),
+            source_bytes: format!(
+                "fn material(input: MaterialInput) -> vec4<f32> {{ return vec4<f32>({color}, 1.0); }}"
+            )
+            .into_bytes(),
+            entry_point: "material".into(),
+            fallback: "standard_ui".into(),
+            parameters: Vec::new(),
+        };
+        let material = |package_id: &str| UiMaterialRef {
+            package_id: package_id.into(),
+            ..UiMaterialRef::default()
+        };
+        let panel = |id: &str, bounds: UiBounds| {
+            let mut value = node();
+            value.node_id = UiNodeId(id.into());
+            value.bounds = bounds;
+            value.style = transparent;
+            value.enter_transition = None;
+            value
+        };
+        root.children = vec![
+            panel(
+                "small-panel",
+                UiBounds {
+                    x: 80.0,
+                    y: 60.0,
+                    width: 32.0,
+                    height: 32.0,
+                },
+            ),
+            panel(
+                "large-panel",
+                UiBounds {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 64.0,
+                    height: 64.0,
+                },
+            ),
+        ];
+        let fragment_id = UiFragmentId("material-ranges".into());
+        let fragments = HashMap::from([(
+            fragment_id.clone(),
+            UiFragment {
+                fragment_id,
+                revision: Revision(1),
+                root,
+                effects: vec![
+                    UiEffect::Material {
+                        node_id: UiNodeId("small-panel".into()),
+                        material: material("a-small-red"),
+                    },
+                    UiEffect::Material {
+                        node_id: UiNodeId("large-panel".into()),
+                        material: material("z-large-blue"),
+                    },
+                ],
+            },
+        )]);
+        let mut renderer = UiWgpuRenderer::new(&device, wgpu::TextureFormat::Rgba8Unorm);
+        renderer.sync_material_packages(
+            &device,
+            &[
+                package("a-small-red", "1.0, 0.0, 0.0"),
+                package("z-large-blue", "0.0, 0.0, 1.0"),
+            ],
+        );
+        let pixels = render_renderer_offscreen_for_test(
+            &mut renderer,
+            &device,
+            &queue,
+            wgpu::TextureFormat::Rgba8Unorm,
+            &fragments,
+            [128, 96],
+            1.0,
+        );
+        let pixel = |x: u32, y: u32| {
+            let offset = ((y * 128 + x) * 4) as usize;
+            [
+                pixels[offset],
+                pixels[offset + 1],
+                pixels[offset + 2],
+                pixels[offset + 3],
+            ]
+        };
+        let small_pixel = pixel(96, 76);
+        let large_pixel = pixel(20, 20);
+        let small_is_red = small_pixel[0] > 200
+            && small_pixel[1] < 40
+            && small_pixel[2] < 40
+            && small_pixel[3] > 200;
+        let large_is_blue = large_pixel[2] > 200
+            && large_pixel[0] < 40
+            && large_pixel[1] < 40
+            && large_pixel[3] > 200;
+        let diagnostics = renderer.paint_order_diagnostics();
+        let pass = small_is_red && large_is_blue;
+        println!(
+            "{}",
+            json!({
+                "probe": "material-instance-ranges.v1",
+                "frame_sequence": 1,
+                "input": {
+                    "small_panel": {"bounds": [80, 60, 32, 32], "material": "a-small-red"},
+                    "large_panel": {"bounds": [0, 0, 64, 64], "material": "z-large-blue"},
+                },
+                "producer": {
+                    "material_buffer": "dedicated-material-instance-buffer",
+                    "group_order": diagnostics.get("group_order"),
+                    "material_batches": [
+                        {"package": "a-small-red", "instance_count": 1},
+                        {"package": "z-large-blue", "instance_count": 1},
+                    ],
+                },
+                "consumer": {
+                    "buffer_id": "offscreen:material-ranges:f1",
+                    "coordinate_space": "logical-pixel",
+                    "small_pixel": small_pixel,
+                    "large_pixel": large_pixel,
+                },
+                "diagnostic": {
+                    "missing_data": !small_is_red || !large_is_blue,
+                    "stale_data": false,
+                    "coordinate_mismatch": false,
+                    "comparison_direction_error": false,
+                },
+                "result": if pass { "passed" } else { "failed" },
+                "pass": pass,
+            })
+        );
+        assert!(pass, "material instances must retain their own geometry ranges");
     }
 
     #[test]

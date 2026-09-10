@@ -406,6 +406,7 @@ impl Eventd {
             "camera.pose.",
             "selection.",
             "ui.file_drop.",
+            "shader.",
         ] {
             core.register_namespace(namespace, 1);
         }

@@ -43,3 +43,4 @@
 /implement_schema.py
 /update_flow_behind.py
 /crates/neon-wgpu-runtime/src/lib.rs.broken-backup
+*.py
