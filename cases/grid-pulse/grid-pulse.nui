@@ -1,0 +1,80 @@
+surface root w 326 h 362
+
+input grid array[36] f32
+input cell_0_on bool = $grid[0] > 0.5
+input cell_1_on bool = $grid[1] > 0.5
+input cell_2_on bool = $grid[2] > 0.5
+input cell_3_on bool = $grid[3] > 0.5
+input cell_4_on bool = $grid[4] > 0.5
+input cell_5_on bool = $grid[5] > 0.5
+input cell_6_on bool = $grid[6] > 0.5
+input cell_7_on bool = $grid[7] > 0.5
+input cell_8_on bool = $grid[8] > 0.5
+input cell_9_on bool = $grid[9] > 0.5
+input cell_10_on bool = $grid[10] > 0.5
+input cell_11_on bool = $grid[11] > 0.5
+input cell_12_on bool = $grid[12] > 0.5
+input cell_13_on bool = $grid[13] > 0.5
+input cell_14_on bool = $grid[14] > 0.5
+input cell_15_on bool = $grid[15] > 0.5
+input cell_16_on bool = $grid[16] > 0.5
+input cell_17_on bool = $grid[17] > 0.5
+input cell_18_on bool = $grid[18] > 0.5
+input cell_19_on bool = $grid[19] > 0.5
+input cell_20_on bool = $grid[20] > 0.5
+input cell_21_on bool = $grid[21] > 0.5
+input cell_22_on bool = $grid[22] > 0.5
+input cell_23_on bool = $grid[23] > 0.5
+input cell_24_on bool = $grid[24] > 0.5
+input cell_25_on bool = $grid[25] > 0.5
+input cell_26_on bool = $grid[26] > 0.5
+input cell_27_on bool = $grid[27] > 0.5
+input cell_28_on bool = $grid[28] > 0.5
+input cell_29_on bool = $grid[29] > 0.5
+input cell_30_on bool = $grid[30] > 0.5
+input cell_31_on bool = $grid[31] > 0.5
+input cell_32_on bool = $grid[32] > 0.5
+input cell_33_on bool = $grid[33] > 0.5
+input cell_34_on bool = $grid[34] > 0.5
+input cell_35_on bool = $grid[35] > 0.5
+
+  text title value "GRID PULSE 6x6" x 16 y 8 w 200 h 20
+
+  panel grid x 16 y 44 w 294 h 294 fill #1a1a22
+    panel cell_0 x 0 y 0 w 44 h 44 fill #4da6ff visible $cell_0_on
+    panel cell_1 x 50 y 0 w 44 h 44 fill #4da6ff visible $cell_1_on
+    panel cell_2 x 100 y 0 w 44 h 44 fill #4da6ff visible $cell_2_on
+    panel cell_3 x 150 y 0 w 44 h 44 fill #4da6ff visible $cell_3_on
+    panel cell_4 x 200 y 0 w 44 h 44 fill #4da6ff visible $cell_4_on
+    panel cell_5 x 250 y 0 w 44 h 44 fill #4da6ff visible $cell_5_on
+    panel cell_6 x 0 y 50 w 44 h 44 fill #4da6ff visible $cell_6_on
+    panel cell_7 x 50 y 50 w 44 h 44 fill #4da6ff visible $cell_7_on
+    panel cell_8 x 100 y 50 w 44 h 44 fill #4da6ff visible $cell_8_on
+    panel cell_9 x 150 y 50 w 44 h 44 fill #4da6ff visible $cell_9_on
+    panel cell_10 x 200 y 50 w 44 h 44 fill #4da6ff visible $cell_10_on
+    panel cell_11 x 250 y 50 w 44 h 44 fill #4da6ff visible $cell_11_on
+    panel cell_12 x 0 y 100 w 44 h 44 fill #4da6ff visible $cell_12_on
+    panel cell_13 x 50 y 100 w 44 h 44 fill #4da6ff visible $cell_13_on
+    panel cell_14 x 100 y 100 w 44 h 44 fill #4da6ff visible $cell_14_on
+    panel cell_15 x 150 y 100 w 44 h 44 fill #4da6ff visible $cell_15_on
+    panel cell_16 x 200 y 100 w 44 h 44 fill #4da6ff visible $cell_16_on
+    panel cell_17 x 250 y 100 w 44 h 44 fill #4da6ff visible $cell_17_on
+    panel cell_18 x 0 y 150 w 44 h 44 fill #4da6ff visible $cell_18_on
+    panel cell_19 x 50 y 150 w 44 h 44 fill #4da6ff visible $cell_19_on
+    panel cell_20 x 100 y 150 w 44 h 44 fill #4da6ff visible $cell_20_on
+    panel cell_21 x 150 y 150 w 44 h 44 fill #4da6ff visible $cell_21_on
+    panel cell_22 x 200 y 150 w 44 h 44 fill #4da6ff visible $cell_22_on
+    panel cell_23 x 250 y 150 w 44 h 44 fill #4da6ff visible $cell_23_on
+    panel cell_24 x 0 y 200 w 44 h 44 fill #4da6ff visible $cell_24_on
+    panel cell_25 x 50 y 200 w 44 h 44 fill #4da6ff visible $cell_25_on
+    panel cell_26 x 100 y 200 w 44 h 44 fill #4da6ff visible $cell_26_on
+    panel cell_27 x 150 y 200 w 44 h 44 fill #4da6ff visible $cell_27_on
+    panel cell_28 x 200 y 200 w 44 h 44 fill #4da6ff visible $cell_28_on
+    panel cell_29 x 250 y 200 w 44 h 44 fill #4da6ff visible $cell_29_on
+    panel cell_30 x 0 y 250 w 44 h 44 fill #4da6ff visible $cell_30_on
+    panel cell_31 x 50 y 250 w 44 h 44 fill #4da6ff visible $cell_31_on
+    panel cell_32 x 100 y 250 w 44 h 44 fill #4da6ff visible $cell_32_on
+    panel cell_33 x 150 y 250 w 44 h 44 fill #4da6ff visible $cell_33_on
+    panel cell_34 x 200 y 250 w 44 h 44 fill #4da6ff visible $cell_34_on
+    panel cell_35 x 250 y 250 w 44 h 44 fill #4da6ff visible $cell_35_on
+

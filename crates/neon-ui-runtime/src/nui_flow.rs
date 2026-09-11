@@ -6253,4 +6253,25 @@ panel workspace row gap 8
         .unwrap_err();
         assert_eq!(error.diagnostics[0].code, "nui_flow_invalid_input");
     }
+
+
+    #[test]
+    fn grid_pulse_case_parses_all_array_bindings_and_derived() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../cases/grid-pulse/grid-pulse.nui");
+        let source = std::fs::read_to_string(path).expect("grid-pulse.nui must exist");
+        let document = parse_nui_flow(&source).expect("grid-pulse case must parse");
+        // 1 array input + 36 derived bool inputs = 37 inputs
+        assert_eq!(document.input_schema.slots.len(), 37);
+        let grid = document.input_schema.slots.iter().find(|s| s.key == "grid").unwrap();
+        match &grid.kind {
+            neon_ui_schema::UiInputKind::Array { length, .. } => assert_eq!(*length, 36),
+            _ => panic!("grid must be Array"),
+        }
+        // 36 derived expressions
+        let derived_count = document.input_schema.slots.iter().filter(|s| s.derived_expression.is_some()).count();
+        assert_eq!(derived_count, 36);
+        // 36 cell visible bindings
+        let visible_bindings = document.ir.bindings.iter().filter(|b| b.property == neon_ui_schema::UiBoundProperty::Visible).count();
+        assert_eq!(visible_bindings, 36, "expected 36 cell visible bindings");
+    }
 }
