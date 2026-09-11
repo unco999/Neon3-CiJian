@@ -5559,8 +5559,16 @@ impl UiWgpuRenderer {
                                 | UiNodeKind::Selectable
                                 | UiNodeKind::Scrollbar
                                 | UiNodeKind::ProgressBar
-                        ) || text.is_none()
-                        {
+                        ) {
+                            return None;
+                        }
+                        // Rich text on non-top-layer nodes: layout directly.
+                        // (Static text cache below is keyed on a plain &str,
+                        // so rich spans take a separate path for now.)
+                        if text.is_none() {
+                            if let Some(TextRef::Rich { spans }) = visual.text.as_ref() {
+                                return layout_rich_text(device, queue, font, visual, spans);
+                            }
                             return None;
                         }
                         let text = text.unwrap();
@@ -8891,34 +8899,170 @@ struct TextMeasure {
     line_height: f32,
 }
 
+/// Whether `ch` belongs to a CJK script where line-breaking is allowed
+/// between any two characters (no whitespace word boundaries).
+fn is_cjk_breakable(ch: char) -> bool {
+    matches!(ch as u32,
+        0x3000..=0x303F | // CJK Symbols and Punctuation
+        0x3040..=0x309F | // Hiragana
+        0x30A0..=0x30FF | // Katakana
+        0x3400..=0x4DBF | // CJK Unified Ideographs Extension A
+        0x4E00..=0x9FFF | // CJK Unified Ideographs
+        0xAC00..=0xD7AF | // Hangul Syllables
+        0xF900..=0xFAFF | // CJK Compatibility Ideographs
+        0xFF00..=0xFFEF   // Halfwidth and Fullwidth Forms (full-width latin/digits/punct)
+    )
+}
+
+/// A single atomic unit for line-breaking.
+#[derive(Debug)]
+enum TextToken {
+    /// A contiguous run of non-space, non-CJK characters (a Latin word,
+    /// number, or symbol run). Must not be split mid-word unless it
+    /// overflows the entire line width.
+    Word(Vec<char>),
+    /// A single CJK character. May break before or after.
+    Cjk(char),
+    /// A space character. Collapsible at line start/end.
+    Space,
+}
+
+/// Tokenize `text` into line-breaking units. Explicit `\n` is returned as
+/// `Word(vec!['\n'])` so the caller can detect it without a separate enum
+/// variant; it is always flushed before being pushed.
+fn tokenize_text(text: &str) -> Vec<TextToken> {
+    let mut tokens = Vec::new();
+    let mut word: Vec<char> = Vec::new();
+    for ch in text.chars() {
+        if ch == '\n' {
+            if !word.is_empty() {
+                tokens.push(TextToken::Word(std::mem::take(&mut word)));
+            }
+            tokens.push(TextToken::Word(vec!['\n']));
+            continue;
+        }
+        if ch == ' ' {
+            if !word.is_empty() {
+                tokens.push(TextToken::Word(std::mem::take(&mut word)));
+            }
+            tokens.push(TextToken::Space);
+        } else if is_cjk_breakable(ch) {
+            if !word.is_empty() {
+                tokens.push(TextToken::Word(std::mem::take(&mut word)));
+            }
+            tokens.push(TextToken::Cjk(ch));
+        } else {
+            word.push(ch);
+        }
+    }
+    if !word.is_empty() {
+        tokens.push(TextToken::Word(word));
+    }
+    tokens
+}
+
 /// Break `text` into character groups per line using the same wrapping
 /// rules that `measure_text_lines` and `layout_text` rely on.  This is the
 /// single source of truth for line-breaking decisions.
+///
+/// Rules:
+/// - Latin words (contiguous non-space non-CJK) break only at word
+///   boundaries; a word longer than the line is split character-by-character.
+/// - CJK characters may break between any two characters.
+/// - Spaces are collapsed at line start and omitted at line end.
+/// - Explicit `\n` always forces a line break.
 fn break_text_lines(
     text: &str,
     available_width: f32,
-    advance: &impl Fn(char) -> f32,
+    advance: &impl Fn(usize, char) -> f32,
 ) -> Vec<Vec<char>> {
+    /// Push the current line after stripping trailing spaces. Trailing spaces
+    /// are never visually meaningful and must not count toward line width.
+    fn push_line(lines: &mut Vec<Vec<char>>, line: &mut Vec<char>) {
+        while line.last() == Some(&' ') {
+            line.pop();
+        }
+        lines.push(std::mem::take(line));
+    }
+
     let width = available_width.max(1.0);
     let mut lines: Vec<Vec<char>> = Vec::new();
     let mut line: Vec<char> = Vec::new();
     let mut line_width = 0.0;
-    for ch in text.chars() {
-        if ch == '\n' {
-            lines.push(std::mem::take(&mut line));
-            line_width = 0.0;
-            continue;
+    let mut char_index = 0usize;
+
+    for token in tokenize_text(text) {
+        match token {
+            TextToken::Word(chars) => {
+                // Explicit newline marker.
+                if chars.len() == 1 && chars[0] == '\n' {
+                    push_line(&mut lines, &mut line);
+                    line_width = 0.0;
+                    char_index += 1;
+                    continue;
+                }
+                let word_width: f32 = chars
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &ch)| advance(char_index + i, ch))
+                    .sum();
+                // If the word does not fit on the current line and the line
+                // is non-empty, break before the word.
+                if !line.is_empty() && line_width + word_width > width {
+                    push_line(&mut lines, &mut line);
+                    line_width = 0.0;
+                }
+                if word_width <= width {
+                    // Word fits on a (possibly fresh) line.
+                    let n = chars.len();
+                    for (i, ch) in chars.into_iter().enumerate() {
+                        line_width += advance(char_index + i, ch);
+                        line.push(ch);
+                    }
+                    char_index += n;
+                } else {
+                    // Word itself overflows the line: split character by
+                    // character (same behaviour as the old per-character
+                    // breaker for unavoidable overflow).
+                    for ch in chars {
+                        let gw = advance(char_index, ch);
+                        if !line.is_empty() && line_width + gw > width {
+                            push_line(&mut lines, &mut line);
+                            line_width = 0.0;
+                        }
+                        line_width += gw;
+                        line.push(ch);
+                        char_index += 1;
+                    }
+                }
+            }
+            TextToken::Cjk(ch) => {
+                let gw = advance(char_index, ch);
+                if !line.is_empty() && line_width + gw > width {
+                    push_line(&mut lines, &mut line);
+                    line_width = 0.0;
+                }
+                line_width += gw;
+                line.push(ch);
+                char_index += 1;
+            }
+            TextToken::Space => {
+                let gw = advance(char_index, ' ');
+                // Collapse leading spaces; trailing spaces are stripped by
+                // push_line. Never break *because* of a space.
+                if line.is_empty() {
+                    char_index += 1;
+                    continue;
+                }
+                line_width += gw;
+                line.push(' ');
+                char_index += 1;
+            }
         }
-        let gw = advance(ch);
-        if !line.is_empty() && line_width + gw > width {
-            lines.push(std::mem::take(&mut line));
-            line_width = 0.0;
-        }
-        line_width += gw;
-        line.push(ch);
     }
+
     if !line.is_empty() || lines.is_empty() {
-        lines.push(line);
+        push_line(&mut lines, &mut line);
     }
     lines
 }
@@ -8931,13 +9075,18 @@ fn measure_text_lines(
     text: &str,
     available_width: f32,
     line_height: f32,
-    advance: &impl Fn(char) -> f32,
+    advance: &impl Fn(usize, char) -> f32,
 ) -> TextMeasure {
     let lines = break_text_lines(text, available_width, advance);
     let line_count = lines.len() as u32;
     let max_line_width = lines
         .iter()
-        .map(|line| line.iter().map(|&ch| advance(ch)).sum::<f32>())
+        .map(|line| {
+            line.iter()
+                .enumerate()
+                .map(|(i, &ch)| advance(i, ch))
+                .sum::<f32>()
+        })
         .fold(0.0f32, f32::max);
     TextMeasure {
         line_count,
@@ -8966,7 +9115,7 @@ fn layout_text(
     // cannot change how many glyphs fit on a line.
     let wrap_width =
         (visual.logical_bounds.width.max(1.0) - text_safe_inset(&visual.kind)).max(1.0);
-    let advance = |ch: char| {
+    let advance = |_idx: usize, ch: char| {
         // Use atlas glyph advance (cached) so line-breaking is identical to
         // what intrinsic_size would compute.
         font.font.metrics(ch, FONT_RASTER_SIZE).advance_width
@@ -9029,30 +9178,99 @@ fn layout_rich_text(
 ) -> Option<Vec<UiTextInstance>> {
     let clip = text_clip(visual)?;
     let world_scale = visual.world_scale.unwrap_or(1.0);
-    let max_scale = spans.iter().map(|span| span.scale).fold(1.0_f32, f32::max);
-    let line_height = font.line_height * world_scale * max_scale;
-    let top = visual.bounds.y + ((visual.bounds.height - line_height).max(0.0) * 0.5);
-    let baseline = top + font.ascent * world_scale * max_scale;
-    let mut x = visual.bounds.x + 10.0;
-    let mut result = Vec::new();
+
+    // Flatten spans into per-character style so line-breaking can use the
+    // real scaled advance of each character (different spans may have
+    // different scales).
+    #[derive(Clone, Copy)]
+    struct StyledChar {
+        ch: char,
+        scale: f32,
+        color: [f32; 4],
+    }
+    let mut styled: Vec<StyledChar> = Vec::new();
     for span in spans {
         let scale = world_scale * span.scale;
+        let color = [
+            span.color[0],
+            span.color[1],
+            span.color[2],
+            span.color[3] * visual.style.opacity,
+        ];
         for ch in span.value.chars() {
-            let glyph = ensure_glyph(device, queue, font, ch).ok()?;
+            styled.push(StyledChar { ch, scale, color });
+        }
+    }
+    if styled.is_empty() {
+        return Some(Vec::new());
+    }
+
+    let wrap_width =
+        (visual.logical_bounds.width.max(1.0) - text_safe_inset(&visual.kind)).max(1.0);
+    let flat_text: String = styled.iter().map(|s| s.ch).collect();
+
+    // Advance for line-breaking: use the per-character scaled advance.
+    let advance = |idx: usize, _ch: char| -> f32 {
+        styled
+            .get(idx)
+            .map(|s| font.font.metrics(s.ch, FONT_RASTER_SIZE).advance_width * s.scale)
+            .unwrap_or(0.0)
+    };
+
+    let char_lines = break_text_lines(&flat_text, wrap_width, &advance);
+
+    // Line height uses the maximum scale across the whole rich text block.
+    let max_scale = styled.iter().map(|s| s.scale).fold(1.0_f32, f32::max);
+    let line_height = font.line_height * max_scale;
+    let block_height = line_height * char_lines.len() as f32;
+    let top = visual.bounds.y + ((visual.bounds.height - block_height).max(0.0) * 0.5);
+
+    let mut result = Vec::new();
+    let mut global_idx = 0usize;
+    for (line_index, line_chars) in char_lines.into_iter().enumerate() {
+        let baseline = top + font.ascent * max_scale + line_index as f32 * line_height;
+        // Compute line advance first for Button centering.
+        let line_advance: f32 = line_chars
+            .iter()
+            .enumerate()
+            .map(|(i, _ch)| {
+                let s = styled[global_idx + i];
+                font.font.metrics(s.ch, FONT_RASTER_SIZE).advance_width * s.scale
+            })
+            .sum();
+        let mut x = if visual.kind == UiNodeKind::Button {
+            visual.bounds.x + ((visual.bounds.width - line_advance).max(0.0) * 0.5)
+        } else {
+            visual.bounds.x
+                + if visual.kind == UiNodeKind::TextInput {
+                    TEXT_INPUT_INSET * world_scale
+                } else if matches!(
+                    visual.kind,
+                    UiNodeKind::Checkbox | UiNodeKind::RadioButton | UiNodeKind::Selectable
+                ) {
+                    30.0 * world_scale
+                } else {
+                    10.0 * world_scale
+                }
+        };
+        for _ch in line_chars {
+            let s = styled[global_idx];
+            let glyph = ensure_glyph(device, queue, font, s.ch).ok()?;
             result.push(UiTextInstance {
                 rect: [
-                    x + glyph.xmin * scale,
-                    baseline + glyph.plane_min_y * scale,
-                    glyph.width * scale,
-                    glyph.height * scale,
+                    x + glyph.xmin * s.scale,
+                    baseline + glyph.plane_min_y * s.scale,
+                    glyph.width * s.scale,
+                    glyph.height * s.scale,
                 ],
-                color: [span.color[0], span.color[1], span.color[2], span.color[3] * visual.style.opacity],
+                color: s.color,
                 clip,
                 uv: glyph.uv,
                 depth: color_pass_depth(visual.world_depth),
                 paint_group_id: visual.paint_group_id,
             });
-            x += glyph.advance * scale;
+            x += glyph.advance * s.scale;
+            global_idx += 1;
         }
     }
     Some(result)
@@ -10201,7 +10419,7 @@ fn intrinsic_size(node: &UiNode, font: Option<&ResidentFont>) -> [f32; 2] {
             },
         };
         let line_height = font.map_or(FONT_RASTER_SIZE, |font| font.line_height);
-        let advance = |ch: char| {
+        let advance = |_idx: usize, ch: char| {
             font.map_or_else(
                 || {
                     if ch.is_ascii() {
@@ -10219,7 +10437,7 @@ fn intrinsic_size(node: &UiNode, font: Option<&ResidentFont>) -> [f32; 2] {
         let available_width = if node.bounds.width > text_inset {
             (node.bounds.width - text_inset).max(1.0)
         } else {
-            text.chars().map(advance).sum::<f32>()
+            text.chars().enumerate().map(|(i, ch)| advance(i, ch)).sum::<f32>()
         };
         // intrinsic_size and layout_text share break_text_lines via
         // measure_text_lines, so the line count and max width always match
@@ -17907,12 +18125,14 @@ mod tests {
 
     #[test]
     fn ui_view_abi_matches_time_uniform() {
-        assert_eq!(std::mem::size_of::<UiView>(), 16);
+        // viewport(8) + color_mode(4) + time_seconds(4) + extras(10×16=160) = 176
+        assert_eq!(std::mem::size_of::<UiView>(), 176);
         assert_eq!(std::mem::align_of::<UiView>(), 4);
         let view = UiView {
             viewport: [12.0, 34.0],
             color_mode: 1,
             time_seconds: 1.25,
+            extras: [[0.0; 4]; 10],
         };
         let bytes = bytemuck::bytes_of(&view);
         assert_eq!(&bytes[0..4], &12.0f32.to_ne_bytes());
@@ -17925,7 +18145,7 @@ mod tests {
 
     const TEST_LINE_HEIGHT: f32 = 20.0;
 
-    fn fixed_advance(ch: char) -> f32 {
+    fn fixed_advance(_idx: usize, ch: char) -> f32 {
         if ch.is_ascii() { 8.0 } else { 16.0 }
     }
 
@@ -17946,13 +18166,21 @@ mod tests {
     }
 
     #[test]
-    fn measure_cjk_auto_wrap_two_lines() {
-        // 地(16) 形(16) U(8) I(8) 测(16) 试(16) = 80 total.
-        // Width 40: [地形U](40) then [I测试](40) → 2 lines, max width 40
+    fn measure_cjk_auto_wrap_keeps_latin_word_intact() {
+        // 地(16) 形(16) [UI word=16] 测(16) 试(16) = 80 total.
+        // Width 40: "UI" is one word and must not be split.
+        //   line1: 地形 (32) — UI would overflow, break before it
+        //   line2: UI测 (8+8+16=32) — 试 would overflow, break before it
+        //   line3: 试 (16)
+        // → 3 lines, max width 32
         let m = measure_text_lines("地形UI测试", 40.0, TEST_LINE_HEIGHT, &fixed_advance);
-        assert_eq!(m.line_count, 2);
-        assert_eq!(m.max_line_width, 40.0);
-        assert_eq!(m.total_height, TEST_LINE_HEIGHT * 2.0);
+        assert_eq!(m.line_count, 3);
+        assert_eq!(m.max_line_width, 32.0);
+        assert_eq!(m.total_height, TEST_LINE_HEIGHT * 3.0);
+        let lines = break_text_lines("地形UI测试", 40.0, &fixed_advance);
+        assert_eq!(lines[0].iter().collect::<String>(), "地形");
+        assert_eq!(lines[1].iter().collect::<String>(), "UI测");
+        assert_eq!(lines[2].iter().collect::<String>(), "试");
     }
 
     #[test]
@@ -18026,6 +18254,74 @@ mod tests {
         assert_eq!(lines[1].iter().collect::<String>(), "World");
         let m = measure_text_lines(text, width, TEST_LINE_HEIGHT, advance);
         assert_eq!(m.line_count as usize, lines.len());
+    }
+
+    #[test]
+    fn measure_english_breaks_at_word_boundary() {
+        // "Hello World" = Hello(40) + space(8) + World(40) = 88
+        // Width 56: Hello(40) fits; space+World would be 48, 40+48=88>56
+        //   → break before World, line1 = "Hello" (40), line2 = "World" (40)
+        let m = measure_text_lines("Hello World", 56.0, TEST_LINE_HEIGHT, &fixed_advance);
+        assert_eq!(m.line_count, 2);
+        assert_eq!(m.max_line_width, 40.0);
+        let lines = break_text_lines("Hello World", 56.0, &fixed_advance);
+        assert_eq!(lines[0].iter().collect::<String>(), "Hello");
+        assert_eq!(lines[1].iter().collect::<String>(), "World");
+    }
+
+    #[test]
+    fn measure_long_word_overflows_char_by_char() {
+        // "Super" = 5×8=40, width=16. Word itself overflows → split char by char.
+        // Su(16) / pe(16) / r(8) → 3 lines
+        let m = measure_text_lines("Super", 16.0, TEST_LINE_HEIGHT, &fixed_advance);
+        assert_eq!(m.line_count, 3);
+        assert_eq!(m.max_line_width, 16.0);
+        let lines = break_text_lines("Super", 16.0, &fixed_advance);
+        assert_eq!(lines[0].iter().collect::<String>(), "Su");
+        assert_eq!(lines[1].iter().collect::<String>(), "pe");
+        assert_eq!(lines[2].iter().collect::<String>(), "r");
+    }
+
+    #[test]
+    fn measure_spaces_collapsed_at_line_edges() {
+        // "A  B" width 24: A(8)+space(8)+space(8)=24 fits on line1.
+        // B would overflow → line2 = "B". Trailing spaces on line1 are stripped.
+        let lines = break_text_lines("A  B", 24.0, &fixed_advance);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].iter().collect::<String>(), "A");
+        assert_eq!(lines[1].iter().collect::<String>(), "B");
+    }
+
+    #[test]
+    fn measure_trailing_space_that_overflows_is_dropped() {
+        // "AB C" width 24: AB(16)+space(8)=24 exactly fits.
+        // C(8) would overflow → line2 = "C". Trailing space on line1 is stripped.
+        let lines = break_text_lines("AB C", 24.0, &fixed_advance);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].iter().collect::<String>(), "AB");
+        assert_eq!(lines[1].iter().collect::<String>(), "C");
+    }
+
+    #[test]
+    fn measure_cjk_breaks_between_any_chars() {
+        // Pure CJK: 地(16) 形(16) 编(16) 辑(16) = 64, width 32
+        // → [地形](32) / [编辑](32), 2 lines
+        let m = measure_text_lines("地形编辑", 32.0, TEST_LINE_HEIGHT, &fixed_advance);
+        assert_eq!(m.line_count, 2);
+        assert_eq!(m.max_line_width, 32.0);
+        let lines = break_text_lines("地形编辑", 32.0, &fixed_advance);
+        assert_eq!(lines[0].iter().collect::<String>(), "地形");
+        assert_eq!(lines[1].iter().collect::<String>(), "编辑");
+    }
+
+    #[test]
+    fn measure_explicit_newline_creates_empty_line() {
+        // "A\n\nB" → 3 lines: "A", "", "B"
+        let lines = break_text_lines("A\n\nB", 100.0, &fixed_advance);
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0].iter().collect::<String>(), "A");
+        assert!(lines[1].is_empty());
+        assert_eq!(lines[2].iter().collect::<String>(), "B");
     }
 
     // ── Container layout tests (§14.2) ──────────────────────────────
