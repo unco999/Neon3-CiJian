@@ -982,6 +982,44 @@ pub enum UiNodeKind {
     DataGrid,
 }
 
+/// A single node in a TreeView hierarchy. Nodes form a recursive tree;
+/// leaf nodes have empty children. Expansion state is owned by the runtime,
+/// not by this declarative schema.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiTreeNode {
+    /// Stable node identifier, unique within the TreeView.
+    pub id: String,
+    /// Display label rendered in the row.
+    pub label: String,
+    /// Optional icon slot key (resolved by the skin system).
+    #[serde(default)]
+    pub icon: Option<String>,
+    /// Child nodes. Empty means this node is a leaf.
+    #[serde(default)]
+    pub children: Vec<UiTreeNode>,
+}
+
+impl UiTreeNode {
+    /// Total number of nodes in this subtree (including self).
+    pub fn node_count(&self) -> usize {
+        1 + self.children.iter().map(|c| c.node_count()).sum::<usize>()
+    }
+
+    /// Maximum depth of this subtree. A leaf has depth 1.
+    pub fn max_depth(&self) -> usize {
+        1 + self.children.iter().map(|c| c.max_depth()).max().unwrap_or(0)
+    }
+
+    /// Find a node by id in this subtree.
+    pub fn find(&self, id: &str) -> Option<&UiTreeNode> {
+        if self.id == id {
+            return Some(self);
+        }
+        self.children.iter().find_map(|c| c.find(id))
+    }
+}
+
 /// Renderer-side nine-slice sampling policy. The source rectangle is expressed
 /// in image pixels; the destination insets are logical UI units.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -4503,6 +4541,36 @@ mod tests {
             serde_json::from_value::<UiTextRegistryDebugSnapshot>(encoded_debug).unwrap(),
             debug
         );
+    }
+
+    #[test]
+    fn tree_node_hierarchy_helpers() {
+        let leaf = UiTreeNode {
+            id: "leaf".into(),
+            label: "Leaf".into(),
+            icon: None,
+            children: vec![],
+        };
+        let parent = UiTreeNode {
+            id: "parent".into(),
+            label: "Parent".into(),
+            icon: Some("folder".into()),
+            children: vec![leaf.clone()],
+        };
+        let root = UiTreeNode {
+            id: "root".into(),
+            label: "Root".into(),
+            icon: None,
+            children: vec![parent.clone(), leaf.clone()],
+        };
+        assert_eq!(root.node_count(), 4);
+        assert_eq!(root.max_depth(), 3);
+        assert_eq!(leaf.node_count(), 1);
+        assert_eq!(leaf.max_depth(), 1);
+        assert!(root.find("leaf").is_some());
+        assert!(root.find("parent").is_some());
+        assert!(root.find("missing").is_none());
+        assert_eq!(root.find("parent").unwrap().children.len(), 1);
     }
 }
 
