@@ -6458,4 +6458,18 @@ panel workspace row gap 8
         let panel2 = reparsed.ir.root.children.iter().find(|n| n.node_id.0 == "scroller").unwrap();
         assert_eq!(panel2.layout.unwrap().scroll_offset, [10.0, 20.0]);
     }
+
+    #[test]
+    fn new_component_kinds_parse_and_round_trip() {
+        let source = "surface root w 800 h 600\n  splitter hsplit x 200 y 0 w 4 h 600\n  context_menu menu x 400 y 300 w 160 h 120\n    text item1 x 8 y 8 w 144 h 24 value \"Copy\"\n    text item2 x 8 y 36 w 144 h 24 value \"Paste\"\n    text item3 x 8 y 64 w 144 h 24 value \"Delete\"\n  tree_view tree x 20 y 20 w 300 h 400\n    text tree-root x 8 y 8 w 284 h 24 value \"project/\"\n    text tree-child1 x 24 y 36 w 268 h 24 value \"crates/\"\n    text tree-child2 x 40 y 64 w 252 h 24 value \"neon-ui-schema\"\n";
+        let document = parse_nui_flow(source).expect("new components should parse");
+        assert!(document.ir.root.children.iter().any(|n| n.node_id.0 == "hsplit" && n.kind == UiNodeKind::Splitter));
+        assert!(document.ir.root.children.iter().any(|n| n.node_id.0 == "menu" && n.kind == UiNodeKind::ContextMenu));
+        assert!(document.ir.root.children.iter().any(|n| n.node_id.0 == "tree" && n.kind == UiNodeKind::TreeView));
+        let formatted = format_nui_flow(source).unwrap();
+        assert!(formatted.contains("splitter hsplit"));
+        assert!(formatted.contains("context_menu menu"));
+        assert!(formatted.contains("tree_view tree"));
+        assert_eq!(format_nui_flow(&formatted).unwrap(), formatted);
+    }
 }
