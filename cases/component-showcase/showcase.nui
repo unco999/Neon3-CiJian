@@ -1,0 +1,165 @@
+# Neon3 Component Showcase - 综合组件展示案例
+# 验证: skin系统(9种组件) + scrollable + 属性绑定 + 新组件(Splitter/ContextMenu/TreeView)
+
+resource btn-idle image
+resource btn-hover image
+resource panel-bg image
+resource track-bg image
+resource fill-bg image
+resource thumb-bg image
+resource check-icon image
+resource radio-dot image
+resource input-bg image
+resource tooltip-bg image
+resource scrollbar-track image
+resource scrollbar-thumb image
+resource progress-track image
+resource progress-fill image
+
+# === Skin 定义 (9种组件) ===
+skin btn-style button
+  slot body idle resource btn-idle nine_slice 4 4 4 4 border 6 6 6 6
+  slot body hover resource btn-hover nine_slice 4 4 4 4 border 6 6 6 6
+
+skin panel-style panel
+  slot body idle resource panel-bg nine_slice 8 8 8 8 border 12 12 12 12
+
+skin slider-style slider
+  slot track idle resource track-bg nine_slice 2 2 2 2 border 3 3 3 3
+  slot fill active resource fill-bg
+  slot thumb idle resource thumb-bg fit contain
+
+skin scrollbar-style scrollbar
+  slot track idle resource scrollbar-track
+  slot thumb idle resource scrollbar-thumb fit contain
+
+skin progress-style progress_bar
+  slot track idle resource progress-track
+  slot fill active resource progress-fill
+
+skin checkbox-style checkbox
+  slot body idle resource input-bg nine_slice 3 3 3 3 border 4 4 4 4
+  slot body hover resource input-bg nine_slice 3 3 3 3 border 4 4 4 4
+  slot fill active resource check-icon fit contain
+
+skin radio-style radio_button
+  slot body idle resource input-bg nine_slice 3 3 3 3 border 4 4 4 4
+  slot body hover resource input-bg nine_slice 3 3 3 3 border 4 4 4 4
+  slot fill active resource radio-dot fit contain
+
+skin input-style input
+  slot body idle resource input-bg nine_slice 3 3 3 3 border 4 4 4 4
+  slot body hover resource input-bg nine_slice 3 3 3 3 border 4 4 4 4
+  slot body active resource input-bg nine_slice 3 3 3 3 border 4 4 4 4
+
+skin tooltip-style tooltip
+  slot body idle resource tooltip-bg nine_slice 6 6 6 6 border 8 8 8 8
+
+# === Input 变量 ===
+input alpha f32 default 0.9
+input offset vec2 default 0,0
+input scroll_pos f32:0..1 default 0.3
+input progress_val f32:0..1 default 0.65
+input slider_val f32:0..100 default 42
+input checkbox_state bool default true
+input radio_state bool default false
+input text_value text default "Hello Neon3"
+input dynamic_text text default "Dynamic Label"
+
+# === 主界面 ===
+surface showcase overlay w 1200 h 800 align stretch fill #0D1117
+
+  # 左侧面板 - 带skin
+  panel left-panel skin panel-style x 20 y 20 w 360 h 760 column pad 16 gap 12 align stretch
+
+    text title h 32 value "Component Showcase" ink #E6EDF3
+    text subtitle h 20 value "9 skin types + scrollable + bindings" ink #8B949E
+
+    # Button with skin
+    button btn-demo skin btn-style h 40 value "Skinned Button" event demo.button.click
+
+    # Slider with skin
+    slider slider-demo skin slider-style h 24 numeric $slider_val event demo.slider.commit
+
+    # ProgressBar with skin
+    progress_bar progress-demo skin progress-style h 16 numeric $progress_val
+
+    # Scrollbar with skin (vertical)
+    scrollbar scroll-demo skin scrollbar-style x 320 y 200 w 16 h 120 scroll $scroll_pos
+
+    # Checkbox with skin
+    checkbox check-demo skin checkbox-style h 24 checked $checkbox_state value "Skinned Checkbox" event demo.check.toggle
+
+    # RadioButton with skin
+    radio_button radio-demo skin radio-style h 24 checked $radio_state value "Skinned Radio" event demo.radio.toggle
+
+    # TextInput with skin
+    input text-demo skin input-style h 32 value $text_value event demo.text.commit
+
+    # Opacity binding demo
+    panel opacity-demo x 0 y 0 w 100 h 40 fill #58A6FF opacity $alpha
+    text opacity-label h 20 value "Opacity bound to $alpha"
+
+  # 中间面板 - Scrollable 容器
+  panel mid-panel skin panel-style x 400 y 20 w 380 h 760 column pad 16 gap 8 align stretch
+
+    text mid-title h 28 value "Scrollable Container" ink #E6EDF3
+    text mid-sub h 18 value "scrollable + scroll_offset binding" ink #8B949E
+
+    # Scrollable panel with scroll_offset binding
+    panel scroller x 0 y 80 w 340 h 400 scrollable scroll_offset $offset column pad 12 gap 8 align stretch
+
+      text item-1 h 32 value "Item 1 - This is a long text that should wrap" fill #161B22 ink #E6EDF3
+      text item-2 h 32 value "Item 2" fill #161B22 ink #E6EDF3
+      text item-3 h 32 value "Item 3" fill #161B22 ink #E6EDF3
+      text item-4 h 32 value "Item 4" fill #161B22 ink #E6EDF3
+      text item-5 h 32 value "Item 5" fill #161B22 ink #E6EDF3
+      text item-6 h 32 value "Item 6" fill #161B22 ink #E6EDF3
+      text item-7 h 32 value "Item 7" fill #161B22 ink #E6EDF3
+      text item-8 h 32 value "Item 8" fill #161B22 ink #E6EDF3
+      text item-9 h 32 value "Item 9" fill #161B22 ink #E6EDF3
+      text item-10 h 32 value "Item 10 - Last item" fill #161B22 ink #E6EDF3
+
+    # Scroll control buttons
+    button scroll-up h 28 value "Scroll Up" event demo.scroll.up
+    button scroll-down h 28 value "Scroll Down" event demo.scroll.down
+
+  # 右侧面板 - 新组件展示
+  panel right-panel skin panel-style x 800 y 20 w 380 h 760 column pad 16 gap 12 align stretch
+
+    text right-title h 28 value "New Components" ink #E6EDF3
+    text right-sub h 18 value "Splitter / ContextMenu / TreeView" ink #8B949E
+
+    # Splitter demo (horizontal layout with splitter)
+    text split-label h 20 value "Splitter (drag to resize)" ink #8B949E
+    panel split-container x 0 y 120 w 340 h 120 row gap 0
+
+      panel split-left w 140 h 120 fill #1F6FEB33
+        text split-left-label h 20 value "Left Pane" ink #E6EDF3
+      splitter split-h w 4 h 120
+      panel split-right w 196 h 120 fill #1F6FEB22
+        text split-right-label h 20 value "Right Pane" ink #E6EDF3
+
+    # ContextMenu placeholder
+    text ctx-label h 20 value "ContextMenu (right-click)" ink #8B949E
+    panel ctx-area x 0 y 280 w 340 h 80 fill #161B22 line #30363D
+      text ctx-hint h 20 value "Right-click here for menu" ink #8B949E
+
+    # TreeView placeholder
+    text tree-label h 20 value "TreeView (hierarchical)" ink #8B949E
+    panel tree-area x 0 y 400 w 340 h 200 fill #161B22 line #30363D column pad 8 gap 4
+
+      text tree-root h 24 value "▼ project/" ink #E6EDF3
+      text tree-crate-1 h 24 value "  ▼ crates/" ink #E6EDF3
+      text tree-crate-2 h 24 value "    neon-ui-schema" ink #8B949E
+      text tree-crate-3 h 24 value "    neon-ui-runtime" ink #8B949E
+      text tree-crate-4 h 24 value "    neon-wgpu-runtime" ink #8B949E
+      text tree-docs h 24 value "  ▶ docs/" ink #E6EDF3
+      text tree-cases h 24 value "  ▶ cases/" ink #E6EDF3
+
+  # Tooltip with skin
+  tooltip demo-tooltip skin tooltip-style x 400 y 700 w 200 h 48
+    text tooltip-text h 20 value "Skinned Tooltip" ink #0D1117
+
+  # Dynamic text binding demo
+  text dynamic-label x 20 y 780 w 300 h 20 value $dynamic_text ink #58A6FF
