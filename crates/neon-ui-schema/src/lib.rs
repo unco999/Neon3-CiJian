@@ -235,6 +235,22 @@ pub struct UiInputSlot {
     pub update_class: UiInputUpdateClass,
     pub semantic_label: String,
     pub packing: UiInputPacking,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub derived_expression: Option<String>,
+}
+
+impl Default for UiInputSlot {
+    fn default() -> Self {
+        Self {
+            key: String::new(),
+            kind: UiInputKind::Bool,
+            default_value: UiInputValue::Bool { value: false },
+            update_class: UiInputUpdateClass::ReliableExternal,
+            semantic_label: String::new(),
+            packing: UiInputPacking { alignment: 4, lanes: 1, offset: 0, representation: UiGpuScalarRepresentation::U32 },
+            derived_expression: None,
+        }
+    }
 }
 /// A control-plane input which supplies a bounded DataGrid window. Grid inputs
 /// deliberately have no scalar value or GPU packing.

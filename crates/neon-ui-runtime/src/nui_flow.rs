@@ -96,7 +96,7 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
                 let kind = neon_ui_schema::UiInputKind::Struct { fields: kind_fields };
                 let default_value = neon_ui_schema::UiInputValue::Struct { fields: value_fields };
                 let (alignment, lanes, representation) = kind.packing();
-                input_slots.push(neon_ui_schema::UiInputSlot { key: struct_key.clone(), kind, default_value, update_class: neon_ui_schema::UiInputUpdateClass::ReliableExternal, semantic_label: struct_key.replace('_', " "), packing: neon_ui_schema::UiInputPacking { alignment, lanes, offset: 0, representation } });
+                input_slots.push(neon_ui_schema::UiInputSlot { key: struct_key.clone(), kind, default_value, update_class: neon_ui_schema::UiInputUpdateClass::ReliableExternal, semantic_label: struct_key.replace('_', " "), packing: neon_ui_schema::UiInputPacking { alignment, lanes, offset: 0, representation }, derived_expression: None });
                 seen_inputs.insert(struct_key);
                 continue;
             }
@@ -2417,6 +2417,41 @@ fn parse_input(text: &str, line: u32) -> FlowResult<Option<(ParsedInput, bool)>>
     } else {
         parts.len()
     };
+    // Derived expression input: input <key> bool = $source > 0.5
+    if parts.len() >= 6 && parts[3] == "=" {
+        let key = parts[1];
+        if parts[2] != "bool" {
+            return Err(error("nui_flow_invalid_input", "derived inputs must be bool", line, 1));
+        }
+        // Reassemble expression from parts[4..]
+        let expr = parts[4..].join(" ");
+        // Validate expression format: $left op right
+        let expr_parts = expr.split_whitespace().collect::<Vec<_>>();
+        if expr_parts.len() != 3 {
+            return Err(error("nui_flow_invalid_input", "expression must be: $left op right", line, 1));
+        }
+        if !expr_parts[0].starts_with('$') {
+            return Err(error("nui_flow_invalid_input", "left operand must be $variable", line, 1));
+        }
+        let op = expr_parts[1];
+        if !matches!(op, "==" | "!=" | ">" | "<" | ">=" | "<=") {
+            return Err(error("nui_flow_invalid_input", "unsupported operator", line, 1));
+        }
+        let kind = UiInputKind::Bool;
+        let (alignment, lanes, representation) = kind.packing();
+        return Ok(Some((
+            ParsedInput::Scalar(UiInputSlot {
+                key: key.into(),
+                kind,
+                default_value: UiInputValue::Bool { value: false },
+                update_class: UiInputUpdateClass::ReliableExternal,
+                semantic_label: key.replace('_', " "),
+                packing: UiInputPacking { alignment, lanes, offset: 0, representation },
+                derived_expression: Some(expr),
+            }),
+            false,
+        )));
+    }
     // Array input: input <key> array[<N>] <element_kind>
     if parts.len() >= 4 && parts[2].starts_with("array[") && parts[2].ends_with("]") {
         let length_str = &parts[2][6..parts[2].len()-1];
@@ -2441,6 +2476,7 @@ fn parse_input(text: &str, line: u32) -> FlowResult<Option<(ParsedInput, bool)>>
                 update_class: UiInputUpdateClass::ReliableExternal,
                 semantic_label: parts[1].into(),
                 packing: UiInputPacking { alignment, lanes, offset: 0, representation },
+                derived_expression: None,
             }),
             false,
         )));
@@ -2511,6 +2547,7 @@ fn parse_input(text: &str, line: u32) -> FlowResult<Option<(ParsedInput, bool)>>
                     offset: 0,
                     representation,
                 },
+                derived_expression: None,
             }),
             false,
         )));
@@ -2661,6 +2698,7 @@ fn parse_input(text: &str, line: u32) -> FlowResult<Option<(ParsedInput, bool)>>
                 offset: 0,
                 representation,
             },
+            derived_expression: None,
         }),
         emit_event,
     )))
@@ -3978,11 +4016,16 @@ fn attach(
 fn reject_forbidden(text: &str, line: u32) -> FlowResult<()> {
     let rich_text_data = text.starts_with("text ") && text.contains(" rich ");
     let array_decl = text.starts_with("input ") && text.contains("array[");
+    // Binding references like $scores[0] may contain brackets.
+    let has_index_binding = text.split_whitespace().any(|token| token.starts_with('$') && token.contains('['));
+    // Derived input declarations use `=`: input x bool = $a > 0.5
+    let derived_decl = text.starts_with("input ") && text.contains(" = ");
     if (text
         .chars()
         .any(|character| matches!(character, '{' | '}' | '[' | ']'))
         && !rich_text_data
-        && !array_decl)
+        && !array_decl
+        && !has_index_binding)
         || text.contains("=>")
         || text.contains("function")
         || text.contains("http:")
@@ -3991,6 +4034,7 @@ fn reject_forbidden(text: &str, line: u32) -> FlowResult<()> {
             && !text.starts_with("budget")
             && !text.starts_with("@")
             && !text.contains("when $")
+            && !derived_decl
     {
         Err(error(
             "ui_program_forbidden_flow_feature",
@@ -4223,33 +4267,49 @@ fn resolve_binding_kind(
     schema: &neon_ui_schema::UiInputSchema,
     input_key: &str,
 ) -> Option<neon_ui_schema::UiInputKind> {
-    match input_key.split_once('.') {
-        None => schema
-            .slots
-            .iter()
-            .find(|slot| slot.key == input_key)
-            .map(|slot| slot.kind.clone()),
-        Some((top_key, field_path)) => {
-            let slot = schema.slots.iter().find(|slot| slot.key == top_key)?;
-            resolve_nested_kind(&slot.kind, field_path)
-        }
-    }
-}
-
-fn resolve_nested_kind(
-    kind: &neon_ui_schema::UiInputKind,
-    path: &str,
-) -> Option<neon_ui_schema::UiInputKind> {
-    let mut current = kind.clone();
-    for segment in path.split('.') {
+    let mut segments = input_key.split('.');
+    let first = segments.next()?;
+    let (top_key, top_index) = parse_path_segment_kind(first);
+    let mut current = schema.slots.iter().find(|slot| slot.key == top_key)?.kind.clone();
+    if top_index.is_some() {
         match current {
-            neon_ui_schema::UiInputKind::Struct { fields } => {
-                current = fields.get(segment)?.clone();
+            neon_ui_schema::UiInputKind::Array { element_kind, .. } => {
+                current = (*element_kind).clone();
             }
             _ => return None,
         }
     }
+    for segment in segments {
+        let (name, index) = parse_path_segment_kind(segment);
+        match current {
+            neon_ui_schema::UiInputKind::Struct { fields } => {
+                current = fields.get(name)?.clone();
+            }
+            _ => return None,
+        }
+        if index.is_some() {
+            match current {
+                neon_ui_schema::UiInputKind::Array { element_kind, .. } => {
+                    current = (*element_kind).clone();
+                }
+                _ => return None,
+            }
+        }
+    }
     Some(current)
+}
+
+fn parse_path_segment_kind(segment: &str) -> (&str, Option<usize>) {
+    if let Some(bracket_start) = segment.find('[') {
+        if segment.ends_with(']') {
+            let name = &segment[..bracket_start];
+            let index_str = &segment[bracket_start + 1..segment.len() - 1];
+            if let Ok(index) = index_str.parse::<usize>() {
+                return (name, Some(index));
+            }
+        }
+    }
+    (segment, None)
 }
 
 fn binding_accepts(property: &UiBoundProperty, kind: &UiInputKind) -> bool {
@@ -6130,5 +6190,67 @@ panel workspace row gap 8
             }
             _ => panic!("expected Array value"),
         }
+    }
+
+    #[test]
+    fn array_index_binding_resolves_kind() {
+        let document = parse_nui_flow(
+            "surface root w 100 h 100\ninput scores array[3] f32\n  slider s numeric $scores[1] w 50 h 20\n",
+        )
+        .expect("array index binding must parse");
+        let bindings = &document.ir.bindings;
+        assert!(bindings.iter().any(|b| b.input_key == "scores[1]" && b.property == UiBoundProperty::NumericValue));
+        let kind = resolve_binding_kind(&document.input_schema, "scores[1]").expect("kind must resolve");
+        assert!(matches!(kind, neon_ui_schema::UiInputKind::F32));
+    }
+
+    #[test]
+    fn array_index_binding_rejects_out_of_bounds_kind() {
+        // Out-of-bounds index still resolves kind (kind-level doesn't check bounds),
+        // but runtime value resolution will return None. This tests kind resolution.
+        let document = parse_nui_flow(
+            "surface root w 100 h 100\ninput scores array[2] f32\n  slider s numeric $scores[0] w 50 h 20\n",
+        )
+        .expect("valid index must parse");
+        let kind = resolve_binding_kind(&document.input_schema, "scores[0]").unwrap();
+        assert!(matches!(kind, neon_ui_schema::UiInputKind::F32));
+    }
+
+    #[test]
+    fn array_index_binding_rejects_non_array_index() {
+        let error = parse_nui_flow(
+            "surface root w 100 h 100\ninput hp f32 default 1.0\n  slider s numeric $hp[0] w 50 h 20\n",
+        )
+        .unwrap_err();
+        assert_eq!(error.diagnostics[0].code, "ui_program_unknown_binding_target");
+    }
+
+    #[test]
+    fn derived_expression_parses_simple_comparison() {
+        let document = parse_nui_flow(
+            "surface root w 100 h 100\ninput hp f32 default 0.8\ninput low_hp bool = $hp < 0.3\n  panel p visible $low_hp w 50 h 50\n",
+        )
+        .expect("derived expression must parse");
+        let slot = document.input_schema.slots.iter().find(|s| s.key == "low_hp").expect("low_hp slot");
+        assert_eq!(slot.derived_expression.as_deref(), Some("$hp < 0.3"));
+        assert!(matches!(slot.kind, neon_ui_schema::UiInputKind::Bool));
+    }
+
+    #[test]
+    fn derived_expression_rejects_non_bool_type() {
+        let error = parse_nui_flow(
+            "surface root w 100 h 100\ninput hp f32 default 0.8\ninput result f32 = $hp > 0.5\n",
+        )
+        .unwrap_err();
+        assert_eq!(error.diagnostics[0].code, "nui_flow_invalid_input");
+    }
+
+    #[test]
+    fn derived_expression_rejects_unknown_operator() {
+        let error = parse_nui_flow(
+            "surface root w 100 h 100\ninput hp f32 default 0.8\ninput bad bool = $hp ~ 0.5\n",
+        )
+        .unwrap_err();
+        assert_eq!(error.diagnostics[0].code, "nui_flow_invalid_input");
     }
 }

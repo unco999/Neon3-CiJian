@@ -1101,6 +1101,7 @@ impl Default for UiLocalPresentationState {
 #[derive(Clone, Debug)]
 pub struct UiProgramSemanticEventRouter {
     program: UiProgram,
+    input_schema: Option<UiInputSchema>,
     inputs: UiResolvedInputs,
     renderer_epoch: u64,
     next_trace_sequence: u64,
@@ -1108,10 +1109,90 @@ pub struct UiProgramSemanticEventRouter {
     trace: Vec<UiEventTraceRecord>,
 }
 
+
+/// Evaluate a simple comparison expression: "$left op right".
+/// Returns None if the expression references missing inputs or has invalid types.
+fn eval_derived_expression(
+    expr: &str,
+    inputs: &UiResolvedInputs,
+) -> Option<bool> {
+    let parts: Vec<&str> = expr.split_whitespace().collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let left = resolve_operand(parts[0], inputs)?;
+    let right = resolve_operand(parts[2], inputs)?;
+    match (left, right) {
+        (UiInputValue::F32 { value: l }, UiInputValue::F32 { value: r }) => Some(compare_f32(l, r, parts[1])),
+        (UiInputValue::I32 { value: l }, UiInputValue::I32 { value: r }) => Some(compare_i64(l as i64, r as i64, parts[1])),
+        (UiInputValue::U32 { value: l }, UiInputValue::U32 { value: r }) => Some(compare_i64(l as i64, r as i64, parts[1])),
+        (UiInputValue::Bool { value: l }, UiInputValue::Bool { value: r }) => Some(match parts[1] {
+            "==" => l == r,
+            "!=" => l != r,
+            _ => false,
+        }),
+        _ => None,
+    }
+}
+
+fn resolve_operand(token: &str, inputs: &UiResolvedInputs) -> Option<UiInputValue> {
+    if let Some(var) = token.strip_prefix('$') {
+        resolve_binding_value(inputs, var).cloned()
+    } else if let Ok(v) = token.parse::<f32>() {
+        Some(UiInputValue::F32 { value: v })
+    } else if let Ok(v) = token.parse::<i32>() {
+        Some(UiInputValue::I32 { value: v })
+    } else if token == "true" {
+        Some(UiInputValue::Bool { value: true })
+    } else if token == "false" {
+        Some(UiInputValue::Bool { value: false })
+    } else {
+        None
+    }
+}
+
+fn compare_f32(l: f32, r: f32, op: &str) -> bool {
+    match op {
+        "==" => l == r,
+        "!=" => l != r,
+        ">" => l > r,
+        "<" => l < r,
+        ">=" => l >= r,
+        "<=" => l <= r,
+        _ => false,
+    }
+}
+
+fn compare_i64(l: i64, r: i64, op: &str) -> bool {
+    match op {
+        "==" => l == r,
+        "!=" => l != r,
+        ">" => l > r,
+        "<" => l < r,
+        ">=" => l >= r,
+        "<=" => l <= r,
+        _ => false,
+    }
+}
+
+/// Recompute all derived inputs after an input frame update.
+fn recompute_derived_inputs(schema: &UiInputSchema, inputs: &mut UiResolvedInputs) {
+    for slot in &schema.slots {
+        if let Some(expr) = &slot.derived_expression {
+            if let Some(result) = eval_derived_expression(expr, inputs) {
+                if let Some(resolved) = inputs.values.get_mut(&slot.key) {
+                    resolved.value = UiInputValue::Bool { value: result };
+                }
+            }
+        }
+    }
+}
+
 impl UiProgramSemanticEventRouter {
     pub fn new(program: UiProgram, inputs: UiResolvedInputs, renderer_epoch: u64) -> Self {
         Self {
             program,
+            input_schema: None,
             inputs,
             renderer_epoch,
             next_trace_sequence: 0,
@@ -1120,7 +1201,13 @@ impl UiProgramSemanticEventRouter {
         }
     }
 
-    pub fn replace_resolved_inputs(&mut self, inputs: UiResolvedInputs) {
+    pub fn set_input_schema(&mut self, schema: UiInputSchema) {
+        self.input_schema = Some(schema);
+    }
+    pub fn replace_resolved_inputs(&mut self, mut inputs: UiResolvedInputs) {
+        if let Some(schema) = &self.input_schema {
+            recompute_derived_inputs(schema, &mut inputs);
+        }
         self.inputs = inputs;
     }
     pub fn set_renderer_epoch(&mut self, renderer_epoch: u64) {
@@ -2590,30 +2677,53 @@ fn binding_accepts(property: &UiBoundProperty, kind: &neon_ui_schema::UiInputKin
 }
 /// Resolves a binding input key to its value, supporting dotted paths like
 /// "player.hp" for Struct inputs. Returns None if the key or field path doesn't resolve.
+/// Parses a path segment into (field_name, optional_array_index).
+/// "count" -> ("count", None)
+/// "slots[0]" -> ("slots", Some(0))
+fn parse_path_segment(segment: &str) -> (&str, Option<usize>) {
+    if let Some(bracket_start) = segment.find('[') {
+        if segment.ends_with(']') {
+            let name = &segment[..bracket_start];
+            let index_str = &segment[bracket_start + 1..segment.len() - 1];
+            if let Ok(index) = index_str.parse::<usize>() {
+                return (name, Some(index));
+            }
+        }
+    }
+    (segment, None)
+}
+
 fn resolve_binding_value<'a>(
     inputs: &'a neon_ui_schema::UiResolvedInputs,
     input_key: &str,
 ) -> Option<&'a neon_ui_schema::UiInputValue> {
-    match input_key.split_once('.') {
-        None => inputs.values.get(input_key).map(|resolved| &resolved.value),
-        Some((top_key, field_path)) => {
-            let top = inputs.values.get(top_key)?;
-            resolve_nested_field(&top.value, field_path)
-        }
-    }
-}
-
-fn resolve_nested_field<'a>(
-    value: &'a neon_ui_schema::UiInputValue,
-    path: &str,
-) -> Option<&'a neon_ui_schema::UiInputValue> {
-    let mut current = value;
-    for segment in path.split('.') {
+    let mut segments = input_key.split('.');
+    let first = segments.next()?;
+    let (top_key, top_index) = parse_path_segment(first);
+    let mut current = &inputs.values.get(top_key)?.value;
+    if let Some(idx) = top_index {
         match current {
-            neon_ui_schema::UiInputValue::Struct { fields } => {
-                current = fields.get(segment)?;
+            neon_ui_schema::UiInputValue::Array { elements, .. } => {
+                current = elements.get(idx)?;
             }
             _ => return None,
+        }
+    }
+    for segment in segments {
+        let (name, index) = parse_path_segment(segment);
+        match current {
+            neon_ui_schema::UiInputValue::Struct { fields } => {
+                current = fields.get(name)?;
+            }
+            _ => return None,
+        }
+        if let Some(idx) = index {
+            match current {
+                neon_ui_schema::UiInputValue::Array { elements, .. } => {
+                    current = elements.get(idx)?;
+                }
+                _ => return None,
+            }
         }
     }
     Some(current)
@@ -6968,6 +7078,7 @@ mod tests {
                     offset: 0,
                     representation: UiGpuScalarRepresentation::Bool32,
                 },
+                derived_expression: None,
             }],
             grid_slots: Vec::new(),
             flow_name: String::new(),
@@ -7079,6 +7190,7 @@ mod tests {
                     offset: 0,
                     representation,
                 },
+            derived_expression: None,
             }],
             grid_slots: Vec::new(),
             flow_name: String::new(),
@@ -7165,6 +7277,7 @@ mod tests {
                     offset: 0,
                     representation,
                 },
+            derived_expression: None,
             }],
             grid_slots: Vec::new(),
             flow_name: String::new(),
@@ -7216,6 +7329,7 @@ mod tests {
                     offset: 0,
                     representation: UiGpuScalarRepresentation::Bool32,
                 },
+                derived_expression: None,
             }],
             grid_slots: vec![neon_ui_schema::UiGridInputSlot {
                 key: "assets_window".into(),
