@@ -951,6 +951,9 @@ pub enum UiNodeKind {
     ListBox,
     Scrollbar,
     ProgressBar,
+    /// A draggable divider that resizes adjacent panels. Orientation is inferred
+    /// from bounds (w > h = horizontal splitter, h > w = vertical splitter).
+    Splitter,
     /// A declarative, virtualized tabular viewport. Row data is supplied by
     /// bounded `UiDataGridFrame` windows rather than by runtime topology.
     DataGrid,

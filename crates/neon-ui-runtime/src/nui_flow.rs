@@ -2764,6 +2764,7 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
         "list_box" => UiNodeKind::ListBox,
         "scrollbar" => UiNodeKind::Scrollbar,
         "progress_bar" => UiNodeKind::ProgressBar,
+        "splitter" => UiNodeKind::Splitter,
         "image" => UiNodeKind::Image,
         "render" => UiNodeKind::RenderSurface,
         "canvas" => UiNodeKind::Canvas,
@@ -4494,6 +4495,7 @@ fn format_node(
         UiNodeKind::ListBox => "list_box",
         UiNodeKind::Scrollbar => "scrollbar",
         UiNodeKind::ProgressBar => "progress_bar",
+        UiNodeKind::Splitter => "splitter",
         UiNodeKind::DataGrid => "data_grid",
         UiNodeKind::Image => "image",
         UiNodeKind::RenderSurface => "render",
@@ -4848,6 +4850,7 @@ fn insert_node(
         "list_box" => UiNodeKind::ListBox,
         "scrollbar" => UiNodeKind::Scrollbar,
         "progress_bar" => UiNodeKind::ProgressBar,
+        "splitter" => UiNodeKind::Splitter,
         "image" => UiNodeKind::Image,
         "render" => UiNodeKind::RenderSurface,
         _ => {
