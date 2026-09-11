@@ -5390,6 +5390,58 @@ impl UiWgpuRenderer {
                 images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, _padding: [0; 2] });
             }
         }
+        // Panel skins replace the standard fill with a skinned body image. The
+        // panel visual and its hit bounds remain the authored logical bounds.
+        for (index, visual) in self.sampled.iter().enumerate() {
+            if visual.kind != UiNodeKind::Panel || !sampled_in_mode(visual, mode) {
+                continue;
+            }
+            let Some(skin_key) = self.skin_references.get(&self.plan[index].id) else { continue };
+            let Some(skin) = self.skins.get(skin_key) else { continue };
+            let Some(slot) = skin.slots.iter().find(|slot| slot.slot_kind == UiSkinSlotKind::Body && slot.state == UiVisualState::Normal) else { continue };
+            let (resource_key, fit, nine_slice) = match &slot.presentation {
+                UiSkinPresentation::Image { resource_key, fit } => (resource_key, *fit, None),
+                UiSkinPresentation::NineSlice { resource_key, layout } => (resource_key, UiImageFit::Stretch, Some(*layout)),
+                _ => continue,
+            };
+            let binding_key = format!("{skin_key}/{resource_key}");
+            let image = self.skin_assets.get(&binding_key).and_then(|asset| self.resident_images.get(&(asset.project_id.clone(), asset.asset_id, asset.revision.0))).or_else(|| self.skin_image_ids.get(&binding_key).and_then(|image_id| self.external_images.get(image_id)));
+            let Some(image) = image else { continue };
+            if nine_slice.is_some_and(|layout| !layout.validate_for_image(image.width, image.height)) { continue; }
+            let (source_insets, target_insets, slice_mode, fill_center) = nine_slice.map(|layout| (layout.source_insets_px.map(|value| value as f32), layout.target_insets, match layout.mode { neon_ui_schema::UiNineSliceMode::Stretch => 0, neon_ui_schema::UiNineSliceMode::Tile => 1, neon_ui_schema::UiNineSliceMode::Mirror => 2 }, u32::from(layout.fill_center))).unwrap_or(([0.0; 4], [0.0; 4], 0, 1));
+            let (rect, uv) = fit_image_rect_and_uv(visual.bounds, image.uv, image.width, image.height, fit);
+            images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, _padding: [0; 2] });
+        }
+        // ProgressBar skins render track + fill using the normalized value.
+        for (index, visual) in self.sampled.iter().enumerate() {
+            if visual.kind != UiNodeKind::ProgressBar || !sampled_in_mode(visual, mode) {
+                continue;
+            }
+            let Some(skin_key) = self.skin_references.get(&self.plan[index].id) else { continue };
+            let Some(skin) = self.skins.get(skin_key) else { continue };
+            let normalized = match &visual.presentation {
+                Some(UiControlPresentation::Numeric { value, min, max }) => ((value - min) / (max - min)).clamp(0.0, 1.0),
+                _ => 0.0,
+            };
+            let track = visual.bounds;
+            let fill = UiBounds { x: track.x, y: track.y, width: track.width * normalized, height: track.height };
+            for (slot_kind, bounds) in [(UiSkinSlotKind::Track, track), (UiSkinSlotKind::Fill, fill)] {
+                let target_state = if slot_kind == UiSkinSlotKind::Fill { UiVisualState::Active } else { UiVisualState::Normal };
+                let Some(slot) = skin.slots.iter().find(|slot| slot.slot_kind == slot_kind && slot.state == target_state) else { continue };
+                let (resource_key, fit, nine_slice) = match &slot.presentation {
+                    UiSkinPresentation::Image { resource_key, fit } => (resource_key, *fit, None),
+                    UiSkinPresentation::NineSlice { resource_key, layout } => (resource_key, UiImageFit::Stretch, Some(*layout)),
+                    _ => continue,
+                };
+                let binding_key = format!("{skin_key}/{resource_key}");
+                let image = self.skin_assets.get(&binding_key).and_then(|asset| self.resident_images.get(&(asset.project_id.clone(), asset.asset_id, asset.revision.0))).or_else(|| self.skin_image_ids.get(&binding_key).and_then(|image_id| self.external_images.get(image_id)));
+                let Some(image) = image else { continue };
+                if nine_slice.is_some_and(|layout| !layout.validate_for_image(image.width, image.height)) { continue; }
+                let (source_insets, target_insets, slice_mode, fill_center) = nine_slice.map(|layout| (layout.source_insets_px.map(|value| value as f32), layout.target_insets, match layout.mode { neon_ui_schema::UiNineSliceMode::Stretch => 0, neon_ui_schema::UiNineSliceMode::Tile => 1, neon_ui_schema::UiNineSliceMode::Mirror => 2 }, u32::from(layout.fill_center))).unwrap_or(([0.0; 4], [0.0; 4], 0, 1));
+                let (rect, uv) = fit_image_rect_and_uv(bounds, image.uv, image.width, image.height, fit);
+                images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, _padding: [0; 2] });
+            }
+        }
         let image_capacity = images.len().max(popup_images.len());
         if image_capacity > self.image_capacity {
             self.image_capacity = image_capacity.next_power_of_two();
