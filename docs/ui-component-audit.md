@@ -132,10 +132,12 @@ Schema 定义了 12 种可绑定属性，NUI Flow 只支持 7 种：
 
 注意：渲染层已有完整的 ScrollView 交互支持（scroll_wheel_at_pointer + scroll_drag），NUI Flow 层只需暴露属性。
 
-### 阶段 C：编辑器核心组件（3-5天）
-- TreeView
-- ContextMenu
-- NumberInput
+### 阶段 C：编辑器核心组件（进行中，commit b589ac4）
+- [x] ContextMenu 基础结构（UiNodeKind + 解析 + 序列化，渲染复用 Modal）
+- [x] TreeView 基础结构（UiNodeKind + 解析 + 序列化）
+- [ ] NumberInput（DragValue 已有数字输入基础，待加上下箭头）
+- [ ] ContextMenu 右键触发 + 点击外部关闭
+- [ ] TreeView 展开/折叠 + 层级缩进 + 选中
 
 ### 阶段 D：动画系统（3-5天）
 - 通用属性动画框架
