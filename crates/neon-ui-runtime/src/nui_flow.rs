@@ -2417,6 +2417,34 @@ fn parse_input(text: &str, line: u32) -> FlowResult<Option<(ParsedInput, bool)>>
     } else {
         parts.len()
     };
+    // Array input: input <key> array[<N>] <element_kind>
+    if parts.len() >= 4 && parts[2].starts_with("array[") && parts[2].ends_with("]") {
+        let length_str = &parts[2][6..parts[2].len()-1];
+        let length: usize = length_str.parse().map_err(|_| {
+            error("nui_flow_invalid_input", "array length must be a positive integer", line, 1)
+        })?;
+        if length == 0 {
+            return Err(error("nui_flow_invalid_input", "array length must be > 0", line, 1));
+        }
+        let element_kind = parse_field_kind(parts[3], line)?;
+        let kind = UiInputKind::Array { element_kind: Box::new(element_kind.clone()), length };
+        let default_value = UiInputValue::Array {
+            elements: (0..length).map(|_| default_for_kind(&element_kind)).collect(),
+            element_kind: Box::new(element_kind),
+        };
+        let (alignment, lanes, representation) = kind.packing();
+        return Ok(Some((
+            ParsedInput::Scalar(UiInputSlot {
+                key: parts[1].into(),
+                kind,
+                default_value,
+                update_class: UiInputUpdateClass::ReliableExternal,
+                semantic_label: parts[1].into(),
+                packing: UiInputPacking { alignment, lanes, offset: 0, representation },
+            }),
+            false,
+        )));
+    }
     if core_len != 5 || parts[3] != "default" {
         return Err(error(
             "nui_flow_invalid_input",
@@ -3949,10 +3977,12 @@ fn attach(
 }
 fn reject_forbidden(text: &str, line: u32) -> FlowResult<()> {
     let rich_text_data = text.starts_with("text ") && text.contains(" rich ");
+    let array_decl = text.starts_with("input ") && text.contains("array[");
     if (text
         .chars()
         .any(|character| matches!(character, '{' | '}' | '[' | ']'))
-        && !rich_text_data)
+        && !rich_text_data
+        && !array_decl)
         || text.contains("=>")
         || text.contains("function")
         || text.contains("http:")
@@ -6047,5 +6077,58 @@ panel workspace row gap 8
         )
         .unwrap_err();
         assert_eq!(error.diagnostics[0].code, "ui_program_input_type_mismatch");
+    }
+
+    #[test]
+    fn array_input_parses_scalar_element_type() {
+        let document = parse_nui_flow(
+            "surface root w 100 h 100\ninput scores array[5] f32\n",
+        )
+        .expect("array input must parse");
+        let slot = document
+            .input_schema
+            .slots
+            .iter()
+            .find(|s| s.key == "scores")
+            .expect("scores slot must exist");
+        match &slot.kind {
+            neon_ui_schema::UiInputKind::Array { element_kind, length } => {
+                assert_eq!(*length, 5);
+                assert!(matches!(element_kind.as_ref(), neon_ui_schema::UiInputKind::F32));
+            }
+            _ => panic!("expected Array kind"),
+        }
+        match &slot.default_value {
+            neon_ui_schema::UiInputValue::Array { elements, .. } => {
+                assert_eq!(elements.len(), 5);
+                assert!(elements.iter().all(|e| matches!(e, neon_ui_schema::UiInputValue::F32 { value: 0.0 })));
+            }
+            _ => panic!("expected Array value"),
+        }
+    }
+
+    #[test]
+    fn array_input_rejects_zero_length() {
+        let error = parse_nui_flow(
+            "surface root w 100 h 100\ninput bad array[0] f32\n",
+        )
+        .unwrap_err();
+        assert_eq!(error.diagnostics[0].code, "nui_flow_invalid_input");
+    }
+
+    #[test]
+    fn array_of_u32_parses_and_defaults_to_zero() {
+        let document = parse_nui_flow(
+            "surface root w 100 h 100\ninput counts array[3] u32\n",
+        )
+        .expect("array of u32 must parse");
+        let slot = document.input_schema.slots.iter().find(|s| s.key == "counts").unwrap();
+        match &slot.default_value {
+            neon_ui_schema::UiInputValue::Array { elements, .. } => {
+                assert_eq!(elements.len(), 3);
+                assert!(elements.iter().all(|e| matches!(e, neon_ui_schema::UiInputValue::U32 { value: 0 })));
+            }
+            _ => panic!("expected Array value"),
+        }
     }
 }
