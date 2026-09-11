@@ -8390,6 +8390,20 @@ fn default_component_style(kind: &UiNodeKind) -> UiStyle {
             corner_radius: 0.0,
             opacity: 1.0,
         },
+        UiNodeKind::ContextMenu => UiStyle {
+            background_color: [0.16, 0.19, 0.22, 0.98],
+            border_color: [0.40, 0.48, 0.55, 0.90],
+            border_width: 1.0,
+            corner_radius: 6.0,
+            opacity: 1.0,
+        },
+        UiNodeKind::TreeView => UiStyle {
+            background_color: [0.10, 0.11, 0.13, 1.0],
+            border_color: [0.28, 0.38, 0.34, 0.70],
+            border_width: 1.0,
+            corner_radius: 4.0,
+            opacity: 1.0,
+        },
         // Containers, labels, images, and render surfaces do not get implicit
         // component chrome. Their authored default is a sentinel used by the
         // component resolver, so make the renderer fallback transparent here.
