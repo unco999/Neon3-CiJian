@@ -1,4 +1,4 @@
-//! GPU-independent UI declaration schema types.
+﻿//! GPU-independent UI declaration schema types.
 //! This crate must not create GPU or window objects.
 
 use neon_protocol::{AssetRef, Revision};
@@ -110,6 +110,7 @@ pub enum UiInputKind {
     U32Range { minimum: u32, maximum: u32 },
     F32Range { minimum: f32, maximum: f32 },
     CanvasData,
+    Struct { fields: std::collections::BTreeMap<String, UiInputKind> },
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -133,6 +134,7 @@ pub enum UiInputValue {
     TextHandle { value: UiTextHandle },
     AssetHandle { id: u64, generation: u32 },
     CanvasData { value: UiCanvasData },
+    Struct { fields: std::collections::BTreeMap<String, UiInputValue> },
 }
 
 /// Bounded, persisted drawing data for a single declarative Canvas node.
@@ -322,6 +324,15 @@ impl UiInputKind {
             // Canvas payload bytes are never packed into the scalar GPU input buffer.
             // This sentinel slot keeps the existing revisioned input store contract.
             Self::CanvasData => (4, 1, UiGpuScalarRepresentation::U32),
+            Self::Struct { .. } => (16, 4, UiGpuScalarRepresentation::Vec4F32),
+        }
+    }
+    /// Number of 16-byte GPU input slots this type occupies.
+    /// Scalar types occupy 1 slot; Struct occupies the sum of its fields.
+    pub fn gpu_slot_count(&self) -> usize {
+        match self {
+            Self::Struct { fields } => fields.values().map(|kind| kind.gpu_slot_count()).sum(),
+            _ => 1,
         }
     }
     pub fn accepts(&self, value: &UiInputValue) -> bool {
@@ -354,6 +365,15 @@ impl UiInputKind {
                     && *value <= *maximum
             }
             (Self::CanvasData, UiInputValue::CanvasData { value }) => value.validate(),
+            (Self::Struct { fields: kind_fields }, UiInputValue::Struct { fields: value_fields }) => {
+                kind_fields.len() == value_fields.len()
+                    && kind_fields.iter().all(|(key, kind)| {
+                        value_fields
+                            .get(key)
+                            .map(|value| kind.accepts(value))
+                            .unwrap_or(false)
+                    })
+            }
             _ => false,
         }
     }

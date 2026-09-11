@@ -1,4 +1,4 @@
-//! Renderer-private adapter for the static UI program contract.
+﻿//! Renderer-private adapter for the static UI program contract.
 //!
 //! This module is intentionally the only place that turns a `UiProgram` into
 //! WGPU buffers.  Its sampled layout output is diagnostic data, never an input
@@ -393,16 +393,28 @@ fn record_bytes(records: usize, stride: usize) -> Vec<u8> {
 }
 fn pack_inputs(inputs: &UiResolvedInputs, budget: &UiResourceBudget) -> Vec<u8> {
     let mut bytes = vec![0; (budget.max_bindings.max(1) as usize) * 16];
-    for (index, value) in inputs
-        .values
-        .values()
-        .take(budget.max_bindings as usize)
-        .enumerate()
-    {
-        let slot = pack_single_slot(&value.value);
-        bytes[index * 16..index * 16 + 16].copy_from_slice(&slot);
+    let mut slot_cursor = 0usize;
+    for value in inputs.values.values() {
+        if slot_cursor >= budget.max_bindings as usize { break; }
+        for slot in flatten_value(&value.value) {
+            if slot_cursor >= budget.max_bindings as usize { break; }
+            bytes[slot_cursor * 16..slot_cursor * 16 + 16].copy_from_slice(&slot);
+            slot_cursor += 1;
+        }
     }
     bytes
+}
+
+/// Flattens a value into one or more 16-byte GPU slots.
+fn flatten_value(value: &UiInputValue) -> Vec<[u8; 16]> {
+    match value {
+        UiInputValue::Struct { fields } => {
+            let mut slots = Vec::with_capacity(fields.len());
+            for field_value in fields.values() { slots.extend(flatten_value(field_value)); }
+            slots
+        }
+        scalar => vec![pack_single_slot(scalar)],
+    }
 }
 
 /// Packs a single input value into its 16-byte GPU slot.
@@ -437,36 +449,74 @@ fn pack_single_slot(value: &UiInputValue) -> [u8; 16] {
         }
         // Enum is resolved on the CPU side (branch predicates), not sampled in shaders.
         // CanvasData has no scalar GPU representation.
-        UiInputValue::Enum { .. } | UiInputValue::CanvasData { .. } => {}
+        UiInputValue::Enum { .. } | UiInputValue::CanvasData { .. } | UiInputValue::Struct { .. } => {}
     }
     bytes
 }
 
-/// Builds a key -> slot-index map from the BTreeMap ordering (same order as pack_inputs).
+/// Builds a key -> starting-slot-index map, accounting for Struct multi-slot expansion.
 fn slot_index_map(inputs: &UiResolvedInputs, budget: &UiResourceBudget) -> BTreeMap<String, usize> {
-    inputs
-        .values
-        .keys()
-        .take(budget.max_bindings as usize)
-        .enumerate()
-        .map(|(index, key)| (key.clone(), index))
-        .collect()
+    let mut map = BTreeMap::new();
+    let mut cursor = 0usize;
+    for (key, value) in inputs.values.iter() {
+        if cursor >= budget.max_bindings as usize { break; }
+        map.insert(key.clone(), cursor);
+        cursor += flatten_value(&value.value).len();
+    }
+    map
 }
 
-/// Returns (offset, 16-byte slot) pairs for only the changed slots.
+/// Resolves a dotted path to a reference of the nested field value.
+fn resolve_field_path<'a>(value: &'a UiInputValue, path: &str) -> Option<&'a UiInputValue> {
+    let mut current = value;
+    for segment in path.split('.') {
+        match current {
+            UiInputValue::Struct { fields } => { current = fields.get(segment)?; }
+            _ => return None,
+        }
+    }
+    Some(current)
+}
+
+/// Returns (offset, 16-byte slot) pairs for changed slots. Supports "key" and "key.field" paths.
 fn pack_changed_slots(
     inputs: &UiResolvedInputs,
     budget: &UiResourceBudget,
 ) -> Vec<(u64, [u8; 16])> {
-    if inputs.changed_slots.is_empty() {
-        return Vec::new();
-    }
+    if inputs.changed_slots.is_empty() { return Vec::new(); }
     let index_map = slot_index_map(inputs, budget);
     let mut updates = Vec::with_capacity(inputs.changed_slots.len());
     for key in &inputs.changed_slots {
-        if let Some(&index) = index_map.get(key) {
-            if let Some(resolved) = inputs.values.get(key) {
-                updates.push(((index * 16) as u64, pack_single_slot(&resolved.value)));
+        let (top_key, field_path) = match key.split_once('.') {
+            Some((top, rest)) => (top, Some(rest)),
+            None => (key.as_str(), None),
+        };
+        let Some(&base_index) = index_map.get(top_key) else { continue; };
+        let Some(resolved) = inputs.values.get(top_key) else { continue; };
+        match field_path {
+            None => {
+                for (i, slot) in flatten_value(&resolved.value).iter().enumerate() {
+                    let idx = base_index + i;
+                    if idx < budget.max_bindings as usize { updates.push(((idx * 16) as u64, *slot)); }
+                }
+            }
+            Some(path) => {
+                if let Some(field_value) = resolve_field_path(&resolved.value, path) {
+                    let mut offset = 0usize;
+                    let mut current = &resolved.value;
+                    for segment in path.split('.') {
+                        if let UiInputValue::Struct { fields } = current {
+                            for (k, v) in fields {
+                                if k == segment { current = v; break; }
+                                offset += flatten_value(v).len();
+                            }
+                        }
+                    }
+                    for (i, slot) in flatten_value(field_value).iter().enumerate() {
+                        let idx = base_index + offset + i;
+                        if idx < budget.max_bindings as usize { updates.push(((idx * 16) as u64, *slot)); }
+                    }
+                }
             }
         }
     }
@@ -745,5 +795,101 @@ mod tests {
         assert_eq!(partial.len(), 1);
         assert_eq!(partial[0].0, 16);
         assert_eq!(partial[0].1, &full[16..32]);
+    }
+
+    use std::collections::BTreeMap as TestBTreeMap;
+
+    fn struct_value(fields: Vec<(&str, UiInputValue)>) -> UiInputValue {
+        let mut map = TestBTreeMap::new();
+        for (k, v) in fields { map.insert(k.to_string(), v); }
+        UiInputValue::Struct { fields: map }
+    }
+
+    #[test]
+    fn struct_flattens_into_consecutive_slots() {
+        // Struct with 3 scalar fields occupies 3 consecutive 16-byte slots.
+        let player = struct_value(vec![
+            ("hp", UiInputValue::F32 { value: 0.8 }),
+            ("level", UiInputValue::U32 { value: 42 }),
+            ("name", UiInputValue::TextHandle { value: neon_ui_schema::UiTextHandle { id: 7, generation: 1 } }),
+        ]);
+        let inputs = make_inputs(vec![("player", player)]);
+        let bytes = pack_inputs(&inputs, &test_budget(8));
+        // BTreeMap order: hp, level, name
+        // slot 0: hp = 0.8
+        assert_eq!(&bytes[0..4], &0.8f32.to_le_bytes());
+        // slot 1: level = 42
+        assert_eq!(&bytes[16..20], &42u32.to_le_bytes());
+        // slot 2: name = TextHandle { id: 7, generation: 1 }
+        assert_eq!(&bytes[32..40], &7u64.to_le_bytes());
+        assert_eq!(&bytes[40..44], &1u32.to_le_bytes());
+    }
+
+    #[test]
+    fn struct_follows_scalar_in_slot_layout() {
+        // A scalar before a struct: scalar takes slot 0, struct fields start at slot 1.
+        let player = struct_value(vec![
+            ("x", UiInputValue::F32 { value: 1.0 }),
+            ("y", UiInputValue::F32 { value: 2.0 }),
+        ]);
+        let inputs = make_inputs(vec![
+            ("flag", UiInputValue::Bool { value: true }),
+            ("player", player),
+        ]);
+        let bytes = pack_inputs(&inputs, &test_budget(8));
+        // slot 0: flag
+        assert_eq!(bytes[0], 1u8);
+        // slot 1: player.x = 1.0
+        assert_eq!(&bytes[16..20], &1.0f32.to_le_bytes());
+        // slot 2: player.y = 2.0
+        assert_eq!(&bytes[32..36], &2.0f32.to_le_bytes());
+    }
+
+    #[test]
+    fn nested_struct_flattens_recursively() {
+        let inner = struct_value(vec![
+            ("a", UiInputValue::F32 { value: 10.0 }),
+            ("b", UiInputValue::F32 { value: 20.0 }),
+        ]);
+        let outer = struct_value(vec![
+            ("inner", inner),
+            ("c", UiInputValue::F32 { value: 30.0 }),
+        ]);
+        let inputs = make_inputs(vec![("outer", outer)]);
+        let bytes = pack_inputs(&inputs, &test_budget(8));
+        // BTreeMap order: c, inner { a, b }  ("c" < "inner")
+        // slot 0: outer.c = 30.0
+        assert_eq!(&bytes[0..4], &30.0f32.to_le_bytes());
+        // slot 1: outer.inner.a = 10.0
+        assert_eq!(&bytes[16..20], &10.0f32.to_le_bytes());
+        // slot 2: outer.inner.b = 20.0
+        assert_eq!(&bytes[32..36], &20.0f32.to_le_bytes());
+    }
+
+    #[test]
+    fn struct_field_partial_update() {
+        let player = struct_value(vec![
+            ("hp", UiInputValue::F32 { value: 0.8 }),
+            ("mp", UiInputValue::F32 { value: 0.5 }),
+        ]);
+        let inputs = make_inputs_with_changes(vec![("player", player)], vec!["player.mp"]);
+        let updates = pack_changed_slots(&inputs, &test_budget(4));
+        // player.mp is the second field -> offset 1 within struct -> absolute slot 1 -> offset 16
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].0, 16);
+        assert_eq!(&updates[0].1[0..4], &0.5f32.to_le_bytes());
+    }
+
+    #[test]
+    fn whole_struct_partial_update_updates_all_fields() {
+        let player = struct_value(vec![
+            ("hp", UiInputValue::F32 { value: 0.8 }),
+            ("mp", UiInputValue::F32 { value: 0.5 }),
+        ]);
+        let inputs = make_inputs_with_changes(vec![("player", player)], vec!["player"]);
+        let updates = pack_changed_slots(&inputs, &test_budget(4));
+        assert_eq!(updates.len(), 2);
+        assert_eq!(updates[0].0, 0);  // hp
+        assert_eq!(updates[1].0, 16); // mp
     }
 }

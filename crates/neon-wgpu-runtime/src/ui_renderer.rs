@@ -1,4 +1,4 @@
-//! Minimal GPU UI composition pass adapted from Neon2's instanced panel renderer.
+﻿//! Minimal GPU UI composition pass adapted from Neon2's instanced panel renderer.
 //! It deliberately consumes only Neon3's public UI schema, not old ECS state.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -9862,6 +9862,7 @@ fn data_grid_cell_display_text(
             format!("asset#{id}:{generation}")
         }
         neon_ui_schema::UiInputValue::CanvasData { .. } => "canvas_data".into(),
+        neon_ui_schema::UiInputValue::Struct { fields } => format!("{{{} fields}}", fields.len()),
     }
 }
 
