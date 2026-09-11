@@ -1312,7 +1312,7 @@ fn input_value_as_event_payload(value: &UiInputValue) -> Option<UiSemanticPayloa
         UiInputValue::Vec2 { .. } | UiInputValue::Vec4 { .. } | UiInputValue::Color { .. } => {
             return None;
         }
-        UiInputValue::CanvasData { .. } | UiInputValue::Struct { .. } => return None,
+        UiInputValue::CanvasData { .. } | UiInputValue::Struct { .. } | UiInputValue::Array { .. } => return None,
     })
 }
 
@@ -1424,6 +1424,7 @@ fn ui_input_kind_name(kind: &neon_ui_schema::UiInputKind) -> String {
         UiInputKind::AssetHandle => "asset".into(),
         UiInputKind::CanvasData => "canvas_data".into(),
         UiInputKind::Struct { .. } => "struct".into(),
+        UiInputKind::Array { length, .. } => format!("array[{}]", length),
     }
 }
 
@@ -1449,6 +1450,9 @@ fn input_value_to_json(value: &UiInputValue) -> serde_json::Value {
             let mut map = serde_json::Map::new();
             for (k, v) in fields { map.insert(k.clone(), input_value_to_json(v)); }
             serde_json::Value::Object(map)
+        }
+        UiInputValue::Array { elements, .. } => {
+            serde_json::Value::Array(elements.iter().map(input_value_to_json).collect())
         }
     }
 }

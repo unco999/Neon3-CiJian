@@ -413,6 +413,11 @@ fn flatten_value(value: &UiInputValue) -> Vec<[u8; 16]> {
             for field_value in fields.values() { slots.extend(flatten_value(field_value)); }
             slots
         }
+        UiInputValue::Array { elements, .. } => {
+            let mut slots = Vec::with_capacity(elements.len());
+            for element in elements { slots.extend(flatten_value(element)); }
+            slots
+        }
         scalar => vec![pack_single_slot(scalar)],
     }
 }
@@ -449,7 +454,7 @@ fn pack_single_slot(value: &UiInputValue) -> [u8; 16] {
         }
         // Enum is resolved on the CPU side (branch predicates), not sampled in shaders.
         // CanvasData has no scalar GPU representation.
-        UiInputValue::Enum { .. } | UiInputValue::CanvasData { .. } | UiInputValue::Struct { .. } => {}
+        UiInputValue::Enum { .. } | UiInputValue::CanvasData { .. } | UiInputValue::Struct { .. } | UiInputValue::Array { .. } => {}
     }
     bytes
 }
@@ -891,5 +896,58 @@ mod tests {
         assert_eq!(updates.len(), 2);
         assert_eq!(updates[0].0, 0);  // hp
         assert_eq!(updates[1].0, 16); // mp
+    }
+
+    #[test]
+    fn array_of_f32_flattens_to_contiguous_slots() {
+        let arr = UiInputValue::Array {
+            elements: vec![
+                UiInputValue::F32 { value: 1.0 },
+                UiInputValue::F32 { value: 2.0 },
+                UiInputValue::F32 { value: 3.0 },
+            ],
+            element_kind: Box::new(neon_ui_schema::UiInputKind::F32),
+        };
+        let slots = flatten_value(&arr);
+        assert_eq!(slots.len(), 3);
+        assert_eq!(f32::from_le_bytes(slots[0][0..4].try_into().unwrap()), 1.0);
+        assert_eq!(f32::from_le_bytes(slots[1][0..4].try_into().unwrap()), 2.0);
+        assert_eq!(f32::from_le_bytes(slots[2][0..4].try_into().unwrap()), 3.0);
+    }
+
+    #[test]
+    fn array_of_struct_flattens_all_fields_contiguously() {
+        let make_slot = |count: u32| {
+            struct_value(vec![
+                ("item", UiInputValue::TextHandle { value: neon_ui_schema::UiTextHandle { id: 0, generation: 0 } }),
+                ("count", UiInputValue::U32 { value: count }),
+            ])
+        };
+        let arr = UiInputValue::Array {
+            elements: vec![make_slot(3), make_slot(5)],
+            element_kind: Box::new(neon_ui_schema::UiInputKind::Struct {
+                fields: [("item".into(), neon_ui_schema::UiInputKind::TextHandle), ("count".into(), neon_ui_schema::UiInputKind::U32)].into_iter().collect()
+            }),
+        };
+        let slots = flatten_value(&arr);
+        assert_eq!(slots.len(), 4);
+        // BTreeMap alphabetical: count before item
+        // slot 0 = count[0], slot 1 = item[0], slot 2 = count[1], slot 3 = item[1]
+        assert_eq!(u32::from_le_bytes(slots[0][0..4].try_into().unwrap()), 3);
+        assert_eq!(u32::from_le_bytes(slots[2][0..4].try_into().unwrap()), 5);
+    }
+
+    #[test]
+    fn array_gpu_slot_count_matches_length() {
+        use neon_ui_schema::UiInputKind;
+        let kind = UiInputKind::Array { element_kind: Box::new(UiInputKind::F32), length: 24 };
+        assert_eq!(kind.gpu_slot_count(), 24);
+        let struct_kind = UiInputKind::Array {
+            element_kind: Box::new(UiInputKind::Struct {
+                fields: [("a".into(), UiInputKind::F32), ("b".into(), UiInputKind::F32)].into_iter().collect()
+            }),
+            length: 10,
+        };
+        assert_eq!(struct_kind.gpu_slot_count(), 20);
     }
 }

@@ -2350,6 +2350,10 @@ fn default_for_kind(kind: &neon_ui_schema::UiInputKind) -> neon_ui_schema::UiInp
         },
         neon_ui_schema::UiInputKind::CanvasData => UiInputValue::CanvasData { value: Default::default() },
         neon_ui_schema::UiInputKind::Struct { .. } => UiInputValue::Struct { fields: Default::default() },
+        neon_ui_schema::UiInputKind::Array { element_kind, length } => UiInputValue::Array {
+            elements: (0..*length).map(|_| default_for_kind(element_kind)).collect(),
+            element_kind: element_kind.clone(),
+        },
     }
 }
 

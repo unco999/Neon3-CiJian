@@ -9863,6 +9863,7 @@ fn data_grid_cell_display_text(
         }
         neon_ui_schema::UiInputValue::CanvasData { .. } => "canvas_data".into(),
         neon_ui_schema::UiInputValue::Struct { fields } => format!("{{{} fields}}", fields.len()),
+        neon_ui_schema::UiInputValue::Array { elements, .. } => format!("[{} elements]", elements.len()),
     }
 }
 

@@ -111,6 +111,7 @@ pub enum UiInputKind {
     F32Range { minimum: f32, maximum: f32 },
     CanvasData,
     Struct { fields: std::collections::BTreeMap<String, UiInputKind> },
+    Array { element_kind: Box<UiInputKind>, length: usize },
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -135,6 +136,7 @@ pub enum UiInputValue {
     AssetHandle { id: u64, generation: u32 },
     CanvasData { value: UiCanvasData },
     Struct { fields: std::collections::BTreeMap<String, UiInputValue> },
+    Array { elements: Vec<UiInputValue>, element_kind: Box<UiInputKind> },
 }
 
 /// Bounded, persisted drawing data for a single declarative Canvas node.
@@ -324,7 +326,7 @@ impl UiInputKind {
             // Canvas payload bytes are never packed into the scalar GPU input buffer.
             // This sentinel slot keeps the existing revisioned input store contract.
             Self::CanvasData => (4, 1, UiGpuScalarRepresentation::U32),
-            Self::Struct { .. } => (16, 4, UiGpuScalarRepresentation::Vec4F32),
+            Self::Struct { .. } | Self::Array { .. } => (16, 4, UiGpuScalarRepresentation::Vec4F32),
         }
     }
     /// Number of 16-byte GPU input slots this type occupies.
@@ -332,6 +334,7 @@ impl UiInputKind {
     pub fn gpu_slot_count(&self) -> usize {
         match self {
             Self::Struct { fields } => fields.values().map(|kind| kind.gpu_slot_count()).sum(),
+            Self::Array { element_kind, length } => element_kind.gpu_slot_count() * length,
             _ => 1,
         }
     }
@@ -373,6 +376,9 @@ impl UiInputKind {
                             .map(|value| kind.accepts(value))
                             .unwrap_or(false)
                     })
+            }
+            (Self::Array { element_kind, length }, UiInputValue::Array { elements, .. }) => {
+                elements.len() == *length && elements.iter().all(|element| element_kind.accepts(element))
             }
             _ => false,
         }
