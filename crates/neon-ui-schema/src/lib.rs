@@ -954,6 +954,12 @@ pub enum UiNodeKind {
     /// A draggable divider that resizes adjacent panels. Orientation is inferred
     /// from bounds (w > h = horizontal splitter, h > w = vertical splitter).
     Splitter,
+    /// A right-click context menu popup. Rendering reuses modal popup logic;
+    /// menu items are child buttons with semantic event routing.
+    ContextMenu,
+    /// A hierarchical tree view for file browsers and outline panels. Each
+    /// node is a selectable row with expand/collapse state.
+    TreeView,
     /// A declarative, virtualized tabular viewport. Row data is supplied by
     /// bounded `UiDataGridFrame` windows rather than by runtime topology.
     DataGrid,

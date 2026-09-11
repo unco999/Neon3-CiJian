@@ -118,9 +118,19 @@ Schema 定义了 12 种可绑定属性，NUI Flow 只支持 7 种：
 
 注意：`scroll` 属性保持 NumericValue（Scrollbar 单轴），新增 `scroll_offset` 用于二维 Vec2 偏移。
 
-### 阶段 B：滚动+分割（2-3天）
-- ScrollView 容器（Panel + scroll=true + 自动 Scrollbar）
-- Splitter 组件
+### 阶段 B：滚动+分割（已完成，commit 201717d + da2ca61）
+- [x] ScrollView 容器基础属性
+  - [x] `scrollable` 无值属性（clip=Scroll）
+  - [x] `scroll_offset` 字面量（x,y 格式）
+  - [x] `scroll_offset` 绑定（Vec2）
+  - [x] 序列化 round-trip
+  - [x] 渲染层已有完整支持（滚轮+拖拽+metrics，3个测试通过）
+- [x] Splitter 组件基础结构
+  - [x] UiNodeKind::Splitter
+  - [x] NUI Flow 解析 + 序列化
+  - [ ] 拖拽调整相邻面板大小（待实现）
+
+注意：渲染层已有完整的 ScrollView 交互支持（scroll_wheel_at_pointer + scroll_drag），NUI Flow 层只需暴露属性。
 
 ### 阶段 C：编辑器核心组件（3-5天）
 - TreeView
