@@ -2868,6 +2868,7 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
             "row" => node.layout.as_mut().unwrap().mode = UiLayoutMode::Row,
             "column" => node.layout.as_mut().unwrap().mode = UiLayoutMode::Column,
             "overlay" => node.layout.as_mut().unwrap().mode = UiLayoutMode::Overlay,
+            "scrollable" => node.layout.as_mut().unwrap().clip = UiClipPolicy::Scroll,
             "x" | "y" | "w" | "h" | "minw" | "maxw" | "grow" | "shrink" | "basis" | "gap"
             | "pad" | "fill" | "line" | "ink" | "opacity" | "radius" | "border_width" | "value"
             | "checked" | "selected" | "state" | "numeric" | "scroll" | "scroll_offset" | "enabled" | "visible"
@@ -3992,12 +3993,16 @@ fn parse_attribute(
         }
         "scroll_offset" => {
             if direct_binding(UiBoundProperty::ScrollOffset).is_none() {
-                return Err(error(
-                    "nui_flow_invalid_control_binding",
-                    "scroll_offset requires a vec2 input binding",
-                    line,
-                    1,
-                ));
+                // Literal form: scroll_offset x,y
+                let nums: Vec<f32> = value
+                    .split(',')
+                    .map(|s| s.trim().parse::<f32>())
+                    .collect::<Result<_, _>>()
+                    .map_err(|_| error("nui_flow_invalid_literal", "scroll_offset literal uses x,y", line, 1))?;
+                if nums.len() != 2 || nums.iter().any(|v| !v.is_finite()) {
+                    return Err(error("nui_flow_invalid_literal", "scroll_offset needs 2 finite numbers", line, 1));
+                }
+                layout.scroll_offset = [nums[0], nums[1]];
             }
         }
         "enabled" => {
@@ -4573,6 +4578,13 @@ fn format_node(
                 UiClipPolicy::Scroll => "scroll",
             };
             line.push_str(&format!(" clip {policy}"));
+        }
+        // Serialize literal scroll_offset only if there is no binding for it.
+        let has_scroll_offset_binding = bindings
+            .iter()
+            .any(|b| b.node_key == node.node_id.0 && b.property == UiBoundProperty::ScrollOffset);
+        if (layout.scroll_offset[0] != 0.0 || layout.scroll_offset[1] != 0.0) && !has_scroll_offset_binding {
+            line.push_str(&format!(" scroll_offset {},{}", layout.scroll_offset[0], layout.scroll_offset[1]));
         }
         if node.kind == UiNodeKind::Image && layout.image_fit != neon_ui_schema::UiImageFit::Stretch {
             let fit = match layout.image_fit { neon_ui_schema::UiImageFit::Stretch => "stretch", neon_ui_schema::UiImageFit::Cover => "cover", neon_ui_schema::UiImageFit::Contain => "contain" };
@@ -6375,5 +6387,22 @@ panel workspace row gap 8
         // opacity and resource bindings should appear in serialized output
         assert!(serialized.contains("opacity $alpha"), "serialized should contain opacity binding");
         assert!(serialized.contains("resource $tex"), "serialized should contain resource binding");
+    }
+
+    #[test]
+    fn scrollable_panel_and_scroll_offset_literal() {
+        let source = "surface root w 200 h 200\n  panel scroller x 0 y 0 w 100 h 100 scrollable scroll_offset 10,20\n    text item1 x 0 y 0 w 80 h 20 value \"Item 1\"\n    text item2 x 0 y 30 w 80 h 20 value \"Item 2\"\n";
+        let document = parse_nui_flow(source).expect("scrollable panel should parse");
+        let panel = document.ir.root.children.iter().find(|n| n.node_id.0 == "scroller").unwrap();
+        assert_eq!(panel.layout.unwrap().clip, neon_ui_schema::UiClipPolicy::Scroll);
+        assert_eq!(panel.layout.unwrap().scroll_offset, [10.0, 20.0]);
+
+        // Serialize round-trip
+        let serialized = format_nui_flow(source).expect("should format");
+        assert!(serialized.contains("clip scroll"), "serialized should contain clip scroll");
+        assert!(serialized.contains("scroll_offset 10,20"), "serialized should contain scroll_offset literal");
+        let reparsed = parse_nui_flow(&serialized).expect("reparsed should succeed");
+        let panel2 = reparsed.ir.root.children.iter().find(|n| n.node_id.0 == "scroller").unwrap();
+        assert_eq!(panel2.layout.unwrap().scroll_offset, [10.0, 20.0]);
     }
 }

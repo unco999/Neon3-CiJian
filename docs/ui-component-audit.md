@@ -103,9 +103,20 @@ Schema 定义了 12 种可绑定属性，NUI Flow 只支持 7 种：
 
 ## 四、推进路线
 
-### 阶段 A：补全属性绑定（1-2天）
-- 补齐 Opacity / ImageAsset / ScrollOffset / CanvasData 的 NUI Flow 绑定
-- 投入产出比最高，改完后所有组件都能用变量控制这些属性
+### 阶段 A：补全属性绑定（已完成，commit 680c684）
+- [x] Opacity 绑定（`opacity $var`，F32）
+- [x] ImageAsset 绑定（`resource $var`，AssetHandle）
+- [x] ScrollOffset 绑定（`scroll_offset $var`，Vec2）
+- [x] CanvasData 绑定（`data $var`，已有专门处理）
+- [x] asset_handle input kind + 默认值 `asset:empty`
+- [x] struct field 支持 asset_handle
+- [x] UiIrDocument::validate() ImageAsset 绑定视为外部图片
+- [x] lower_nui_flow_effects 生成 ImageBinding effect
+- [x] binding_accepts 补齐类型校验
+- [x] 序列化 round-trip
+- [x] 5个新测试，全量测试通过（ui-schema 37, ui-runtime 148, GPU 20）
+
+注意：`scroll` 属性保持 NumericValue（Scrollbar 单轴），新增 `scroll_offset` 用于二维 Vec2 偏移。
 
 ### 阶段 B：滚动+分割（2-3天）
 - ScrollView 容器（Panel + scroll=true + 自动 Scrollbar）
