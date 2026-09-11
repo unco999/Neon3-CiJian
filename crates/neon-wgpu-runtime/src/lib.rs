@@ -4043,6 +4043,16 @@ impl HeadlessExternalGpu {
             }
             UiPointerEventType::Down => {
                 self.perf.pointer_down_received += 1;
+                // Secondary (right-click) requests a context menu at the pointer.
+                // The semantic layer can use this to show a ContextMenu component.
+                if matches!(event.button, Some(neon_ui_schema::UiPointerButton::Secondary)) {
+                    let current_hit = ui.hit_binding_at_pointer();
+                    return Ok(json!({
+                        "state": "context_menu_requested",
+                        "pixel": event.pixel,
+                        "hit_binding": current_hit.as_ref().map(|(id, _)| *id)
+                    }));
+                }
                 if !matches!(event.button, Some(neon_ui_schema::UiPointerButton::Primary)) {
                     return Err("ui_pointer_button_unsupported".into());
                 }
