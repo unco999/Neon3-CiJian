@@ -5442,6 +5442,88 @@ impl UiWgpuRenderer {
                 images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, _padding: [0; 2] });
             }
         }
+        // Scrollbar skins render track + thumb using the normalized scroll value.
+        for (index, visual) in self.sampled.iter().enumerate() {
+            if visual.kind != UiNodeKind::Scrollbar || !sampled_in_mode(visual, mode) {
+                continue;
+            }
+            let Some(skin_key) = self.skin_references.get(&self.plan[index].id) else { continue };
+            let Some(skin) = self.skins.get(skin_key) else { continue };
+            let normalized = match &visual.presentation {
+                Some(UiControlPresentation::Numeric { value, min, max }) => ((value - min) / (max - min)).clamp(0.0, 1.0),
+                _ => 0.0,
+            };
+            let horizontal = visual.bounds.width > visual.bounds.height;
+            let track = visual.bounds;
+            let thumb_size = if horizontal { visual.bounds.height.min(24.0) } else { visual.bounds.width.min(24.0) };
+            let thumb = if horizontal {
+                UiBounds { x: track.x + (track.width - thumb_size) * normalized, y: track.y, width: thumb_size, height: track.height }
+            } else {
+                UiBounds { x: track.x, y: track.y + (track.height - thumb_size) * normalized, width: track.width, height: thumb_size }
+            };
+            for (slot_kind, bounds) in [(UiSkinSlotKind::Track, track), (UiSkinSlotKind::Thumb, thumb)] {
+                let Some(slot) = skin.slots.iter().find(|slot| slot.slot_kind == slot_kind && slot.state == UiVisualState::Normal) else { continue };
+                let (resource_key, fit, nine_slice) = match &slot.presentation {
+                    UiSkinPresentation::Image { resource_key, fit } => (resource_key, *fit, None),
+                    UiSkinPresentation::NineSlice { resource_key, layout } => (resource_key, UiImageFit::Stretch, Some(*layout)),
+                    _ => continue,
+                };
+                let binding_key = format!("{skin_key}/{resource_key}");
+                let image = self.skin_assets.get(&binding_key).and_then(|asset| self.resident_images.get(&(asset.project_id.clone(), asset.asset_id, asset.revision.0))).or_else(|| self.skin_image_ids.get(&binding_key).and_then(|image_id| self.external_images.get(image_id)));
+                let Some(image) = image else { continue };
+                if nine_slice.is_some_and(|layout| !layout.validate_for_image(image.width, image.height)) { continue; }
+                let (source_insets, target_insets, slice_mode, fill_center) = nine_slice.map(|layout| (layout.source_insets_px.map(|value| value as f32), layout.target_insets, match layout.mode { neon_ui_schema::UiNineSliceMode::Stretch => 0, neon_ui_schema::UiNineSliceMode::Tile => 1, neon_ui_schema::UiNineSliceMode::Mirror => 2 }, u32::from(layout.fill_center))).unwrap_or(([0.0; 4], [0.0; 4], 0, 1));
+                let (rect, uv) = fit_image_rect_and_uv(bounds, image.uv, image.width, image.height, fit);
+                images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, _padding: [0; 2] });
+            }
+        }
+        // Checkbox skins render body + check mark based on selected state.
+        for (index, visual) in self.sampled.iter().enumerate() {
+            if visual.kind != UiNodeKind::Checkbox || !sampled_in_mode(visual, mode) {
+                continue;
+            }
+            let Some(skin_key) = self.skin_references.get(&self.plan[index].id) else { continue };
+            let Some(skin) = self.skins.get(skin_key) else { continue };
+            let selected = matches!(&visual.presentation, Some(UiControlPresentation::Toggle { selected }) if *selected);
+            let hovered = self.pointer_position.is_some_and(|position| contains(visual.bounds, position));
+            let body_state = if hovered { UiVisualState::Hover } else { UiVisualState::Normal };
+            // Body
+            if let Some(slot) = skin.slots.iter().find(|slot| slot.slot_kind == UiSkinSlotKind::Body && slot.state == body_state) {
+                let (resource_key, fit, nine_slice) = match &slot.presentation {
+                    UiSkinPresentation::Image { resource_key, fit } => (resource_key, *fit, None),
+                    UiSkinPresentation::NineSlice { resource_key, layout } => (resource_key, UiImageFit::Stretch, Some(*layout)),
+                    _ => continue,
+                };
+                let binding_key = format!("{skin_key}/{resource_key}");
+                if let Some(image) = self.skin_assets.get(&binding_key).and_then(|asset| self.resident_images.get(&(asset.project_id.clone(), asset.asset_id, asset.revision.0))).or_else(|| self.skin_image_ids.get(&binding_key).and_then(|image_id| self.external_images.get(image_id))) {
+                    if !nine_slice.is_some_and(|layout| !layout.validate_for_image(image.width, image.height)) {
+                        let (source_insets, target_insets, slice_mode, fill_center) = nine_slice.map(|layout| (layout.source_insets_px.map(|value| value as f32), layout.target_insets, match layout.mode { neon_ui_schema::UiNineSliceMode::Stretch => 0, neon_ui_schema::UiNineSliceMode::Tile => 1, neon_ui_schema::UiNineSliceMode::Mirror => 2 }, u32::from(layout.fill_center))).unwrap_or(([0.0; 4], [0.0; 4], 0, 1));
+                        let (rect, uv) = fit_image_rect_and_uv(visual.bounds, image.uv, image.width, image.height, fit);
+                        images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, _padding: [0; 2] });
+                    }
+                }
+            }
+            // Check mark (only when selected) - use Fill slot as check mark
+            if selected {
+                if let Some(slot) = skin.slots.iter().find(|slot| slot.slot_kind == UiSkinSlotKind::Fill && slot.state == UiVisualState::Active) {
+                    let (resource_key, fit, nine_slice) = match &slot.presentation {
+                        UiSkinPresentation::Image { resource_key, fit } => (resource_key, *fit, None),
+                        UiSkinPresentation::NineSlice { resource_key, layout } => (resource_key, UiImageFit::Stretch, Some(*layout)),
+                        _ => continue,
+                    };
+                    let binding_key = format!("{skin_key}/{resource_key}");
+                    if let Some(image) = self.skin_assets.get(&binding_key).and_then(|asset| self.resident_images.get(&(asset.project_id.clone(), asset.asset_id, asset.revision.0))).or_else(|| self.skin_image_ids.get(&binding_key).and_then(|image_id| self.external_images.get(image_id))) {
+                        if !nine_slice.is_some_and(|layout| !layout.validate_for_image(image.width, image.height)) {
+                            let (source_insets, target_insets, slice_mode, fill_center) = nine_slice.map(|layout| (layout.source_insets_px.map(|value| value as f32), layout.target_insets, match layout.mode { neon_ui_schema::UiNineSliceMode::Stretch => 0, neon_ui_schema::UiNineSliceMode::Tile => 1, neon_ui_schema::UiNineSliceMode::Mirror => 2 }, u32::from(layout.fill_center))).unwrap_or(([0.0; 4], [0.0; 4], 0, 1));
+                            let mark_size = visual.bounds.width.min(visual.bounds.height) * 0.6;
+                            let mark_bounds = UiBounds { x: visual.bounds.x + (visual.bounds.width - mark_size) * 0.5, y: visual.bounds.y + (visual.bounds.height - mark_size) * 0.5, width: mark_size, height: mark_size };
+                            let (rect, uv) = fit_image_rect_and_uv(mark_bounds, image.uv, image.width, image.height, fit);
+                            images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, _padding: [0; 2] });
+                        }
+                    }
+                }
+            }
+        }
         let image_capacity = images.len().max(popup_images.len());
         if image_capacity > self.image_capacity {
             self.image_capacity = image_capacity.next_power_of_two();
