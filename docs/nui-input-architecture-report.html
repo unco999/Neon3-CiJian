@@ -1,0 +1,350 @@
+<html style="margin:0;padding:0;background:#0a0e17;">
+<div style="font-family:'Segoe UI',system-ui,sans-serif;color:#c8d6e5;padding:32px;max-width:1100px;margin:0 auto;">
+
+<!-- 标题 -->
+<div style="border-left:4px solid #4fc3f7;padding-left:16px;margin-bottom:32px;">
+  <h1 style="margin:0;font-size:26px;color:#e8f4fd;">NUI Input/Val 变量架构诊断报告</h1>
+  <p style="margin:8px 0 0;color:#7a8fa6;font-size:14px;">Neon3 v0.2.7 · 文字排版修复后架构审查 · 2026-09-12</p>
+</div>
+
+<!-- 一、核心结论 -->
+<div style="background:#111827;border:1px solid #1e293b;border-radius:8px;padding:20px;margin-bottom:28px;">
+  <h2 style="margin:0 0 12px;font-size:18px;color:#4fc3f7;">核心结论</h2>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;">
+    <div style="background:#0d1117;border-radius:6px;padding:14px;border-left:3px solid #ef5350;">
+      <div style="font-size:13px;color:#ef5350;font-weight:600;margin-bottom:6px;">确认的问题</div>
+      <div style="font-size:13px;line-height:1.6;color:#b0bec5;">UiInputValue 只有标量枚举，无 Struct/Object/Array。复杂数据必须拆成独立变量，24格背包需声明24个 slot。</div>
+    </div>
+    <div style="background:#0d1117;border-radius:6px;padding:14px;border-left:3px solid #ffa726;">
+      <div style="font-size:13px;color:#ffa726;font-weight:600;margin-bottom:6px;">刷新影响</div>
+      <div style="font-size:13px;line-height:1.6;color:#b0bec5;">GPU 端 pack_inputs 全量重打包所有 slot，无增量上传。N 个变量中任一个变化，整个 input buffer 重新上传。</div>
+    </div>
+    <div style="background:#0d1117;border-radius:6px;padding:14px;border-left:3px solid #ab47bc;">
+      <div style="font-size:13px;color:#ab47bc;font-weight:600;margin-bottom:6px;">类型缺口</div>
+      <div style="font-size:13px;line-height:1.6;color:#b0bec5;">Vec2/Vec4/Color/Enum/AssetHandle 在 GPU pack_inputs 中未实现（_ =&gt; {}），shader 读不到。</div>
+    </div>
+    <div style="background:#0d1117;border-radius:6px;padding:14px;border-left:3px solid #66bb6a;">
+      <div style="font-size:13px;color:#66bb6a;font-weight:600;margin-bottom:6px;">SDK 已有能力</div>
+      <div style="font-size:13px;line-height:1.6;color:#b0bec5;">ObservableStore 支持 CollectionStore/SelectionStore/事务/增量 diff，但 runtime 端无对应 input 类型承接。</div>
+    </div>
+  </div>
+</div>
+
+<!-- 二、当前架构数据流 -->
+<h2 style="font-size:18px;color:#4fc3f7;margin:0 0 16px;">一、当前架构数据流</h2>
+<div style="background:#111827;border:1px solid #1e293b;border-radius:8px;padding:24px;margin-bottom:28px;overflow-x:auto;">
+<svg viewBox="0 0 1040 320" width="100%" style="min-width:700px;">
+  <!-- SDK 层 -->
+  <rect x="20" y="20" width="300" height="280" rx="8" fill="#0d1520" stroke="#1e3a5f" stroke-width="1.5"/>
+  <text x="170" y="44" text-anchor="middle" fill="#4fc3f7" font-size="14" font-weight="600">SDK (TypeScript)</text>
+  
+  <rect x="40" y="60" width="260" height="50" rx="4" fill="#111d2e" stroke="#2a4a6a"/>
+  <text x="170" y="82" text-anchor="middle" fill="#e8f4fd" font-size="12">ObservableStore</text>
+  <text x="170" y="100" text-anchor="middle" fill="#7a8fa6" font-size="10">Scalar / Collection / Selection</text>
+  
+  <rect x="40" y="125" width="260" height="50" rx="4" fill="#111d2e" stroke="#2a4a6a"/>
+  <text x="170" y="147" text-anchor="middle" fill="#e8f4fd" font-size="12">transaction() 批量修改</text>
+  <text x="170" y="165" text-anchor="middle" fill="#7a8fa6" font-size="10">changedScalars() 增量追踪</text>
+  
+  <rect x="40" y="190" width="260" height="50" rx="4" fill="#1a2a1a" stroke="#2a5a2a"/>
+  <text x="170" y="212" text-anchor="middle" fill="#a5d6a7" font-size="12">buildPublication()</text>
+  <text x="170" y="230" text-anchor="middle" fill="#7a8fa6" font-size="10">scalar_frame.changes = dirty keys</text>
+  
+  <rect x="40" y="255" width="260" height="30" rx="4" fill="#1a1a2a" stroke="#3a3a5a"/>
+  <text x="170" y="275" text-anchor="middle" fill="#b39ddb" font-size="11">UiInputFrame (RPC)</text>
+
+  <!-- 箭头 SDK -> Runtime -->
+  <path d="M320 160 L380 160" stroke="#4fc3f7" stroke-width="2" marker-end="url(#arrow)"/>
+  <text x="350" y="152" text-anchor="middle" fill="#4fc3f7" font-size="10">changes: Vec</text>
+  
+  <!-- Runtime 层 -->
+  <rect x="380" y="20" width="300" height="280" rx="8" fill="#0d1520" stroke="#1e3a5f" stroke-width="1.5"/>
+  <text x="530" y="44" text-anchor="middle" fill="#4fc3f7" font-size="14" font-weight="600">UI Runtime (Rust)</text>
+  
+  <rect x="400" y="60" width="260" height="50" rx="4" fill="#111d2e" stroke="#2a4a6a"/>
+  <text x="530" y="82" text-anchor="middle" fill="#e8f4fd" font-size="12">UiResolvedInputs</text>
+  <text x="530" y="100" text-anchor="middle" fill="#7a8fa6" font-size="10">BTreeMap&lt;key, UiInputValue&gt;</text>
+  
+  <rect x="400" y="125" width="260" height="50" rx="4" fill="#2a1a1a" stroke="#5a2a2a"/>
+  <text x="530" y="147" text-anchor="middle" fill="#ef9a9a" font-size="12">UiInputValue 枚举</text>
+  <text x="530" y="165" text-anchor="middle" fill="#7a8fa6" font-size="10">仅标量: bool/i32/f32/enum/text...</text>
+  
+  <rect x="400" y="190" width="260" height="50" rx="4" fill="#111d2e" stroke="#2a4a6a"/>
+  <text x="530" y="212" text-anchor="middle" fill="#e8f4fd" font-size="12">NUI Flow 绑定解析</text>
+  <text x="530" y="230" text-anchor="middle" fill="#7a8fa6" font-size="10">slot 声明 → node 属性绑定</text>
+  
+  <rect x="400" y="255" width="260" height="30" rx="4" fill="#1a1a2a" stroke="#3a3a5a"/>
+  <text x="530" y="275" text-anchor="middle" fill="#b39ddb" font-size="11">resolved input snapshot</text>
+
+  <!-- 箭头 Runtime -> GPU -->
+  <path d="M680 160 L740 160" stroke="#4fc3f7" stroke-width="2" marker-end="url(#arrow)"/>
+  <text x="710" y="152" text-anchor="middle" fill="#ef5350" font-size="10">全量重打包!</text>
+  
+  <!-- GPU 层 -->
+  <rect x="740" y="20" width="280" height="280" rx="8" fill="#0d1520" stroke="#1e3a5f" stroke-width="1.5"/>
+  <text x="880" y="44" text-anchor="middle" fill="#4fc3f7" font-size="14" font-weight="600">WGPU Runtime (GPU)</text>
+  
+  <rect x="760" y="60" width="240" height="50" rx="4" fill="#2a1a1a" stroke="#5a2a2a"/>
+  <text x="880" y="82" text-anchor="middle" fill="#ef9a9a" font-size="12">pack_inputs() 全量</text>
+  <text x="880" y="100" text-anchor="middle" fill="#7a8fa6" font-size="10">每 slot 16 字节，遍历全部 values</text>
+  
+  <rect x="760" y="125" width="240" height="50" rx="4" fill="#111d2e" stroke="#2a4a6a"/>
+  <text x="880" y="147" text-anchor="middle" fill="#e8f4fd" font-size="12">Storage Buffer</text>
+  <text x="880" y="165" text-anchor="middle" fill="#7a8fa6" font-size="10">write_buffer 整体上传</text>
+  
+  <rect x="760" y="190" width="240" height="50" rx="4" fill="#2a1a1a" stroke="#5a2a2a"/>
+  <text x="880" y="212" text-anchor="middle" fill="#ef9a9a" font-size="12">仅支持 5 种类型</text>
+  <text x="880" y="230" text-anchor="middle" fill="#7a8fa6" font-size="10">bool/i32/u32/f32/text</text>
+  
+  <rect x="760" y="255" width="240" height="30" rx="4" fill="#1a1a2a" stroke="#3a3a5a"/>
+  <text x="880" y="275" text-anchor="middle" fill="#b39ddb" font-size="11">shader 读取 input[index]</text>
+  
+  <defs>
+    <marker id="arrow" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6 Z" fill="#4fc3f7"/>
+    </marker>
+  </defs>
+</svg>
+<div style="margin-top:12px;font-size:12px;color:#7a8fa6;">红色标注 = 当前瓶颈或缺失</div>
+</div>
+
+<!-- 三、问题诊断 -->
+<h2 style="font-size:18px;color:#4fc3f7;margin:0 0 16px;">二、问题诊断（实际证据）</h2>
+
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:28px;">
+  
+  <div style="background:#111827;border:1px solid #1e293b;border-radius:8px;padding:18px;">
+    <h3 style="margin:0 0 10px;font-size:15px;color:#ef5350;">P0 · 无结构体 Input 类型</h3>
+    <div style="font-size:13px;line-height:1.7;color:#b0bec5;">
+      <p style="margin:0 0 8px;"><b>证据</b>：<code style="background:#1e293b;padding:2px 6px;border-radius:3px;color:#ffab91;">UiInputValue</code> 枚举只有 11 种标量，无 Struct/Object/Map/Array。</p>
+      <p style="margin:0 0 8px;"><b>实际痛点</b>：案例中 24 格背包必须写成：</p>
+      <code style="display:block;background:#0d1117;padding:8px;border-radius:4px;font-size:11px;color:#a5d6a7;overflow-x:auto;">apple_in_slot_01, apple_in_slot_02, ... apple_in_slot_24
+orange_in_slot_01, orange_in_slot_02, ... orange_in_slot_24
+→ N种物品 × 24格 = 24N 个独立变量</code>
+      <p style="margin:8px 0 0;"><b>后果</b>：变量爆炸、命名冗余、无法整体替换、事务边界模糊。</p>
+    </div>
+  </div>
+
+  <div style="background:#111827;border:1px solid #1e293b;border-radius:8px;padding:18px;">
+    <h3 style="margin:0 0 10px;font-size:15px;color:#ef5350;">P0 · GPU 全量重打包无增量</h3>
+    <div style="font-size:13px;line-height:1.7;color:#b0bec5;">
+      <p style="margin:0 0 8px;"><b>证据</b>：<code style="background:#1e293b;padding:2px 6px;border-radius:3px;color:#ffab91;">pack_inputs()</code> 遍历 <code style="background:#1e293b;padding:2px 6px;border-radius:3px;">inputs.values</code> 全部 slot，每 slot 固定 16 字节。</p>
+      <p style="margin:0 0 8px;"><b>刷新路径</b>：</p>
+      <code style="display:block;background:#0d1117;padding:8px;border-radius:4px;font-size:11px;color:#a5d6a7;">SDK 增量 changes → Runtime 全量 resolved
+→ pack_inputs 遍历全部 N 个 slot
+→ write_buffer 整体上传 GPU</code>
+      <p style="margin:8px 0 0;"><b>后果</b>：100 个 slot 中改 1 个，仍打包上传 100×16=1600 字节。slot 越多浪费越大。</p>
+    </div>
+  </div>
+
+  <div style="background:#111827;border:1px solid #1e293b;border-radius:8px;padding:18px;">
+    <h3 style="margin:0 0 10px;font-size:15px;color:#ffa726;">P1 · GPU 类型支持不完整</h3>
+    <div style="font-size:13px;line-height:1.7;color:#b0bec5;">
+      <p style="margin:0 0 8px;"><b>证据</b>：<code style="background:#1e293b;padding:2px 6px;border-radius:3px;">pack_inputs</code> match 中：</p>
+      <code style="display:block;background:#0d1117;padding:8px;border-radius:4px;font-size:11px;color:#ef9a9a;">UiInputValue::Vec2 { .. } | Vec4 | Color | Enum
+| AssetHandle | CanvasData => {}</code>
+      <p style="margin:8px 0 0;"><b>后果</b>：声明了这些类型的 slot，shader 中读到的是零值。NUI Flow 解析器甚至不支持声明 vec2/vec4/color。</p>
+    </div>
+  </div>
+
+  <div style="background:#111827;border:1px solid #1e293b;border-radius:8px;padding:18px;">
+    <h3 style="margin:0 0 10px;font-size:15px;color:#ffa726;">P1 · Collection 与 Input 脱节</h3>
+    <div style="font-size:13px;line-height:1.7;color:#b0bec5;">
+      <p style="margin:0 0 8px;"><b>证据</b>：SDK 有 <code style="background:#1e293b;padding:2px 6px;border-radius:3px;color:#a5d6a7;">CollectionStore</code>（支持 add/remove/move/replace），但 runtime 的 <code style="background:#1e293b;padding:2px 6px;border-radius:3px;">UiInputValue</code> 无列表类型。</p>
+      <p style="margin:0 0 8px;"><b>当前出路</b>：Collection 只能通过 <code style="background:#1e293b;padding:2px 6px;border-radius:3px;">UiGridInputSlot</code> → DataGrid 渲染。</p>
+      <p style="margin:8px 0 0;"><b>后果</b>：集合数据无法绑定到普通节点属性（如可见性、位置、文本），只能在表格中显示。</p>
+    </div>
+  </div>
+
+  <div style="background:#111827;border:1px solid #1e293b;border-radius:8px;padding:18px;">
+    <h3 style="margin:0 0 10px;font-size:15px;color:#ab47bc;">P2 · NUI Flow 无表达式</h3>
+    <div style="font-size:13px;line-height:1.7;color:#b0bec5;">
+      <p style="margin:0 0 8px;"><b>证据</b>：<code style="background:#1e293b;padding:2px 6px;border-radius:3px;">nui_flow.rs</code> 头部声明 "It has no evaluator, expressions, callbacks"。</p>
+      <p style="margin:0 0 8px;"><b>后果</b>：派生状态（如 <code style="background:#1e293b;padding:2px 6px;border-radius:3px;">row_5_visible = capacity != "small"</code>）必须在 SDK 端计算后写成独立 slot。进一步加剧变量爆炸。</p>
+    </div>
+  </div>
+
+  <div style="background:#111827;border:1px solid #1e293b;border-radius:8px;padding:18px;">
+    <h3 style="margin:0 0 10px;font-size:15px;color:#ab47bc;">P2 · StateMachine 只管样式</h3>
+    <div style="font-size:13px;line-height:1.7;color:#b0bec5;">
+      <p style="margin:0 0 8px;"><b>证据</b>：<code style="background:#1e293b;padding:2px 6px;border-radius:3px;">NuiFlowState</code> 只有 styles（bounds/background/border/opacity），无数据值。</p>
+      <p style="margin:0 0 8px;"><b>后果</b>：状态切换只能动画样式，不能切换数据/可见性逻辑。复杂交互必须靠 input slot + branch predicate 模拟。</p>
+    </div>
+  </div>
+</div>
+
+<!-- 四、缺失功能清单 -->
+<h2 style="font-size:18px;color:#4fc3f7;margin:0 0 16px;">三、缺失功能清单</h2>
+<div style="background:#111827;border:1px solid #1e293b;border-radius:8px;padding:20px;margin-bottom:28px;">
+  <table style="width:100%;border-collapse:collapse;font-size:13px;">
+    <thead>
+      <tr style="border-bottom:2px solid #1e3a5f;">
+        <th style="text-align:left;padding:8px 12px;color:#4fc3f7;">功能</th>
+        <th style="text-align:left;padding:8px 12px;color:#4fc3f7;">当前状态</th>
+        <th style="text-align:left;padding:8px 12px;color:#4fc3f7;">优先级</th>
+        <th style="text-align:left;padding:8px 12px;color:#4fc3f7;">影响范围</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr style="border-bottom:1px solid #1e293b;">
+        <td style="padding:10px 12px;color:#e8f4fd;">Struct/Object input 类型</td>
+        <td style="padding:10px 12px;color:#ef9a9a;">缺失</td>
+        <td style="padding:10px 12px;"><span style="background:#5a2a2a;color:#ef9a9a;padding:2px 8px;border-radius:3px;font-size:11px;">P0</span></td>
+        <td style="padding:10px 12px;color:#b0bec5;">schema/runtime/GPU/SDK 全链路</td>
+      </tr>
+      <tr style="border-bottom:1px solid #1e293b;">
+        <td style="padding:10px 12px;color:#e8f4fd;">Array/List input 类型</td>
+        <td style="padding:10px 12px;color:#ef9a9a;">缺失（仅 DataGrid）</td>
+        <td style="padding:10px 12px;"><span style="background:#5a2a2a;color:#ef9a9a;padding:2px 8px;border-radius:3px;font-size:11px;">P0</span></td>
+        <td style="padding:10px 12px;color:#b0bec5;">集合数据绑定到节点属性</td>
+      </tr>
+      <tr style="border-bottom:1px solid #1e293b;">
+        <td style="padding:10px 12px;color:#e8f4fd;">GPU 增量上传（partial update）</td>
+        <td style="padding:10px 12px;color:#ef9a9a;">全量重打包</td>
+        <td style="padding:10px 12px;"><span style="background:#5a2a2a;color:#ef9a9a;padding:2px 8px;border-radius:3px;font-size:11px;">P0</span></td>
+        <td style="padding:10px 12px;color:#b0bec5;">大规模 slot 时的性能</td>
+      </tr>
+      <tr style="border-bottom:1px solid #1e293b;">
+        <td style="padding:10px 12px;color:#e8f4fd;">GPU 完整类型支持（Vec2/4/Color/Enum）</td>
+        <td style="padding:10px 12px;color:#ffa726;">pack_inputs 中 =&gt; {}</td>
+        <td style="padding:10px 12px;"><span style="background:#5a4a1a;color:#ffa726;padding:2px 8px;border-radius:3px;font-size:11px;">P1</span></td>
+        <td style="padding:10px 12px;color:#b0bec5;">shader 中使用向量/颜色输入</td>
+      </tr>
+      <tr style="border-bottom:1px solid #1e293b;">
+        <td style="padding:10px 12px;color:#e8f4fd;">结构体字段级绑定</td>
+        <td style="padding:10px 12px;color:#ffa726;">缺失</td>
+        <td style="padding:10px 12px;"><span style="background:#5a4a1a;color:#ffa726;padding:2px 8px;border-radius:3px;font-size:11px;">P1</span></td>
+        <td style="padding:10px 12px;color:#b0bec5;">节点属性绑定到 struct.field</td>
+      </tr>
+      <tr style="border-bottom:1px solid #1e293b;">
+        <td style="padding:10px 12px;color:#e8f4fd;">NUI Flow 受限表达式</td>
+        <td style="padding:10px 12px;color:#ab47bc;">无表达式</td>
+        <td style="padding:10px 12px;"><span style="background:#3a1a5a;color:#ce93d8;padding:2px 8px;border-radius:3px;font-size:11px;">P2</span></td>
+        <td style="padding:10px 12px;color:#b0bec5;">减少 SDK 端派生变量</td>
+      </tr>
+      <tr style="border-bottom:1px solid #1e293b;">
+        <td style="padding:10px 12px;color:#e8f4fd;">派生状态/计算属性（runtime 端）</td>
+        <td style="padding:10px 12px;color:#ab47bc;">缺失</td>
+        <td style="padding:10px 12px;"><span style="background:#3a1a5a;color:#ce93d8;padding:2px 8px;border-radius:3px;font-size:11px;">P2</span></td>
+        <td style="padding:10px 12px;color:#b0bec5;">computed input，减少 SDK 同步</td>
+      </tr>
+      <tr>
+        <td style="padding:10px 12px;color:#e8f4fd;">NUI Flow 声明 vec2/vec4/color</td>
+        <td style="padding:10px 12px;color:#ab47bc;">解析器不支持</td>
+        <td style="padding:10px 12px;"><span style="background:#3a1a5a;color:#ce93d8;padding:2px 8px;border-radius:3px;font-size:11px;">P2</span></td>
+        <td style="padding:10px 12px;color:#b0bec5;">Flow 文档中声明向量输入</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<!-- 五、推进路线 -->
+<h2 style="font-size:18px;color:#4fc3f7;margin:0 0 16px;">四、推进路线（分阶段）</h2>
+<div style="background:#111827;border:1px solid #1e293b;border-radius:8px;padding:24px;margin-bottom:28px;">
+
+  <!-- 阶段1 -->
+  <div style="display:flex;gap:16px;margin-bottom:24px;">
+    <div style="flex-shrink:0;width:80px;text-align:center;">
+      <div style="background:#4fc3f7;color:#0a0e17;width:48px;height:48px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:18px;margin:0 auto;">1</div>
+      <div style="font-size:11px;color:#4fc3f7;margin-top:6px;">第1阶段</div>
+      <div style="font-size:10px;color:#7a8fa6;">1-2天</div>
+    </div>
+    <div style="flex:1;background:#0d1520;border-radius:6px;padding:14px;border-left:3px solid #4fc3f7;">
+      <div style="font-size:14px;font-weight:600;color:#e8f4fd;margin-bottom:8px;">补齐 GPU 类型支持 + 增量上传</div>
+      <ul style="margin:0;padding-left:18px;font-size:12px;line-height:1.8;color:#b0bec5;">
+        <li><code style="color:#a5d6a7;">pack_inputs</code> 实现 Vec2/Vec4/Color/Enum 的 GPU 打包（每 slot 16 字节足够容纳 vec4）</li>
+        <li>NUI Flow 解析器增加 <code style="color:#a5d6a7;">vec2</code>/<code style="color:#a5d6a7;">vec4</code>/<code style="color:#a5d6a7;">color</code> 类型声明</li>
+        <li>基于 <code style="color:#a5d6a7;">changed_slots</code> 做 partial buffer update（只 write 变化的 16 字节槽位）</li>
+        <li><b>验收</b>：shader 中能读到 vec4/color 输入；100 slot 改 1 个只上传 16 字节</li>
+      </ul>
+    </div>
+  </div>
+
+  <!-- 阶段2 -->
+  <div style="display:flex;gap:16px;margin-bottom:24px;">
+    <div style="flex-shrink:0;width:80px;text-align:center;">
+      <div style="background:#66bb6a;color:#0a0e17;width:48px;height:48px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:18px;margin:0 auto;">2</div>
+      <div style="font-size:11px;color:#66bb6a;margin-top:6px;">第2阶段</div>
+      <div style="font-size:10px;color:#7a8fa6;">3-5天</div>
+    </div>
+    <div style="flex:1;background:#0d1520;border-radius:6px;padding:14px;border-left:3px solid #66bb6a;">
+      <div style="font-size:14px;font-weight:600;color:#e8f4fd;margin-bottom:8px;">Struct input 类型（核心）</div>
+      <ul style="margin:0;padding-left:18px;font-size:12px;line-height:1.8;color:#b0bec5;">
+        <li><code style="color:#a5d6a7;">UiInputValue::Struct { fields: BTreeMap&lt;String, UiInputValue&gt; }</code> — 支持嵌套</li>
+        <li><code style="color:#a5d6a7;">UiInputKind::Struct { fields: BTreeMap&lt;String, UiInputKind&gt; }</code> — schema 声明</li>
+        <li>GPU 布局：struct 展开为连续的 16 字节槽位，字段偏移由 schema 计算</li>
+        <li>NUI Flow 语法：<code style="color:#a5d6a7;">input player struct { name text, hp f32, pos vec2 }</code></li>
+        <li>SDK 端：<code style="color:#a5d6a7;">store.value("player.hp").set(0.8)</code> 字段级访问，自动生成 struct 更新</li>
+        <li>字段级绑定：<code style="color:#a5d6a7;">bind text_value $player.name</code></li>
+        <li><b>验收</b>：背包案例从 24N 个变量缩减为 1 个 struct array</li>
+      </ul>
+    </div>
+  </div>
+
+  <!-- 阶段3 -->
+  <div style="display:flex;gap:16px;margin-bottom:24px;">
+    <div style="flex-shrink:0;width:80px;text-align:center;">
+      <div style="background:#ffa726;color:#0a0e17;width:48px;height:48px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:18px;margin:0 auto;">3</div>
+      <div style="font-size:11px;color:#ffa726;margin-top:6px;">第3阶段</div>
+      <div style="font-size:10px;color:#7a8fa6;">3-5天</div>
+    </div>
+    <div style="flex:1;background:#0d1520;border-radius:6px;padding:14px;border-left:3px solid #ffa726;">
+      <div style="font-size:14px;font-weight:600;color:#e8f4fd;margin-bottom:8px;">Array input 类型 + Collection 直通</div>
+      <ul style="margin:0;padding-left:18px;font-size:12px;line-height:1.8;color:#b0bec5;">
+        <li><code style="color:#a5d6a7;">UiInputValue::Array { elements: Vec&lt;UiInputValue&gt;, element_kind }</code></li>
+        <li>固定长度数组走 GPU uniform buffer；动态长度走 storage buffer + length uniform</li>
+        <li>SDK CollectionStore → Array input 自动序列化，不再仅限 DataGrid</li>
+        <li>数组元素绑定：<code style="color:#a5d6a7;">bind visible $slots[i].occupied</code>（需索引表达式）</li>
+        <li><b>验收</b>：背包用 <code style="color:#a5d6a7;">input slots array[24] of struct { item text, count u32 }</code> 声明</li>
+      </ul>
+    </div>
+  </div>
+
+  <!-- 阶段4 -->
+  <div style="display:flex;gap:16px;">
+    <div style="flex-shrink:0;width:80px;text-align:center;">
+      <div style="background:#ab47bc;color:#0a0e17;width:48px;height:48px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:18px;margin:0 auto;">4</div>
+      <div style="font-size:11px;color:#ab47bc;margin-top:6px;">第4阶段</div>
+      <div style="font-size:10px;color:#7a8fa6;">后续</div>
+    </div>
+    <div style="flex:1;background:#0d1520;border-radius:6px;padding:14px;border-left:3px solid #ab47bc;">
+      <div style="font-size:14px;font-weight:600;color:#e8f4fd;margin-bottom:8px;">受限表达式 + 派生状态</div>
+      <ul style="margin:0;padding-left:18px;font-size:12px;line-height:1.8;color:#b0bec5;">
+        <li>NUI Flow 增加受限表达式：比较（==/!=/&gt;/&lt;）、逻辑（and/or/not）、算术（+/-/*）</li>
+        <li>派生 input：<code style="color:#a5d6a7;">input row5_visible bool = $capacity != "small"</code>，runtime 端计算</li>
+        <li>表达式在 UI Runtime 求值，不进入 GPU，不承载领域规则（符合 AGENTS.md 边界）</li>
+        <li><b>验收</b>：案例中 row_5_visible/row_6_visible 等派生变量无需 SDK 端同步</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+<!-- 六、立即可做的低成本改进 -->
+<h2 style="font-size:18px;color:#4fc3f7;margin:0 0 16px;">五、立即可做的低成本改进（不改动架构）</h2>
+<div style="background:#111827;border:1px solid #1e293b;border-radius:8px;padding:20px;margin-bottom:28px;">
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
+    <div style="background:#0d1520;padding:12px;border-radius:6px;">
+      <div style="font-size:13px;color:#4fc3f7;font-weight:600;margin-bottom:4px;">① 补齐 pack_inputs 类型</div>
+      <div style="font-size:12px;color:#b0bec5;">约 30 行代码，Vec2/Vec4/Color/Enum 写入 16 字节槽位</div>
+    </div>
+    <div style="background:#0d1520;padding:12px;border-radius:6px;">
+      <div style="font-size:13px;color:#4fc3f7;font-weight:600;margin-bottom:4px;">② NUI Flow 增加 vec2/vec4/color 声明</div>
+      <div style="font-size:12px;color:#b0bec5;">解析器加 3 个分支，约 20 行代码</div>
+    </div>
+    <div style="background:#0d1520;padding:12px;border-radius:6px;">
+      <div style="font-size:13px;color:#4fc3f7;font-weight:600;margin-bottom:4px;">③ 基于 changed_slots 的 partial upload</div>
+      <div style="font-size:12px;color:#b0bec5;">UiResolvedInputs 已有 changed_slots 字段，GPU 端按偏移 write_buffer</div>
+    </div>
+    <div style="background:#0d1520;padding:12px;border-radius:6px;">
+      <div style="font-size:13px;color:#4fc3f7;font-weight:600;margin-bottom:4px;">④ SDK 端 struct 模拟（过渡方案）</div>
+      <div style="font-size:12px;color:#b0bec5;">store.value("player.hp") 自动映射为 "player__hp" 扁平 key，runtime 端暂不感知</div>
+    </div>
+  </div>
+</div>
+
+<div style="text-align:center;padding:16px;color:#7a8fa6;font-size:12px;border-top:1px solid #1e293b;">
+  Neon3 NUI Input Architecture Report · generated 2026-09-12 · based on v0.2.7 source audit
+</div>
+
+</div>
+</html>

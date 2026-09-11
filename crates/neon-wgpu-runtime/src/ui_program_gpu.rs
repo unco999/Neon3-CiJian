@@ -4,6 +4,7 @@
 //! WGPU buffers.  Its sampled layout output is diagnostic data, never an input
 //! or a replacement for the UI runtime's CPU execution backend.
 
+use std::collections::BTreeMap;
 use std::time::Instant;
 
 use neon_protocol::Revision;
@@ -119,11 +120,19 @@ impl GpuUiProgramBackend {
             0,
             &record_bytes(program.branch_records.len(), 4),
         );
-        queue.write_buffer(
-            &buffers.input_buffer,
-            0,
-            &pack_inputs(inputs, &program.resource_budget),
-        );
+        // Input buffer: full upload on first stage / program change, partial
+        // upload when only specific slots changed and the buffer already exists.
+        if recreate || inputs.changed_slots.is_empty() {
+            queue.write_buffer(
+                &buffers.input_buffer,
+                0,
+                &pack_inputs(inputs, &program.resource_budget),
+            );
+        } else {
+            for (offset, slot_bytes) in pack_changed_slots(inputs, &program.resource_budget) {
+                queue.write_buffer(&buffers.input_buffer, offset, &slot_bytes);
+            }
+        }
         queue.write_buffer(
             &buffers.dirty_buffer,
             0,
@@ -390,26 +399,78 @@ fn pack_inputs(inputs: &UiResolvedInputs, budget: &UiResourceBudget) -> Vec<u8> 
         .take(budget.max_bindings as usize)
         .enumerate()
     {
-        let offset = index * 16;
-        match &value.value {
-            UiInputValue::Bool { value } => bytes[offset] = u8::from(*value),
-            UiInputValue::I32 { value } => {
-                bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes())
-            }
-            UiInputValue::U32 { value } => {
-                bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes())
-            }
-            UiInputValue::F32 { value } => {
-                bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes())
-            }
-            UiInputValue::TextHandle { value } => {
-                bytes[offset..offset + 8].copy_from_slice(&value.id.to_le_bytes());
-                bytes[offset + 8..offset + 12].copy_from_slice(&value.generation.to_le_bytes());
-            }
-            _ => {}
-        }
+        let slot = pack_single_slot(&value.value);
+        bytes[index * 16..index * 16 + 16].copy_from_slice(&slot);
     }
     bytes
+}
+
+/// Packs a single input value into its 16-byte GPU slot.
+fn pack_single_slot(value: &UiInputValue) -> [u8; 16] {
+    let mut bytes = [0u8; 16];
+    match value {
+        UiInputValue::Bool { value } => bytes[0] = u8::from(*value),
+        UiInputValue::I32 { value } => bytes[0..4].copy_from_slice(&value.to_le_bytes()),
+        UiInputValue::U32 { value } => bytes[0..4].copy_from_slice(&value.to_le_bytes()),
+        UiInputValue::F32 { value } => bytes[0..4].copy_from_slice(&value.to_le_bytes()),
+        UiInputValue::Vec2 { value } => {
+            bytes[0..4].copy_from_slice(&value[0].to_le_bytes());
+            bytes[4..8].copy_from_slice(&value[1].to_le_bytes());
+        }
+        UiInputValue::Vec4 { value } => {
+            for i in 0..4 {
+                bytes[i * 4..(i + 1) * 4].copy_from_slice(&value[i].to_le_bytes());
+            }
+        }
+        UiInputValue::Color { value } => {
+            for i in 0..4 {
+                bytes[i * 4..(i + 1) * 4].copy_from_slice(&value[i].to_le_bytes());
+            }
+        }
+        UiInputValue::TextHandle { value } => {
+            bytes[0..8].copy_from_slice(&value.id.to_le_bytes());
+            bytes[8..12].copy_from_slice(&value.generation.to_le_bytes());
+        }
+        UiInputValue::AssetHandle { id, generation } => {
+            bytes[0..8].copy_from_slice(&id.to_le_bytes());
+            bytes[8..12].copy_from_slice(&generation.to_le_bytes());
+        }
+        // Enum is resolved on the CPU side (branch predicates), not sampled in shaders.
+        // CanvasData has no scalar GPU representation.
+        UiInputValue::Enum { .. } | UiInputValue::CanvasData { .. } => {}
+    }
+    bytes
+}
+
+/// Builds a key -> slot-index map from the BTreeMap ordering (same order as pack_inputs).
+fn slot_index_map(inputs: &UiResolvedInputs, budget: &UiResourceBudget) -> BTreeMap<String, usize> {
+    inputs
+        .values
+        .keys()
+        .take(budget.max_bindings as usize)
+        .enumerate()
+        .map(|(index, key)| (key.clone(), index))
+        .collect()
+}
+
+/// Returns (offset, 16-byte slot) pairs for only the changed slots.
+fn pack_changed_slots(
+    inputs: &UiResolvedInputs,
+    budget: &UiResourceBudget,
+) -> Vec<(u64, [u8; 16])> {
+    if inputs.changed_slots.is_empty() {
+        return Vec::new();
+    }
+    let index_map = slot_index_map(inputs, budget);
+    let mut updates = Vec::with_capacity(inputs.changed_slots.len());
+    for key in &inputs.changed_slots {
+        if let Some(&index) = index_map.get(key) {
+            if let Some(resolved) = inputs.values.get(key) {
+                updates.push(((index * 16) as u64, pack_single_slot(&resolved.value)));
+            }
+        }
+    }
+    updates
 }
 fn fits_budget(program: &UiProgram) -> bool {
     let budget = &program.resource_budget;
@@ -471,4 +532,218 @@ fn bounds_close(left: UiBounds, right: UiBounds, tolerance: f32) -> bool {
         && (left.y - right.y).abs() <= tolerance
         && (left.width - right.width).abs() <= tolerance
         && (left.height - right.height).abs() <= tolerance
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use neon_protocol::Revision;
+    use neon_ui_schema::{
+        UiInputValueSource, UiProgramCapability, UiProgramCapabilityOwner,
+        UiProgramCapabilityStatus, UiProgramRevision, UiResolvedInputValue,
+    };
+    use std::collections::BTreeMap;
+
+    fn test_budget(max_bindings: u32) -> UiResourceBudget {
+        UiResourceBudget {
+            max_nodes: 16,
+            max_bindings,
+            max_instances: 16,
+            max_text_records: 16,
+            max_glyph_instances: 16,
+            max_events: 16,
+            max_clips: 16,
+        }
+    }
+
+    fn test_program_revision() -> UiProgramRevision {
+        UiProgramRevision {
+            program_id: "test".into(),
+            revision: Revision(1),
+            schema_version: 1,
+            capabilities: vec![UiProgramCapability {
+                name: "static_layout".into(),
+                version: 1,
+                owner: UiProgramCapabilityOwner::SharedContract,
+                status: UiProgramCapabilityStatus::Experimental,
+            }],
+        }
+    }
+
+    fn resolved(value: UiInputValue) -> UiResolvedInputValue {
+        UiResolvedInputValue {
+            value,
+            source: UiInputValueSource::Default,
+            last_update_revision: Revision(0),
+        }
+    }
+
+    fn make_inputs(pairs: Vec<(&str, UiInputValue)>) -> UiResolvedInputs {
+        let mut values = BTreeMap::new();
+        for (key, value) in pairs {
+            values.insert(key.to_string(), resolved(value));
+        }
+        UiResolvedInputs {
+            program_revision: test_program_revision(),
+            input_revision: Revision(1),
+            values,
+            changed_slots: vec![],
+        }
+    }
+
+    #[test]
+    fn pack_inputs_f32_occupies_first_four_bytes() {
+        let inputs = make_inputs(vec![("a", UiInputValue::F32 { value: 1.5 })]);
+        let bytes = pack_inputs(&inputs, &test_budget(4));
+        assert_eq!(bytes.len(), 64);
+        assert_eq!(&bytes[0..4], &1.5f32.to_le_bytes());
+        assert_eq!(&bytes[4..16], &[0u8; 12]);
+    }
+
+    #[test]
+    fn pack_inputs_vec2_packs_xy_in_first_eight_bytes() {
+        let inputs = make_inputs(vec![("pos", UiInputValue::Vec2 { value: [1.0, 2.0] })]);
+        let bytes = pack_inputs(&inputs, &test_budget(4));
+        assert_eq!(&bytes[0..4], &1.0f32.to_le_bytes());
+        assert_eq!(&bytes[4..8], &2.0f32.to_le_bytes());
+        assert_eq!(&bytes[8..16], &[0u8; 8]);
+    }
+
+    #[test]
+    fn pack_inputs_vec4_packs_xyzw_full_slot() {
+        let inputs = make_inputs(vec![("v", UiInputValue::Vec4 { value: [0.1, 0.2, 0.3, 0.4] })]);
+        let bytes = pack_inputs(&inputs, &test_budget(4));
+        let expected: [f32; 4] = [0.1, 0.2, 0.3, 0.4];
+        for i in 0..4 {
+            assert_eq!(&bytes[i * 4..(i + 1) * 4], &expected[i].to_le_bytes());
+        }
+    }
+
+    #[test]
+    fn pack_inputs_color_packs_rgba_full_slot() {
+        let inputs = make_inputs(vec![("c", UiInputValue::Color { value: [1.0, 0.5, 0.0, 0.8] })]);
+        let bytes = pack_inputs(&inputs, &test_budget(4));
+        let expected: [f32; 4] = [1.0, 0.5, 0.0, 0.8];
+        for i in 0..4 {
+            assert_eq!(&bytes[i * 4..(i + 1) * 4], &expected[i].to_le_bytes());
+        }
+    }
+
+    #[test]
+    fn pack_inputs_multiple_slots_are_16_byte_strided() {
+        let inputs = make_inputs(vec![
+            ("a", UiInputValue::F32 { value: 1.0 }),
+            ("b", UiInputValue::Vec2 { value: [2.0, 3.0] }),
+            ("c", UiInputValue::Vec4 { value: [4.0, 5.0, 6.0, 7.0] }),
+        ]);
+        let bytes = pack_inputs(&inputs, &test_budget(4));
+        // BTreeMap sorts by key: a, b, c
+        // slot 0 (a): f32 = 1.0
+        assert_eq!(&bytes[0..4], &1.0f32.to_le_bytes());
+        // slot 1 (b): vec2 = [2.0, 3.0]
+        assert_eq!(&bytes[16..20], &2.0f32.to_le_bytes());
+        assert_eq!(&bytes[20..24], &3.0f32.to_le_bytes());
+        // slot 2 (c): vec4 = [4.0, 5.0, 6.0, 7.0]
+        assert_eq!(&bytes[32..36], &4.0f32.to_le_bytes());
+        assert_eq!(&bytes[36..40], &5.0f32.to_le_bytes());
+        assert_eq!(&bytes[40..44], &6.0f32.to_le_bytes());
+        assert_eq!(&bytes[44..48], &7.0f32.to_le_bytes());
+    }
+
+    #[test]
+    fn pack_inputs_bool_packs_as_u8() {
+        let inputs = make_inputs(vec![("flag", UiInputValue::Bool { value: true })]);
+        let bytes = pack_inputs(&inputs, &test_budget(2));
+        assert_eq!(bytes[0], 1u8);
+        assert_eq!(&bytes[1..16], &[0u8; 15]);
+    }
+
+    #[test]
+    fn pack_inputs_enum_leaves_slot_zero() {
+        // Enum is CPU-side only; GPU slot should be zeroed.
+        let inputs = make_inputs(vec![("mode", UiInputValue::Enum { value: "compact".into() })]);
+        let bytes = pack_inputs(&inputs, &test_budget(2));
+        assert_eq!(&bytes[0..16], &[0u8; 16]);
+    }
+
+    fn make_inputs_with_changes(
+        pairs: Vec<(&str, UiInputValue)>,
+        changed: Vec<&str>,
+    ) -> UiResolvedInputs {
+        let mut inputs = make_inputs(pairs);
+        inputs.changed_slots = changed.into_iter().map(str::to_string).collect();
+        inputs
+    }
+
+    #[test]
+    fn pack_changed_slots_returns_empty_when_no_changes() {
+        let inputs = make_inputs(vec![("a", UiInputValue::F32 { value: 1.0 })]);
+        let updates = pack_changed_slots(&inputs, &test_budget(4));
+        assert!(updates.is_empty());
+    }
+
+    #[test]
+    fn pack_changed_slots_returns_correct_offset_and_bytes() {
+        let inputs = make_inputs_with_changes(
+            vec![
+                ("a", UiInputValue::F32 { value: 1.0 }),
+                ("b", UiInputValue::Vec2 { value: [2.0, 3.0] }),
+                ("c", UiInputValue::F32 { value: 4.0 }),
+            ],
+            vec!["b"],
+        );
+        let updates = pack_changed_slots(&inputs, &test_budget(4));
+        assert_eq!(updates.len(), 1);
+        // "b" is the second key in BTreeMap order -> index 1 -> offset 16
+        assert_eq!(updates[0].0, 16);
+        assert_eq!(&updates[0].1[0..4], &2.0f32.to_le_bytes());
+        assert_eq!(&updates[0].1[4..8], &3.0f32.to_le_bytes());
+    }
+
+    #[test]
+    fn pack_changed_slots_handles_multiple_changes() {
+        let inputs = make_inputs_with_changes(
+            vec![
+                ("a", UiInputValue::F32 { value: 1.0 }),
+                ("b", UiInputValue::F32 { value: 2.0 }),
+                ("c", UiInputValue::F32 { value: 3.0 }),
+            ],
+            vec!["a", "c"],
+        );
+        let updates = pack_changed_slots(&inputs, &test_budget(4));
+        assert_eq!(updates.len(), 2);
+        // "a" -> index 0 -> offset 0, "c" -> index 2 -> offset 32
+        assert_eq!(updates[0].0, 0);
+        assert_eq!(updates[1].0, 32);
+        assert_eq!(&updates[0].1[0..4], &1.0f32.to_le_bytes());
+        assert_eq!(&updates[1].1[0..4], &3.0f32.to_le_bytes());
+    }
+
+    #[test]
+    fn pack_changed_slots_ignores_unknown_keys() {
+        let inputs = make_inputs_with_changes(
+            vec![("a", UiInputValue::F32 { value: 1.0 })],
+            vec!["nonexistent"],
+        );
+        let updates = pack_changed_slots(&inputs, &test_budget(4));
+        assert!(updates.is_empty());
+    }
+
+    #[test]
+    fn pack_changed_slots_matches_full_pack_for_changed_slot() {
+        // The partial bytes for a changed slot must equal the corresponding
+        // 16-byte region in the full pack.
+        let inputs = make_inputs_with_changes(
+            vec![
+                ("a", UiInputValue::Vec4 { value: [0.1, 0.2, 0.3, 0.4] }),
+                ("b", UiInputValue::Color { value: [1.0, 0.0, 0.0, 1.0] }),
+            ],
+            vec!["b"],
+        );
+        let full = pack_inputs(&inputs, &test_budget(4));
+        let partial = pack_changed_slots(&inputs, &test_budget(4));
+        assert_eq!(partial.len(), 1);
+        assert_eq!(partial[0].0, 16);
+        assert_eq!(partial[0].1, &full[16..32]);
+    }
 }

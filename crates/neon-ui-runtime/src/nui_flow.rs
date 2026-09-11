@@ -1,4 +1,4 @@
-//! Closed, line-oriented NUI Flow authoring notation.
+﻿//! Closed, line-oriented NUI Flow authoring notation.
 //!
 //! Flow is deliberately parsed into the canonical JSON IR. It has no evaluator,
 //! expressions, callbacks, or source of domain truth.
@@ -2338,6 +2338,9 @@ fn parse_input(text: &str, line: u32) -> FlowResult<Option<(ParsedInput, bool)>>
         "i32" => UiInputKind::I32,
         "u32" => UiInputKind::U32,
         "f32" => UiInputKind::F32,
+        "vec2" => UiInputKind::Vec2,
+        "vec4" => UiInputKind::Vec4,
+        "color" => UiInputKind::Color,
         "text" => UiInputKind::TextHandle,
         range_spec if range_spec.starts_with("i32:") => {
             let (minimum, maximum) = parse_range(range_spec, "i32", line, str::parse::<i32>)?;
@@ -2420,6 +2423,39 @@ fn parse_input(text: &str, line: u32) -> FlowResult<Option<(ParsedInput, bool)>>
         (UiInputKind::Enum { .. }, value) => UiInputValue::Enum {
             value: value.into(),
         },
+        (UiInputKind::Vec2, value) => {
+            let nums: Vec<f32> = value
+                .split(',')
+                .map(|s| s.trim().parse::<f32>())
+                .collect::<Result<_, _>>()
+                .map_err(|_| error("nui_flow_invalid_literal", "vec2 default uses x,y", line, 1))?;
+            if nums.len() != 2 || nums.iter().any(|v| !v.is_finite()) {
+                return Err(error("nui_flow_invalid_literal", "vec2 default needs 2 finite numbers", line, 1));
+            }
+            UiInputValue::Vec2 { value: [nums[0], nums[1]] }
+        }
+        (UiInputKind::Vec4, value) => {
+            let nums: Vec<f32> = value
+                .split(',')
+                .map(|s| s.trim().parse::<f32>())
+                .collect::<Result<_, _>>()
+                .map_err(|_| error("nui_flow_invalid_literal", "vec4 default uses x,y,z,w", line, 1))?;
+            if nums.len() != 4 || nums.iter().any(|v| !v.is_finite()) {
+                return Err(error("nui_flow_invalid_literal", "vec4 default needs 4 finite numbers", line, 1));
+            }
+            UiInputValue::Vec4 { value: [nums[0], nums[1], nums[2], nums[3]] }
+        }
+        (UiInputKind::Color, value) => {
+            let nums: Vec<f32> = value
+                .split(',')
+                .map(|s| s.trim().parse::<f32>())
+                .collect::<Result<_, _>>()
+                .map_err(|_| error("nui_flow_invalid_literal", "color default uses r,g,b,a", line, 1))?;
+            if nums.len() != 4 || nums.iter().any(|v| !v.is_finite() || !(0.0..=1.0).contains(v)) {
+                return Err(error("nui_flow_invalid_literal", "color default needs 4 numbers in 0..1", line, 1));
+            }
+            UiInputValue::Color { value: [nums[0], nums[1], nums[2], nums[3]] }
+        }
         _ => {
             return Err(error(
                 "nui_flow_invalid_literal",
@@ -5651,5 +5687,86 @@ panel workspace row gap 8
             missing_material_key.diagnostics[0].code,
             "nui_flow_unknown_shader"
         );
+    }
+
+    #[test]
+    fn vec2_input_parses_default_value() {
+        let document = parse_nui_flow(
+            "surface root w 100 h 100\ninput offset vec2 default 10.5,-20.0\n",
+        )
+        .expect("vec2 input must parse");
+        let slot = document
+            .input_schema
+            .slots
+            .iter()
+            .find(|s| s.key == "offset")
+            .expect("offset slot must exist");
+        assert_eq!(slot.kind, UiInputKind::Vec2);
+        assert_eq!(
+            slot.default_value,
+            UiInputValue::Vec2 {
+                value: [10.5, -20.0]
+            }
+        );
+    }
+
+    #[test]
+    fn vec4_input_parses_default_value() {
+        let document = parse_nui_flow(
+            "surface root w 100 h 100\ninput quat vec4 default 0.0,0.0,0.0,1.0\n",
+        )
+        .expect("vec4 input must parse");
+        let slot = document
+            .input_schema
+            .slots
+            .iter()
+            .find(|s| s.key == "quat")
+            .expect("quat slot must exist");
+        assert_eq!(slot.kind, UiInputKind::Vec4);
+        assert_eq!(
+            slot.default_value,
+            UiInputValue::Vec4 {
+                value: [0.0, 0.0, 0.0, 1.0]
+            }
+        );
+    }
+
+    #[test]
+    fn color_input_parses_default_value() {
+        let document = parse_nui_flow(
+            "surface root w 100 h 100\ninput tint color default 1.0,0.5,0.0,0.8\n",
+        )
+        .expect("color input must parse");
+        let slot = document
+            .input_schema
+            .slots
+            .iter()
+            .find(|s| s.key == "tint")
+            .expect("tint slot must exist");
+        assert_eq!(slot.kind, UiInputKind::Color);
+        assert_eq!(
+            slot.default_value,
+            UiInputValue::Color {
+                value: [1.0, 0.5, 0.0, 0.8]
+            }
+        );
+    }
+
+    #[test]
+    fn vec2_input_rejects_wrong_component_count() {
+        let error = parse_nui_flow(
+            "surface root w 100 h 100\ninput bad vec2 default 1.0,2.0,3.0\n",
+        )
+        .unwrap_err();
+        assert_eq!(error.diagnostics[0].code, "nui_flow_invalid_literal");
+    }
+
+    #[test]
+    fn color_input_rejects_out_of_range() {
+        let error = parse_nui_flow(
+            "surface root w 100 h 100\ninput bad color default 1.5,0.0,0.0,1.0\n",
+        )
+        .unwrap_err();
+        assert_eq!(error.diagnostics[0].code, "nui_flow_invalid_literal");
     }
 }
