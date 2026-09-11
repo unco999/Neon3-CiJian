@@ -8383,6 +8383,13 @@ fn default_component_style(kind: &UiNodeKind) -> UiStyle {
             corner_radius: 4.0,
             opacity: 1.0,
         },
+        UiNodeKind::Splitter => UiStyle {
+            background_color: [0.18, 0.22, 0.21, 1.0],
+            border_color: [0.0, 0.0, 0.0, 0.0],
+            border_width: 0.0,
+            corner_radius: 0.0,
+            opacity: 1.0,
+        },
         // Containers, labels, images, and render surfaces do not get implicit
         // component chrome. Their authored default is a sentinel used by the
         // component resolver, so make the renderer fallback transparent here.
