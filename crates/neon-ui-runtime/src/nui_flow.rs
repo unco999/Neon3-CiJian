@@ -60,6 +60,7 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
     let mut skins = Vec::new();
     let mut shader_packages = Vec::new();
     let mut current_skin: Option<neon_ui_schema::UiControlSkin> = None;
+    let mut pending_struct: Option<(String, u32, BTreeMap<String, neon_ui_schema::UiInputKind>, BTreeMap<String, neon_ui_schema::UiInputValue>)> = None;
 
     for (index, raw) in source.lines().enumerate() {
         let line = (index + 1) as u32;
@@ -89,6 +90,30 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
             ));
         }
         let content = without_comment.trim();
+        // Struct input block: collect indented field lines until closing brace.
+        if let Some((struct_key, _struct_line, mut kind_fields, mut value_fields)) = pending_struct.take() {
+            if content == "}" {
+                let kind = neon_ui_schema::UiInputKind::Struct { fields: kind_fields };
+                let default_value = neon_ui_schema::UiInputValue::Struct { fields: value_fields };
+                let (alignment, lanes, representation) = kind.packing();
+                input_slots.push(neon_ui_schema::UiInputSlot { key: struct_key.clone(), kind, default_value, update_class: neon_ui_schema::UiInputUpdateClass::ReliableExternal, semantic_label: struct_key.replace('_', " "), packing: neon_ui_schema::UiInputPacking { alignment, lanes, offset: 0, representation } });
+                seen_inputs.insert(struct_key);
+                continue;
+            }
+            let (field_name, field_kind, field_value) = parse_struct_field(content, line)?;
+            if kind_fields.contains_key(&field_name) { return Err(error("nui_flow_duplicate_struct_field", "duplicate field", line, 1)); }
+            kind_fields.insert(field_name.clone(), field_kind);
+            value_fields.insert(field_name, field_value);
+            pending_struct = Some((struct_key, _struct_line, kind_fields, value_fields));
+            continue;
+        }
+        if indent == 0 {
+            if let Some(key) = parse_struct_header(content) {
+                if !seen_inputs.insert(key.clone()) { return Err(error("ui_program_duplicate_input_key", "duplicate", line, 1)); }
+                pending_struct = Some((key, line, BTreeMap::new(), BTreeMap::new()));
+                continue;
+            }
+        }
         reject_forbidden(content, line)?;
         if indent == 0 && content.starts_with("skin ") {
             if let Some(skin) = current_skin.take() {
@@ -2248,6 +2273,135 @@ fn validate_state_machines(
 enum ParsedInput {
     Scalar(UiInputSlot),
     Grid(UiGridInputSlot),
+}
+
+/// Detects `input <key> struct {` and returns the key.
+fn parse_struct_header(content: &str) -> Option<String> {
+    let parts: Vec<&str> = content.split_whitespace().collect();
+    if parts.len() == 4 && parts[0] == "input" && parts[2] == "struct" && parts[3] == "{" {
+        if valid_key(parts[1]) {
+            return Some(parts[1].to_string());
+        }
+    }
+    None
+}
+
+/// Parses a struct field line: `<name> <kind> [default <value>]`.
+fn parse_struct_field(
+    content: &str,
+    line: u32,
+) -> FlowResult<(String, neon_ui_schema::UiInputKind, neon_ui_schema::UiInputValue)> {
+    let parts: Vec<&str> = content.split_whitespace().collect();
+    if parts.is_empty() {
+        return Err(error("nui_flow_invalid_struct_field", "empty struct field", line, 1));
+    }
+    let field_name = parts[0].to_string();
+    if !valid_key(&field_name) {
+        return Err(error("nui_flow_invalid_struct_field", "invalid field name", line, 1));
+    }
+    if parts.len() < 2 {
+        return Err(error("nui_flow_invalid_struct_field", "field requires a kind", line, 1));
+    }
+    let kind = parse_field_kind(parts[1], line)?;
+    // Parse optional default value
+    let default_value = if parts.len() >= 4 && parts[2] == "default" {
+        parse_field_default(&kind, parts[3], line)?
+    } else if parts.len() == 2 {
+        default_for_kind(&kind)
+    } else {
+        return Err(error("nui_flow_invalid_struct_field", "field syntax: <name> <kind> [default <value>]", line, 1));
+    };
+    Ok((field_name, kind, default_value))
+}
+
+fn parse_field_kind(kind_str: &str, line: u32) -> FlowResult<neon_ui_schema::UiInputKind> {
+    use neon_ui_schema::UiInputKind;
+    match kind_str {
+        "bool" => Ok(UiInputKind::Bool),
+        "i32" => Ok(UiInputKind::I32),
+        "u32" => Ok(UiInputKind::U32),
+        "f32" => Ok(UiInputKind::F32),
+        "vec2" => Ok(UiInputKind::Vec2),
+        "vec4" => Ok(UiInputKind::Vec4),
+        "color" => Ok(UiInputKind::Color),
+        "text" => Ok(UiInputKind::TextHandle),
+        s if s.starts_with("enum:") => {
+            let variants = s[5..].split('|').filter(|v| !v.is_empty()).map(str::to_owned).collect::<Vec<_>>();
+            if variants.is_empty() || variants.iter().any(|v| !valid_key(v)) {
+                return Err(error("nui_flow_invalid_struct_field", "enum uses enum:one|two", line, 1));
+            }
+            Ok(UiInputKind::Enum { variants })
+        }
+        _ => Err(error("nui_flow_unknown_field_kind", "struct field supports bool, i32, u32, f32, vec2, vec4, color, text, enum", line, 1)),
+    }
+}
+
+fn default_for_kind(kind: &neon_ui_schema::UiInputKind) -> neon_ui_schema::UiInputValue {
+    use neon_ui_schema::UiInputValue;
+    match kind {
+        neon_ui_schema::UiInputKind::Bool => UiInputValue::Bool { value: false },
+        neon_ui_schema::UiInputKind::I32 | neon_ui_schema::UiInputKind::I32Range { .. } => UiInputValue::I32 { value: 0 },
+        neon_ui_schema::UiInputKind::U32 | neon_ui_schema::UiInputKind::U32Range { .. } => UiInputValue::U32 { value: 0 },
+        neon_ui_schema::UiInputKind::F32 | neon_ui_schema::UiInputKind::F32Range { .. } => UiInputValue::F32 { value: 0.0 },
+        neon_ui_schema::UiInputKind::Vec2 => UiInputValue::Vec2 { value: [0.0, 0.0] },
+        neon_ui_schema::UiInputKind::Vec4 => UiInputValue::Vec4 { value: [0.0, 0.0, 0.0, 0.0] },
+        neon_ui_schema::UiInputKind::Color => UiInputValue::Color { value: [0.0, 0.0, 0.0, 1.0] },
+        neon_ui_schema::UiInputKind::TextHandle | neon_ui_schema::UiInputKind::AssetHandle => UiInputValue::TextHandle {
+            value: neon_ui_schema::UiTextHandle { id: 0, generation: 0 },
+        },
+        neon_ui_schema::UiInputKind::Enum { variants } => UiInputValue::Enum {
+            value: variants.first().cloned().unwrap_or_default(),
+        },
+        neon_ui_schema::UiInputKind::CanvasData => UiInputValue::CanvasData { value: Default::default() },
+        neon_ui_schema::UiInputKind::Struct { .. } => UiInputValue::Struct { fields: Default::default() },
+    }
+}
+
+fn parse_field_default(
+    kind: &neon_ui_schema::UiInputKind,
+    value: &str,
+    line: u32,
+) -> FlowResult<neon_ui_schema::UiInputValue> {
+    use neon_ui_schema::{UiInputKind, UiInputValue};
+    match (kind, value) {
+        (UiInputKind::Bool, "true") => Ok(UiInputValue::Bool { value: true }),
+        (UiInputKind::Bool, "false") => Ok(UiInputValue::Bool { value: false }),
+        (UiInputKind::I32 | UiInputKind::I32Range { .. }, v) => Ok(UiInputValue::I32 {
+            value: v.parse().map_err(|_| error("nui_flow_invalid_literal", "invalid i32 default", line, 1))?,
+        }),
+        (UiInputKind::U32 | UiInputKind::U32Range { .. }, v) => Ok(UiInputValue::U32 {
+            value: v.parse().map_err(|_| error("nui_flow_invalid_literal", "invalid u32 default", line, 1))?,
+        }),
+        (UiInputKind::F32 | UiInputKind::F32Range { .. }, v) => Ok(UiInputValue::F32 {
+            value: v.parse::<f32>().ok().filter(|x| x.is_finite())
+                .ok_or_else(|| error("nui_flow_invalid_literal", "invalid finite f32 default", line, 1))?,
+        }),
+        (UiInputKind::Vec2, v) => {
+            let nums: Vec<f32> = v.split(',').map(|s| s.trim().parse::<f32>())
+                .collect::<Result<_, _>>().map_err(|_| error("nui_flow_invalid_literal", "vec2 default uses x,y", line, 1))?;
+            if nums.len() != 2 { return Err(error("nui_flow_invalid_literal", "vec2 needs 2 numbers", line, 1)); }
+            Ok(UiInputValue::Vec2 { value: [nums[0], nums[1]] })
+        }
+        (UiInputKind::Vec4, v) => {
+            let nums: Vec<f32> = v.split(',').map(|s| s.trim().parse::<f32>())
+                .collect::<Result<_, _>>().map_err(|_| error("nui_flow_invalid_literal", "vec4 default uses x,y,z,w", line, 1))?;
+            if nums.len() != 4 { return Err(error("nui_flow_invalid_literal", "vec4 needs 4 numbers", line, 1)); }
+            Ok(UiInputValue::Vec4 { value: [nums[0], nums[1], nums[2], nums[3]] })
+        }
+        (UiInputKind::Color, v) => {
+            let nums: Vec<f32> = v.split(',').map(|s| s.trim().parse::<f32>())
+                .collect::<Result<_, _>>().map_err(|_| error("nui_flow_invalid_literal", "color default uses r,g,b,a", line, 1))?;
+            if nums.len() != 4 || nums.iter().any(|x| !(0.0..=1.0).contains(x)) {
+                return Err(error("nui_flow_invalid_literal", "color needs 4 numbers in 0..1", line, 1));
+            }
+            Ok(UiInputValue::Color { value: [nums[0], nums[1], nums[2], nums[3]] })
+        }
+        (UiInputKind::TextHandle, "text:empty") => Ok(UiInputValue::TextHandle {
+            value: neon_ui_schema::UiTextHandle { id: 0, generation: 0 },
+        }),
+        (UiInputKind::Enum { .. }, v) => Ok(UiInputValue::Enum { value: v.into() }),
+        _ => Err(error("nui_flow_invalid_literal", "field default does not match its type", line, 1)),
+    }
 }
 
 fn parse_input(text: &str, line: u32) -> FlowResult<Option<(ParsedInput, bool)>> {
@@ -5768,5 +5922,60 @@ panel workspace row gap 8
         )
         .unwrap_err();
         assert_eq!(error.diagnostics[0].code, "nui_flow_invalid_literal");
+    }
+
+    #[test]
+    fn struct_input_parses_fields_and_defaults() {
+        let document = parse_nui_flow(
+            "surface root w 100 h 100\ninput player struct {\n  hp f32 default 0.8\n  level u32 default 5\n  name text default text:empty\n}\n",
+        )
+        .expect("struct input must parse");
+        let slot = document
+            .input_schema
+            .slots
+            .iter()
+            .find(|s| s.key == "player")
+            .expect("player slot must exist");
+        match &slot.kind {
+            neon_ui_schema::UiInputKind::Struct { fields } => {
+                assert_eq!(fields.len(), 3);
+                assert!(matches!(fields.get("hp"), Some(neon_ui_schema::UiInputKind::F32)));
+                assert!(matches!(fields.get("level"), Some(neon_ui_schema::UiInputKind::U32)));
+                assert!(matches!(fields.get("name"), Some(neon_ui_schema::UiInputKind::TextHandle)));
+            }
+            _ => panic!("expected Struct kind"),
+        }
+        match &slot.default_value {
+            neon_ui_schema::UiInputValue::Struct { fields } => {
+                assert_eq!(fields.get("hp"), Some(&neon_ui_schema::UiInputValue::F32 { value: 0.8 }));
+                assert_eq!(fields.get("level"), Some(&neon_ui_schema::UiInputValue::U32 { value: 5 }));
+            }
+            _ => panic!("expected Struct value"),
+        }
+    }
+
+    #[test]
+    fn struct_field_without_default_uses_type_default() {
+        let document = parse_nui_flow(
+            "surface root w 100 h 100\ninput cfg struct {\n  enabled bool\n  ratio f32\n}\n",
+        )
+        .expect("struct with implicit defaults must parse");
+        let slot = document.input_schema.slots.iter().find(|s| s.key == "cfg").unwrap();
+        match &slot.default_value {
+            neon_ui_schema::UiInputValue::Struct { fields } => {
+                assert_eq!(fields.get("enabled"), Some(&neon_ui_schema::UiInputValue::Bool { value: false }));
+                assert_eq!(fields.get("ratio"), Some(&neon_ui_schema::UiInputValue::F32 { value: 0.0 }));
+            }
+            _ => panic!("expected Struct value"),
+        }
+    }
+
+    #[test]
+    fn struct_input_rejects_duplicate_fields() {
+        let error = parse_nui_flow(
+            "surface root w 100 h 100\ninput s struct {\n  x f32\n  x f32\n}\n",
+        )
+        .unwrap_err();
+        assert_eq!(error.diagnostics[0].code, "nui_flow_duplicate_struct_field");
     }
 }
