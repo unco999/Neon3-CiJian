@@ -228,30 +228,26 @@ fn main() -> std::io::Result<()> {
     println!("[grid-pulse]   failures: {failures}/{UPDATE_ITERATIONS}");
     println!("[grid-pulse]   submit time: min={min_time_ms:.2}ms max={max_time_ms:.2}ms avg={:.2}ms", total_time_ms / UPDATE_ITERATIONS as f64);
     println!("[grid-pulse]   last frame: {last_visible}/36 cells visible");
+    println!("[grid-pulse] entering live update mode (Ctrl+C to exit)...");
 
-    // Wait for render to settle
-    thread::sleep(Duration::from_millis(500));
-
-    // Capture final state
-    std::fs::create_dir_all(r"D:\Neon3\shots").ok();
-    let capture = call(
-        endpoint,
-        "wgpu.render.target.capture",
-        999,
-        json!({"target":"ui.color.v1", "path": CAPTURE_PATH, "redraw": true}),
-    )
-    .map_err(std::io::Error::other)?;
-    println!("[grid-pulse] capture result: {capture}");
-
-    // Shutdown
-    let _ = call(endpoint, "service.shutdown", 1000, json!({}));
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while service.try_wait()?.is_none() && Instant::now() < deadline {
-        thread::sleep(Duration::from_millis(25));
+    // Live update loop: keep changing the grid at ~10fps so the window stays active
+    let mut live_iter = UPDATE_ITERATIONS;
+    loop {
+        let seed = (live_iter as u32).wrapping_mul(2654435761).wrapping_add(12345);
+        let (fragment, visible_count) = grid_fragment(seed, 1 + live_iter as u32);
+        let seq = 100 + live_iter as u64;
+        let _ = call(
+            endpoint,
+            "wgpu.ui.submit_fragment",
+            seq,
+            json!(UiCommand::SubmitFragment {
+                submission: UiFragmentSubmission::new(fragment)
+            }),
+        );
+        if live_iter % 30 == 0 {
+            println!("[grid-pulse] live frame {live_iter}: {visible_count}/36 cells visible");
+        }
+        live_iter += 1;
+        thread::sleep(Duration::from_millis(100)); // ~10fps for live view
     }
-    if service.try_wait()?.is_none() {
-        service.kill()?;
-    }
-    println!("[grid-pulse] done -> {CAPTURE_PATH}");
-    Ok(())
 }
