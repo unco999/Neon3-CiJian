@@ -11909,6 +11909,7 @@ impl WgpuRuntime {
                 neon_ui_schema::UI_PROGRAM_SEMANTIC_EVENT_CAPABILITY_NAME,
                 neon_ui_schema::UI_NINE_SLICE_CAPABILITY_NAME,
                 neon_ui_schema::UI_CANVAS_POINTS_LINES_CAPABILITY_NAME,
+                neon_ui_schema::UI_COMPONENT_SKIN_CAPABILITY_NAME,
             ]
             .into_iter()
             .map(|name| neon_ui_schema::UiProgramCapability {
