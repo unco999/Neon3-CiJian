@@ -474,18 +474,14 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
         let binding_span = source_map
             .get(&binding.node_key)
             .expect("Flow node keys populate the source map");
-        let slot = schema
-            .slots
-            .iter()
-            .find(|slot| slot.key == binding.input_key)
-            .ok_or_else(|| {
-                error_at(
-                    "ui_program_unknown_binding_target",
-                    "binding references an input that is not declared by this Flow document",
-                    binding_span,
-                )
-            })?;
-        if !binding_accepts(&binding.property, &slot.kind) {
+        let resolved_kind = resolve_binding_kind(&schema, &binding.input_key).ok_or_else(|| {
+            error_at(
+                "ui_program_unknown_binding_target",
+                "binding references an input that is not declared by this Flow document",
+                binding_span,
+            )
+        })?;
+        if !binding_accepts(&binding.property, &resolved_kind) {
             return Err(error_at(
                 "ui_program_input_type_mismatch",
                 "binding property is incompatible with its declared input kind",
@@ -525,11 +521,11 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
                 let slot = schema
                     .slots
                     .iter()
-                    .find(|slot| &slot.key == input_key)
+                    .find(|slot| slot.key == *input_key)
                     .ok_or_else(|| {
                         error(
-                            "ui_program_invalid_branch_template",
-                            "branch predicate input is not declared",
+                            "ui_program_unknown_binding_target",
+                            "branch references an input that is not declared",
                             1,
                             1,
                         )
@@ -2243,8 +2239,8 @@ fn validate_state_machines(
                     .find(|slot| slot.key == *input_key)
                     .ok_or_else(|| {
                         error(
-                            "nui_flow_invalid_state_machine",
-                            "transition predicate input is not declared",
+                            "ui_program_unknown_binding_target",
+                            "transition predicate references an undeclared input",
                             1,
                             1,
                         )
@@ -4186,6 +4182,42 @@ fn valid_key(key: &str) -> bool {
 fn valid_intent(intent: &str) -> bool {
     intent.contains('.') && intent.split('.').all(valid_key)
 }
+/// Resolves a binding input key to its UiInputKind, supporting dotted paths
+/// like "player.hp" for Struct inputs. Returns None if the key or field path
+/// doesn't resolve to a declared input.
+fn resolve_binding_kind(
+    schema: &neon_ui_schema::UiInputSchema,
+    input_key: &str,
+) -> Option<neon_ui_schema::UiInputKind> {
+    match input_key.split_once('.') {
+        None => schema
+            .slots
+            .iter()
+            .find(|slot| slot.key == input_key)
+            .map(|slot| slot.kind.clone()),
+        Some((top_key, field_path)) => {
+            let slot = schema.slots.iter().find(|slot| slot.key == top_key)?;
+            resolve_nested_kind(&slot.kind, field_path)
+        }
+    }
+}
+
+fn resolve_nested_kind(
+    kind: &neon_ui_schema::UiInputKind,
+    path: &str,
+) -> Option<neon_ui_schema::UiInputKind> {
+    let mut current = kind.clone();
+    for segment in path.split('.') {
+        match current {
+            neon_ui_schema::UiInputKind::Struct { fields } => {
+                current = fields.get(segment)?.clone();
+            }
+            _ => return None,
+        }
+    }
+    Some(current)
+}
+
 fn binding_accepts(property: &UiBoundProperty, kind: &UiInputKind) -> bool {
     match property {
         UiBoundProperty::TextValue => matches!(kind, UiInputKind::TextHandle),
@@ -5977,5 +6009,39 @@ panel workspace row gap 8
         )
         .unwrap_err();
         assert_eq!(error.diagnostics[0].code, "nui_flow_duplicate_struct_field");
+    }
+
+    #[test]
+    fn struct_field_binding_resolves_kind() {
+        let document = parse_nui_flow(
+            "input player struct {\n  hp f32 default 0.8\n  name text default text:empty\n}\nsurface root w 100 h 100\n  slider hp_slider numeric $player.hp w 50 h 20\n  text name_label value $player.name w 50 h 20\n",
+        )
+        .expect("struct field binding must parse");
+        let bindings = &document.ir.bindings;
+        assert_eq!(bindings.len(), 2);
+        assert!(bindings.iter().any(|b| b.input_key == "player.hp" && b.property == UiBoundProperty::NumericValue));
+        assert!(bindings.iter().any(|b| b.input_key == "player.name" && b.property == UiBoundProperty::TextValue));
+        let hp_kind = resolve_binding_kind(&document.input_schema, "player.hp").expect("hp kind must resolve");
+        assert!(matches!(hp_kind, neon_ui_schema::UiInputKind::F32));
+        let name_kind = resolve_binding_kind(&document.input_schema, "player.name").expect("name kind must resolve");
+        assert!(matches!(name_kind, neon_ui_schema::UiInputKind::TextHandle));
+    }
+
+    #[test]
+    fn struct_field_binding_rejects_unknown_field() {
+        let error = parse_nui_flow(
+            "input player struct {\n  hp f32\n}\nsurface root w 100 h 100\n  text label value $player.nonexistent w 50 h 20\n",
+        )
+        .unwrap_err();
+        assert_eq!(error.diagnostics[0].code, "ui_program_unknown_binding_target");
+    }
+
+    #[test]
+    fn struct_field_binding_rejects_type_mismatch() {
+        let error = parse_nui_flow(
+            "input player struct {\n  hp f32 default 0.8\n}\nsurface root w 100 h 100\n  text label value $player.hp w 50 h 20\n",
+        )
+        .unwrap_err();
+        assert_eq!(error.diagnostics[0].code, "ui_program_input_type_mismatch");
     }
 }

@@ -2584,6 +2584,37 @@ fn binding_accepts(property: &UiBoundProperty, kind: &neon_ui_schema::UiInputKin
         UiBoundProperty::CanvasData => matches!(kind, CanvasData),
     }
 }
+/// Resolves a binding input key to its value, supporting dotted paths like
+/// "player.hp" for Struct inputs. Returns None if the key or field path doesn't resolve.
+fn resolve_binding_value<'a>(
+    inputs: &'a neon_ui_schema::UiResolvedInputs,
+    input_key: &str,
+) -> Option<&'a neon_ui_schema::UiInputValue> {
+    match input_key.split_once('.') {
+        None => inputs.values.get(input_key).map(|resolved| &resolved.value),
+        Some((top_key, field_path)) => {
+            let top = inputs.values.get(top_key)?;
+            resolve_nested_field(&top.value, field_path)
+        }
+    }
+}
+
+fn resolve_nested_field<'a>(
+    value: &'a neon_ui_schema::UiInputValue,
+    path: &str,
+) -> Option<&'a neon_ui_schema::UiInputValue> {
+    let mut current = value;
+    for segment in path.split('.') {
+        match current {
+            neon_ui_schema::UiInputValue::Struct { fields } => {
+                current = fields.get(segment)?;
+            }
+            _ => return None,
+        }
+    }
+    Some(current)
+}
+
 fn apply_binding(
     state: &mut UiCpuNodeState,
     property: &UiBoundProperty,
