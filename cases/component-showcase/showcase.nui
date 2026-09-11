@@ -140,22 +140,24 @@ surface showcase overlay w 1200 h 800 align stretch fill #0D1117
       panel split-right w 196 h 120 fill #1F6FEB22
         text split-right-label h 20 value "Right Pane" ink #E6EDF3
 
-    # ContextMenu placeholder
-    text ctx-label h 20 value "ContextMenu (right-click)" ink #8B949E
-    panel ctx-area x 0 y 280 w 340 h 80 fill #161B22 line #30363D
-      text ctx-hint h 20 value "Right-click here for menu" ink #8B949E
+    # ContextMenu (right-click to show, uses context_menu component)
+    text ctx-label h 20 value "ContextMenu (right-click anywhere)" ink #8B949E
+    context_menu demo-context x 420 y 320 w 180 h 120 visible false
+      text ctx-item-1 x 8 y 8 w 164 h 28 value "Copy" ink #E6EDF3 event demo.ctx.copy
+      text ctx-item-2 x 8 y 40 w 164 h 28 value "Paste" ink #E6EDF3 event demo.ctx.paste
+      text ctx-item-3 x 8 y 72 w 164 h 28 value "Delete" ink #F85149 event demo.ctx.delete
+    button show-ctx-btn h 28 value "Show Context Menu" event demo.ctx.show
 
-    # TreeView placeholder
-    text tree-label h 20 value "TreeView (hierarchical)" ink #8B949E
-    panel tree-area x 0 y 400 w 340 h 200 fill #161B22 line #30363D column pad 8 gap 4
-
-      text tree-root h 24 value "▼ project/" ink #E6EDF3
-      text tree-crate-1 h 24 value "  ▼ crates/" ink #E6EDF3
-      text tree-crate-2 h 24 value "    neon-ui-schema" ink #8B949E
-      text tree-crate-3 h 24 value "    neon-ui-runtime" ink #8B949E
-      text tree-crate-4 h 24 value "    neon-wgpu-runtime" ink #8B949E
-      text tree-docs h 24 value "  ▶ docs/" ink #E6EDF3
-      text tree-cases h 24 value "  ▶ cases/" ink #E6EDF3
+    # TreeView (hierarchical, uses tree_view component)
+    text tree-label h 20 value "TreeView (hierarchical structure)" ink #8B949E
+    tree_view demo-tree x 0 y 400 w 340 h 200
+      text tree-root x 8 y 8 w 324 h 24 value "▼ project/" ink #E6EDF3 event demo.tree.root
+      text tree-crate-1 x 24 y 36 w 308 h 24 value "▼ crates/" ink #E6EDF3 event demo.tree.crates
+      text tree-crate-2 x 40 y 64 w 292 h 24 value "neon-ui-schema" ink #8B949E event demo.tree.schema
+      text tree-crate-3 x 40 y 92 w 292 h 24 value "neon-ui-runtime" ink #8B949E event demo.tree.runtime
+      text tree-crate-4 x 40 y 120 w 292 h 24 value "neon-wgpu-runtime" ink #8B949E event demo.tree.wgpu
+      text tree-docs x 24 y 148 w 308 h 24 value "▶ docs/" ink #E6EDF3 event demo.tree.docs
+      text tree-cases x 24 y 176 w 308 h 24 value "▶ cases/" ink #E6EDF3 event demo.tree.cases
 
   # Tooltip with skin
   tooltip demo-tooltip skin tooltip-style x 400 y 700 w 200 h 48
