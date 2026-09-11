@@ -8600,6 +8600,22 @@ fn component_chrome_instances(visual: &UiVisual) -> Vec<UiInstance> {
             }
             _ => Vec::new(),
         },
+        UiNodeKind::TreeView => {
+            // TreeView base chrome: row separators every 24px
+            let row_height = 24.0;
+            let num_rows = ((bounds.height - 8.0) / row_height).floor() as i32;
+            (0..num_rows)
+                .map(|i| {
+                    let y = bounds.y + 8.0 + i as f32 * row_height;
+                    chrome(
+                        UiBounds { x: bounds.x + 4.0, y, width: bounds.width - 8.0, height: 1.0 },
+                        [0.12, 0.16, 0.15, 0.5],
+                        [0.0, 0.0, 0.0, 0.0],
+                        0.0,
+                    )
+                })
+                .collect()
+        }
         UiNodeKind::Tabs => match &visual.presentation {
             Some(UiControlPresentation::Choice { token, options, .. }) => {
                 let segments = tab_segments(bounds, options.len());
