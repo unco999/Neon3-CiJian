@@ -8616,6 +8616,34 @@ fn component_chrome_instances(visual: &UiVisual) -> Vec<UiInstance> {
                 })
                 .collect()
         }
+        UiNodeKind::ContextMenu => {
+            // ContextMenu chrome: subtle inner border highlight
+            vec![chrome(
+                UiBounds { x: bounds.x + 1.0, y: bounds.y + 1.0, width: bounds.width - 2.0, height: bounds.height - 2.0 },
+                [0.0, 0.0, 0.0, 0.0],
+                [0.25, 0.32, 0.38, 0.4],
+                4.0,
+            )]
+        }
+        UiNodeKind::Splitter => {
+            // Splitter chrome: center grip line
+            let horizontal = bounds.width > bounds.height;
+            if horizontal {
+                vec![chrome(
+                    UiBounds { x: bounds.x + bounds.width * 0.5 - 1.0, y: bounds.y + 4.0, width: 2.0, height: bounds.height - 8.0 },
+                    [0.30, 0.38, 0.35, 0.6],
+                    [0.0, 0.0, 0.0, 0.0],
+                    1.0,
+                )]
+            } else {
+                vec![chrome(
+                    UiBounds { x: bounds.x + 4.0, y: bounds.y + bounds.height * 0.5 - 1.0, width: bounds.width - 8.0, height: 2.0 },
+                    [0.30, 0.38, 0.35, 0.6],
+                    [0.0, 0.0, 0.0, 0.0],
+                    1.0,
+                )]
+            }
+        }
         UiNodeKind::Tabs => match &visual.presentation {
             Some(UiControlPresentation::Choice { token, options, .. }) => {
                 let segments = tab_segments(bounds, options.len());
