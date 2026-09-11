@@ -17,7 +17,7 @@ use neon_protocol::{
     ClientIdentity, ClientKind, ProtocolVersion, RequestId, Revision, RpcRequest, RpcStatus,
     ServiceName,
 };
-use neon_ui_schema::{UiCommand, UiEffect, UiFragment, UiFragmentId, UiFragmentSubmission, UiNode};
+use neon_ui_schema::{UiCommand, UiEffect, UiFragment, UiFragmentId, UiFragmentSubmission, UiNode, TextRef};
 use neon_ui_runtime::nui_flow::{lower_nui_flow, lower_nui_flow_effects, parse_nui_flow};
 use serde_json::json;
 
@@ -75,6 +75,7 @@ fn load_nui_fragment() -> Result<(UiNode, Vec<UiEffect>), String> {
     Ok((ir.root, effects))
 }
 
+/// Tree expansion state.
 fn main() -> Result<(), String> {
     println!("=== Component Showcase Probe ===");
     println!("Loading NUI from: {NUI_PATH}");
@@ -98,6 +99,7 @@ fn main() -> Result<(), String> {
     root.surface = None;
     println!("Root node: kind={:?}, bounds={:?}, style.bg={:?}, surface={:?}, children={}",
         root.kind, root.bounds, root.style.background_color, root.surface, root.children.len());
+
 
     // Submit fragment directly (like grid_pulse_probe) - build AFTER modifying root
     let fragment = UiFragment {
@@ -129,7 +131,52 @@ fn main() -> Result<(), String> {
         Err(e) => println!("Capture failed: {}", e),
     }
 
-    // Keep the UI alive by periodically resubmitting the fragment
+    // TreeView expansion state for demo
+    struct TreeState {
+        project_expanded: bool,
+        crates_expanded: bool,
+    }
+    impl TreeState {
+        fn new() -> Self {
+            Self { project_expanded: true, crates_expanded: true }
+        }
+        fn toggle_project(&mut self) { self.project_expanded = !self.project_expanded; }
+        fn toggle_crates(&mut self) { self.crates_expanded = !self.crates_expanded; }
+        fn apply(&self, node: &mut UiNode) {
+            match node.node_id.0.as_str() {
+                "tree-root" => {
+                    if let Some(text) = &mut node.text {
+                        *text = TextRef::Literal {
+                            value: if self.project_expanded { "▼ project/" } else { "▶ project/" }.into(),
+                        };
+                    }
+                }
+                "tree-crate-1" => {
+                    node.visible = self.project_expanded;
+                    if let Some(text) = &mut node.text {
+                        *text = TextRef::Literal {
+                            value: if self.crates_expanded { "▼ crates/" } else { "▶ crates/" }.into(),
+                        };
+                    }
+                }
+                "tree-crate-2" | "tree-crate-3" | "tree-crate-4" => {
+                    node.visible = self.project_expanded && self.crates_expanded;
+                }
+                "tree-docs" | "tree-cases" => {
+                    node.visible = self.project_expanded;
+                }
+                _ => {}
+            }
+            for child in &mut node.children {
+                self.apply(child);
+            }
+        }
+    }
+
+    let mut tree_state = TreeState::new();
+    let mut frame_count = 0u64;
+
+    // Keep the UI alive by periodically resubmitting the fragment.
     let mut revision = 2u64;
     loop {
         thread::sleep(Duration::from_millis(500));
@@ -137,10 +184,27 @@ fn main() -> Result<(), String> {
             println!("Runtime exited unexpectedly");
             break;
         }
+
+        frame_count += 1;
+
+        // Toggle tree expansion every 8 heartbeats (~4 seconds)
+        let should_capture = frame_count % 8 == 0;
+        if should_capture {
+            if frame_count % 16 == 0 {
+                tree_state.toggle_project();
+            } else {
+                tree_state.toggle_crates();
+            }
+        }
+
+        // Apply tree state to a fresh clone of the root
+        let mut display_root = root.clone();
+        tree_state.apply(&mut display_root);
+
         let fragment = UiFragment {
             fragment_id: UiFragmentId("showcase".into()),
             revision: Revision(revision),
-            root: root.clone(),
+            root: display_root,
             effects: effects.clone(),
         };
         let command = UiCommand::SubmitFragment {
@@ -150,6 +214,15 @@ fn main() -> Result<(), String> {
             eprintln!("heartbeat submit failed: {error}");
         }
         revision += 1;
+
+        // Capture AFTER submitting the fragment
+        if should_capture {
+            thread::sleep(Duration::from_millis(500));
+            let shot = format!(r"D:\Neon3\shots\showcase-tree-p{}-c{}.png",
+                tree_state.project_expanded, tree_state.crates_expanded);
+            let _ = call(endpoint, "wgpu.render.target.capture", 9999,
+                json!({"target":"ui.color.v1", "path": shot, "redraw": true}));
+        }
     }
 
     let _ = child.kill();

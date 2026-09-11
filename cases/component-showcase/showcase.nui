@@ -73,7 +73,7 @@ surface showcase overlay w 1200 h 800 align stretch fill #0D1117
   panel left-panel skin panel-style x 20 y 20 w 360 h 760 column pad 16 gap 12 align stretch
 
     text title h 32 value "Component Showcase"
-    text subtitle h 20 value "9 skin types + scrollable + bindings"
+    text subtitle h 24 value "9 skin types + scrollable + bindings"
 
     # Button with skin
     button btn-demo skin btn-style h 40 value "Skinned Button" event demo.button.click
@@ -98,13 +98,13 @@ surface showcase overlay w 1200 h 800 align stretch fill #0D1117
 
     # Opacity binding demo
     panel opacity-demo x 0 y 0 w 100 h 40 fill #58A6FF opacity $alpha
-    text opacity-label h 20 value "Opacity bound to $alpha"
+    text opacity-label h 24 value "Opacity bound to $alpha"
 
   # 中间面板 - Scrollable 容器
   panel mid-panel skin panel-style x 400 y 20 w 380 h 760 column pad 16 gap 8 align stretch
 
     text mid-title h 28 value "Scrollable Container"
-    text mid-sub h 18 value "scrollable + scroll_offset binding"
+    text mid-sub h 24 value "scrollable + scroll_offset binding"
 
     # Scrollable panel with scroll_offset binding
     panel scroller x 0 y 80 w 340 h 400 scrollable scroll_offset $offset column pad 12 gap 8 align stretch
@@ -128,20 +128,20 @@ surface showcase overlay w 1200 h 800 align stretch fill #0D1117
   panel right-panel skin panel-style x 800 y 20 w 380 h 760 column pad 16 gap 12 align stretch
 
     text right-title h 28 value "New Components"
-    text right-sub h 18 value "Splitter / ContextMenu / TreeView"
+    text right-sub h 24 value "Splitter / ContextMenu / TreeView"
 
     # Splitter demo (horizontal layout with splitter)
-    text split-label h 20 value "Splitter (drag to resize)"
+    text split-label h 24 value "Splitter (drag to resize)"
     panel split-container x 0 y 120 w 340 h 120 row gap 0
 
       panel split-left w 140 h 120 fill #1F6FEB33
-        text split-left-label h 20 value "Left Pane"
+        text split-left-label h 24 value "Left Pane"
       splitter split-h w 4 h 120
       panel split-right w 196 h 120 fill #1F6FEB22
-        text split-right-label h 20 value "Right Pane"
+        text split-right-label h 24 value "Right Pane"
 
     # ContextMenu (right-click to show, uses context_menu component)
-    text ctx-label h 20 value "ContextMenu (right-click anywhere)"
+    text ctx-label h 24 value "ContextMenu (right-click anywhere)"
     context_menu demo-context x 420 y 320 w 180 h 120 visible false
       text ctx-item-1 x 8 y 8 w 164 h 28 value "Copy" event demo.ctx.copy
       text ctx-item-2 x 8 y 40 w 164 h 28 value "Paste" event demo.ctx.paste
@@ -149,7 +149,7 @@ surface showcase overlay w 1200 h 800 align stretch fill #0D1117
     button show-ctx-btn h 28 value "Show Context Menu" event demo.ctx.show
 
     # TreeView (hierarchical, uses tree_view component)
-    text tree-label h 20 value "TreeView (hierarchical structure)"
+    text tree-label h 24 value "TreeView (hierarchical structure)"
     tree_view demo-tree x 0 y 400 w 340 h 200
       text tree-root x 8 y 8 w 324 h 24 value "▼ project/" event demo.tree.root
       text tree-crate-1 x 24 y 36 w 308 h 24 value "▼ crates/" event demo.tree.crates
@@ -161,7 +161,7 @@ surface showcase overlay w 1200 h 800 align stretch fill #0D1117
 
   # Tooltip with skin
   tooltip demo-tooltip skin tooltip-style x 400 y 700 w 200 h 48
-    text tooltip-text h 20 value "Skinned Tooltip"
+    text tooltip-text h 24 value "Skinned Tooltip"
 
   # Dynamic text binding demo
   text dynamic-label x 20 y 780 w 300 h 20 value $dynamic_text
