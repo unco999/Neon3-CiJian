@@ -1,7 +1,8 @@
-//! Grid pulse rendering probe.
+//! Grid pulse high-frequency update probe.
 //!
-//! Renders a 6x6 grid of panels with random visibility (matching the
-//! grid-pulse.nui case structure) and captures a PNG.
+//! Renders a 6x6 grid, then rapidly resubmits the fragment with changing
+//! cell visibility/color (60 iterations ~ 1 second at 60fps target).
+//! Verifies the runtime stays stable under high-frequency fragment churn.
 
 use std::{
     net::SocketAddr,
@@ -21,9 +22,11 @@ use neon_ui_schema::{
 };
 use serde_json::json;
 
-const ENDPOINT: &str = "127.0.0.1:39252";
+const ENDPOINT: &str = "127.0.0.1:39253";
 const TIMEOUT: Duration = Duration::from_secs(15);
 const CAPTURE_PATH: &str = r"D:\Neon3\shots\grid-pulse-probe.png";
+const UPDATE_ITERATIONS: usize = 60;
+const UPDATE_INTERVAL_MS: u64 = 16; // ~60fps
 
 fn request(method: &str, sequence: u64, params: serde_json::Value) -> RpcRequest {
     RpcRequest {
@@ -89,7 +92,9 @@ fn panel(id: &str, x: f32, y: f32, w: f32, h: f32, color: [f32; 4], visible: boo
     }
 }
 
-fn grid_fragment() -> UiFragment {
+/// Build a grid fragment with the given RNG seed. Different seeds produce
+/// different cell visibility/color patterns.
+fn grid_fragment(seed: u32, revision: u32) -> (UiFragment, usize) {
     const COLS: usize = 6;
     const ROWS: usize = 6;
     const CELL: f32 = 44.0;
@@ -98,28 +103,30 @@ fn grid_fragment() -> UiFragment {
     let grid_w = COLS as f32 * CELL + (COLS as f32 - 1.0) * GAP;
     let grid_h = ROWS as f32 * CELL + (ROWS as f32 - 1.0) * GAP;
 
-    // Simple LCG random
-    let mut rng = 42u32;
+    let mut rng = seed;
     let mut next = || {
         rng = rng.wrapping_mul(1103515245).wrapping_add(12345);
         ((rng >> 16) & 0x7fff) as f32 / 32767.0
     };
 
     let mut cells = Vec::new();
-    let mut hot_count = 0;
+    let mut visible_count = 0;
     for r in 0..ROWS {
         for c in 0..COLS {
             let i = r * COLS + c;
             let v = next();
             let visible = v > 0.5;
-            if visible { hot_count += 1; }
+            if visible { visible_count += 1; }
             let x = PADDING + c as f32 * (CELL + GAP);
             let y = PADDING + 32.0 + r as f32 * (CELL + GAP);
-            // Blue for normal, red tint for "hot" (>0.75)
+            // Color shifts with seed to test color churn
+            let hue = (seed as f32 * 0.01) % 1.0;
             let color = if v > 0.75 {
-                [1.0, 0.4, 0.4, 1.0]
+                // Hot: red-orange, brightness varies with seed
+                [1.0, 0.3 + hue * 0.3, 0.2, 1.0]
             } else {
-                [0.3, 0.65, 1.0, 1.0]
+                // Normal: blue-cyan, brightness varies with seed
+                [0.2 + hue * 0.2, 0.5 + hue * 0.2, 1.0, 1.0]
             };
             cells.push(panel(&format!("cell_{i}"), x, y, CELL, CELL, color, visible));
         }
@@ -146,13 +153,12 @@ fn grid_fragment() -> UiFragment {
         children: cells,
     };
 
-    println!("[grid-pulse] {hot_count}/36 cells visible");
-    UiFragment {
+    (UiFragment {
         fragment_id: UiFragmentId("grid-pulse".into()),
-        revision: Revision(1),
+        revision: Revision(revision as u64),
         root,
         effects: Vec::<UiEffect>::new(),
-    }
+    }, visible_count)
 }
 
 fn main() -> std::io::Result<()> {
@@ -160,6 +166,7 @@ fn main() -> std::io::Result<()> {
     let mut service = launch()?;
     let started = Instant::now();
 
+    // Wait for health
     loop {
         match call(endpoint, "service.health", 1, json!({})) {
             Ok(_) => break,
@@ -174,31 +181,70 @@ fn main() -> std::io::Result<()> {
     }
     println!("[grid-pulse] service healthy");
 
-    let fragment = grid_fragment();
-    let submitted = call(
-        endpoint,
-        "wgpu.ui.submit_fragment",
-        2,
-        json!(UiCommand::SubmitFragment {
-            submission: UiFragmentSubmission::new(fragment)
-        }),
-    )
-    .map_err(std::io::Error::other)?;
-    println!("[grid-pulse] fragment submitted: {submitted}");
+    // High-frequency update loop
+    let mut failures = 0;
+    let mut min_time_ms = f64::MAX;
+    let mut max_time_ms = 0.0f64;
+    let mut total_time_ms = 0.0f64;
+    let mut last_visible = 0;
 
-    thread::sleep(Duration::from_millis(800));
+    for iter in 0..UPDATE_ITERATIONS {
+        let seed = (iter as u32).wrapping_mul(2654435761).wrapping_add(12345);
+        let (fragment, visible_count) = grid_fragment(seed, 1 + iter as u32);
+        last_visible = visible_count;
 
+        let t0 = Instant::now();
+        let seq = 100 + iter as u64;
+        let result = call(
+            endpoint,
+            "wgpu.ui.submit_fragment",
+            seq,
+            json!(UiCommand::SubmitFragment {
+                submission: UiFragmentSubmission::new(fragment)
+            }),
+        );
+        let elapsed = t0.elapsed().as_secs_f64() * 1000.0;
+        total_time_ms += elapsed;
+        min_time_ms = min_time_ms.min(elapsed);
+        max_time_ms = max_time_ms.max(elapsed);
+
+        match result {
+            Ok(_) => {}
+            Err(e) => {
+                failures += 1;
+                if failures <= 3 {
+                    eprintln!("[grid-pulse] iter {iter} submit failed: {e}");
+                }
+            }
+        }
+
+        // Throttle to ~60fps
+        if elapsed < UPDATE_INTERVAL_MS as f64 {
+            thread::sleep(Duration::from_millis(UPDATE_INTERVAL_MS - elapsed as u64));
+        }
+    }
+
+    println!("[grid-pulse] high-frequency loop complete: {UPDATE_ITERATIONS} iterations");
+    println!("[grid-pulse]   failures: {failures}/{UPDATE_ITERATIONS}");
+    println!("[grid-pulse]   submit time: min={min_time_ms:.2}ms max={max_time_ms:.2}ms avg={:.2}ms", total_time_ms / UPDATE_ITERATIONS as f64);
+    println!("[grid-pulse]   last frame: {last_visible}/36 cells visible");
+
+    // Wait for render to settle
+    thread::sleep(Duration::from_millis(500));
+
+    // Capture final state
     std::fs::create_dir_all(r"D:\Neon3\shots").ok();
     let capture = call(
         endpoint,
         "wgpu.render.target.capture",
-        3,
+        999,
         json!({"target":"ui.color.v1", "path": CAPTURE_PATH, "redraw": true}),
     )
     .map_err(std::io::Error::other)?;
     println!("[grid-pulse] capture result: {capture}");
 
-    let _ = call(endpoint, "service.shutdown", 4, json!({}));
+    // Shutdown
+    let _ = call(endpoint, "service.shutdown", 1000, json!({}));
     let deadline = Instant::now() + Duration::from_secs(2);
     while service.try_wait()?.is_none() && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(25));
