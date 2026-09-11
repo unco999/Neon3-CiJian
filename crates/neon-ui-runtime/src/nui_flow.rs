@@ -579,11 +579,11 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
         }
     }
     for (node_key, skin_key) in &skin_references {
-        if !matches!(find_node(&root.node, node_key), Some(node) if matches!(node.kind, UiNodeKind::Button | UiNodeKind::Slider))
+        if !matches!(find_node(&root.node, node_key), Some(node) if matches!(node.kind, UiNodeKind::Button | UiNodeKind::Slider | UiNodeKind::Scrollbar | UiNodeKind::ProgressBar | UiNodeKind::Checkbox | UiNodeKind::RadioButton | UiNodeKind::TextInput | UiNodeKind::Tooltip | UiNodeKind::Panel))
             || !skin_keys.contains(skin_key)
             || !matches!((find_node(&root.node, node_key), skins.iter().find(|skin| skin.key == *skin_key)), (Some(node), Some(skin)) if node.kind == skin.component_kind)
         {
-            return Err(error("nui_flow_invalid_skin", "button skin reference must target a declared button skin", 1, 1));
+            return Err(error("nui_flow_invalid_skin", "skin reference must target a declared skin of matching component kind", 1, 1));
         }
     }
     apply_boolean_binding_defaults(&mut root.node, &bindings, &schema);
@@ -1177,7 +1177,18 @@ fn format_skin_state(state: neon_ui_schema::UiVisualState) -> &'static str {
 }
 
 fn format_skin_component(kind: &neon_ui_schema::UiNodeKind) -> &'static str {
-    match kind { neon_ui_schema::UiNodeKind::Button => "button", neon_ui_schema::UiNodeKind::Slider => "slider", _ => "unsupported" }
+    match kind {
+        neon_ui_schema::UiNodeKind::Button => "button",
+        neon_ui_schema::UiNodeKind::Slider => "slider",
+        neon_ui_schema::UiNodeKind::Scrollbar => "scrollbar",
+        neon_ui_schema::UiNodeKind::ProgressBar => "progress_bar",
+        neon_ui_schema::UiNodeKind::Checkbox => "checkbox",
+        neon_ui_schema::UiNodeKind::RadioButton => "radio_button",
+        neon_ui_schema::UiNodeKind::TextInput => "input",
+        neon_ui_schema::UiNodeKind::Tooltip => "tooltip",
+        neon_ui_schema::UiNodeKind::Panel => "panel",
+        _ => "unsupported",
+    }
 }
 
 fn format_skin_slot_kind(kind: neon_ui_schema::UiSkinSlotKind) -> &'static str {
@@ -1500,12 +1511,24 @@ struct NodeBuild {
 
 fn parse_skin_header(text: &str, line: u32) -> FlowResult<neon_ui_schema::UiControlSkin> {
     let parts = text.split_whitespace().collect::<Vec<_>>();
-    if parts.len() != 3 || parts[0] != "skin" || !valid_key(parts[1]) || !matches!(parts[2], "button" | "slider") {
-        return Err(error("nui_flow_invalid_skin", "skin syntax is: skin <key> button|slider", line, 1));
+    if parts.len() != 3 || parts[0] != "skin" || !valid_key(parts[1]) {
+        return Err(error("nui_flow_invalid_skin", "skin syntax is: skin <key> <component_kind>", line, 1));
     }
+    let component_kind = match parts[2] {
+        "button" => neon_ui_schema::UiNodeKind::Button,
+        "slider" => neon_ui_schema::UiNodeKind::Slider,
+        "scrollbar" => neon_ui_schema::UiNodeKind::Scrollbar,
+        "progress_bar" => neon_ui_schema::UiNodeKind::ProgressBar,
+        "checkbox" => neon_ui_schema::UiNodeKind::Checkbox,
+        "radio_button" => neon_ui_schema::UiNodeKind::RadioButton,
+        "input" => neon_ui_schema::UiNodeKind::TextInput,
+        "tooltip" => neon_ui_schema::UiNodeKind::Tooltip,
+        "panel" => neon_ui_schema::UiNodeKind::Panel,
+        _ => return Err(error("nui_flow_invalid_skin", "skin component kind must be button, slider, scrollbar, progress_bar, checkbox, radio_button, input, tooltip, or panel", line, 1)),
+    };
     Ok(neon_ui_schema::UiControlSkin {
         key: parts[1].into(),
-        component_kind: if parts[2] == "slider" { neon_ui_schema::UiNodeKind::Slider } else { neon_ui_schema::UiNodeKind::Button },
+        component_kind,
         slots: Vec::new(),
     })
 }
@@ -2937,8 +2960,8 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
                     };
                 } else {
                     if token == "skin" {
-                        if !matches!(component, "button" | "slider") || !valid_key(value) {
-                            return Err(error("nui_flow_invalid_skin", "skin reference is valid only for button or slider and requires a stable key", line, 1));
+                        if !matches!(component, "button" | "slider" | "scrollbar" | "progress_bar" | "checkbox" | "radio_button" | "input" | "tooltip" | "panel") || !valid_key(value) {
+                            return Err(error("nui_flow_invalid_skin", "skin reference is valid only for skinnable components and requires a stable key", line, 1));
                         }
                         skin_key = Some(value.into());
                     } else {
@@ -5698,6 +5721,27 @@ panel workspace row gap 8
         let formatted = format_nui_flow(source).unwrap();
         assert!(formatted.contains("input guides canvas_data default canvas:empty"));
         assert!(formatted.contains("canvas overlay data $guides"));
+        assert_eq!(format_nui_flow(&formatted).unwrap(), formatted);
+    }
+
+    #[test]
+    fn expanded_skin_component_kinds_parse_and_round_trip() {
+        let source = "resource bg image\nresource track image\nresource fill image\nresource thumb image\nresource check image\nskin panel_bg panel\n  slot body idle resource bg nine_slice 4 4 4 4 border 8 8 8 8\nskin bar progress_bar\n  slot track idle resource track\n  slot fill active resource fill\nskin vscroll scrollbar\n  slot track idle resource track\n  slot thumb idle resource thumb fit contain\nskin box checkbox\n  slot body idle resource bg\n  slot body hover resource check\nsurface root\n  panel card skin panel_bg w 200 h 100\n  progress_bar load skin bar w 200 h 12\n  scrollbar v skin vscroll w 12 h 100\n  checkbox opt skin box value \"Option\"\n";
+        let document = parse_nui_flow(source).expect("expanded skins should parse");
+        assert_eq!(document.ir.skins.len(), 4);
+        assert_eq!(document.ir.skins[0].component_kind, UiNodeKind::Panel);
+        assert_eq!(document.ir.skins[1].component_kind, UiNodeKind::ProgressBar);
+        assert_eq!(document.ir.skins[2].component_kind, UiNodeKind::Scrollbar);
+        assert_eq!(document.ir.skins[3].component_kind, UiNodeKind::Checkbox);
+        assert_eq!(document.ir.skin_references["card"], "panel_bg");
+        assert_eq!(document.ir.skin_references["load"], "bar");
+        assert_eq!(document.ir.skin_references["v"], "vscroll");
+        assert_eq!(document.ir.skin_references["opt"], "box");
+        let formatted = format_nui_flow(source).unwrap();
+        assert!(formatted.contains("skin panel_bg panel"));
+        assert!(formatted.contains("skin bar progress_bar"));
+        assert!(formatted.contains("skin vscroll scrollbar"));
+        assert!(formatted.contains("skin box checkbox"));
         assert_eq!(format_nui_flow(&formatted).unwrap(), formatted);
     }
 

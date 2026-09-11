@@ -873,7 +873,7 @@ pub struct UiSkinSlot {
 impl UiControlSkin {
     pub fn validate(&self) -> Result<(), UiSchemaError> {
         if self.key.trim().is_empty()
-            || !matches!(self.component_kind, UiNodeKind::Button | UiNodeKind::Slider)
+            || !matches!(self.component_kind, UiNodeKind::Button | UiNodeKind::Slider | UiNodeKind::Scrollbar | UiNodeKind::ProgressBar | UiNodeKind::Checkbox | UiNodeKind::RadioButton | UiNodeKind::TextInput | UiNodeKind::Tooltip | UiNodeKind::Panel)
         {
             return Err(UiSchemaError::InvalidControlSkin);
         }
@@ -893,16 +893,33 @@ impl UiControlSkin {
                 _ => return Err(UiSchemaError::InvalidControlSkin),
             }
         }
-        let required = match self.component_kind {
+        let required: &[(UiSkinSlotKind, UiVisualState)] = match self.component_kind {
             UiNodeKind::Button => &[
                 (UiSkinSlotKind::Body, UiVisualState::Normal),
-            ][..],
+            ],
             UiNodeKind::Slider => &[
                 (UiSkinSlotKind::Track, UiVisualState::Normal),
                 (UiSkinSlotKind::Fill, UiVisualState::Active),
                 (UiSkinSlotKind::Thumb, UiVisualState::Normal),
-            ][..],
-            _ => &[][..],
+            ],
+            UiNodeKind::Scrollbar => &[
+                (UiSkinSlotKind::Track, UiVisualState::Normal),
+                (UiSkinSlotKind::Thumb, UiVisualState::Normal),
+            ],
+            UiNodeKind::ProgressBar => &[
+                (UiSkinSlotKind::Track, UiVisualState::Normal),
+                (UiSkinSlotKind::Fill, UiVisualState::Active),
+            ],
+            UiNodeKind::Checkbox | UiNodeKind::RadioButton => &[
+                (UiSkinSlotKind::Body, UiVisualState::Normal),
+            ],
+            UiNodeKind::TextInput => &[
+                (UiSkinSlotKind::Body, UiVisualState::Normal),
+            ],
+            UiNodeKind::Tooltip | UiNodeKind::Panel => &[
+                (UiSkinSlotKind::Body, UiVisualState::Normal),
+            ],
+            _ => &[],
         };
         if required.iter().any(|(kind, state)| {
             !self.slots.iter().any(|slot| slot.slot_kind == *kind && slot.state == *state)
@@ -4559,7 +4576,7 @@ impl UiIrDocument {
             }
         }
         if self.skin_references.iter().any(|(node_key, skin_key)| {
-            !matches!(find_ir_node(&self.root, node_key), Some(node) if matches!(node.kind, UiNodeKind::Button | UiNodeKind::Slider))
+            !matches!(find_ir_node(&self.root, node_key), Some(node) if matches!(node.kind, UiNodeKind::Button | UiNodeKind::Slider | UiNodeKind::Scrollbar | UiNodeKind::ProgressBar | UiNodeKind::Checkbox | UiNodeKind::RadioButton | UiNodeKind::TextInput | UiNodeKind::Tooltip | UiNodeKind::Panel))
                 || !skin_keys.contains(skin_key)
                 || !matches!(
                     (find_ir_node(&self.root, node_key), self.skins.iter().find(|skin| skin.key == *skin_key)),
