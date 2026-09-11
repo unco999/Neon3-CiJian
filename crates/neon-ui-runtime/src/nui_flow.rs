@@ -861,6 +861,19 @@ pub fn lower_nui_flow_effects(document: &NuiFlowDocument) -> Vec<UiEffect> {
                 image_id: resource_key.clone(),
             }),
     );
+    // Image nodes with a runtime asset_handle binding also need an ImageBinding
+    // effect so validate treats them as externally provisioned.
+    effects.extend(
+        document
+            .ir
+            .bindings
+            .iter()
+            .filter(|binding| binding.property == UiBoundProperty::ImageAsset)
+            .map(|binding| UiEffect::ImageBinding {
+                node_id: UiNodeId(binding.node_key.clone()),
+                image_id: binding.input_key.clone(),
+            }),
+    );
     effects.extend(
         document
             .ir
@@ -2320,6 +2333,7 @@ fn parse_field_kind(kind_str: &str, line: u32) -> FlowResult<neon_ui_schema::UiI
         "vec2" => Ok(UiInputKind::Vec2),
         "vec4" => Ok(UiInputKind::Vec4),
         "color" => Ok(UiInputKind::Color),
+        "asset_handle" => Ok(UiInputKind::AssetHandle),
         "text" => Ok(UiInputKind::TextHandle),
         s if s.starts_with("enum:") => {
             let variants = s[5..].split('|').filter(|v| !v.is_empty()).map(str::to_owned).collect::<Vec<_>>();
@@ -2398,6 +2412,10 @@ fn parse_field_default(
         }
         (UiInputKind::TextHandle, "text:empty") => Ok(UiInputValue::TextHandle {
             value: neon_ui_schema::UiTextHandle { id: 0, generation: 0 },
+        }),
+        (UiInputKind::AssetHandle, "asset:empty") => Ok(UiInputValue::AssetHandle {
+            id: 0,
+            generation: 0,
         }),
         (UiInputKind::Enum { .. }, v) => Ok(UiInputValue::Enum { value: v.into() }),
         _ => Err(error("nui_flow_invalid_literal", "field default does not match its type", line, 1)),
@@ -2560,6 +2578,7 @@ fn parse_input(text: &str, line: u32) -> FlowResult<Option<(ParsedInput, bool)>>
         "vec2" => UiInputKind::Vec2,
         "vec4" => UiInputKind::Vec4,
         "color" => UiInputKind::Color,
+        "asset_handle" => UiInputKind::AssetHandle,
         "text" => UiInputKind::TextHandle,
         range_spec if range_spec.starts_with("i32:") => {
             let (minimum, maximum) = parse_range(range_spec, "i32", line, str::parse::<i32>)?;
@@ -2638,6 +2657,10 @@ fn parse_input(text: &str, line: u32) -> FlowResult<Option<(ParsedInput, bool)>>
                 id: 0,
                 generation: 0,
             },
+        },
+        (UiInputKind::AssetHandle, "asset:empty") => UiInputValue::AssetHandle {
+            id: 0,
+            generation: 0,
         },
         (UiInputKind::Enum { .. }, value) => UiInputValue::Enum {
             value: value.into(),
@@ -2847,7 +2870,7 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
             "overlay" => node.layout.as_mut().unwrap().mode = UiLayoutMode::Overlay,
             "x" | "y" | "w" | "h" | "minw" | "maxw" | "grow" | "shrink" | "basis" | "gap"
             | "pad" | "fill" | "line" | "ink" | "opacity" | "radius" | "border_width" | "value"
-            | "checked" | "selected" | "state" | "numeric" | "scroll" | "enabled" | "visible"
+            | "checked" | "selected" | "state" | "numeric" | "scroll" | "scroll_offset" | "enabled" | "visible"
             | "event" | "token" | "align" | "clip" | "fit" | "justify" | "data" | "rich" | "skin"
             | "composition_layer" | "layer" => {
                 let value = *parts.get(index + 1).ok_or_else(|| {
@@ -3149,15 +3172,27 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
                         1,
                     )
                 })?;
-                if !valid_key(value) {
-                    return Err(error(
-                        "nui_flow_invalid_resource",
-                        "image resource key is invalid",
-                        line,
-                        1,
-                    ));
+                if let Some(input_key) = value.strip_prefix('$') {
+                    if !valid_key(input_key) {
+                        return Err(error(
+                            "nui_flow_invalid_resource",
+                            "image resource binding input key is invalid",
+                            line,
+                            1,
+                        ));
+                    }
+                    bindings.push((UiBoundProperty::ImageAsset, input_key.into()));
+                } else {
+                    if !valid_key(value) {
+                        return Err(error(
+                            "nui_flow_invalid_resource",
+                            "image resource key is invalid",
+                            line,
+                            1,
+                        ));
+                    }
+                    image_resource = Some(value.into());
                 }
-                image_resource = Some(value.into());
                 index += 1;
             }
             "frame" if matches!(component, "panel" | "tooltip") => {
@@ -3847,7 +3882,9 @@ fn parse_attribute(
             node.style.border_color = color(value, line)?;
         }
         "opacity" => {
-            node.style.opacity = number(value, line)?.clamp(0.0, 1.0);
+            if direct_binding(UiBoundProperty::Opacity).is_none() {
+                node.style.opacity = number(value, line)?.clamp(0.0, 1.0);
+            }
         }
         "radius" => {
             node.style.corner_radius = number(value, line)?.max(0.0);
@@ -3948,6 +3985,16 @@ fn parse_attribute(
                 return Err(error(
                     "nui_flow_invalid_control_binding",
                     "numeric and scroll require a numeric input binding",
+                    line,
+                    1,
+                ));
+            }
+        }
+        "scroll_offset" => {
+            if direct_binding(UiBoundProperty::ScrollOffset).is_none() {
+                return Err(error(
+                    "nui_flow_invalid_control_binding",
+                    "scroll_offset requires a vec2 input binding",
                     line,
                     1,
                 ));
@@ -4330,7 +4377,9 @@ fn binding_accepts(property: &UiBoundProperty, kind: &UiInputKind) -> bool {
                 | UiInputKind::F32Range { .. }
         ),
         UiBoundProperty::CanvasData => matches!(kind, UiInputKind::CanvasData),
-        _ => false,
+        UiBoundProperty::Opacity => matches!(kind, UiInputKind::F32),
+        UiBoundProperty::ImageAsset => matches!(kind, UiInputKind::AssetHandle),
+        UiBoundProperty::ScrollOffset => matches!(kind, UiInputKind::Vec2),
     }
 }
 fn align_up(value: u32, alignment: u32) -> u32 {
@@ -4552,7 +4601,11 @@ fn format_node(
             UiBoundProperty::Selected => "selected",
             UiBoundProperty::StateToken => "state",
             UiBoundProperty::NumericValue => "numeric",
-            _ => continue,
+            UiBoundProperty::Opacity => "opacity",
+            UiBoundProperty::ImageAsset => "resource",
+            UiBoundProperty::ScrollOffset => "scroll_offset",
+            // CanvasData is serialized by the dedicated canvas block above.
+            UiBoundProperty::CanvasData => continue,
         };
         line.push_str(&format!(" {} ${}", property, binding.input_key));
     }
@@ -6273,5 +6326,54 @@ panel workspace row gap 8
         // 36 cell visible bindings
         let visible_bindings = document.ir.bindings.iter().filter(|b| b.property == neon_ui_schema::UiBoundProperty::Visible).count();
         assert_eq!(visible_bindings, 36, "expected 36 cell visible bindings");
+    }
+
+    #[test]
+    fn opacity_binding_parses_and_type_checks() {
+        let document = parse_nui_flow(
+            "surface root w 100 h 100\n  panel box x 0 y 0 w 50 h 50 opacity $alpha\ninput alpha f32 default 0.5\n",
+        )
+        .expect("opacity binding should parse");
+        let binding = document.ir.bindings.iter().find(|b| b.property == neon_ui_schema::UiBoundProperty::Opacity).unwrap();
+        assert_eq!(binding.input_key, "alpha");
+        assert_eq!(binding.node_key, "box");
+    }
+
+    #[test]
+    fn image_resource_binding_parses() {
+        let document = parse_nui_flow(
+            "surface root w 100 h 100\n  image icon x 0 y 0 w 32 h 32 resource $tex\ninput tex asset_handle default asset:empty\n",
+        )
+        .expect("image resource binding should parse");
+        let binding = document.ir.bindings.iter().find(|b| b.property == neon_ui_schema::UiBoundProperty::ImageAsset).unwrap();
+        assert_eq!(binding.input_key, "tex");
+        assert_eq!(binding.node_key, "icon");
+    }
+
+    #[test]
+    fn scroll_offset_binding_requires_vec2() {
+        // Valid: vec2 input
+        let document = parse_nui_flow(
+            "surface root w 100 h 100\n  panel area x 0 y 0 w 80 h 80 scroll_offset $offset\ninput offset vec2 default 0,0\n",
+        )
+        .expect("scroll_offset binding with vec2 should parse");
+        let binding = document.ir.bindings.iter().find(|b| b.property == neon_ui_schema::UiBoundProperty::ScrollOffset).unwrap();
+        assert_eq!(binding.input_key, "offset");
+
+        // Invalid: f32 input (scroll_offset requires vec2)
+        let err = parse_nui_flow(
+            "surface root w 100 h 100\n  panel area x 0 y 0 w 80 h 80 scroll_offset $offset\ninput offset f32 default 0\n",
+        )
+        .unwrap_err();
+        assert!(err.diagnostics.iter().any(|d| d.code == "ui_program_input_type_mismatch"));
+    }
+
+    #[test]
+    fn new_bindings_serialize_round_trip() {
+        let source = "surface root w 100 h 100\n  panel box x 0 y 0 w 50 h 50 opacity $alpha\n  image icon x 60 y 0 w 32 h 32 resource $tex\ninput alpha f32 default 0.5\ninput tex asset_handle default asset:empty\n";
+        let serialized = format_nui_flow(source).expect("should format");
+        // opacity and resource bindings should appear in serialized output
+        assert!(serialized.contains("opacity $alpha"), "serialized should contain opacity binding");
+        assert!(serialized.contains("resource $tex"), "serialized should contain resource binding");
     }
 }

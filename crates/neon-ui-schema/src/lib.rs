@@ -4318,6 +4318,7 @@ mod tests {
                     offset: 0,
                     representation,
                 },
+                derived_expression: None,
             }],
             grid_slots: Vec::new(),
             flow_name: "terrain".into(),
@@ -4484,11 +4485,17 @@ impl UiIrDocument {
         if self.schema_version != 1 || self.surface_id.0.trim().is_empty() {
             return Err(UiSchemaError::InvalidIrDocument);
         }
-        let external_image_nodes = self
+        let mut external_image_nodes = self
             .image_resources
             .keys()
             .cloned()
             .collect::<std::collections::HashSet<_>>();
+        // Nodes with a runtime ImageAsset binding are also externally provisioned.
+        for binding in &self.bindings {
+            if binding.property == UiBoundProperty::ImageAsset {
+                external_image_nodes.insert(binding.node_key.clone());
+            }
+        }
         self.root
             .validate_with_external_images(&external_image_nodes)?;
         if self.resource_budget.max_nodes == 0 || self.resource_budget.max_instances == 0 {
