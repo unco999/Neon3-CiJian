@@ -238,7 +238,8 @@ mod world_ui_pipeline;
 use gpu_preview::HeightmapPreviewConverter;
 pub use ui_program_gpu::GpuUiProgramBackend;
 use ui_renderer::{
-    LocalPresentationCommit, PendingLocalPresentationKey, UiDrawMode, UiHitBinding, UiWgpuRenderer,
+    set_global_view_extras, LocalPresentationCommit, PendingLocalPresentationKey, UiDrawMode,
+    UiHitBinding, UiWgpuRenderer,
 };
 use world_ui_pipeline::{WorldUiCamera, WorldUiCameraState, WorldUiPipeline};
 
@@ -378,6 +379,33 @@ impl WindowBackdrop {
 /// `DxgiFromVisual` path. Keep the glass absorption in the renderer's final
 /// premultiplied clear so it is below transparent UI pixels but in the visual
 /// that actually reaches the screen.
+/// Parse `{ extras: [[f32;4]; 10] }` from RPC params for wgpu.ui.set_view_extras.
+fn parse_view_extras(params: &Value) -> Result<[[f32; 4]; 10], String> {
+    let arr = params
+        .get("extras")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "extras must be a 10-element array of [f32;4]".to_string())?;
+    if arr.len() != 10 {
+        return Err(format!("extras must have exactly 10 slots, got {}", arr.len()));
+    }
+    let mut out = [[0.0f32; 4]; 10];
+    for (i, slot) in arr.iter().enumerate() {
+        let vals = slot
+            .as_array()
+            .ok_or_else(|| format!("extras[{i}] must be an array of 4 numbers"))?;
+        if vals.len() != 4 {
+            return Err(format!("extras[{i}] must have exactly 4 elements, got {}", vals.len()));
+        }
+        for (j, v) in vals.iter().enumerate() {
+            out[i][j] = v
+                .as_f64()
+                .ok_or_else(|| format!("extras[{i}][{j}] must be a number"))?
+                as f32;
+        }
+    }
+    Ok(out)
+}
+
 fn native_glass_clear_color() -> wgpu::Color {
     let tint = std::env::var("NEON_BACKDROP_TINT").unwrap_or_else(|_| "#000000".into());
     let rgb = tint
@@ -2222,6 +2250,68 @@ impl WindowedRuntime {
         });
     }
 
+    /// Publish GPU→CPU shader events to eventd as `shader.event`. Each event
+    /// carries the u32 event_id emitted by `emit_shader_event` in WGSL and the
+    /// vec4<f32> payload. Publishing runs on a worker thread so the render loop
+    /// is not blocked by eventd round-trips.
+    fn publish_shader_events(&mut self, events: Vec<(u32, [f32; 4])>) {
+        let Some(endpoint) = self.eventd_endpoint else {
+            return;
+        };
+        if events.is_empty() {
+            return;
+        }
+        let epoch = self.epoch;
+        let frame_sequence = self.gpu.as_ref().map_or(0, |gpu| gpu.frame_count);
+        let publisher = ClientIdentity {
+            kind: ClientKind::WgpuRuntime,
+            instance_id: format!("window-{}", epoch),
+            pid: std::process::id(),
+            origin: "neon-wgpu-runtime".into(),
+        };
+        thread::spawn(move || {
+            let mut client = match EventClient::connect(endpoint) {
+                Ok(client) => client,
+                Err(error) => {
+                    eprintln!("[neon-wgpu-runtime] shader event connect failed: {error}");
+                    return;
+                }
+            };
+            for (index, (event_id, payload)) in events.into_iter().enumerate() {
+                let request_id = RequestId(format!(
+                    "wgpu-shader-event-{}-{}-{}",
+                    epoch, frame_sequence, index
+                ));
+                let publish = neon_protocol::EventPublish {
+                    protocol: "neon3.event".into(),
+                    version: PROTOCOL_VERSION,
+                    request_id,
+                    publisher: publisher.clone(),
+                    name: "shader.event".into(),
+                    schema_version: 1,
+                    payload: json!({
+                        "event_id": event_id,
+                        "payload": payload.to_vec(),
+                    }),
+                    idempotency_key: Some(format!(
+                        "shader-event:{}:{}:{}",
+                        epoch, frame_sequence, index
+                    )),
+                };
+                match client.publish(&publish) {
+                    Ok(ack) if ack.status == neon_protocol::EventAckStatus::Accepted => {}
+                    Ok(ack) => eprintln!(
+                        "[neon-wgpu-runtime] shader event rejected: {:?}",
+                        ack.error
+                    ),
+                    Err(error) => {
+                        eprintln!("[neon-wgpu-runtime] shader event publish failed: {error}");
+                    }
+                }
+            }
+        });
+    }
+
     fn preload_fixture_image(&mut self, endpoint: SocketAddr) -> Result<(), String> {
         let asset = AssetRef {
             project_id: "fixture-project".into(),
@@ -2335,6 +2425,10 @@ impl WindowedRuntime {
         // The shell-fit resize is deferred until the `gpu` borrow is released
         // at the end of this frame (see below).
         let mut pending_window_resize: Option<winit::dpi::PhysicalSize<u32>> = None;
+        // Copy out endpoint/epoch before the gpu mutable borrow so the
+        // shader-event publish thread can be spawned without reborrowing self.
+        let shader_event_endpoint = self.eventd_endpoint;
+        let shader_event_epoch = self.epoch;
         let Some(gpu) = self.gpu.as_mut() else {
             return Ok(());
         };
@@ -2374,6 +2468,9 @@ impl WindowedRuntime {
                 Err(_) => gpu.input.cancel(),
             }
         }
+        // Reset the GPU shader-event ring counter before this frame's material
+        // passes write to it. The matching readback happens after queue.submit.
+        gpu.ui.begin_shader_event_frame(&gpu.queue);
         // When an Acrylic shared target exists, wgpu renders into it and
         let surface_texture = {
             let surface = gpu.surface.as_ref().expect("window surface missing");
@@ -2668,6 +2765,9 @@ impl WindowedRuntime {
                 .enqueue_hit_readback(&mut encoder, &gpu.hit_target, pixel)
                 .map(|slot| (slot, pixel))
         });
+        // Copy the shader-event ring into the staging buffer so it can be read
+        // back from the GPU after this submission completes.
+        gpu.ui.finish_shader_event_frame(&mut encoder);
         gpu.queue.submit(Some(encoder.finish()));
         let submitted_at = Instant::now();
         if let Some((slot, _)) = queued_readback {
@@ -2693,6 +2793,65 @@ impl WindowedRuntime {
         gpu.longest_frame_gap_ms = gpu.longest_frame_gap_ms.max(frame_gap_ms);
         gpu.last_present = now;
         gpu.frame_count += 1;
+        // Read back GPU→CPU shader events emitted by `emit_shader_event` in
+        // material shaders this frame, then publish each one to eventd as
+        // `shader.event`. The readback blocks briefly on the just-submitted
+        // copy; publishing runs on a worker thread.
+        gpu.ui.read_shader_events(&gpu.device);
+        let shader_events = gpu.ui.take_shader_events();
+        if !shader_events.is_empty() {
+            if let Some(endpoint) = shader_event_endpoint {
+                let frame_sequence = gpu.frame_count;
+                let epoch = shader_event_epoch;
+                let publisher = ClientIdentity {
+                    kind: ClientKind::WgpuRuntime,
+                    instance_id: format!("window-{}", epoch),
+                    pid: std::process::id(),
+                    origin: "neon-wgpu-runtime".into(),
+                };
+                thread::spawn(move || {
+                    let mut client = match EventClient::connect(endpoint) {
+                        Ok(client) => client,
+                        Err(error) => {
+                            eprintln!("[neon-wgpu-runtime] shader event connect failed: {error}");
+                            return;
+                        }
+                    };
+                    for (index, (event_id, payload)) in shader_events.into_iter().enumerate() {
+                        let request_id = RequestId(format!(
+                            "wgpu-shader-event-{}-{}-{}",
+                            epoch, frame_sequence, index
+                        ));
+                        let publish = neon_protocol::EventPublish {
+                            protocol: "neon3.event".into(),
+                            version: PROTOCOL_VERSION,
+                            request_id,
+                            publisher: publisher.clone(),
+                            name: "shader.event".into(),
+                            schema_version: 1,
+                            payload: json!({
+                                "event_id": event_id,
+                                "payload": payload.to_vec(),
+                            }),
+                            idempotency_key: Some(format!(
+                                "shader-event:{}:{}:{}",
+                                epoch, frame_sequence, index
+                            )),
+                        };
+                        match client.publish(&publish) {
+                            Ok(ack) if ack.status == neon_protocol::EventAckStatus::Accepted => {}
+                            Ok(ack) => eprintln!(
+                                "[neon-wgpu-runtime] shader event rejected: {:?}",
+                                ack.error
+                            ),
+                            Err(error) => {
+                                eprintln!("[neon-wgpu-runtime] shader event publish failed: {error}");
+                            }
+                        }
+                    }
+                });
+            }
+        }
         #[cfg(debug_assertions)]
         {
             gpu.final_target_valid = true;
@@ -11385,6 +11544,18 @@ impl WgpuRuntime {
             "wgpu.ui.remove_fragment" => self.remove_fragment(request_id, request.params),
             "wgpu.shader.register" => self.shader_register(request_id, request.params),
             "wgpu.shader.state" => self.accept(request_id, self.shader_registry.snapshot()),
+            "wgpu.ui.set_view_extras" => {
+                // Host-driven per-view extra uniform data (10 x vec4<f32>).
+                // Written to a process-global that the render loop reads into
+                // the View uniform every frame. Shaders use view.extras[N].
+                match parse_view_extras(&request.params) {
+                    Ok(extras) => {
+                        set_global_view_extras(extras);
+                        self.accept(request_id, json!({"status": "ok", "slots": 10}))
+                    }
+                    Err(error) => self.reject(request_id, "invalid_request", &error, None),
+                }
+            }
             "wgpu.ui.semantic_event.validate" | "test.ui.semantic_event.inject" => {
                 self.inject_semantic_event(request_id, request.params)
             }

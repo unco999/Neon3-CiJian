@@ -6055,12 +6055,19 @@ impl UiWgpuRenderer {
             submission_index: None,
             timeout: Some(std::time::Duration::from_secs(1)),
         });
-        let Ok(Ok(())) = rx.recv() else {
+        // recv_timeout avoids hanging the render thread forever if the GPU
+        // readback stalls; without this the window freezes and the OS may
+        // kill the process.
+        let map_result = rx.recv_timeout(std::time::Duration::from_secs(2));
+        let Ok(Ok(())) = map_result else {
             return;
         };
         let data = match slice.get_mapped_range() {
             Ok(range) => range,
-            Err(_) => return,
+            Err(_) => {
+                staging.unmap();
+                return;
+            }
         };
         if data.len() < 4 {
             drop(data);
