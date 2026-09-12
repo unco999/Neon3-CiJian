@@ -3750,19 +3750,31 @@ impl UiWgpuRenderer {
         let left_dw = new_left_w - orig_left_w;
         let right_dx = right_x - orig_right_x;
         let right_dw = new_right_w - orig_right_w;
-        // Step 5: Propagate to descendants.
+        // Step 5: Propagate to descendants.  Only right-panel descendants move
+        // in x; absolute-positioned children keep their own width.  Clip is
+        // the intersection of child bounds with the resized panel, clamped to
+        // zero so a fully-overflowing child produces no glyphs instead of a
+        // negative-width clip that disables scissoring.
         for (idx, _) in &drag.original_bounds {
             if *idx == left_idx || *idx == right_idx || *idx == split_idx {
                 continue;
             }
-            if is_descendant(&self.plan, *idx, left_idx) {
-                self.plan[*idx].target.bounds.width += left_dw;
-            }
-            if is_descendant(&self.plan, *idx, right_idx) {
+            let is_left = is_descendant(&self.plan, *idx, left_idx);
+            let is_right = is_descendant(&self.plan, *idx, right_idx);
+            if is_right {
                 self.plan[*idx].target.bounds.x += right_dx;
-                self.plan[*idx].target.bounds.width += right_dw;
             }
-            self.plan[*idx].target.clip = self.plan[*idx].target.bounds;
+            let panel_bounds = if is_left {
+                self.plan[left_idx].target.bounds
+            } else {
+                self.plan[right_idx].target.bounds
+            };
+            let cb = self.plan[*idx].target.bounds;
+            let cx = panel_bounds.x.max(cb.x);
+            let cy = panel_bounds.y.max(cb.y);
+            let cw = (panel_bounds.x + panel_bounds.width).min(cb.x + cb.width) - cx;
+            let ch = (panel_bounds.y + panel_bounds.height).min(cb.y + cb.height) - cy;
+            self.plan[*idx].target.clip = UiBounds { x: cx, y: cy, width: cw.max(0.0), height: ch.max(0.0) };
         }
         self.plan[left_idx].target.clip = self.plan[left_idx].target.bounds;
         self.plan[right_idx].target.clip = self.plan[right_idx].target.bounds;
@@ -3815,17 +3827,28 @@ impl UiWgpuRenderer {
             self.plan[split_idx].target.bounds.x = split_x;
             self.plan[right_idx].target.bounds.x = new_right_x;
             self.plan[right_idx].target.bounds.width = new_right_w;
-            // Propagate to descendants.
+            // Propagate to descendants.  Only right-panel children move in x;
+            // absolute children keep their own width.  Clip intersects the
+            // resized panel and is clamped to zero.
             for idx in 0..self.plan.len() {
                 if idx == left_idx || idx == right_idx || idx == split_idx { continue; }
-                if is_descendant(&self.plan, idx, left_idx) {
-                    self.plan[idx].target.bounds.width += left_dw;
-                }
-                if is_descendant(&self.plan, idx, right_idx) {
+                let is_left = is_descendant(&self.plan, idx, left_idx);
+                let is_right = is_descendant(&self.plan, idx, right_idx);
+                if !is_left && !is_right { continue; }
+                if is_right {
                     self.plan[idx].target.bounds.x += right_dx;
-                    self.plan[idx].target.bounds.width += right_dw;
                 }
-                self.plan[idx].target.clip = self.plan[idx].target.bounds;
+                let panel_bounds = if is_left {
+                    self.plan[left_idx].target.bounds
+                } else {
+                    self.plan[right_idx].target.bounds
+                };
+                let cb = self.plan[idx].target.bounds;
+                let cx = panel_bounds.x.max(cb.x);
+                let cy = panel_bounds.y.max(cb.y);
+                let cw = (panel_bounds.x + panel_bounds.width).min(cb.x + cb.width) - cx;
+                let ch = (panel_bounds.y + panel_bounds.height).min(cb.y + cb.height) - cy;
+                self.plan[idx].target.clip = UiBounds { x: cx, y: cy, width: cw.max(0.0), height: ch.max(0.0) };
             }
             self.plan[left_idx].target.clip = self.plan[left_idx].target.bounds;
             self.plan[right_idx].target.clip = self.plan[right_idx].target.bounds;
