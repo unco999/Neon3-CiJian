@@ -186,35 +186,6 @@ impl AppState {
         if node.node_id.0 == "demo-context" {
             node.visible = self.context_menu_visible;
         }
-        // Splitter: adjust left/right pane widths based on mode
-        if node.node_id.0 == "split-left" {
-            let total = 336.0; // split-container width 340 - splitter 4
-            let left_w = match self.splitter_mode {
-                0 => total * 0.5,
-                1 => total * 0.3,
-                _ => total * 0.7,
-            };
-            node.bounds.width = left_w;
-        }
-        if node.node_id.0 == "split-right" {
-            let total = 336.0;
-            let left_w = match self.splitter_mode {
-                0 => total * 0.5,
-                1 => total * 0.3,
-                _ => total * 0.7,
-            };
-            node.bounds.x = 140.0 + 4.0; // original left 140 + splitter 4
-            node.bounds.width = total - left_w;
-        }
-        if node.node_id.0 == "split-h" {
-            let total = 336.0;
-            let left_w = match self.splitter_mode {
-                0 => total * 0.5,
-                1 => total * 0.3,
-                _ => total * 0.7,
-            };
-            node.bounds.x = left_w; // move splitter to new position
-        }
         // Button text shows click count
         if node.node_id.0 == "btn-demo" && self.click_count > 0 {
             if let Some(text) = &mut node.text {

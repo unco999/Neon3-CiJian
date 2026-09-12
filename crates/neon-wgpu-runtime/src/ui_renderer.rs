@@ -1519,6 +1519,9 @@ pub struct UiWgpuRenderer {
     context_menu_bindings: HashMap<String, String>,
     /// Active splitter drag state, if any.
     splitter_drag: Option<SplitterDrag>,
+    /// Persistent splitter positions (x coordinate) keyed by splitter node path.
+    /// Survives fragment re-submissions; applied each frame so drag results stick.
+    splitter_positions: HashMap<String, f32>,
     /// Persistent built-in numeric state (slider value, scroll position).
     builtin_numerics: HashMap<String, (f32, f32, f32)>,
     /// Persistent built-in choice selection (ListBox/Tabs/Combo/Dropdown).
@@ -2374,6 +2377,7 @@ impl UiWgpuRenderer {
             context_menu_anchor: None,
             context_menu_bindings: HashMap::new(),
             splitter_drag: None,
+            splitter_positions: HashMap::new(),
             builtin_numerics: HashMap::new(),
             builtin_choices: HashMap::new(),
             pending_local_presentations: HashMap::new(),
@@ -2530,7 +2534,9 @@ impl UiWgpuRenderer {
     }
 
     fn compose_sampled_visuals(&mut self, time_seconds: f32) -> Vec<Option<usize>> {
-        // Apply splitter drag to target bounds BEFORE sampling
+        // Apply persisted splitter positions (from finished drags) first.
+        self.apply_persisted_splitter_positions();
+        // Apply active splitter drag to target bounds BEFORE sampling.
         self.apply_splitter_drag_to_targets();
         self.update_scroll_metrics();
         for index in 0..self.plan.len() {
@@ -3694,9 +3700,11 @@ impl UiWgpuRenderer {
         self.pointer_visual_dirty = true;
     }
 
-    /// Finish the splitter drag.
+    /// Finish the splitter drag and persist the final position.
     pub(crate) fn finish_splitter_drag(&mut self) {
-        if self.splitter_drag.take().is_some() {
+        if let Some(drag) = self.splitter_drag.take() {
+            self.splitter_positions.insert(drag.splitter_path.clone(), drag.splitter_pos);
+            splitter_debug(&format!("[FINISH] path={} saved_pos={:.1}", drag.splitter_path, drag.splitter_pos));
             self.pointer_visual_dirty = true;
         }
     }
@@ -3762,6 +3770,67 @@ impl UiWgpuRenderer {
         self.active.remove(&self.plan[left_idx].id);
         self.active.remove(&self.plan[right_idx].id);
         self.pointer_visual_dirty = true;
+    }
+
+    /// Apply persisted splitter positions (from finished drags) to plan bounds.
+    /// Runs every frame so drag results survive fragment re-submissions.
+    fn apply_persisted_splitter_positions(&mut self) {
+        // Collect splitter nodes with persisted positions first.
+        let splitters: Vec<(usize, f32)> = self.plan.iter().enumerate()
+            .filter(|(_, n)| n.target.kind == UiNodeKind::Splitter)
+            .filter_map(|(i, n)| self.splitter_positions.get(&n.id).map(|&pos| (i, pos)))
+            .collect();
+        for (split_idx, splitter_x) in splitters {
+            let splitter = &self.plan[split_idx];
+            let Some(parent_id) = splitter.parent_id.clone() else { continue };
+            // Find siblings in plan order.
+            let siblings: Vec<usize> = self.plan.iter().enumerate()
+                .filter(|(_, n)| n.parent_id.as_deref() == Some(parent_id.as_str()))
+                .map(|(i, _)| i)
+                .collect();
+            let Some(pos) = siblings.iter().position(|&i| i == split_idx) else { continue };
+            if pos == 0 || pos >= siblings.len() - 1 { continue; }
+            let left_idx = siblings[pos - 1];
+            let right_idx = siblings[pos + 1];
+            let split_w = splitter.target.bounds.width;
+            let container_start = self.plan[left_idx].target.bounds.x;
+            let container_end = self.plan[right_idx].target.bounds.x + self.plan[right_idx].target.bounds.width;
+            let container_size = container_end - container_start;
+            // Clamp position.
+            let min_pos = container_start + 8.0;
+            let max_pos = container_end - split_w - 8.0;
+            let split_x = splitter_x.clamp(min_pos, max_pos);
+            // Compute deltas from current bounds.
+            let orig_left_w = self.plan[left_idx].target.bounds.width;
+            let orig_right_x = self.plan[right_idx].target.bounds.x;
+            let orig_right_w = self.plan[right_idx].target.bounds.width;
+            let new_left_w = split_x - container_start;
+            let new_right_x = split_x + split_w;
+            let new_right_w = container_end - new_right_x;
+            let left_dw = new_left_w - orig_left_w;
+            let right_dx = new_right_x - orig_right_x;
+            let right_dw = new_right_w - orig_right_w;
+            // Apply to immediate nodes.
+            self.plan[left_idx].target.bounds.width = new_left_w;
+            self.plan[split_idx].target.bounds.x = split_x;
+            self.plan[right_idx].target.bounds.x = new_right_x;
+            self.plan[right_idx].target.bounds.width = new_right_w;
+            // Propagate to descendants.
+            for idx in 0..self.plan.len() {
+                if idx == left_idx || idx == right_idx || idx == split_idx { continue; }
+                if is_descendant(&self.plan, idx, left_idx) {
+                    self.plan[idx].target.bounds.width += left_dw;
+                }
+                if is_descendant(&self.plan, idx, right_idx) {
+                    self.plan[idx].target.bounds.x += right_dx;
+                    self.plan[idx].target.bounds.width += right_dw;
+                }
+                self.plan[idx].target.clip = self.plan[idx].target.bounds;
+            }
+            self.plan[left_idx].target.clip = self.plan[left_idx].target.bounds;
+            self.plan[right_idx].target.clip = self.plan[right_idx].target.bounds;
+            self.plan[split_idx].target.clip = self.plan[split_idx].target.bounds;
+        }
     }
 
     /// Show all context menus (built-in right-click). Uses a global flag
@@ -7787,6 +7856,9 @@ impl UiWgpuRenderer {
     }
 
     fn instance(&self, visual: &UiVisual, node_path: &str, time_seconds: f32) -> UiInstance {
+        if node_path.contains("split") {
+            splitter_debug(&format!("[INSTANCE] path={} kind={:?} bounds=({},{},{},{}) bg={:?}", node_path, visual.kind, visual.bounds.x, visual.bounds.y, visual.bounds.width, visual.bounds.height, visual.style.background_color));
+        }
         let mut visual = visual.clone();
         // Apply persistent built-in toggle state (survives fragment re-submission)
         if let Some(&selected) = self.builtin_toggles.get(node_path)
@@ -7831,6 +7903,10 @@ impl UiWgpuRenderer {
             },
         );
         let fill = style.background_color;
+        if node_path.contains("split-h") {
+            let has_active = self.active.get(node_path).is_some();
+            splitter_debug(&format!("[FILL] path={} resolved_fill={:?} has_active_transition={}", node_path, fill, has_active));
+        }
         if visual.kind == UiNodeKind::Button
             && pointer_over
             && time_seconds < self.pressed_until_seconds
@@ -8560,7 +8636,8 @@ fn resolve_component_style(
     } else {
         authored
     };
-    // Splitter renders as a dark seam with a center grip line.
+    // Splitter: opaque black matching window clear color = thin seam between panels.
+    // 8px hit area, visually appears as a dark divider.
     if matches!(kind, UiNodeKind::Splitter) {
         style.background_color = [0.0, 0.0, 0.0, 1.0];
         style.border_color = [0.0, 0.0, 0.0, 0.0];
@@ -9900,6 +9977,12 @@ fn layout_text(
     horizontal_scroll: Option<f32>,
 ) -> Option<Vec<UiTextInstance>> {
     let clip = text_clip(visual)?;
+    if clip[2] <= 0.0 || clip[3] <= 0.0
+        || visual.bounds.width <= 0.0 || visual.bounds.height <= 0.0
+        || visual.logical_bounds.width <= 0.0
+    {
+        return None;
+    }
     // Glyph scale comes only from the owning WorldUi root transform. It is not
     // derived from text bounds or content height, so camera distance cannot
     // create an independent text-layout feedback loop.
@@ -9972,6 +10055,12 @@ fn layout_rich_text(
     spans: &[neon_ui_schema::UiRichTextSpan],
 ) -> Option<Vec<UiTextInstance>> {
     let clip = text_clip(visual)?;
+    if clip[2] <= 0.0 || clip[3] <= 0.0
+        || visual.bounds.width <= 0.0 || visual.bounds.height <= 0.0
+        || visual.logical_bounds.width <= 0.0
+    {
+        return None;
+    }
     let world_scale = visual.world_scale.unwrap_or(1.0);
 
     // Flatten spans into per-character style so line-breaking can use the
@@ -11313,6 +11402,11 @@ fn resolve_children(
     inner: UiBounds,
     font: Option<&ResidentFont>,
 ) -> Vec<UiBounds> {
+    if format!("{:?}", node.node_id).contains("split-container") {
+        for child in &node.children {
+            splitter_debug(&format!("[LAYOUT] child={:?} bounds=({},{},{},{}) mode={:?}", child.node_id, child.bounds.x, child.bounds.y, child.bounds.width, child.bounds.height, parent_layout.mode));
+        }
+    }
     if !matches!(parent_layout.mode, UiLayoutMode::Row | UiLayoutMode::Column) {
         return node
             .children

@@ -132,12 +132,11 @@ surface showcase overlay w 1200 h 800 align stretch fill #0D1117
 
     # Splitter demo (horizontal layout with splitter)
     text split-label h 24 value "Splitter (drag to resize)"
-    panel split-container w 340 h 120 row gap 0
-
-      panel split-left w 140 h 120 fill #1F6FEB33
+    panel split-container w 344 h 120
+      panel split-left x 0 y 0 w 140 h 120 fill #1F6FEB33
         text split-left-label x 4 y 4 w 132 h 24 value "Left Pane"
-      splitter split-h w 8 h 120 event demo.splitter.toggle
-      panel split-right w 196 h 120 fill #1F6FEB22
+      splitter split-h x 140 y 0 w 8 h 120 event demo.splitter.toggle
+      panel split-right x 148 y 0 w 196 h 120 fill #1F6FEB22
         text split-right-label x 4 y 4 w 184 h 24 value "Right Pane"
 
     # ContextMenu (right-click to show, uses context_menu component)
