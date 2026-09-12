@@ -7824,6 +7824,10 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                         self.redraw_pending = true;
                     }
                     gpu.ui.update_value_gesture();
+                    if gpu.ui.splitter_drag_active() {
+                        gpu.ui.update_splitter_drag();
+                        self.redraw_pending = true;
+                    }
                     let x = (f64::from(logical.x) * gpu.scale_factor)
                         .max(0.0)
                         .min(gpu.config.width.saturating_sub(1) as f64)
@@ -7873,6 +7877,16 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                 if state == winit::event::ElementState::Pressed
                     && button == winit::event::MouseButton::Left =>
             {
+                // Splitter drag: check if pressing on a splitter
+                if let Some(gpu) = self.gpu.as_mut() {
+                    if let Some((_, binding)) = gpu.ui.hit_binding_at_pointer()
+                        && gpu.ui.is_splitter_binding(&binding.node_path)
+                    {
+                        gpu.ui.begin_splitter_drag(&binding.node_path);
+                        self.redraw_pending = true;
+                        return;
+                    }
+                }
                 // Borderless windows let the app background act as a native drag
                 // region. Any semantic control keeps priority and never starts a
                 // window drag, so domain UI interaction remains intact.
@@ -8224,10 +8238,12 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                 if let Ok(mut camera) = self.world_ui_lab_camera.lock() {
                     camera.set_drag(winit::event::MouseButton::Right, true);
                 }
-                // Built-in context menu: show all ContextMenu components on right-click
+                // Built-in context menu: show only if node under pointer has binding
                 if let Some(gpu) = self.gpu.as_mut() {
-                    gpu.ui.show_context_menus();
-                    self.redraw_pending = true;
+                    if gpu.ui.context_menu_at_pointer().is_some() {
+                        gpu.ui.show_context_menus();
+                        self.redraw_pending = true;
+                    }
                 }
             }
             WindowEvent::MouseInput { state, button, .. }
@@ -8245,6 +8261,11 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                 if state == winit::event::ElementState::Released
                     && button == winit::event::MouseButton::Left =>
             {
+                // Splitter drag: finish
+                if let Some(gpu) = self.gpu.as_mut() {
+                    gpu.ui.finish_splitter_drag();
+                    self.redraw_pending = true;
+                }
                 if let Ok(mut camera) = self.world_ui_lab_camera.lock() {
                     camera.set_drag(winit::event::MouseButton::Left, false);
                 }

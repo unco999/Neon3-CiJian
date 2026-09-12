@@ -1,4 +1,4 @@
-﻿//! Minimal GPU UI composition pass adapted from Neon2's instanced panel renderer.
+//! Minimal GPU UI composition pass adapted from Neon2's instanced panel renderer.
 //! It deliberately consumes only Neon3's public UI schema, not old ECS state.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -1378,6 +1378,40 @@ fn resolve_shell_cut(size: [f32; 2], declared: [f32; 4]) -> [f32; 4] {
     cut
 }
 
+/// Active splitter drag state. Records the left/right panel indices and
+/// the current drag ratio so sampling can resize panels in real time.
+struct SplitterDrag {
+    left_index: usize,
+    right_index: usize,
+    splitter_path: String,
+    /// True when the splitter divides a horizontal row (drag along X axis).
+    horizontal: bool,
+    /// The container's left edge (or top edge for vertical).
+    container_start: f32,
+    /// Total width of left + splitter + right.
+    container_size: f32,
+    /// Width of the splitter itself.
+    splitter_size: f32,
+    /// Offset from pointer to splitter's leading edge at drag start.
+    /// Keeps the grab point stable so the splitter doesn't jump.
+    pointer_offset: f32,
+    /// Current leading edge position of the splitter.
+    splitter_pos: f32,
+    /// Original bounds for all affected nodes, captured at drag start.
+    original_bounds: Vec<(usize, UiBounds)>,
+}
+
+fn splitter_debug(msg: &str) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("D:\\Neon3\\splitter_debug.log")
+    {
+        let _ = writeln!(f, "{}", msg);
+    }
+}
+
 pub struct UiWgpuRenderer {
     trace_role: &'static str,
     color_format: wgpu::TextureFormat,
@@ -1476,6 +1510,15 @@ pub struct UiWgpuRenderer {
     /// These values survive fragment re-submissions and override fragment
     /// ControlPresentation during rendering.
     builtin_toggles: HashMap<String, bool>,
+    /// Global context-menu visibility flag. Per-node builtin_toggles filter
+    /// runs during plan building when hidden menus aren't in the plan yet.
+    context_menus_visible: bool,
+    /// Right-click anchor position for context menu placement.
+    context_menu_anchor: Option<[f32; 2]>,
+    /// Maps host node path -> bound ContextMenu node key.
+    context_menu_bindings: HashMap<String, String>,
+    /// Active splitter drag state, if any.
+    splitter_drag: Option<SplitterDrag>,
     /// Persistent built-in numeric state (slider value, scroll position).
     builtin_numerics: HashMap<String, (f32, f32, f32)>,
     /// Persistent built-in choice selection (ListBox/Tabs/Combo/Dropdown).
@@ -2327,6 +2370,10 @@ impl UiWgpuRenderer {
             value_gesture: None,
             value_previews: HashMap::new(),
             builtin_toggles: HashMap::new(),
+            context_menus_visible: false,
+            context_menu_anchor: None,
+            context_menu_bindings: HashMap::new(),
+            splitter_drag: None,
             builtin_numerics: HashMap::new(),
             builtin_choices: HashMap::new(),
             pending_local_presentations: HashMap::new(),
@@ -2483,6 +2530,8 @@ impl UiWgpuRenderer {
     }
 
     fn compose_sampled_visuals(&mut self, time_seconds: f32) -> Vec<Option<usize>> {
+        // Apply splitter drag to target bounds BEFORE sampling
+        self.apply_splitter_drag_to_targets();
         self.update_scroll_metrics();
         for index in 0..self.plan.len() {
             let node_id = self.plan[index].id.clone();
@@ -3544,27 +3593,214 @@ impl UiWgpuRenderer {
         })
     }
 
-    /// Show all context menus in the current plan (built-in right-click).
-    pub(crate) fn show_context_menus(&mut self) {
-        for node in &self.plan {
-            if matches!(node.target.kind, UiNodeKind::ContextMenu) {
-                self.builtin_toggles.insert(node.id.clone(), true);
+    /// Whether a splitter drag is currently active.
+    pub(crate) fn splitter_drag_active(&self) -> bool {
+        self.splitter_drag.is_some()
+    }
+
+    /// Check if the node at the given path is a Splitter.
+    pub(crate) fn is_splitter_binding(&self, node_path: &str) -> bool {
+        self.plan.iter().any(|node| {
+            node.id == node_path && matches!(node.target.kind, UiNodeKind::Splitter)
+        })
+    }
+
+    /// Begin a splitter drag. Finds the left and right sibling panels around
+    /// the splitter and records the initial ratio.
+    pub(crate) fn begin_splitter_drag(&mut self, splitter_path: &str) -> bool {
+        let Some(split_idx) = self.plan.iter().position(|n| n.id == splitter_path) else {
+            return false;
+        };
+        let splitter = &self.plan[split_idx];
+        let parent_id = match splitter.parent_id.clone() {
+            Some(pid) => pid,
+            None => return false,
+        };
+        // Find siblings: children of the same parent, in plan order.
+        let siblings: Vec<usize> = self.plan.iter().enumerate()
+            .filter(|(_, n)| n.parent_id.as_deref() == Some(parent_id.as_str()))
+            .map(|(i, _)| i)
+            .collect();
+        let pos = match siblings.iter().position(|&i| i == split_idx) {
+            Some(p) => p,
+            None => return false,
+        };
+        if pos == 0 || pos >= siblings.len() - 1 {
+            return false;
+        }
+        let left_idx = siblings[pos - 1];
+        let right_idx = siblings[pos + 1];
+        let left = &self.plan[left_idx].target.bounds;
+        let right = &self.plan[right_idx].target.bounds;
+        let total = left.width + splitter.target.bounds.width + right.width;
+        if total <= 0.0 {
+            return false;
+        }
+        let horizontal = splitter.target.bounds.width < splitter.target.bounds.height;
+        let container_start = if horizontal { left.x } else { left.y };
+        let splitter_size = if horizontal { splitter.target.bounds.width } else { splitter.target.bounds.height };
+        let splitter_lead = if horizontal { splitter.target.bounds.x } else { splitter.target.bounds.y };
+        // Record pointer offset so the grab point stays stable during drag.
+        let pointer_pos = if horizontal {
+            self.pointer_position.map(|p| p[0]).unwrap_or(splitter_lead)
+        } else {
+            self.pointer_position.map(|p| p[1]).unwrap_or(splitter_lead)
+        };
+        let pointer_offset = pointer_pos - splitter_lead;
+        // Capture original bounds for panels, splitter, and all descendants.
+        let mut original_bounds = Vec::new();
+        for idx in 0..self.plan.len() {
+            if idx == left_idx || idx == right_idx || idx == split_idx
+                || is_descendant(&self.plan, idx, left_idx)
+                || is_descendant(&self.plan, idx, right_idx)
+            {
+                original_bounds.push((idx, self.plan[idx].target.bounds));
             }
         }
+        self.splitter_drag = Some(SplitterDrag {
+            left_index: left_idx,
+            right_index: right_idx,
+            splitter_path: splitter_path.to_string(),
+            horizontal,
+            container_start,
+            container_size: total,
+            splitter_size,
+            pointer_offset,
+            splitter_pos: splitter_lead,
+            original_bounds,
+        });
+        splitter_debug(&format!(
+            "[BEGIN] path={} horizontal={} container_start={} container_size={} splitter_size={} pointer_offset={} splitter_pos={} left_w={} right_w={}",
+            splitter_path, horizontal, container_start, total, splitter_size, pointer_offset, splitter_lead, left.width, right.width
+        ));
         self.pointer_visual_dirty = true;
+        true
+    }
+
+    /// Update the splitter drag based on current pointer position.
+    pub(crate) fn update_splitter_drag(&mut self) {
+        let Some(drag) = self.splitter_drag.as_mut() else { return };
+        let Some(pointer) = self.pointer_position else { return };
+        let pos = if drag.horizontal { pointer[0] } else { pointer[1] };
+        // Splitter leading edge follows pointer with the original grab offset.
+        let min_pos = drag.container_start + 8.0; // minimum left panel width
+        let max_pos = drag.container_start + drag.container_size - drag.splitter_size - 8.0;
+        let new_pos = (pos - drag.pointer_offset).clamp(min_pos, max_pos);
+        splitter_debug(&format!(
+            "[UPDATE] pointer=({:.1},{:.1}) pos={:.1} offset={:.1} old_pos={:.1} new_pos={:.1} min={:.1} max={:.1}",
+            pointer[0], pointer[1], pos, drag.pointer_offset, drag.splitter_pos, new_pos, min_pos, max_pos
+        ));
+        drag.splitter_pos = new_pos;
+        self.pointer_visual_dirty = true;
+    }
+
+    /// Finish the splitter drag.
+    pub(crate) fn finish_splitter_drag(&mut self) {
+        if self.splitter_drag.take().is_some() {
+            self.pointer_visual_dirty = true;
+        }
+    }
+
+    /// Apply active splitter drag to target bounds BEFORE sampling.
+    /// This modifies plan[index].target.bounds so sampling, inherited transforms,
+    /// hit testing, and vertex submission all see the drag geometry natively.
+    fn apply_splitter_drag_to_targets(&mut self) {
+        let Some(drag) = self.splitter_drag.as_ref() else { return };
+        let left_idx = drag.left_index;
+        let right_idx = drag.right_index;
+        let split_idx = match self.plan.iter().position(|n| n.id == drag.splitter_path) {
+            Some(i) => i,
+            None => return,
+        };
+        // Step 1: RESET all affected nodes to original bounds.
+        for (idx, orig) in &drag.original_bounds {
+            self.plan[*idx].target.bounds = *orig;
+        }
+        // Step 2: Compute geometry directly from splitter position (no ratio).
+        let split_x = drag.splitter_pos;
+        let split_w = drag.splitter_size;
+        let left_x = drag.container_start;
+        let new_left_w = split_x - left_x;
+        let right_x = split_x + split_w;
+        let new_right_w = (left_x + drag.container_size) - right_x;
+        // Step 3: Apply new bounds.
+        self.plan[left_idx].target.bounds.width = new_left_w;
+        self.plan[split_idx].target.bounds.x = split_x;
+        self.plan[right_idx].target.bounds.x = right_x;
+        self.plan[right_idx].target.bounds.width = new_right_w;
+        splitter_debug(&format!(
+            "[APPLY] split_x={:.1} new_left_w={:.1} right_x={:.1} new_right_w={:.1} left_idx={} right_idx={} split_idx={}",
+            split_x, new_left_w, right_x, new_right_w, left_idx, right_idx, split_idx
+        ));
+        // Step 4: Get original bounds for delta calculation.
+        let orig_left_w = drag.original_bounds.iter()
+            .find(|(i, _)| *i == left_idx).map(|(_, b)| b.width).unwrap_or(new_left_w);
+        let orig_right_x = drag.original_bounds.iter()
+            .find(|(i, _)| *i == right_idx).map(|(_, b)| b.x).unwrap_or(right_x);
+        let orig_right_w = drag.original_bounds.iter()
+            .find(|(i, _)| *i == right_idx).map(|(_, b)| b.width).unwrap_or(new_right_w);
+        let left_dw = new_left_w - orig_left_w;
+        let right_dx = right_x - orig_right_x;
+        let right_dw = new_right_w - orig_right_w;
+        // Step 5: Propagate to descendants.
+        for (idx, _) in &drag.original_bounds {
+            if *idx == left_idx || *idx == right_idx || *idx == split_idx {
+                continue;
+            }
+            if is_descendant(&self.plan, *idx, left_idx) {
+                self.plan[*idx].target.bounds.width += left_dw;
+            }
+            if is_descendant(&self.plan, *idx, right_idx) {
+                self.plan[*idx].target.bounds.x += right_dx;
+                self.plan[*idx].target.bounds.width += right_dw;
+            }
+            self.plan[*idx].target.clip = self.plan[*idx].target.bounds;
+        }
+        self.plan[left_idx].target.clip = self.plan[left_idx].target.bounds;
+        self.plan[right_idx].target.clip = self.plan[right_idx].target.bounds;
+        self.plan[split_idx].target.clip = self.plan[split_idx].target.bounds;
+        self.active.remove(&self.plan[left_idx].id);
+        self.active.remove(&self.plan[right_idx].id);
+        self.pointer_visual_dirty = true;
+    }
+
+    /// Show all context menus (built-in right-click). Uses a global flag
+    /// because hidden menus aren't in the plan during filtering.
+    pub(crate) fn show_context_menus(&mut self) {
+        self.context_menus_visible = true;
+        self.context_menu_anchor = self.pointer_position;
+        self.pointer_visual_dirty = true;
+    }
+
+    /// Find the context menu bound to the node under the pointer (or ancestor).
+    pub(crate) fn context_menu_at_pointer(&self) -> Option<String> {
+        let pointer = self.pointer_position?;
+        let hit_index = self.plan.iter().enumerate().rev().find_map(|(index, node)| {
+            let b = node.target.bounds;
+            if pointer[0] >= b.x && pointer[0] <= b.x + b.width
+                && pointer[1] >= b.y && pointer[1] <= b.y + b.height
+            {
+                Some(index)
+            } else {
+                None
+            }
+        })?;
+        let mut current = Some(hit_index);
+        while let Some(idx) = current {
+            let node = &self.plan[idx];
+            if let Some(menu_id) = self.context_menu_bindings.get(&node.id) {
+                return Some(menu_id.clone());
+            }
+            current = node.parent_id.as_deref()
+                .and_then(|pid| self.plan.iter().position(|n| n.id == pid));
+        }
+        None
     }
 
     /// Hide all context menus (built-in, called on click-outside).
     pub(crate) fn hide_context_menus(&mut self) {
-        let mut changed = false;
-        for node in &self.plan {
-            if matches!(node.target.kind, UiNodeKind::ContextMenu) {
-                if self.builtin_toggles.insert(node.id.clone(), false).unwrap_or(true) {
-                    changed = true;
-                }
-            }
-        }
-        if changed {
+        if self.context_menus_visible {
+            self.context_menus_visible = false;
             self.pointer_visual_dirty = true;
         }
     }
@@ -6790,6 +7026,12 @@ impl UiWgpuRenderer {
                             *layer,
                         );
                     }
+                    neon_ui_schema::UiEffect::ContextMenuBinding { node_id, context_menu_id } => {
+                        self.context_menu_bindings.insert(
+                            format!("{}/{}", fragment.fragment_id.0, node_id.0),
+                            context_menu_id.clone(),
+                        );
+                    }
                     neon_ui_schema::UiEffect::ControlSkin { skin } => {
                         self.skins.insert(skin.key.clone(), skin.clone());
                     }
@@ -6862,14 +7104,61 @@ impl UiWgpuRenderer {
             .filter(|(_, _, t, _)| matches!(t.kind, UiNodeKind::TreeView))
             .map(|(id, _, _, _)| id.clone())
             .collect();
+        let parent_map: std::collections::HashMap<String, Option<String>> = nodes.iter()
+            .map(|(id, pid, _, _)| (id.clone(), pid.clone()))
+            .collect();
+        // Collect IDs of hidden context menus for descendant filtering.
+        let hidden_ctx_ids: std::collections::HashSet<String> = nodes.iter()
+            .filter(|(id, _, target, _)| {
+                matches!(target.kind, UiNodeKind::ContextMenu)
+                    && !self.context_menus_visible
+            })
+            .map(|(id, _, _, _)| id.clone())
+            .collect();
+        let is_ctx_hidden = |id: &str| -> bool {
+            let mut current = Some(id.to_string());
+            while let Some(cid) = current {
+                if hidden_ctx_ids.contains(&cid) {
+                    return true;
+                }
+                current = parent_map.get(&cid).cloned().flatten();
+            }
+            false
+        };
+        // Compute position deltas for visible context menus (anchor placement).
+        let mut ctx_deltas: std::collections::HashMap<String, (f32, f32)> = std::collections::HashMap::new();
+        if let Some([ax, ay]) = self.context_menu_anchor {
+            if self.context_menus_visible {
+                for (id, _, target, _) in &nodes {
+                    if matches!(target.kind, UiNodeKind::ContextMenu)
+                        && !hidden_ctx_ids.contains(id)
+                    {
+                        ctx_deltas.insert(id.clone(), (ax - target.bounds.x, ay - target.bounds.y));
+                    }
+                }
+            }
+        }
+        let ctx_delta_for = |id: &str| -> Option<(f32, f32)> {
+            let mut current = Some(id.to_string());
+            while let Some(cid) = current {
+                if let Some(delta) = ctx_deltas.get(&cid) {
+                    return Some(*delta);
+                }
+                current = parent_map.get(&cid).cloned().flatten();
+            }
+            None
+        };
         let mut filtered_nodes = Vec::with_capacity(nodes.len());
         let mut skip_until_indent: Option<f32> = None;
-        for (id, parent_id, target, transition) in nodes {
-            // Built-in ContextMenu visibility: hide when toggled off
-            if matches!(target.kind, UiNodeKind::ContextMenu)
-                && !self.builtin_toggles.get(&id).copied().unwrap_or(false)
-            {
+        for (id, parent_id, mut target, transition) in nodes {
+            // Skip hidden context menus and all their descendants.
+            if is_ctx_hidden(&id) {
                 continue;
+            }
+            // Move visible context menu and descendants to anchor position.
+            if let Some((dx, dy)) = ctx_delta_for(&id) {
+                target.bounds.x += dx;
+                target.bounds.y += dy;
             }
             let parent_is_treeview = parent_id.as_ref()
                 .is_some_and(|pid| treeview_parents.contains(pid));
@@ -7532,7 +7821,8 @@ impl UiWgpuRenderer {
             visual.presentation.as_ref(),
             UiStateFlags {
                 hovered: pointer_over,
-                pressed: pointer_over && time_seconds < self.pressed_until_seconds,
+                pressed: (pointer_over && time_seconds < self.pressed_until_seconds)
+                    || self.splitter_drag.as_ref().is_some_and(|d| d.splitter_path == node_path),
                 focused: self.focused_control.as_deref() == Some(node_path),
                 disabled: !visual.enabled,
                 selected,
@@ -8270,6 +8560,12 @@ fn resolve_component_style(
     } else {
         authored
     };
+    // Splitter renders as a dark seam with a center grip line.
+    if matches!(kind, UiNodeKind::Splitter) {
+        style.background_color = [0.0, 0.0, 0.0, 1.0];
+        style.border_color = [0.0, 0.0, 0.0, 0.0];
+        style.border_width = 0.0;
+    }
     let selected = flags.selected || flags.checked;
     if selected {
         style = apply_style_patch(
@@ -8434,7 +8730,7 @@ fn component_spec(kind: &UiNodeKind) -> UiComponentSpec {
             ),
             top_layer: matches!(
                 kind,
-                UiNodeKind::Tooltip | UiNodeKind::Modal | UiNodeKind::Dialog
+                UiNodeKind::Tooltip | UiNodeKind::Modal | UiNodeKind::Dialog | UiNodeKind::ContextMenu
             ),
             virtualized: *kind == UiNodeKind::DataGrid,
         },
@@ -8570,7 +8866,7 @@ fn default_component_style(kind: &UiNodeKind) -> UiStyle {
             opacity: 1.0,
         },
         UiNodeKind::Splitter => UiStyle {
-            background_color: [0.18, 0.22, 0.21, 1.0],
+            background_color: [0.0, 0.0, 0.0, 0.0],
             border_color: [0.0, 0.0, 0.0, 0.0],
             border_width: 0.0,
             corner_radius: 0.0,
@@ -8813,7 +9109,8 @@ fn component_chrome_instances(visual: &UiVisual) -> Vec<UiInstance> {
         }
         UiNodeKind::Splitter => {
             // Splitter chrome: center grip line
-            let horizontal = bounds.width > bounds.height;
+            // horizontal = drag along X axis (vertical bar), same semantics as begin_splitter_drag
+            let horizontal = bounds.width < bounds.height;
             if horizontal {
                 vec![chrome(
                     UiBounds { x: bounds.x + bounds.width * 0.5 - 1.0, y: bounds.y + 4.0, width: 2.0, height: bounds.height - 8.0 },
@@ -9811,6 +10108,25 @@ fn overlay_instance(bounds: UiBounds, clip: UiBounds, color: [f32; 4]) -> UiInst
         paint_group_id: 0,
         ..UiInstance::zeroed()
     }
+}
+
+/// Check if node at `idx` is a descendant of (or equal to) node at `ancestor_idx`.
+fn is_descendant(plan: &[PlannedNode], idx: usize, ancestor_idx: usize) -> bool {
+    if idx == ancestor_idx {
+        return true;
+    }
+    let mut current = idx;
+    while let Some(pid) = plan[current].parent_id.as_deref() {
+        if let Some(pidx) = plan.iter().position(|n| n.id == pid) {
+            if pidx == ancestor_idx {
+                return true;
+            }
+            current = pidx;
+        } else {
+            break;
+        }
+    }
+    false
 }
 
 fn top_layer_roots(plan: &[PlannedNode], indices: &HashMap<&str, usize>) -> Vec<Option<usize>> {

@@ -2282,6 +2282,7 @@ pub fn compile_ui_program(
         geometry_records: document.geometry_records.clone(),
         material_records: document.material_records.clone(),
         composition_layer_records: document.composition_layer_records.clone(),
+        context_menu_records: document.context_menu_records.clone(),
         resource_budget: document.resource_budget.clone(),
         dependency_index: dependencies,
         layout_hash,

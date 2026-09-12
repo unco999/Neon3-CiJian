@@ -54,6 +54,7 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
     let mut image_resources = BTreeMap::new();
     let mut panel_decorations = BTreeMap::new();
     let mut skin_references = BTreeMap::new();
+    let mut context_menu_records = BTreeMap::new();
     let mut geometry_records = BTreeMap::new();
     let mut material_records = BTreeMap::new();
     let mut composition_layer_records = BTreeMap::new();
@@ -298,6 +299,9 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
         }
         if let Some(skin_key) = node.skin_key.take() {
             skin_references.insert(node.node.node_id.0.clone(), skin_key);
+        }
+        if let Some(context_menu_id) = node.context_menu.take() {
+            context_menu_records.insert(node.node.node_id.0.clone(), context_menu_id);
         }
         if let Some(previous) = stack.last() {
             if indent > previous.0 + 2 {
@@ -687,6 +691,7 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
         geometry_records,
         material_records,
         composition_layer_records,
+        context_menu_records,
         branches,
         templates,
         data_grids,
@@ -909,6 +914,10 @@ pub fn lower_nui_flow_effects(document: &NuiFlowDocument) -> Vec<UiEffect> {
             node_id: UiNodeId(node_key.clone()),
             layer: *layer,
         }
+    }));
+    effects.extend(document.ir.context_menu_records.iter().map(|(node_id, menu_id)| UiEffect::ContextMenuBinding {
+        node_id: UiNodeId(node_id.clone()),
+        context_menu_id: menu_id.clone(),
     }));
     effects.extend(document.ir.skins.iter().cloned().map(|skin| UiEffect::ControlSkin { skin }));
     effects.extend(document.ir.skin_references.iter().map(|(node_id, skin_key)| UiEffect::SkinReference {
@@ -1504,6 +1513,7 @@ struct NodeBuild {
     nine_slice: Option<UiNineSlice>,
     world_panel: Option<NuiFlowWorldPanelDeclaration>,
     skin_key: Option<String>,
+    context_menu: Option<String>,
     geometry: Option<UiGeometry>,
     material: Option<UiMaterialRef>,
     composition_layer: UiCompositionLayer,
@@ -2873,6 +2883,7 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
     let mut image_resource = None;
     let mut nine_slice = None;
     let mut skin_key = None;
+    let mut context_menu = None;
     let geometry = None;
     let material = None;
     let mut composition_layer = UiCompositionLayer::Normal;
@@ -2898,7 +2909,7 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
             "x" | "y" | "w" | "h" | "minw" | "maxw" | "grow" | "shrink" | "basis" | "gap"
             | "pad" | "fill" | "line" | "ink" | "opacity" | "radius" | "border_width" | "value"
             | "checked" | "selected" | "state" | "numeric" | "scroll" | "scroll_offset" | "enabled" | "visible"
-            | "event" | "token" | "align" | "clip" | "fit" | "justify" | "data" | "rich" | "skin"
+            | "event" | "token" | "align" | "clip" | "fit" | "justify" | "data" | "rich" | "skin" | "context_menu"
             | "composition_layer" | "layer" => {
                 let value = *parts.get(index + 1).ok_or_else(|| {
                     error(
@@ -2964,6 +2975,11 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
                             return Err(error("nui_flow_invalid_skin", "skin reference is valid only for skinnable components and requires a stable key", line, 1));
                         }
                         skin_key = Some(value.into());
+                    } else if token == "context_menu" {
+                        if !valid_key(value) {
+                            return Err(error("nui_flow_invalid_context_menu", "context_menu requires a valid node key", line, 1));
+                        }
+                        context_menu = Some(value.into());
                     } else {
                         parse_attribute(&mut node, &mut bindings, &mut intents, token, value, line)?;
                     }
@@ -3435,6 +3451,7 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
         nine_slice,
         world_panel,
         skin_key,
+        context_menu,
         geometry,
         material,
         composition_layer,

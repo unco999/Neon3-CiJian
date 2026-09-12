@@ -1605,6 +1605,12 @@ pub enum UiEffect {
     DropBinding {
         binding: UiDropBinding,
     },
+    /// Binds a panel/visual node to a ContextMenu node. Right-clicking within
+    /// the host node's bounds shows the referenced context menu at the cursor.
+    ContextMenuBinding {
+        node_id: UiNodeId,
+        context_menu_id: String,
+    },
     CameraVisibility {
         binding: UiCameraVisibilityBinding,
     },
@@ -2019,6 +2025,10 @@ pub struct UiIrDocument {
     /// Node key to composition destination. Missing entries are `normal`.
     #[serde(default)]
     pub composition_layer_records: std::collections::BTreeMap<String, UiCompositionLayer>,
+    /// Visual node key to ContextMenu node key. Right-clicking within the host
+    /// node shows the referenced context menu at the cursor position.
+    #[serde(default)]
+    pub context_menu_records: std::collections::BTreeMap<String, String>,
     /// Immutable shader packages declared by the document (control-plane
     /// registration data). Fragment IR never carries raw WGSL source.
     #[serde(default)]
@@ -2891,6 +2901,9 @@ pub struct UiProgram {
     pub material_records: std::collections::BTreeMap<String, UiMaterialRef>,
     #[serde(default)]
     pub composition_layer_records: std::collections::BTreeMap<String, UiCompositionLayer>,
+    /// Visual node key to ContextMenu node key.
+    #[serde(default)]
+    pub context_menu_records: std::collections::BTreeMap<String, String>,
     pub resource_budget: UiResourceBudget,
     pub dependency_index: UiDependencyIndex,
     pub layout_hash: String,
@@ -3537,6 +3550,13 @@ impl UiEffect {
             }
             Self::CameraVisibility { binding } => {
                 if binding.node_id.0.trim().is_empty() || binding.camera_id.0.trim().is_empty() {
+                    Err(UiSchemaError::InvalidProgramEvent)
+                } else {
+                    Ok(())
+                }
+            }
+            Self::ContextMenuBinding { node_id, context_menu_id } => {
+                if node_id.0.trim().is_empty() || context_menu_id.trim().is_empty() {
                     Err(UiSchemaError::InvalidProgramEvent)
                 } else {
                     Ok(())
