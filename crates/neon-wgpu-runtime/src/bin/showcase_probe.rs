@@ -358,6 +358,7 @@ impl TreeState {
 struct AppState {
     checkbox_state: bool,
     radio_state: bool,
+    switch_state: bool,
     slider_val: f32,
     scroll_pos: f32,
     progress_val: f32,
@@ -378,6 +379,7 @@ impl AppState {
         Self {
             checkbox_state: true,
             radio_state: false,
+            switch_state: true,
             slider_val: 42.0,
             scroll_pos: 0.3,
             progress_val: 0.65,
@@ -404,6 +406,10 @@ impl AppState {
             UiEffect::ControlPresentation {
                 node_id: UiNodeId("radio-demo".into()),
                 state: UiControlPresentation::Toggle { selected: self.radio_state },
+            },
+            UiEffect::ControlPresentation {
+                node_id: UiNodeId("switch-demo".into()),
+                state: UiControlPresentation::Toggle { selected: self.switch_state },
             },
             UiEffect::ControlPresentation {
                 node_id: UiNodeId("slider-demo".into()),
@@ -525,6 +531,10 @@ impl AppState {
             "demo.radio.toggle" => {
                 self.radio_state = !self.radio_state;
                 println!("[radio] -> {}", self.radio_state);
+            }
+            "demo.switch.toggle" => {
+                self.switch_state = !self.switch_state;
+                println!("[switch] -> {}", self.switch_state);
             }
             "demo.scroll.up" => {
                 self.scroll_pos = (self.scroll_pos - 0.1).max(0.0);
