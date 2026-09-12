@@ -8224,6 +8224,11 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                 if let Ok(mut camera) = self.world_ui_lab_camera.lock() {
                     camera.set_drag(winit::event::MouseButton::Right, true);
                 }
+                // Built-in context menu: show all ContextMenu components on right-click
+                if let Some(gpu) = self.gpu.as_mut() {
+                    gpu.ui.show_context_menus();
+                    self.redraw_pending = true;
+                }
             }
             WindowEvent::MouseInput { state, button, .. }
                 if state == winit::event::ElementState::Released
@@ -8242,6 +8247,10 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
             {
                 if let Ok(mut camera) = self.world_ui_lab_camera.lock() {
                     camera.set_drag(winit::event::MouseButton::Left, false);
+                }
+                // Built-in context menu: hide on left-click (click-outside dismiss)
+                if let Some(gpu) = self.gpu.as_mut() {
+                    gpu.ui.hide_context_menus();
                 }
                 if let Some(gpu) = self.gpu.as_mut()
                     && gpu.ui.scroll_drag_active()
@@ -8373,6 +8382,13 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                     );
                 }
                 if let Some(Ok(released)) = binding {
+                    // Built-in TreeView expand/collapse
+                    if let Some(gpu) = self.gpu.as_mut() {
+                        if gpu.ui.is_treeview_child(&released.binding.node_path) {
+                            gpu.ui.toggle_treeview_node(&released.binding.node_path);
+                            self.redraw_pending = true;
+                        }
+                    }
                     let local_window_action = released.binding.intent.as_ref().and_then(|intent| {
                         let neon_ui_schema::UiIntent::Invoke { action, .. } = intent;
                         matches!(

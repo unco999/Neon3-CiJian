@@ -3361,6 +3361,7 @@ impl UiWgpuRenderer {
                 Some(UiControlPresentation::Numeric { min, max, .. }),
             ) => (*min, *max),
             (UiNodeKind::Scrollbar, Some(UiControlPresentation::Scroll { .. })) => (0.0, 1.0),
+            (UiNodeKind::Splitter, _) => (0.0, 1.0), // split ratio 0-1
             _ => return false,
         };
         let hit_bounds = visual.bounds;
@@ -3382,6 +3383,18 @@ impl UiWgpuRenderer {
                 height: visual.bounds.height,
             },
             UiNodeKind::DragValue => drag_value_bounds(visual.bounds),
+            UiNodeKind::Splitter => {
+                // Use parent container bounds as the drag range
+                if let Some(parent_id) = self.plan.iter().find(|n| n.id == binding.node_path).and_then(|n| n.parent_id.clone()) {
+                    if let Some(parent) = self.plan.iter().find(|n| n.id == parent_id) {
+                        parent.target.bounds
+                    } else {
+                        visual.bounds
+                    }
+                } else {
+                    visual.bounds
+                }
+            }
             _ => visual.bounds,
         };
         if !self
@@ -3408,7 +3421,7 @@ impl UiWgpuRenderer {
             .is_some_and(|node| {
                 matches!(
                     node.target.kind,
-                    UiNodeKind::Slider | UiNodeKind::DragValue | UiNodeKind::Scrollbar
+                    UiNodeKind::Slider | UiNodeKind::DragValue | UiNodeKind::Scrollbar | UiNodeKind::Splitter
                 )
             })
     }
@@ -3506,6 +3519,59 @@ impl UiWgpuRenderer {
     pub(crate) fn set_choice(&mut self, node_path: &str, value: &str) {
         self.builtin_choices.insert(node_path.to_owned(), value.to_owned());
         self.pointer_visual_dirty = true;
+    }
+
+    /// Toggle TreeView node expand/collapse state.
+    /// Returns true if expanded, false if collapsed.
+    pub(crate) fn toggle_treeview_node(&mut self, node_path: &str) -> bool {
+        let current = self.builtin_toggles.get(node_path).copied().unwrap_or(true);
+        let new = !current;
+        self.builtin_toggles.insert(node_path.to_owned(), new);
+        self.pointer_visual_dirty = true;
+        new
+    }
+
+    /// Check if a node is a TreeView child (parent is TreeView).
+    pub(crate) fn is_treeview_child(&self, node_path: &str) -> bool {
+        let Some(index) = self.plan.iter().position(|node| node.id == node_path) else {
+            return false;
+        };
+        let Some(parent_id) = self.plan[index].parent_id.as_ref() else {
+            return false;
+        };
+        self.plan.iter().any(|node| {
+            node.id == *parent_id && matches!(node.target.kind, UiNodeKind::TreeView)
+        })
+    }
+
+    /// Show all context menus in the current plan (built-in right-click).
+    pub(crate) fn show_context_menus(&mut self) {
+        for node in &self.plan {
+            if matches!(node.target.kind, UiNodeKind::ContextMenu) {
+                self.builtin_toggles.insert(node.id.clone(), true);
+            }
+        }
+        self.pointer_visual_dirty = true;
+    }
+
+    /// Hide all context menus (built-in, called on click-outside).
+    pub(crate) fn hide_context_menus(&mut self) {
+        let mut changed = false;
+        for node in &self.plan {
+            if matches!(node.target.kind, UiNodeKind::ContextMenu) {
+                if self.builtin_toggles.insert(node.id.clone(), false).unwrap_or(true) {
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            self.pointer_visual_dirty = true;
+        }
+    }
+
+    /// Check if a context menu is currently visible.
+    pub(crate) fn context_menu_visible(&self, node_path: &str) -> bool {
+        self.builtin_toggles.get(node_path).copied().unwrap_or(false)
     }
 
     pub(crate) fn cancel_value_gesture(&mut self) {
@@ -6788,6 +6854,47 @@ impl UiWgpuRenderer {
                 layout_probe.join(",")
             );
         }
+        // Apply TreeView built-in expand/collapse state.
+        // TreeView children are flat Label nodes; hierarchy is expressed by x indent.
+        // A collapsed parent hides all subsequent more-indented siblings until the
+        // next node at the same or lesser indent.
+        let treeview_parents: HashSet<String> = nodes.iter()
+            .filter(|(_, _, t, _)| matches!(t.kind, UiNodeKind::TreeView))
+            .map(|(id, _, _, _)| id.clone())
+            .collect();
+        let mut filtered_nodes = Vec::with_capacity(nodes.len());
+        let mut skip_until_indent: Option<f32> = None;
+        for (id, parent_id, target, transition) in nodes {
+            // Built-in ContextMenu visibility: hide when toggled off
+            if matches!(target.kind, UiNodeKind::ContextMenu)
+                && !self.builtin_toggles.get(&id).copied().unwrap_or(false)
+            {
+                continue;
+            }
+            let parent_is_treeview = parent_id.as_ref()
+                .is_some_and(|pid| treeview_parents.contains(pid));
+            if parent_is_treeview && matches!(target.kind, UiNodeKind::Label) {
+                let indent = target.bounds.x;
+                if let Some(threshold) = skip_until_indent {
+                    if indent > threshold {
+                        continue; // hidden by collapsed parent
+                    } else {
+                        skip_until_indent = None;
+                    }
+                }
+                // Check if this node is a collapsible parent (has children)
+                let node_path = &id;
+                let is_expanded = self.builtin_toggles.get(node_path).copied().unwrap_or(true);
+                if !is_expanded {
+                    // Find the next node at same or lesser indent to know where to stop
+                    skip_until_indent = Some(indent);
+                }
+            } else {
+                skip_until_indent = None;
+            }
+            filtered_nodes.push((id, parent_id, target, transition));
+        }
+        let nodes = filtered_nodes;
         let live: HashSet<_> = nodes.iter().map(|(id, _, _, _)| id.clone()).collect();
         if viewport_changed {
             self.current.clear();
