@@ -602,6 +602,10 @@ impl AppState {
             "demo.acc.general" => { self.acc_general = !self.acc_general; println!("[acc] general={}", self.acc_general); }
             "demo.acc.advanced" => { self.acc_advanced = !self.acc_advanced; println!("[acc] advanced={}", self.acc_advanced); }
             "demo.acc.about" => { self.acc_about = !self.acc_about; println!("[acc] about={}", self.acc_about); }
+            "demo.mb.file" => println!("[mb] File menu clicked"),
+            "demo.mb.edit" => println!("[mb] Edit menu clicked"),
+            "demo.mb.view" => println!("[mb] View menu clicked"),
+            "demo.mb.help" => println!("[mb] Help menu clicked"),
             _ => println!("[unknown] {action}"),
         }
     }

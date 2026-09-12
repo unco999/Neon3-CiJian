@@ -360,8 +360,8 @@ surface showcase overlay w 1200 h 1000 align stretch fill #0D1117
     text switch-label h 24 value "Switch (toggle)"
     switch switch-demo w 344 h 32 checked $switch_state value "Enable feature" event demo.switch.toggle
 
-    # MenuBar - 菜单栏
-    text menubar-label h 24 value "MenuBar"
+    # MenuBar - 菜单栏（点击菜单项触发动作）
+    text menubar-label h 24 value "MenuBar (click items)"
     menu_bar demo-menubar w 344 h 32
       text mb-file x 8 y 4 w 60 h 24 value "File" event demo.mb.file
       text mb-edit x 76 y 4 w 60 h 24 value "Edit" event demo.mb.edit
