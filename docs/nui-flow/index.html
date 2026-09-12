@@ -1,0 +1,1115 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0b1014">
+  <meta name="description" content="Neon3 NUI Flow V1：从声明式 UI 写法、数据绑定、组件与交互，到运行时原理、案例和验收。">
+  <title>NUI Flow / Neon3</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <button class="menu-toggle" id="menuToggle" type="button" aria-controls="sidebar" aria-expanded="false">目录</button>
+    <a class="brand" href="#top" aria-label="回到 NUI Flow 首页">
+      <span class="brand-mark">N3</span>
+      <span>NUI FLOW<small>NEON3 / V1 AUTHORING</small></span>
+    </a>
+    <nav class="topbar-nav" aria-label="快捷导航">
+      <a href="#start">快速开始</a>
+      <a href="#components">组件</a>
+      <a href="#cases">案例</a>
+      <a href="#debug">验证</a>
+    </nav>
+    <div class="topbar-tools">
+      <button class="tool-button" id="themeToggle" type="button" aria-label="切换浅色或深色主题">主题</button>
+      <a class="tool-button github-link" href="https://github.com/unco999/Neon3-CiJian" target="_blank" rel="noopener">GitHub</a>
+    </div>
+  </header>
+
+  <div class="site-shell">
+    <aside class="sidebar" id="sidebar">
+      <div class="sidebar-kicker">Documentation</div>
+      <h2>NUI Flow</h2>
+      <p>把 UI 写成可验证的声明，把领域事实交给正确的服务。</p>
+      <nav aria-label="文档目录">
+        <ul class="toc">
+          <li><a href="#top" data-toc-link>首页与定位</a></li>
+          <li><a href="#start" data-toc-link>01 · 快速开始</a></li>
+          <li><a href="#principles" data-toc-link>02 · 原理与边界</a></li>
+          <li><a href="#syntax" data-toc-link>03 · 语法骨架</a></li>
+          <li><a href="#inputs" data-toc-link>04 · 输入与绑定</a></li>
+          <li><a href="#layout" data-toc-link>05 · 布局与样式</a></li>
+          <li><a href="#components" data-toc-link>06 · 组件词典</a></li>
+          <li><a href="#state" data-toc-link>07 · 分支与状态机</a></li>
+          <li><a href="#interaction" data-toc-link>08 · 交互与事件</a></li>
+          <li><a href="#datagrid" data-toc-link>09 · DataGrid</a></li>
+          <li><a href="#resources" data-toc-link>10 · 资源与渲染</a></li>
+          <li><a href="#patches" data-toc-link>11 · Patch</a></li>
+          <li><a href="#cases" data-toc-link>12 · 案例索引</a></li>
+          <li><a href="#debug" data-toc-link>13 · 调试与验收</a></li>
+          <li><a href="#matrix" data-toc-link>14 · 能力矩阵</a></li>
+          <li><a href="#appendix" data-toc-link>15 · 速查与证据</a></li>
+        </ul>
+      </nav>
+      <div class="sidebar-note">
+        <strong>页面标记规则</strong>
+        稳定表示有代码与测试覆盖；部分表示语法或底层能力存在但集成仍需验证；设计表示文档规划，不应当成当前 API。
+      </div>
+    </aside>
+
+    <main id="content">
+      <section class="hero" id="top">
+        <div class="hero-copy">
+          <div class="eyebrow">Neon3 / Declarative UI / V1</div>
+          <h1>把界面写成<span>声明</span>，把事实留在领域。</h1>
+          <p class="hero-lede">NUI Flow 是 Neon3 的紧凑、逐行、可验证 UI 描述格式。它描述层级、布局、类型化输入和语义意图；解析、编译、像素、命中测试与业务真相分别由正确的 owner 负责。</p>
+          <div class="hero-actions">
+            <a class="primary-action" href="#start">从第一份 Flow 开始</a>
+            <a class="secondary-action" href="#principles">先看运行原理</a>
+          </div>
+          <div class="hero-meta">
+            <span class="meta-chip"><strong>V1</strong>line-oriented</span>
+            <span class="meta-chip"><strong>IR</strong>canonical JSON</span>
+            <span class="meta-chip"><strong>GPU</strong>single owner</span>
+            <span class="meta-chip"><strong>ID</strong>stable semantic key</span>
+          </div>
+        </div>
+        <div class="hero-diagram" aria-label="NUI Flow 从源码到像素的处理链路">
+          <div class="diagram-head">
+            <strong>One declaration, several owners</strong>
+            <span>source → pixels → intent</span>
+          </div>
+          <div class="flow-rail">
+            <div class="flow-step">
+              <span class="flow-index">01</span>
+              <div class="flow-copy"><strong>写 .nui</strong><span>稳定 key、布局、绑定、事件</span></div>
+            </div>
+            <div class="flow-step">
+              <span class="flow-index">02</span>
+              <div class="flow-copy"><strong>parse + validate</strong><span>关闭词汇表、类型检查、source span</span></div>
+            </div>
+            <div class="flow-step">
+              <span class="flow-index">03</span>
+              <div class="flow-copy"><strong>lower → UiProgram</strong><span>canonical IR 与有限资源预算</span></div>
+            </div>
+            <div class="flow-step">
+              <span class="flow-index">04</span>
+              <div class="flow-copy"><strong>WGPU 合成</strong><span>唯一窗口、GPU、布局、命中与像素 owner</span></div>
+            </div>
+            <div class="flow-step">
+              <span class="flow-index">05</span>
+              <div class="flow-copy"><strong>semantic intent</strong><span>用户操作只向外发送领域语义，不发送坐标</span></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="doc-section" id="start" data-search-section>
+        <div class="section-kicker">01 / Start Here</div>
+        <h2>先写出一份能解释自己的 Flow</h2>
+        <p class="section-intro">最短的学习路径不是背完整 grammar，而是先建立三个判断：节点是什么、数据从哪里进来、交互要向哪个领域发出什么意图。</p>
+
+        <div class="search-panel">
+          <input class="search-field" id="docSearch" type="search" placeholder="搜索本页：例如 struct、拖放、revision、nine_slice" autocomplete="off">
+          <span class="search-status" id="searchStatus" aria-live="polite">搜索 15 个章节</span>
+        </div>
+
+        <div class="lead-grid">
+          <div class="info-block">
+            <strong>节点是静态拓扑</strong>
+            <p>每一行声明一个稳定 semantic key。运行时可以隐藏预编译分支或实例化有界模板，但不能让 Flow 代码无限创建节点。</p>
+          </div>
+          <div class="info-block">
+            <strong>输入是类型化握手</strong>
+            <p>领域服务把已准备好的 bool、数字、文本句柄、网格窗口等值发布到 input slot。Flow 只声明绑定，不推断业务事实。</p>
+          </div>
+          <div class="info-block">
+            <strong>事件是语义请求</strong>
+            <p><code>event terrain.tool.select</code> 描述意图，不声明 handler。路由、权限、事务和项目写入留在应用/领域 owner。</p>
+          </div>
+        </div>
+
+        <h3>最小文档</h3>
+        <div class="code-wrap">
+          <pre><code>version 1
+surface hello column w 420 h 220 gap 12 pad 16 align stretch fill #11191F
+  text title h 28 value "Hello, NUI Flow"
+  text body value "One surface. Stable keys. Typed inputs."
+  button save h 36 value "Save" event app.save
+</code></pre>
+        </div>
+        <div class="two-column">
+          <div>
+            <h4>逐行读法</h4>
+            <div class="syntax-list">
+              <div class="syntax-row"><strong>version 1</strong><span>使用 Flow V1 语法。新版本必须显式升级，旧 parser 不会静默重解释。</span></div>
+              <div class="syntax-row"><strong>surface hello</strong><span>根节点和 surface identity。文档只允许一个根；根的 key 进入 IR 与诊断。</span></div>
+              <div class="syntax-row"><strong>column / w / h</strong><span>根采用纵向布局并给出逻辑尺寸。逻辑单位不是屏幕物理像素。</span></div>
+              <div class="syntax-row"><strong>text / button</strong><span>子节点用两个空格缩进。按钮没有回调，只有声明过的 semantic intent。</span></div>
+            </div>
+          </div>
+          <div>
+            <h4>第一轮验证</h4>
+            <p>AI、编辑器或脚本应复用生产 parser/compiler，不要在客户端复制第二套 grammar。</p>
+            <div class="code-wrap">
+              <pre><code>cargo run -p neon-ui-runtime --bin neon3_authoring_probe</code></pre>
+            </div>
+            <p>探针从 stdin 读取 JSONL，每行输出一个 JSONL 结果；成功结果包含 input schema、canonical IR、节点 outline、预算和 layout hash，失败结果包含 parser/compiler stage 与 source diagnostics。</p>
+            <div class="code-wrap">
+              <pre><code>{"request_id":"hello-1","operation":"validate","sequence":1,"source":"version 1\nsurface hello\n  text title value \"Hello\""}</code></pre>
+            </div>
+          </div>
+        </div>
+
+        <div class="callout warning">
+          <strong>推荐的工程起点</strong>
+          先用静态 literal text 和一个 button 验证 parse/compile，再增加 input binding；最后才加入 branch、DataGrid、资源和跨进程 host。每加一层都能单独定位失败阶段。
+        </div>
+      </section>
+
+      <section class="doc-section" id="principles" data-search-section>
+        <div class="section-kicker">02 / Principles</div>
+        <h2>它为什么这样设计</h2>
+        <p class="section-intro">NUI Flow 的限制不是为了让作者难受，而是为了让 UI 能被编译、检查、重启恢复、跨语言消费，并且不把业务真相偷偷藏进渲染进程。</p>
+
+        <div class="flow-diagram">
+          <div class="flow-diagram-item"><small>AUTHOR</small><strong>Flow source</strong><p>人类、AI、Rust、Node 或 Python 都可以生成同一种声明。</p></div>
+          <div class="flow-diagram-item"><small>UI RUNTIME</small><strong>Parse / lower / validate</strong><p>产生 UiIrDocument、UiProgram 和 typed diagnostics。</p></div>
+          <div class="flow-diagram-item"><small>DOMAIN</small><strong>Facts / mutations</strong><p>提供输入帧、文本句柄、网格窗口，接受语义请求。</p></div>
+          <div class="flow-diagram-item"><small>WGPU</small><strong>Layout / hit / pixels</strong><p>唯一窗口与 GPU owner，负责最终合成和本地反馈。</p></div>
+          <div class="flow-diagram-item"><small>FEEDBACK</small><strong>Snapshot / intent</strong><p>领域状态以新 snapshot 回到 UI，UI 不猜测完成结果。</p></div>
+        </div>
+
+        <h3>四个 owner，四种责任</h3>
+        <div class="owner-grid">
+          <div class="owner-card"><span class="owner-label">NUI FLOW</span><strong>声明</strong><p>层级、布局、绑定、有限分支、模板能力和 semantic intent。</p></div>
+          <div class="owner-card"><span class="owner-label">UI RUNTIME</span><strong>解释</strong><p>解析、类型验证、编译、输入快照、文本句柄、host adapter 和诊断。</p></div>
+          <div class="owner-card"><span class="owner-label">DOMAIN / HOST</span><strong>决定</strong><p>项目状态、权限、排序、过滤、事务、业务规则和 accepted/rejected。</p></div>
+          <div class="owner-card"><span class="owner-label">WGPU RUNTIME</span><strong>呈现</strong><p>窗口、GPU 资源、布局测量、命中测试、pointer capture、像素和合成。</p></div>
+        </div>
+
+        <h3>一条完整的数据回路</h3>
+        <div class="code-wrap">
+          <pre><code>domain snapshot
+  -> typed input frame { health: f32, title: text_handle }
+  -> neon-ui-runtime validates revision + handles
+  -> UiProgram evaluates bindings and bounded branches
+  -> neon-wgpu-runtime lays out and draws pixels
+  -> user activates `terrain.tool.select`
+  -> semantic intent crosses the boundary
+  -> domain validates, mutates, and publishes a new snapshot</code></pre>
+        </div>
+        <div class="principle-grid">
+          <div class="principle"><span class="principle-number">A</span><strong>Flow 不是脚本</strong><p>没有 callback、循环、网络、文件读取、表达式 evaluator 或任意代码执行。有限 statechart 只负责 UI-local presentation。</p></div>
+          <div class="principle"><span class="principle-number">B</span><strong>UI 不直接写项目</strong><p>按钮只产生 intent。项目写入必须经过领域服务和 projectd 的 revisioned 事务。</p></div>
+          <div class="principle"><span class="principle-number">C</span><strong>画面不等于业务真相</strong><p>截图可以辅助 visual acceptance，但不能证明 mutation 成功。必须读取 response、snapshot、job 或 trace。</p></div>
+          <div class="principle"><span class="principle-number">D</span><strong>局部实时反馈留在 WGPU</strong><p>hover、pressed、滚轮、拖拽预览和 pointer capture 不需要每帧 RPC；语义 begin/end/commit 才走可靠边界。</p></div>
+        </div>
+
+        <div class="callout danger">
+          <strong>不能从 UI key 推导业务 identity</strong>
+          <code>640060</code> 一类 renderer hit ID、pointer 坐标、纹理 slot、GPU handle 和数组下标都不能进入 Flow、patch、公共 intent 或项目协议。可见的节点 key 只用于稳定语义定位。
+        </div>
+      </section>
+
+      <section class="doc-section" id="syntax" data-search-section>
+        <div class="section-kicker">03 / Grammar</div>
+        <h2>语法骨架：逐行、两格、关闭词汇</h2>
+        <p class="section-intro">V1 追求确定性。解析器可以在单行和单个 source span 内给出可重复错误；布局和资源不会因为隐藏的脚本副作用而改变。</p>
+
+        <h3>词法规则</h3>
+        <div class="table-scroll">
+          <table>
+            <thead><tr><th>规则</th><th>正确写法</th><th>会发生什么</th></tr></thead>
+            <tbody>
+              <tr><td>源编码</td><td>UTF-8；一行一个 declaration</td><td>不可识别的行通常会落到稳定 parser diagnostic。</td></tr>
+              <tr><td>缩进</td><td>每层正好两个空格</td><td>Tab 或奇数缩进返回 <code>nui_flow_tabs_forbidden</code> / <code>nui_flow_mixed_indentation</code>。</td></tr>
+              <tr><td>注释</td><td>第一处非空字符为 <code>#</code></td><td>只支持整行注释；V1 不支持 inline comment。</td></tr>
+              <tr><td>字符串</td><td><code>"hello \"NUI\"\n"</code></td><td>支持 <code>\"</code>、<code>\\</code>、<code>\n</code>；空格文本必须整体加引号。</td></tr>
+              <tr><td>key</td><td><code>terrain.tool-rail_1</code></td><td>仅 ASCII 字母、数字、<code>.</code>、<code>_</code>、<code>-</code>；key 是稳定语义名。</td></tr>
+              <tr><td>拒绝项</td><td>不写 URL、路径、回调、代码块、任意 JSON、GPU handle</td><td>返回 <code>ui_program_forbidden_flow_feature</code>，不会 silent no-op。</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>顶层声明顺序</h3>
+        <p>解析器对部分声明顺序有兼容性，但推荐按下面的顺序维护文件：公共头部 → 输入/资源 → statechart/交互声明 → 唯一根树。</p>
+        <div class="code-wrap">
+          <pre><code>version 1
+surface surface.editor.terrain revision 12
+flow terrain-workbench
+budget nodes=128 bindings=96 instances=128 text=96 glyphs=2048 events=64 clips=32
+
+input can_commit bool default false
+input terrain_name text default text:empty
+input selected_tool enum:select|sculpt|water default select
+resource terrain-preview render_surface
+
+machine terrain initial loading
+state terrain ready
+sync terrain when $selected_tool=water -> ready
+
+surface workbench row gap 8
+  panel inspector column
+    text title value $terrain_name
+  render terrain-preview</code></pre>
+        </div>
+
+        <div class="two-column">
+          <div>
+            <h4>Budget 是编译契约</h4>
+            <p><code>nodes</code>、<code>bindings</code>、<code>instances</code>、<code>text</code>、<code>glyphs</code>、<code>events</code>、<code>clips</code> 是有界资源上限。编译器会把实际节点、literal text、模板实例和 clip 数量与预算比较。</p>
+          </div>
+          <div>
+            <h4>表面尺寸使用逻辑单位</h4>
+            <p>Flow 不表达物理屏幕像素、DPI、camera matrix 或 GPU viewport。renderer 负责把逻辑布局映射到当前 composition target。</p>
+          </div>
+        </div>
+        <div class="inline-note"><p><strong>兼容提示：</strong>旧 fixture 可能省略 <code>version</code>、<code>revision</code> 或 <code>flow</code>，当前 parser 有默认值/兼容路径；新文件仍建议显式写出版本与 revision，方便诊断和回放。</p></div>
+      </section>
+
+      <section class="doc-section" id="inputs" data-search-section>
+        <div class="section-kicker">04 / Inputs</div>
+        <h2>输入与绑定：唯一的数据入口</h2>
+        <p class="section-intro">Flow 不直接访问领域对象。声明一个 input slot，给它类型和默认值，再把这个 slot 绑定到有限的节点属性。文本和资源也遵循同一条边界。</p>
+
+        <h3>类型清单</h3>
+        <div class="table-scroll">
+          <table>
+            <thead><tr><th>Flow 类型</th><th>示例</th><th>含义 / 约束</th><th>状态</th></tr></thead>
+            <tbody>
+              <tr><td><code>bool</code></td><td><code>input enabled bool default true</code></td><td>可用于 visible、enabled、checked、selected 和 branch。</td><td><span class="status status-stable">稳定</span></td></tr>
+              <tr><td><code>i32 / u32 / f32</code></td><td><code>input count i32 default 4</code></td><td>数值绑定；可用 <code>i32:min..max</code> 等声明 inclusive range。</td><td><span class="status status-stable">稳定</span></td></tr>
+              <tr><td><code>enum:a|b</code></td><td><code>input mode enum:alpha|beta default beta</code></td><td>变体必须是稳定 key；可用于 combo、tabs、list_box、state 和 enum branch。</td><td><span class="status status-stable">稳定</span></td></tr>
+              <tr><td><code>text</code></td><td><code>input title text default text:empty</code></td><td>传输的是 <code>TextHandle</code>，不是任意长度 raw string；内容由 text registry/host 提供。</td><td><span class="status status-stable">稳定</span></td></tr>
+              <tr><td><code>asset_handle</code></td><td><code>input icon asset_handle default asset:empty</code></td><td>稳定资源句柄；图片上传和 atlas residency 仍归 WGPU。</td><td><span class="status status-partial">需资源链路</span></td></tr>
+              <tr><td><code>vec2 / vec4 / color</code></td><td><code>input offset vec2 default 0,0</code></td><td>当前 parser/schema/GPU packing 有支持；<code>color</code> 每个分量必须在 0..1。</td><td><span class="status status-supported">已覆盖</span></td></tr>
+              <tr><td><code>grid</code></td><td><code>input rows grid default grid:empty</code></td><td>控制面 bounded window，不进入 scalar GPU buffer；专供 DataGrid。</td><td><span class="status status-stable">稳定</span></td></tr>
+              <tr><td><code>canvas_data</code></td><td><code>input guides canvas_data default canvas:empty</code></td><td>有界 points/lines 数据；不允许 draw callback、路径或 GPU handle。</td><td><span class="status status-supported">已覆盖</span></td></tr>
+              <tr><td><code>struct</code></td><td>见下方多行声明</td><td>schema 和 parser 支持字段；字段级绑定可解析，但完整编译/host 路径仍应跑 probe。</td><td><span class="status status-partial">实验性</span></td></tr>
+              <tr><td><code>array[N]</code></td><td><code>input cells array[36] f32</code></td><td>固定长度、有界、可做数组索引 binding；Array of Struct 不是当前 Flow 稳定写法。</td><td><span class="status status-partial">实验性</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>类型化绑定</h3>
+        <div class="code-wrap">
+          <pre><code>input can_commit bool default false
+input visible bool default true
+input checked bool default false
+input amount f32:0..1 default 0.5
+input choice enum:alpha|beta default alpha
+input title text default text:empty
+input offset vec2 default 0,0
+input opacity f32:0..1 default 0.8
+input icon asset_handle default asset:empty
+input guides canvas_data default canvas:empty
+
+surface controls column w 420 h 360
+  text heading value $title
+  button commit value "Commit" enabled $can_commit
+  checkbox feature checked $checked
+  slider amount numeric $amount
+  combo mode state $choice
+  panel preview visible $visible opacity $opacity scroll_offset $offset
+    image icon-image resource $icon fit contain
+  canvas guides data $guides</code></pre>
+        </div>
+        <div class="table-scroll">
+          <table class="compact-table">
+            <thead><tr><th>属性</th><th>接受的类型</th><th>典型节点</th></tr></thead>
+            <tbody>
+              <tr><td><code>value $x</code></td><td>text</td><td>text、button、input、所有需要 label 的控件</td></tr>
+              <tr><td><code>visible $x</code> / <code>enabled $x</code></td><td>bool</td><td>任意节点</td></tr>
+              <tr><td><code>checked $x</code> / <code>selected $x</code></td><td>bool</td><td>checkbox、radio_button、selectable、switch</td></tr>
+              <tr><td><code>numeric $x</code></td><td>i32、u32、f32 或 ranged numeric</td><td>slider、drag_value、scrollbar、progress_bar</td></tr>
+              <tr><td><code>state $x</code></td><td>enum</td><td>combo、dropdown、tabs、list_box</td></tr>
+              <tr><td><code>opacity $x</code></td><td>f32</td><td>节点透明度</td></tr>
+              <tr><td><code>resource $x</code></td><td>asset_handle</td><td>外部图片 binding</td></tr>
+              <tr><td><code>scroll_offset $x</code></td><td>vec2</td><td>二维滚动偏移</td></tr>
+              <tr><td><code>data $x</code></td><td>canvas_data</td><td>canvas</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Struct、Array 与受限派生值</h3>
+        <div class="two-column">
+          <div class="demo-panel">
+            <h4>Struct</h4>
+            <div class="code-wrap">
+              <pre><code>input player struct {
+  name text
+  health f32
+  enabled bool default true
+}
+surface player-card column
+  text name value $player.name
+  progress_bar hp numeric $player.health
+  panel badge visible $player.enabled</code></pre>
+            </div>
+            <p>当前 schema 会递归计算 packing；parser 可以解析点路径和字段默认值。生产接入请用 authoring probe 验证 compiler 与 host publication 是否支持你的字段路径。</p>
+          </div>
+          <div class="demo-panel">
+            <h4>Array + derived bool</h4>
+            <div class="code-wrap">
+              <pre><code>input cells array[36] f32
+input cell_0_on bool = $cells[0] &gt; 0.5
+input cell_1_on bool = $cells[1] &gt; 0.5
+surface grid
+  panel cell-0 visible $cell_0_on
+  panel cell-1 visible $cell_1_on</code></pre>
+            </div>
+            <p>派生语法只允许一个简单比较：<code>==</code>、<code>!=</code>、<code>&gt;</code>、<code>&lt;</code>、<code>&gt;=</code>、<code>&lt;=</code>。它不是通用表达式语言。</p>
+          </div>
+        </div>
+        <div class="callout warning">
+          <strong>当前实现边界：不要把“parser 接受”当成“全链路稳定”</strong>
+          Struct/Array 的类型、packing 和解析测试已经存在，但部分 compiler/evaluator 绑定路径仍按 top-level input key 查找；派生值也需要通过带 schema 的 input replacement path 才会重算。对这两类能力，先执行 <code>neon3_authoring_probe</code>，再接入真实 host。
+        </div>
+
+        <h3>变量变化观察事件：<code>emitevent</code></h3>
+        <div class="code-wrap">
+          <pre><code>flow terrain-workbench
+input brush_size i32:0..24 default 4 emitevent</code></pre>
+        </div>
+        <p>变化会被命名为 <code>flow.terrain-workbench.brush_size</code>，payload 是结构化 observation，包含 module、surface、variable_key、kind、old/new 值。它不是 domain command；只有明确声明 <code>emitevent</code> 的 slot 才发布，grid 不能使用它。</p>
+      </section>
+
+      <section class="doc-section" id="layout" data-search-section>
+        <div class="section-kicker">05 / Layout</div>
+        <h2>布局与样式：逻辑矩形上的确定性规则</h2>
+        <p class="section-intro">Flow 的布局属性进入 canonical IR；WGPU 在实际 viewport 中完成测量、裁剪和最终绘制。不要把逻辑布局和物理像素、命中 ID 混在一起。</p>
+
+        <h3>容器与主轴</h3>
+        <div class="code-wrap">
+          <pre><code>surface layout column w 520 h 260 gap 10 pad 12 align stretch fill #17201E
+  panel toolbar row h 40 gap 8 pad 6 justify between
+    text title value "Toolbar"
+    button action w 100 h 28 value "Run" event app.run
+  panel body column grow 1 gap 6 clip rounded
+    text item-a h 24 value "A"
+    text item-b h 24 value "B"
+  panel footer row h 32 align center
+    text status value "Ready"</code></pre>
+        </div>
+        <div class="table-scroll">
+          <table>
+            <thead><tr><th>类别</th><th>token</th><th>说明</th></tr></thead>
+            <tbody>
+              <tr><td>主轴</td><td><code>row</code> / <code>column</code> / <code>overlay</code></td><td>兄弟节点横向、纵向或叠放；默认布局由 runtime schema 提供。</td></tr>
+              <tr><td>尺寸</td><td><code>x y w h minw maxw basis</code></td><td>逻辑位置/尺寸与 flex 约束。所有数字必须 finite。</td></tr>
+              <tr><td>空间</td><td><code>pad gap grow shrink</code></td><td><code>pad</code> 是四向相同 padding；<code>gap</code> 分隔兄弟。</td></tr>
+              <tr><td>对齐</td><td><code>align start|center|end|stretch</code></td><td>交叉轴对齐。</td></tr>
+              <tr><td>分布</td><td><code>justify start|center|end|between|around|evenly</code></td><td>主轴剩余空间分布。</td></tr>
+              <tr><td>裁剪</td><td><code>clip none|bounds|rounded|scroll</code></td><td>默认 panel 是 <code>bounds</code>；scroll 会使用既有 scroll offset。</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>样式、图片适配和设计 token</h3>
+        <div class="table-scroll">
+          <table class="compact-table">
+            <thead><tr><th>声明</th><th>当前行为</th><th>注意</th></tr></thead>
+            <tbody>
+              <tr><td><code>fill #RRGGBB[AA]</code></td><td>节点背景色</td><td>颜色转为 normalized RGBA。</td></tr>
+              <tr><td><code>line #RRGGBB[AA]</code></td><td>节点边框色</td><td>边框宽度可在节点上用 <code>border_width</code>，也可由 state style 改写。</td></tr>
+              <tr><td><code>radius n</code></td><td>节点圆角</td><td>与 rounded clipping/hit 区域一起由 renderer 解释。</td></tr>
+              <tr><td><code>opacity n</code> / <code>opacity $x</code></td><td>字面量或 f32 binding</td><td>binding 必须是 f32；范围建议写入 input kind。</td></tr>
+              <tr><td><code>image ... fit stretch|cover|contain</code></td><td>renderer 调整 image UV，布局 bounds 不变</td><td>图片资源不是 CSS background-image。</td></tr>
+              <tr><td><code>token token:name</code> / <code>ink token:name</code></td><td>当前只做语法校验</td><td>theme token registry 的真实注入仍不是完整 V1 rendering contract。</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout warning"><strong>不要用布局表达领域逻辑</strong>不能通过改变 <code>x</code>、<code>width</code> 或等待某个时间来推断“保存完成”。可见性和状态应来自显式 bool/enum input；accepted/rejected 必须来自领域 snapshot。</div>
+      </section>
+
+      <section class="doc-section" id="components" data-search-section>
+        <div class="section-kicker">06 / Components</div>
+        <h2>组件词典：从容器到编辑器工具</h2>
+        <p class="section-intro">下表以当前 parser 的 closed vocabulary 为准。容器类节点会降低为兼容的 Panel topology；高级节点是否具备完整 host 交互，还要看 WGPU 与外部 host 的接入状态。</p>
+
+        <div class="component-family">
+          <h3>结构与数据</h3>
+          <div class="component-list">
+            <span class="component-chip">surface<small>根 / panel IR</small></span>
+            <span class="component-chip">panel<small>通用容器</small></span>
+            <span class="component-chip">scroll<small>clip scroll</small></span>
+            <span class="component-chip">overlay<small>顶层布局</small></span>
+            <span class="component-chip">branch<small>预编译条件树</small></span>
+            <span class="component-chip">repeat<small>有界 rows</small></span>
+            <span class="component-chip">template<small>惰性原型</small></span>
+            <span class="component-chip">data_grid<small>虚拟窗口</small></span>
+          </div>
+        </div>
+        <div class="component-family">
+          <h3>内容与渲染面</h3>
+          <div class="component-list">
+            <span class="component-chip">text<small>literal / text handle</small></span>
+            <span class="component-chip">image<small>asset / external binding</small></span>
+            <span class="component-chip">render<small>named surface target</small></span>
+            <span class="component-chip">canvas<small>points / lines</small></span>
+          </div>
+        </div>
+        <div class="inline-note">
+          <p><strong>受限富文本：</strong><code>text</code> 可以使用 <code>rich</code> 后跟一个 quoted JSON span array；每个 span 只有 value、normalized RGBA color 和 scale。它不是 Markdown/HTML，不创建子节点，也不能放 markup、callback 或资源句柄。由于 formatter 只保证 canonical subset，使用后仍应通过 probe 检查格式化结果。</p>
+        </div>
+        <div class="code-wrap">
+          <pre><code>surface rich-demo column w 420 h 80
+  text status rich "[{\"value\":\"Ready\",\"color\":[0.48,0.83,0.74,1.0],\"scale\":1.0}]"</code></pre>
+        </div>
+        <div class="component-family">
+          <h3>标准控件</h3>
+          <div class="component-list">
+            <span class="component-chip">button<small>activate</small></span>
+            <span class="component-chip">input<small>text commit</small></span>
+            <span class="component-chip">checkbox<small>bool toggle</small></span>
+            <span class="component-chip">radio_button<small>bool select</small></span>
+            <span class="component-chip">slider<small>numeric</small></span>
+            <span class="component-chip">drag_value<small>numeric</small></span>
+            <span class="component-chip">combo<small>enum state</small></span>
+            <span class="component-chip">dropdown<small>enum state</small></span>
+            <span class="component-chip">tabs<small>enum state</small></span>
+            <span class="component-chip">selectable<small>bool select</small></span>
+            <span class="component-chip">list_box<small>enum state</small></span>
+            <span class="component-chip">scrollbar<small>numeric scroll</small></span>
+            <span class="component-chip">progress_bar<small>read-only numeric</small></span>
+          </div>
+        </div>
+        <div class="component-family">
+          <h3>编辑器与顶层 presentation</h3>
+          <div class="component-list">
+            <span class="component-chip">tooltip<small>top layer</small></span>
+            <span class="component-chip">modal<small>backdrop layer</small></span>
+            <span class="component-chip">dialog<small>modal alias</small></span>
+            <span class="component-chip">splitter<small>divider geometry</small></span>
+            <span class="component-chip">context_menu<small>right-click target</small></span>
+            <span class="component-chip">tree_view<small>hierarchy node</small></span>
+            <span class="component-chip">switch<small>toggle presentation</small></span>
+            <span class="component-chip">toast<small>transient notice</small></span>
+            <span class="component-chip">menu_bar<small>menu headers</small></span>
+            <span class="component-chip">accordion<small>expandable sections</small></span>
+            <span class="component-chip">spinner<small>render-loop arc</small></span>
+            <span class="component-chip">divider<small>separator line</small></span>
+            <span class="component-chip">popup<small>generic top layer</small></span>
+          </div>
+        </div>
+
+        <h3>控件绑定对照</h3>
+        <div class="table-scroll">
+          <table>
+            <thead><tr><th>控件</th><th>主要状态</th><th>绑定形式</th><th>交互输出</th><th>特别规则</th></tr></thead>
+            <tbody>
+              <tr><td><code>button</code></td><td>enabled</td><td><code>value</code> / <code>enabled</code></td><td>activate / declared intent</td><td>无持久控制值。</td></tr>
+              <tr><td><code>input</code></td><td>text handle</td><td><code>value $text</code></td><td>text commit</td><td>提交的是 bounded text handle。</td></tr>
+              <tr><td><code>checkbox</code></td><td>bool</td><td><code>checked $bool</code></td><td>selection changed</td><td>禁用时不进入 hit-test。</td></tr>
+              <tr><td><code>radio_button</code> / <code>selectable</code></td><td>bool</td><td><code>selected $bool</code></td><td>selection changed</td><td>互斥/分组策略由 host/domain 定义。</td></tr>
+              <tr><td><code>slider</code> / <code>drag_value</code></td><td>numeric</td><td><code>numeric $number</code></td><td>preview / commit</td><td>需要 numeric 类型，建议有界 range。</td></tr>
+              <tr><td><code>combo</code> / <code>dropdown</code> / <code>tabs</code></td><td>enum</td><td><code>state $enum</code></td><td>selection changed</td><td>状态 token 必须是 declared enum variant。</td></tr>
+              <tr><td><code>scrollbar</code></td><td>numeric position</td><td><code>scroll $number</code></td><td>value commit</td><td>二维滚动使用容器的 <code>scroll_offset</code>。</td></tr>
+              <tr><td><code>progress_bar</code></td><td>numeric display</td><td><code>numeric $number</code></td><td>无 pointer event</td><td>只读；不会因为绑定变化自动产生业务动画。</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <details>
+          <summary>为什么“标准控件行为”和“皮肤”必须分开？</summary>
+          <div class="details-body">
+            <p>控件的类型、focus、pressed、pointer capture、keyboard 与 semantic event 是行为契约；skin 只提供有限的 body、track、fill、thumb 等视觉 slot。替换 image 或 nine-slice 不应改变 hit region，也不应让外部拿到 atlas UV。</p>
+            <p>当前实现已经有 <code>UiControlSkin</code> schema、资源校验、fallback 和多套 fixture；Flow 侧的 skin slot grammar 仍是受限子集，设计稿中更丰富的 token、icon、padding 和固定尺寸不能直接当成稳定语法。</p>
+          </div>
+        </details>
+      </section>
+
+      <section class="doc-section" id="state" data-search-section>
+        <div class="section-kicker">07 / Presentation State</div>
+        <h2>分支、状态机与 motion</h2>
+        <p class="section-intro">NUI Flow 可以声明有限的 UI-local presentation statechart。它能选择预编译 subtree、为样式过渡提供 from/to 快照，并发出一个已声明的 semantic intent；它不能代替领域状态机。</p>
+
+        <h3>一个可验证的状态机</h3>
+        <div class="code-wrap">
+          <pre><code>input workspace_state enum:loading|ready|error default loading
+input can_publish bool default false
+
+machine asset_review initial loading
+state asset_review ready
+state asset_review publishing
+state asset_review error
+
+sync asset_review when $workspace_state=ready -> ready
+sync asset_review when $workspace_state=error -> error
+on asset_review asset.review.publish when $can_publish -> publishing emit asset.review.publish
+on asset_review asset.review.retry -> loading emit asset.review.retry
+
+surface review column
+  branch loading-view when $workspace_state=loading
+    text loading-label value "Loading"
+  branch ready-view in asset_review.ready
+    text ready-label value "Ready"
+  branch publish-view in asset_review.publishing
+    text publish-label value "Publishing"
+</code></pre>
+        </div>
+        <div class="table-scroll">
+          <table class="compact-table">
+            <thead><tr><th>声明</th><th>输入</th><th>限制</th></tr></thead>
+            <tbody>
+              <tr><td><code>machine key initial state</code></td><td>创建唯一 chart</td><td>initial state 必须被声明；state 集合是有限的。</td></tr>
+              <tr><td><code>state machine state</code></td><td>增加合法目标</td><td>不创建节点，不访问服务，不改 domain truth。</td></tr>
+              <tr><td><code>sync ... when predicate</code></td><td>bool 或 enum equality</td><td>只接受 <code>$flag</code>、<code>!$flag</code>、<code>$mode=ready</code>。</td></tr>
+              <tr><td><code>on ... intent</code></td><td>已声明 dotted intent</td><td>先经过 normal semantic-event gate，不能绕过事件验证。</td></tr>
+              <tr><td><code>emit intent</code></td><td>最多一个 dotted intent</td><td>只是向 domain 发请求；domain completion 仍通过新 input snapshot 返回。</td></tr>
+              <tr><td><code>branch ... in machine.state</code></td><td>machine-local state</td><td>只隐藏/显示预编译 subtree，不能动态改 topology。</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Motion 是显式的 presentation policy</h3>
+        <div class="code-wrap">
+          <pre><code>motion panel-expand duration 240 easing ease_out
+machine inspector initial compact
+state inspector expanded
+on inspector inspector.toggle -> expanded
+transition inspector compact -> expanded motion panel-expand
+style inspector.compact.inspector-panel x 0 y 0 w 280 h 120 opacity 0.82
+style inspector.expanded.inspector-panel x 0 y 0 w 520 h 280 opacity 1
+
+surface inspector-root
+  panel inspector-panel column w 280 h 120
+    text title value "Inspector"
+</code></pre>
+        </div>
+        <p>当前 motion 支持毫秒 duration 和 <code>linear</code>、<code>ease_in</code>、<code>ease_out</code>、<code>ease_in_out</code>；state style 可声明 bounds、fill、line、border_width、corner_radius、opacity。renderer 负责采样和插值。</p>
+        <div class="callout warning">
+          <strong>ProgressBar 不等于健康值 tween</strong>
+          <code>progress_bar health numeric $health</code> 只表示绑定当前值。若 health 从 82 变化到 30，要由应用/领域动画系统逐 tick 产生合法 input frame；不要在 Flow 里写 <code>animate</code>、时间、回调或业务目标值。
+        </div>
+        <div class="callout danger"><strong>当前集成注意</strong>headless state-machine tests 覆盖同步、分支、drag 和 style transition；部分 host refresh helper 仍会以默认 presentation state 重新求值。把状态机用于真实应用前，应验证提交链路是否持续携带 local presentation state，而不是只看到 parser 成功。</div>
+      </section>
+
+      <section class="doc-section" id="interaction" data-search-section>
+        <div class="section-kicker">08 / Interaction</div>
+        <h2>交互：本地即时反馈，可靠语义提交</h2>
+        <p class="section-intro">高频 pointer 不应该变成每帧跨进程 request。WGPU 在本地完成 hover、focus、capture、scroll 和 preview；语义动作在确定时机通过公共 contract 发出。</p>
+
+        <h3>事件不是按钮编号</h3>
+        <div class="table-scroll">
+          <table>
+            <thead><tr><th>事件类型</th><th>常见来源</th><th>外部看到的内容</th><th>不会暴露</th></tr></thead>
+            <tbody>
+              <tr><td><code>activate</code></td><td>button</td><td>declared intent、source node key、revision、request identity</td><td>hit ID、screen coordinate</td></tr>
+              <tr><td><code>selection_changed</code></td><td>checkbox、tabs、combo、list_box</td><td>typed bool/enum value</td><td>renderer child index as identity</td></tr>
+              <tr><td><code>value_tentative</code></td><td>slider、drag_value</td><td>typed preview value（若 host 需要）</td><td>每个 raw pointer move</td></tr>
+              <tr><td><code>value_commit</code></td><td>slider release、scrollbar</td><td>最终 typed value 与 semantic intent</td><td>拖拽轨迹坐标</td></tr>
+              <tr><td><code>text_edit_commit</code></td><td>input</td><td>bounded text handle</td><td>未提交的 preedit 字符串</td></tr>
+              <tr><td><code>drag_drop</code></td><td>declared drag/drop</td><td>stable source/target key、placement、template key</td><td>pointer offset、GPU path</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Drag 与 Drop：提案，不是直接 reparent</h3>
+        <div class="code-wrap">
+          <pre><code>machine board_drag initial resting
+state board_drag dragging
+state board_drag accepted
+on board_drag ui.drag.begin -> dragging
+on board_drag ui.drag.end -> accepted
+
+drag card-drag source backlog-card axis both snap 8 threshold 3 within surface
+drop progress-drop target progress-panel accepts card-drag placement into present progress-template emit workspace.card.reparent
+
+surface board column
+  panel backlog-panel column
+    panel backlog-card h 72
+      text title value "Card 01"
+  panel progress-panel column
+    template progress-template h 72 capacity 8 key row_key overflow_summary
+      text row value "Prepared row"
+</code></pre>
+        </div>
+        <ol>
+          <li>WGPU 命中声明的 source，捕获 pointer 并立即移动本地 preview。</li>
+          <li>release 时解析最深、最上层的有效 target，生成 stable proposal。</li>
+          <li>host 发送 <code>workspace.card.reparent</code>，带 current revision 和 idempotency key。</li>
+          <li>domain 校验权限、target schema、placement 和 template，接受后生成新的 revisioned UI program。</li>
+          <li>UI 只根据 accepted/rejected snapshot 清理 prediction；renderer 从不直接修改 canonical tree。</li>
+        </ol>
+        <div class="callout"><strong>三种 boundary policy</strong><code>within parent</code> 将预览限制在 source parent；<code>within surface</code> 限制在 renderer viewport；<code>within free</code> 不施加边界。这些是 presentation policy，不是业务放置规则。</div>
+
+        <h3>交互生命周期和 revision</h3>
+        <div class="code-wrap">
+          <pre><code>pointer down
+  -> local hit-test + pointer capture
+  -> interaction.begin { interaction_id, renderer_epoch, expected_revision }
+  -> local preview / optional coalesced samples
+pointer up | cancel | focus loss | epoch change
+  -> reliable interaction.end or interaction.cancel
+  -> host/domain returns accepted, rejected, or conflict
+  -> final snapshot / composition revision</code></pre>
+        </div>
+        <p><code>request_id</code> 串联 command、effect、job 和 trace；<code>expected_revision</code> 防止旧状态覆盖新状态；<code>idempotency_key</code> 让断线重试不会重复写入；service epoch 变化时必须丢弃旧 interaction。</p>
+      </section>
+
+      <section class="doc-section" id="datagrid" data-search-section>
+        <div class="section-kicker">09 / DataGrid</div>
+        <h2>DataGrid：有界窗口，不把一万行变成一万个节点</h2>
+        <p class="section-intro">DataGrid 是控制面 grid input + renderer-local scrolling + domain window request 的组合。Flow 只声明列和容量，行 identity、typed cells、display text 和 list revision 都由 domain 提供。</p>
+
+        <h3>声明一个虚拟表格</h3>
+        <div class="code-wrap">
+          <pre><code>input asset_window grid default grid:empty
+surface asset-list column w 720 h 420 gap 8 pad 12 align stretch fill #17201E
+  text title h 24 value "Assets"
+  data_grid assets h 360 source $asset_window capacity 32 row_height 28 overscan 4 columns "name:240:text,status:140:dropdown:draft|ready|archived:asset.status.set,owner:120:select:asset.owner.toggle,notes:240:edit:128:asset.notes.commit"
+</code></pre>
+        </div>
+        <div class="table-scroll">
+          <table>
+            <thead><tr><th>列 grammar</th><th>含义</th><th>限制</th></tr></thead>
+            <tbody>
+              <tr><td><code>key:width</code></td><td>默认 text column</td><td>key 唯一，width 必须为正整数。</td></tr>
+              <tr><td><code>key:width:text</code></td><td>只读文本</td><td>display handle 由 domain 提供。</td></tr>
+              <tr><td><code>key:width:select:intent</code></td><td>bool cell select</td><td>intent 必须是合法 dotted token。</td></tr>
+              <tr><td><code>key:width:dropdown:a|b:intent</code></td><td>enum cell dropdown</td><td>options 非空且不能重复；override 不能增加未声明选项。</td></tr>
+              <tr><td><code>key:width:edit:max:intent</code></td><td>bounded text edit</td><td>max_chars 必须大于 0；commit 由 host/domain 接受或拒绝。</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Domain 返回的是窗口</h3>
+        <div class="code-wrap">
+          <pre><code>{
+  "source_key": "asset_window",
+  "frame": {
+    "list_revision": 7,
+    "total_rows": 10000,
+    "first_row": 480,
+    "window_rows": [
+      {
+        "stable_row_key": "asset-480",
+        "cells": {
+          "name": {"value": {"kind":"text_handle","value":{"id":81,"generation":1}}, "display": {"id":82,"generation":1}},
+          "status": {"value": {"kind":"enum","value":"ready"}, "display": {"id":83,"generation":1}}
+        }
+      }
+    ],
+    "expected_program_revision": {"program_id":"asset-list","revision":3,"schema_version":1,"capabilities":[]}
+  }
+}</code></pre>
+        </div>
+        <div class="two-column">
+          <div>
+            <h4>容量怎么选</h4>
+            <p>从 viewport 高度和 row height 开始估算：<code>visible_rows ≈ viewport_height / row_height</code>，再给 2–4 行 overscan。容量越大，refill 越少，但每帧 cell/text/control 工作越多。</p>
+            <p>例如 300 logical px、28 px row：约 11 行可见，<code>capacity 24</code> 或 <code>32</code> 通常是合理起点。</p>
+          </div>
+          <div>
+            <h4>滚动如何跨边界</h4>
+            <p>WGPU 本地处理 wheel、thumb drag、Shift+wheel 和 middle-button pan。可见范围离开当前 frame 时，发送最新的 <code>WindowRequest</code>；旧请求会被 coalesce，不会把每个 raw wheel 事件都变成 RPC。</p>
+          </div>
+        </div>
+        <div class="callout warning"><strong>row index 不是 identity</strong>窗口从 480 移到 481 后，<code>first_row</code> 变了，但事件仍使用 <code>stable_row_key</code> + column key。不要把生成的 renderer path 或数组位置写入领域协议。</div>
+      </section>
+
+      <section class="doc-section" id="resources" data-search-section>
+        <div class="section-kicker">10 / Resources &amp; Rendering</div>
+        <h2>资源、图片、Canvas 与唯一 GPU owner</h2>
+        <p class="section-intro">Flow 可以声明资源 key 和 renderer-neutral effect，但不携带路径、bytes、纹理指针或 bind group。外部资源必须经过受控的 public contract。</p>
+
+        <h3>图片和 nine-slice</h3>
+        <div class="code-wrap">
+          <pre><code>resource panel-frame image
+surface root column w 420 h 180
+  panel frame frame panel-frame w 360 h 96 nine_slice 16 16 16 16 border 12 12 12 12 mode stretch fill_center true
+    text title value "Nine-slice frame"
+</code></pre>
+        </div>
+        <div class="table-scroll">
+          <table class="compact-table">
+            <thead><tr><th>字段</th><th>单位 / 规则</th></tr></thead>
+            <tbody>
+              <tr><td>source insets</td><td>图片像素，顺序 <code>left top right bottom</code>，不能超出源图片。</td></tr>
+              <tr><td>target border</td><td>逻辑 UI units，使用同样的四边顺序。</td></tr>
+              <tr><td>mode</td><td><code>stretch</code>、<code>tile</code>、<code>mirror</code>。</td></tr>
+              <tr><td>fill_center</td><td>false 时保留边框而不填充中间 patch。</td></tr>
+              <tr><td>布局关系</td><td>nine-slice 只改变 visual decoration；内容布局仍由 node 的 <code>pad</code> 决定。</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>外部图片的真实链路</h3>
+        <div class="code-wrap">
+          <pre><code>external engine
+  -> ui.image.upload { image_id, media_type, width, height, bytes }
+  -> neon-ui-runtime validates and forwards
+  -> wgpu.ui.image.upload
+  -> WGPU owns atlas slot, generation, region, uv
+  -> UiEffect::ImageBinding { node_id, image_id }
+</code></pre>
+        </div>
+        <p>图片 Flow 只写稳定 key。<code>projectd</code> 不参与 external transient image path；native GPU handle、atlas UV 和 texture index 不进入 JSON/Flow。完整 acceptance entry point 是 <code>cargo run -p neon-ui-runtime --bin image_resource_probe</code>。</p>
+
+        <div class="two-column">
+          <div class="demo-panel">
+            <h4>Canvas：typed points / lines</h4>
+            <div class="code-wrap">
+              <pre><code>input detected_guides canvas_data default canvas:empty
+surface analysis column w 640 h 360
+  canvas guides data $detected_guides grow 1 clip bounds</code></pre>
+            </div>
+            <p>V1 允许有限的 point/line 数据。坐标是 canvas-local logical units，x 向右、y 向下；WGPU 负责 clipping 和 GPU expansion。</p>
+          </div>
+          <div class="demo-panel">
+            <h4>World panel：camera gate</h4>
+            <div class="code-wrap">
+              <pre><code>surface editor column
+  world panel mission-marker camera 3d:editor-camera anchor mission.main w 240 h 48
+    text mission-title value "Mission"
+</code></pre>
+            </div>
+            <p>只有 camera id/kind 和可选 stable anchor 进入 Flow。camera frame 无效时整个 subtree 不参与 layout、hit testing 和 draw。</p>
+          </div>
+        </div>
+
+        <h3>Skin、geometry、material 的状态</h3>
+        <div class="table-scroll">
+          <table>
+            <thead><tr><th>能力</th><th>Flow 形态</th><th>当前边界</th></tr></thead>
+            <tbody>
+              <tr><td>Control skin</td><td><code>skin primary button</code> + indented <code>slot</code></td><td>有限 slot + image/nine-slice resource；默认 skin 是 fallback。设计稿里尚未落地的 solid/token/icon slot 不要直接使用。</td></tr>
+              <tr><td>Cut geometry</td><td><code>geometry cut bl br tr tl</code></td><td>renderer 用同一 polygon 处理视觉 clip 和 hit-test；值是 bounded logical pixels。</td></tr>
+              <tr><td>Custom material</td><td><code>shader key version n fallback standard_ui</code> + <code>material key</code></td><td>Flow 只保留 stable shader package key；source registration 走控制面，真实 live WGSL compile/bind 仍需按 capability 验证。</td></tr>
+              <tr><td>Composition layer</td><td><code>composition_layer behind_glass</code> 或 <code>layer top</code></td><td>只控制合成目的，不改变布局和领域身份。</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout danger"><strong>不允许“看起来能画”就绕过资源边界</strong>客户端不能自己创建 WGPU resource、传纹理地址、读取文件路径后塞进 Flow，或让 shader 访问任意 texture/storage buffer。能力协商失败时应该得到稳定 error/fallback，而不是默默降级为 PNG。</div>
+      </section>
+
+      <section class="doc-section" id="patches" data-search-section>
+        <div class="section-kicker">11 / Revisioned Patches</div>
+        <h2>Patch：用稳定路径更新 canonical IR</h2>
+        <p class="section-intro">当整个 Flow 重编译过重，或工具需要做小范围结构编辑，可以使用 revisioned patch。Patch 改的是 canonical UI document，应用后必须产生新的 document revision，并重新编译验证。</p>
+
+        <div class="code-wrap">
+          <pre><code>@ revision 12
+~ /workbench/tool_rail/water_tool enabled false
++ /workbench/inspector text help_text
+- /workbench/inspector/obsolete_help
+&gt; /workbench/tool_rail/water_tool /workbench/inspector</code></pre>
+        </div>
+        <div class="table-scroll">
+          <table>
+            <thead><tr><th>操作</th><th>格式</th><th>规则</th></tr></thead>
+            <tbody>
+              <tr><td><code>@</code></td><td><code>@ revision 12</code></td><td>必须出现；所有 operation 使用同一个 expected revision。</td></tr>
+              <tr><td><code>~</code></td><td><code>~ path property value</code></td><td>只支持 <code>enabled</code>、<code>visible</code>、<code>value</code>、<code>w</code>、<code>h</code>。</td></tr>
+              <tr><td><code>+</code></td><td><code>+ parent component key</code></td><td>插入 closed-vocabulary node；key 不能已存在。</td></tr>
+              <tr><td><code>-</code></td><td><code>- path</code></td><td>不能删除 root；目标必须存在。</td></tr>
+              <tr><td><code>&gt;</code></td><td><code>&gt; source destination-parent</code></td><td>移动 non-root node；不能 self/root move。</td></tr>
+              <tr><td>路径</td><td><code>key</code> 或 <code>/a/b/c</code></td><td>只接受 stable semantic keys；纯数字 segment/数组下标会被拒绝。</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <h3>Dry-run 的用途</h3>
+        <ol>
+          <li>解析 patch，检查 source spans 和 expected revision。</li>
+          <li>在隔离的 document copy 上 apply。</li>
+          <li>重新执行 canonical IR validation 和 program compile。</li>
+          <li>只返回 diff、impacted nodes、预算和 diagnostics；通过后再替换 active program。</li>
+        </ol>
+        <div class="callout warning"><strong>Patch 不是领域 mutation</strong>它只修改 UI declaration/program。拖放产生的 reparent proposal 仍须交给 domain 验证，domain 接受后才能构造新 UI revision；renderer 不直接调用 patch。</div>
+      </section>
+
+      <section class="doc-section" id="cases" data-search-section>
+        <div class="section-kicker">12 / Cases</div>
+        <h2>案例索引：从一行 text 到真实工作台</h2>
+        <p class="section-intro">这些不是虚构的 marketing demo，而是仓库里的 fixture、case 或 probe。点击源码链接可以回到完整文件；页面只摘取关键片段，方便先理解模式再阅读全部实现。</p>
+
+        <div class="case-grid">
+          <article class="case-card">
+            <div class="case-card-head"><h3>01 · Minimal</h3><span class="status status-stable">入门</span></div>
+            <p>只验证 root、column、文字和稳定节点 key。适合确认 parser 能工作。</p>
+            <div class="mini-code">surface minimal column w 360 h 200
+  text title value "Hello NUI Flow"</div>
+            <a class="case-source" href="https://github.com/unco999/Neon3-CiJian/blob/master/crates/neon-ui-runtime/src/bin/nui_guide_render.rs#L50-L60" target="_blank" rel="noopener">nui_guide_render.rs / 01-minimal</a>
+          </article>
+          <article class="case-card">
+            <div class="case-card-head"><h3>02 · Typed status</h3><span class="status status-stable">输入绑定</span></div>
+            <p>用 text handle、bool 和 bounded f32 驱动标题、按钮和进度条。</p>
+            <div class="mini-code">input health f32:0..100 default 82
+progress_bar hp numeric $health</div>
+            <a class="case-source" href="https://github.com/unco999/Neon3-CiJian/blob/master/docs/nui-single-page.md#4-数据规律input-槽是唯一的数据入口" target="_blank" rel="noopener">docs/nui-single-page.md / inputs</a>
+          </article>
+          <article class="case-card">
+            <div class="case-card-head"><h3>03 · Terrain workbench</h3><span class="status status-supported">真实工作台</span></div>
+            <p>工具栏、render surface、inspector、loading/ready/error branch 和 repeat row。</p>
+            <div class="mini-code">button tool-water value "Water" event terrain.tool.select
+render terrain-render-surface
+branch ready-state when $workbench_state=ready</div>
+            <a class="case-source" href="https://github.com/unco999/Neon3-CiJian/blob/master/tests/fixtures/ui/terrain-workbench.nui" target="_blank" rel="noopener">tests/fixtures/ui/terrain-workbench.nui</a>
+          </article>
+          <article class="case-card">
+            <div class="case-card-head"><h3>04 · Asset review</h3><span class="status status-supported">综合</span></div>
+            <p>真实复杂 fixture：typed title、permission bool、publish statechart、branches、repeat、template、render 和拖拽。</p>
+            <div class="mini-code">machine asset_review initial loading
+on asset_review asset.review.publish when $can_publish -> publishing emit asset.review.publish</div>
+            <a class="case-source" href="https://github.com/unco999/Neon3-CiJian/blob/master/tests/fixtures/ui/asset-review-workbench.nui" target="_blank" rel="noopener">tests/fixtures/ui/asset-review-workbench.nui</a>
+          </article>
+          <article class="case-card">
+            <div class="case-card-head"><h3>05 · Component gallery</h3><span class="status status-experimental">大集合</span></div>
+            <p>checkbox、radio、slider、dropdown、tabs、scrollbar、image、dialog、DataGrid、world render、skin 和 drag/drop。</p>
+            <div class="mini-code">budget nodes=200 bindings=132 instances=144
+data_grid asset-grid ...
+drop discard-gem-drop ... emit inventory.item.discard</div>
+            <a class="case-source" href="https://github.com/unco999/Neon3-CiJian/blob/master/tests/fixtures/ui/imgui-component-gallery.nui" target="_blank" rel="noopener">tests/fixtures/ui/imgui-component-gallery.nui</a>
+          </article>
+          <article class="case-card">
+            <div class="case-card-head"><h3>06 · Virtual list</h3><span class="status status-stable">虚拟化</span></div>
+            <p>10,000 行只发送 bounded window；列可声明 text、edit、dropdown、select。</p>
+            <div class="mini-code">data_grid virtual-list h 252 source $asset_window capacity 24 row_height 24 overscan 6</div>
+            <a class="case-source" href="https://github.com/unco999/Neon3-CiJian/blob/master/tests/fixtures/ui/virtual-list-demo.nui" target="_blank" rel="noopener">tests/fixtures/ui/virtual-list-demo.nui</a>
+          </article>
+          <article class="case-card">
+            <div class="case-card-head"><h3>07 · Kanban reparent</h3><span class="status status-supported">拖放提案</span></div>
+            <p>多个 drag source、into/before/after placement、target-owned template 和 accepted/rejected branch。</p>
+            <div class="mini-code">drop progress-audit-drop target in-progress-panel
+  accepts audit-card-drag placement before
+  present progress-template emit workspace.card.reparent</div>
+            <a class="case-source" href="https://github.com/unco999/Neon3-CiJian/blob/master/tests/fixtures/ui/kanban-reparent-workbench.nui" target="_blank" rel="noopener">tests/fixtures/ui/kanban-reparent-workbench.nui</a>
+          </article>
+          <article class="case-card">
+            <div class="case-card-head"><h3>08 · Grid Pulse</h3><span class="status status-partial">扩展类型</span></div>
+            <p>36 个 f32 array 元素，使用 36 个受限 derived bool 控制 cell visibility；展示 array/index 的边界。</p>
+            <div class="mini-code">input grid array[36] f32
+input cell_0_on bool = $grid[0] &gt; 0.5
+panel cell_0 visible $cell_0_on</div>
+            <a class="case-source" href="https://github.com/unco999/Neon3-CiJian/tree/master/cases/grid-pulse" target="_blank" rel="noopener">cases/grid-pulse/</a>
+          </article>
+          <article class="case-card">
+            <div class="case-card-head"><h3>09 · Image + nine-slice</h3><span class="status status-supported">资源路径</span></div>
+            <p>外部 engine 上传 RGBA bytes，WGPU 返回 atlas residency，Flow 只绑定稳定 image id。</p>
+            <div class="mini-code">resource engine-image-01 image
+panel external-panel frame engine-image-01 nine_slice 1 1 1 1 border 12 12 12 12</div>
+            <a class="case-source" href="https://github.com/unco999/Neon3-CiJian/blob/master/crates/neon-ui-runtime/src/bin/image_resource_probe.rs" target="_blank" rel="noopener">image_resource_probe.rs</a>
+          </article>
+          <article class="case-card">
+            <div class="case-card-head"><h3>10 · World marker</h3><span class="status status-partial">相机门控</span></div>
+            <p>同一 panel subtree 通过 camera kind/id 和 world anchor 投影到世界 UI；无有效 frame 时完全不参与绘制。</p>
+            <div class="mini-code">world panel marker camera 3d:editor-camera anchor world-marker w 240 h 48</div>
+            <a class="case-source" href="https://github.com/unco999/Neon3-CiJian/blob/master/crates/neon-ui-runtime/tests/fixtures/ui/world-ui-panel-motion.nui" target="_blank" rel="noopener">world-ui-panel-motion.nui</a>
+          </article>
+        </div>
+
+        <div class="callout warning">
+          <strong>Fixture 验证状态要单独看</strong>
+          用生产 <code>neon3_authoring_probe</code> 直接批量验证当前 <code>tests/fixtures/ui/*.nui</code> 时，<code>data-grid-demo</code>、<code>kanban-reparent-workbench</code>、<code>scroll-view-demo</code>、<code>virtual-list-demo</code> 返回 compiled；<code>asset-review-workbench</code> 和 <code>imgui-component-gallery</code> 目前触发 clip budget，<code>terrain-workbench</code> 缺少 render resource，stress fixture 的第 320 行存在缩进错误。复杂 demo wrapper 会补 preview fallback 或 host resource；不要把“fixture 能被测试文件 parse”误写成“独立 authoring probe 已全链路编译”。
+        </div>
+
+        <h3>已有 headless 渲染证据</h3>
+        <p>仓库已经为基础教程生成了 560×300 的真实渲染图。它们用于视觉辅助，不替代 parser、snapshot、trace 和 revision 验收。</p>
+        <div class="media-strip">
+          <figure class="media-card"><img src="../media/nui-guide/01-minimal.png" alt="最小 NUI Flow 渲染结果" loading="lazy"><figcaption><strong>Minimal</strong>root + text</figcaption></figure>
+          <figure class="media-card"><img src="../media/nui-guide/02-layout.png" alt="row 与 column 布局渲染结果" loading="lazy"><figcaption><strong>Layout</strong>row / column / gap</figcaption></figure>
+          <figure class="media-card"><img src="../media/nui-guide/03-inputs.png" alt="typed input 绑定渲染结果" loading="lazy"><figcaption><strong>Inputs</strong>typed bindings</figcaption></figure>
+          <figure class="media-card"><img src="../media/nui-guide/04-events.png" alt="按钮与 slider 事件渲染结果" loading="lazy"><figcaption><strong>Events</strong>semantic intent</figcaption></figure>
+          <figure class="media-card"><img src="../media/nui-guide/05-scroll.png" alt="滚动容器渲染结果" loading="lazy"><figcaption><strong>Scroll</strong>clip + overflow</figcaption></figure>
+          <figure class="media-card"><img src="../media/nui-guide/06-datagrid.png" alt="DataGrid 渲染结果" loading="lazy"><figcaption><strong>DataGrid</strong>bounded window</figcaption></figure>
+          <figure class="media-card"><img src="../media/nui-guide/07-workbench.png" alt="综合工作台渲染结果" loading="lazy"><figcaption><strong>Workbench</strong>composed Flow</figcaption></figure>
+        </div>
+
+        <h3>案例选择建议</h3>
+        <div class="checklist">
+          <div class="check-row"><div><strong>只需要静态面板</strong><span>从 Minimal → Layout，先确认 root、主轴、尺寸和 clip。</span></div></div>
+          <div class="check-row"><div><strong>需要业务状态</strong><span>从 Typed status → Terrain workbench，练习 input schema、revision 和 domain snapshot。</span></div></div>
+          <div class="check-row"><div><strong>需要很多行</strong><span>从 DataGrid → Virtual list，先理解 bounded frame，再接 window request。</span></div></div>
+          <div class="check-row"><div><strong>需要拖拽改变归属</strong><span>直接读 Kanban；预览在 WGPU，canonical reparent 必须由 domain 接受。</span></div></div>
+          <div class="check-row"><div><strong>需要扩展 renderer</strong><span>读 Image/nine-slice、Canvas、skin 和 geometry/material 的 owner 分工，再检查 capability。</span></div></div>
+        </div>
+      </section>
+
+      <section class="doc-section" id="debug" data-search-section>
+        <div class="section-kicker">13 / Debug &amp; Acceptance</div>
+        <h2>如何验证，而不是凭截图猜成功</h2>
+        <p class="section-intro">NUI 的验证分成 contract、service、GPU、composition 和 rendered 五层。页面本身只展示工具入口；真实功能仍要在对应 runtime 和 host 上运行。</p>
+
+        <h3>推荐验证顺序</h3>
+        <div class="code-wrap">
+          <pre><code># 1. parser / lowering / statechart focused tests
+cargo test -p neon-ui-runtime nui_flow::tests::
+cargo test -p neon-ui-runtime nui_state_machine::tests::
+
+# 2. schema contract
+cargo test -p neon-ui-schema
+
+# 3. machine-readable authoring probe
+cargo run -p neon-ui-runtime --bin neon3_authoring_probe
+
+# 4. complete UI runtime library
+cargo test -p neon-ui-runtime --lib
+
+# 5. source hygiene
+git diff --check</code></pre>
+        </div>
+        <p>要验证最终窗口/共享 surface，再启动所需的 WGPU service，使用 <code>flow_submit_probe</code>、<code>nui_guide_render</code> 或 <code>image_resource_probe</code>；不要让普通 AI client 自己创建窗口或 WGPU resource。</p>
+
+        <h3>Authoring probe 的 JSONL 契约</h3>
+        <div class="code-wrap">
+          <pre><code>{
+  "status": "passed",
+  "input": {
+    "request_id": "guide-1",
+    "operation": "validate",
+    "sequence": 1,
+    "source_bytes": 156
+  },
+  "stage": "compiled",
+  "result": {
+    "surface_id": "demo",
+    "input_schema": {"slots": [{"key":"enabled","kind":{"kind":"bool"}}]},
+    "program": {
+      "node_count": 2,
+      "binding_count": 1,
+      "event_count": 1,
+      "layout_hash": "fnv1a64-...",
+      "nodes": [{"key":"root","kind":"panel"},{"key":"save","kind":"button"}]
+    }
+  }
+}</code></pre>
+        </div>
+        <p>失败记录包含 <code>stage: parse</code> 或 <code>stage: compile</code>、稳定 diagnostic code 和 source span。probe 遇到任意失败时以非零 exit code 结束，适合 CI 和 AI toolchain。</p>
+
+        <h3>常见错误定位</h3>
+        <div class="table-scroll">
+          <table>
+            <thead><tr><th>错误 / 症状</th><th>通常原因</th><th>先查什么</th></tr></thead>
+            <tbody>
+              <tr><td><code>nui_flow_mixed_indentation</code></td><td>缩进不是 2 的倍数</td><td>每个 child level 是否正好多两个空格。</td></tr>
+              <tr><td><code>nui_flow_unknown_component</code></td><td>节点不在 closed vocabulary</td><td>拼写、版本、是否把设计稿组件当成当前 parser 能力。</td></tr>
+              <tr><td><code>nui_flow_unquoted_text</code></td><td>literal value 没有双引号</td><td>包含空格的 value 是否整体 quoted。</td></tr>
+              <tr><td><code>ui_program_input_type_mismatch</code></td><td>属性和 input kind 不兼容</td><td>checked/selected 是否 bool，state 是否 enum，numeric 是否 numeric。</td></tr>
+              <tr><td><code>ui_program_capacity_overflow</code></td><td>实际节点/文字/clip/template 超预算</td><td>budget 与真实 topology，尤其是 stress fixture。</td></tr>
+              <tr><td><code>ui_program_stale_input_revision</code></td><td>host 没有推进 accepted nested input revision</td><td>读取 <code>result.snapshot.scalar_inputs.input_revision</code>，不要读取过时的顶层字段。</td></tr>
+              <tr><td><code>ui_host_grid_unavailable</code></td><td>window request 没有当前 bounded frame</td><td>grid source、list revision、program revision 是否匹配。</td></tr>
+              <tr><td>点击后没有第二次状态</td><td>host completion 排队/未按同一 request 关联</td><td>查 interaction record → UI host stages → command receipt → composition revision。</td></tr>
+              <tr><td>截图有控件但没有数据</td><td>只提交了 topology，没有 text/grid/input publication</td><td>检查 text registry、typed frame、accepted publication 和 final composition。</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>AI / CI 排障链</h3>
+        <div class="code-wrap">
+          <pre><code>request_id
+  -> command journal / debug.command.get
+  -> service snapshot + revision
+  -> async job / host publication
+  -> WGPU render diagnostics
+  -> composition frame sequence
+  -> optional PNG / pixel assertion</code></pre>
+        </div>
+        <div class="checklist">
+          <div class="check-row"><div><strong>contract-ready</strong><span>parser、serde、版本、错误码和类型兼容。</span></div></div>
+          <div class="check-row"><div><strong>service-ready</strong><span>headless runtime 接收 command，发布正确 snapshot/effect。</span></div></div>
+          <div class="check-row"><div><strong>gpu-ready</strong><span>WGPU 应用 command，资源或管线进入 Ready。</span></div></div>
+          <div class="check-row"><div><strong>composition-ready</strong><span>对应 UI/world surface 被挂入最终 composition graph。</span></div></div>
+          <div class="check-row"><div><strong>wgpu-rendered</strong><span>最终 target 有正确 frame sequence 和可验证像素。</span></div></div>
+          <div class="check-row"><div><strong>interactive-accepted</strong><span>最后仍需要人类确认交互、布局、性能和工作流。</span></div></div>
+        </div>
+      </section>
+
+      <section class="doc-section" id="matrix" data-search-section>
+        <div class="section-kicker">14 / Capability Matrix</div>
+        <h2>能力矩阵：当前可以相信什么</h2>
+        <p class="section-intro">“语法可解析”“IR 有字段”“renderer 有代码”“host 已接通”是四件不同的事。下面按当前仓库证据拆开标注。</p>
+        <div class="filter-bar" role="group" aria-label="过滤能力状态">
+          <button class="filter-button is-active" type="button" data-filter="all">全部</button>
+          <button class="filter-button" type="button" data-filter="stable">稳定</button>
+          <button class="filter-button" type="button" data-filter="supported">已覆盖</button>
+          <button class="filter-button" type="button" data-filter="partial">部分</button>
+          <button class="filter-button" type="button" data-filter="design">设计中</button>
+        </div>
+        <div class="matrix-grid" id="capabilityMatrix">
+          <article class="matrix-card" data-status="stable"><span class="status status-stable">稳定</span><strong>parse / validate / lower</strong><p>生产入口是 <code>parse_nui_flow</code>、<code>lower_nui_flow</code> 和 <code>compile_nui_flow_program</code>；source map 与 deterministic diagnostics 已覆盖。</p><a class="evidence" href="https://github.com/unco999/Neon3-CiJian/blob/master/crates/neon-ui-runtime/src/nui_flow.rs" target="_blank" rel="noopener">nui_flow.rs</a></article>
+          <article class="matrix-card" data-status="stable"><span class="status status-stable">稳定</span><strong>布局、标准控件、语义事件</strong><p>panel、text、button、输入控制、numeric/enum binding 与 declared intent 有 parser/runtime/schema 测试。</p><a class="evidence" href="https://github.com/unco999/Neon3-CiJian/blob/master/crates/neon-ui-runtime/src/lib.rs" target="_blank" rel="noopener">runtime compiler/evaluator</a></article>
+          <article class="matrix-card" data-status="supported"><span class="status status-supported">已覆盖</span><strong>scroll / clip / bounded repeat</strong><p>scroll 容器、clip policy、repeat/template capacity 和 overflow summary 已进入 fixture 与 host adapter。</p><a class="evidence" href="https://github.com/unco999/Neon3-CiJian/blob/master/tests/fixtures/ui/scroll-view-demo.nui" target="_blank" rel="noopener">scroll fixture</a></article>
+          <article class="matrix-card" data-status="stable"><span class="status status-stable">稳定</span><strong>DataGrid window</strong><p>grid input、row/cell schema、列 presentation、bounded frame、overscan 和 window request 是独立控制面。</p><a class="evidence" href="https://github.com/unco999/Neon3-CiJian/blob/master/docs/nui-flow-data-grid.md" target="_blank" rel="noopener">DataGrid contract</a></article>
+          <article class="matrix-card" data-status="supported"><span class="status status-supported">已覆盖</span><strong>statechart / motion</strong><p>machine、state、sync、on、style、motion、transition 的 parser 和 headless tests 已存在；数值业务动画仍不由 progress binding 自动产生。</p><a class="evidence" href="https://github.com/unco999/Neon3-CiJian/blob/master/crates/neon-ui-runtime/src/nui_state_machine.rs" target="_blank" rel="noopener">nui_state_machine.rs</a></article>
+          <article class="matrix-card" data-status="supported"><span class="status status-supported">已覆盖</span><strong>drag / drop proposal</strong><p>local drag controller、snap、threshold、boundary、target-owned template 和 placement 已有 fixture；真实 reparent 仍由 domain commit。</p><a class="evidence" href="https://github.com/unco999/Neon3-CiJian/blob/master/tests/fixtures/ui/kanban-reparent-workbench.nui" target="_blank" rel="noopener">Kanban fixture</a></article>
+          <article class="matrix-card" data-status="supported"><span class="status status-supported">已覆盖</span><strong>external image / nine-slice</strong><p>UI forwarder 只转发 upload，WGPU 管 atlas/generation/region/uv；nine-slice 是 renderer-owned visual effect。</p><a class="evidence" href="https://github.com/unco999/Neon3-CiJian/blob/master/crates/neon-ui-runtime/src/bin/image_resource_probe.rs" target="_blank" rel="noopener">image_resource_probe</a></article>
+          <article class="matrix-card" data-status="partial"><span class="status status-partial">部分</span><strong>struct / array / derived</strong><p>schema、parser、packing 和局部 tests 已有；复杂路径的 compiler、host publication、派生重算需要针对实际 integration 再验证。</p><a class="evidence" href="https://github.com/unco999/Neon3-CiJian/blob/master/docs/UPDATE-nui-input-architecture.md" target="_blank" rel="noopener">known limitations</a></article>
+          <article class="matrix-card" data-status="partial"><span class="status status-partial">部分</span><strong>skin / geometry / material</strong><p>skin、cut geometry、material reference 和 shader registration contract 已存在；自定义 shader live compile/bind 仍需 capability 与 renderer acceptance。</p><a class="evidence" href="https://github.com/unco999/Neon3-CiJian/blob/master/docs/NUI_CUSTOM_SHADER_AND_GEOMETRY.md" target="_blank" rel="noopener">shader contract</a></article>
+          <article class="matrix-card" data-status="partial"><span class="status status-partial">部分</span><strong>world panel</strong><p>camera gate、anchor declaration、world bridge schema 和 fixture 存在；真实外部 host 的 camera/anchor 数据面需单独验证。</p><a class="evidence" href="https://github.com/unco999/Neon3-CiJian/blob/master/docs/nui-flow-reference-and-bevy-status-debug.md#world-panels" target="_blank" rel="noopener">world panel notes</a></article>
+          <article class="matrix-card" data-status="design"><span class="status status-design">设计中</span><strong>丰富主题 token / arbitrary skin slots</strong><p>当前 Flow 对 token/ink 主要做引用校验，设计稿中的 icon、content padding、theme registry 和更丰富状态 fallback 不能直接当成稳定 V1 grammar。</p><a class="evidence" href="https://github.com/unco999/Neon3-CiJian/blob/master/docs/NUI_COMPONENT_SKIN_DESIGN.md" target="_blank" rel="noopener">skin design</a></article>
+          <article class="matrix-card" data-status="design"><span class="status status-design">设计中</span><strong>复杂表达式 / 动态无限拓扑</strong><p>任意函数、循环、过滤、排序、条件组合、无限列表和 runtime code generation 都明确不属于 NUI Flow V1。</p><a class="evidence" href="https://github.com/unco999/Neon3-CiJian/blob/master/docs/nui-flow-ai-authoring.md#ai-boundaries" target="_blank" rel="noopener">AI boundaries</a></article>
+        </div>
+      </section>
+
+      <section class="doc-section" id="appendix" data-search-section>
+        <div class="section-kicker">15 / Appendix</div>
+        <h2>写作速查与源码证据</h2>
+        <p class="section-intro">把这一节当作提交前的 checklist。完整语义以代码和测试为准；旧报告中与当前 parser 冲突的内容应以本页的状态标记和最新 fixture 为准。</p>
+
+        <div class="two-column">
+          <div>
+            <h3>新写一个 Flow 的顺序</h3>
+            <div class="checklist">
+              <div class="check-row"><div><strong>1. 先定 owner</strong><span>哪些是 domain facts，哪些只是 UI-local presentation。</span></div></div>
+              <div class="check-row"><div><strong>2. 列出 inputs</strong><span>每个外部值给出 kind、默认值和必要的 range。</span></div></div>
+              <div class="check-row"><div><strong>3. 画静态 topology</strong><span>所有 node key 稳定、唯一、有界，容器尺寸明确。</span></div></div>
+              <div class="check-row"><div><strong>4. 加 binding</strong><span>只使用兼容属性；复杂条件先由 domain 计算成 bool/enum。</span></div></div>
+              <div class="check-row"><div><strong>5. 加 semantic intent</strong><span>使用领域词，不把 button 编号、坐标或 renderer ID 带出去。</span></div></div>
+              <div class="check-row"><div><strong>6. parse → compile → probe</strong><span>先 headless，再接 service，再做 GPU/composition capture。</span></div></div>
+            </div>
+          </div>
+          <div>
+            <h3>关键入口</h3>
+            <div class="table-scroll">
+              <table class="compact-table">
+                <thead><tr><th>需求</th><th>入口</th></tr></thead>
+                <tbody>
+                  <tr><td>解析 Flow</td><td><code>neon_ui_runtime::parse_nui_flow</code></td></tr>
+                  <tr><td>格式化</td><td><code>format_nui_flow</code>（语义格式化，不保证完整 source round-trip）</td></tr>
+                  <tr><td>降低为 IR</td><td><code>lower_nui_flow</code></td></tr>
+                  <tr><td>编译 program</td><td><code>compile_nui_flow_program</code></td></tr>
+                  <tr><td>Patch</td><td><code>parse_nui_flow_patch</code> / <code>apply_nui_ir_patch</code></td></tr>
+                  <tr><td>本地状态机</td><td><code>NuiFlowStateMachineRuntime</code></td></tr>
+                  <tr><td>调试/回放</td><td><code>UiDebugSession</code> APIs</td></tr>
+                  <tr><td>AI/CI authoring</td><td><code>neon3_authoring_probe</code></td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
+        <h3>源码与文档入口</h3>
+        <div class="table-scroll">
+          <table>
+            <thead><tr><th>主题</th><th>推荐阅读</th><th>用途</th></tr></thead>
+            <tbody>
+              <tr><td>完整 V1 grammar</td><td><a href="../nui-flow-ai-authoring.md">docs/nui-flow-ai-authoring.md</a> · <a href="../../plan/neon3-nui-flow.md">plan/neon3-nui-flow.md</a></td><td>AI authoring contract 与规范 grammar。</td></tr>
+              <tr><td>parser / lowerer</td><td><a href="https://github.com/unco999/Neon3-CiJian/blob/master/crates/neon-ui-runtime/src/nui_flow.rs" target="_blank" rel="noopener">crates/neon-ui-runtime/src/nui_flow.rs</a></td><td>当前真实可解析 token、diagnostic 和 lowering。</td></tr>
+              <tr><td>schema</td><td><a href="https://github.com/unco999/Neon3-CiJian/blob/master/crates/neon-ui-schema/src/lib.rs" target="_blank" rel="noopener">crates/neon-ui-schema/src/lib.rs</a></td><td>公共类型、IR、effect、DataGrid、skin、revision。</td></tr>
+              <tr><td>state machine</td><td><a href="https://github.com/unco999/Neon3-CiJian/blob/master/crates/neon-ui-runtime/src/nui_state_machine.rs" target="_blank" rel="noopener">nui_state_machine.rs</a></td><td>transition、motion、drag/drop controller 的 headless 行为。</td></tr>
+              <tr><td>DataGrid</td><td><a href="../nui-flow-data-grid.md">docs/nui-flow-data-grid.md</a></td><td>window frame、cell presentations 和 host adapter。</td></tr>
+              <tr><td>AI 调试</td><td><a href="../ai-debug-workflow.md">docs/ai-debug-workflow.md</a> · <a href="../neon3-ai-authoring-integration.md">authoring integration</a></td><td>snapshot、trace、probe、revision 排障路径。</td></tr>
+              <tr><td>完整 fixture</td><td><a href="https://github.com/unco999/Neon3-CiJian/tree/master/tests/fixtures/ui" target="_blank" rel="noopener">tests/fixtures/ui/</a></td><td>从基础控件到综合工作台的实际案例。</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout"><strong>一句话记忆</strong>input slot 负责“进来什么”，stable key 负责“是谁”，Flow 负责“怎么排列和声明意图”，domain 负责“事实和写入”，WGPU 负责“怎么画和怎么即时响应”。</div>
+      </section>
+
+      <footer class="footer">
+        <p>NUI Flow / Neon3 · 本页基于当前仓库的 V1 grammar、schema、runtime tests、fixtures 和 probes 整理。页面不是独立实现；真实行为以对应版本的源码与验收结果为准。</p>
+        <div class="footer-links">
+          <a href="#start">回到开始</a>
+          <a href="https://github.com/unco999/Neon3-CiJian" target="_blank" rel="noopener">查看仓库</a>
+        </div>
+      </footer>
+    </main>
+  </div>
+
+  <script src="app.js" defer></script>
+</body>
+</html>

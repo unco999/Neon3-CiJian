@@ -7435,6 +7435,7 @@ mod tests {
             geometry_records: BTreeMap::new(),
             material_records: BTreeMap::new(),
             composition_layer_records: BTreeMap::new(),
+            context_menu_records: BTreeMap::new(),
             shader_packages: Vec::new(),
             branches: Vec::new(),
             templates: Vec::new(),

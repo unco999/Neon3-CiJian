@@ -8,6 +8,8 @@
 <p align="center"><strong>独立 UI 渲染 Runtime、进程架构与公共协议</strong><br />
 窗口与 GPU 由 Neon3 Runtime 统一负责；应用可以使用任意语言通过公共协议提交 UI、状态和交互。</p>
 
+<p align="center"><a href="https://unco999.github.io/Neon3-CiJian/nui-flow/"><strong>NUI Flow 文档站</strong></a> · 从语法、数据绑定和组件案例到运行原理与验收</p>
+
 <p align="center"><img src="readme.png" width="1120" alt="Neon3 Runtime 与协议总览" /></p>
 
 ## 从案例开始
