@@ -2,6 +2,39 @@
 
 All notable changes to Neon3 are recorded in this file.
 
+## v0.2.8 — 2026-09-12
+
+### Added
+
+- **Splitter component with real-time drag resizing.** The new SplitterDrag state machine modifies sampled target bounds directly, so sampling, inherited transforms, hit-testing, and vertex submission all see drag geometry consistently. Drag position is computed from pointer offset rather than ratio, eliminating flicker. On release, the final position is persisted and re-applied each frame.
+- **ContextMenu component with pointer-anchored popup.** NUI components can declare context_menu <menu_id>; right-clicking opens the referenced context_menu node at the pointer position. ContextMenu nodes are always included in the flatten pass, marked as top-layer (no parent clipping, rendered above all normal content), and bounds preserved through layout.
+- **Skin capability expanded to 19 component types.** dialog, context_menu, splitter, combo, dropdown, tabs, selectable, list_box, drag_value now accept skin references. Schema, NUI parser, and renderer extended in sync.
+- **Skin visual-state expansion.** Scrollbar track/thumb support Normal/Hover/Pressed. Checkbox/RadioButton body support Normal/Hover/Pressed/Disabled. Button/Slider slot selection includes Disabled fallback.
+- **Multi-skin component showcase.** component-showcase displays multiple skin variants for Slider, Checkbox, ProgressBar, Input, Scrollbar, RadioButton, Tooltip.
+
+### Changed
+
+- resolve_children no longer forces zero bounds on invisible ContextMenu nodes.
+- top_layer_roots now recognizes ContextMenu alongside Tooltip/Modal/Dialog.
+- flatten_node includes ContextMenu nodes even when visible=false.
+
+### Fixed
+
+- Splitter drag updates in real time (previously required mouse release).
+- Splitter drag direction reversed; pointer offset now maps correctly.
+- Splitter left panel resizes in sync with right panel during drag.
+- Splitter pressed-state no longer disappears while left button is held.
+- Text in zero-width panels no longer pops in/out unexpectedly.
+- ContextMenu popup now occludes content behind it.
+- ContextMenu child nodes follow parent to pointer position.
+
+### Verification
+
+- cargo build --release passes for full workspace (Windows x86_64).
+- showcase_probe launches and renders all skin variants; Splitter drag resizes both panels in real time and persists on release.
+- Right-click opens ContextMenu at pointer position, rendered above all content.
+- Checkbox/RadioButton/Scrollbar hover and pressed states respond to pointer interaction.
+
 ## v0.2.5 — 2026-09-04
 
 ### Added
