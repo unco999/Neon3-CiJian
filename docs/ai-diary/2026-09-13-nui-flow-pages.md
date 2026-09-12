@@ -80,3 +80,13 @@ status: completed
 - 相对链接检查：66 个链接，`status=passed`。
 - 本地 `python -m http.server`：`/nui-flow/`、`styles.css`、`app.js`、`01-minimal.png`、`07-workbench.png` 均返回 HTTP 200。
 - `git diff --check`：通过；Git 只提示现有文件的 LF/CRLF 转换 warning，没有 whitespace failure。
+
+## Commit / Pages 部署追踪
+
+- 初始提交：`e17740e docs: add NUI Flow GitHub Pages guide`。
+- 第一次 HTTPS push 被 GitHub 拒绝：OAuth token 没有 `workflow` scope；`gh auth refresh -h github.com -s workflow` 又因 device authorization 网络连接失败。
+- `ssh -T git@github.com` 验证账号成功后，使用临时 SSH remote URL 推送，没有修改 `origin` 配置。
+- 首次 workflow run `34718217618` 失败，原因是仓库 Pages 尚未启用，`actions/configure-pages@v5` 返回 404。
+- 通过 `gh api --method POST repos/unco999/Neon3-CiJian/pages -f build_type=workflow` 成功启用 Pages，并提交 `3af46be ci: enable GitHub Pages deployment`，打开 `enablement: true`。
+- 第二次 workflow run `34718302057` 成功，GitHub 返回 Pages 根地址 `https://unco999.github.io/Neon3-CiJian/`。
+- 云端验收实际请求 `https://unco999.github.io/Neon3-CiJian/nui-flow/`、`styles.css`、`app.js` 和 `media/nui-guide/01-minimal.png`：全部 HTTP 200；HTML 中的 `NUI FLOW`、`受限富文本`、`Fixture 验证状态要单独看`、`能力矩阵`、`neon3_authoring_probe` 五个标记均存在。
