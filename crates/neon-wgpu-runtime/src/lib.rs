@@ -2144,7 +2144,7 @@ impl WindowedRuntime {
                 "Neon3 - WGPU Runtime (epoch {}) - Ctrl+O: Open image",
                 self.epoch
             ))
-            .with_inner_size(PhysicalSize::new(1280, 800))
+            .with_inner_size(PhysicalSize::new(1280, 1024))
             .with_transparent(backdrop.requests_transparency())
             .with_no_redirection_bitmap(backdrop.requests_transparency())
             .with_decorations(!matches!(
