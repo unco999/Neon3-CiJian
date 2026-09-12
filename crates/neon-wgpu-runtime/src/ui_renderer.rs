@@ -1517,6 +1517,8 @@ pub struct UiWgpuRenderer {
     context_menu_anchor: Option<[f32; 2]>,
     /// Maps host node path -> bound ContextMenu node key.
     context_menu_bindings: HashMap<String, String>,
+    /// The currently visible context menu ID (only one shown at a time).
+    active_context_menu_id: Option<String>,
     /// Active splitter drag state, if any.
     splitter_drag: Option<SplitterDrag>,
     /// Persistent splitter positions (x coordinate) keyed by splitter node path.
@@ -2376,6 +2378,7 @@ impl UiWgpuRenderer {
             context_menus_visible: false,
             context_menu_anchor: None,
             context_menu_bindings: HashMap::new(),
+            active_context_menu_id: None,
             splitter_drag: None,
             splitter_positions: HashMap::new(),
             builtin_numerics: HashMap::new(),
@@ -3858,7 +3861,10 @@ impl UiWgpuRenderer {
 
     /// Show all context menus (built-in right-click). Uses a global flag
     /// because hidden menus aren't in the plan during filtering.
-    pub(crate) fn show_context_menus(&mut self) {
+    /// Show a specific context menu at the pointer position. Only the menu
+    /// with the matching ID is rendered; all other ContextMenu nodes stay hidden.
+    pub(crate) fn show_context_menu(&mut self, menu_id: String) {
+        self.active_context_menu_id = Some(menu_id);
         self.context_menus_visible = true;
         self.context_menu_anchor = self.pointer_position;
         self.pointer_visual_dirty = true;
@@ -3867,6 +3873,7 @@ impl UiWgpuRenderer {
     /// Find the context menu bound to the node under the pointer (or ancestor).
     pub(crate) fn context_menu_at_pointer(&self) -> Option<String> {
         let pointer = self.pointer_position?;
+        println!("[ctx-menu] pointer=({:.1},{:.1}), bindings={:?}", pointer[0], pointer[1], self.context_menu_bindings.keys().collect::<Vec<_>>());
         let hit_index = self.plan.iter().enumerate().rev().find_map(|(index, node)| {
             let b = node.target.bounds;
             if pointer[0] >= b.x && pointer[0] <= b.x + b.width
@@ -3877,15 +3884,19 @@ impl UiWgpuRenderer {
                 None
             }
         })?;
+        println!("[ctx-menu] hit_index={}, hit_id={}", hit_index, self.plan[hit_index].id);
         let mut current = Some(hit_index);
         while let Some(idx) = current {
             let node = &self.plan[idx];
+            println!("[ctx-menu] walk: id={}, parent={:?}", node.id, node.parent_id);
             if let Some(menu_id) = self.context_menu_bindings.get(&node.id) {
+                println!("[ctx-menu] FOUND binding: {} -> {}", node.id, menu_id);
                 return Some(menu_id.clone());
             }
             current = node.parent_id.as_deref()
                 .and_then(|pid| self.plan.iter().position(|n| n.id == pid));
         }
+        println!("[ctx-menu] NO binding found in ancestor chain");
         None
     }
 
@@ -3893,6 +3904,7 @@ impl UiWgpuRenderer {
     pub(crate) fn hide_context_menus(&mut self) {
         if self.context_menus_visible {
             self.context_menus_visible = false;
+            self.active_context_menu_id = None;
             self.pointer_visual_dirty = true;
         }
     }
@@ -7219,13 +7231,30 @@ impl UiWgpuRenderer {
             .map(|(id, pid, _, _)| (id.clone(), pid.clone()))
             .collect();
         // Collect IDs of hidden context menus for descendant filtering.
+        // Only the active context menu is visible; all others are hidden.
+        // Active ID may be stored without fragment prefix, so match by suffix.
+        let active_suffix = self.active_context_menu_id.as_deref()
+            .map(|active| format!("/{}", active));
+        let is_active_ctx = |id: &str| -> bool {
+            self.active_context_menu_id.as_deref().map_or(false, |active| {
+                id == active || active_suffix.as_deref().map_or(false, |suf| id.ends_with(suf))
+            })
+        };
         let hidden_ctx_ids: std::collections::HashSet<String> = nodes.iter()
             .filter(|(id, _, target, _)| {
                 matches!(target.kind, UiNodeKind::ContextMenu)
-                    && !self.context_menus_visible
+                    && (!self.context_menus_visible || !is_active_ctx(id))
             })
             .map(|(id, _, _, _)| id.clone())
             .collect();
+        if self.context_menus_visible {
+            let ctx_nodes: Vec<_> = nodes.iter()
+                .filter(|(_, _, t, _)| matches!(t.kind, UiNodeKind::ContextMenu))
+                .map(|(id, _, t, _)| (id.clone(), t.bounds))
+                .collect();
+            println!("[ctx-filter] visible={}, active={:?}, suffix={:?}, ctx_nodes={:?}, hidden={:?}",
+                self.context_menus_visible, self.active_context_menu_id, active_suffix, ctx_nodes, hidden_ctx_ids);
+        }
         let is_ctx_hidden = |id: &str| -> bool {
             let mut current = Some(id.to_string());
             while let Some(cid) = current {
@@ -7264,10 +7293,17 @@ impl UiWgpuRenderer {
         for (id, parent_id, mut target, transition) in nodes {
             // Skip hidden context menus and all their descendants.
             if is_ctx_hidden(&id) {
+                if matches!(target.kind, UiNodeKind::ContextMenu) {
+                    println!("[ctx-filter] SKIP ctx node: {}", id);
+                }
                 continue;
             }
             // Move visible context menu and descendants to anchor position.
             if let Some((dx, dy)) = ctx_delta_for(&id) {
+                if matches!(target.kind, UiNodeKind::ContextMenu) {
+                    println!("[ctx-filter] KEEP ctx node: {}, bounds=({:.0},{:.0},{:.0},{:.0}), delta=({:.0},{:.0})",
+                        id, target.bounds.x, target.bounds.y, target.bounds.width, target.bounds.height, dx, dy);
+                }
                 target.bounds.x += dx;
                 target.bounds.y += dy;
             }
@@ -10266,7 +10302,7 @@ fn top_layer_roots(plan: &[PlannedNode], indices: &HashMap<&str, usize>) -> Vec<
         roots[index] = if node.target.world_depth.is_none()
             && matches!(
                 node.target.kind,
-                UiNodeKind::Tooltip | UiNodeKind::Modal | UiNodeKind::Dialog
+                UiNodeKind::Tooltip | UiNodeKind::Modal | UiNodeKind::Dialog | UiNodeKind::ContextMenu
             ) {
             Some(index)
         } else {
@@ -11174,7 +11210,7 @@ fn flatten_node(
     let top_layer = inherited_top_layer
         || matches!(
             node.kind,
-            UiNodeKind::Tooltip | UiNodeKind::Modal | UiNodeKind::Dialog
+            UiNodeKind::Tooltip | UiNodeKind::Modal | UiNodeKind::Dialog | UiNodeKind::ContextMenu
         );
     let own_clip = if top_layer {
         None
@@ -11201,7 +11237,12 @@ fn flatten_node(
         width: 2_000_000.0,
         height: 2_000_000.0,
     });
-    if !node.visible || hidden_world_nodes.contains(node.node_id.0.as_str()) {
+    // ContextMenu nodes are always included in the flattened list; their
+    // actual visibility is controlled by the active_context_menu_id filter
+    // that runs after flattening. Other invisible nodes are skipped here.
+    if (!node.visible && !matches!(node.kind, UiNodeKind::ContextMenu))
+        || hidden_world_nodes.contains(node.node_id.0.as_str())
+    {
         return;
     }
     if node.style.opacity > 0.0 {
@@ -11604,7 +11645,7 @@ fn resolve_children(
         .iter()
         .enumerate()
         .map(|(index, child)| {
-            if !child.visible {
+            if !child.visible && !matches!(child.kind, UiNodeKind::ContextMenu) {
                 return UiBounds {
                     x: inner.x,
                     y: inner.y,
@@ -13263,7 +13304,7 @@ mod tests {
             if spec.capabilities.top_layer {
                 assert!(matches!(
                     kind,
-                    UiNodeKind::Tooltip | UiNodeKind::Modal | UiNodeKind::Dialog
+                    UiNodeKind::Tooltip | UiNodeKind::Modal | UiNodeKind::Dialog | UiNodeKind::ContextMenu
                 ));
             }
         }

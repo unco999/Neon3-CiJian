@@ -8238,11 +8238,15 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                 if let Ok(mut camera) = self.world_ui_lab_camera.lock() {
                     camera.set_drag(winit::event::MouseButton::Right, true);
                 }
-                // Built-in context menu: show only if node under pointer has binding
+                // Built-in context menu: show only the menu bound to the node under pointer
                 if let Some(gpu) = self.gpu.as_mut() {
-                    if gpu.ui.context_menu_at_pointer().is_some() {
-                        gpu.ui.show_context_menus();
+                    println!("[ctx-menu] right-click pressed, checking pointer");
+                    if let Some(menu_id) = gpu.ui.context_menu_at_pointer() {
+                        println!("[ctx-menu] showing menu: {}", menu_id);
+                        gpu.ui.show_context_menu(menu_id);
                         self.redraw_pending = true;
+                    } else {
+                        println!("[ctx-menu] no binding found");
                     }
                 }
             }
