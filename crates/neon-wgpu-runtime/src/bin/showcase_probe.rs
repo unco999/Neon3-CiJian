@@ -372,6 +372,9 @@ struct AppState {
     skin_radio_circle: bool,
     skin_radio_card: bool,
     tree: TreeState,
+    acc_general: bool,
+    acc_advanced: bool,
+    acc_about: bool,
 }
 
 impl AppState {
@@ -393,6 +396,9 @@ impl AppState {
             skin_radio_circle: false,
             skin_radio_card: true,
             tree: TreeState::new(),
+            acc_general: true,
+            acc_advanced: false,
+            acc_about: false,
         }
     }
 
@@ -498,6 +504,37 @@ impl AppState {
         if node.node_id.0 == "demo-context" {
             node.visible = self.context_menu_visible;
         }
+        // Accordion expand/collapse
+        if node.node_id.0 == "acc-general-content" {
+            node.visible = self.acc_general;
+        }
+        if node.node_id.0 == "acc-advanced-content" {
+            node.visible = self.acc_advanced;
+        }
+        if node.node_id.0 == "acc-about-content" {
+            node.visible = self.acc_about;
+        }
+        if node.node_id.0 == "acc-h1" {
+            if let Some(text) = &mut node.text {
+                *text = TextRef::Literal {
+                    value: if self.acc_general { "▼ General Settings" } else { "▶ General Settings" }.into(),
+                };
+            }
+        }
+        if node.node_id.0 == "acc-h2" {
+            if let Some(text) = &mut node.text {
+                *text = TextRef::Literal {
+                    value: if self.acc_advanced { "▼ Advanced Options" } else { "▶ Advanced Options" }.into(),
+                };
+            }
+        }
+        if node.node_id.0 == "acc-h3" {
+            if let Some(text) = &mut node.text {
+                *text = TextRef::Literal {
+                    value: if self.acc_about { "▼ About" } else { "▶ About" }.into(),
+                };
+            }
+        }
         // Button text shows click count
         if node.node_id.0 == "btn-demo" && self.click_count > 0 {
             if let Some(text) = &mut node.text {
@@ -562,6 +599,9 @@ impl AppState {
             "demo.tree.docs" | "demo.tree.cases" | "demo.tree.schema" | "demo.tree.runtime" | "demo.tree.wgpu" => {
                 println!("[tree] leaf: {action}");
             }
+            "demo.acc.general" => { self.acc_general = !self.acc_general; println!("[acc] general={}", self.acc_general); }
+            "demo.acc.advanced" => { self.acc_advanced = !self.acc_advanced; println!("[acc] advanced={}", self.acc_advanced); }
+            "demo.acc.about" => { self.acc_about = !self.acc_about; println!("[acc] about={}", self.acc_about); }
             _ => println!("[unknown] {action}"),
         }
     }

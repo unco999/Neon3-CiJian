@@ -369,14 +369,23 @@ surface showcase overlay w 1200 h 1000 align stretch fill #0D1117
       text mb-help x 212 y 4 w 60 h 24 value "Help" event demo.mb.help
 
     # Accordion - 折叠面板
-    text accordion-label h 24 value "Accordion"
-    accordion demo-accordion w 344 h 120
-      panel acc-item-1 x 0 y 0 w 344 h 36 fill #161B22
+    text accordion-label h 24 value "Accordion (click header to expand)"
+    accordion demo-accordion w 344 h 280
+      panel acc-general-header x 0 y 0 w 344 h 36 fill #161B22
         text acc-h1 x 8 y 6 w 328 h 24 value "▼ General Settings" event demo.acc.general
-      panel acc-item-2 x 0 y 36 w 344 h 36 fill #161B22
+      panel acc-general-content x 0 y 36 w 344 h 60 fill #0D1117
+        text acc-general-text x 12 y 8 w 320 h 20 value "Theme: Dark"
+        text acc-general-text2 x 12 y 32 w 320 h 20 value "Language: English"
+      panel acc-advanced-header x 0 y 96 w 344 h 36 fill #161B22
         text acc-h2 x 8 y 6 w 328 h 24 value "▶ Advanced Options" event demo.acc.advanced
-      panel acc-item-3 x 0 y 72 w 344 h 36 fill #161B22
+      panel acc-advanced-content x 0 y 132 w 344 h 60 fill #0D1117
+        text acc-adv-text x 12 y 8 w 320 h 20 value "GPU Acceleration: On"
+        text acc-adv-text2 x 12 y 32 w 320 h 20 value "VSync: Enabled"
+      panel acc-about-header x 0 y 192 w 344 h 36 fill #161B22
         text acc-h3 x 8 y 6 w 328 h 24 value "▶ About" event demo.acc.about
+      panel acc-about-content x 0 y 228 w 344 h 48 fill #0D1117
+        text acc-about-text x 12 y 8 w 320 h 20 value "Neon3 UI Framework"
+        text acc-about-text2 x 12 y 30 w 320 h 20 value "Version 0.2.8"
 
     # Spinner - 加载指示器
     text spinner-label h 24 value "Spinner (loading)"
