@@ -136,7 +136,7 @@ surface showcase overlay w 1200 h 800 align stretch fill #0D1117
 
       panel split-left w 140 h 120 fill #1F6FEB33
         text split-left-label h 24 value "Left Pane"
-      splitter split-h w 4 h 120
+      splitter split-h w 4 h 120 event demo.splitter.toggle
       panel split-right w 196 h 120 fill #1F6FEB22
         text split-right-label h 24 value "Right Pane"
 
@@ -151,7 +151,7 @@ surface showcase overlay w 1200 h 800 align stretch fill #0D1117
     # TreeView (hierarchical, uses tree_view component)
     text tree-label h 24 value "TreeView (hierarchical structure)"
     tree_view demo-tree x 0 y 400 w 340 h 200
-      text tree-root x 8 y 8 w 324 h 24 value "▼ project/" event demo.tree.root
+      text tree-root x 8 y 20 w 324 h 24 value "▼ project/" event demo.tree.root
       text tree-crate-1 x 24 y 36 w 308 h 24 value "▼ crates/" event demo.tree.crates
       text tree-crate-2 x 40 y 64 w 292 h 24 value "neon-ui-schema" event demo.tree.schema
       text tree-crate-3 x 40 y 92 w 292 h 24 value "neon-ui-runtime" event demo.tree.runtime

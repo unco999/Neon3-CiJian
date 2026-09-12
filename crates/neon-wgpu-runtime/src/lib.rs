@@ -1478,6 +1478,54 @@ impl ShellWindowFit {
 
 /// The only process-local home for Winit and WGPU objects in Neon3.
 /// Domain runtimes communicate with this process through the public RPC protocol.
+/// Built-in component interaction state store.
+///
+/// Holds renderer-local state for components whose fixed interactions
+/// (checkbox toggle, radio select, slider drag, tree expand/collapse)
+/// are handled inside the WGPU runtime instead of requiring an external
+/// UI runtime. Values are keyed by node_path (fragment_id/node_id).
+#[derive(Default, Clone)]
+pub struct ComponentStateStore {
+    /// node_path -> boolean (Checkbox/Radio/Tree expanded)
+    pub toggles: std::collections::HashMap<String, bool>,
+    /// node_path -> (value, min, max) (Slider/Scrollbar/Progress)
+    pub numerics: std::collections::HashMap<String, (f32, f32, f32)>,
+    /// node_path -> text value (TextInput)
+    pub texts: std::collections::HashMap<String, String>,
+    /// node_path -> selected index (Tabs/ListBox/Combo)
+    pub selections: std::collections::HashMap<String, i32>,
+    /// node_path -> visibility (ContextMenu/Dropdown popup)
+    pub visibilities: std::collections::HashMap<String, bool>,
+}
+
+impl ComponentStateStore {
+    pub fn new() -> Self { Self::default() }
+
+    /// Toggle a boolean value, returning the new value.
+    pub fn toggle(&mut self, key: &str, default: bool) -> bool {
+        let current = self.toggles.get(key).copied().unwrap_or(default);
+        let new = !current;
+        self.toggles.insert(key.to_string(), new);
+        new
+    }
+
+    pub fn set_toggle(&mut self, key: &str, value: bool) {
+        self.toggles.insert(key.to_string(), value);
+    }
+
+    pub fn get_toggle(&self, key: &str, default: bool) -> bool {
+        self.toggles.get(key).copied().unwrap_or(default)
+    }
+
+    pub fn set_numeric(&mut self, key: &str, value: f32, min: f32, max: f32) {
+        self.numerics.insert(key.to_string(), (value, min, max));
+    }
+
+    pub fn get_numeric(&self, key: &str) -> Option<(f32, f32, f32)> {
+        self.numerics.get(key).copied()
+    }
+}
+
 pub struct WindowedRuntime {
     epoch: u64,
     gpu: Option<WindowGpu>,
@@ -1514,6 +1562,8 @@ pub struct WindowedRuntime {
     /// `resumed`; an SDK opens the surface explicitly via
     /// `android.host.open_surface` / `wgpu.ui.render_surface.open`.
     lazy_surface: bool,
+    /// Built-in component interaction state (checkbox toggle, slider value, etc.).
+    component_states: ComponentStateStore,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1900,6 +1950,7 @@ impl WindowedRuntime {
             next_file_drop_sequence: 0,
             world_ui_lab_camera: Arc::new(Mutex::new(WorldUiLabCameraController::default())),
             lazy_surface: false,
+            component_states: ComponentStateStore::new(),
         }
     }
 
@@ -8020,9 +8071,13 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                     {
                         gpu.input.set_hover_id(Some(0));
                         let _ = gpu.input.pointer_down();
-                        gpu.captured_binding = Some(binding);
+                        gpu.captured_binding = Some(binding.clone());
                         gpu.active_interaction_id = Some(interaction_id.clone());
-                        gpu.pending_control_value = Some(value);
+                        gpu.pending_control_value = Some(value.clone());
+                        // Persist choice selection to built-in state
+                        if let neon_ui_schema::UiSemanticPayloadValue::Enum { value: v } = &value {
+                            gpu.ui.set_choice(&binding.node_path, v);
+                        }
                         let binding = gpu
                             .captured_binding
                             .clone()

@@ -1472,6 +1472,14 @@ pub struct UiWgpuRenderer {
     drag_offsets: HashMap<String, [f32; 2]>,
     value_gesture: Option<UiValueGesture>,
     value_previews: HashMap<String, UiSemanticPayloadValue>,
+    /// Persistent built-in component interaction state (checkbox toggle, etc.).
+    /// These values survive fragment re-submissions and override fragment
+    /// ControlPresentation during rendering.
+    builtin_toggles: HashMap<String, bool>,
+    /// Persistent built-in numeric state (slider value, scroll position).
+    builtin_numerics: HashMap<String, (f32, f32, f32)>,
+    /// Persistent built-in choice selection (ListBox/Tabs/Combo/Dropdown).
+    builtin_choices: HashMap<String, String>,
     pending_local_presentations:
         HashMap<PendingLocalPresentationKey, PendingLocalPresentationCommit>,
     open_dropdown: Option<String>,
@@ -2318,6 +2326,9 @@ impl UiWgpuRenderer {
             drag_offsets: HashMap::new(),
             value_gesture: None,
             value_previews: HashMap::new(),
+            builtin_toggles: HashMap::new(),
+            builtin_numerics: HashMap::new(),
+            builtin_choices: HashMap::new(),
             pending_local_presentations: HashMap::new(),
             open_dropdown: None,
             scroll_offsets: HashMap::new(),
@@ -2660,6 +2671,45 @@ impl UiWgpuRenderer {
                 inherited_scroll_clip
             };
             subtree_opacity[index] = inherited_opacity * own_opacity;
+        }
+        // Apply persistent built-in choice selection (ListBox/Tabs/Combo/Dropdown).
+        for (index, node) in self.plan.iter().enumerate() {
+            let Some(selected) = self.builtin_choices.get(&node.id) else {
+                continue;
+            };
+            if !matches!(node.target.kind, UiNodeKind::ListBox | UiNodeKind::Tabs | UiNodeKind::Combo | UiNodeKind::Dropdown) {
+                continue;
+            }
+            if let Some(UiControlPresentation::Choice { options, .. }) = &self.sampled[index].presentation {
+                self.sampled[index].presentation = Some(UiControlPresentation::Choice {
+                    token: selected.clone(),
+                    options: options.clone(),
+                    selected: true,
+                });
+            }
+        }
+        // Apply persistent built-in numeric state (slider value, scroll position).
+        // These survive fragment re-submissions. Transient value_previews (drag
+        // in progress) override these in the loop below.
+        for (index, node) in self.plan.iter().enumerate() {
+            let Some(&(value, min, max)) = self.builtin_numerics.get(&node.id) else {
+                continue;
+            };
+            if !matches!(node.target.kind, UiNodeKind::Slider | UiNodeKind::DragValue | UiNodeKind::Scrollbar | UiNodeKind::ProgressBar) {
+                continue;
+            }
+            if let Some(UiControlPresentation::Numeric { .. }) = &self.sampled[index].presentation {
+                self.sampled[index].presentation = Some(UiControlPresentation::Numeric {
+                    value,
+                    min,
+                    max,
+                });
+            }
+            if let Some(UiControlPresentation::Scroll { .. }) = &self.sampled[index].presentation {
+                self.sampled[index].presentation = Some(UiControlPresentation::Scroll {
+                    position: value,
+                });
+            }
         }
         // Local numeric gestures update the renderer presentation before an
         // authoritative fragment revision arrives. Apply that preview to the
@@ -3391,6 +3441,15 @@ impl UiWgpuRenderer {
     ) -> Option<(UiSemanticPayloadValue, LocalPresentationCommit)> {
         let gesture = self.value_gesture.take()?;
         let value = self.value_previews.get(&gesture.node_path)?.clone();
+        // Persist numeric value to built-in state (survives fragment re-submission)
+        if let UiSemanticPayloadValue::F32 { value: v } = &value {
+            self.builtin_numerics
+                .insert(gesture.node_path.clone(), (*v, gesture.min, gesture.max));
+        }
+        if let UiSemanticPayloadValue::I32 { value: v } = &value {
+            self.builtin_numerics
+                .insert(gesture.node_path.clone(), (*v as f32, gesture.min, gesture.max));
+        }
         Some((
             value.clone(),
             LocalPresentationCommit::Value {
@@ -3426,7 +3485,11 @@ impl UiWgpuRenderer {
                 Some(UiControlPresentation::Toggle { selected }) => Some(*selected),
                 _ => None,
             })?;
-        let value = UiSemanticPayloadValue::Bool { value: !selected };
+        let new_selected = !selected;
+        let value = UiSemanticPayloadValue::Bool { value: new_selected };
+        // Persist to built-in state (survives fragment re-submission)
+        self.builtin_toggles.insert(node_path.to_owned(), new_selected);
+        // Also set transient preview for immediate visual feedback
         self.value_previews
             .insert(node_path.to_owned(), value.clone());
         self.pointer_visual_dirty = true;
@@ -3437,6 +3500,12 @@ impl UiWgpuRenderer {
                 value,
             },
         ))
+    }
+
+    /// Set persistent built-in choice selection for ListBox/Tabs/Combo/Dropdown.
+    pub(crate) fn set_choice(&mut self, node_path: &str, value: &str) {
+        self.builtin_choices.insert(node_path.to_owned(), value.to_owned());
+        self.pointer_visual_dirty = true;
     }
 
     pub(crate) fn cancel_value_gesture(&mut self) {
@@ -7323,6 +7392,16 @@ impl UiWgpuRenderer {
 
     fn instance(&self, visual: &UiVisual, node_path: &str, time_seconds: f32) -> UiInstance {
         let mut visual = visual.clone();
+        // Apply persistent built-in toggle state (survives fragment re-submission)
+        if let Some(&selected) = self.builtin_toggles.get(node_path)
+            && matches!(
+                visual.kind,
+                UiNodeKind::Checkbox | UiNodeKind::RadioButton | UiNodeKind::Selectable
+            )
+        {
+            visual.presentation = Some(UiControlPresentation::Toggle { selected });
+        }
+        // Transient value previews (drag in progress) override built-in state
         if let Some(UiSemanticPayloadValue::Bool { value }) = self.value_previews.get(node_path)
             && matches!(
                 visual.kind,
