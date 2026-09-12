@@ -46,6 +46,16 @@ resource progress-rounded-fill image
 resource slider-square-thumb image
 resource slider-square-track image
 resource slider-square-fill image
+resource scrollbar-fat-track image
+resource scrollbar-fat-thumb image
+resource scrollbar-dark-track image
+resource scrollbar-dark-thumb image
+resource radio-circle-ring image
+resource radio-circle-dot image
+resource radio-card-body image
+resource radio-card-icon image
+resource tooltip-dark-bg image
+resource tooltip-accent-bg image
 
 # === Skin 定义 (9种组件 + 多套变体) ===
 skin btn-style button
@@ -173,6 +183,33 @@ skin slider-square slider
   slot fill active resource slider-square-fill
   slot thumb idle resource slider-square-thumb fit contain
 
+# === Scrollbar 变体 ===
+skin scrollbar-fat scrollbar
+  slot track idle resource scrollbar-fat-track
+  slot thumb idle resource scrollbar-fat-thumb fit contain
+
+skin scrollbar-dark scrollbar
+  slot track idle resource scrollbar-dark-track
+  slot thumb idle resource scrollbar-dark-thumb fit contain
+
+# === RadioButton 变体 ===
+skin radio-circle radio_button
+  slot body idle resource radio-circle-ring fit contain
+  slot body hover resource radio-circle-ring fit contain
+  slot fill active resource radio-circle-dot fit contain
+
+skin radio-card radio_button
+  slot body idle resource radio-card-body nine_slice 4 4 4 4 border 6 6 6 6
+  slot body hover resource radio-card-body nine_slice 4 4 4 4 border 6 6 6 6
+  slot fill active resource radio-card-icon fit contain
+
+# === Tooltip 变体 ===
+skin tooltip-dark tooltip
+  slot body idle resource tooltip-dark-bg nine_slice 6 6 6 6 border 8 8 8 8
+
+skin tooltip-accent tooltip
+  slot body idle resource tooltip-accent-bg nine_slice 6 6 6 6 border 8 8 8 8
+
 # === Input 变量 ===
 input alpha f32 default 0.9
 input offset vec2 default 0,0
@@ -244,6 +281,18 @@ surface showcase overlay w 1200 h 800 align stretch fill #0D1117
       input skin-input-def skin input-style w 100 h 28 value "Default"
       input skin-input-dark skin input-dark w 100 h 32 value "Dark"
       input skin-input-warm skin input-warm w 100 h 28 value "Warm"
+
+    text skin-scroll-label h 20 value "Scrollbar:"
+    panel skin-scroll-row w 328 h 64 column gap 6
+      scrollbar skin-scroll-def skin scrollbar-style w 300 h 14 scroll $scroll_pos
+      scrollbar skin-scroll-fat skin scrollbar-fat w 300 h 20 scroll $scroll_pos
+      scrollbar skin-scroll-dark skin scrollbar-dark w 300 h 10 scroll $scroll_pos
+
+    text skin-radio-label h 20 value "RadioButton:"
+    panel skin-radio-row w 328 h 36 row gap 12 align center
+      radio_button skin-radio-def skin radio-style w 100 h 24 value "Default" event demo.skin.radio.def
+      radio_button skin-radio-circle skin radio-circle w 100 h 28 value "Circle" event demo.skin.radio.circle
+      radio_button skin-radio-card skin radio-card w 100 h 32 value "Card" event demo.skin.radio.card
 
   # 中间面板 - Scrollable 容器
   panel mid-panel skin panel-style x 400 y 20 w 380 h 760 column pad 16 gap 8 align stretch
@@ -319,9 +368,13 @@ surface showcase overlay w 1200 h 800 align stretch fill #0D1117
       button skin-btn-dark skin btn-dark w 108 h 36 value "Dark"
       button skin-btn-warm skin btn-warm w 108 h 36 value "Warm"
 
-  # Tooltip with skin
-  tooltip demo-tooltip skin tooltip-style x 400 y 700 w 200 h 48
-    text tooltip-text h 24 value "Skinned Tooltip"
+  # Tooltip variants (top layer, static display)
+  tooltip skin-tooltip-def skin tooltip-style x 420 y 740 w 120 h 40
+    text tt-def-text h 20 value "Default Tip"
+  tooltip skin-tooltip-dark skin tooltip-dark x 560 y 740 w 120 h 40
+    text tt-dark-text h 20 value "Dark Tip"
+  tooltip skin-tooltip-accent skin tooltip-accent x 700 y 740 w 120 h 40
+    text tt-accent-text h 20 value "Accent Tip"
 
   # Dynamic text binding demo
   text dynamic-label x 20 y 780 w 300 h 20 value $dynamic_text

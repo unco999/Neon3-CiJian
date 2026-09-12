@@ -274,6 +274,19 @@ fn upload_showcase_images(endpoint: SocketAddr) -> Result<(), String> {
     upload_image(endpoint, seq, "slider-square-thumb", border_image((255, 200, 60, 255), (200, 150, 30, 255)))?; seq += 1;
     upload_image(endpoint, seq, "slider-square-track", solid_image(50, 50, 60, 255))?; seq += 1;
     upload_image(endpoint, seq, "slider-square-fill", solid_image(255, 200, 60, 255))?; seq += 1;
+    // Scrollbar variants
+    upload_image(endpoint, seq, "scrollbar-fat-track", solid_image(50, 30, 20, 255))?; seq += 1;
+    upload_image(endpoint, seq, "scrollbar-fat-thumb", border_image((255, 160, 40, 255), (220, 120, 20, 255)))?; seq += 1;
+    upload_image(endpoint, seq, "scrollbar-dark-track", solid_image(18, 18, 24, 255))?; seq += 1;
+    upload_image(endpoint, seq, "scrollbar-dark-thumb", solid_image(60, 100, 180, 220))?; seq += 1;
+    // Radio variants
+    upload_image(endpoint, seq, "radio-circle-ring", ring_image((100, 200, 140, 255)))?; seq += 1;
+    upload_image(endpoint, seq, "radio-circle-dot", circle_image(100, 220, 160, 255))?; seq += 1;
+    upload_image(endpoint, seq, "radio-card-body", border_image((80, 160, 200, 255), (20, 50, 70, 255)))?; seq += 1;
+    upload_image(endpoint, seq, "radio-card-icon", solid_image(120, 200, 240, 255))?; seq += 1;
+    // Tooltip variants
+    upload_image(endpoint, seq, "tooltip-dark-bg", solid_image(20, 20, 28, 250))?; seq += 1;
+    upload_image(endpoint, seq, "tooltip-accent-bg", border_image((60, 120, 220, 255), (30, 50, 90, 245)))?; seq += 1;
     println!("Uploaded {} skin images", seq - 1000);
     Ok(())
 }
@@ -354,6 +367,9 @@ struct AppState {
     skin_check_def: bool,
     skin_check_circle: bool,
     skin_check_card: bool,
+    skin_radio_def: bool,
+    skin_radio_circle: bool,
+    skin_radio_card: bool,
     tree: TreeState,
 }
 
@@ -371,6 +387,9 @@ impl AppState {
             skin_check_def: true,
             skin_check_circle: true,
             skin_check_card: false,
+            skin_radio_def: true,
+            skin_radio_circle: false,
+            skin_radio_card: true,
             tree: TreeState::new(),
         }
     }
@@ -437,6 +456,32 @@ impl AppState {
                 node_id: UiNodeId("skin-prog-rounded".into()),
                 state: UiControlPresentation::Numeric { value: self.progress_val, min: 0.0, max: 1.0 },
             },
+            // Scrollbar variants
+            UiEffect::ControlPresentation {
+                node_id: UiNodeId("skin-scroll-def".into()),
+                state: UiControlPresentation::Scroll { position: self.scroll_pos },
+            },
+            UiEffect::ControlPresentation {
+                node_id: UiNodeId("skin-scroll-fat".into()),
+                state: UiControlPresentation::Scroll { position: self.scroll_pos },
+            },
+            UiEffect::ControlPresentation {
+                node_id: UiNodeId("skin-scroll-dark".into()),
+                state: UiControlPresentation::Scroll { position: self.scroll_pos },
+            },
+            // Radio variants
+            UiEffect::ControlPresentation {
+                node_id: UiNodeId("skin-radio-def".into()),
+                state: UiControlPresentation::Toggle { selected: self.skin_radio_def },
+            },
+            UiEffect::ControlPresentation {
+                node_id: UiNodeId("skin-radio-circle".into()),
+                state: UiControlPresentation::Toggle { selected: self.skin_radio_circle },
+            },
+            UiEffect::ControlPresentation {
+                node_id: UiNodeId("skin-radio-card".into()),
+                state: UiControlPresentation::Toggle { selected: self.skin_radio_card },
+            },
         ]
     }
 
@@ -474,6 +519,9 @@ impl AppState {
             "demo.skin.check.def" => { self.skin_check_def = !self.skin_check_def; }
             "demo.skin.check.circle" => { self.skin_check_circle = !self.skin_check_circle; }
             "demo.skin.check.card" => { self.skin_check_card = !self.skin_check_card; }
+            "demo.skin.radio.def" => { self.skin_radio_def = !self.skin_radio_def; }
+            "demo.skin.radio.circle" => { self.skin_radio_circle = !self.skin_radio_circle; }
+            "demo.skin.radio.card" => { self.skin_radio_card = !self.skin_radio_card; }
             "demo.radio.toggle" => {
                 self.radio_state = !self.radio_state;
                 println!("[radio] -> {}", self.radio_state);

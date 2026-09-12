@@ -5789,7 +5789,8 @@ impl UiWgpuRenderer {
             };
             let hovered = self.pointer_position.is_some_and(|position| contains(visual.bounds, position));
             let pressed = hovered && time_seconds < self.pressed_until_seconds;
-            let Some(slot) = select_button_skin_slot(skin, hovered, pressed) else {
+            let enabled = visual.enabled;
+            let Some(slot) = select_button_skin_slot(skin, hovered, pressed, enabled) else {
                 continue;
             };
             let (resource_key, fit, nine_slice) = match &slot.presentation {
@@ -5846,6 +5847,7 @@ impl UiWgpuRenderer {
             };
             let hovered = self.pointer_position.is_some_and(|position| contains(visual.bounds, position));
             let pressed = hovered && time_seconds < self.pressed_until_seconds;
+            let enabled = visual.enabled;
             // Track height and thumb size scale with component height for distinct skin variants
             let track_h = (visual.bounds.height * 0.18).clamp(2.0, 8.0);
             let thumb_s = (visual.bounds.height * 0.55).clamp(8.0, 24.0);
@@ -5853,7 +5855,7 @@ impl UiWgpuRenderer {
             let fill = UiBounds { x: track.x, y: track.y, width: track.width * normalized, height: track.height };
             let thumb = UiBounds { x: track.x + track.width * normalized - thumb_s * 0.5, y: track.y + track_h * 0.5 - thumb_s * 0.5, width: thumb_s, height: thumb_s };
             for (slot_kind, bounds) in [(UiSkinSlotKind::Track, track), (UiSkinSlotKind::Fill, fill), (UiSkinSlotKind::Thumb, thumb)] {
-                let Some(slot) = select_slider_skin_slot(skin, slot_kind, hovered, pressed) else { continue };
+                let Some(slot) = select_slider_skin_slot(skin, slot_kind, hovered, pressed, enabled) else { continue };
                 let (resource_key, fit, nine_slice) = match &slot.presentation {
                     UiSkinPresentation::Image { resource_key, fit } => (resource_key, *fit, None),
                     UiSkinPresentation::NineSlice { resource_key, layout } => (resource_key, UiImageFit::Stretch, Some(*layout)),
@@ -5868,10 +5870,13 @@ impl UiWgpuRenderer {
                 images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, _padding: [0; 2] });
             }
         }
-        // Panel skins replace the standard fill with a skinned body image. The
-        // panel visual and its hit bounds remain the authored logical bounds.
+        // Panel / Dialog / ContextMenu / Splitter / ListBox skins replace the
+        // standard fill with a skinned body image. These are non-interactive
+        // body-only components; only the Normal state is consulted.
         for (index, visual) in self.sampled.iter().enumerate() {
-            if visual.kind != UiNodeKind::Panel || !sampled_in_mode(visual, mode) {
+            if !matches!(visual.kind, UiNodeKind::Panel | UiNodeKind::Dialog | UiNodeKind::ContextMenu | UiNodeKind::Splitter | UiNodeKind::ListBox)
+                || !sampled_in_mode(visual, mode)
+            {
                 continue;
             }
             let Some(skin_key) = self.skin_references.get(&self.plan[index].id) else { continue };
@@ -5921,6 +5926,7 @@ impl UiWgpuRenderer {
             }
         }
         // Scrollbar skins render track + thumb using the normalized scroll value.
+        // Track and thumb each support Normal / Hover / Pressed states.
         for (index, visual) in self.sampled.iter().enumerate() {
             if visual.kind != UiNodeKind::Scrollbar || !sampled_in_mode(visual, mode) {
                 continue;
@@ -5939,8 +5945,15 @@ impl UiWgpuRenderer {
             } else {
                 UiBounds { x: track.x, y: track.y + (track.height - thumb_size) * normalized, width: track.width, height: thumb_size }
             };
-            for (slot_kind, bounds) in [(UiSkinSlotKind::Track, track), (UiSkinSlotKind::Thumb, thumb)] {
-                let Some(slot) = skin.slots.iter().find(|slot| slot.slot_kind == slot_kind && slot.state == UiVisualState::Normal) else { continue };
+            let pointer = self.pointer_position;
+            let track_hovered = pointer.is_some_and(|p| contains(track, p));
+            let thumb_hovered = pointer.is_some_and(|p| contains(thumb, p));
+            let thumb_pressed = thumb_hovered && time_seconds < self.pressed_until_seconds;
+            for (slot_kind, bounds, hovered, pressed) in [
+                (UiSkinSlotKind::Track, track, track_hovered, false),
+                (UiSkinSlotKind::Thumb, thumb, thumb_hovered, thumb_pressed),
+            ] {
+                let Some(slot) = select_scrollbar_skin_slot(skin, slot_kind, hovered, pressed) else { continue };
                 let (resource_key, fit, nine_slice) = match &slot.presentation {
                     UiSkinPresentation::Image { resource_key, fit } => (resource_key, *fit, None),
                     UiSkinPresentation::NineSlice { resource_key, layout } => (resource_key, UiImageFit::Stretch, Some(*layout)),
@@ -5956,6 +5969,7 @@ impl UiWgpuRenderer {
             }
         }
         // Checkbox skins render body + check mark based on selected state.
+        // Body supports Normal / Hover / Pressed / Disabled; Fill (check mark) shows when selected.
         for (index, visual) in self.sampled.iter().enumerate() {
             if visual.kind != UiNodeKind::Checkbox || !sampled_in_mode(visual, mode) {
                 continue;
@@ -5964,7 +5978,8 @@ impl UiWgpuRenderer {
             let Some(skin) = self.skins.get(skin_key) else { continue };
             let selected = matches!(&visual.presentation, Some(UiControlPresentation::Toggle { selected }) if *selected);
             let hovered = self.pointer_position.is_some_and(|position| contains(visual.bounds, position));
-            let body_state = if hovered { UiVisualState::Hover } else { UiVisualState::Normal };
+            let pressed = hovered && time_seconds < self.pressed_until_seconds;
+            let enabled = visual.enabled;
             // Box area: square on the left, vertically centered (matches default checkbox layout)
             let box_size = (visual.bounds.height - 4.0).max(10.0).min(24.0);
             let box_bounds = UiBounds {
@@ -5973,8 +5988,8 @@ impl UiWgpuRenderer {
                 width: box_size,
                 height: box_size,
             };
-            // Body
-            if let Some(slot) = skin.slots.iter().find(|slot| slot.slot_kind == UiSkinSlotKind::Body && slot.state == body_state) {
+            // Body (supports Disabled → Pressed → Hover → Normal fallback)
+            if let Some(slot) = select_toggle_skin_slot(skin, UiSkinSlotKind::Body, hovered, pressed, enabled) {
                 let (resource_key, fit, nine_slice) = match &slot.presentation {
                     UiSkinPresentation::Image { resource_key, fit } => (resource_key, *fit, None),
                     UiSkinPresentation::NineSlice { resource_key, layout } => (resource_key, UiImageFit::Stretch, Some(*layout)),
@@ -5989,9 +6004,11 @@ impl UiWgpuRenderer {
                     }
                 }
             }
-            // Check mark (only when selected) - use Fill slot as check mark, centered in box
+            // Check mark (only when selected) - use Fill slot, centered in box
             if selected {
-                if let Some(slot) = skin.slots.iter().find(|slot| slot.slot_kind == UiSkinSlotKind::Fill && slot.state == UiVisualState::Active) {
+                if let Some(slot) = select_toggle_skin_slot(skin, UiSkinSlotKind::Fill, hovered, pressed, enabled)
+                    .or_else(|| skin.slots.iter().find(|s| s.slot_kind == UiSkinSlotKind::Fill && s.state == UiVisualState::Active))
+                {
                     let (resource_key, fit, nine_slice) = match &slot.presentation {
                         UiSkinPresentation::Image { resource_key, fit } => (resource_key, *fit, None),
                         UiSkinPresentation::NineSlice { resource_key, layout } => (resource_key, UiImageFit::Stretch, Some(*layout)),
@@ -6011,6 +6028,7 @@ impl UiWgpuRenderer {
             }
         }
         // RadioButton skins render body + dot based on selected state.
+        // Body supports Normal / Hover / Pressed / Disabled; Fill (dot) shows when selected.
         for (index, visual) in self.sampled.iter().enumerate() {
             if visual.kind != UiNodeKind::RadioButton || !sampled_in_mode(visual, mode) {
                 continue;
@@ -6019,7 +6037,8 @@ impl UiWgpuRenderer {
             let Some(skin) = self.skins.get(skin_key) else { continue };
             let selected = matches!(&visual.presentation, Some(UiControlPresentation::Toggle { selected }) if *selected);
             let hovered = self.pointer_position.is_some_and(|position| contains(visual.bounds, position));
-            let body_state = if hovered { UiVisualState::Hover } else { UiVisualState::Normal };
+            let pressed = hovered && time_seconds < self.pressed_until_seconds;
+            let enabled = visual.enabled;
             // Box area: square on the left, vertically centered (matches default radio layout)
             let box_size = (visual.bounds.height - 4.0).max(10.0).min(24.0);
             let box_bounds = UiBounds {
@@ -6028,8 +6047,8 @@ impl UiWgpuRenderer {
                 width: box_size,
                 height: box_size,
             };
-            // Body
-            if let Some(slot) = skin.slots.iter().find(|slot| slot.slot_kind == UiSkinSlotKind::Body && slot.state == body_state) {
+            // Body (supports Disabled → Pressed → Hover → Normal fallback)
+            if let Some(slot) = select_toggle_skin_slot(skin, UiSkinSlotKind::Body, hovered, pressed, enabled) {
                 let (resource_key, fit, nine_slice) = match &slot.presentation {
                     UiSkinPresentation::Image { resource_key, fit } => (resource_key, *fit, None),
                     UiSkinPresentation::NineSlice { resource_key, layout } => (resource_key, UiImageFit::Stretch, Some(*layout)),
@@ -6044,9 +6063,11 @@ impl UiWgpuRenderer {
                     }
                 }
             }
-            // Dot (only when selected) - use Fill slot as dot, centered in box
+            // Dot (only when selected) - use Fill slot, centered in box
             if selected {
-                if let Some(slot) = skin.slots.iter().find(|slot| slot.slot_kind == UiSkinSlotKind::Fill && slot.state == UiVisualState::Active) {
+                if let Some(slot) = select_toggle_skin_slot(skin, UiSkinSlotKind::Fill, hovered, pressed, enabled)
+                    .or_else(|| skin.slots.iter().find(|s| s.slot_kind == UiSkinSlotKind::Fill && s.state == UiVisualState::Active))
+                {
                     let (resource_key, fit, nine_slice) = match &slot.presentation {
                         UiSkinPresentation::Image { resource_key, fit } => (resource_key, *fit, None),
                         UiSkinPresentation::NineSlice { resource_key, layout } => (resource_key, UiImageFit::Stretch, Some(*layout)),
@@ -6130,6 +6151,76 @@ impl UiWgpuRenderer {
             let (source_insets, target_insets, slice_mode, fill_center) = nine_slice.map(|layout| (layout.source_insets_px.map(|value| value as f32), layout.target_insets, match layout.mode { neon_ui_schema::UiNineSliceMode::Stretch => 0, neon_ui_schema::UiNineSliceMode::Tile => 1, neon_ui_schema::UiNineSliceMode::Mirror => 2 }, u32::from(layout.fill_center))).unwrap_or(([0.0; 4], [0.0; 4], 0, 1));
             let (rect, uv) = fit_image_rect_and_uv(visual.bounds, image.uv, image.width, image.height, fit);
             images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, _padding: [0; 2] });
+        }
+        // Combo / Dropdown / Tabs / Selectable skins render a body image with
+        // hover / pressed / disabled state support (same fallback chain as Button).
+        for (index, visual) in self.sampled.iter().enumerate() {
+            if !matches!(visual.kind, UiNodeKind::Combo | UiNodeKind::Dropdown | UiNodeKind::Tabs | UiNodeKind::Selectable)
+                || !sampled_in_mode(visual, mode)
+            {
+                continue;
+            }
+            let Some(skin_key) = self.skin_references.get(&self.plan[index].id) else { continue };
+            let Some(skin) = self.skins.get(skin_key) else { continue };
+            let hovered = self.pointer_position.is_some_and(|position| contains(visual.bounds, position));
+            let pressed = hovered && time_seconds < self.pressed_until_seconds;
+            let enabled = visual.enabled;
+            let Some(slot) = select_toggle_skin_slot(skin, UiSkinSlotKind::Body, hovered, pressed, enabled) else { continue };
+            let (resource_key, fit, nine_slice) = match &slot.presentation {
+                UiSkinPresentation::Image { resource_key, fit } => (resource_key, *fit, None),
+                UiSkinPresentation::NineSlice { resource_key, layout } => (resource_key, UiImageFit::Stretch, Some(*layout)),
+                _ => continue,
+            };
+            let binding_key = format!("{skin_key}/{resource_key}");
+            let image = self.skin_assets.get(&binding_key).and_then(|asset| self.resident_images.get(&(asset.project_id.clone(), asset.asset_id, asset.revision.0))).or_else(|| self.skin_image_ids.get(&binding_key).and_then(|image_id| self.external_images.get(image_id)));
+            let Some(image) = image else { continue };
+            if nine_slice.is_some_and(|layout| !layout.validate_for_image(image.width, image.height)) { continue; }
+            let (source_insets, target_insets, slice_mode, fill_center) = nine_slice.map(|layout| (layout.source_insets_px.map(|value| value as f32), layout.target_insets, match layout.mode { neon_ui_schema::UiNineSliceMode::Stretch => 0, neon_ui_schema::UiNineSliceMode::Tile => 1, neon_ui_schema::UiNineSliceMode::Mirror => 2 }, u32::from(layout.fill_center))).unwrap_or(([0.0; 4], [0.0; 4], 0, 1));
+            let (rect, uv) = fit_image_rect_and_uv(visual.bounds, image.uv, image.width, image.height, fit);
+            images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, _padding: [0; 2] });
+        }
+        // DragValue skins render a track background plus an optional body overlay.
+        for (index, visual) in self.sampled.iter().enumerate() {
+            if visual.kind != UiNodeKind::DragValue || !sampled_in_mode(visual, mode) {
+                continue;
+            }
+            let Some(skin_key) = self.skin_references.get(&self.plan[index].id) else { continue };
+            let Some(skin) = self.skins.get(skin_key) else { continue };
+            let hovered = self.pointer_position.is_some_and(|position| contains(visual.bounds, position));
+            let pressed = hovered && time_seconds < self.pressed_until_seconds;
+            let enabled = visual.enabled;
+            // Track (base background)
+            if let Some(slot) = select_toggle_skin_slot(skin, UiSkinSlotKind::Track, hovered, pressed, enabled) {
+                let (resource_key, fit, nine_slice) = match &slot.presentation {
+                    UiSkinPresentation::Image { resource_key, fit } => (resource_key, *fit, None),
+                    UiSkinPresentation::NineSlice { resource_key, layout } => (resource_key, UiImageFit::Stretch, Some(*layout)),
+                    _ => continue,
+                };
+                let binding_key = format!("{skin_key}/{resource_key}");
+                if let Some(image) = self.skin_assets.get(&binding_key).and_then(|asset| self.resident_images.get(&(asset.project_id.clone(), asset.asset_id, asset.revision.0))).or_else(|| self.skin_image_ids.get(&binding_key).and_then(|image_id| self.external_images.get(image_id))) {
+                    if !nine_slice.is_some_and(|layout| !layout.validate_for_image(image.width, image.height)) {
+                        let (source_insets, target_insets, slice_mode, fill_center) = nine_slice.map(|layout| (layout.source_insets_px.map(|value| value as f32), layout.target_insets, match layout.mode { neon_ui_schema::UiNineSliceMode::Stretch => 0, neon_ui_schema::UiNineSliceMode::Tile => 1, neon_ui_schema::UiNineSliceMode::Mirror => 2 }, u32::from(layout.fill_center))).unwrap_or(([0.0; 4], [0.0; 4], 0, 1));
+                        let (rect, uv) = fit_image_rect_and_uv(visual.bounds, image.uv, image.width, image.height, fit);
+                        images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, _padding: [0; 2] });
+                    }
+                }
+            }
+            // Body (overlay on top of track)
+            if let Some(slot) = select_toggle_skin_slot(skin, UiSkinSlotKind::Body, hovered, pressed, enabled) {
+                let (resource_key, fit, nine_slice) = match &slot.presentation {
+                    UiSkinPresentation::Image { resource_key, fit } => (resource_key, *fit, None),
+                    UiSkinPresentation::NineSlice { resource_key, layout } => (resource_key, UiImageFit::Stretch, Some(*layout)),
+                    _ => continue,
+                };
+                let binding_key = format!("{skin_key}/{resource_key}");
+                if let Some(image) = self.skin_assets.get(&binding_key).and_then(|asset| self.resident_images.get(&(asset.project_id.clone(), asset.asset_id, asset.revision.0))).or_else(|| self.skin_image_ids.get(&binding_key).and_then(|image_id| self.external_images.get(image_id))) {
+                    if !nine_slice.is_some_and(|layout| !layout.validate_for_image(image.width, image.height)) {
+                        let (source_insets, target_insets, slice_mode, fill_center) = nine_slice.map(|layout| (layout.source_insets_px.map(|value| value as f32), layout.target_insets, match layout.mode { neon_ui_schema::UiNineSliceMode::Stretch => 0, neon_ui_schema::UiNineSliceMode::Tile => 1, neon_ui_schema::UiNineSliceMode::Mirror => 2 }, u32::from(layout.fill_center))).unwrap_or(([0.0; 4], [0.0; 4], 0, 1));
+                        let (rect, uv) = fit_image_rect_and_uv(visual.bounds, image.uv, image.width, image.height, fit);
+                        images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, _padding: [0; 2] });
+                    }
+                }
+            }
         }
         let image_capacity = images.len().max(popup_images.len());
         if image_capacity > self.image_capacity {
@@ -8903,8 +8994,10 @@ fn collect_image_fits(node: &UiNode, output: &mut HashMap<String, UiImageFit>) {
     }
 }
 
-fn select_button_skin_slot<'a>(skin: &'a UiControlSkin, hovered: bool, pressed: bool) -> Option<&'a UiSkinSlot> {
-    let states = if pressed {
+fn select_button_skin_slot<'a>(skin: &'a UiControlSkin, hovered: bool, pressed: bool, enabled: bool) -> Option<&'a UiSkinSlot> {
+    let states = if !enabled {
+        [UiVisualState::Disabled, UiVisualState::Normal, UiVisualState::Normal]
+    } else if pressed {
         [UiVisualState::Pressed, UiVisualState::Hover, UiVisualState::Normal]
     } else if hovered {
         [UiVisualState::Hover, UiVisualState::Normal, UiVisualState::Normal]
@@ -8916,12 +9009,56 @@ fn select_button_skin_slot<'a>(skin: &'a UiControlSkin, hovered: bool, pressed: 
     })
 }
 
-fn select_slider_skin_slot<'a>(skin: &'a UiControlSkin, kind: UiSkinSlotKind, hovered: bool, pressed: bool) -> Option<&'a UiSkinSlot> {
-    let states = match kind {
-        UiSkinSlotKind::Fill => [UiVisualState::Active, UiVisualState::Normal, UiVisualState::Normal],
-        _ if pressed => [UiVisualState::Pressed, UiVisualState::Hover, UiVisualState::Normal],
-        _ if hovered => [UiVisualState::Hover, UiVisualState::Normal, UiVisualState::Normal],
-        _ => [UiVisualState::Normal, UiVisualState::Normal, UiVisualState::Normal],
+fn select_slider_skin_slot<'a>(skin: &'a UiControlSkin, kind: UiSkinSlotKind, hovered: bool, pressed: bool, enabled: bool) -> Option<&'a UiSkinSlot> {
+    let states = if !enabled {
+        [UiVisualState::Disabled, UiVisualState::Normal, UiVisualState::Normal]
+    } else if kind == UiSkinSlotKind::Fill {
+        [UiVisualState::Active, UiVisualState::Normal, UiVisualState::Normal]
+    } else if pressed {
+        [UiVisualState::Pressed, UiVisualState::Hover, UiVisualState::Normal]
+    } else if hovered {
+        [UiVisualState::Hover, UiVisualState::Normal, UiVisualState::Normal]
+    } else {
+        [UiVisualState::Normal, UiVisualState::Normal, UiVisualState::Normal]
+    };
+    states.iter().find_map(|state| skin.slots.iter().find(|slot| slot.slot_kind == kind && slot.state == *state))
+}
+
+/// Select a skin slot for toggle controls (Checkbox / RadioButton).
+/// Supports Disabled → Pressed → Hover → Normal fallback chain for any slot kind.
+fn select_toggle_skin_slot<'a>(
+    skin: &'a UiControlSkin,
+    kind: UiSkinSlotKind,
+    hovered: bool,
+    pressed: bool,
+    enabled: bool,
+) -> Option<&'a UiSkinSlot> {
+    let states = if !enabled {
+        [UiVisualState::Disabled, UiVisualState::Normal, UiVisualState::Normal]
+    } else if pressed {
+        [UiVisualState::Pressed, UiVisualState::Hover, UiVisualState::Normal]
+    } else if hovered {
+        [UiVisualState::Hover, UiVisualState::Normal, UiVisualState::Normal]
+    } else {
+        [UiVisualState::Normal, UiVisualState::Normal, UiVisualState::Normal]
+    };
+    states.iter().find_map(|state| skin.slots.iter().find(|slot| slot.slot_kind == kind && slot.state == *state))
+}
+
+/// Select a skin slot for Scrollbar track / thumb.
+/// Supports Pressed → Hover → Normal fallback chain.
+fn select_scrollbar_skin_slot<'a>(
+    skin: &'a UiControlSkin,
+    kind: UiSkinSlotKind,
+    hovered: bool,
+    pressed: bool,
+) -> Option<&'a UiSkinSlot> {
+    let states = if pressed {
+        [UiVisualState::Pressed, UiVisualState::Hover, UiVisualState::Normal]
+    } else if hovered {
+        [UiVisualState::Hover, UiVisualState::Normal, UiVisualState::Normal]
+    } else {
+        [UiVisualState::Normal, UiVisualState::Normal, UiVisualState::Normal]
     };
     states.iter().find_map(|state| skin.slots.iter().find(|slot| slot.slot_kind == kind && slot.state == *state))
 }
