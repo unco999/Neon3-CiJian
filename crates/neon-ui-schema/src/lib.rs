@@ -873,7 +873,7 @@ pub struct UiSkinSlot {
 impl UiControlSkin {
     pub fn validate(&self) -> Result<(), UiSchemaError> {
         if self.key.trim().is_empty()
-            || !matches!(self.component_kind, UiNodeKind::Button | UiNodeKind::Slider | UiNodeKind::Scrollbar | UiNodeKind::ProgressBar | UiNodeKind::Checkbox | UiNodeKind::RadioButton | UiNodeKind::TextInput | UiNodeKind::Tooltip | UiNodeKind::Panel | UiNodeKind::Dialog | UiNodeKind::ContextMenu | UiNodeKind::Splitter | UiNodeKind::Combo | UiNodeKind::Dropdown | UiNodeKind::Tabs | UiNodeKind::Selectable | UiNodeKind::ListBox | UiNodeKind::DragValue | UiNodeKind::Modal | UiNodeKind::TreeView | UiNodeKind::Switch | UiNodeKind::Toast | UiNodeKind::MenuBar | UiNodeKind::Accordion | UiNodeKind::Spinner | UiNodeKind::Divider)
+            || !matches!(self.component_kind, UiNodeKind::Button | UiNodeKind::Slider | UiNodeKind::Scrollbar | UiNodeKind::ProgressBar | UiNodeKind::Checkbox | UiNodeKind::RadioButton | UiNodeKind::TextInput | UiNodeKind::Tooltip | UiNodeKind::Panel | UiNodeKind::Dialog | UiNodeKind::ContextMenu | UiNodeKind::Splitter | UiNodeKind::Combo | UiNodeKind::Dropdown | UiNodeKind::Tabs | UiNodeKind::Selectable | UiNodeKind::ListBox | UiNodeKind::DragValue | UiNodeKind::Modal | UiNodeKind::TreeView | UiNodeKind::Switch | UiNodeKind::Toast | UiNodeKind::MenuBar | UiNodeKind::Accordion | UiNodeKind::Spinner | UiNodeKind::Divider | UiNodeKind::Popup)
         {
             return Err(UiSchemaError::InvalidControlSkin);
         }
@@ -924,7 +924,7 @@ impl UiControlSkin {
                 | UiNodeKind::Selectable | UiNodeKind::ListBox
                 | UiNodeKind::Modal | UiNodeKind::TreeView
                 | UiNodeKind::Toast | UiNodeKind::MenuBar | UiNodeKind::Accordion
-                | UiNodeKind::Spinner | UiNodeKind::Divider => &[
+                | UiNodeKind::Spinner | UiNodeKind::Divider | UiNodeKind::Popup => &[
                 (UiSkinSlotKind::Body, UiVisualState::Normal),
             ],
             UiNodeKind::Switch => &[
@@ -1014,6 +1014,11 @@ pub enum UiNodeKind {
     /// A horizontal or vertical separator line. Orientation inferred from
     /// bounds (w > h = horizontal, h > w = vertical).
     Divider,
+    /// A generic top-layer popup container. Like Panel, accepts arbitrary
+    /// child nodes for custom structure, but renders above normal layout
+    /// flow and does not participate in parent sizing. Visibility controlled
+    /// by `visible`; used for dropdowns, tooltips, popovers, modal content.
+    Popup,
 }
 
 /// A single node in a TreeView hierarchy. Nodes form a recursive tree;

@@ -5875,7 +5875,7 @@ impl UiWgpuRenderer {
         // standard fill with a skinned body image. These are non-interactive
         // body-only components; only the Normal state is consulted.
         for (index, visual) in self.sampled.iter().enumerate() {
-            if !matches!(visual.kind, UiNodeKind::Panel | UiNodeKind::Dialog | UiNodeKind::ContextMenu | UiNodeKind::Splitter | UiNodeKind::ListBox | UiNodeKind::Modal | UiNodeKind::TreeView | UiNodeKind::Toast | UiNodeKind::MenuBar | UiNodeKind::Accordion | UiNodeKind::Spinner | UiNodeKind::Divider)
+            if !matches!(visual.kind, UiNodeKind::Panel | UiNodeKind::Dialog | UiNodeKind::ContextMenu | UiNodeKind::Splitter | UiNodeKind::ListBox | UiNodeKind::Modal | UiNodeKind::TreeView | UiNodeKind::Toast | UiNodeKind::MenuBar | UiNodeKind::Accordion | UiNodeKind::Spinner | UiNodeKind::Divider | UiNodeKind::Popup)
                 || !sampled_in_mode(visual, mode)
             {
                 continue;
@@ -9019,7 +9019,7 @@ fn component_spec(kind: &UiNodeKind) -> UiComponentSpec {
             ),
             top_layer: matches!(
                 kind,
-                UiNodeKind::Tooltip | UiNodeKind::Modal | UiNodeKind::Dialog | UiNodeKind::ContextMenu | UiNodeKind::Toast
+                UiNodeKind::Tooltip | UiNodeKind::Modal | UiNodeKind::Dialog | UiNodeKind::ContextMenu | UiNodeKind::Toast | UiNodeKind::Popup
             ),
             virtualized: *kind == UiNodeKind::DataGrid,
         },
@@ -9263,6 +9263,13 @@ fn default_component_style(kind: &UiNodeKind) -> UiStyle {
             corner_radius: 0.0,
             opacity: 1.0,
         },
+        UiNodeKind::Popup => UiStyle {
+            background_color: [0.10, 0.12, 0.15, 0.96],
+            border_color: [0.30, 0.36, 0.42, 1.0],
+            border_width: 1.0,
+            corner_radius: 6.0,
+            opacity: 1.0,
+        },
         // Containers, labels, images, and render surfaces do not get implicit
         // component chrome. Their authored default is a sentinel used by the
         // component resolver, so make the renderer fallback transparent here.
@@ -9475,8 +9482,8 @@ fn component_chrome_instances(visual: &UiVisual) -> Vec<UiInstance> {
                 })
                 .collect()
         }
-        UiNodeKind::ContextMenu => {
-            // ContextMenu chrome: subtle inner border highlight
+        UiNodeKind::ContextMenu | UiNodeKind::Popup => {
+            // ContextMenu/Popup chrome: subtle inner border highlight
             vec![chrome(
                 UiBounds { x: bounds.x + 1.0, y: bounds.y + 1.0, width: bounds.width - 2.0, height: bounds.height - 2.0 },
                 [0.0, 0.0, 0.0, 0.0],
@@ -10571,7 +10578,7 @@ fn top_layer_roots(plan: &[PlannedNode], indices: &HashMap<&str, usize>) -> Vec<
         roots[index] = if node.target.world_depth.is_none()
             && matches!(
                 node.target.kind,
-                UiNodeKind::Tooltip | UiNodeKind::Modal | UiNodeKind::Dialog | UiNodeKind::ContextMenu
+                UiNodeKind::Tooltip | UiNodeKind::Modal | UiNodeKind::Dialog | UiNodeKind::ContextMenu | UiNodeKind::Popup
             ) {
             Some(index)
         } else {
@@ -11479,7 +11486,7 @@ fn flatten_node(
     let top_layer = inherited_top_layer
         || matches!(
             node.kind,
-            UiNodeKind::Tooltip | UiNodeKind::Modal | UiNodeKind::Dialog | UiNodeKind::ContextMenu
+            UiNodeKind::Tooltip | UiNodeKind::Modal | UiNodeKind::Dialog | UiNodeKind::ContextMenu | UiNodeKind::Popup
         );
     let own_clip = if top_layer {
         None
@@ -11509,7 +11516,7 @@ fn flatten_node(
     // ContextMenu nodes are always included in the flattened list; their
     // actual visibility is controlled by the active_context_menu_id filter
     // that runs after flattening. Other invisible nodes are skipped here.
-    if (!node.visible && !matches!(node.kind, UiNodeKind::ContextMenu))
+    if (!node.visible && !matches!(node.kind, UiNodeKind::ContextMenu | UiNodeKind::Popup))
         || hidden_world_nodes.contains(node.node_id.0.as_str())
     {
         return;
@@ -11914,7 +11921,7 @@ fn resolve_children(
         .iter()
         .enumerate()
         .map(|(index, child)| {
-            if !child.visible && !matches!(child.kind, UiNodeKind::ContextMenu) {
+            if !child.visible && !matches!(child.kind, UiNodeKind::ContextMenu | UiNodeKind::Popup) {
                 return UiBounds {
                     x: inner.x,
                     y: inner.y,
@@ -13573,7 +13580,7 @@ mod tests {
             if spec.capabilities.top_layer {
                 assert!(matches!(
                     kind,
-                    UiNodeKind::Tooltip | UiNodeKind::Modal | UiNodeKind::Dialog | UiNodeKind::ContextMenu
+                    UiNodeKind::Tooltip | UiNodeKind::Modal | UiNodeKind::Dialog | UiNodeKind::ContextMenu | UiNodeKind::Toast | UiNodeKind::Popup
                 ));
             }
         }

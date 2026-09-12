@@ -583,7 +583,7 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
         }
     }
     for (node_key, skin_key) in &skin_references {
-        if !matches!(find_node(&root.node, node_key), Some(node) if matches!(node.kind, UiNodeKind::Button | UiNodeKind::Slider | UiNodeKind::Scrollbar | UiNodeKind::ProgressBar | UiNodeKind::Checkbox | UiNodeKind::RadioButton | UiNodeKind::TextInput | UiNodeKind::Tooltip | UiNodeKind::Panel | UiNodeKind::Dialog | UiNodeKind::ContextMenu | UiNodeKind::Splitter | UiNodeKind::Combo | UiNodeKind::Dropdown | UiNodeKind::Tabs | UiNodeKind::Selectable | UiNodeKind::ListBox | UiNodeKind::DragValue | UiNodeKind::Modal | UiNodeKind::TreeView | UiNodeKind::Switch | UiNodeKind::Toast | UiNodeKind::MenuBar | UiNodeKind::Accordion | UiNodeKind::Spinner | UiNodeKind::Divider))
+        if !matches!(find_node(&root.node, node_key), Some(node) if matches!(node.kind, UiNodeKind::Button | UiNodeKind::Slider | UiNodeKind::Scrollbar | UiNodeKind::ProgressBar | UiNodeKind::Checkbox | UiNodeKind::RadioButton | UiNodeKind::TextInput | UiNodeKind::Tooltip | UiNodeKind::Panel | UiNodeKind::Dialog | UiNodeKind::ContextMenu | UiNodeKind::Splitter | UiNodeKind::Combo | UiNodeKind::Dropdown | UiNodeKind::Tabs | UiNodeKind::Selectable | UiNodeKind::ListBox | UiNodeKind::DragValue | UiNodeKind::Modal | UiNodeKind::TreeView | UiNodeKind::Switch | UiNodeKind::Toast | UiNodeKind::MenuBar | UiNodeKind::Accordion | UiNodeKind::Spinner | UiNodeKind::Divider | UiNodeKind::Popup))
             || !skin_keys.contains(skin_key)
             || !matches!((find_node(&root.node, node_key), skins.iter().find(|skin| skin.key == *skin_key)), (Some(node), Some(skin)) if node.kind == skin.component_kind)
         {
@@ -1213,6 +1213,7 @@ fn format_skin_component(kind: &neon_ui_schema::UiNodeKind) -> &'static str {
         neon_ui_schema::UiNodeKind::Accordion => "accordion",
         neon_ui_schema::UiNodeKind::Spinner => "spinner",
         neon_ui_schema::UiNodeKind::Divider => "divider",
+        neon_ui_schema::UiNodeKind::Popup => "popup",
         _ => "unsupported",
     }
 }
@@ -1568,7 +1569,8 @@ fn parse_skin_header(text: &str, line: u32) -> FlowResult<neon_ui_schema::UiCont
         "accordion" => neon_ui_schema::UiNodeKind::Accordion,
         "spinner" => neon_ui_schema::UiNodeKind::Spinner,
         "divider" => neon_ui_schema::UiNodeKind::Divider,
-        _ => return Err(error("nui_flow_invalid_skin", "skin component kind must be one of: button, slider, scrollbar, progress_bar, checkbox, radio_button, input, tooltip, panel, dialog, context_menu, splitter, combo, dropdown, tabs, selectable, list_box, drag_value, modal, tree_view, switch, toast, menu_bar, accordion, spinner, divider", line, 1)),
+        "popup" => neon_ui_schema::UiNodeKind::Popup,
+        _ => return Err(error("nui_flow_invalid_skin", "skin component kind must be one of: button, slider, scrollbar, progress_bar, checkbox, radio_button, input, tooltip, panel, dialog, context_menu, splitter, combo, dropdown, tabs, selectable, list_box, drag_value, modal, tree_view, switch, toast, menu_bar, accordion, spinner, divider, popup", line, 1)),
     };
     Ok(neon_ui_schema::UiControlSkin {
         key: parts[1].into(),
@@ -2840,6 +2842,7 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
         "accordion" => UiNodeKind::Accordion,
         "spinner" => UiNodeKind::Spinner,
         "divider" => UiNodeKind::Divider,
+        "popup" => UiNodeKind::Popup,
         "image" => UiNodeKind::Image,
         "render" => UiNodeKind::RenderSurface,
         "canvas" => UiNodeKind::Canvas,
@@ -3011,7 +3014,7 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
                     };
                 } else {
                     if token == "skin" {
-                        if !matches!(component, "button" | "slider" | "scrollbar" | "progress_bar" | "checkbox" | "radio_button" | "input" | "tooltip" | "panel" | "dialog" | "context_menu" | "splitter" | "combo" | "dropdown" | "tabs" | "selectable" | "list_box" | "drag_value" | "modal" | "tree_view" | "switch" | "toast" | "menu_bar" | "accordion" | "spinner" | "divider") || !valid_key(value) {
+                        if !matches!(component, "button" | "slider" | "scrollbar" | "progress_bar" | "checkbox" | "radio_button" | "input" | "tooltip" | "panel" | "dialog" | "context_menu" | "splitter" | "combo" | "dropdown" | "tabs" | "selectable" | "list_box" | "drag_value" | "modal" | "tree_view" | "switch" | "toast" | "menu_bar" | "accordion" | "spinner" | "divider" | "popup") || !valid_key(value) {
                             return Err(error("nui_flow_invalid_skin", "skin reference is valid only for skinnable components and requires a stable key", line, 1));
                         }
                         skin_key = Some(value.into());
@@ -4590,6 +4593,7 @@ fn format_node(
         UiNodeKind::Accordion => "accordion",
         UiNodeKind::Spinner => "spinner",
         UiNodeKind::Divider => "divider",
+        UiNodeKind::Popup => "popup",
     };
     let mut line = format!("{}{} {}", " ".repeat(indent), kind, node.node_id.0);
     if let Some(skin) = skin_references.get(&node.node_id.0) {
@@ -4949,6 +4953,7 @@ fn insert_node(
         "accordion" => UiNodeKind::Accordion,
         "spinner" => UiNodeKind::Spinner,
         "divider" => UiNodeKind::Divider,
+        "popup" => UiNodeKind::Popup,
         "image" => UiNodeKind::Image,
         "render" => UiNodeKind::RenderSurface,
         _ => {

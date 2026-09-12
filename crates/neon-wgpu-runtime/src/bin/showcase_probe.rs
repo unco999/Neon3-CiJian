@@ -375,6 +375,7 @@ struct AppState {
     acc_general: bool,
     acc_advanced: bool,
     acc_about: bool,
+    active_menu: Option<String>,
 }
 
 impl AppState {
@@ -399,7 +400,16 @@ impl AppState {
             acc_general: true,
             acc_advanced: false,
             acc_about: false,
+            active_menu: None,
         }
+    }
+
+    fn toggle_menu(&mut self, menu: &str) {
+        self.active_menu = match &self.active_menu {
+            Some(m) if m == menu => None,
+            _ => Some(menu.to_string()),
+        };
+        println!("[mb] active_menu={:?}", self.active_menu);
     }
 
     /// Build ControlPresentation effects from current state.
@@ -535,6 +545,29 @@ impl AppState {
                 };
             }
         }
+        // MenuBar dropdown (Popup)
+        if node.node_id.0 == "mb-dropdown" {
+            node.visible = self.active_menu.is_some();
+        }
+        if node.node_id.0 == "mb-dd-1" || node.node_id.0 == "mb-dd-2"
+            || node.node_id.0 == "mb-dd-3" || node.node_id.0 == "mb-dd-4"
+        {
+            if let Some(menu) = &self.active_menu {
+                if let Some(text) = &mut node.text {
+                    let items: &[&str] = match menu.as_str() {
+                        "file" => &["New", "Open...", "Save", "Quit"],
+                        "edit" => &["Undo", "Redo", "Cut", "Copy"],
+                        "view" => &["Zoom In", "Zoom Out", "Fullscreen", "Reload"],
+                        "help" => &["About", "Documentation", "Check Update", "Feedback"],
+                        _ => &["Item 1", "Item 2", "Item 3", "Item 4"],
+                    };
+                    let idx = match node.node_id.0.as_str() {
+                        "mb-dd-1" => 0, "mb-dd-2" => 1, "mb-dd-3" => 2, _ => 3,
+                    };
+                    *text = TextRef::Literal { value: items[idx].into() };
+                }
+            }
+        }
         // Button text shows click count
         if node.node_id.0 == "btn-demo" && self.click_count > 0 {
             if let Some(text) = &mut node.text {
@@ -602,10 +635,14 @@ impl AppState {
             "demo.acc.general" => { self.acc_general = !self.acc_general; println!("[acc] general={}", self.acc_general); }
             "demo.acc.advanced" => { self.acc_advanced = !self.acc_advanced; println!("[acc] advanced={}", self.acc_advanced); }
             "demo.acc.about" => { self.acc_about = !self.acc_about; println!("[acc] about={}", self.acc_about); }
-            "demo.mb.file" => println!("[mb] File menu clicked"),
-            "demo.mb.edit" => println!("[mb] Edit menu clicked"),
-            "demo.mb.view" => println!("[mb] View menu clicked"),
-            "demo.mb.help" => println!("[mb] Help menu clicked"),
+            "demo.mb.file" => { self.toggle_menu("file"); }
+            "demo.mb.edit" => { self.toggle_menu("edit"); }
+            "demo.mb.view" => { self.toggle_menu("view"); }
+            "demo.mb.help" => { self.toggle_menu("help"); }
+            "demo.mb.dd1" | "demo.mb.dd2" | "demo.mb.dd3" | "demo.mb.dd4" => {
+                println!("[mb] dropdown item: {action}");
+                self.active_menu = None;
+            }
             _ => println!("[unknown] {action}"),
         }
     }

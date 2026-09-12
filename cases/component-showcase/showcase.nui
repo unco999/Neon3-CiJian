@@ -360,13 +360,19 @@ surface showcase overlay w 1200 h 1000 align stretch fill #0D1117
     text switch-label h 24 value "Switch (toggle)"
     switch switch-demo w 344 h 32 checked $switch_state value "Enable feature" event demo.switch.toggle
 
-    # MenuBar - 菜单栏（点击菜单项触发动作）
-    text menubar-label h 24 value "MenuBar (click items)"
+    # MenuBar - 菜单栏（点击展开下拉）
+    text menubar-label h 24 value "MenuBar (click to expand)"
     menu_bar demo-menubar w 344 h 32
       text mb-file x 8 y 4 w 60 h 24 value "File" event demo.mb.file
       text mb-edit x 76 y 4 w 60 h 24 value "Edit" event demo.mb.edit
       text mb-view x 144 y 4 w 60 h 24 value "View" event demo.mb.view
       text mb-help x 212 y 4 w 60 h 24 value "Help" event demo.mb.help
+    # MenuBar 下拉（Popup 组件，top-layer，自定义结构）
+    popup mb-dropdown x 0 y 830 w 160 h 140
+      text mb-dd-1 x 8 y 4 w 144 h 28 value "New" event demo.mb.dd1
+      text mb-dd-2 x 8 y 36 w 144 h 28 value "Open..." event demo.mb.dd2
+      text mb-dd-3 x 8 y 68 w 144 h 28 value "Save" event demo.mb.dd3
+      text mb-dd-4 x 8 y 100 w 144 h 28 value "Quit" event demo.mb.dd4
 
     # Accordion - 折叠面板
     text accordion-label h 24 value "Accordion (click header to expand)"
