@@ -4177,10 +4177,56 @@ impl HeadlessExternalGpu {
                     return Err("pointer_release_rejected".into());
                 }
                 let Some(binding) = binding else {
-                    return Ok(json!({"state": "released"}));
+                    // 点击空白区域：发送 ui.click_blank 语义事件
+                    self.next_semantic_sequence = self.next_semantic_sequence.saturating_add(1);
+                    let Some(first_fragment) = fragments.values().next() else {
+                        return Ok(json!({"state": "released"}));
+                    };
+                    let fragment = neon_ui_schema::UiFragmentRevision {
+                        id: first_fragment.fragment_id.clone(),
+                        revision: first_fragment.revision,
+                    };
+                    let event_id = format!("wgpu-click-blank-{}", self.next_semantic_sequence);
+                    return Ok(json!({"semantic_event": neon_ui_schema::UiSemanticEvent {
+                        event: neon_ui_schema::UiSemanticEventType::PointerClick,
+                        event_id,
+                        renderer_epoch: 1,
+                        composition_revision: fragment.revision,
+                        fragment,
+                        intent: neon_ui_schema::UiIntent::Invoke { action: "ui.click_blank".into(), params: serde_json::json!({}) },
+                        pointer: Some(neon_ui_schema::UiPointerMetadata { id: event.pointer_id, sequence: self.next_semantic_sequence }),
+                        focus: None,
+                        data_grid_cell: None,
+                        text: None,
+                        control_value: None,
+                        drag_drop: None,
+                    }}));
                 };
                 let Some(intent) = binding.intent else {
-                    return Ok(json!({"state": "released"}));
+                    // 点击无事件组件：同样发送 ui.click_blank
+                    self.next_semantic_sequence = self.next_semantic_sequence.saturating_add(1);
+                    let Some(first_fragment) = fragments.values().next() else {
+                        return Ok(json!({"state": "released"}));
+                    };
+                    let fragment = neon_ui_schema::UiFragmentRevision {
+                        id: first_fragment.fragment_id.clone(),
+                        revision: first_fragment.revision,
+                    };
+                    let event_id = format!("wgpu-click-blank-{}", self.next_semantic_sequence);
+                    return Ok(json!({"semantic_event": neon_ui_schema::UiSemanticEvent {
+                        event: neon_ui_schema::UiSemanticEventType::PointerClick,
+                        event_id,
+                        renderer_epoch: 1,
+                        composition_revision: fragment.revision,
+                        fragment,
+                        intent: neon_ui_schema::UiIntent::Invoke { action: "ui.click_blank".into(), params: serde_json::json!({}) },
+                        pointer: Some(neon_ui_schema::UiPointerMetadata { id: event.pointer_id, sequence: self.next_semantic_sequence }),
+                        focus: None,
+                        data_grid_cell: None,
+                        text: None,
+                        control_value: None,
+                        drag_drop: None,
+                    }}));
                 };
                 let finished_value = presentation_ui.finish_value_gesture();
                 let toggle_value = presentation_ui.finish_toggle_control(&binding.node_path);
@@ -8240,13 +8286,9 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                 }
                 // Built-in context menu: show only the menu bound to the node under pointer
                 if let Some(gpu) = self.gpu.as_mut() {
-                    println!("[ctx-menu] right-click pressed, checking pointer");
                     if let Some(menu_id) = gpu.ui.context_menu_at_pointer() {
-                        println!("[ctx-menu] showing menu: {}", menu_id);
                         gpu.ui.show_context_menu(menu_id);
                         self.redraw_pending = true;
-                    } else {
-                        println!("[ctx-menu] no binding found");
                     }
                 }
             }
@@ -8485,6 +8527,32 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                         && let Some(gpu) = self.gpu.as_mut()
                     {
                         gpu.ui.rollback_local_presentation(presentation);
+                    } else if released.binding.intent.is_none()
+                        && let Some(endpoint) = self.ui_endpoint
+                    {
+                        // 有 binding 但无 intent（点击无事件组件），也发送 ui.click_blank
+                        let sequence = self.gpu.as_mut().map(|gpu| {
+                            gpu.next_semantic_sequence = gpu.next_semantic_sequence.saturating_add(1);
+                            gpu.next_semantic_sequence
+                        }).unwrap_or(0);
+                        let mut blank_binding = released.binding.clone();
+                        blank_binding.intent = Some(neon_ui_schema::UiIntent::Invoke {
+                            action: "ui.click_blank".into(),
+                            params: serde_json::json!({}),
+                        });
+                        forward_pointer_click(
+                            endpoint,
+                            self.epoch,
+                            self.applied_composition_revision,
+                            sequence,
+                            None,
+                            blank_binding,
+                            None,
+                            self.pointer_delivery.clone(),
+                            self.interaction_traces.clone(),
+                            self.event_proxy.clone(),
+                            None,
+                        );
                     }
                     self.redraw_pending = true;
                     #[cfg(target_os = "android")]
@@ -8494,6 +8562,44 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                             gpu.last_pointer_outcome, gpu.last_pointer_node_path
                         );
                     }
+                } else if binding.is_none() {
+                    // ID 图返回空 = 点击空白区域，发送 ui.click_blank 语义事件
+                    if let Some(endpoint) = self.ui_endpoint {
+                        let sequence = self.gpu.as_mut().map(|gpu| {
+                            gpu.next_semantic_sequence = gpu.next_semantic_sequence.saturating_add(1);
+                            gpu.next_semantic_sequence
+                        }).unwrap_or(0);
+                        let fragment = neon_ui_schema::UiFragmentRevision {
+                            id: neon_ui_schema::UiFragmentId("showcase".into()),
+                            revision: self.applied_composition_revision,
+                        };
+                        let dummy_binding = crate::ui_renderer::UiHitBinding {
+                            node_path: String::new(),
+                            fragment,
+                            intent: Some(neon_ui_schema::UiIntent::Invoke {
+                                action: "ui.click_blank".into(),
+                                params: serde_json::json!({}),
+                            }),
+                            text_input: None,
+                            data_grid_cell: None,
+                            control_value: None,
+                            max_text_length: None,
+                        };
+                        forward_pointer_click(
+                            endpoint,
+                            self.epoch,
+                            self.applied_composition_revision,
+                            sequence,
+                            None,
+                            dummy_binding,
+                            None,
+                            self.pointer_delivery.clone(),
+                            self.interaction_traces.clone(),
+                            self.event_proxy.clone(),
+                            None,
+                        );
+                    }
+                    self.redraw_pending = true;
                 }
             }
             WindowEvent::MouseInput { state, button, .. }

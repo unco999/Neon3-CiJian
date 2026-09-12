@@ -548,6 +548,16 @@ impl AppState {
         // MenuBar dropdown (Popup)
         if node.node_id.0 == "mb-dropdown" {
             node.visible = self.active_menu.is_some();
+            // 根据当前菜单动态设置 x 坐标，对齐到对应菜单项下方
+            if let Some(menu) = &self.active_menu {
+                node.bounds.x = match menu.as_str() {
+                    "file" => 8.0,
+                    "edit" => 76.0,
+                    "view" => 144.0,
+                    "help" => 212.0,
+                    _ => 8.0,
+                };
+            }
         }
         if node.node_id.0 == "mb-dd-1" || node.node_id.0 == "mb-dd-2"
             || node.node_id.0 == "mb-dd-3" || node.node_id.0 == "mb-dd-4"
@@ -582,6 +592,10 @@ impl AppState {
     }
 
     fn handle_action(&mut self, action: &str) {
+        // 点击任何非菜单元素时关闭下拉
+        if !action.starts_with("demo.mb.") && self.active_menu.is_some() {
+            self.active_menu = None;
+        }
         match action {
             "demo.button.click" => {
                 self.click_count += 1;
@@ -643,7 +657,16 @@ impl AppState {
                 println!("[mb] dropdown item: {action}");
                 self.active_menu = None;
             }
-            _ => println!("[unknown] {action}"),
+            "ui.click_blank" => {
+                // 点击空白区域，菜单已在开头统一关闭
+            }
+            _ => {
+                // 点击其他元素时关闭菜单下拉
+                if self.active_menu.is_some() {
+                    self.active_menu = None;
+                }
+                println!("[unknown] {action}");
+            }
         }
     }
 }

@@ -1,8 +1,26 @@
-# Changelog
+﻿# Changelog
 
 All notable changes to Neon3 are recorded in this file.
 
-## v0.2.8 — 2026-09-12
+## v0.2.9 — 2026-09-12
+
+### Added
+
+- 7 new component types: Switch, Toast, MenuBar, Accordion, Spinner, Divider, Popup
+- Popup generic top-layer container for customizable dropdowns
+- MenuBar interactive dropdowns via Popup
+- Accordion expand/collapse interaction
+- ui.click_blank semantic event for outside-click dismissal
+- Skin capability expanded to 27 component types
+
+### Fixed
+
+- MenuBar dropdown position aligns to clicked menu item
+- Click outside closes menu via ui.click_blank
+- Popup no longer opens on startup
+- Removed all debug logging
+
+## v0.2.8 鈥?2026-09-12
 
 ### Added
 
@@ -35,7 +53,7 @@ All notable changes to Neon3 are recorded in this file.
 - Right-click opens ContextMenu at pointer position, rendered above all content.
 - Checkbox/RadioButton/Scrollbar hover and pressed states respond to pointer interaction.
 
-## v0.2.5 — 2026-09-04
+## v0.2.5 鈥?2026-09-04
 
 ### Added
 
@@ -89,7 +107,7 @@ All notable changes to Neon3 are recorded in this file.
 - Node SDK 77 tests and Python SDK 92 tests pass with integration gates;
   desktop behavior unchanged.
 
-## v0.2.4 — 2026-09-02
+## v0.2.4 鈥?2026-09-02
 
 ### Added
 
@@ -111,7 +129,7 @@ All notable changes to Neon3 are recorded in this file.
 - component-gallery launched as a real windowed multi-process session.
 - Windows x86_64 release binaries built.
 
-## v0.2.3 — 2026-09-01
+## v0.2.3 鈥?2026-09-01
 
 ### Added
 
@@ -171,9 +189,10 @@ All notable changes to Neon3 are recorded in this file.
   `neon-ui-runtime`, `neon-wgpu-runtime`, font assets, release manifest).
 - `neon-gpu-ecs` is a workspace crate only; crates.io registry publication
   (`scripts/publish-crates.ps1`) is a separate step and was not run for this tag.
-## v0.2.6 — 2026-09-06
+## v0.2.6 鈥?2026-09-06
 
-- 修复 NUI Flow 动态状态重挂后的完整 input 恢复。
-- 增加 TextInput 提交事件的 typed 文本传递，支持外部 host 发送聊天消息。
-- 修复窗口输入失焦提交、聊天发送按钮和多控件布局问题。
-- 增加可执行 Flow submit probe。
+- 淇 NUI Flow 鍔ㄦ€佺姸鎬侀噸鎸傚悗鐨勫畬鏁?input 鎭㈠銆?
+- 澧炲姞 TextInput 鎻愪氦浜嬩欢鐨?typed 鏂囨湰浼犻€掞紝鏀寔澶栭儴 host 鍙戦€佽亰澶╂秷鎭€?
+- 淇绐楀彛杈撳叆澶辩劍鎻愪氦銆佽亰澶╁彂閫佹寜閽拰澶氭帶浠跺竷灞€闂銆?
+- 澧炲姞鍙墽琛?Flow submit probe銆?
+

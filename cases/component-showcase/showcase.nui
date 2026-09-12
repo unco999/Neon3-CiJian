@@ -225,6 +225,9 @@ input dynamic_text text default text:empty
 # === 主界面 ===
 surface showcase overlay w 1200 h 1000 align stretch fill #0D1117
 
+  # 空白点击捕获层（最底层，点击空白区域发送 ui.click_blank 事件）
+  panel click-capture x 0 y 0 w 1200 h 1000 fill #00000000 event ui.click_blank
+
   # 左侧面板 - 带skin
   panel left-panel skin panel-style x 20 y 20 w 360 h 960 column pad 16 gap 12 align stretch
 
@@ -367,12 +370,12 @@ surface showcase overlay w 1200 h 1000 align stretch fill #0D1117
       text mb-edit x 76 y 4 w 60 h 24 value "Edit" event demo.mb.edit
       text mb-view x 144 y 4 w 60 h 24 value "View" event demo.mb.view
       text mb-help x 212 y 4 w 60 h 24 value "Help" event demo.mb.help
-    # MenuBar 下拉（Popup 组件，top-layer，自定义结构）
-    popup mb-dropdown x 0 y 830 w 160 h 140
-      text mb-dd-1 x 8 y 4 w 144 h 28 value "New" event demo.mb.dd1
-      text mb-dd-2 x 8 y 36 w 144 h 28 value "Open..." event demo.mb.dd2
-      text mb-dd-3 x 8 y 68 w 144 h 28 value "Save" event demo.mb.dd3
-      text mb-dd-4 x 8 y 100 w 144 h 28 value "Quit" event demo.mb.dd4
+      # MenuBar 下拉（Popup 顶层容器，作为 MenuBar 子节点，绝对定位紧跟下方）
+      popup mb-dropdown x 0 y 32 w 160 h 88 visible false
+        text mb-dd-1 x 8 y 4 w 144 h 20 value "New" event demo.mb.dd1
+        text mb-dd-2 x 8 y 26 w 144 h 20 value "Open..." event demo.mb.dd2
+        text mb-dd-3 x 8 y 48 w 144 h 20 value "Save" event demo.mb.dd3
+        text mb-dd-4 x 8 y 70 w 144 h 20 value "Quit" event demo.mb.dd4
 
     # Accordion - 折叠面板
     text accordion-label h 24 value "Accordion (click header to expand)"

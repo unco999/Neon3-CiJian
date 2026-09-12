@@ -1401,17 +1401,6 @@ struct SplitterDrag {
     original_bounds: Vec<(usize, UiBounds)>,
 }
 
-fn splitter_debug(msg: &str) {
-    use std::io::Write;
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("D:\\Neon3\\splitter_debug.log")
-    {
-        let _ = writeln!(f, "{}", msg);
-    }
-}
-
 pub struct UiWgpuRenderer {
     trace_role: &'static str,
     color_format: wgpu::TextureFormat,
@@ -3678,10 +3667,6 @@ impl UiWgpuRenderer {
             splitter_pos: splitter_lead,
             original_bounds,
         });
-        splitter_debug(&format!(
-            "[BEGIN] path={} horizontal={} container_start={} container_size={} splitter_size={} pointer_offset={} splitter_pos={} left_w={} right_w={}",
-            splitter_path, horizontal, container_start, total, splitter_size, pointer_offset, splitter_lead, left.width, right.width
-        ));
         self.pointer_visual_dirty = true;
         true
     }
@@ -3695,10 +3680,6 @@ impl UiWgpuRenderer {
         let min_pos = drag.container_start + 8.0; // minimum left panel width
         let max_pos = drag.container_start + drag.container_size - drag.splitter_size - 8.0;
         let new_pos = (pos - drag.pointer_offset).clamp(min_pos, max_pos);
-        splitter_debug(&format!(
-            "[UPDATE] pointer=({:.1},{:.1}) pos={:.1} offset={:.1} old_pos={:.1} new_pos={:.1} min={:.1} max={:.1}",
-            pointer[0], pointer[1], pos, drag.pointer_offset, drag.splitter_pos, new_pos, min_pos, max_pos
-        ));
         drag.splitter_pos = new_pos;
         self.pointer_visual_dirty = true;
     }
@@ -3707,7 +3688,6 @@ impl UiWgpuRenderer {
     pub(crate) fn finish_splitter_drag(&mut self) {
         if let Some(drag) = self.splitter_drag.take() {
             self.splitter_positions.insert(drag.splitter_path.clone(), drag.splitter_pos);
-            splitter_debug(&format!("[FINISH] path={} saved_pos={:.1}", drag.splitter_path, drag.splitter_pos));
             self.pointer_visual_dirty = true;
         }
     }
@@ -3739,10 +3719,6 @@ impl UiWgpuRenderer {
         self.plan[split_idx].target.bounds.x = split_x;
         self.plan[right_idx].target.bounds.x = right_x;
         self.plan[right_idx].target.bounds.width = new_right_w;
-        splitter_debug(&format!(
-            "[APPLY] split_x={:.1} new_left_w={:.1} right_x={:.1} new_right_w={:.1} left_idx={} right_idx={} split_idx={}",
-            split_x, new_left_w, right_x, new_right_w, left_idx, right_idx, split_idx
-        ));
         // Step 4: Get original bounds for delta calculation.
         let orig_left_w = drag.original_bounds.iter()
             .find(|(i, _)| *i == left_idx).map(|(_, b)| b.width).unwrap_or(new_left_w);
@@ -3873,7 +3849,6 @@ impl UiWgpuRenderer {
     /// Find the context menu bound to the node under the pointer (or ancestor).
     pub(crate) fn context_menu_at_pointer(&self) -> Option<String> {
         let pointer = self.pointer_position?;
-        println!("[ctx-menu] pointer=({:.1},{:.1}), bindings={:?}", pointer[0], pointer[1], self.context_menu_bindings.keys().collect::<Vec<_>>());
         let hit_index = self.plan.iter().enumerate().rev().find_map(|(index, node)| {
             let b = node.target.bounds;
             if pointer[0] >= b.x && pointer[0] <= b.x + b.width
@@ -3884,19 +3859,15 @@ impl UiWgpuRenderer {
                 None
             }
         })?;
-        println!("[ctx-menu] hit_index={}, hit_id={}", hit_index, self.plan[hit_index].id);
         let mut current = Some(hit_index);
         while let Some(idx) = current {
             let node = &self.plan[idx];
-            println!("[ctx-menu] walk: id={}, parent={:?}", node.id, node.parent_id);
             if let Some(menu_id) = self.context_menu_bindings.get(&node.id) {
-                println!("[ctx-menu] FOUND binding: {} -> {}", node.id, menu_id);
                 return Some(menu_id.clone());
             }
             current = node.parent_id.as_deref()
                 .and_then(|pid| self.plan.iter().position(|n| n.id == pid));
         }
-        println!("[ctx-menu] NO binding found in ancestor chain");
         None
     }
 
@@ -7372,14 +7343,6 @@ impl UiWgpuRenderer {
             })
             .map(|(id, _, _, _)| id.clone())
             .collect();
-        if self.context_menus_visible {
-            let ctx_nodes: Vec<_> = nodes.iter()
-                .filter(|(_, _, t, _)| matches!(t.kind, UiNodeKind::ContextMenu))
-                .map(|(id, _, t, _)| (id.clone(), t.bounds))
-                .collect();
-            println!("[ctx-filter] visible={}, active={:?}, suffix={:?}, ctx_nodes={:?}, hidden={:?}",
-                self.context_menus_visible, self.active_context_menu_id, active_suffix, ctx_nodes, hidden_ctx_ids);
-        }
         let is_ctx_hidden = |id: &str| -> bool {
             let mut current = Some(id.to_string());
             while let Some(cid) = current {
@@ -7418,17 +7381,10 @@ impl UiWgpuRenderer {
         for (id, parent_id, mut target, transition) in nodes {
             // Skip hidden context menus and all their descendants.
             if is_ctx_hidden(&id) {
-                if matches!(target.kind, UiNodeKind::ContextMenu) {
-                    println!("[ctx-filter] SKIP ctx node: {}", id);
-                }
                 continue;
             }
             // Move visible context menu and descendants to anchor position.
             if let Some((dx, dy)) = ctx_delta_for(&id) {
-                if matches!(target.kind, UiNodeKind::ContextMenu) {
-                    println!("[ctx-filter] KEEP ctx node: {}, bounds=({:.0},{:.0},{:.0},{:.0}), delta=({:.0},{:.0})",
-                        id, target.bounds.x, target.bounds.y, target.bounds.width, target.bounds.height, dx, dy);
-                }
                 target.bounds.x += dx;
                 target.bounds.y += dy;
             }
@@ -8059,9 +8015,6 @@ impl UiWgpuRenderer {
     }
 
     fn instance(&self, visual: &UiVisual, node_path: &str, time_seconds: f32) -> UiInstance {
-        if node_path.contains("split") {
-            splitter_debug(&format!("[INSTANCE] path={} kind={:?} bounds=({},{},{},{}) bg={:?}", node_path, visual.kind, visual.bounds.x, visual.bounds.y, visual.bounds.width, visual.bounds.height, visual.style.background_color));
-        }
         let mut visual = visual.clone();
         // Apply persistent built-in toggle state (survives fragment re-submission)
         if let Some(&selected) = self.builtin_toggles.get(node_path)
@@ -8106,10 +8059,6 @@ impl UiWgpuRenderer {
             },
         );
         let fill = style.background_color;
-        if node_path.contains("split-h") {
-            let has_active = self.active.get(node_path).is_some();
-            splitter_debug(&format!("[FILL] path={} resolved_fill={:?} has_active_transition={}", node_path, fill, has_active));
-        }
         if visual.kind == UiNodeKind::Button
             && pointer_over
             && time_seconds < self.pressed_until_seconds
@@ -11516,7 +11465,7 @@ fn flatten_node(
     // ContextMenu nodes are always included in the flattened list; their
     // actual visibility is controlled by the active_context_menu_id filter
     // that runs after flattening. Other invisible nodes are skipped here.
-    if (!node.visible && !matches!(node.kind, UiNodeKind::ContextMenu | UiNodeKind::Popup))
+    if (!node.visible && !matches!(node.kind, UiNodeKind::ContextMenu))
         || hidden_world_nodes.contains(node.node_id.0.as_str())
     {
         return;
@@ -11761,11 +11710,6 @@ fn resolve_children(
     inner: UiBounds,
     font: Option<&ResidentFont>,
 ) -> Vec<UiBounds> {
-    if format!("{:?}", node.node_id).contains("split-container") {
-        for child in &node.children {
-            splitter_debug(&format!("[LAYOUT] child={:?} bounds=({},{},{},{}) mode={:?}", child.node_id, child.bounds.x, child.bounds.y, child.bounds.width, child.bounds.height, parent_layout.mode));
-        }
-    }
     if !matches!(parent_layout.mode, UiLayoutMode::Row | UiLayoutMode::Column) {
         return node
             .children
@@ -11921,7 +11865,7 @@ fn resolve_children(
         .iter()
         .enumerate()
         .map(|(index, child)| {
-            if !child.visible && !matches!(child.kind, UiNodeKind::ContextMenu | UiNodeKind::Popup) {
+            if !child.visible && !matches!(child.kind, UiNodeKind::ContextMenu) {
                 return UiBounds {
                     x: inner.x,
                     y: inner.y,
