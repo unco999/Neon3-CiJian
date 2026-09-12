@@ -5870,11 +5870,11 @@ impl UiWgpuRenderer {
                 images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, _padding: [0; 2] });
             }
         }
-        // Panel / Dialog / ContextMenu / Splitter / ListBox skins replace the
-        // standard fill with a skinned body image. These are non-interactive
+        // Panel / Dialog / ContextMenu / Splitter / ListBox / Modal / TreeView skins
+        // replace the standard fill with a skinned body image. These are non-interactive
         // body-only components; only the Normal state is consulted.
         for (index, visual) in self.sampled.iter().enumerate() {
-            if !matches!(visual.kind, UiNodeKind::Panel | UiNodeKind::Dialog | UiNodeKind::ContextMenu | UiNodeKind::Splitter | UiNodeKind::ListBox)
+            if !matches!(visual.kind, UiNodeKind::Panel | UiNodeKind::Dialog | UiNodeKind::ContextMenu | UiNodeKind::Splitter | UiNodeKind::ListBox | UiNodeKind::Modal | UiNodeKind::TreeView)
                 || !sampled_in_mode(visual, mode)
             {
                 continue;

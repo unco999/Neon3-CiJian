@@ -873,7 +873,7 @@ pub struct UiSkinSlot {
 impl UiControlSkin {
     pub fn validate(&self) -> Result<(), UiSchemaError> {
         if self.key.trim().is_empty()
-            || !matches!(self.component_kind, UiNodeKind::Button | UiNodeKind::Slider | UiNodeKind::Scrollbar | UiNodeKind::ProgressBar | UiNodeKind::Checkbox | UiNodeKind::RadioButton | UiNodeKind::TextInput | UiNodeKind::Tooltip | UiNodeKind::Panel | UiNodeKind::Dialog | UiNodeKind::ContextMenu | UiNodeKind::Splitter | UiNodeKind::Combo | UiNodeKind::Dropdown | UiNodeKind::Tabs | UiNodeKind::Selectable | UiNodeKind::ListBox | UiNodeKind::DragValue)
+            || !matches!(self.component_kind, UiNodeKind::Button | UiNodeKind::Slider | UiNodeKind::Scrollbar | UiNodeKind::ProgressBar | UiNodeKind::Checkbox | UiNodeKind::RadioButton | UiNodeKind::TextInput | UiNodeKind::Tooltip | UiNodeKind::Panel | UiNodeKind::Dialog | UiNodeKind::ContextMenu | UiNodeKind::Splitter | UiNodeKind::Combo | UiNodeKind::Dropdown | UiNodeKind::Tabs | UiNodeKind::Selectable | UiNodeKind::ListBox | UiNodeKind::DragValue | UiNodeKind::Modal | UiNodeKind::TreeView)
         {
             return Err(UiSchemaError::InvalidControlSkin);
         }
@@ -921,7 +921,8 @@ impl UiControlSkin {
             ],
             UiNodeKind::Dialog | UiNodeKind::ContextMenu | UiNodeKind::Splitter
                 | UiNodeKind::Combo | UiNodeKind::Dropdown | UiNodeKind::Tabs
-                | UiNodeKind::Selectable | UiNodeKind::ListBox => &[
+                | UiNodeKind::Selectable | UiNodeKind::ListBox
+                | UiNodeKind::Modal | UiNodeKind::TreeView => &[
                 (UiSkinSlotKind::Body, UiVisualState::Normal),
             ],
             UiNodeKind::DragValue => &[

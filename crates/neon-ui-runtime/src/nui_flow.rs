@@ -583,7 +583,7 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
         }
     }
     for (node_key, skin_key) in &skin_references {
-        if !matches!(find_node(&root.node, node_key), Some(node) if matches!(node.kind, UiNodeKind::Button | UiNodeKind::Slider | UiNodeKind::Scrollbar | UiNodeKind::ProgressBar | UiNodeKind::Checkbox | UiNodeKind::RadioButton | UiNodeKind::TextInput | UiNodeKind::Tooltip | UiNodeKind::Panel | UiNodeKind::Dialog | UiNodeKind::ContextMenu | UiNodeKind::Splitter | UiNodeKind::Combo | UiNodeKind::Dropdown | UiNodeKind::Tabs | UiNodeKind::Selectable | UiNodeKind::ListBox | UiNodeKind::DragValue))
+        if !matches!(find_node(&root.node, node_key), Some(node) if matches!(node.kind, UiNodeKind::Button | UiNodeKind::Slider | UiNodeKind::Scrollbar | UiNodeKind::ProgressBar | UiNodeKind::Checkbox | UiNodeKind::RadioButton | UiNodeKind::TextInput | UiNodeKind::Tooltip | UiNodeKind::Panel | UiNodeKind::Dialog | UiNodeKind::ContextMenu | UiNodeKind::Splitter | UiNodeKind::Combo | UiNodeKind::Dropdown | UiNodeKind::Tabs | UiNodeKind::Selectable | UiNodeKind::ListBox | UiNodeKind::DragValue | UiNodeKind::Modal | UiNodeKind::TreeView))
             || !skin_keys.contains(skin_key)
             || !matches!((find_node(&root.node, node_key), skins.iter().find(|skin| skin.key == *skin_key)), (Some(node), Some(skin)) if node.kind == skin.component_kind)
         {
@@ -1205,6 +1205,8 @@ fn format_skin_component(kind: &neon_ui_schema::UiNodeKind) -> &'static str {
         neon_ui_schema::UiNodeKind::Selectable => "selectable",
         neon_ui_schema::UiNodeKind::ListBox => "list_box",
         neon_ui_schema::UiNodeKind::DragValue => "drag_value",
+        neon_ui_schema::UiNodeKind::Modal => "modal",
+        neon_ui_schema::UiNodeKind::TreeView => "tree_view",
         _ => "unsupported",
     }
 }
@@ -1552,7 +1554,9 @@ fn parse_skin_header(text: &str, line: u32) -> FlowResult<neon_ui_schema::UiCont
         "selectable" => neon_ui_schema::UiNodeKind::Selectable,
         "list_box" => neon_ui_schema::UiNodeKind::ListBox,
         "drag_value" => neon_ui_schema::UiNodeKind::DragValue,
-        _ => return Err(error("nui_flow_invalid_skin", "skin component kind must be one of: button, slider, scrollbar, progress_bar, checkbox, radio_button, input, tooltip, panel, dialog, context_menu, splitter, combo, dropdown, tabs, selectable, list_box, drag_value", line, 1)),
+        "modal" => neon_ui_schema::UiNodeKind::Modal,
+        "tree_view" => neon_ui_schema::UiNodeKind::TreeView,
+        _ => return Err(error("nui_flow_invalid_skin", "skin component kind must be one of: button, slider, scrollbar, progress_bar, checkbox, radio_button, input, tooltip, panel, dialog, context_menu, splitter, combo, dropdown, tabs, selectable, list_box, drag_value, modal, tree_view", line, 1)),
     };
     Ok(neon_ui_schema::UiControlSkin {
         key: parts[1].into(),
@@ -2989,7 +2993,7 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
                     };
                 } else {
                     if token == "skin" {
-                        if !matches!(component, "button" | "slider" | "scrollbar" | "progress_bar" | "checkbox" | "radio_button" | "input" | "tooltip" | "panel" | "dialog" | "context_menu" | "splitter" | "combo" | "dropdown" | "tabs" | "selectable" | "list_box" | "drag_value") || !valid_key(value) {
+                        if !matches!(component, "button" | "slider" | "scrollbar" | "progress_bar" | "checkbox" | "radio_button" | "input" | "tooltip" | "panel" | "dialog" | "context_menu" | "splitter" | "combo" | "dropdown" | "tabs" | "selectable" | "list_box" | "drag_value" | "modal" | "tree_view") || !valid_key(value) {
                             return Err(error("nui_flow_invalid_skin", "skin reference is valid only for skinnable components and requires a stable key", line, 1));
                         }
                         skin_key = Some(value.into());
