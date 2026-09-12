@@ -873,7 +873,7 @@ pub struct UiSkinSlot {
 impl UiControlSkin {
     pub fn validate(&self) -> Result<(), UiSchemaError> {
         if self.key.trim().is_empty()
-            || !matches!(self.component_kind, UiNodeKind::Button | UiNodeKind::Slider | UiNodeKind::Scrollbar | UiNodeKind::ProgressBar | UiNodeKind::Checkbox | UiNodeKind::RadioButton | UiNodeKind::TextInput | UiNodeKind::Tooltip | UiNodeKind::Panel | UiNodeKind::Dialog | UiNodeKind::ContextMenu | UiNodeKind::Splitter | UiNodeKind::Combo | UiNodeKind::Dropdown | UiNodeKind::Tabs | UiNodeKind::Selectable | UiNodeKind::ListBox | UiNodeKind::DragValue | UiNodeKind::Modal | UiNodeKind::TreeView)
+            || !matches!(self.component_kind, UiNodeKind::Button | UiNodeKind::Slider | UiNodeKind::Scrollbar | UiNodeKind::ProgressBar | UiNodeKind::Checkbox | UiNodeKind::RadioButton | UiNodeKind::TextInput | UiNodeKind::Tooltip | UiNodeKind::Panel | UiNodeKind::Dialog | UiNodeKind::ContextMenu | UiNodeKind::Splitter | UiNodeKind::Combo | UiNodeKind::Dropdown | UiNodeKind::Tabs | UiNodeKind::Selectable | UiNodeKind::ListBox | UiNodeKind::DragValue | UiNodeKind::Modal | UiNodeKind::TreeView | UiNodeKind::Switch | UiNodeKind::Toast | UiNodeKind::MenuBar | UiNodeKind::Accordion | UiNodeKind::Spinner | UiNodeKind::Divider)
         {
             return Err(UiSchemaError::InvalidControlSkin);
         }
@@ -922,8 +922,14 @@ impl UiControlSkin {
             UiNodeKind::Dialog | UiNodeKind::ContextMenu | UiNodeKind::Splitter
                 | UiNodeKind::Combo | UiNodeKind::Dropdown | UiNodeKind::Tabs
                 | UiNodeKind::Selectable | UiNodeKind::ListBox
-                | UiNodeKind::Modal | UiNodeKind::TreeView => &[
+                | UiNodeKind::Modal | UiNodeKind::TreeView
+                | UiNodeKind::Toast | UiNodeKind::MenuBar | UiNodeKind::Accordion
+                | UiNodeKind::Spinner | UiNodeKind::Divider => &[
                 (UiSkinSlotKind::Body, UiVisualState::Normal),
+            ],
+            UiNodeKind::Switch => &[
+                (UiSkinSlotKind::Track, UiVisualState::Normal),
+                (UiSkinSlotKind::Thumb, UiVisualState::Normal),
             ],
             UiNodeKind::DragValue => &[
                 (UiSkinSlotKind::Track, UiVisualState::Normal),
@@ -990,6 +996,24 @@ pub enum UiNodeKind {
     /// A declarative, virtualized tabular viewport. Row data is supplied by
     /// bounded `UiDataGridFrame` windows rather than by runtime topology.
     DataGrid,
+    /// A boolean on/off switch with a sliding thumb. Visually distinct from
+    /// Checkbox; uses Toggle presentation for selected state.
+    Switch,
+    /// A transient auto-dismissing notification popup. Rendered top-layer;
+    /// duration controls automatic hide (0 = persistent until dismissed).
+    Toast,
+    /// A persistent horizontal menu bar with expandable menu items. Each
+    /// child is a menu header; clicking opens a dropdown of child items.
+    MenuBar,
+    /// A vertically stacked set of expandable/collapsible sections. Each
+    /// child panel has a clickable header and a content area that toggles.
+    Accordion,
+    /// An indeterminate loading indicator. Renders a rotating arc; animation
+    /// is driven by the render loop time.
+    Spinner,
+    /// A horizontal or vertical separator line. Orientation inferred from
+    /// bounds (w > h = horizontal, h > w = vertical).
+    Divider,
 }
 
 /// A single node in a TreeView hierarchy. Nodes form a recursive tree;

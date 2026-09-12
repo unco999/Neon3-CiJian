@@ -5870,11 +5870,12 @@ impl UiWgpuRenderer {
                 images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, _padding: [0; 2] });
             }
         }
-        // Panel / Dialog / ContextMenu / Splitter / ListBox / Modal / TreeView skins
-        // replace the standard fill with a skinned body image. These are non-interactive
+        // Panel / Dialog / ContextMenu / Splitter / ListBox / Modal / TreeView
+        // / Toast / MenuBar / Accordion / Spinner / Divider skins replace the
+        // standard fill with a skinned body image. These are non-interactive
         // body-only components; only the Normal state is consulted.
         for (index, visual) in self.sampled.iter().enumerate() {
-            if !matches!(visual.kind, UiNodeKind::Panel | UiNodeKind::Dialog | UiNodeKind::ContextMenu | UiNodeKind::Splitter | UiNodeKind::ListBox | UiNodeKind::Modal | UiNodeKind::TreeView)
+            if !matches!(visual.kind, UiNodeKind::Panel | UiNodeKind::Dialog | UiNodeKind::ContextMenu | UiNodeKind::Splitter | UiNodeKind::ListBox | UiNodeKind::Modal | UiNodeKind::TreeView | UiNodeKind::Toast | UiNodeKind::MenuBar | UiNodeKind::Accordion | UiNodeKind::Spinner | UiNodeKind::Divider)
                 || !sampled_in_mode(visual, mode)
             {
                 continue;
@@ -5894,6 +5895,39 @@ impl UiWgpuRenderer {
             let (source_insets, target_insets, slice_mode, fill_center) = nine_slice.map(|layout| (layout.source_insets_px.map(|value| value as f32), layout.target_insets, match layout.mode { neon_ui_schema::UiNineSliceMode::Stretch => 0, neon_ui_schema::UiNineSliceMode::Tile => 1, neon_ui_schema::UiNineSliceMode::Mirror => 2 }, u32::from(layout.fill_center))).unwrap_or(([0.0; 4], [0.0; 4], 0, 1));
             let (rect, uv) = fit_image_rect_and_uv(visual.bounds, image.uv, image.width, image.height, fit);
             images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, _padding: [0; 2] });
+        }
+        // Switch skins render track + sliding thumb. Thumb position is driven by
+        // the Toggle presentation (selected = on). Track and thumb support
+        // Normal / Hover / Pressed / Disabled via select_toggle_skin_slot.
+        for (index, visual) in self.sampled.iter().enumerate() {
+            if visual.kind != UiNodeKind::Switch || !sampled_in_mode(visual, mode) {
+                continue;
+            }
+            let Some(skin_key) = self.skin_references.get(&self.plan[index].id) else { continue };
+            let Some(skin) = self.skins.get(skin_key) else { continue };
+            let selected = matches!(&visual.presentation, Some(UiControlPresentation::Toggle { selected }) if *selected);
+            let hovered = self.pointer_position.is_some_and(|position| contains(visual.bounds, position));
+            let pressed = hovered && time_seconds < self.pressed_until_seconds;
+            let enabled = visual.enabled;
+            let track = visual.bounds;
+            let thumb_size = track.height.min(24.0).max(8.0);
+            let thumb_x = if selected { track.x + track.width - thumb_size - 2.0 } else { track.x + 2.0 };
+            let thumb = UiBounds { x: thumb_x, y: track.y + (track.height - thumb_size) * 0.5, width: thumb_size, height: thumb_size };
+            for (slot_kind, bounds) in [(UiSkinSlotKind::Track, track), (UiSkinSlotKind::Thumb, thumb)] {
+                let Some(slot) = select_toggle_skin_slot(skin, slot_kind, hovered, pressed, enabled) else { continue };
+                let (resource_key, fit, nine_slice) = match &slot.presentation {
+                    UiSkinPresentation::Image { resource_key, fit } => (resource_key, *fit, None),
+                    UiSkinPresentation::NineSlice { resource_key, layout } => (resource_key, UiImageFit::Stretch, Some(*layout)),
+                    _ => continue,
+                };
+                let binding_key = format!("{skin_key}/{resource_key}");
+                let image = self.skin_assets.get(&binding_key).and_then(|asset| self.resident_images.get(&(asset.project_id.clone(), asset.asset_id, asset.revision.0))).or_else(|| self.skin_image_ids.get(&binding_key).and_then(|image_id| self.external_images.get(image_id)));
+                let Some(image) = image else { continue };
+                if nine_slice.is_some_and(|layout| !layout.validate_for_image(image.width, image.height)) { continue; }
+                let (source_insets, target_insets, slice_mode, fill_center) = nine_slice.map(|layout| (layout.source_insets_px.map(|value| value as f32), layout.target_insets, match layout.mode { neon_ui_schema::UiNineSliceMode::Stretch => 0, neon_ui_schema::UiNineSliceMode::Tile => 1, neon_ui_schema::UiNineSliceMode::Mirror => 2 }, u32::from(layout.fill_center))).unwrap_or(([0.0; 4], [0.0; 4], 0, 1));
+                let (rect, uv) = fit_image_rect_and_uv(bounds, image.uv, image.width, image.height, fit);
+                images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, _padding: [0; 2] });
+            }
         }
         // ProgressBar skins render track + fill using the normalized value.
         for (index, visual) in self.sampled.iter().enumerate() {
@@ -8893,6 +8927,9 @@ fn component_spec(kind: &UiNodeKind) -> UiComponentSpec {
             | UiNodeKind::ListBox
             | UiNodeKind::Scrollbar
             | UiNodeKind::ProgressBar
+            | UiNodeKind::Switch
+            | UiNodeKind::Toast
+            | UiNodeKind::MenuBar
     );
     let interactive = matches!(
         kind,
@@ -8908,6 +8945,9 @@ fn component_spec(kind: &UiNodeKind) -> UiComponentSpec {
             | UiNodeKind::Selectable
             | UiNodeKind::ListBox
             | UiNodeKind::Scrollbar
+            | UiNodeKind::Switch
+            | UiNodeKind::MenuBar
+            | UiNodeKind::Accordion
     );
     let metrics = UiComponentMetrics {
         min_width: 0.0,
@@ -8917,13 +8957,16 @@ fn component_spec(kind: &UiNodeKind) -> UiComponentSpec {
             | UiNodeKind::RadioButton
             | UiNodeKind::Slider
             | UiNodeKind::DragValue
-            | UiNodeKind::Selectable => 30.0,
-            UiNodeKind::TextInput | UiNodeKind::Combo | UiNodeKind::Dropdown | UiNodeKind::Tabs => {
+            | UiNodeKind::Selectable
+            | UiNodeKind::Switch => 30.0,
+            UiNodeKind::TextInput | UiNodeKind::Combo | UiNodeKind::Dropdown | UiNodeKind::Tabs | UiNodeKind::MenuBar => {
                 32.0
             }
             UiNodeKind::ListBox => 90.0,
             UiNodeKind::Scrollbar => 20.0,
             UiNodeKind::ProgressBar => 24.0,
+            UiNodeKind::Spinner => 24.0,
+            UiNodeKind::Divider => 1.0,
             _ => 0.0,
         },
         horizontal_padding: match kind {
@@ -8967,7 +9010,7 @@ fn component_spec(kind: &UiNodeKind) -> UiComponentSpec {
             ),
             toggle: matches!(
                 kind,
-                UiNodeKind::Checkbox | UiNodeKind::RadioButton | UiNodeKind::Selectable
+                UiNodeKind::Checkbox | UiNodeKind::RadioButton | UiNodeKind::Selectable | UiNodeKind::Switch
             ),
             popup: matches!(kind, UiNodeKind::Combo | UiNodeKind::Dropdown),
             scroll: matches!(
@@ -8976,7 +9019,7 @@ fn component_spec(kind: &UiNodeKind) -> UiComponentSpec {
             ),
             top_layer: matches!(
                 kind,
-                UiNodeKind::Tooltip | UiNodeKind::Modal | UiNodeKind::Dialog | UiNodeKind::ContextMenu
+                UiNodeKind::Tooltip | UiNodeKind::Modal | UiNodeKind::Dialog | UiNodeKind::ContextMenu | UiNodeKind::Toast
             ),
             virtualized: *kind == UiNodeKind::DataGrid,
         },
@@ -9176,6 +9219,48 @@ fn default_component_style(kind: &UiNodeKind) -> UiStyle {
             border_color: [0.28, 0.38, 0.34, 0.70],
             border_width: 1.0,
             corner_radius: 4.0,
+            opacity: 1.0,
+        },
+        UiNodeKind::Switch => UiStyle {
+            background_color: [0.09, 0.12, 0.12, 1.0],
+            border_color: [0.27, 0.46, 0.40, 0.82],
+            border_width: 1.0,
+            corner_radius: 10.0,
+            opacity: 1.0,
+        },
+        UiNodeKind::Toast => UiStyle {
+            background_color: [0.14, 0.17, 0.20, 0.96],
+            border_color: [0.38, 0.46, 0.54, 0.85],
+            border_width: 1.0,
+            corner_radius: 6.0,
+            opacity: 1.0,
+        },
+        UiNodeKind::MenuBar => UiStyle {
+            background_color: [0.12, 0.14, 0.16, 1.0],
+            border_color: [0.30, 0.38, 0.44, 0.80],
+            border_width: 1.0,
+            corner_radius: 0.0,
+            opacity: 1.0,
+        },
+        UiNodeKind::Accordion => UiStyle {
+            background_color: [0.10, 0.12, 0.14, 1.0],
+            border_color: [0.28, 0.36, 0.42, 0.70],
+            border_width: 1.0,
+            corner_radius: 4.0,
+            opacity: 1.0,
+        },
+        UiNodeKind::Spinner => UiStyle {
+            background_color: [0.0, 0.0, 0.0, 0.0],
+            border_color: [0.0, 0.0, 0.0, 0.0],
+            border_width: 0.0,
+            corner_radius: 0.0,
+            opacity: 1.0,
+        },
+        UiNodeKind::Divider => UiStyle {
+            background_color: [0.22, 0.28, 0.32, 1.0],
+            border_color: [0.0, 0.0, 0.0, 0.0],
+            border_width: 0.0,
+            corner_radius: 0.0,
             opacity: 1.0,
         },
         // Containers, labels, images, and render surfaces do not get implicit
@@ -9498,6 +9583,53 @@ fn component_chrome_instances(visual: &UiVisual) -> Vec<UiInstance> {
             [0.46, 0.72, 0.76, 0.95],
             3.0,
         )],
+        UiNodeKind::Switch => {
+            let track = UiBounds {
+                x: bounds.x + 4.0,
+                y: center_y - 7.0,
+                width: (bounds.width - 8.0).max(28.0),
+                height: 14.0,
+            };
+            let thumb_size = 10.0;
+            let thumb_x = if selected {
+                track.x + track.width - thumb_size - 2.0
+            } else {
+                track.x + 2.0
+            };
+            vec![
+                chrome(track, if selected { [0.16, 0.35, 0.28, 1.0] } else { muted }, if selected { mint } else { [0.40, 0.44, 0.50, 0.8] }, 7.0),
+                chrome(
+                    UiBounds { x: thumb_x, y: center_y - thumb_size * 0.5, width: thumb_size, height: thumb_size },
+                    [0.90, 0.92, 0.95, 1.0],
+                    [0.90, 0.92, 0.95, 1.0],
+                    5.0,
+                ),
+            ]
+        }
+        UiNodeKind::Spinner => {
+            // Static arc ring; animation is handled by the render loop via
+            // time-based rotation when a skin is not applied.
+            let size = bounds.width.min(bounds.height).min(24.0).max(8.0);
+            let cx = bounds.x + bounds.width * 0.5;
+            let cy = bounds.y + bounds.height * 0.5;
+            let half = size * 0.5;
+            vec![
+                // Background ring (full circle, muted)
+                chrome(
+                    UiBounds { x: cx - half, y: cy - half, width: size, height: size },
+                    [0.0, 0.0, 0.0, 0.0],
+                    [0.25, 0.30, 0.35, 0.6],
+                    half,
+                ),
+                // Foreground arc (top-right quarter, accent)
+                chrome(
+                    UiBounds { x: cx - half + 1.0, y: cy - half + 1.0, width: size - 2.0, height: (size - 2.0) * 0.5 },
+                    [0.0, 0.0, 0.0, 0.0],
+                    mint,
+                    half - 1.0,
+                ),
+            ]
+        }
         _ => Vec::new(),
     }
 }
