@@ -3,7 +3,14 @@
 
 resource btn-idle image
 resource btn-hover image
+resource btn-idle-dark image
+resource btn-hover-dark image
+resource btn-idle-warm image
+resource btn-hover-warm image
 resource panel-bg image
+resource panel-dark image
+resource panel-warm image
+resource panel-accent image
 resource track-bg image
 resource fill-bg image
 resource thumb-bg image
@@ -15,14 +22,55 @@ resource scrollbar-track image
 resource scrollbar-thumb image
 resource progress-track image
 resource progress-fill image
+resource slider-fat-track image
+resource slider-fat-fill image
+resource slider-fat-thumb image
+resource slider-min-track image
+resource slider-min-fill image
+resource slider-min-thumb image
+resource check-dark-body image
+resource check-dark-icon image
+resource check-warm-body image
+resource check-warm-icon image
+resource progress-blue-fill image
+resource progress-warm-fill image
+resource input-dark-bg image
+resource input-warm-bg image
+resource check-circle-ring image
+resource check-circle-dot image
+resource check-card-body image
+resource check-card-icon image
+resource progress-striped-fill image
+resource progress-rounded-track image
+resource progress-rounded-fill image
+resource slider-square-thumb image
+resource slider-square-track image
+resource slider-square-fill image
 
-# === Skin 定义 (9种组件) ===
+# === Skin 定义 (9种组件 + 多套变体) ===
 skin btn-style button
   slot body idle resource btn-idle nine_slice 4 4 4 4 border 6 6 6 6
   slot body hover resource btn-hover nine_slice 4 4 4 4 border 6 6 6 6
 
+skin btn-dark button
+  slot body idle resource btn-idle-dark nine_slice 4 4 4 4 border 6 6 6 6
+  slot body hover resource btn-hover-dark nine_slice 4 4 4 4 border 6 6 6 6
+
+skin btn-warm button
+  slot body idle resource btn-idle-warm nine_slice 4 4 4 4 border 6 6 6 6
+  slot body hover resource btn-hover-warm nine_slice 4 4 4 4 border 6 6 6 6
+
 skin panel-style panel
   slot body idle resource panel-bg nine_slice 8 8 8 8 border 12 12 12 12
+
+skin panel-dark panel
+  slot body idle resource panel-dark nine_slice 8 8 8 8 border 12 12 12 12
+
+skin panel-warm panel
+  slot body idle resource panel-warm nine_slice 8 8 8 8 border 12 12 12 12
+
+skin panel-accent panel
+  slot body idle resource panel-accent nine_slice 8 8 8 8 border 12 12 12 12
 
 skin slider-style slider
   slot track idle resource track-bg nine_slice 2 2 2 2 border 3 3 3 3
@@ -54,6 +102,76 @@ skin input-style input
 
 skin tooltip-style tooltip
   slot body idle resource tooltip-bg nine_slice 6 6 6 6 border 8 8 8 8
+
+# === Slider 变体 ===
+skin slider-fat slider
+  slot track idle resource slider-fat-track nine_slice 4 4 4 4 border 8 8 8 8
+  slot fill active resource slider-fat-fill
+  slot thumb idle resource slider-fat-thumb fit contain
+
+skin slider-minimal slider
+  slot track idle resource slider-min-track nine_slice 1 1 1 1 border 1 1 1 1
+  slot fill active resource slider-min-fill
+  slot thumb idle resource slider-min-thumb fit contain
+
+# === Checkbox 变体 ===
+skin checkbox-dark checkbox
+  slot body idle resource check-dark-body nine_slice 3 3 3 3 border 5 5 5 5
+  slot body hover resource check-dark-body nine_slice 3 3 3 3 border 5 5 5 5
+  slot fill active resource check-dark-icon fit contain
+
+skin checkbox-warm checkbox
+  slot body idle resource check-warm-body nine_slice 3 3 3 3 border 5 5 5 5
+  slot body hover resource check-warm-body nine_slice 3 3 3 3 border 5 5 5 5
+  slot fill active resource check-warm-icon fit contain
+
+# === ProgressBar 变体 ===
+skin progress-blue progress_bar
+  slot track idle resource progress-track
+  slot fill active resource progress-blue-fill
+
+skin progress-warm progress_bar
+  slot track idle resource progress-track
+  slot fill active resource progress-warm-fill
+
+# === Input 变体 ===
+skin input-dark input
+  slot body idle resource input-dark-bg nine_slice 3 3 3 3 border 5 5 5 5
+  slot body hover resource input-dark-bg nine_slice 3 3 3 3 border 5 5 5 5
+  slot body active resource input-dark-bg nine_slice 3 3 3 3 border 5 5 5 5
+
+skin input-warm input
+  slot body idle resource input-warm-bg nine_slice 3 3 3 3 border 5 5 5 5
+  slot body hover resource input-warm-bg nine_slice 3 3 3 3 border 5 5 5 5
+  slot body active resource input-warm-bg nine_slice 3 3 3 3 border 5 5 5 5
+
+# === Checkbox 圆形样式 ===
+skin checkbox-circle checkbox
+  slot body idle resource check-circle-ring fit contain
+  slot body hover resource check-circle-ring fit contain
+  slot fill active resource check-circle-dot fit contain
+
+# === Checkbox 卡片样式（粗边框紫色） ===
+skin checkbox-card checkbox
+  slot body idle resource check-card-body nine_slice 4 4 4 4 border 6 6 6 6
+  slot body hover resource check-card-body nine_slice 4 4 4 4 border 6 6 6 6
+  slot fill active resource check-card-icon fit contain
+
+# === ProgressBar 条纹样式 ===
+skin progress-striped progress_bar
+  slot track idle resource progress-track
+  slot fill active resource progress-striped-fill
+
+# === ProgressBar 圆角样式 ===
+skin progress-rounded progress_bar
+  slot track idle resource progress-rounded-track fit contain
+  slot fill active resource progress-rounded-fill fit contain
+
+# === Slider 方块滑块样式 ===
+skin slider-square slider
+  slot track idle resource slider-square-track nine_slice 2 2 2 2 border 3 3 3 3
+  slot fill active resource slider-square-fill
+  slot thumb idle resource slider-square-thumb fit contain
 
 # === Input 变量 ===
 input alpha f32 default 0.9
@@ -98,7 +216,34 @@ surface showcase overlay w 1200 h 800 align stretch fill #0D1117
 
     # Opacity binding demo
     panel opacity-demo x 0 y 0 w 100 h 40 fill #58A6FF opacity $alpha
-    text opacity-label h 24 value "Opacity bound to $alpha"
+    text opacity-label h 24 value "Opacity binding demo"
+
+    # === Skin 变体展示区 ===
+    text skin-section-title h 28 value "Skin Variants"
+
+    text skin-slider-label h 20 value "Slider:"
+    panel skin-slider-row w 328 h 40 row gap 12 align center
+      slider skin-slider-def skin slider-style w 100 h 22 numeric $slider_val
+      slider skin-slider-fat skin slider-fat w 100 h 36 numeric $slider_val
+      slider skin-slider-min skin slider-minimal w 100 h 14 numeric $slider_val
+
+    text skin-check-label h 20 value "Checkbox:"
+    panel skin-check-row w 328 h 40 row gap 12 align center
+      checkbox skin-check-def skin checkbox-style w 100 h 24 value "Square" event demo.skin.check.def
+      checkbox skin-check-circle skin checkbox-circle w 100 h 28 value "Circle" event demo.skin.check.circle
+      checkbox skin-check-card skin checkbox-card w 100 h 32 value "Card" event demo.skin.check.card
+
+    text skin-prog-label h 20 value "ProgressBar:"
+    panel skin-prog-row w 328 h 24 row gap 12
+      progress_bar skin-prog-def skin progress-style w 100 h 14 numeric $progress_val
+      progress_bar skin-prog-striped skin progress-striped w 100 h 20 numeric $progress_val
+      progress_bar skin-prog-rounded skin progress-rounded w 100 h 14 numeric $progress_val
+
+    text skin-input-label h 20 value "Input:"
+    panel skin-input-row w 328 h 36 row gap 12
+      input skin-input-def skin input-style w 100 h 28 value "Default"
+      input skin-input-dark skin input-dark w 100 h 32 value "Dark"
+      input skin-input-warm skin input-warm w 100 h 28 value "Warm"
 
   # 中间面板 - Scrollable 容器
   panel mid-panel skin panel-style x 400 y 20 w 380 h 760 column pad 16 gap 8 align stretch
@@ -149,7 +294,7 @@ surface showcase overlay w 1200 h 800 align stretch fill #0D1117
 
     # TreeView (hierarchical, uses tree_view component)
     text tree-label h 24 value "TreeView (hierarchical structure)"
-    tree_view demo-tree x 0 y 400 w 340 h 200
+    tree_view demo-tree w 340 h 200
       text tree-root x 8 y 20 w 324 h 24 value "▼ project/" event demo.tree.root
       text tree-crate-1 x 24 y 36 w 308 h 24 value "▼ crates/" event demo.tree.crates
       text tree-crate-2 x 40 y 64 w 292 h 24 value "neon-ui-schema" event demo.tree.schema
@@ -157,6 +302,22 @@ surface showcase overlay w 1200 h 800 align stretch fill #0D1117
       text tree-crate-4 x 40 y 120 w 292 h 24 value "neon-wgpu-runtime" event demo.tree.wgpu
       text tree-docs x 24 y 148 w 308 h 24 value "▶ docs/" event demo.tree.docs
       text tree-cases x 24 y 176 w 308 h 24 value "▶ cases/" event demo.tree.cases
+
+    # Skin Variants — 同组件多套 skin 静态展示
+    text skin-label h 24 value "Skin Variants (same component, different skins)"
+    panel skin-row w 344 h 80 row gap 8
+      panel skin-panel-default skin panel-style w 80 h 80
+        text skin-t1 x 4 y 8 w 72 h 24 value "Default"
+      panel skin-panel-dark skin panel-dark w 80 h 80
+        text skin-t2 x 4 y 8 w 72 h 24 value "Dark"
+      panel skin-panel-warm skin panel-warm w 80 h 80
+        text skin-t3 x 4 y 8 w 72 h 24 value "Warm"
+      panel skin-panel-accent skin panel-accent w 80 h 80
+        text skin-t4 x 4 y 8 w 72 h 24 value "Accent"
+    panel skin-btn-row w 344 h 36 row gap 10
+      button skin-btn-default skin btn-style w 108 h 36 value "Default"
+      button skin-btn-dark skin btn-dark w 108 h 36 value "Dark"
+      button skin-btn-warm skin btn-warm w 108 h 36 value "Warm"
 
   # Tooltip with skin
   tooltip demo-tooltip skin tooltip-style x 400 y 700 w 200 h 48

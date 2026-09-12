@@ -15,7 +15,7 @@ use std::{
 use neon_ipc::{RpcClient, RpcServer};
 use neon_protocol::{
     ClientIdentity, ClientKind, ProtocolVersion, RequestId, Revision, RpcRequest, RpcResponse,
-    RpcStatus, ServiceName,
+    RpcStatus, ServiceName, UiImageSource, UiImageUploadRequest,
 };
 use neon_ui_schema::{
     UiCommand, UiControlPresentation, UiEffect, UiFragment, UiFragmentId, UiFragmentSubmission,
@@ -60,6 +60,222 @@ fn call(
         return Err(format!("{method} rejected: {:?}", response.error));
     }
     Ok(response.result.unwrap_or_else(|| json!({})))
+}
+
+/// Generate a solid-color RGBA8 image (16x16, suitable for nine_slice).
+fn solid_image(r: u8, g: u8, b: u8, a: u8) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(16 * 16 * 4);
+    for _ in 0..16 * 16 {
+        bytes.extend_from_slice(&[r, g, b, a]);
+    }
+    bytes
+}
+
+/// Generate a 16x16 image with a 2px border and inner fill (two-tone).
+fn border_image(border: (u8, u8, u8, u8), fill: (u8, u8, u8, u8)) -> Vec<u8> {
+    let (br, bg, bb, ba) = border;
+    let (fr, fg, fb, fa) = fill;
+    let mut bytes = Vec::with_capacity(16 * 16 * 4);
+    for y in 0..16 {
+        for x in 0..16 {
+            let is_border = x < 2 || x >= 14 || y < 2 || y >= 14;
+            if is_border {
+                bytes.extend_from_slice(&[br, bg, bb, ba]);
+            } else {
+                bytes.extend_from_slice(&[fr, fg, fb, fa]);
+            }
+        }
+    }
+    bytes
+}
+
+/// Generate a 16x16 filled circle (transparent outside).
+fn circle_image(r: u8, g: u8, b: u8, a: u8) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(16 * 16 * 4);
+    let cx = 7.5;
+    let cy = 7.5;
+    let radius = 7.0;
+    for y in 0..16 {
+        for x in 0..16 {
+            let dx = x as f32 - cx;
+            let dy = y as f32 - cy;
+            let dist = (dx * dx + dy * dy).sqrt();
+            if dist <= radius {
+                bytes.extend_from_slice(&[r, g, b, a]);
+            } else {
+                bytes.extend_from_slice(&[0, 0, 0, 0]);
+            }
+        }
+    }
+    bytes
+}
+
+/// Generate a 16x16 ring (circle with transparent center, 3px border).
+fn ring_image(border: (u8, u8, u8, u8)) -> Vec<u8> {
+    let (br, bg, bb, ba) = border;
+    let mut bytes = Vec::with_capacity(16 * 16 * 4);
+    let cx = 7.5;
+    let cy = 7.5;
+    let outer_r = 7.0;
+    let inner_r = 4.0;
+    for y in 0..16 {
+        for x in 0..16 {
+            let dx = x as f32 - cx;
+            let dy = y as f32 - cy;
+            let dist = (dx * dx + dy * dy).sqrt();
+            if dist <= outer_r && dist >= inner_r {
+                bytes.extend_from_slice(&[br, bg, bb, ba]);
+            } else {
+                bytes.extend_from_slice(&[0, 0, 0, 0]);
+            }
+        }
+    }
+    bytes
+}
+
+/// Generate a 16x16 diagonal striped image (45-degree stripes).
+fn striped_image(stripe: (u8, u8, u8, u8), bg: (u8, u8, u8, u8)) -> Vec<u8> {
+    let (sr, sg, sb, sa) = stripe;
+    let (br, bg, bb, ba) = bg;
+    let mut bytes = Vec::with_capacity(16 * 16 * 4);
+    for y in 0..16 {
+        for x in 0..16 {
+            let is_stripe = ((x + y) % 6) < 3;
+            if is_stripe {
+                bytes.extend_from_slice(&[sr, sg, sb, sa]);
+            } else {
+                bytes.extend_from_slice(&[br, bg, bb, ba]);
+            }
+        }
+    }
+    bytes
+}
+
+/// Generate a 16x16 rounded-rectangle image (transparent corners, 3px radius).
+fn rounded_image(fill: (u8, u8, u8, u8)) -> Vec<u8> {
+    let (fr, fg, fb, fa) = fill;
+    let mut bytes = Vec::with_capacity(16 * 16 * 4);
+    let radius = 3.0;
+    for y in 0..16 {
+        for x in 0..16 {
+            // Determine if this pixel is inside the rounded rect
+            let in_corner = if x < 3 && y < 3 {
+                let dx = 2.5 - x as f32;
+                let dy = 2.5 - y as f32;
+                dx * dx + dy * dy > radius * radius
+            } else if x >= 13 && y < 3 {
+                let dx = x as f32 - 12.5;
+                let dy = 2.5 - y as f32;
+                dx * dx + dy * dy > radius * radius
+            } else if x < 3 && y >= 13 {
+                let dx = 2.5 - x as f32;
+                let dy = y as f32 - 12.5;
+                dx * dx + dy * dy > radius * radius
+            } else if x >= 13 && y >= 13 {
+                let dx = x as f32 - 12.5;
+                let dy = y as f32 - 12.5;
+                dx * dx + dy * dy > radius * radius
+            } else {
+                false
+            };
+            if in_corner {
+                bytes.extend_from_slice(&[0, 0, 0, 0]);
+            } else {
+                bytes.extend_from_slice(&[fr, fg, fb, fa]);
+            }
+        }
+    }
+    bytes
+}
+
+/// Upload a generated image to the runtime so skins can reference it. Retries on timeout.
+fn upload_image(endpoint: SocketAddr, seq: u64, image_id: &str, bytes: Vec<u8>) -> Result<(), String> {
+    let upload = UiImageUploadRequest {
+        source: UiImageSource {
+            image_id: image_id.into(),
+            media_type: "application/x-neon-rgba8".into(),
+            width: 16,
+            height: 16,
+            bytes,
+        },
+    };
+    let mut last_err = String::new();
+    for attempt in 0..5 {
+        match call(endpoint, "wgpu.ui.image.upload", seq, serde_json::to_value(&upload).unwrap()) {
+            Ok(_) => return Ok(()),
+            Err(e) => {
+                last_err = e;
+                if attempt < 4 {
+                    thread::sleep(Duration::from_millis(200 * (attempt + 1)));
+                }
+            }
+        }
+    }
+    Err(format!("upload {image_id} failed after 5 attempts: {last_err}"))
+}
+
+/// Upload all showcase skin images. Called once before fragment submission.
+fn upload_showcase_images(endpoint: SocketAddr) -> Result<(), String> {
+    let mut seq = 1000u64;
+    // Panel backgrounds
+    upload_image(endpoint, seq, "panel-bg", solid_image(40, 50, 70, 230))?; seq += 1;
+    upload_image(endpoint, seq, "panel-dark", solid_image(28, 28, 34, 240))?; seq += 1;
+    upload_image(endpoint, seq, "panel-warm", solid_image(58, 42, 30, 235))?; seq += 1;
+    upload_image(endpoint, seq, "panel-accent", solid_image(24, 58, 54, 235))?; seq += 1;
+    // Button idle / hover
+    upload_image(endpoint, seq, "btn-idle", solid_image(50, 90, 160, 255))?; seq += 1;
+    upload_image(endpoint, seq, "btn-hover", solid_image(70, 120, 200, 255))?; seq += 1;
+    upload_image(endpoint, seq, "btn-idle-dark", solid_image(60, 60, 72, 255))?; seq += 1;
+    upload_image(endpoint, seq, "btn-hover-dark", solid_image(85, 85, 100, 255))?; seq += 1;
+    upload_image(endpoint, seq, "btn-idle-warm", solid_image(160, 100, 50, 255))?; seq += 1;
+    upload_image(endpoint, seq, "btn-hover-warm", solid_image(200, 130, 70, 255))?; seq += 1;
+    // Slider / progress / input / tooltip / scrollbar
+    upload_image(endpoint, seq, "track-bg", solid_image(40, 44, 52, 255))?; seq += 1;
+    upload_image(endpoint, seq, "fill-bg", solid_image(80, 140, 220, 255))?; seq += 1;
+    upload_image(endpoint, seq, "thumb-bg", solid_image(180, 200, 230, 255))?; seq += 1;
+    upload_image(endpoint, seq, "input-bg", solid_image(30, 34, 42, 255))?; seq += 1;
+    upload_image(endpoint, seq, "check-icon", solid_image(120, 200, 255, 255))?; seq += 1;
+    upload_image(endpoint, seq, "radio-dot", solid_image(120, 200, 255, 255))?; seq += 1;
+    upload_image(endpoint, seq, "tooltip-bg", solid_image(50, 48, 40, 245))?; seq += 1;
+    upload_image(endpoint, seq, "scrollbar-track", solid_image(30, 32, 38, 200))?; seq += 1;
+    upload_image(endpoint, seq, "scrollbar-thumb", solid_image(100, 108, 120, 220))?; seq += 1;
+    upload_image(endpoint, seq, "progress-track", solid_image(40, 44, 52, 255))?; seq += 1;
+    upload_image(endpoint, seq, "progress-fill", solid_image(80, 180, 120, 255))?; seq += 1;
+    // Slider variants
+    upload_image(endpoint, seq, "slider-fat-track", border_image((180, 100, 30, 255), (100, 60, 20, 255)))?; seq += 1;
+    upload_image(endpoint, seq, "slider-fat-fill", solid_image(240, 180, 40, 255))?; seq += 1;
+    upload_image(endpoint, seq, "slider-fat-thumb", border_image((255, 255, 255, 255), (220, 220, 230, 255)))?; seq += 1;
+    upload_image(endpoint, seq, "slider-min-track", solid_image(60, 60, 68, 255))?; seq += 1;
+    upload_image(endpoint, seq, "slider-min-fill", solid_image(80, 200, 140, 255))?; seq += 1;
+    upload_image(endpoint, seq, "slider-min-thumb", solid_image(200, 255, 220, 255))?; seq += 1;
+    // Checkbox variants
+    upload_image(endpoint, seq, "check-dark-body", border_image((80, 80, 90, 255), (20, 20, 26, 255)))?; seq += 1;
+    upload_image(endpoint, seq, "check-dark-icon", solid_image(240, 240, 250, 255))?; seq += 1;
+    upload_image(endpoint, seq, "check-warm-body", border_image((140, 90, 40, 255), (50, 35, 20, 255)))?; seq += 1;
+    upload_image(endpoint, seq, "check-warm-icon", solid_image(255, 200, 80, 255))?; seq += 1;
+    // Progress variants
+    upload_image(endpoint, seq, "progress-blue-fill", solid_image(60, 120, 220, 255))?; seq += 1;
+    upload_image(endpoint, seq, "progress-warm-fill", solid_image(220, 130, 50, 255))?; seq += 1;
+    // Input variants
+    upload_image(endpoint, seq, "input-dark-bg", border_image((70, 70, 80, 255), (15, 15, 20, 255)))?; seq += 1;
+    upload_image(endpoint, seq, "input-warm-bg", border_image((120, 80, 40, 255), (40, 28, 18, 255)))?; seq += 1;
+    // Circle checkbox style
+    upload_image(endpoint, seq, "check-circle-ring", ring_image((100, 160, 255, 255)))?; seq += 1;
+    upload_image(endpoint, seq, "check-circle-dot", circle_image(100, 200, 255, 255))?; seq += 1;
+    // Card checkbox style (thick border)
+    upload_image(endpoint, seq, "check-card-body", border_image((180, 80, 200, 255), (40, 20, 50, 255)))?; seq += 1;
+    upload_image(endpoint, seq, "check-card-icon", solid_image(220, 140, 255, 255))?; seq += 1;
+    // Striped progress
+    upload_image(endpoint, seq, "progress-striped-fill", striped_image((100, 200, 140, 255), (60, 140, 90, 255)))?; seq += 1;
+    // Rounded progress
+    upload_image(endpoint, seq, "progress-rounded-track", rounded_image((40, 44, 52, 255)))?; seq += 1;
+    upload_image(endpoint, seq, "progress-rounded-fill", rounded_image((220, 100, 180, 255)))?; seq += 1;
+    // Square slider thumb
+    upload_image(endpoint, seq, "slider-square-thumb", border_image((255, 200, 60, 255), (200, 150, 30, 255)))?; seq += 1;
+    upload_image(endpoint, seq, "slider-square-track", solid_image(50, 50, 60, 255))?; seq += 1;
+    upload_image(endpoint, seq, "slider-square-fill", solid_image(255, 200, 60, 255))?; seq += 1;
+    println!("Uploaded {} skin images", seq - 1000);
+    Ok(())
 }
 
 fn launch() -> std::io::Result<Child> {
@@ -135,6 +351,9 @@ struct AppState {
     click_count: u32,
     context_menu_visible: bool,
     splitter_mode: u8, // 0=50/50, 1=30/70, 2=70/30
+    skin_check_def: bool,
+    skin_check_circle: bool,
+    skin_check_card: bool,
     tree: TreeState,
 }
 
@@ -149,6 +368,9 @@ impl AppState {
             click_count: 0,
             context_menu_visible: false,
             splitter_mode: 0,
+            skin_check_def: true,
+            skin_check_circle: true,
+            skin_check_card: false,
             tree: TreeState::new(),
         }
     }
@@ -175,6 +397,45 @@ impl AppState {
             UiEffect::ControlPresentation {
                 node_id: UiNodeId("scroll-demo".into()),
                 state: UiControlPresentation::Scroll { position: self.scroll_pos },
+            },
+            // Skin variant sliders
+            UiEffect::ControlPresentation {
+                node_id: UiNodeId("skin-slider-def".into()),
+                state: UiControlPresentation::Numeric { value: self.slider_val, min: 0.0, max: 100.0 },
+            },
+            UiEffect::ControlPresentation {
+                node_id: UiNodeId("skin-slider-fat".into()),
+                state: UiControlPresentation::Numeric { value: self.slider_val, min: 0.0, max: 100.0 },
+            },
+            UiEffect::ControlPresentation {
+                node_id: UiNodeId("skin-slider-min".into()),
+                state: UiControlPresentation::Numeric { value: self.slider_val, min: 0.0, max: 100.0 },
+            },
+            // Skin variant checkboxes (independent states)
+            UiEffect::ControlPresentation {
+                node_id: UiNodeId("skin-check-def".into()),
+                state: UiControlPresentation::Toggle { selected: self.skin_check_def },
+            },
+            UiEffect::ControlPresentation {
+                node_id: UiNodeId("skin-check-circle".into()),
+                state: UiControlPresentation::Toggle { selected: self.skin_check_circle },
+            },
+            UiEffect::ControlPresentation {
+                node_id: UiNodeId("skin-check-card".into()),
+                state: UiControlPresentation::Toggle { selected: self.skin_check_card },
+            },
+            // Skin variant progress bars
+            UiEffect::ControlPresentation {
+                node_id: UiNodeId("skin-prog-def".into()),
+                state: UiControlPresentation::Numeric { value: self.progress_val, min: 0.0, max: 1.0 },
+            },
+            UiEffect::ControlPresentation {
+                node_id: UiNodeId("skin-prog-striped".into()),
+                state: UiControlPresentation::Numeric { value: self.progress_val, min: 0.0, max: 1.0 },
+            },
+            UiEffect::ControlPresentation {
+                node_id: UiNodeId("skin-prog-rounded".into()),
+                state: UiControlPresentation::Numeric { value: self.progress_val, min: 0.0, max: 1.0 },
             },
         ]
     }
@@ -210,6 +471,9 @@ impl AppState {
                 self.checkbox_state = !self.checkbox_state;
                 println!("[checkbox] -> {}", self.checkbox_state);
             }
+            "demo.skin.check.def" => { self.skin_check_def = !self.skin_check_def; }
+            "demo.skin.check.circle" => { self.skin_check_circle = !self.skin_check_circle; }
+            "demo.skin.check.card" => { self.skin_check_card = !self.skin_check_card; }
             "demo.radio.toggle" => {
                 self.radio_state = !self.radio_state;
                 println!("[radio] -> {}", self.radio_state);
@@ -292,8 +556,11 @@ fn main() -> Result<(), String> {
     start_ui_host_server(click_queue.clone());
 
     let mut child = launch().map_err(|e| format!("launch failed: {e}"))?;
-    thread::sleep(Duration::from_secs(2));
+    thread::sleep(Duration::from_secs(3));
     let endpoint: SocketAddr = ENDPOINT.parse().unwrap();
+
+    // Upload skin images before submitting the fragment.
+    upload_showcase_images(endpoint)?;
 
     let mut root = root;
     root.surface = None;
