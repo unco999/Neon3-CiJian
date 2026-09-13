@@ -62,6 +62,7 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
     let mut shader_packages = Vec::new();
     let mut current_skin: Option<neon_ui_schema::UiControlSkin> = None;
     let mut pending_struct: Option<(String, u32, BTreeMap<String, neon_ui_schema::UiInputKind>, BTreeMap<String, neon_ui_schema::UiInputValue>)> = None;
+    let mut node_motion_refs = BTreeMap::<String, NodeMotionRefs>::new();
 
     for (index, raw) in source.lines().enumerate() {
         let line = (index + 1) as u32;
@@ -260,6 +261,13 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
             continue;
         }
         let mut node = parse_node(content, line)?;
+        node_motion_refs.insert(
+            node.node.node_id.0.clone(),
+            NodeMotionRefs {
+                enter: node.enter_motion.take(),
+                transition: node.transition_motion.take(),
+            },
+        );
         if let Some(resource_key) = node.image_resource.take() {
             if !matches!(node.node.kind, UiNodeKind::Image | UiNodeKind::Panel | UiNodeKind::Tooltip) {
                 return Err(error(
@@ -451,6 +459,7 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
     if root.composition_layer != UiCompositionLayer::Normal {
         composition_layer_records.insert(root.node.node_id.0.clone(), root.composition_layer);
     }
+    apply_node_motion_refs(&mut root.node, &node_motion_refs, &motions)?;
     let mut offset = 0;
     for slot in &mut input_slots {
         offset = align_up(offset, slot.packing.alignment);
@@ -1092,12 +1101,17 @@ pub fn format_nui_flow(source: &str) -> FlowResult<String> {
         lines.push(format!("{}{emit}", format_input(slot)));
     }
     for motion in &parsed.motions {
-        lines.push(format!(
+        let mut line = format!(
             "motion {} duration {} easing {}",
             motion.key,
             motion.transition.duration_ms,
             format_easing(motion.transition.easing)
-        ));
+        );
+        if motion.transition.delay_ms > 0 {
+            line.push_str(&format!(" delay {}", motion.transition.delay_ms));
+        }
+        append_motion_from(&mut line, motion.transition.from);
+        lines.push(line);
     }
     for machine in &parsed.state_machines {
         lines.push(format!(
@@ -1112,7 +1126,7 @@ pub fn format_nui_flow(source: &str) -> FlowResult<String> {
             lines.push(format!("state {} {}", machine.key, state.name));
             for style in &state.styles {
                 lines.push(format!(
-                    "  style {}.{}.{} {}",
+                    "style {}.{}.{} {}",
                     machine.key,
                     state.name,
                     style.node_key,
@@ -1127,7 +1141,7 @@ pub fn format_nui_flow(source: &str) -> FlowResult<String> {
         {
             for style in &state.styles {
                 lines.push(format!(
-                    "  style {}.{}.{} {}",
+                    "style {}.{}.{} {}",
                     machine.key,
                     state.name,
                     style.node_key,
@@ -1136,6 +1150,42 @@ pub fn format_nui_flow(source: &str) -> FlowResult<String> {
             }
         }
         for transition in &machine.transitions {
+            match &transition.trigger {
+                NuiFlowStateTrigger::Sync => {
+                    if let Some(predicate) = &transition.predicate {
+                        lines.push(format!(
+                            "sync {} when {} -> {}",
+                            machine.key,
+                            format_predicate(predicate),
+                            transition.target_state
+                        ));
+                    }
+                }
+                NuiFlowStateTrigger::Intent { name } => {
+                    let from = (transition.from_state != "*")
+                        .then(|| format!(" from {}", transition.from_state))
+                        .unwrap_or_default();
+                    let predicate = transition
+                        .predicate
+                        .as_ref()
+                        .map(|predicate| format!(" when {}", format_predicate(predicate)))
+                        .unwrap_or_default();
+                    let emit = transition
+                        .emit_intent
+                        .as_ref()
+                        .map(|intent| format!(" emit {intent}"))
+                        .unwrap_or_default();
+                    lines.push(format!(
+                        "on {} {}{}{} -> {}{}",
+                        machine.key,
+                        name,
+                        from,
+                        predicate,
+                        transition.target_state,
+                        emit
+                    ));
+                }
+            }
             if let Some(motion_key) = &transition.motion_key {
                 lines.push(format!(
                     "transition {} {} -> {} motion {}",
@@ -1179,6 +1229,27 @@ pub fn format_nui_flow(source: &str) -> FlowResult<String> {
         &mut lines,
     );
     Ok(lines.join("\n") + "\n")
+}
+
+fn format_predicate(predicate: &UiBranchPredicate) -> String {
+    match predicate {
+        UiBranchPredicate::Bool {
+            input_key,
+            expected,
+        } => {
+            if *expected {
+                format!("${input_key}")
+            } else {
+                format!("!${input_key}")
+            }
+        }
+        UiBranchPredicate::EnumEquals { input_key, variant } => {
+            format!("${input_key}={variant}")
+        }
+        UiBranchPredicate::MachineState { machine_key, state } => {
+            format!("{machine_key}.{state}")
+        }
+    }
 }
 
 fn format_skin_state(state: neon_ui_schema::UiVisualState) -> &'static str {
@@ -1524,6 +1595,8 @@ struct NodeBuild {
     node: UiNode,
     bindings: Vec<(UiBoundProperty, String)>,
     intents: Vec<String>,
+    enter_motion: Option<String>,
+    transition_motion: Option<String>,
     branch_predicate: Option<UiBranchPredicate>,
     template: Option<(u32, BTreeMap<String, UiInputKind>, String, bool)>,
     data_grid: Option<UiDataGridDeclaration>,
@@ -1535,6 +1608,49 @@ struct NodeBuild {
     geometry: Option<UiGeometry>,
     material: Option<UiMaterialRef>,
     composition_layer: UiCompositionLayer,
+}
+
+#[derive(Default)]
+struct NodeMotionRefs {
+    enter: Option<String>,
+    transition: Option<String>,
+}
+
+/// Resolves node-local motion references after the complete document has been
+/// parsed. References are kept outside the public node schema while parsing so
+/// forward declarations remain deterministic and the renderer still consumes
+/// the existing compatibility `enter_transition` slot.
+fn apply_node_motion_refs(
+    node: &mut UiNode,
+    refs: &BTreeMap<String, NodeMotionRefs>,
+    motions: &[NuiFlowMotion],
+) -> FlowResult<()> {
+    if let Some(reference) = refs.get(&node.node_id.0) {
+        if reference.enter.is_some() && reference.transition.is_some() {
+            return Err(error(
+                "nui_flow_duplicate_motion_reference",
+                "a node may declare enter or transition, not both",
+                1,
+                1,
+            ));
+        }
+        let key = reference.enter.as_ref().or(reference.transition.as_ref());
+        if let Some(key) = key {
+            let motion = motions.iter().find(|motion| motion.key == *key).ok_or_else(|| {
+                error(
+                    "nui_flow_unknown_motion",
+                    "node references an undeclared motion",
+                    1,
+                    1,
+                )
+            })?;
+            node.enter_transition = Some(motion.transition.clone());
+        }
+    }
+    for child in &mut node.children {
+        apply_node_motion_refs(child, refs, motions)?;
+    }
+    Ok(())
 }
 
 fn parse_skin_header(text: &str, line: u32) -> FlowResult<neon_ui_schema::UiControlSkin> {
@@ -1783,15 +1899,23 @@ fn parse_motion_declaration(text: &str, line: u32) -> FlowResult<Option<NuiFlowM
     if words.first().map(String::as_str) != Some("motion") {
         return Ok(None);
     }
-    if words.len() != 6 || !valid_key(&words[1]) || words[2] != "duration" || words[4] != "easing" {
+    if words.len() < 6 || !valid_key(&words[1]) || words[2] != "duration" || words[4] != "easing" {
         return Err(error(
             "nui_flow_invalid_motion",
-            "motion syntax is: motion <key> duration <ms> easing <linear|ease_in|ease_out|ease_in_out>",
+            "motion syntax is: motion <key> duration <ms> easing <linear|ease_in|ease_out|ease_in_out> [delay <ms>] [from <property> <value> ...]",
             line,
             1,
         ));
     }
     let duration_ms = parse_u64(&words[3], line, "duration")?;
+    if duration_ms == 0 {
+        return Err(error(
+            "nui_flow_invalid_motion",
+            "motion duration must be greater than zero",
+            line,
+            1,
+        ));
+    }
     if duration_ms > u64::from(u32::MAX) {
         return Err(error(
             "nui_flow_invalid_motion",
@@ -1814,13 +1938,96 @@ fn parse_motion_declaration(text: &str, line: u32) -> FlowResult<Option<NuiFlowM
             ));
         }
     };
+    let mut delay_ms = 0_u32;
+    let mut from = UiTransitionState::default();
+    let mut index = 6;
+    while index < words.len() {
+        match words[index].as_str() {
+            "delay" => {
+                let value = words.get(index + 1).ok_or_else(|| {
+                    error("nui_flow_invalid_motion", "delay requires milliseconds", line, 1)
+                })?;
+                delay_ms = u32::try_from(parse_u64(value, line, "delay")?).map_err(|_| {
+                    error("nui_flow_invalid_motion", "motion delay exceeds the supported range", line, 1)
+                })?;
+                index += 2;
+            }
+            "from" => {
+                index += 1;
+                if index >= words.len() {
+                    return Err(error("nui_flow_invalid_motion", "from requires at least one property", line, 1));
+                }
+                while index < words.len() && words[index] != "delay" && words[index] != "from" {
+                    let property = words[index].as_str();
+                    match property {
+                        "opacity" => {
+                            let value = words.get(index + 1).ok_or_else(|| error("nui_flow_invalid_motion", "from opacity requires a value", line, 1))?;
+                            from.opacity = Some(number(value, line)?.clamp(0.0, 1.0));
+                            index += 2;
+                        }
+                        "fill" | "background" => {
+                            let value = words.get(index + 1).ok_or_else(|| error("nui_flow_invalid_motion", "from fill requires a color", line, 1))?;
+                            from.background_color = Some(color(value, line)?);
+                            index += 2;
+                        }
+                        "line" | "border" => {
+                            let value = words.get(index + 1).ok_or_else(|| error("nui_flow_invalid_motion", "from border requires a color", line, 1))?;
+                            from.border_color = Some(color(value, line)?);
+                            index += 2;
+                        }
+                        "border_width" => {
+                            let value = words.get(index + 1).ok_or_else(|| error("nui_flow_invalid_motion", "from border_width requires a value", line, 1))?;
+                            from.border_width = Some(number(value, line)?.max(0.0));
+                            index += 2;
+                        }
+                        "corner_radius" | "radius" => {
+                            let value = words.get(index + 1).ok_or_else(|| error("nui_flow_invalid_motion", "from corner_radius requires a value", line, 1))?;
+                            from.corner_radius = Some(number(value, line)?.max(0.0));
+                            index += 2;
+                        }
+                        "bounds" => {
+                            let values = words.get(index + 1..index + 5).ok_or_else(|| error("nui_flow_invalid_motion", "from bounds requires x y width height", line, 1))?;
+                            from.bounds = Some(UiBounds {
+                                x: number(&values[0], line)?,
+                                y: number(&values[1], line)?,
+                                width: number(&values[2], line)?.max(0.0),
+                                height: number(&values[3], line)?.max(0.0),
+                            });
+                            index += 5;
+                        }
+                        "numeric" => {
+                            let value = words.get(index + 1).ok_or_else(|| error("nui_flow_invalid_motion", "from numeric requires a value", line, 1))?;
+                            from.numeric_value = Some(number(value, line)?);
+                            index += 2;
+                        }
+                        _ => {
+                            return Err(error(
+                                "nui_flow_invalid_motion",
+                                "supported from properties are bounds, opacity, fill, line, border_width, corner_radius, and numeric",
+                                line,
+                                1,
+                            ));
+                        }
+                    }
+                }
+            }
+            _ => {
+                return Err(error(
+                    "nui_flow_invalid_motion",
+                    "motion tail accepts delay and from clauses",
+                    line,
+                    1,
+                ));
+            }
+        }
+    }
     Ok(Some(NuiFlowMotion {
         key: words[1].clone(),
         transition: UiTransition {
-            delay_ms: 0,
+            delay_ms,
             duration_ms: duration_ms as u32,
             easing,
-            from: UiTransitionState::default(),
+            from,
             motion_key: Some(words[1].clone()),
         },
     }))
@@ -2023,43 +2230,61 @@ fn parse_state_machine_declaration(
             Ok(true)
         }
         Some("on") => {
-            let when_index = words.iter().position(|word| *word == "when");
-            let arrow_index = words
-                .iter()
-                .position(|word| *word == "->")
-                .ok_or_else(|| invalid("event transition requires -> <state>"))?;
-            if words.len() < 5 || arrow_index + 1 >= words.len() || !valid_intent(words[2]) {
+            if words.len() < 5 || !valid_intent(words[2]) {
                 return Err(invalid(
-                    "on syntax is: on <machine> <intent> [when <predicate>] -> <state> [emit <intent>]",
+                    "on syntax is: on <machine> <intent> [from <state>] [when <predicate>] -> <state> [emit <intent>]",
                 ));
             }
-            if let Some(index) = when_index {
-                if index != 3 || arrow_index != 5 {
-                    return Err(invalid("event transition has an invalid when clause"));
+
+            // `from` is optional for backwards compatibility. Without it the
+            // event is a wildcard presentation event; with it, dispatch only
+            // selects the transition while the machine is in that state. This
+            // keeps a button's semantic intent stable while making a real
+            // toggle/cycle possible without renderer-side if/else logic.
+            let mut cursor = 3;
+            let mut from_state = "*".to_owned();
+            if words.get(cursor) == Some(&"from") {
+                let state = words.get(cursor + 1).copied().ok_or_else(|| {
+                    invalid("on from requires a declared source state")
+                })?;
+                if !valid_key(state) {
+                    return Err(invalid("on from requires a valid source state"));
                 }
-            } else if arrow_index != 3 {
-                return Err(invalid("event transition has an invalid target"));
+                from_state = state.into();
+                cursor += 2;
             }
-            let trailing = &words[arrow_index + 2..];
+            let mut predicate = None;
+            if words.get(cursor) == Some(&"when") {
+                let predicate_text = words.get(cursor + 1).copied().ok_or_else(|| {
+                    invalid("on when requires a predicate")
+                })?;
+                predicate = Some(parse_branch_predicate(predicate_text, line)?);
+                cursor += 2;
+            }
+            if words.get(cursor) != Some(&"->") || cursor + 1 >= words.len() {
+                return Err(invalid("event transition requires -> <state>"));
+            }
+            let target_state = words[cursor + 1];
+            if !valid_key(target_state) {
+                return Err(invalid("event transition target must be a valid state"));
+            }
+            let trailing = &words[cursor + 2..];
             let emit_intent = match trailing {
                 [] => None,
                 ["emit", intent] if valid_intent(intent) => Some((*intent).into()),
                 _ => return Err(invalid("emit accepts one dotted semantic intent")),
             };
-            let predicate = when_index
-                .map(|_| parse_branch_predicate(words[4], line))
-                .transpose()?;
             let machine = machines
                 .iter_mut()
                 .find(|machine| machine.key == words[1])
                 .ok_or_else(|| invalid("event transition references an undeclared machine"))?;
             machine.transitions.push(NuiFlowStateTransition {
-                from_state: "*".into(),
+                from_state,
                 trigger: NuiFlowStateTrigger::Intent {
                     name: words[2].into(),
                 },
                 predicate,
-                target_state: words[arrow_index + 1].into(),
+                target_state: target_state.into(),
                 emit_intent,
                 motion_key: None,
             });
@@ -2933,6 +3158,8 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
     let mut composition_layer = UiCompositionLayer::Normal;
     let mut world_camera = None;
     let mut world_anchor = None;
+    let mut enter_motion = None;
+    let mut transition_motion = None;
     let mut used = HashSet::new();
     let mut index = key_index + 1;
     while index < parts.len() {
@@ -2953,8 +3180,8 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
             "x" | "y" | "w" | "h" | "minw" | "maxw" | "grow" | "shrink" | "basis" | "gap"
             | "pad" | "fill" | "line" | "ink" | "opacity" | "radius" | "border_width" | "value"
             | "checked" | "selected" | "state" | "numeric" | "scroll" | "scroll_offset" | "enabled" | "visible"
-            | "event" | "token" | "align" | "clip" | "clip_shape" | "fit" | "justify" | "data" | "rich" | "skin" | "context_menu"
-            | "composition_layer" | "layer" => {
+             | "event" | "token" | "align" | "clip" | "clip_shape" | "fit" | "justify" | "data" | "rich" | "skin" | "context_menu" | "enter" | "transition"
+             | "composition_layer" | "layer" => {
                 let value = *parts.get(index + 1).ok_or_else(|| {
                     error(
                         "nui_flow_missing_value",
@@ -2964,7 +3191,29 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
                     )
                 })?;
                 index += 1;
-                if token == "rich" {
+                if token == "enter" || token == "transition" {
+                    if !valid_key(value) {
+                        return Err(error(
+                            "nui_flow_invalid_motion",
+                            "node motion reference must be a valid motion key",
+                            line,
+                            1,
+                        ));
+                    }
+                    let slot = if token == "enter" {
+                        &mut enter_motion
+                    } else {
+                        &mut transition_motion
+                    };
+                    if slot.replace(value.into()).is_some() {
+                        return Err(error(
+                            "nui_flow_duplicate_motion_reference",
+                            "node motion reference appears more than once",
+                            line,
+                            1,
+                        ));
+                    }
+                } else if token == "rich" {
                     if component != "text" {
                         return Err(error(
                             "nui_flow_unknown_attribute",
@@ -3488,6 +3737,8 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
         node,
         bindings,
         intents,
+        enter_motion,
+        transition_motion,
         branch_predicate,
         template,
         data_grid,
@@ -4713,6 +4964,11 @@ fn format_node(
     if let Some(TextRef::Literal { value }) = &node.text {
         line.push_str(&format!(" value \"{}\"", value.replace('"', "\\\"")));
     }
+    if let Some(transition) = &node.enter_transition
+        && let Some(motion_key) = &transition.motion_key
+    {
+        line.push_str(&format!(" transition {motion_key}"));
+    }
     for binding in bindings
         .iter()
         .filter(|binding| binding.node_key == node.node_id.0)
@@ -4797,6 +5053,38 @@ fn format_node(
             composition_layer_records,
             lines,
         );
+    }
+}
+
+fn append_motion_from(line: &mut String, from: UiTransitionState) {
+    let mut fields = Vec::new();
+    if let Some(bounds) = from.bounds {
+        fields.push(format!(
+            "bounds {} {} {} {}",
+            bounds.x, bounds.y, bounds.width, bounds.height
+        ));
+    }
+    if let Some(value) = from.opacity {
+        fields.push(format!("opacity {value}"));
+    }
+    if let Some(color) = from.background_color {
+        fields.push(format!("fill {}", format_color(color)));
+    }
+    if let Some(color) = from.border_color {
+        fields.push(format!("line {}", format_color(color)));
+    }
+    if let Some(value) = from.border_width {
+        fields.push(format!("border_width {value}"));
+    }
+    if let Some(value) = from.corner_radius {
+        fields.push(format!("corner_radius {value}"));
+    }
+    if let Some(value) = from.numeric_value {
+        fields.push(format!("numeric {value}"));
+    }
+    if !fields.is_empty() {
+        line.push_str(" from ");
+        line.push_str(&fields.join(" "));
     }
 }
 
@@ -5995,6 +6283,59 @@ panel workspace row gap 8
         assert_ne!(idle_root.bounds, hit_root.bounds);
         assert!(formatted.contains("style status.idle.status-root"));
         assert!(formatted.contains("style status.hit.status-root"));
+    }
+
+    #[test]
+    fn animation_showcase_declares_button_driven_motion_catalog() {
+        let source = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../cases/animation-showcase/animation.nui"
+        ))
+        .expect("animation showcase fixture must exist");
+        let document = parse_nui_flow(&source).expect("animation showcase must parse");
+        assert_eq!(document.motions.len(), 8);
+        assert_eq!(document.state_machines.len(), 8);
+        assert!(document
+            .motions
+            .iter()
+            .any(|motion| motion.key == "delayed-reveal"
+                && motion.transition.delay_ms == 90
+                && motion.transition.from.opacity == Some(0.0)));
+        let panel_a = document
+            .state_machines
+            .iter()
+            .find(|machine| machine.key == "panel-a")
+            .expect("panel-a state machine");
+        assert!(panel_a.transitions.iter().any(|transition| {
+            transition.from_state == "compact"
+                && transition.target_state == "expanded"
+                && matches!(
+                    transition.trigger,
+                    NuiFlowStateTrigger::Intent { ref name } if name == "anim.a.toggle"
+                )
+        }));
+        assert!(panel_a.transitions.iter().any(|transition| {
+            transition.from_state == "expanded" && transition.target_state == "compact"
+        }));
+        fn find<'a>(node: &'a UiNode, key: &str) -> Option<&'a UiNode> {
+            if node.node_id.0 == key {
+                return Some(node);
+            }
+            node.children.iter().find_map(|child| find(child, key))
+        }
+        assert_eq!(
+            find(&document.ir.root, "anim-panel-h")
+                .and_then(|node| node.enter_transition.as_ref())
+                .and_then(|transition| transition.motion_key.as_deref()),
+            Some("delayed-reveal")
+        );
+        assert!(document.ir.events.iter().any(|event| {
+            event.node_key == "btn-a-toggle" && event.intent == "anim.a.toggle"
+        }));
+        let formatted = format_nui_flow(&source).expect("showcase formatter must accept the catalog");
+        assert!(formatted.contains("delay 90 from bounds 840 760 80 40 opacity 0"));
+        assert!(formatted.contains("on panel-a anim.a.toggle from compact -> expanded"));
+        parse_nui_flow(&formatted).expect("formatted showcase must remain parseable");
     }
 
     #[test]

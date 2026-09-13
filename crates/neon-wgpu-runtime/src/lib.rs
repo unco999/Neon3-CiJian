@@ -12723,6 +12723,7 @@ mod tests {
                 enter_transition: None,
                 world_depth: None,
                 world_scale: None,
+                clip_shape: UiClipShape::default(),
                 children,
             }
         }
@@ -13151,6 +13152,7 @@ mod tests {
                 enter_transition: None,
                 world_depth: None,
                 world_scale: None,
+                clip_shape: UiClipShape::default(),
                 children: Vec::new(),
             },
             effects: vec![UiEffect::SemanticAction {
@@ -13343,6 +13345,7 @@ mod tests {
             enter_transition: None,
             world_depth: None,
             world_scale: None,
+            clip_shape: UiClipShape::default(),
             children: Vec::new(),
         };
         gated.root.children.push(marker);
@@ -13544,6 +13547,7 @@ mod tests {
             enter_transition: None,
             world_depth: None,
             world_scale: None,
+            clip_shape: UiClipShape::default(),
             children: Vec::new(),
         };
         gated.root.children.push(marker);
@@ -14189,6 +14193,7 @@ mod tests {
             enter_transition: None,
             world_depth: None,
             world_scale: None,
+            clip_shape: UiClipShape::default(),
             children: Vec::new(),
         };
         let fragments = HashMap::from([(
@@ -14395,6 +14400,7 @@ mod tests {
             enter_transition: None,
             world_depth: None,
             world_scale: None,
+            clip_shape: UiClipShape::default(),
             children: Vec::new(),
         };
         let fragments = HashMap::from([(
@@ -14533,6 +14539,7 @@ mod tests {
             children: Vec::new(),
             world_depth: None,
             world_scale: None,
+            clip_shape: UiClipShape::default(),
         };
         let fragments = HashMap::from([(
             UiFragmentId("srgb-acceptance".into()),
@@ -14592,9 +14599,10 @@ mod tests {
                     ..UiStyle::default()
                 },
                 enter_transition: None,
-                world_depth: None,
-                world_scale: None,
-                children: Vec::new(),
+            world_depth: None,
+            world_scale: None,
+            clip_shape: UiClipShape::default(),
+            children: Vec::new(),
             },
             UiNode {
                 node_id: UiNodeId("front".into()),
@@ -14614,9 +14622,10 @@ mod tests {
                 surface: None,
                 style: UiStyle::default(),
                 enter_transition: None,
-                world_depth: None,
-                world_scale: None,
-                children: Vec::new(),
+            world_depth: None,
+            world_scale: None,
+            clip_shape: UiClipShape::default(),
+            children: Vec::new(),
             },
             UiNode {
                 node_id: UiNodeId("disabled".into()),
@@ -14636,9 +14645,10 @@ mod tests {
                 surface: None,
                 style: UiStyle::default(),
                 enter_transition: None,
-                world_depth: None,
-                world_scale: None,
-                children: Vec::new(),
+            world_depth: None,
+            world_scale: None,
+            clip_shape: UiClipShape::default(),
+            children: Vec::new(),
             },
             UiNode {
                 node_id: UiNodeId("transparent".into()),
@@ -14661,6 +14671,7 @@ mod tests {
                     ..UiStyle::default()
                 },
                 enter_transition: None,
+                clip_shape: UiClipShape::default(),
                 children: Vec::new(),
                 world_depth: None,
                 world_scale: None,
@@ -14737,6 +14748,7 @@ mod tests {
             enter_transition: None,
             world_depth: None,
             world_scale: None,
+            clip_shape: UiClipShape::default(),
             children: Vec::new(),
         };
         let clipper = UiNode {
@@ -14760,6 +14772,7 @@ mod tests {
             surface: None,
             style: UiStyle::default(),
             enter_transition: None,
+            clip_shape: UiClipShape::default(),
             children: vec![child],
             world_depth: None,
             world_scale: None,
@@ -14782,6 +14795,7 @@ mod tests {
             surface: None,
             style: UiStyle::default(),
             enter_transition: None,
+            clip_shape: UiClipShape::default(),
             children: vec![clipper],
             world_depth: None,
             world_scale: None,

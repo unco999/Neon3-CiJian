@@ -194,6 +194,13 @@ impl NuiFlowStateMachineRuntime {
     pub fn state(&self, machine_key: &str) -> Option<&str> {
         self.states.get(machine_key).map(String::as_str)
     }
+
+    /// Returns the presentation-only state snapshot for diagnostics and
+    /// deterministic probes. The map is a copy on purpose: callers cannot
+    /// mutate the state machine behind the dispatch/revision boundary.
+    pub fn states_snapshot(&self) -> BTreeMap<String, String> {
+        self.states.clone()
+    }
     pub fn revision(&self) -> Revision {
         self.revision
     }
@@ -243,7 +250,16 @@ impl NuiFlowStateMachineRuntime {
         intent: &str,
     ) -> Vec<NuiFlowStateTransitionResult> {
         document.state_machines.iter().filter_map(|machine| {
-            let transition = machine.transitions.iter().find(|transition| matches!(&transition.trigger, NuiFlowStateTrigger::Intent { name } if name == intent) && transition.predicate.as_ref().is_none_or(|predicate| predicate_matches(predicate, inputs)))?;
+            let current_state = self.state(machine.key.as_str());
+            let transition = machine.transitions.iter().find(|transition| {
+                matches!(&transition.trigger, NuiFlowStateTrigger::Intent { name } if name == intent)
+                    && (transition.from_state == "*"
+                        || current_state == Some(transition.from_state.as_str()))
+                    && transition
+                        .predicate
+                        .as_ref()
+                        .is_none_or(|predicate| predicate_matches(predicate, inputs))
+            })?;
             let motion_key = transition.motion_key.clone().or_else(|| {
                 motion_key_for(
                     machine,
@@ -450,6 +466,34 @@ mod tests {
                 .dispatch(&document, &inputs(false, "ready"), "status.reset")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn state_specific_button_transitions_make_a_real_toggle_without_renderer_logic() {
+        let source = concat!(
+            "motion toggle duration 120 easing ease_out\n",
+            "machine menu initial closed\n",
+            "state menu opened\n",
+            "on menu menu.toggle from closed -> opened\n",
+            "on menu menu.toggle from opened -> closed\n",
+            "transition menu closed -> opened motion toggle\n",
+            "transition menu opened -> closed motion toggle\n",
+            "surface menu\n",
+            "  button toggle value \"Toggle\" event menu.toggle\n",
+        );
+        let document = crate::parse_nui_flow(source).unwrap();
+        let mut runtime = NuiFlowStateMachineRuntime::new(&document);
+        let first = runtime.dispatch(&document, &inputs(false, "ready"), "menu.toggle");
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].previous_state, "closed");
+        assert_eq!(first[0].state, "opened");
+        assert_eq!(runtime.state("menu"), Some("opened"));
+        let second = runtime.dispatch(&document, &inputs(false, "ready"), "menu.toggle");
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].previous_state, "opened");
+        assert_eq!(second[0].state, "closed");
+        assert_eq!(runtime.state("menu"), Some("closed"));
+        assert_eq!(runtime.revision(), Revision(2));
     }
 
     #[test]

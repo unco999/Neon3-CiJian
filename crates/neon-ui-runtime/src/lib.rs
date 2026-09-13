@@ -1450,15 +1450,28 @@ fn apply_transitions_to_fragment(fragment: &mut UiFragment, motions: &[PendingSt
                 .iter()
                 .find(|style| style.node_key == node.node_id.0)
             {
-                transition.from = UiTransitionState {
-                    bounds: style.bounds,
-                    background_color: style.background_color,
-                    border_color: style.border_color,
-                    border_width: style.border_width,
-                    corner_radius: style.corner_radius,
-                    opacity: style.opacity,
-                    numeric_value: None,
-                };
+                // State styles are patches. Preserve any explicit `from`
+                // values declared by the motion when the previous state does
+                // not override that property; this is what lets a state
+                // motion also provide an enter/pop baseline.
+                if style.bounds.is_some() {
+                    transition.from.bounds = style.bounds;
+                }
+                if style.background_color.is_some() {
+                    transition.from.background_color = style.background_color;
+                }
+                if style.border_color.is_some() {
+                    transition.from.border_color = style.border_color;
+                }
+                if style.border_width.is_some() {
+                    transition.from.border_width = style.border_width;
+                }
+                if style.corner_radius.is_some() {
+                    transition.from.corner_radius = style.corner_radius;
+                }
+                if style.opacity.is_some() {
+                    transition.from.opacity = style.opacity;
+                }
             }
             // Apply the target state's style record directly to the node; the
             // renderer interpolates from `from` (old state) to these values.
@@ -2831,6 +2844,10 @@ fn stable_program_hash(
 /// nodes so the animation ends at the new state's appearance.
 #[derive(Clone, Debug)]
 struct PendingStateMotion {
+    machine_key: String,
+    previous_state: String,
+    target_state: String,
+    state_revision: Revision,
     transition: UiTransition,
     previous_styles: Vec<NuiFlowStateStyle>,
     target_styles: Vec<NuiFlowStateStyle>,
@@ -2852,6 +2869,21 @@ impl PendingStateMotion {
                     .unwrap_or_else(|| "anonymous-motion".into())
             })
     }
+}
+
+fn pending_motion_debug(motion: &PendingStateMotion) -> Value {
+    json!({
+        "machine_key": motion.machine_key,
+        "previous_state": motion.previous_state,
+        "target_state": motion.target_state,
+        "state_revision": motion.state_revision,
+        "motion_key": motion.transition.motion_key,
+        "delay_ms": motion.transition.delay_ms,
+        "duration_ms": motion.transition.duration_ms,
+        "easing": format!("{:?}", motion.transition.easing),
+        "previous_styles": motion.previous_styles,
+        "target_styles": motion.target_styles,
+    })
 }
 
 /// A host-forward deferred to the next service tick. The pointer lane returns
@@ -2890,6 +2922,9 @@ pub struct UiRuntime {
     /// inputs. Set during `forward_host_request`; consumed and cleared by
     /// `handle_external_input_frame` after the next input frame arrives.
     pending_motions: Vec<PendingStateMotion>,
+    /// Last statechart transition selected for a semantic event. This is a
+    /// read-only diagnostic record and is replaced atomically for each event.
+    last_state_transitions: Vec<PendingStateMotion>,
     /// Deferred host forward + publication application. Pointer-lane inbound
     /// requests enqueue here and return `accepted` immediately; the queue is
     /// drained on the next service tick so the next pointer never waits for a
@@ -2945,6 +2980,7 @@ impl UiRuntime {
             flow_state_machine: None,
             wgpu_endpoint: None,
             pending_motions: Vec::new(),
+            last_state_transitions: Vec::new(),
             pending_host_forwards: VecDeque::new(),
             async_host_forward: false,
         }
@@ -2996,6 +3032,7 @@ impl UiRuntime {
                 CAPABILITY_STATE_ANIMATION.into(),
                 CAPABILITY_NUMERIC_ANIMATION.into(),
                 CAPABILITY_DEBUG_INTERACTION.into(),
+                "ui.animation.debug.v1".into(),
             ],
         }
     }
@@ -3023,6 +3060,7 @@ impl UiRuntime {
             "debug.ui.host.snapshot" => Some(json!(
                 self.host_adapter.as_ref().map(UiHostAdapter::snapshot)
             )),
+            "debug.ui.animation.snapshot" => Some(self.animation_debug_snapshot()),
             "debug.command.get" => return self.handle_debug_command(request),
             "debug.trace.query" => return self.handle_debug_trace(request),
             "debug.interaction.get" => return self.handle_interaction_get(request),
@@ -3064,6 +3102,34 @@ impl UiRuntime {
                 }),
             },
         }
+    }
+
+    /// Presentation-state and animation-bridge diagnostics. This is a read-only
+    /// snapshot: it exposes the UI runtime's discrete state/revision and the
+    /// pending motion records without exposing renderer-local hit IDs or GPU
+    /// state.
+    fn animation_debug_snapshot(&self) -> Value {
+        let program_revision = self
+            .host_adapter
+            .as_ref()
+            .map(|adapter| adapter.program().revision.clone());
+        let state_revision = self
+            .flow_state_machine
+            .as_ref()
+            .map(NuiFlowStateMachineRuntime::revision);
+        json!({
+            "program_revision": program_revision,
+            "state_revision": state_revision,
+            "states": self.flow_state_machine.as_ref().map(NuiFlowStateMachineRuntime::states_snapshot),
+            "pending_motions": self.pending_motions.iter().map(pending_motion_debug).collect::<Vec<_>>(),
+            "last_transitions": self
+                .last_state_transitions
+                .iter()
+                .map(pending_motion_debug)
+                .collect::<Vec<_>>(),
+            "cached_fragment_revision": self.cached_fragment.as_ref().map(|fragment| fragment.revision),
+            "renderer_epoch": self.epoch,
+        })
     }
 
     fn handle_surface_event(&mut self, request: RpcRequest) -> RpcResponse {
@@ -3688,6 +3754,10 @@ impl UiRuntime {
                         .map(|motion| motion.transition.clone());
                     if let Some(base_transition) = base {
                         let pending = PendingStateMotion {
+                            machine_key: transition.machine_key,
+                            previous_state: transition.previous_state,
+                            target_state: transition.state,
+                            state_revision: transition.revision,
                             transition: base_transition,
                             previous_styles: transition.previous_styles,
                             target_styles: transition.target_styles,
@@ -3706,6 +3776,7 @@ impl UiRuntime {
                 .retain(|pending| pending.scope_key() != scope_key);
             self.pending_motions.push(motion.clone());
         }
+        self.last_state_transitions = selected_motions.clone();
         // Start local presentation motion before waiting for the authoritative
         // host response. A slow domain must not delay the panel's visual state
         // transition; the later publication retargets the same renderer-owned
@@ -3789,6 +3860,10 @@ impl UiRuntime {
                 json!({
                     "state": "accepted",
                     "semantic_intent": semantic_feedback,
+                    "presentation_transitions": selected_motions
+                        .iter()
+                        .map(pending_motion_debug)
+                        .collect::<Vec<_>>(),
                 }),
             );
             self.idempotent_responses
@@ -4105,6 +4180,10 @@ impl UiRuntime {
             // Retaining the old fragment here made every subsequent control
             // event carry a stale revision after the first publication.
             self.cached_fragment = Some(updated);
+            // The host publication completes this semantic event. Do not
+            // replay optimistic motion records on the next event; retaining
+            // them would accumulate stale panel targets indefinitely.
+            self.pending_motions.clear();
             // Deferred pointer-lane completion passes `None` because the
             // state machine was already advanced when the request was
             // enqueued. Do not erase it here: doing so made the next panel
@@ -4117,6 +4196,10 @@ impl UiRuntime {
                 response.result = Some(json!({
                     "semantic_intent": semantic_feedback,
                     "input_revision": semantic_input_revision,
+                    "presentation_transitions": selected_motions
+                        .iter()
+                        .map(pending_motion_debug)
+                        .collect::<Vec<_>>(),
                 }));
             }
             self.idempotent_responses
@@ -7394,6 +7477,7 @@ mod tests {
                 enter_transition: None,
                 world_depth: None,
                 world_scale: None,
+                clip_shape: UiClipShape::default(),
                 children: vec![UiNode {
                     node_id: UiNodeId("commit".into()),
                     kind: UiNodeKind::Button,
@@ -7414,6 +7498,7 @@ mod tests {
                     enter_transition: None,
                     world_depth: None,
                     world_scale: None,
+                    clip_shape: UiClipShape::default(),
                     children: Vec::new(),
                 }],
             },
@@ -7524,6 +7609,7 @@ mod tests {
             enter_transition: None,
             world_depth: None,
             world_scale: None,
+            clip_shape: UiClipShape::default(),
             children: Vec::new(),
         });
         document.data_grids.push(UiDataGridDeclaration {
@@ -7858,6 +7944,7 @@ mod tests {
             enter_transition: None,
             world_depth: None,
             world_scale: None,
+            clip_shape: UiClipShape::default(),
             children: Vec::new(),
         });
         document.data_grids.push(UiDataGridDeclaration {
@@ -8070,6 +8157,7 @@ mod tests {
             enter_transition: None,
             world_depth: None,
             world_scale: None,
+            clip_shape: UiClipShape::default(),
             children: Vec::new(),
         });
         assert_eq!(
@@ -8124,6 +8212,7 @@ mod tests {
             enter_transition: None,
             world_depth: None,
             world_scale: None,
+            clip_shape: UiClipShape::default(),
             children: Vec::new(),
         });
         document.templates.push(UiTemplateDeclaration {
@@ -8360,6 +8449,10 @@ mod tests {
             motion_key: Some("health-change".into()),
         };
         let pending_motion = PendingStateMotion {
+            machine_key: "test-machine".into(),
+            previous_state: "before".into(),
+            target_state: "after".into(),
+            state_revision: Revision(1),
             transition: motion,
             previous_styles: Vec::new(),
             target_styles: vec![NuiFlowStateStyle {
@@ -8440,6 +8533,7 @@ mod tests {
                 enter_transition: None,
                 world_depth: None,
                 world_scale: None,
+                clip_shape: UiClipShape::default(),
                 children: Vec::new(),
             }
         }
@@ -8466,11 +8560,16 @@ mod tests {
                 enter_transition: None,
                 world_depth: None,
                 world_scale: None,
+                clip_shape: UiClipShape::default(),
                 children: vec![panel("panel-a"), panel("panel-b")],
             },
             effects: Vec::new(),
         };
         let motion = |node_key: &str, duration_ms: u32| PendingStateMotion {
+            machine_key: "test-machine".into(),
+            previous_state: "before".into(),
+            target_state: "after".into(),
+            state_revision: Revision(1),
             transition: UiTransition {
                 delay_ms: 0,
                 duration_ms,
@@ -8545,6 +8644,7 @@ mod tests {
                 enter_transition: None,
                 world_depth: None,
                 world_scale: None,
+                clip_shape: UiClipShape::default(),
                 children: Vec::new(),
             }
         }
@@ -8571,6 +8671,7 @@ mod tests {
                 enter_transition: None,
                 world_depth: None,
                 world_scale: None,
+                clip_shape: UiClipShape::default(),
                 children: (0..4)
                     .map(|index| panel(&format!("panel-{index}")))
                     .collect(),
@@ -8578,6 +8679,10 @@ mod tests {
             effects: Vec::new(),
         };
         let motion = |node_key: &str, duration_ms: u32| PendingStateMotion {
+            machine_key: "test-machine".into(),
+            previous_state: "before".into(),
+            target_state: "after".into(),
+            state_revision: Revision(1),
             transition: UiTransition {
                 delay_ms: 0,
                 duration_ms,
@@ -8630,6 +8735,10 @@ mod tests {
         // Dispatch A1, B1, then A2. The batch must keep B1 and replace only the
         // A scope with A2, proving per-scope dedup with no Option overwrite.
         let motion = |node_key: &str, duration_ms: u32| PendingStateMotion {
+            machine_key: "test-machine".into(),
+            previous_state: "before".into(),
+            target_state: "after".into(),
+            state_revision: Revision(1),
             transition: UiTransition {
                 delay_ms: 0,
                 duration_ms,

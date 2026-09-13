@@ -6,7 +6,7 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::Instant;
 
 use bytemuck::{Pod, Zeroable};
-use neon_protocol::{AssetBytes, AssetRef, UiImageSource, UiImageTextureRef, UiImageTextureRegion};
+use neon_protocol::{AssetBytes, AssetRef, Revision, UiImageSource, UiImageTextureRef, UiImageTextureRegion};
 use neon_ui_schema::{
     RenderSurfaceRef, TextRef, UiAlignItems, UiBounds, UiClipPolicy, UiClipShape, UiControlPresentation,
     UiDataGridCellTarget, UiDataGridWindowRequest, UiDragAxis, UiDragBinding, UiDragBoundary,
@@ -1167,8 +1167,81 @@ struct UiVisual {
     paint_group_id: u32,
 }
 
+/// Stable lifecycle identity for a renderer node. A plan path alone is not
+/// sufficient: the same semantic key may disappear and reappear while an old
+/// exit/completion record is still in flight.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct AnimationIdentity {
+    node_id: String,
+    generation: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AnimationReason {
+    Enter,
+    Transition,
+    PresentationState,
+    Exit,
+    Retarget,
+    Restore,
+}
+
+impl AnimationReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Enter => "enter",
+            Self::Transition => "transition",
+            Self::PresentationState => "presentation_state",
+            Self::Exit => "exit",
+            Self::Retarget => "retarget",
+            Self::Restore => "restore",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LifecycleState {
+    Current,
+    Active,
+    Exiting,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct SampledNodeVisual {
+    identity: AnimationIdentity,
+    transition_id: Option<u64>,
+    visual: UiVisual,
+    lifecycle: LifecycleState,
+}
+
+/// Immutable result of one renderer clock sample. The render pass and hit-test
+/// pass can consume the same snapshot without observing half-updated maps.
+#[derive(Clone, Debug, PartialEq)]
+struct VisualFrameSnapshot {
+    program_revision: Revision,
+    frame_sequence: u64,
+    animation_epoch: u64,
+    nodes: Vec<SampledNodeVisual>,
+}
+
+#[derive(Clone, Debug)]
+struct ExitingNode {
+    transition: ActiveTransition,
+    remove_after_seconds: f32,
+}
+
 #[derive(Clone, Debug)]
 struct ActiveTransition {
+    identity: AnimationIdentity,
+    transition_id: u64,
+    program_revision: Revision,
+    source_frame_sequence: u64,
+    animation_epoch: u64,
+    reason: AnimationReason,
+    /// The exact old visual sampled at the retarget clock. This is retained
+    /// only for diagnostics; `from` is the immutable value used by the new
+    /// transition.
+    retarget_source: Option<UiVisual>,
     from: UiVisual,
     target: UiVisual,
     started_at_seconds: f32,
@@ -1197,7 +1270,12 @@ struct UiAnimationSpec {
 #[derive(Clone, Debug, PartialEq)]
 struct UiAnimationInstance {
     node_path: String,
+    identity: AnimationIdentity,
+    transition_id: u64,
     fragment_revision: neon_protocol::Revision,
+    source_frame_sequence: u64,
+    animation_epoch: u64,
+    reason: AnimationReason,
     started_at_seconds: f32,
     spec: UiAnimationSpec,
     status: UiAnimationStatus,
@@ -1210,7 +1288,12 @@ fn animation_instance_from_active(
 ) -> UiAnimationInstance {
     UiAnimationInstance {
         node_path: node_path.to_owned(),
-        fragment_revision: neon_protocol::Revision(0),
+        identity: active.identity.clone(),
+        transition_id: active.transition_id,
+        fragment_revision: active.program_revision,
+        source_frame_sequence: active.source_frame_sequence,
+        animation_epoch: active.animation_epoch,
+        reason: active.reason,
         started_at_seconds: active.started_at_seconds,
         spec: UiAnimationSpec {
             motion_key: active.transition.motion_key.clone(),
@@ -1233,7 +1316,12 @@ impl ActiveTransition {
         let finished = transition_finished(self, time_seconds);
         UiAnimationInstance {
             node_path: node_path.to_owned(),
+            identity: self.identity.clone(),
+            transition_id: self.transition_id,
             fragment_revision,
+            source_frame_sequence: self.source_frame_sequence,
+            animation_epoch: self.animation_epoch,
+            reason: self.reason,
             started_at_seconds: self.started_at_seconds,
             spec: UiAnimationSpec {
                 motion_key: self.transition.motion_key.clone(),
@@ -1476,7 +1564,11 @@ fn is_world_panel_path(path: &str) -> bool {
 fn transition_finished(active: &ActiveTransition, time_seconds: f32) -> bool {
     time_seconds
         >= active.started_at_seconds
-            + (active.transition.delay_ms + active.transition.duration_ms) as f32 / 1000.0
+            + active
+                .transition
+                .delay_ms
+                .saturating_add(active.transition.duration_ms) as f32
+                / 1000.0
 }
 
 /// Resolves the final shell polygon from authored corner cuts and final panel
@@ -1562,7 +1654,15 @@ pub struct UiWgpuRenderer {
     plan_viewport_revision: u64,
     view_buffer_viewport_revision: u64,
     current: HashMap<String, UiVisual>,
+    current_identities: HashMap<String, AnimationIdentity>,
     active: HashMap<String, ActiveTransition>,
+    exiting: HashMap<AnimationIdentity, ExitingNode>,
+    node_generations: HashMap<String, u64>,
+    live_node_ids: HashSet<String>,
+    next_transition_id: u64,
+    animation_frame_sequence: u64,
+    animation_epoch: u64,
+    last_frame_snapshot: Option<VisualFrameSnapshot>,
     animation_history: VecDeque<UiAnimationInstance>,
     pointer_position: Option<[f32; 2]>,
     pressed_until_seconds: f32,
@@ -2456,7 +2556,15 @@ impl UiWgpuRenderer {
             plan_viewport_revision: 0,
             view_buffer_viewport_revision: 0,
             current: HashMap::new(),
+            current_identities: HashMap::new(),
             active: HashMap::new(),
+            exiting: HashMap::new(),
+            node_generations: HashMap::new(),
+            live_node_ids: HashSet::new(),
+            next_transition_id: 1,
+            animation_frame_sequence: 0,
+            animation_epoch: 1,
+            last_frame_snapshot: None,
             animation_history: VecDeque::with_capacity(64),
             pointer_position: None,
             pressed_until_seconds: 0.0,
@@ -2673,6 +2781,11 @@ impl UiWgpuRenderer {
     }
 
     fn compose_sampled_visuals(&mut self, time_seconds: f32) -> Vec<Option<usize>> {
+        // One immutable clock/frame identity is used for every node in this
+        // composition pass. The hit-test pass can consume the resulting
+        // `last_frame_snapshot` instead of inferring a frame from array order.
+        self.animation_frame_sequence = self.animation_frame_sequence.saturating_add(1).max(1);
+        let frame_sequence = self.animation_frame_sequence;
         // Apply persisted splitter positions (from finished drags) first.
         self.apply_persisted_splitter_positions();
         // Apply active splitter drag to target bounds BEFORE sampling.
@@ -2683,10 +2796,29 @@ impl UiWgpuRenderer {
             let target = self.plan[index].target.clone();
             let transition = self.plan[index].transition.clone();
             let was_active = self.active.contains_key(&node_id);
+            let node_generation = self.node_generations.get(&node_id).copied().unwrap_or(1);
+            let program_revision = self
+                .plan_revisions
+                .iter()
+                .find(|(fragment_id, _)| {
+                    node_id
+                        .strip_prefix(&format!("{}/", fragment_id.0))
+                        .is_some()
+                })
+                .map(|(_, revision)| *revision)
+                .unwrap_or(Revision(0));
             // Always begin with a canonical transition sample. Inherited composition
             // below must never accumulate in `sampled` across renderer entry points.
             self.sampled[index] =
-                self.sample_with_history(&node_id, &target, transition.as_ref(), time_seconds);
+                self.sample_with_history(
+                    &node_id,
+                    &target,
+                    transition.as_ref(),
+                    node_generation,
+                    program_revision,
+                    frame_sequence,
+                    time_seconds,
+                );
             if target.world_scale.is_some() && self.sampled[index].bounds != target.bounds {
                 self.layout_counters.world_transform_update_count = self
                     .layout_counters
@@ -2742,10 +2874,21 @@ impl UiWgpuRenderer {
                 self.sampled[index].bounds.x - target.bounds.x,
                 self.sampled[index].bounds.y - target.bounds.y,
             ];
+            let rendered_opacity = self
+                .active
+                .get(&self.plan[index].id)
+                .map(|active| sample_transition(active, time_seconds).style.opacity)
+                .unwrap_or(self.sampled[index].style.opacity);
             let own_opacity = if target.style.opacity > 0.0 {
-                self.sampled[index].style.opacity / target.style.opacity
+                rendered_opacity / target.style.opacity
+            } else if self.active.contains_key(&self.plan[index].id) {
+                // A node whose target opacity is zero must remain in the plan
+                // while its fade-out track is sampled. Use the sampled target
+                // opacity as the subtree factor so descendants fade together
+                // instead of escaping through the parent with full opacity.
+                rendered_opacity
             } else {
-                1.0
+                0.0
             };
             let sticky_vertical = self.plan[index]
                 .id
@@ -2939,6 +3082,48 @@ impl UiWgpuRenderer {
                 }
             }
         }
+        self.last_frame_snapshot = Some(VisualFrameSnapshot {
+            program_revision: self
+                .plan_revisions
+                .values()
+                .copied()
+                .max_by_key(|revision| revision.0)
+                .unwrap_or(Revision(0)),
+            frame_sequence,
+            animation_epoch: self.animation_epoch,
+            nodes: self
+                .plan
+                .iter()
+                .enumerate()
+                .map(|(index, node)| {
+                    let active = self.active.get(&node.id);
+                    SampledNodeVisual {
+                        identity: AnimationIdentity {
+                            node_id: node.id.clone(),
+                            generation: self
+                                .node_generations
+                                .get(&node.id)
+                                .copied()
+                                .unwrap_or(1),
+                        },
+                        transition_id: active.map(|active| active.transition_id),
+                        // Keep the diagnostic snapshot honest about what the
+                        // consumer renders during an active GPU track. The
+                        // plan/sample array intentionally holds the target
+                        // record used to build the instance; the active track
+                        // is the actual frame-time visual.
+                        visual: active
+                            .map(|active| sample_transition(active, time_seconds))
+                            .unwrap_or_else(|| self.sampled[index].clone()),
+                        lifecycle: if active.is_some() {
+                            LifecycleState::Active
+                        } else {
+                            LifecycleState::Current
+                        },
+                    }
+                })
+                .collect(),
+        });
         top_layer
     }
 
@@ -5016,7 +5201,11 @@ impl UiWgpuRenderer {
         let mut completed = Vec::new();
         self.active.retain(|id, active| {
             let end = active.started_at_seconds
-                + (active.transition.delay_ms + active.transition.duration_ms) as f32 / 1000.0;
+                + active
+                    .transition
+                    .delay_ms
+                    .saturating_add(active.transition.duration_ms) as f32
+                    / 1000.0;
             if time_seconds < end {
                 true
             } else {
@@ -5029,6 +5218,7 @@ impl UiWgpuRenderer {
                 completed.push((
                     id.clone(),
                     active.target.clone(),
+                    active.identity.clone(),
                     active.transition.motion_key.clone(),
                     active.started_at_seconds,
                     active.transition.duration_ms,
@@ -5036,7 +5226,7 @@ impl UiWgpuRenderer {
                 false
             }
         });
-        for (node, target, motion_key, start_seconds, duration_ms) in completed {
+        for (node, target, identity, motion_key, start_seconds, duration_ms) in completed {
             if self.trace_role != "screen" && is_world_panel_path(&node) {
                 eprintln!(
                     "{}",
@@ -5056,8 +5246,10 @@ impl UiWgpuRenderer {
             // re-starts a no-op motion against the still-present
             // `enter_transition` — the endless start/complete churn.
             self.current.insert(node.clone(), target);
+            self.current_identities.insert(node, identity);
         }
-        !self.active.is_empty() || time_seconds < self.pressed_until_seconds
+        !self.active.is_empty()
+            || time_seconds < self.pressed_until_seconds
     }
 
     pub(crate) fn cancel_animation(&mut self, node_path: &str) -> bool {
@@ -5073,8 +5265,37 @@ impl UiWgpuRenderer {
         while self.animation_history.len() > 64 {
             self.animation_history.pop_front();
         }
+        self.current_identities
+            .insert(node_path.to_owned(), active.identity.clone());
         self.current.insert(node_path.to_owned(), active.target);
         true
+    }
+
+    fn visual_debug_value(visual: &UiVisual) -> Value {
+        json!({
+            "bounds": {
+                "x": visual.bounds.x,
+                "y": visual.bounds.y,
+                "width": visual.bounds.width,
+                "height": visual.bounds.height,
+            },
+            "opacity": visual.style.opacity,
+            "background_color": visual.style.background_color,
+            "border_color": visual.style.border_color,
+            "border_width": visual.style.border_width,
+            "corner_radius": visual.style.corner_radius,
+            "clip_shape": match visual.clip_shape {
+                UiClipShape::Rect => "rect",
+                UiClipShape::Circle => "circle",
+                UiClipShape::Ellipse => "ellipse",
+            },
+            "numeric_value": match &visual.presentation {
+                Some(UiControlPresentation::Numeric { value, min, max }) => {
+                    json!({"value": value, "min": min, "max": max})
+                }
+                _ => Value::Null,
+            },
+        })
     }
 
     /// Renderer-side snapshot of every in-flight transition. `node_key` is the
@@ -5088,6 +5309,7 @@ impl UiWgpuRenderer {
             .iter()
             .map(|(node_key, active)| {
                 let elapsed_ms = ((time_seconds - active.started_at_seconds) * 1000.0).max(0.0);
+                let sampled = sample_transition(active, time_seconds);
                 let status = if transition_finished(active, time_seconds) {
                     UiAnimationStatus::Completed
                 } else {
@@ -5095,30 +5317,35 @@ impl UiWgpuRenderer {
                 };
                 json!({
                     "node_key": node_key,
+                    "identity": {
+                        "node_id": active.identity.node_id,
+                        "generation": active.identity.generation,
+                    },
+                    "transition_id": active.transition_id,
+                    "program_revision": active.program_revision.0,
+                    "source_frame_sequence": active.source_frame_sequence,
+                    "animation_epoch": active.animation_epoch,
+                    "reason": active.reason.as_str(),
                     "motion_key": active.transition.motion_key,
+                    "retarget_source": active
+                        .retarget_source
+                        .as_ref()
+                        .map(Self::visual_debug_value),
                     "elapsed_ms": elapsed_ms,
                     "delay_ms": active.transition.delay_ms,
                     "duration_ms": active.transition.duration_ms,
                     "easing": format_easing(active.transition.easing),
-                    "progress": ((elapsed_ms - active.transition.delay_ms as f32)
-                        / active.transition.duration_ms as f32)
-                        .clamp(0.0, 1.0),
-                    "status": format!("{status:?}"),
-                    "target": {
-                        "bounds": {
-                            "x": active.target.bounds.x,
-                            "y": active.target.bounds.y,
-                            "width": active.target.bounds.width,
-                            "height": active.target.bounds.height,
-                        },
-                        "opacity": active.target.style.opacity,
-                        "numeric_value": match &active.target.presentation {
-                            Some(UiControlPresentation::Numeric { value, min, max }) => {
-                                json!({"value": value, "min": min, "max": max})
-                            }
-                            _ => Value::Null,
-                        },
+                    "progress": if active.transition.duration_ms == 0 {
+                        1.0
+                    } else {
+                        ((elapsed_ms - active.transition.delay_ms as f32)
+                            / active.transition.duration_ms as f32)
+                            .clamp(0.0, 1.0)
                     },
+                    "status": format!("{status:?}"),
+                    "target": Self::visual_debug_value(&active.target),
+                    "from": Self::visual_debug_value(&active.from),
+                    "sampled": Self::visual_debug_value(&sampled),
                 })
             })
             .collect::<Vec<_>>();
@@ -5130,13 +5357,48 @@ impl UiWgpuRenderer {
             .map(|animation| {
                 json!({
                     "node_key": animation.node_path,
+                    "identity": {
+                        "node_id": animation.identity.node_id,
+                        "generation": animation.identity.generation,
+                    },
+                    "transition_id": animation.transition_id,
+                    "program_revision": animation.fragment_revision.0,
+                    "source_frame_sequence": animation.source_frame_sequence,
+                    "animation_epoch": animation.animation_epoch,
+                    "reason": animation.reason.as_str(),
                     "status": format!("{:?}", animation.status),
                     "motion_key": animation.spec.motion_key,
                     "started_at_seconds": animation.started_at_seconds,
                 })
             })
             .collect::<Vec<_>>();
-        json!({ "count": transitions.len(), "transitions": transitions, "history": history })
+        let frame = self.last_frame_snapshot.as_ref().map(|snapshot| {
+            json!({
+                "program_revision": snapshot.program_revision.0,
+                "frame_sequence": snapshot.frame_sequence,
+                "animation_epoch": snapshot.animation_epoch,
+                "nodes": snapshot.nodes.iter().map(|node| {
+                    json!({
+                        "node_id": node.identity.node_id,
+                        "generation": node.identity.generation,
+                        "transition_id": node.transition_id,
+                        "lifecycle": match node.lifecycle {
+                            LifecycleState::Current => "current",
+                            LifecycleState::Active => "active",
+                            LifecycleState::Exiting => "exiting",
+                        },
+                        "visual": Self::visual_debug_value(&node.visual),
+                    })
+                }).collect::<Vec<_>>(),
+            })
+        });
+        json!({
+            "count": transitions.len(),
+            "transitions": transitions,
+            "history": history,
+            "exiting_count": self.exiting.len(),
+            "frame": frame,
+        })
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -7580,11 +7842,41 @@ impl UiWgpuRenderer {
         }
         let nodes = filtered_nodes;
         let live: HashSet<_> = nodes.iter().map(|(id, _, _, _)| id.clone()).collect();
+        let previous_live = self.live_node_ids.clone();
+        for id in &live {
+            let generation = match self.node_generations.get(id).copied() {
+                Some(generation) if previous_live.contains(id) => generation,
+                Some(generation) => generation.saturating_add(1).max(1),
+                None => 1,
+            };
+            self.node_generations.insert(id.clone(), generation);
+        }
+        self.live_node_ids = live.clone();
         if viewport_changed {
             self.current.clear();
+            self.current_identities.clear();
             self.active.clear();
+            self.exiting.clear();
+            self.last_frame_snapshot = None;
+            self.animation_epoch = self.animation_epoch.saturating_add(1).max(1);
         } else {
+            let removed = previous_live
+                .difference(&live)
+                .cloned()
+                .collect::<Vec<_>>();
+            for id in removed {
+                if let Some(active) = self.active.remove(&id) {
+                    self.animation_history.push_back(animation_instance_from_active(
+                        &id,
+                        &active,
+                        UiAnimationStatus::Cancelled,
+                    ));
+                }
+                self.current.remove(&id);
+                self.current_identities.remove(&id);
+            }
             self.current.retain(|id, _| live.contains(id));
+            self.current_identities.retain(|id, _| live.contains(id));
             self.active.retain(|id, _| live.contains(id));
         }
         self.plan.clear();
@@ -8034,9 +8326,21 @@ impl UiWgpuRenderer {
         id: &str,
         target: &UiVisual,
         transition: Option<&UiTransition>,
+        node_generation: u64,
+        program_revision: Revision,
+        source_frame_sequence: u64,
         time_seconds: f32,
     ) -> UiVisual {
         let superseded = self.active.get(id).cloned();
+        let target_changed = superseded
+            .as_ref()
+            .is_some_and(|previous| previous.target != *target);
+        let had_previous = superseded.is_some();
+        let had_current = self.current.contains_key(id);
+        let retarget_source = superseded
+            .as_ref()
+            .filter(|_| target_changed)
+            .map(|previous| sample_transition(previous, time_seconds));
         let sampled = Self::sample(
             &mut self.current,
             &mut self.active,
@@ -8045,20 +8349,48 @@ impl UiWgpuRenderer {
             transition,
             time_seconds,
         );
-        if let Some(previous) = superseded
-            && transition.is_some()
-            && previous.target != *target
-        {
-            self.animation_history
-                .push_back(animation_instance_from_active(
-                    id,
-                    &previous,
-                    UiAnimationStatus::Superseded,
-                ));
-            while self.animation_history.len() > 64 {
-                self.animation_history.pop_front();
+        if let Some(previous) = superseded {
+            if transition.is_some() && target_changed {
+                self.animation_history
+                    .push_back(animation_instance_from_active(
+                        id,
+                        &previous,
+                        UiAnimationStatus::Superseded,
+                    ));
             }
         }
+        if target_changed || (self.active.contains_key(id) && !had_previous) {
+            let transition_id = self.next_transition_id;
+            self.next_transition_id = self.next_transition_id.saturating_add(1).max(1);
+            if let Some(active) = self.active.get_mut(id) {
+                active.identity = AnimationIdentity {
+                    node_id: id.to_owned(),
+                    generation: node_generation,
+                };
+                active.transition_id = transition_id;
+                active.program_revision = program_revision;
+                active.source_frame_sequence = source_frame_sequence;
+                active.animation_epoch = self.animation_epoch;
+                active.reason = if target_changed {
+                    AnimationReason::Retarget
+                } else if had_current {
+                    AnimationReason::Transition
+                } else {
+                    AnimationReason::Enter
+                };
+                active.retarget_source = retarget_source;
+            }
+        }
+        while self.animation_history.len() > 64 {
+            self.animation_history.pop_front();
+        }
+        self.current_identities.insert(
+            id.to_owned(),
+            AnimationIdentity {
+                node_id: id.to_owned(),
+                generation: node_generation,
+            },
+        );
         sampled
     }
 
@@ -8116,6 +8448,10 @@ impl UiWgpuRenderer {
                     .as_ref()
                     .is_some_and(|source| Self::same_world_visual_except_position(source, target)))
         {
+            // The old track has reached the new target (or the update is an
+            // immediate replacement). Do not leave the superseded record
+            // alive to overwrite the new target on a later render pass.
+            active.remove(id);
             current.insert(id.to_owned(), target.clone());
             return target.clone();
         }
@@ -8153,6 +8489,16 @@ impl UiWgpuRenderer {
                     from.bounds.y = target.bounds.y;
                 }
                 let next_active = ActiveTransition {
+                    identity: AnimationIdentity {
+                        node_id: id.to_owned(),
+                        generation: 0,
+                    },
+                    transition_id: 0,
+                    program_revision: Revision(0),
+                    source_frame_sequence: 0,
+                    animation_epoch: 0,
+                    reason: AnimationReason::Transition,
+                    retarget_source: None,
                     from,
                     target: target.clone(),
                     started_at_seconds: time_seconds,
@@ -8161,7 +8507,13 @@ impl UiWgpuRenderer {
                 active.insert(id.to_owned(), next_active);
                 target.clone()
             }
-            _ => target.clone(),
+            Some(_) | None => {
+                // An update without a positive-duration motion is an
+                // immediate target commit. Cancel any old track first so a
+                // stale GPU instance cannot keep sampling it.
+                active.remove(id);
+                target.clone()
+            }
         };
         current.insert(id.to_owned(), sampled.clone());
         sampled
@@ -11683,7 +12035,15 @@ fn flatten_node(
     {
         return;
     }
-    if node.style.opacity > 0.0 {
+    // Keep a zero-opacity node in the render plan only when its declared
+    // transition actually fades down from a visible source. Hidden nodes with
+    // a reveal motion must stay absent until their target becomes visible.
+    let fading_out = node
+        .enter_transition
+        .as_ref()
+        .and_then(|transition| transition.from.opacity)
+        .is_some_and(|from| from > node.style.opacity);
+    if node.style.opacity > 0.0 || fading_out {
         let node_path = format!("{fragment_id}/{}", node.node_id.0);
         let logical_bounds = LogicalLayoutBox {
             x: bounds.x,
@@ -12214,9 +12574,12 @@ fn from_bounds_clip(from: Option<UiBounds>, target: &UiVisual) -> Option<UiBound
 
 fn sample_transition(active: &ActiveTransition, time_seconds: f32) -> UiVisual {
     let elapsed_ms = ((time_seconds - active.started_at_seconds) * 1000.0).max(0.0);
-    let progress = ((elapsed_ms - active.transition.delay_ms as f32)
-        / active.transition.duration_ms as f32)
-        .clamp(0.0, 1.0);
+    let progress = if active.transition.duration_ms == 0 {
+        1.0
+    } else {
+        ((elapsed_ms - active.transition.delay_ms as f32) / active.transition.duration_ms as f32)
+            .clamp(0.0, 1.0)
+    };
     let t = ease(progress, active.transition.easing);
     let presentation = match (&active.from.presentation, &active.target.presentation) {
         (
@@ -12559,7 +12922,7 @@ mod tests {
                 },
             ],
         };
-        let resource = |hovered, pressed| match &select_button_skin_slot(&skin, hovered, pressed).unwrap().presentation {
+        let resource = |hovered, pressed| match &select_button_skin_slot(&skin, hovered, pressed, true).unwrap().presentation {
             UiSkinPresentation::Image { resource_key, .. } => resource_key.as_str(),
             _ => unreachable!(),
         };
@@ -12579,9 +12942,9 @@ mod tests {
                 UiSkinSlot { slot_kind: UiSkinSlotKind::Thumb, state: UiVisualState::Hover, presentation: UiSkinPresentation::Default },
             ],
         };
-        assert_eq!(select_slider_skin_slot(&skin, UiSkinSlotKind::Track, false, false).unwrap().slot_kind, UiSkinSlotKind::Track);
-        assert_eq!(select_slider_skin_slot(&skin, UiSkinSlotKind::Fill, true, true).unwrap().state, UiVisualState::Active);
-        assert_eq!(select_slider_skin_slot(&skin, UiSkinSlotKind::Thumb, true, true).unwrap().state, UiVisualState::Hover);
+        assert_eq!(select_slider_skin_slot(&skin, UiSkinSlotKind::Track, false, false, true).unwrap().slot_kind, UiSkinSlotKind::Track);
+        assert_eq!(select_slider_skin_slot(&skin, UiSkinSlotKind::Fill, true, true, true).unwrap().state, UiVisualState::Active);
+        assert_eq!(select_slider_skin_slot(&skin, UiSkinSlotKind::Thumb, true, true, true).unwrap().state, UiVisualState::Hover);
     }
 
     #[test]
@@ -12738,6 +13101,7 @@ mod tests {
                 height: 80.0,
             },
             clip_radius: 0.0,
+            clip_shape: UiClipShape::default(),
             image: None,
             surface: None,
             text: None,
@@ -13004,6 +13368,7 @@ mod tests {
                 height: 100.0,
             },
             clip_radius: 0.0,
+            clip_shape: UiClipShape::default(),
             image: None,
             surface: None,
             text: Some(TextRef::Literal {
@@ -13464,6 +13829,7 @@ mod tests {
                 height: 100.0,
             },
             clip_radius: 0.0,
+            clip_shape: UiClipShape::default(),
             image: None,
             surface: None,
             text: Some(TextRef::Literal {
@@ -13585,6 +13951,7 @@ mod tests {
                 height: 100.0,
             },
             clip_radius: 0.0,
+            clip_shape: UiClipShape::default(),
             image: None,
             surface: None,
             text: None,
@@ -13829,6 +14196,7 @@ mod tests {
             enabled: true,
             clip: viewport,
             clip_radius: 0.0,
+            clip_shape: UiClipShape::default(),
             image: None,
             surface: None,
             text: None,
@@ -13918,6 +14286,7 @@ mod tests {
             enabled: true,
             clip: viewport,
             clip_radius: 0.0,
+            clip_shape: UiClipShape::default(),
             image: None,
             surface: None,
             text: None,
@@ -14039,6 +14408,7 @@ mod tests {
             enter_transition: None,
             world_depth: None,
             world_scale: None,
+            clip_shape: UiClipShape::default(),
             children: Vec::new(),
         });
         let pixels = render_offscreen_for_test(
@@ -14117,6 +14487,7 @@ mod tests {
                 surface: None,
                 style: UiStyle::default(),
                 enter_transition: None,
+                clip_shape: UiClipShape::default(),
                 children: Vec::new(),
                 world_depth: None,
                 world_scale: None,
@@ -14142,6 +14513,7 @@ mod tests {
             enter_transition: None,
             world_depth: None,
             world_scale: None,
+            clip_shape: UiClipShape::default(),
             children: Vec::new(),
         });
         root.children.push(UiNode {
@@ -14164,6 +14536,7 @@ mod tests {
             enter_transition: None,
             world_depth: None,
             world_scale: None,
+            clip_shape: UiClipShape::default(),
             children: Vec::new(),
         });
         let pixels = render_hit_ids_for_test(
@@ -14292,6 +14665,7 @@ mod tests {
                 children: Vec::new(),
                 world_depth: None,
                 world_scale: None,
+                clip_shape: UiClipShape::default(),
             };
             let fragment = UiFragment {
                 fragment_id: UiFragmentId("f".into()),
@@ -14602,6 +14976,7 @@ mod tests {
             enter_transition: None,
             world_depth: None,
             world_scale: None,
+            clip_shape: UiClipShape::default(),
             children: Vec::new(),
         };
         let cell = |id| neon_ui_schema::UiDataGridCell {
@@ -14784,6 +15159,7 @@ mod tests {
             enter_transition: None,
             world_depth: None,
             world_scale: None,
+            clip_shape: UiClipShape::default(),
             children: Vec::new(),
         };
         let cell = |id, presentation_override| neon_ui_schema::UiDataGridCell {
@@ -14948,6 +15324,7 @@ mod tests {
             enter_transition: None,
             world_depth: None,
             world_scale: None,
+            clip_shape: UiClipShape::default(),
             children: Vec::new(),
         };
         let declaration = neon_ui_schema::UiDataGridDeclaration {
@@ -15108,6 +15485,7 @@ mod tests {
             enter_transition: None,
             world_depth: None,
             world_scale: None,
+            clip_shape: UiClipShape::default(),
             children: Vec::new(),
         };
         let declaration = neon_ui_schema::UiDataGridDeclaration {
@@ -15339,6 +15717,7 @@ mod tests {
             enter_transition: None,
             world_depth: None,
             world_scale: None,
+            clip_shape: UiClipShape::default(),
             children: Vec::new(),
         };
         let declaration = neon_ui_schema::UiDataGridDeclaration {
@@ -15603,6 +15982,7 @@ mod tests {
             children: Vec::new(),
             world_depth: None,
             world_scale: None,
+            clip_shape: UiClipShape::default(),
         }
     }
 
@@ -16198,6 +16578,7 @@ mod tests {
             enter_transition: None,
             world_depth: None,
             world_scale: None,
+            clip_shape: UiClipShape::default(),
             children: Vec::new(),
         });
         let fragments = HashMap::from([(
@@ -16799,6 +17180,7 @@ mod tests {
                 surface: None,
                 style: UiStyle::default(),
                 enter_transition: None,
+                clip_shape: UiClipShape::default(),
                 children: Vec::new(),
                 world_depth: None,
                 world_scale: None,
@@ -16965,6 +17347,7 @@ mod tests {
             enter_transition: None,
             world_depth: None,
             world_scale: None,
+            clip_shape: UiClipShape::default(),
             children: Vec::new(),
         };
         let mut fragment = UiFragment {
@@ -17018,6 +17401,7 @@ mod tests {
             enter_transition: None,
             world_depth: None,
             world_scale: None,
+            clip_shape: UiClipShape::default(),
             children: Vec::new(),
         };
         let fragments = HashMap::from([(
@@ -18385,6 +18769,7 @@ mod tests {
             enter_transition: None,
             world_depth: None,
             world_scale: None,
+            clip_shape: UiClipShape::default(),
             children: Vec::new(),
         };
         let fragment = UiFragment {
@@ -18444,6 +18829,7 @@ mod tests {
             children: Vec::new(),
             world_depth: None,
             world_scale: None,
+            clip_shape: UiClipShape::default(),
         };
         let fragment = UiFragment {
             fragment_id: UiFragmentId("bundled-cjk-text".into()),
@@ -18503,6 +18889,7 @@ mod tests {
             children: Vec::new(),
             world_depth: None,
             world_scale: None,
+            clip_shape: UiClipShape::default(),
         };
         let root = UiNode {
             node_id: UiNodeId("clip-root".into()),
@@ -18534,6 +18921,7 @@ mod tests {
             children: vec![label],
             world_depth: None,
             world_scale: None,
+            clip_shape: UiClipShape::default(),
         };
         let pixels = render_offscreen_for_test(
             &device,
@@ -18611,6 +18999,7 @@ mod tests {
                 children: Vec::new(),
                 world_depth: None,
                 world_scale: None,
+                clip_shape: UiClipShape::default(),
             },
             UiNode {
                 node_id: UiNodeId("second".into()),
@@ -18633,6 +19022,7 @@ mod tests {
                 children: Vec::new(),
                 world_depth: None,
                 world_scale: None,
+                clip_shape: UiClipShape::default(),
             },
         ];
         let fragments = HashMap::from([(
@@ -18773,6 +19163,7 @@ mod tests {
                 height: 2_000_000.0,
             },
             clip_radius: 0.0,
+            clip_shape: UiClipShape::default(),
             image: None,
             surface: None,
             text: None,
@@ -18785,6 +19176,16 @@ mod tests {
         };
         let transition = node().enter_transition.unwrap();
         let active = ActiveTransition {
+            identity: AnimationIdentity {
+                node_id: "test/transition".into(),
+                generation: 1,
+            },
+            transition_id: 1,
+            program_revision: Revision(1),
+            source_frame_sequence: 1,
+            animation_epoch: 1,
+            reason: AnimationReason::Enter,
+            retarget_source: None,
             from: transition_source(&target, &transition),
             target: target.clone(),
             started_at_seconds: 1.0,
@@ -18825,6 +19226,7 @@ mod tests {
                 height: 2_000_000.0,
             },
             clip_radius: 0.0,
+            clip_shape: UiClipShape::default(),
             image: None,
             surface: None,
             text: None,
@@ -18846,6 +19248,16 @@ mod tests {
             motion_key: Some("test.motion".into()),
         };
         let active = ActiveTransition {
+            identity: AnimationIdentity {
+                node_id: "test/node".into(),
+                generation: 1,
+            },
+            transition_id: 1,
+            program_revision: Revision(4),
+            source_frame_sequence: 1,
+            animation_epoch: 1,
+            reason: AnimationReason::Transition,
+            retarget_source: None,
             from: transition_source(&target, &transition),
             target,
             started_at_seconds: 1.0,
@@ -18895,6 +19307,7 @@ mod tests {
                 height: 2_000_000.0,
             },
             clip_radius: 0.0,
+            clip_shape: UiClipShape::default(),
             image: None,
             surface: None,
             text: None,
@@ -18918,6 +19331,16 @@ mod tests {
         renderer.active.insert(
             "test/cancel".into(),
             ActiveTransition {
+                identity: AnimationIdentity {
+                    node_id: "test/cancel".into(),
+                    generation: 1,
+                },
+                transition_id: 1,
+                program_revision: Revision(1),
+                source_frame_sequence: 1,
+                animation_epoch: 1,
+                reason: AnimationReason::Transition,
+                retarget_source: None,
                 from: transition_source(&target, &transition),
                 target: target.clone(),
                 started_at_seconds: 1.0,
@@ -18962,6 +19385,7 @@ mod tests {
                 height: 2_000_000.0,
             },
             clip_radius: 0.0,
+            clip_shape: UiClipShape::default(),
             image: None,
             surface: None,
             text: None,
@@ -18988,12 +19412,34 @@ mod tests {
             motion_key: Some("retarget".into()),
         };
         let first = visual(100.0);
-        renderer.sample_with_history("retarget/node", &first, Some(&transition), 1.0);
+        renderer.sample_with_history(
+            "retarget/node",
+            &first,
+            Some(&transition),
+            1,
+            Revision(1),
+            1,
+            1.0,
+        );
+        let first_transition_id = renderer.active["retarget/node"].transition_id;
         let midpoint = sample_transition(renderer.active.get("retarget/node").unwrap(), 1.05);
         let second = visual(200.0);
-        renderer.sample_with_history("retarget/node", &second, Some(&transition), 1.05);
+        renderer.sample_with_history(
+            "retarget/node",
+            &second,
+            Some(&transition),
+            1,
+            Revision(1),
+            2,
+            1.05,
+        );
         let active = renderer.active.get("retarget/node").unwrap();
         assert_eq!(active.from.bounds.x, midpoint.bounds.x);
+        assert_eq!(active.retarget_source.as_ref().unwrap().bounds.x, midpoint.bounds.x);
+        assert_eq!(active.transition_id, first_transition_id + 1);
+        assert_eq!(active.identity.generation, 1);
+        assert_eq!(active.reason, AnimationReason::Retarget);
+        assert_eq!(active.source_frame_sequence, 2);
         assert!(
             matches!(renderer.animation_history.back(), Some(animation) if animation.status == UiAnimationStatus::Superseded)
         );
@@ -19032,6 +19478,7 @@ mod tests {
                 height: 2_000_000.0,
             },
             clip_radius: 0.0,
+            clip_shape: UiClipShape::default(),
             image: None,
             surface: None,
             text: None,
@@ -19058,6 +19505,16 @@ mod tests {
             motion_key: None,
         };
         let active = ActiveTransition {
+            identity: AnimationIdentity {
+                node_id: "test/numeric".into(),
+                generation: 1,
+            },
+            transition_id: 1,
+            program_revision: Revision(1),
+            source_frame_sequence: 1,
+            animation_epoch: 1,
+            reason: AnimationReason::Transition,
+            retarget_source: None,
             from: transition_source(&target, &transition),
             target: target.clone(),
             started_at_seconds: 1.0,
@@ -19109,6 +19566,7 @@ mod tests {
                 height: 2_000_000.0,
             },
             clip_radius: 0.0,
+            clip_shape: UiClipShape::default(),
             image: None,
             surface: None,
             text: None,
@@ -19150,6 +19608,7 @@ mod tests {
                 height: 2_000_000.0,
             },
             clip_radius: 0.0,
+            clip_shape: UiClipShape::default(),
             image: None,
             surface: None,
             text: None,
@@ -19161,6 +19620,16 @@ mod tests {
             paint_group_id: 0,
         };
         let active = ActiveTransition {
+            identity: AnimationIdentity {
+                node_id: "test/update".into(),
+                generation: 1,
+            },
+            transition_id: 1,
+            program_revision: Revision(1),
+            source_frame_sequence: 1,
+            animation_epoch: 1,
+            reason: AnimationReason::Transition,
+            retarget_source: None,
             from: original,
             target,
             started_at_seconds: 0.0,
@@ -19213,6 +19682,7 @@ mod tests {
                 height: 10.0,
             },
             clip_radius: 0.0,
+            clip_shape: UiClipShape::default(),
             image: None,
             surface: None,
             text: None,
@@ -19285,6 +19755,7 @@ mod tests {
             declared_scroll_offset: [0.0; 2],
             world_depth: Some(0.5),
             world_scale: None,
+            clip_shape: UiClipShape::default(),
             paint_group_id: 0,
         };
         let transition = UiTransition {
@@ -19671,6 +20142,7 @@ mod tests {
             children: Vec::new(),
             world_depth: None,
             world_scale: None,
+            clip_shape: UiClipShape::default(),
         };
         let [width, height] = intrinsic_size(&node, None);
         // Without font, each ASCII char = FONT_RASTER_SIZE * 0.5 = 8.0
@@ -19843,6 +20315,7 @@ mod tests {
             enter_transition: None,
             world_depth: None,
             world_scale: None,
+            clip_shape: UiClipShape::default(),
             children: Vec::new(),
         };
         let root = UiNode {
@@ -19860,6 +20333,7 @@ mod tests {
             enter_transition: None,
             world_depth: None,
             world_scale: None,
+            clip_shape: UiClipShape::default(),
             children: vec![child("first", 0.0, 0.0, 20.0), child("overlay", 60.0, 48.0, 30.0), child("second", 0.0, 0.0, 20.0)],
         };
         let bounds = resolve_children(

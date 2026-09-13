@@ -803,6 +803,7 @@ mod tests {
                 enter_transition: None,
                 world_depth: None,
                 world_scale: None,
+                clip_shape: neon_ui_schema::UiClipShape::default(),
                 children: Vec::new(),
             },
             effects: Vec::new(),
@@ -920,6 +921,7 @@ mod tests {
                 enter_transition: None,
                 world_depth: None,
                 world_scale: None,
+                clip_shape: neon_ui_schema::UiClipShape::default(),
                 children: Vec::new(),
             }
         }

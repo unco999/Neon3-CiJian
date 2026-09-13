@@ -1,69 +1,81 @@
-# Neon3 Animation Showcase - 动效综合测试案例
-# 验证: 状态机动画 + bounds/opacity/color/position 插值 + 嵌套层次 + 多状态循环
+# Neon3 Animation Showcase - 带语义按钮的动画大全案例
+#
+# 这是一个可直接提交给 neon-ui-runtime 的声明式案例。按钮只发出稳定的
+# semantic intent；每个 presentation machine 在 UI runtime 内选择状态和
+# motion，WGPU runtime 只接收更新后的 visual target 并按统一时钟采样。
+# 覆盖：enter/transition、bounds、opacity、颜色、位置、border/radius、
+# delay、嵌套子树、多状态循环，以及快速 retarget 的真实交互入口。
 
 # === Motion 定义 ===
-motion expand duration 300 easing ease_out
-motion collapse duration 200 easing ease_in
-motion fade-in duration 400 easing ease_out
-motion fade-out duration 250 easing ease_in
-motion slide duration 350 easing ease_in_out
-motion pulse duration 200 easing ease_out
-motion color-shift duration 300 easing ease_in_out
+motion expand duration 320 easing ease_out from bounds 420 40 120 72 opacity 0.55
+motion collapse duration 220 easing ease_in
+motion fade-in duration 420 easing ease_out delay 40 from opacity 0
+motion fade-out duration 260 easing ease_in
+motion slide duration 360 easing ease_in_out from bounds 300 520 180 120
+motion color-shift duration 340 easing ease_in_out from fill #17324A border_width 1
+motion edge-glow duration 420 easing ease_out from border_width 1 corner_radius 4
+motion delayed-reveal duration 520 easing ease_out delay 90 from bounds 840 760 80 40 opacity 0
 
-# === 状态机 1: 面板展开/收起 (bounds 动画) ===
+# === 状态机 A：面板展开/收起（bounds + opacity） ===
 machine panel-a initial compact
 state panel-a expanded
-on panel-a anim.a.toggle -> expanded
+on panel-a anim.a.toggle from compact -> expanded
+on panel-a anim.a.toggle from expanded -> compact
 on panel-a anim.a.collapse -> compact
 transition panel-a compact -> expanded motion expand
 transition panel-a expanded -> compact motion collapse
 style panel-a.compact.anim-panel-a x 420 y 40 w 200 h 120
 style panel-a.expanded.anim-panel-a x 420 y 40 w 400 h 200
 
-# === 状态机 2: 淡入淡出 (opacity 动画) ===
+# === 状态机 B：淡入淡出（opacity + descendant fade） ===
 machine panel-b initial visible
 state panel-b hidden
-on panel-b anim.b.toggle -> hidden
+on panel-b anim.b.toggle from visible -> hidden
+on panel-b anim.b.toggle from hidden -> visible
 on panel-b anim.b.show -> visible
 transition panel-b visible -> hidden motion fade-out
 transition panel-b hidden -> visible motion fade-in
 style panel-b.visible.anim-panel-b opacity 1.0
 style panel-b.hidden.anim-panel-b opacity 0.0
 
-# === 状态机 3: 颜色变换 (background_color 动画) ===
+# === 状态机 C：颜色变换（background + border） ===
 machine panel-c initial normal
 state panel-c warning
 state panel-c error
-on panel-c anim.c.next -> warning
+on panel-c anim.c.next from normal -> warning
+on panel-c anim.c.next from warning -> error
+on panel-c anim.c.next from error -> normal
+on panel-c anim.c.normal -> normal
 on panel-c anim.c.warn -> warning
 on panel-c anim.c.error -> error
-on panel-c anim.c.normal -> normal
 transition panel-c normal -> warning motion color-shift
 transition panel-c warning -> error motion color-shift
 transition panel-c error -> normal motion color-shift
-style panel-c.normal.anim-panel-c fill #2D6A4F
-style panel-c.warning.anim-panel-c fill #E76F51
-style panel-c.error.anim-panel-c fill #D62828
+style panel-c.normal.anim-panel-c fill #2D6A4F line #8AE6B8 border_width 1 corner_radius 8
+style panel-c.warning.anim-panel-c fill #E76F51 line #FFD166 border_width 4 corner_radius 18
+style panel-c.error.anim-panel-c fill #D62828 line #FFB4A2 border_width 8 corner_radius 28
 
-# === 状态机 4: 滑动位置 (position 动画) ===
+# === 状态机 D：滑动位置（x/y bounds） ===
 machine panel-d initial left
 state panel-d right
-on panel-d anim.d.toggle -> right
+on panel-d anim.d.toggle from left -> right
+on panel-d anim.d.toggle from right -> left
 on panel-d anim.d.left -> left
 transition panel-d left -> right motion slide
 transition panel-d right -> left motion slide
-style panel-d.left.anim-panel-d x 420 y 520
-style panel-d.right.anim-panel-d x 700 y 520
+style panel-d.left.anim-panel-d x 420 y 520 w 180 h 100
+style panel-d.right.anim-panel-d x 700 y 520 w 180 h 100
 
-# === 状态机 5: 嵌套层次动画 (父面板 + 子元素同时变化) ===
+# === 状态机 E：嵌套层次动画（父/子节点同一 semantic transition） ===
 machine panel-e initial collapsed
 state panel-e expanded
-on panel-e anim.e.toggle -> expanded
+on panel-e anim.e.toggle from collapsed -> expanded
+on panel-e anim.e.toggle from expanded -> collapsed
 on panel-e anim.e.collapse -> collapsed
 transition panel-e collapsed -> expanded motion expand
 transition panel-e expanded -> collapsed motion collapse
-style panel-e.collapsed.anim-panel-e x 420 y 680 w 200 h 80
-style panel-e.expanded.anim-panel-e x 420 y 680 w 380 h 200
+style panel-e.collapsed.anim-panel-e x 420 y 660 w 200 h 100
+style panel-e.expanded.anim-panel-e x 420 y 660 w 380 h 200
 style panel-e.collapsed.child-a x 430 y 690 w 80 h 30
 style panel-e.expanded.child-a x 430 y 690 w 160 h 40
 style panel-e.collapsed.child-b x 520 y 690 w 80 h 30
@@ -71,14 +83,16 @@ style panel-e.expanded.child-b x 600 y 690 w 160 h 40
 style panel-e.collapsed.child-c x 430 y 730 w 170 h 20 opacity 0.0
 style panel-e.expanded.child-c x 430 y 750 w 340 h 80 opacity 1.0
 
-# === 状态机 6: 多状态循环 (3状态 + 不同bounds/color) ===
+# === 状态机 F：多状态循环（small/medium/large） ===
 machine panel-f initial small
 state panel-f medium
 state panel-f large
-on panel-f anim.f.next -> medium
+on panel-f anim.f.next from small -> medium
+on panel-f anim.f.next from medium -> large
+on panel-f anim.f.next from large -> small
+on panel-f anim.f.small -> small
 on panel-f anim.f.medium -> medium
 on panel-f anim.f.large -> large
-on panel-f anim.f.small -> small
 transition panel-f small -> medium motion expand
 transition panel-f medium -> large motion expand
 transition panel-f large -> small motion collapse
@@ -86,85 +100,109 @@ style panel-f.small.anim-panel-f x 820 y 40 w 120 h 120 fill #1D3557
 style panel-f.medium.anim-panel-f x 820 y 40 w 200 h 200 fill #457B9D
 style panel-f.large.anim-panel-f x 820 y 40 w 300 h 300 fill #A8DADC
 
+# === 状态机 G：边框/圆角曲线 ===
+machine panel-g initial quiet
+state panel-g emphasized
+on panel-g anim.g.toggle from quiet -> emphasized
+on panel-g anim.g.toggle from emphasized -> quiet
+transition panel-g quiet -> emphasized motion edge-glow
+transition panel-g emphasized -> quiet motion edge-glow
+style panel-g.quiet.anim-panel-g x 1040 y 400 w 140 h 92 fill #263238 line #405A64 border_width 1 corner_radius 4
+style panel-g.emphasized.anim-panel-g x 1040 y 400 w 140 h 92 fill #143D59 line #80ED99 border_width 10 corner_radius 32
+
+# === 状态机 H：延迟入场/退出（delay + retarget） ===
+machine panel-h initial hidden
+state panel-h shown
+on panel-h anim.h.toggle from hidden -> shown
+on panel-h anim.h.toggle from shown -> hidden
+transition panel-h hidden -> shown motion delayed-reveal
+transition panel-h shown -> hidden motion fade-out
+style panel-h.hidden.anim-panel-h x 840 y 760 w 220 h 90 opacity 0.0
+style panel-h.shown.anim-panel-h x 840 y 760 w 260 h 110 opacity 1.0
+
 # === 主界面 ===
-surface anim-showcase overlay w 1200 h 900 align stretch fill #0D1117
+surface anim-showcase overlay w 1200 h 900 fill #0D1117
 
-  # 空白点击捕获层
-  panel click-capture x 0 y 0 w 1200 h 900 fill #00000000 event ui.click_blank
+  panel control-panel x 20 y 20 w 370 h 860 fill #161B22 radius 8 column pad 16 gap 10
+    text title w 330 h 28 value "Neon3 Animation Showcase"
+    text subtitle w 330 h 18 value "UI Runtime Statechart + WGPU Sampler"
 
-  # 左侧控制面板
-  panel control-panel x 20 y 20 w 380 h 860 fill #161B22 radius 8 column pad 16 gap 10
-
-    text title h 28 value "Animation Showcase"
-    text subtitle h 18 value "状态机动效综合测试"
-
-    text section-a h 22 value "A: 展开/收起 (bounds)"
+    text section-a h 22 value "A  Bounds / Expand"
     panel row-a row gap 8 h 36
-      button btn-a-toggle w 140 h 32 value "Toggle A" event anim.a.toggle
-      button btn-a-collapse w 140 h 32 value "Collapse" event anim.a.collapse
+      button btn-a-toggle w 150 h 32 fill #1D5660 line #56DDE0 radius 4 value "Toggle A" event anim.a.toggle
+      button btn-a-collapse w 150 h 32 fill #263B4A line #5B7080 radius 4 value "Collapse" event anim.a.collapse
 
-    text section-b h 22 value "B: 淡入淡出 (opacity)"
+    text section-b h 22 value "B  Opacity / Fade"
     panel row-b row gap 8 h 36
-      button btn-b-toggle w 140 h 32 value "Toggle B" event anim.b.toggle
-      button btn-b-show w 140 h 32 value "Show" event anim.b.show
+      button btn-b-toggle w 150 h 32 fill #5B2A86 line #C77DFF radius 4 value "Toggle B" event anim.b.toggle
+      button btn-b-show w 150 h 32 fill #263B4A line #5B7080 radius 4 value "Show" event anim.b.show
 
-    text section-c h 22 value "C: 颜色变换 (fill)"
+    text section-c h 22 value "C  Color / Border"
     panel row-c row gap 8 h 36
-      button btn-c-normal w 100 h 32 value "Normal" event anim.c.normal
-      button btn-c-warn w 100 h 32 value "Warning" event anim.c.warn
-      button btn-c-error w 100 h 32 value "Error" event anim.c.error
+      button btn-c-normal w 96 h 32 fill #275B45 line #8AE6B8 radius 4 value "Normal" event anim.c.normal
+      button btn-c-warn w 96 h 32 fill #9D4D3A line #FFD166 radius 4 value "Warning" event anim.c.warn
+      button btn-c-error w 96 h 32 fill #8B2525 line #FFB4A2 radius 4 value "Error" event anim.c.error
 
-    text section-d h 22 value "D: 滑动位置 (position)"
+    text section-d h 22 value "D  Position / Slide"
     panel row-d row gap 8 h 36
-      button btn-d-toggle w 140 h 32 value "Toggle D" event anim.d.toggle
-      button btn-d-left w 140 h 32 value "Left" event anim.d.left
+      button btn-d-toggle w 150 h 32 fill #9D4D3A line #FFB38A radius 4 value "Toggle D" event anim.d.toggle
+      button btn-d-left w 150 h 32 fill #263B4A line #5B7080 radius 4 value "Left" event anim.d.left
 
-    text section-e h 22 value "E: 嵌套层次动画"
+    text section-e h 22 value "E  Nested Subtree"
     panel row-e row gap 8 h 36
-      button btn-e-toggle w 140 h 32 value "Toggle E" event anim.e.toggle
-      button btn-e-collapse w 140 h 32 value "Collapse" event anim.e.collapse
+      button btn-e-toggle w 150 h 32 fill #244D7A line #76A9E0 radius 4 value "Toggle E" event anim.e.toggle
+      button btn-e-collapse w 150 h 32 fill #263B4A line #5B7080 radius 4 value "Collapse" event anim.e.collapse
 
-    text section-f h 22 value "F: 多状态循环"
+    text section-f h 22 value "F  Three-State Cycle"
     panel row-f row gap 8 h 36
-      button btn-f-small w 100 h 32 value "Small" event anim.f.small
-      button btn-f-medium w 100 h 32 value "Medium" event anim.f.medium
-      button btn-f-large w 100 h 32 value "Large" event anim.f.large
+      button btn-f-next w 150 h 32 fill #244D7A line #76A9E0 radius 4 value "Next F" event anim.f.next
+      button btn-f-large w 150 h 32 fill #457B9D line #A8DADC radius 4 value "Large" event anim.f.large
 
-    text hint h 16 value "点击按钮触发对应状态转换动画"
+    text section-g h 22 value "G  Border / Radius"
+    panel row-g row gap 8 h 36
+      button btn-g-toggle w 150 h 32 fill #174B3B line #80ED99 radius 4 value "Toggle G" event anim.g.toggle
+      button btn-g-quiet w 150 h 32 fill #263B4A line #5B7080 radius 4 value "Quiet" event anim.g.toggle
+
+    text section-h h 22 value "H  Delay / Re-target"
+    panel row-h row gap 8 h 36
+      button btn-h-toggle w 150 h 32 fill #5E2A84 line #D0A2F7 radius 4 value "Toggle H" event anim.h.toggle
+      button btn-h-again w 150 h 32 fill #263B4A line #5B7080 radius 4 value "Retarget" event anim.h.toggle
+
+    text hint w 330 h 16 value "Buttons emit intents; no probe-side style if/else."
 
   # === 右侧动画展示区 ===
+  panel anim-panel-a x 420 y 40 w 200 h 120 fill #2D6A4F radius 8 transition expand
+    text label-a h 20 value "A: Bounds"
 
-  # 面板A: 展开/收起
-  panel anim-panel-a x 420 y 40 w 200 h 120 fill #2D6A4F radius 8
-    text label-a h 20 value "Panel A: Expand"
+  panel anim-panel-b x 420 y 240 w 200 h 100 fill #7B2CBF radius 8 transition fade-in
+    text label-b h 20 value "B: Opacity"
 
-  # 面板B: 淡入淡出
-  panel anim-panel-b x 420 y 260 w 200 h 120 fill #7B2CBF radius 8
-    text label-b h 20 value "Panel B: Fade"
+  panel anim-panel-c x 420 y 380 w 200 h 100 fill #2D6A4F radius 8 transition color-shift
+    text label-c h 20 value "C: Color + Border"
 
-  # 面板C: 颜色变换
-  panel anim-panel-c x 420 y 400 w 200 h 100 fill #2D6A4F radius 8
-    text label-c h 20 value "Panel C: Color"
+  panel anim-panel-d x 420 y 520 w 180 h 100 fill #E76F51 radius 8 transition slide
+    text label-d h 20 value "D: Slide"
 
-  # 面板D: 滑动位置
-  panel anim-panel-d x 420 y 520 w 180 h 120 fill #E76F51 radius 8
-    text label-d h 20 value "Panel D: Slide"
-
-  # 面板E: 嵌套层次动画
-  panel anim-panel-e x 420 y 680 w 200 h 80 fill #1D3557 radius 8
+  panel anim-panel-e x 420 y 660 w 200 h 100 fill #1D3557 radius 8 transition expand
     panel child-a x 430 y 690 w 80 h 30 fill #457B9D radius 4
     panel child-b x 520 y 690 w 80 h 30 fill #A8DADC radius 4
-    panel child-c x 430 y 730 w 170 h 20 fill #F1FAEE opacity 0.0 radius 4
+    panel child-c x 430 y 710 w 170 h 20 fill #F1FAEE opacity 0.0 radius 4
       text child-c-text h 16 value "Nested child appears"
 
-  # 面板F: 多状态循环
-  panel anim-panel-f x 820 y 40 w 120 h 120 fill #1D3557 radius 8
-    text label-f h 20 value "Panel F: Cycle"
+  panel anim-panel-f x 820 y 40 w 120 h 120 fill #1D3557 radius 8 transition expand
+    text label-f h 20 value "F: Cycle"
 
-  # 标签说明
-  text tag-a x 420 y 165 h 16 value "A: bounds 插值"
-  text tag-b x 420 y 385 h 16 value "B: opacity 插值"
-  text tag-c x 420 y 505 h 16 value "C: background_color 插值"
-  text tag-d x 420 y 645 h 16 value "D: position 插值"
-  text tag-e x 420 y 765 h 16 value "E: 嵌套子元素同步动画"
-  text tag-f x 820 y 165 h 16 value "F: 3状态循环"
+  panel anim-panel-g x 1040 y 400 w 140 h 92 fill #263238 line #405A64 border_width 1 radius 4 transition edge-glow
+    text label-g h 20 value "G: Edge"
+
+  panel anim-panel-h x 840 y 760 w 220 h 90 fill #5E2A84 radius 8 opacity 0.0 transition delayed-reveal
+    text label-h h 20 value "H: Delayed"
+
+  text tag-a x 420 y 165 w 350 h 16 value "A: bounds + retarget"
+  text tag-b x 420 y 350 w 350 h 16 value "B: opacity + descendants"
+  text tag-c x 420 y 490 w 350 h 16 value "C: RGBA/border/radius"
+  text tag-d x 420 y 630 w 350 h 16 value "D: position bounds"
+  text tag-e x 420 y 785 w 350 h 16 value "E: parent + child tracks"
+  text tag-f x 820 y 165 w 300 h 16 value "F: 3-state cycle"
+  text tag-g x 1040 y 505 w 220 h 16 value "G: delayed edge curve"
+  text tag-h x 840 y 875 w 350 h 16 value "H: delay + rapid retarget"
