@@ -17,7 +17,7 @@ use neon_protocol::{
     ServiceName,
 };
 use neon_ui_schema::{
-    UiBounds, UiCanvasData, UiCanvasLine, UiCanvasPoint, UiCommand, UiFragment, UiFragmentId,
+    UiBounds, UiCanvasData, UiCanvasLine, UiCanvasPoint, UiClipShape, UiCommand, UiFragment, UiFragmentId,
     UiFragmentSubmission, UiNode, UiNodeId, UiNodeKind, UiStyle,
 };
 use serde_json::json;
@@ -86,6 +86,7 @@ fn canvas_fragment() -> UiFragment {
             enter_transition: None,
             world_depth: None,
             world_scale: None,
+            clip_shape: UiClipShape::default(),
             children: Vec::new(),
         },
         effects: vec![neon_ui_schema::UiEffect::CanvasData {

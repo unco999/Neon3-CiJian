@@ -41,7 +41,7 @@ use neon_ui_runtime::{
 #[cfg(test)]
 use neon_ui_schema::UiFragmentSubmission;
 use neon_ui_schema::{
-    TextRef, UiBounds, UiCommand, UiDataGridWindowRequest, UiFragment, UiFragmentId, UiHostInbound,
+    TextRef, UiBounds, UiClipShape, UiCommand, UiDataGridWindowRequest, UiFragment, UiFragmentId, UiHostInbound,
     UiNode, UiNodeId, UiNodeKind, UiPointerEvent, UiPointerEventType, UiProgramRevision,
     UiSemanticEvent, UiSemanticEventType, UiSemanticPayloadValue, UiStyle, UiTransition,
     UiTransitionState, UiWindowRequest,
@@ -7113,6 +7113,7 @@ fn world_ui_lab_fragment() -> HashMap<UiFragmentId, UiFragment> {
         enter_transition: None,
         world_depth: None,
         world_scale: None,
+        clip_shape: UiClipShape::default(),
         children: Vec::new(),
     };
     let root = UiNode {
@@ -7141,6 +7142,7 @@ fn world_ui_lab_fragment() -> HashMap<UiFragmentId, UiFragment> {
         enter_transition: None,
         world_depth: None,
         world_scale: None,
+        clip_shape: UiClipShape::default(),
         children: vec![
             label(
                 "callsign",
@@ -10713,6 +10715,7 @@ impl WindowedRuntime {
             }),
             world_depth: None,
             world_scale: None,
+            clip_shape: UiClipShape::default(),
             children: vec![
                 UiNode {
                     node_id: neon_ui_schema::UiNodeId("demo-title".into()),
@@ -10749,6 +10752,7 @@ impl WindowedRuntime {
                     }),
                     world_depth: None,
                     world_scale: None,
+                    clip_shape: UiClipShape::default(),
                     children: Vec::new(),
                 },
                 UiNode {
@@ -10792,6 +10796,7 @@ impl WindowedRuntime {
                     }),
                     world_depth: None,
                     world_scale: None,
+                    clip_shape: UiClipShape::default(),
                     children: Vec::new(),
                 },
             ],

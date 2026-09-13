@@ -244,7 +244,7 @@ surface showcase overlay w 1200 h 1000 align stretch fill #0D1117
     progress_bar progress-demo skin progress-style h 16 numeric $progress_val
 
     # Scrollbar with skin (vertical)
-    scrollbar scroll-demo skin scrollbar-style x 320 y 200 w 16 h 120 scroll $scroll_pos
+    scrollbar scroll-demo skin scrollbar-style x 320 y 200 w 16 h 120 scroll $scroll_pos event demo.scroll.change
 
     # Checkbox with skin
     checkbox check-demo skin checkbox-style h 24 checked $checkbox_state value "Skinned Checkbox" event demo.check.toggle
@@ -288,9 +288,9 @@ surface showcase overlay w 1200 h 1000 align stretch fill #0D1117
 
     text skin-scroll-label h 20 value "Scrollbar:"
     panel skin-scroll-row w 328 h 64 column gap 6
-      scrollbar skin-scroll-def skin scrollbar-style w 300 h 14 scroll $scroll_pos
-      scrollbar skin-scroll-fat skin scrollbar-fat w 300 h 20 scroll $scroll_pos
-      scrollbar skin-scroll-dark skin scrollbar-dark w 300 h 10 scroll $scroll_pos
+      scrollbar skin-scroll-def skin scrollbar-style w 300 h 14 scroll $scroll_pos event demo.scroll.change
+      scrollbar skin-scroll-fat skin scrollbar-fat w 300 h 20 scroll $scroll_pos event demo.scroll.change
+      scrollbar skin-scroll-dark skin scrollbar-dark w 300 h 10 scroll $scroll_pos event demo.scroll.change
 
     text skin-radio-label h 20 value "RadioButton:"
     panel skin-radio-row w 328 h 36 row gap 12 align center
@@ -323,7 +323,7 @@ surface showcase overlay w 1200 h 1000 align stretch fill #0D1117
     button scroll-down h 28 value "Scroll Down" event demo.scroll.down
 
   # 右侧面板 - 新组件展示
-  panel right-panel skin panel-style x 800 y 20 w 380 h 960 column pad 16 gap 12 align stretch context_menu demo-context
+  panel right-panel skin panel-style x 800 y 20 w 380 h 960 column pad 16 gap 12 align stretch scrollable context_menu demo-context
 
     text right-title h 28 value "New Components"
     text right-sub h 24 value "Splitter / ContextMenu / TreeView"
@@ -355,6 +355,31 @@ surface showcase overlay w 1200 h 1000 align stretch fill #0D1117
       text tree-crate-4 x 40 y 120 w 292 h 24 value "neon-wgpu-runtime" event demo.tree.wgpu
       text tree-docs x 24 y 148 w 308 h 24 value "▶ docs/" event demo.tree.docs
       text tree-cases x 24 y 176 w 308 h 24 value "▶ cases/" event demo.tree.cases
+
+    # Clip Shapes — 全面裁剪测试（圆形/椭圆/矩形/圆角/嵌套/继承）
+    divider clip-divider w 344 h 2
+    text clip-label h 20 value "Clip Shapes — all variants"
+    text clip-r1-label h 14 value "circle / ellipse / bounds overflow"
+    panel clip-row1 w 344 h 80 row gap 10 align center
+      panel clip-circle w 70 h 70 fill #1F6FEB clip_shape circle
+        text cc-t x 0 y 25 w 70 h 20 value "CIRCLE"
+      panel clip-ellipse w 90 h 50 fill #238636 clip_shape ellipse
+        text ce-t x 0 y 15 w 90 h 20 value "ELLIPSE"
+      panel clip-bounds w 80 h 70 fill #DA3633 clip bounds
+        text cb-t1 x 4 y 8 w 120 h 18 value "BOUNDS"
+        text cb-t2 x 4 y 32 w 120 h 18 value "overflow text here"
+    text clip-r2-label h 14 value "rounded / nested / inheritance"
+    panel clip-row2 w 344 h 80 row gap 10 align center
+      panel clip-rounded w 80 h 70 fill #8957E5 radius 12 clip rounded
+        text cr-t x 4 y 6 w 100 h 18 value "ROUNDED"
+        panel cr-inner x 4 y 30 w 100 h 32 fill #FFFFFF33
+      panel clip-nested w 80 h 70 fill #DB6D28 radius 14 clip rounded
+        text cn-t x 4 y 6 w 72 h 18 value "Nested"
+        panel cn-inner x 4 y 28 w 72 h 36 fill #FFFFFF22
+          text cn-it x 2 y 8 w 68 h 18 value "inner"
+      panel clip-inherit w 70 h 70 fill #1F6FEB clip_shape circle
+        panel ci-inner x 8 y 8 w 54 h 54 fill #FFFFFF44
+          text ci-it x 0 y 17 w 54 h 18 value "INHERIT"
 
     # === 新增组件测试区 ===
     divider new-comp-divider w 344 h 2

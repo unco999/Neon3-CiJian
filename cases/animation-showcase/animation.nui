@@ -1,0 +1,170 @@
+# Neon3 Animation Showcase - 动效综合测试案例
+# 验证: 状态机动画 + bounds/opacity/color/position 插值 + 嵌套层次 + 多状态循环
+
+# === Motion 定义 ===
+motion expand duration 300 easing ease_out
+motion collapse duration 200 easing ease_in
+motion fade-in duration 400 easing ease_out
+motion fade-out duration 250 easing ease_in
+motion slide duration 350 easing ease_in_out
+motion pulse duration 200 easing ease_out
+motion color-shift duration 300 easing ease_in_out
+
+# === 状态机 1: 面板展开/收起 (bounds 动画) ===
+machine panel-a initial compact
+state panel-a expanded
+on panel-a anim.a.toggle -> expanded
+on panel-a anim.a.collapse -> compact
+transition panel-a compact -> expanded motion expand
+transition panel-a expanded -> compact motion collapse
+style panel-a.compact.anim-panel-a x 420 y 40 w 200 h 120
+style panel-a.expanded.anim-panel-a x 420 y 40 w 400 h 200
+
+# === 状态机 2: 淡入淡出 (opacity 动画) ===
+machine panel-b initial visible
+state panel-b hidden
+on panel-b anim.b.toggle -> hidden
+on panel-b anim.b.show -> visible
+transition panel-b visible -> hidden motion fade-out
+transition panel-b hidden -> visible motion fade-in
+style panel-b.visible.anim-panel-b opacity 1.0
+style panel-b.hidden.anim-panel-b opacity 0.0
+
+# === 状态机 3: 颜色变换 (background_color 动画) ===
+machine panel-c initial normal
+state panel-c warning
+state panel-c error
+on panel-c anim.c.next -> warning
+on panel-c anim.c.warn -> warning
+on panel-c anim.c.error -> error
+on panel-c anim.c.normal -> normal
+transition panel-c normal -> warning motion color-shift
+transition panel-c warning -> error motion color-shift
+transition panel-c error -> normal motion color-shift
+style panel-c.normal.anim-panel-c fill #2D6A4F
+style panel-c.warning.anim-panel-c fill #E76F51
+style panel-c.error.anim-panel-c fill #D62828
+
+# === 状态机 4: 滑动位置 (position 动画) ===
+machine panel-d initial left
+state panel-d right
+on panel-d anim.d.toggle -> right
+on panel-d anim.d.left -> left
+transition panel-d left -> right motion slide
+transition panel-d right -> left motion slide
+style panel-d.left.anim-panel-d x 420 y 520
+style panel-d.right.anim-panel-d x 700 y 520
+
+# === 状态机 5: 嵌套层次动画 (父面板 + 子元素同时变化) ===
+machine panel-e initial collapsed
+state panel-e expanded
+on panel-e anim.e.toggle -> expanded
+on panel-e anim.e.collapse -> collapsed
+transition panel-e collapsed -> expanded motion expand
+transition panel-e expanded -> collapsed motion collapse
+style panel-e.collapsed.anim-panel-e x 420 y 680 w 200 h 80
+style panel-e.expanded.anim-panel-e x 420 y 680 w 380 h 200
+style panel-e.collapsed.child-a x 430 y 690 w 80 h 30
+style panel-e.expanded.child-a x 430 y 690 w 160 h 40
+style panel-e.collapsed.child-b x 520 y 690 w 80 h 30
+style panel-e.expanded.child-b x 600 y 690 w 160 h 40
+style panel-e.collapsed.child-c x 430 y 730 w 170 h 20 opacity 0.0
+style panel-e.expanded.child-c x 430 y 750 w 340 h 80 opacity 1.0
+
+# === 状态机 6: 多状态循环 (3状态 + 不同bounds/color) ===
+machine panel-f initial small
+state panel-f medium
+state panel-f large
+on panel-f anim.f.next -> medium
+on panel-f anim.f.medium -> medium
+on panel-f anim.f.large -> large
+on panel-f anim.f.small -> small
+transition panel-f small -> medium motion expand
+transition panel-f medium -> large motion expand
+transition panel-f large -> small motion collapse
+style panel-f.small.anim-panel-f x 820 y 40 w 120 h 120 fill #1D3557
+style panel-f.medium.anim-panel-f x 820 y 40 w 200 h 200 fill #457B9D
+style panel-f.large.anim-panel-f x 820 y 40 w 300 h 300 fill #A8DADC
+
+# === 主界面 ===
+surface anim-showcase overlay w 1200 h 900 align stretch fill #0D1117
+
+  # 空白点击捕获层
+  panel click-capture x 0 y 0 w 1200 h 900 fill #00000000 event ui.click_blank
+
+  # 左侧控制面板
+  panel control-panel x 20 y 20 w 380 h 860 fill #161B22 radius 8 column pad 16 gap 10
+
+    text title h 28 value "Animation Showcase"
+    text subtitle h 18 value "状态机动效综合测试"
+
+    text section-a h 22 value "A: 展开/收起 (bounds)"
+    panel row-a row gap 8 h 36
+      button btn-a-toggle w 140 h 32 value "Toggle A" event anim.a.toggle
+      button btn-a-collapse w 140 h 32 value "Collapse" event anim.a.collapse
+
+    text section-b h 22 value "B: 淡入淡出 (opacity)"
+    panel row-b row gap 8 h 36
+      button btn-b-toggle w 140 h 32 value "Toggle B" event anim.b.toggle
+      button btn-b-show w 140 h 32 value "Show" event anim.b.show
+
+    text section-c h 22 value "C: 颜色变换 (fill)"
+    panel row-c row gap 8 h 36
+      button btn-c-normal w 100 h 32 value "Normal" event anim.c.normal
+      button btn-c-warn w 100 h 32 value "Warning" event anim.c.warn
+      button btn-c-error w 100 h 32 value "Error" event anim.c.error
+
+    text section-d h 22 value "D: 滑动位置 (position)"
+    panel row-d row gap 8 h 36
+      button btn-d-toggle w 140 h 32 value "Toggle D" event anim.d.toggle
+      button btn-d-left w 140 h 32 value "Left" event anim.d.left
+
+    text section-e h 22 value "E: 嵌套层次动画"
+    panel row-e row gap 8 h 36
+      button btn-e-toggle w 140 h 32 value "Toggle E" event anim.e.toggle
+      button btn-e-collapse w 140 h 32 value "Collapse" event anim.e.collapse
+
+    text section-f h 22 value "F: 多状态循环"
+    panel row-f row gap 8 h 36
+      button btn-f-small w 100 h 32 value "Small" event anim.f.small
+      button btn-f-medium w 100 h 32 value "Medium" event anim.f.medium
+      button btn-f-large w 100 h 32 value "Large" event anim.f.large
+
+    text hint h 16 value "点击按钮触发对应状态转换动画"
+
+  # === 右侧动画展示区 ===
+
+  # 面板A: 展开/收起
+  panel anim-panel-a x 420 y 40 w 200 h 120 fill #2D6A4F radius 8
+    text label-a h 20 value "Panel A: Expand"
+
+  # 面板B: 淡入淡出
+  panel anim-panel-b x 420 y 260 w 200 h 120 fill #7B2CBF radius 8
+    text label-b h 20 value "Panel B: Fade"
+
+  # 面板C: 颜色变换
+  panel anim-panel-c x 420 y 400 w 200 h 100 fill #2D6A4F radius 8
+    text label-c h 20 value "Panel C: Color"
+
+  # 面板D: 滑动位置
+  panel anim-panel-d x 420 y 520 w 180 h 120 fill #E76F51 radius 8
+    text label-d h 20 value "Panel D: Slide"
+
+  # 面板E: 嵌套层次动画
+  panel anim-panel-e x 420 y 680 w 200 h 80 fill #1D3557 radius 8
+    panel child-a x 430 y 690 w 80 h 30 fill #457B9D radius 4
+    panel child-b x 520 y 690 w 80 h 30 fill #A8DADC radius 4
+    panel child-c x 430 y 730 w 170 h 20 fill #F1FAEE opacity 0.0 radius 4
+      text child-c-text h 16 value "Nested child appears"
+
+  # 面板F: 多状态循环
+  panel anim-panel-f x 820 y 40 w 120 h 120 fill #1D3557 radius 8
+    text label-f h 20 value "Panel F: Cycle"
+
+  # 标签说明
+  text tag-a x 420 y 165 h 16 value "A: bounds 插值"
+  text tag-b x 420 y 385 h 16 value "B: opacity 插值"
+  text tag-c x 420 y 505 h 16 value "C: background_color 插值"
+  text tag-d x 420 y 645 h 16 value "D: position 插值"
+  text tag-e x 420 y 765 h 16 value "E: 嵌套子元素同步动画"
+  text tag-f x 820 y 165 h 16 value "F: 3状态循环"

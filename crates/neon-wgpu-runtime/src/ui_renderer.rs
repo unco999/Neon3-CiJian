@@ -8,7 +8,7 @@ use std::time::Instant;
 use bytemuck::{Pod, Zeroable};
 use neon_protocol::{AssetBytes, AssetRef, UiImageSource, UiImageTextureRef, UiImageTextureRegion};
 use neon_ui_schema::{
-    RenderSurfaceRef, TextRef, UiAlignItems, UiBounds, UiClipPolicy, UiControlPresentation,
+    RenderSurfaceRef, TextRef, UiAlignItems, UiBounds, UiClipPolicy, UiClipShape, UiControlPresentation,
     UiDataGridCellTarget, UiDataGridWindowRequest, UiDragAxis, UiDragBinding, UiDragBoundary,
     UiDropPlacement, UiEasing, UiFragment, UiFragmentRevision, UiImageFit, UiIntent, UiJustifyContent,
     UiLayout, UiLayoutMode, UiNode, UiNodeKind, UiSemanticPayloadValue, UiStyle,
@@ -74,6 +74,65 @@ fn outside_clip(pixel: vec2<f32>, clip: vec4<f32>, radius: f32) -> bool {
     return length(max(abs(point) - extent, vec2<f32>(0.0))) > r;
 }
 
+fn outside_clip_shape(pixel: vec2<f32>, clip: vec4<f32>, radius: f32, shape: f32) -> bool {
+    if (pixel.x < clip.x || pixel.y < clip.y || pixel.x > clip.z || pixel.y > clip.w) { return true; }
+    if (shape < 0.5) {
+        if (radius <= 0.0) { return false; }
+        let size = clip.zw - clip.xy; let r = min(radius, min(size.x, size.y) * 0.5);
+        let point = pixel - (clip.xy + size * 0.5); let extent = max(size * 0.5 - vec2<f32>(r), vec2<f32>(0.0));
+        return length(max(abs(point) - extent, vec2<f32>(0.0))) > r;
+    }
+    let center = (clip.xy + clip.zw) * 0.5;
+    let half = (clip.zw - clip.xy) * 0.5;
+    if (shape < 1.5) {
+        let r = min(half.x, half.y);
+        return distance(pixel, center) > r;
+    }
+    let d = (pixel - center) / max(half, vec2<f32>(0.001));
+    return dot(d, d) > 1.0;
+}
+
+// Signed distance to a rounded rectangle. Positive = outside, negative = inside.
+fn rounded_rect_sdf(pixel: vec2<f32>, clip: vec4<f32>, radius: f32) -> f32 {
+    let size = clip.zw - clip.xy;
+    let r = min(radius, min(size.x, size.y) * 0.5);
+    let center = clip.xy + size * 0.5;
+    let extent = max(size * 0.5 - vec2<f32>(r), vec2<f32>(0.0));
+    let p = abs(pixel - center) - extent;
+    let q = max(p, vec2<f32>(0.0));
+    return length(q) + min(max(p.x, p.y), 0.0) - r;
+}
+
+// Signed distance to a circle inscribed in the clip rect.
+fn circle_sdf(pixel: vec2<f32>, clip: vec4<f32>) -> f32 {
+    let center = (clip.xy + clip.zw) * 0.5;
+    let half = (clip.zw - clip.xy) * 0.5;
+    let r = min(half.x, half.y);
+    return distance(pixel, center) - r;
+}
+
+// Approximate signed distance to an ellipse matching the clip rect.
+fn ellipse_sdf(pixel: vec2<f32>, clip: vec4<f32>) -> f32 {
+    let center = (clip.xy + clip.zw) * 0.5;
+    let half = (clip.zw - clip.xy) * 0.5;
+    let d = (pixel - center) / max(half, vec2<f32>(0.001));
+    return (length(d) - 1.0) * min(half.x, half.y);
+}
+
+// Clip coverage alpha with a 1px anti-aliased edge. 1.0 = fully inside,
+// 0.0 = fully outside. Replaces hard discard for smooth clip edges.
+fn clip_alpha(pixel: vec2<f32>, clip: vec4<f32>, radius: f32, shape: f32) -> f32 {
+    var sdf: f32;
+    if (shape < 0.5) {
+        sdf = rounded_rect_sdf(pixel, clip, radius);
+    } else if (shape < 1.5) {
+        sdf = circle_sdf(pixel, clip);
+    } else {
+        sdf = ellipse_sdf(pixel, clip);
+    }
+    return clamp(0.5 - sdf, 0.0, 1.0);
+}
+
 fn outside_cut(local: vec2<f32>, size: vec2<f32>, cut: vec4<f32>) -> bool {
     // cut = [bl, br, tr, tl] logical pixels removed from each corner.
     let p = local * size;
@@ -103,6 +162,7 @@ struct VsIn {
     @location(9) from_params: vec4<f32>,
     @location(10) animation: vec4<f32>,
     @location(11) cut: vec4<f32>,
+    @location(12) clip_shape: f32,
 }
 
 struct VsOut {
@@ -115,6 +175,7 @@ struct VsOut {
     @location(5) clip: vec4<f32>,
     @location(6) pixel: vec2<f32>,
     @location(7) cut: vec4<f32>,
+    @location(8) @interpolate(flat) clip_shape: f32,
 }
 
 @vertex
@@ -140,12 +201,14 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32, input: VsIn) -> VsOut {
     output.clip = input.clip;
     output.pixel = pixel;
     output.cut = input.cut;
+    output.clip_shape = input.clip_shape;
     return output;
 }
 
 @fragment
 fn fs_main(input: VsOut) -> @location(0) vec4<f32> {
-    if (outside_clip(input.pixel, input.clip, input.params.w)) { discard; }
+    let clip_a = clip_alpha(input.pixel, input.clip, input.params.w, input.clip_shape);
+    if (clip_a <= 0.001) { discard; }
     if (outside_cut(input.local, input.size, input.cut)) { discard; }
     if (input.params.y < 0.0) {
         let cut = min(-input.params.y, input.size.x * 0.25);
@@ -163,7 +226,7 @@ fn fs_main(input: VsOut) -> @location(0) vec4<f32> {
             edge_distance
         );
 let color = mix(input.fill, input.border, border_alpha);
-        let alpha = color.a * input.params.z * shape_alpha;
+        let alpha = color.a * input.params.z * shape_alpha * clip_a;
         // A transparent structural container must not populate the color depth
         // attachment. Otherwise its near depth rejects all visible World UI
         // children while contributing no color itself.
@@ -179,7 +242,7 @@ let color = mix(input.fill, input.border, border_alpha);
     let edge_distance = select(min(extent.x - abs(point.x), extent.y - abs(point.y)), -corner_distance, radius > 0.0);
     let border_alpha = 1.0 - smoothstep(input.params.x - 1.0, input.params.x + 1.0, edge_distance);
     let color = mix(input.fill, input.border, border_alpha);
-    let alpha = color.a * input.params.z * shape_alpha;
+    let alpha = color.a * input.params.z * shape_alpha * clip_a;
     if (alpha <= 0.001) { discard; }
     let glass = liquid_glass(color, input.pixel, input.local);
     return vec4<f32>(select(srgb_to_linear(glass.rgb), glass.rgb, view.color_mode == 1u) * alpha, alpha);
@@ -190,17 +253,17 @@ const HIT_SHADER: &str = r#"
 struct View { viewport: vec2<f32>, color_mode: u32, time_seconds: f32, extras: array<vec4<f32>, 10> }
 @group(0) @binding(0) var<uniform> view: View;
 fn animation_progress(animation: vec4<f32>) -> f32 { if (animation.w == 0.0 || animation.y <= 0.0) { return 1.0; } let t=clamp((view.time_seconds-animation.x)/animation.y,0.0,1.0); if(animation.z==1.0){return t*t;} if(animation.z==2.0){return 1.0-(1.0-t)*(1.0-t);} if(animation.z==3.0){return select(2.0*t*t,1.0-pow(-2.0*t+2.0,2.0)/2.0,t>=0.5);} return t; }
-fn outside_clip(pixel: vec2<f32>, clip: vec4<f32>, radius: f32) -> bool { if (pixel.x < clip.x || pixel.y < clip.y || pixel.x > clip.z || pixel.y > clip.w) { return true; } if (radius <= 0.0) { return false; } let size=clip.zw-clip.xy; let r=min(radius,min(size.x,size.y)*0.5); let point=pixel-(clip.xy+size*0.5); let extent=max(size*0.5-vec2<f32>(r),vec2<f32>(0.0)); return length(max(abs(point)-extent,vec2<f32>(0.0)))>r; }
+fn outside_clip_shape(pixel: vec2<f32>, clip: vec4<f32>, radius: f32, shape: f32) -> bool { if (pixel.x < clip.x || pixel.y < clip.y || pixel.x > clip.z || pixel.y > clip.w) { return true; } if (shape < 0.5) { if (radius <= 0.0) { return false; } let size=clip.zw-clip.xy; let r=min(radius,min(size.x,size.y)*0.5); let point=pixel-(clip.xy+size*0.5); let extent=max(size*0.5-vec2<f32>(r),vec2<f32>(0.0)); return length(max(abs(point)-extent,vec2<f32>(0.0)))>r; } let center=(clip.xy+clip.zw)*0.5; let half=(clip.zw-clip.xy)*0.5; if (shape < 1.5) { let r=min(half.x,half.y); return distance(pixel,center)>r; } let d=(pixel-center)/max(half,vec2<f32>(0.001)); return dot(d,d)>1.0; }
 fn outside_cut(local: vec2<f32>, size: vec2<f32>, cut: vec4<f32>) -> bool { let p = local * size; let bl = min(cut.x, min(size.x, size.y)); let br = min(cut.y, min(size.x, size.y)); let tr = min(cut.z, min(size.x, size.y)); let tl = min(cut.w, min(size.x, size.y)); if (bl > 0.0 && p.x < bl && p.y < bl && p.x + p.y < bl) { return true; } let rx = size.x - p.x; if (br > 0.0 && rx < br && p.y < br && rx + p.y < br) { return true; } let ty = size.y - p.y; if (tr > 0.0 && rx < tr && ty < tr && rx + ty < tr) { return true; } if (tl > 0.0 && p.x < tl && p.y < tl && p.x + p.y < tl) { return true; } return false; }
-struct VsIn { @location(0) rect: vec4<f32>, @location(1) params: vec4<f32>, @location(2) hit_id: u32, @location(3) clip: vec4<f32>, @location(4) cut: vec4<f32> }
-struct VsOut { @builtin(position) position: vec4<f32>, @location(0) local: vec2<f32>, @location(1) size: vec2<f32>, @location(2) params: vec4<f32>, @location(3) @interpolate(flat) hit_id: u32, @location(4) clip: vec4<f32>, @location(5) pixel: vec2<f32>, @location(6) cut: vec4<f32> }
+struct VsIn { @location(0) rect: vec4<f32>, @location(1) params: vec4<f32>, @location(2) hit_id: u32, @location(3) clip: vec4<f32>, @location(4) cut: vec4<f32>, @location(5) clip_shape: f32 }
+struct VsOut { @builtin(position) position: vec4<f32>, @location(0) local: vec2<f32>, @location(1) size: vec2<f32>, @location(2) params: vec4<f32>, @location(3) @interpolate(flat) hit_id: u32, @location(4) clip: vec4<f32>, @location(5) pixel: vec2<f32>, @location(6) cut: vec4<f32>, @location(7) @interpolate(flat) clip_shape: f32 }
 @vertex fn vs_main(@builtin(vertex_index) vertex_index: u32, input: VsIn) -> VsOut {
  var corners = array<vec2<f32>, 6>(vec2<f32>(0.0,0.0),vec2<f32>(1.0,0.0),vec2<f32>(0.0,1.0),vec2<f32>(0.0,1.0),vec2<f32>(1.0,0.0),vec2<f32>(1.0,1.0));
  let local = corners[vertex_index]; let pixel = input.rect.xy + local * input.rect.zw; var output: VsOut;
- output.position = vec4<f32>(pixel.x / view.viewport.x * 2.0 - 1.0, 1.0 - pixel.y / view.viewport.y * 2.0, 0.0, 1.0); output.local = local; output.size = input.rect.zw; output.params = input.params; output.hit_id = input.hit_id; output.clip = input.clip; output.pixel = pixel; output.cut = input.cut; return output;
+ output.position = vec4<f32>(pixel.x / view.viewport.x * 2.0 - 1.0, 1.0 - pixel.y / view.viewport.y * 2.0, 0.0, 1.0); output.local = local; output.size = input.rect.zw; output.params = input.params; output.hit_id = input.hit_id; output.clip = input.clip; output.pixel = pixel; output.cut = input.cut; output.clip_shape = input.clip_shape; return output;
 }
 @fragment fn fs_main(input: VsOut) -> @location(0) u32 {
-   if (outside_clip(input.pixel, input.clip, input.params.w)) { discard; }
+   if (outside_clip_shape(input.pixel, input.clip, input.params.w, input.clip_shape)) { discard; }
   if (outside_cut(input.local, input.size, input.cut)) { discard; }
   if (input.params.y < 0.0) {
    let cut=min(-input.params.y,input.size.x*0.25); let point=input.local*input.size;
@@ -238,15 +301,16 @@ struct ShaderEventBuffer { counter: atomic<u32>, events: array<ShaderEvent> }
 @group(0) @binding(1) var<storage, read_write> shader_events: ShaderEventBuffer;
 fn emit_shader_event(event_id: u32, payload: vec4<f32>) { let slot = atomicAdd(&shader_events.counter, 1u); if (slot < 256u) { shader_events.events[slot].event_id = event_id; shader_events.events[slot].payload = payload; } }
 fn srgb_to_linear(value: vec3<f32>) -> vec3<f32> { let low=value/12.92; let high=pow((value+vec3<f32>(0.055))/1.055,vec3<f32>(2.4)); return select(low,high,value>vec3<f32>(0.04045)); }
-fn outside_clip(pixel: vec2<f32>, clip: vec4<f32>, radius: f32) -> bool { if (pixel.x < clip.x || pixel.y < clip.y || pixel.x > clip.z || pixel.y > clip.w) { return true; } if (radius <= 0.0) { return false; } let size=clip.zw-clip.xy; let r=min(radius,min(size.x,size.y)*0.5); let point=pixel-(clip.xy+size*0.5); let extent=max(size*0.5-vec2<f32>(r),vec2<f32>(0.0)); return length(max(abs(point)-extent,vec2<f32>(0.0)))>r; }
+fn outside_clip_shape(pixel: vec2<f32>, clip: vec4<f32>, radius: f32, shape: f32) -> bool { if (pixel.x < clip.x || pixel.y < clip.y || pixel.x > clip.z || pixel.y > clip.w) { return true; } if (shape < 0.5) { if (radius <= 0.0) { return false; } let size=clip.zw-clip.xy; let r=min(radius,min(size.x,size.y)*0.5); let point=pixel-(clip.xy+size*0.5); let extent=max(size*0.5-vec2<f32>(r),vec2<f32>(0.0)); return length(max(abs(point)-extent,vec2<f32>(0.0)))>r; } let center=(clip.xy+clip.zw)*0.5; let half=(clip.zw-clip.xy)*0.5; if (shape < 1.5) { let r=min(half.x,half.y); return distance(pixel,center)>r; } let d=(pixel-center)/max(half,vec2<f32>(0.001)); return dot(d,d)>1.0; }
+fn clip_alpha(pixel: vec2<f32>, clip: vec4<f32>, radius: f32, shape: f32) -> f32 { var sdf: f32; if (shape < 0.5) { let size=clip.zw-clip.xy; let r=min(radius,min(size.x,size.y)*0.5); let center=clip.xy+size*0.5; let extent=max(size*0.5-vec2<f32>(r),vec2<f32>(0.0)); let p=abs(pixel-center)-extent; let q=max(p,vec2<f32>(0.0)); sdf=length(q)+min(max(p.x,p.y),0.0)-r; } else if (shape < 1.5) { let center=(clip.xy+clip.zw)*0.5; let half=(clip.zw-clip.xy)*0.5; let r=min(half.x,half.y); sdf=distance(pixel,center)-r; } else { let center=(clip.xy+clip.zw)*0.5; let half=(clip.zw-clip.xy)*0.5; let d=(pixel-center)/max(half,vec2<f32>(0.001)); sdf=(length(d)-1.0)*min(half.x,half.y); } return clamp(0.5-sdf,0.0,1.0); }
 fn outside_cut(local: vec2<f32>, size: vec2<f32>, cut: vec4<f32>) -> bool { let p=local*size; let bl=min(cut.x,min(size.x,size.y)); let br=min(cut.y,min(size.x,size.y)); let tr=min(cut.z,min(size.x,size.y)); let tl=min(cut.w,min(size.x,size.y)); if(bl>0.0&&p.x<bl&&p.y<bl&&p.x+p.y<bl){return true;} let rx=size.x-p.x; if(br>0.0&&rx<br&&p.y<br&&rx+p.y<br){return true;} let ty=size.y-p.y; if(tr>0.0&&rx<tr&&ty<tr&&rx+ty<tr){return true;} if(tl>0.0&&p.x<tl&&p.y<tl&&p.x+p.y<tl){return true;} return false; }
-struct VsIn { @location(0) rect: vec4<f32>, @location(1) fill: vec4<f32>, @location(2) border: vec4<f32>, @location(3) params: vec4<f32>, @location(4) clip: vec4<f32>, @location(5) depth: f32, @location(6) from_rect: vec4<f32>, @location(7) from_fill: vec4<f32>, @location(8) from_border: vec4<f32>, @location(9) from_params: vec4<f32>, @location(10) animation: vec4<f32>, @location(11) cut: vec4<f32> }
-struct VsOut { @builtin(position) position: vec4<f32>, @location(0) local: vec2<f32>, @location(1) size: vec2<f32>, @location(2) fill: vec4<f32>, @location(3) border: vec4<f32>, @location(4) params: vec4<f32>, @location(5) clip: vec4<f32>, @location(6) pixel: vec2<f32>, @location(7) cut: vec4<f32> }
-@vertex fn vs_main(@builtin(vertex_index) index: u32, input: VsIn) -> VsOut { var corners=array<vec2<f32>,6>(vec2<f32>(0.0,0.0),vec2<f32>(1.0,0.0),vec2<f32>(0.0,1.0),vec2<f32>(0.0,1.0),vec2<f32>(1.0,0.0),vec2<f32>(1.0,1.0)); let local=corners[index]; let pixel=input.rect.xy+local*input.rect.zw; var output:VsOut; output.position=vec4<f32>(pixel.x/view.viewport.x*2.0-1.0,1.0-pixel.y/view.viewport.y*2.0,input.depth,1.0); output.local=local; output.size=input.rect.zw; output.fill=input.fill; output.border=input.border; output.params=input.params; output.clip=input.clip; output.pixel=pixel; output.cut=input.cut; return output; }
+struct VsIn { @location(0) rect: vec4<f32>, @location(1) fill: vec4<f32>, @location(2) border: vec4<f32>, @location(3) params: vec4<f32>, @location(4) clip: vec4<f32>, @location(5) depth: f32, @location(6) from_rect: vec4<f32>, @location(7) from_fill: vec4<f32>, @location(8) from_border: vec4<f32>, @location(9) from_params: vec4<f32>, @location(10) animation: vec4<f32>, @location(11) cut: vec4<f32>, @location(12) clip_shape: f32 }
+struct VsOut { @builtin(position) position: vec4<f32>, @location(0) local: vec2<f32>, @location(1) size: vec2<f32>, @location(2) fill: vec4<f32>, @location(3) border: vec4<f32>, @location(4) params: vec4<f32>, @location(5) clip: vec4<f32>, @location(6) pixel: vec2<f32>, @location(7) cut: vec4<f32>, @location(8) @interpolate(flat) clip_shape: f32 }
+@vertex fn vs_main(@builtin(vertex_index) index: u32, input: VsIn) -> VsOut { var corners=array<vec2<f32>,6>(vec2<f32>(0.0,0.0),vec2<f32>(1.0,0.0),vec2<f32>(0.0,1.0),vec2<f32>(0.0,1.0),vec2<f32>(1.0,0.0),vec2<f32>(1.0,1.0)); let local=corners[index]; let pixel=input.rect.xy+local*input.rect.zw; var output:VsOut; output.position=vec4<f32>(pixel.x/view.viewport.x*2.0-1.0,1.0-pixel.y/view.viewport.y*2.0,input.depth,1.0); output.local=local; output.size=input.rect.zw; output.fill=input.fill; output.border=input.border; output.params=input.params; output.clip=input.clip; output.pixel=pixel; output.cut=input.cut; output.clip_shape=input.clip_shape; return output; }
 struct MaterialInput { local_position: vec2<f32>, bounds: vec4<f32>, base_color: vec4<f32>, border_color: vec4<f32>, time_seconds: f32, opacity: f32, geometry_edge: f32, state_flags: u32 }
 "#;
 const MATERIAL_SHADER_SUFFIX: &str = r#"
-@fragment fn fs_material(input: VsOut) -> @location(0) vec4<f32> { if(outside_clip(input.pixel,input.clip,input.params.w)||outside_cut(input.local,input.size,input.cut)){discard;} let edge=min(min(input.local.x,1.0-input.local.x),min(input.local.y,1.0-input.local.y)); let color=material(MaterialInput(input.local,vec4<f32>(input.pixel,input.size),input.fill,input.border,view.time_seconds,input.params.z,edge,0u)); let alpha=clamp(color.a,0.0,1.0); if(alpha<=0.001){discard;} let rgb=select(srgb_to_linear(color.rgb),color.rgb,view.color_mode==1u); return vec4<f32>(rgb*alpha,alpha); }
+@fragment fn fs_material(input: VsOut) -> @location(0) vec4<f32> { let clip_a=clip_alpha(input.pixel,input.clip,input.params.w,input.clip_shape); if(clip_a<=0.001||outside_cut(input.local,input.size,input.cut)){discard;} let edge=min(min(input.local.x,1.0-input.local.x),min(input.local.y,1.0-input.local.y)); let color=material(MaterialInput(input.local,vec4<f32>(input.pixel,input.size),input.fill,input.border,view.time_seconds,input.params.z,edge,0u)); let alpha=clamp(color.a,0.0,1.0)*clip_a; if(alpha<=0.001){discard;} let rgb=select(srgb_to_linear(color.rgb),color.rgb,view.color_mode==1u); return vec4<f32>(rgb*alpha,alpha); }
 "#;
 
 const DEPTH_SHADER: &str = r#"
@@ -260,6 +324,48 @@ fn outside_clip(pixel: vec2<f32>, clip: vec4<f32>, radius: f32) -> bool {
     let point = pixel - (clip.xy + size * 0.5); let extent = max(size * 0.5 - vec2<f32>(r), vec2<f32>(0.0));
     return length(max(abs(point) - extent, vec2<f32>(0.0))) > r;
 }
+fn outside_clip_shape(pixel: vec2<f32>, clip: vec4<f32>, radius: f32, shape: f32) -> bool {
+    if (pixel.x < clip.x || pixel.y < clip.y || pixel.x > clip.z || pixel.y > clip.w) { return true; }
+    if (shape < 0.5) {
+        if (radius <= 0.0) { return false; }
+        let size = clip.zw - clip.xy; let r = min(radius, min(size.x, size.y) * 0.5);
+        let point = pixel - (clip.xy + size * 0.5); let extent = max(size * 0.5 - vec2<f32>(r), vec2<f32>(0.0));
+        return length(max(abs(point) - extent, vec2<f32>(0.0))) > r;
+    }
+    let center = (clip.xy + clip.zw) * 0.5;
+    let half = (clip.zw - clip.xy) * 0.5;
+    if (shape < 1.5) {
+        let r = min(half.x, half.y);
+        return distance(pixel, center) > r;
+    }
+    let d = (pixel - center) / max(half, vec2<f32>(0.001));
+    return dot(d, d) > 1.0;
+}
+
+fn clip_alpha(pixel: vec2<f32>, clip: vec4<f32>, radius: f32, shape: f32) -> f32 {
+    var sdf: f32;
+    if (shape < 0.5) {
+        let size = clip.zw - clip.xy;
+        let r = min(radius, min(size.x, size.y) * 0.5);
+        let center = clip.xy + size * 0.5;
+        let extent = max(size * 0.5 - vec2<f32>(r), vec2<f32>(0.0));
+        let p = abs(pixel - center) - extent;
+        let q = max(p, vec2<f32>(0.0));
+        sdf = length(q) + min(max(p.x, p.y), 0.0) - r;
+    } else if (shape < 1.5) {
+        let center = (clip.xy + clip.zw) * 0.5;
+        let half = (clip.zw - clip.xy) * 0.5;
+        let r = min(half.x, half.y);
+        sdf = distance(pixel, center) - r;
+    } else {
+        let center = (clip.xy + clip.zw) * 0.5;
+        let half = (clip.zw - clip.xy) * 0.5;
+        let d = (pixel - center) / max(half, vec2<f32>(0.001));
+        sdf = (length(d) - 1.0) * min(half.x, half.y);
+    }
+    return clamp(0.5 - sdf, 0.0, 1.0);
+}
+
 struct VsIn {
     @location(0) rect: vec4<f32>,
     @location(1) fill: vec4<f32>,
@@ -272,6 +378,7 @@ struct VsIn {
     @location(8) from_border: vec4<f32>,
     @location(9) from_params: vec4<f32>,
     @location(10) animation: vec4<f32>,
+    @location(12) clip_shape: f32,
 }
 struct VsOut {
     @builtin(position) position: vec4<f32>,
@@ -281,6 +388,7 @@ struct VsOut {
     @location(3) depth: f32,
     @location(4) local: vec2<f32>,
     @location(5) size: vec2<f32>,
+    @location(6) @interpolate(flat) clip_shape: f32,
 }
 @vertex fn vs_main(@builtin(vertex_index) vertex_index: u32, input: VsIn) -> VsOut {
     var corners = array<vec2<f32>, 6>(
@@ -296,10 +404,12 @@ struct VsOut {
     output.depth = input.depth;
     output.local = local;
     output.size = rect.zw;
+    output.clip_shape = input.clip_shape;
     return output;
 }
 @fragment fn fs_main(input: VsOut) -> @location(0) f32 {
-    if (outside_clip(input.pixel, input.clip, input.params.w)) { discard; }
+    let clip_a = clip_alpha(input.pixel, input.clip, input.params.w, input.clip_shape);
+    if (clip_a <= 0.001) { discard; }
     // Zero is a valid topmost depth for screen UI. The external target is a
     // color target, so screen groups can overwrite world depth at overlap.
     if (input.depth < 0.0) { discard; }
@@ -339,12 +449,13 @@ struct View { viewport: vec2<f32>, color_mode: u32, time_seconds: f32, extras: a
 fn srgb_to_linear(value: vec3<f32>) -> vec3<f32> {
  let low = value / 12.92; let high = pow((value + vec3<f32>(0.055)) / 1.055, vec3<f32>(2.4)); return select(low, high, value > vec3<f32>(0.04045));
 }
-struct VsIn { @location(0) rect: vec4<f32>, @location(1) tint: vec4<f32>, @location(2) clip: vec4<f32>, @location(3) uv: vec4<f32>, @location(4) depth: f32, @location(5) source_insets: vec4<f32>, @location(6) target_insets: vec4<f32>, @location(7) mode: u32, @location(8) fill_center: u32 }
-struct VsOut { @builtin(position) position: vec4<f32>, @location(0) local: vec2<f32>, @location(1) tint: vec4<f32>, @location(2) clip: vec4<f32>, @location(3) pixel: vec2<f32>, @location(4) uv: vec4<f32>, @location(5) source_insets: vec4<f32>, @location(6) target_insets: vec4<f32>, @location(7) @interpolate(flat) mode: u32, @location(8) @interpolate(flat) fill_center: u32, @location(9) rect_size: vec2<f32> }
+fn clip_alpha(pixel: vec2<f32>, clip: vec4<f32>, radius: f32, shape: f32) -> f32 { var sdf: f32; if (shape < 0.5) { let size=clip.zw-clip.xy; let r=min(radius,min(size.x,size.y)*0.5); let center=clip.xy+size*0.5; let extent=max(size*0.5-vec2<f32>(r),vec2<f32>(0.0)); let p=abs(pixel-center)-extent; let q=max(p,vec2<f32>(0.0)); sdf=length(q)+min(max(p.x,p.y),0.0)-r; } else if (shape < 1.5) { let center=(clip.xy+clip.zw)*0.5; let half=(clip.zw-clip.xy)*0.5; let r=min(half.x,half.y); sdf=distance(pixel,center)-r; } else { let center=(clip.xy+clip.zw)*0.5; let half=(clip.zw-clip.xy)*0.5; let d=(pixel-center)/max(half,vec2<f32>(0.001)); sdf=(length(d)-1.0)*min(half.x,half.y); } return clamp(0.5-sdf,0.0,1.0); }
+struct VsIn { @location(0) rect: vec4<f32>, @location(1) tint: vec4<f32>, @location(2) clip: vec4<f32>, @location(3) uv: vec4<f32>, @location(4) depth: f32, @location(5) source_insets: vec4<f32>, @location(6) target_insets: vec4<f32>, @location(7) mode: u32, @location(8) fill_center: u32, @location(9) clip_shape: f32 }
+struct VsOut { @builtin(position) position: vec4<f32>, @location(0) local: vec2<f32>, @location(1) tint: vec4<f32>, @location(2) clip: vec4<f32>, @location(3) pixel: vec2<f32>, @location(4) uv: vec4<f32>, @location(5) source_insets: vec4<f32>, @location(6) target_insets: vec4<f32>, @location(7) @interpolate(flat) mode: u32, @location(8) @interpolate(flat) fill_center: u32, @location(9) rect_size: vec2<f32>, @location(10) @interpolate(flat) clip_shape: f32 }
 @vertex fn vs_main(@builtin(vertex_index) index: u32, input: VsIn) -> VsOut {
  var corners = array<vec2<f32>, 6>(vec2<f32>(0.0,0.0),vec2<f32>(1.0,0.0),vec2<f32>(0.0,1.0),vec2<f32>(0.0,1.0),vec2<f32>(1.0,0.0),vec2<f32>(1.0,1.0));
  let local = corners[index]; let pixel = input.rect.xy + local * input.rect.zw; var output: VsOut;
-    output.position = vec4<f32>(pixel.x / view.viewport.x * 2.0 - 1.0, 1.0 - pixel.y / view.viewport.y * 2.0, input.depth, 1.0); output.local = local; output.tint = input.tint; output.clip = input.clip; output.pixel = pixel; output.uv = input.uv; output.source_insets = input.source_insets; output.target_insets = input.target_insets; output.mode = input.mode; output.fill_center = input.fill_center; output.rect_size = input.rect.zw; return output;
+    output.position = vec4<f32>(pixel.x / view.viewport.x * 2.0 - 1.0, 1.0 - pixel.y / view.viewport.y * 2.0, input.depth, 1.0); output.local = local; output.tint = input.tint; output.clip = input.clip; output.pixel = pixel; output.uv = input.uv; output.source_insets = input.source_insets; output.target_insets = input.target_insets; output.mode = input.mode; output.fill_center = input.fill_center; output.rect_size = input.rect.zw; output.clip_shape = input.clip_shape; return output;
  }
 fn compressed_insets(size: f32, left: f32, right: f32) -> vec2<f32> {
   let total = left + right;
@@ -379,7 +490,8 @@ fn map_axis(distance: f32, size: f32, source_size: f32, target_edges: vec2<f32>,
   return source.x + tile_offset;
 }
 @fragment fn fs_main(input: VsOut) -> @location(0) vec4<f32> {
- if (input.pixel.x < input.clip.x || input.pixel.y < input.clip.y || input.pixel.x > input.clip.z || input.pixel.y > input.clip.w) { discard; }
+ let clip_a = clip_alpha(input.pixel, input.clip, 0.0, input.clip_shape);
+ if (clip_a <= 0.001) { discard; }
     // External images are atlas entries with integer regions. Sample the
     // resolved texel directly instead of relying on normalized filtering at
     // the atlas boundary; this keeps the first/last texel visible for both
@@ -405,7 +517,7 @@ fn map_axis(distance: f32, size: f32, source_size: f32, target_edges: vec2<f32>,
          atlas_dims - vec2<i32>(1),
      );
     let sample = textureLoad(image_texture, texel, 0);
-  let alpha = sample.a * input.tint.a;
+  let alpha = sample.a * input.tint.a * clip_a;
   if (alpha <= 0.001) { discard; }
   let tint = select(srgb_to_linear(input.tint.rgb), input.tint.rgb, view.color_mode == 1u);
      return vec4<f32>(sample.rgb * tint * alpha, alpha);
@@ -481,6 +593,9 @@ struct UiInstance {
     /// the node has no cut geometry. The fragment shader clips to the same
     /// polygon used by the hit pass.
     cut: [f32; 4],
+    /// Clip shape code: 0.0 = rect (default), 1.0 = circle, 2.0 = ellipse.
+    /// Passed as f32 for WGSL vertex attribute compatibility.
+    clip_shape: f32,
 }
 
 #[repr(C)]
@@ -521,6 +636,9 @@ struct UiHitInstance {
     clip: [f32; 4],
     /// Cut-corner panel style in logical pixels: [bl, br, tr, tl].
     cut: [f32; 4],
+    /// Clip shape code: 0.0 = rect, 1.0 = circle, 2.0 = ellipse.
+    clip_shape: f32,
+    _pad2: [f32; 3],
 }
 
 #[derive(Clone, Debug)]
@@ -759,7 +877,8 @@ struct UiImageInstance {
     target_insets: [f32; 4],
     mode: u32,
     fill_center: u32,
-    _padding: [u32; 2],
+    clip_shape: f32,
+    _pad: u32,
 }
 
 #[repr(C)]
@@ -1032,6 +1151,7 @@ struct UiVisual {
     enabled: bool,
     clip: UiBounds,
     clip_radius: f32,
+    clip_shape: UiClipShape,
     image: Option<AssetRef>,
     surface: Option<RenderSurfaceRef>,
     text: Option<TextRef>,
@@ -1578,6 +1698,7 @@ impl UiWgpuRenderer {
                 wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 136, shader_location: 9 },
                 wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 152, shader_location: 10 },
                 wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 168, shader_location: 11 },
+                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32, offset: 184, shader_location: 12 },
             ];
             let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(&format!("neon3-ui-material-pipeline-{}", package.package_id)),
@@ -1780,6 +1901,11 @@ impl UiWgpuRenderer {
                             offset: 168,
                             shader_location: 11,
                         },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32,
+                            offset: 184,
+                            shader_location: 12,
+                        },
                     ],
                 })],
                 compilation_options: Default::default(),
@@ -1851,6 +1977,11 @@ impl UiWgpuRenderer {
                             format: wgpu::VertexFormat::Float32x4,
                             offset: 64,
                             shader_location: 4,
+                        },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32,
+                            offset: 80,
+                            shader_location: 5,
                         },
                     ],
                 })],
@@ -2063,6 +2194,11 @@ impl UiWgpuRenderer {
                             offset: 108,
                             shader_location: 8,
                         },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32,
+                            offset: 112,
+                            shader_location: 9,
+                        },
                     ],
                 })],
                 compilation_options: Default::default(),
@@ -2255,6 +2391,11 @@ impl UiWgpuRenderer {
                                 offset: 152,
                                 shader_location: 10,
                             },
+                            wgpu::VertexAttribute {
+                                format: wgpu::VertexFormat::Float32,
+                                offset: 184,
+                                shader_location: 12,
+                            },
                         ],
                     })],
                     compilation_options: Default::default(),
@@ -2435,6 +2576,12 @@ impl UiWgpuRenderer {
                     visual.clip.y + visual.clip.height,
                 ],
                 cut: self.node_cuts.get(short_key).copied().unwrap_or([0.0; 4]),
+                clip_shape: match visual.clip_shape {
+                    UiClipShape::Rect => 0.0,
+                    UiClipShape::Circle => 1.0,
+                    UiClipShape::Ellipse => 2.0,
+                },
+                _pad2: [0.0; 3],
             });
         }
         if instances.is_empty() {
@@ -2767,7 +2914,7 @@ impl UiWgpuRenderer {
             else {
                 continue;
             };
-            if !matches!(node.target.kind, UiNodeKind::Slider | UiNodeKind::DragValue) {
+            if !matches!(node.target.kind, UiNodeKind::Slider | UiNodeKind::DragValue | UiNodeKind::Scrollbar) {
                 continue;
             }
             if let Some(UiControlPresentation::Numeric { min, max, .. }) =
@@ -2777,6 +2924,11 @@ impl UiWgpuRenderer {
                     value: *value,
                     min: *min,
                     max: *max,
+                });
+            }
+            if let Some(UiControlPresentation::Scroll { .. }) = &self.sampled[index].presentation {
+                self.sampled[index].presentation = Some(UiControlPresentation::Scroll {
+                    position: *value,
                 });
             }
             if node.target.kind == UiNodeKind::Slider {
@@ -3423,11 +3575,22 @@ impl UiWgpuRenderer {
                 width: (visual.bounds.width - 24.0).max(1.0),
                 height: visual.bounds.height,
             },
-            UiNodeKind::Scrollbar => UiBounds {
-                x: visual.bounds.x + 10.0,
-                y: visual.bounds.y,
-                width: (visual.bounds.width - 20.0).max(1.0),
-                height: visual.bounds.height,
+            UiNodeKind::Scrollbar => {
+                if visual.bounds.width > visual.bounds.height {
+                    UiBounds {
+                        x: visual.bounds.x + 10.0,
+                        y: visual.bounds.y,
+                        width: (visual.bounds.width - 20.0).max(1.0),
+                        height: visual.bounds.height,
+                    }
+                } else {
+                    UiBounds {
+                        x: visual.bounds.x,
+                        y: visual.bounds.y + 10.0,
+                        width: visual.bounds.width,
+                        height: (visual.bounds.height - 20.0).max(1.0),
+                    }
+                }
             },
             UiNodeKind::DragValue => drag_value_bounds(visual.bounds),
             UiNodeKind::Splitter => {
@@ -3480,8 +3643,11 @@ impl UiWgpuRenderer {
         let Some(pointer) = self.pointer_position else {
             return false;
         };
-        let fraction =
-            ((pointer[0] - gesture.bounds.x) / gesture.bounds.width.max(1.0)).clamp(0.0, 1.0);
+        let fraction = if gesture.kind == UiNodeKind::Scrollbar && gesture.bounds.height > gesture.bounds.width {
+            ((pointer[1] - gesture.bounds.y) / gesture.bounds.height.max(1.0)).clamp(0.0, 1.0)
+        } else {
+            ((pointer[0] - gesture.bounds.x) / gesture.bounds.width.max(1.0)).clamp(0.0, 1.0)
+        };
         let value = gesture.min + (gesture.max - gesture.min) * fraction;
         let payload = match gesture.kind {
             UiNodeKind::DragValue => UiSemanticPayloadValue::I32 {
@@ -5727,7 +5893,7 @@ impl UiWgpuRenderer {
                     target_insets,
                     mode,
                     fill_center,
-                    _padding: [0; 2],
+                    clip_shape: 0.0, _pad: 0,
                 })
             })();
             let Some(image) = image else {
@@ -5801,7 +5967,7 @@ impl UiWgpuRenderer {
                 target_insets,
                 mode: slice_mode,
                 fill_center,
-                _padding: [0; 2],
+                clip_shape: 0.0, _pad: 0,
             });
         }
         // Slider skins replace the standard track/fill/thumb chrome only. The
@@ -5838,7 +6004,7 @@ impl UiWgpuRenderer {
                 if nine_slice.is_some_and(|layout| !layout.validate_for_image(image.width, image.height)) { continue; }
                 let (source_insets, target_insets, slice_mode, fill_center) = nine_slice.map(|layout| (layout.source_insets_px.map(|value| value as f32), layout.target_insets, match layout.mode { neon_ui_schema::UiNineSliceMode::Stretch => 0, neon_ui_schema::UiNineSliceMode::Tile => 1, neon_ui_schema::UiNineSliceMode::Mirror => 2 }, u32::from(layout.fill_center))).unwrap_or(([0.0; 4], [0.0; 4], 0, 1));
                 let (rect, uv) = fit_image_rect_and_uv(bounds, image.uv, image.width, image.height, fit);
-                images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, _padding: [0; 2] });
+                images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, clip_shape: 0.0, _pad: 0 });
             }
         }
         // Panel / Dialog / ContextMenu / Splitter / ListBox / Modal / TreeView
@@ -5865,7 +6031,7 @@ impl UiWgpuRenderer {
             if nine_slice.is_some_and(|layout| !layout.validate_for_image(image.width, image.height)) { continue; }
             let (source_insets, target_insets, slice_mode, fill_center) = nine_slice.map(|layout| (layout.source_insets_px.map(|value| value as f32), layout.target_insets, match layout.mode { neon_ui_schema::UiNineSliceMode::Stretch => 0, neon_ui_schema::UiNineSliceMode::Tile => 1, neon_ui_schema::UiNineSliceMode::Mirror => 2 }, u32::from(layout.fill_center))).unwrap_or(([0.0; 4], [0.0; 4], 0, 1));
             let (rect, uv) = fit_image_rect_and_uv(visual.bounds, image.uv, image.width, image.height, fit);
-            images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, _padding: [0; 2] });
+            images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, clip_shape: 0.0, _pad: 0 });
         }
         // Switch skins render track + sliding thumb. Thumb position is driven by
         // the Toggle presentation (selected = on). Track and thumb support
@@ -5897,7 +6063,7 @@ impl UiWgpuRenderer {
                 if nine_slice.is_some_and(|layout| !layout.validate_for_image(image.width, image.height)) { continue; }
                 let (source_insets, target_insets, slice_mode, fill_center) = nine_slice.map(|layout| (layout.source_insets_px.map(|value| value as f32), layout.target_insets, match layout.mode { neon_ui_schema::UiNineSliceMode::Stretch => 0, neon_ui_schema::UiNineSliceMode::Tile => 1, neon_ui_schema::UiNineSliceMode::Mirror => 2 }, u32::from(layout.fill_center))).unwrap_or(([0.0; 4], [0.0; 4], 0, 1));
                 let (rect, uv) = fit_image_rect_and_uv(bounds, image.uv, image.width, image.height, fit);
-                images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, _padding: [0; 2] });
+                images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, clip_shape: 0.0, _pad: 0 });
             }
         }
         // ProgressBar skins render track + fill using the normalized value.
@@ -5927,7 +6093,7 @@ impl UiWgpuRenderer {
                 if nine_slice.is_some_and(|layout| !layout.validate_for_image(image.width, image.height)) { continue; }
                 let (source_insets, target_insets, slice_mode, fill_center) = nine_slice.map(|layout| (layout.source_insets_px.map(|value| value as f32), layout.target_insets, match layout.mode { neon_ui_schema::UiNineSliceMode::Stretch => 0, neon_ui_schema::UiNineSliceMode::Tile => 1, neon_ui_schema::UiNineSliceMode::Mirror => 2 }, u32::from(layout.fill_center))).unwrap_or(([0.0; 4], [0.0; 4], 0, 1));
                 let (rect, uv) = fit_image_rect_and_uv(bounds, image.uv, image.width, image.height, fit);
-                images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, _padding: [0; 2] });
+                images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, clip_shape: 0.0, _pad: 0 });
             }
         }
         // Scrollbar skins render track + thumb using the normalized scroll value.
@@ -5940,6 +6106,7 @@ impl UiWgpuRenderer {
             let Some(skin) = self.skins.get(skin_key) else { continue };
             let normalized = match &visual.presentation {
                 Some(UiControlPresentation::Numeric { value, min, max }) => ((value - min) / (max - min)).clamp(0.0, 1.0),
+                Some(UiControlPresentation::Scroll { position }) => position.clamp(0.0, 1.0),
                 _ => 0.0,
             };
             let horizontal = visual.bounds.width > visual.bounds.height;
@@ -5970,7 +6137,7 @@ impl UiWgpuRenderer {
                 if nine_slice.is_some_and(|layout| !layout.validate_for_image(image.width, image.height)) { continue; }
                 let (source_insets, target_insets, slice_mode, fill_center) = nine_slice.map(|layout| (layout.source_insets_px.map(|value| value as f32), layout.target_insets, match layout.mode { neon_ui_schema::UiNineSliceMode::Stretch => 0, neon_ui_schema::UiNineSliceMode::Tile => 1, neon_ui_schema::UiNineSliceMode::Mirror => 2 }, u32::from(layout.fill_center))).unwrap_or(([0.0; 4], [0.0; 4], 0, 1));
                 let (rect, uv) = fit_image_rect_and_uv(bounds, image.uv, image.width, image.height, fit);
-                images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, _padding: [0; 2] });
+                images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, clip_shape: 0.0, _pad: 0 });
             }
         }
         // Checkbox skins render body + check mark based on selected state.
@@ -6005,7 +6172,7 @@ impl UiWgpuRenderer {
                     if !nine_slice.is_some_and(|layout| !layout.validate_for_image(image.width, image.height)) {
                         let (source_insets, target_insets, slice_mode, fill_center) = nine_slice.map(|layout| (layout.source_insets_px.map(|value| value as f32), layout.target_insets, match layout.mode { neon_ui_schema::UiNineSliceMode::Stretch => 0, neon_ui_schema::UiNineSliceMode::Tile => 1, neon_ui_schema::UiNineSliceMode::Mirror => 2 }, u32::from(layout.fill_center))).unwrap_or(([0.0; 4], [0.0; 4], 0, 1));
                         let (rect, uv) = fit_image_rect_and_uv(box_bounds, image.uv, image.width, image.height, fit);
-                        images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, _padding: [0; 2] });
+                        images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, clip_shape: 0.0, _pad: 0 });
                     }
                 }
             }
@@ -6026,7 +6193,7 @@ impl UiWgpuRenderer {
                             let mark_size = box_size * 0.6;
                             let mark_bounds = UiBounds { x: box_bounds.x + (box_size - mark_size) * 0.5, y: box_bounds.y + (box_size - mark_size) * 0.5, width: mark_size, height: mark_size };
                             let (rect, uv) = fit_image_rect_and_uv(mark_bounds, image.uv, image.width, image.height, fit);
-                            images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, _padding: [0; 2] });
+                            images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, clip_shape: 0.0, _pad: 0 });
                         }
                     }
                 }
@@ -6064,7 +6231,7 @@ impl UiWgpuRenderer {
                     if !nine_slice.is_some_and(|layout| !layout.validate_for_image(image.width, image.height)) {
                         let (source_insets, target_insets, slice_mode, fill_center) = nine_slice.map(|layout| (layout.source_insets_px.map(|value| value as f32), layout.target_insets, match layout.mode { neon_ui_schema::UiNineSliceMode::Stretch => 0, neon_ui_schema::UiNineSliceMode::Tile => 1, neon_ui_schema::UiNineSliceMode::Mirror => 2 }, u32::from(layout.fill_center))).unwrap_or(([0.0; 4], [0.0; 4], 0, 1));
                         let (rect, uv) = fit_image_rect_and_uv(box_bounds, image.uv, image.width, image.height, fit);
-                        images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, _padding: [0; 2] });
+                        images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, clip_shape: 1.0, _pad: 0 });
                     }
                 }
             }
@@ -6085,7 +6252,7 @@ impl UiWgpuRenderer {
                             let dot_size = box_size * 0.5;
                             let dot_bounds = UiBounds { x: box_bounds.x + (box_size - dot_size) * 0.5, y: box_bounds.y + (box_size - dot_size) * 0.5, width: dot_size, height: dot_size };
                             let (rect, uv) = fit_image_rect_and_uv(dot_bounds, image.uv, image.width, image.height, fit);
-                            images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, _padding: [0; 2] });
+                            images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, clip_shape: 1.0, _pad: 0 });
                         }
                     }
                 }
@@ -6113,7 +6280,7 @@ impl UiWgpuRenderer {
                     if !nine_slice.is_some_and(|layout| !layout.validate_for_image(image.width, image.height)) {
                         let (source_insets, target_insets, slice_mode, fill_center) = nine_slice.map(|layout| (layout.source_insets_px.map(|value| value as f32), layout.target_insets, match layout.mode { neon_ui_schema::UiNineSliceMode::Stretch => 0, neon_ui_schema::UiNineSliceMode::Tile => 1, neon_ui_schema::UiNineSliceMode::Mirror => 2 }, u32::from(layout.fill_center))).unwrap_or(([0.0; 4], [0.0; 4], 0, 1));
                         let (rect, uv) = fit_image_rect_and_uv(visual.bounds, image.uv, image.width, image.height, fit);
-                        images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, _padding: [0; 2] });
+                        images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, clip_shape: 0.0, _pad: 0 });
                     }
                 }
             }
@@ -6130,7 +6297,7 @@ impl UiWgpuRenderer {
                         if !nine_slice.is_some_and(|layout| !layout.validate_for_image(image.width, image.height)) {
                             let (source_insets, target_insets, slice_mode, fill_center) = nine_slice.map(|layout| (layout.source_insets_px.map(|value| value as f32), layout.target_insets, match layout.mode { neon_ui_schema::UiNineSliceMode::Stretch => 0, neon_ui_schema::UiNineSliceMode::Tile => 1, neon_ui_schema::UiNineSliceMode::Mirror => 2 }, u32::from(layout.fill_center))).unwrap_or(([0.0; 4], [0.0; 4], 0, 1));
                             let (rect, uv) = fit_image_rect_and_uv(visual.bounds, image.uv, image.width, image.height, fit);
-                            images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, _padding: [0; 2] });
+                            images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, clip_shape: 0.0, _pad: 0 });
                         }
                     }
                 }
@@ -6155,7 +6322,7 @@ impl UiWgpuRenderer {
             if nine_slice.is_some_and(|layout| !layout.validate_for_image(image.width, image.height)) { continue; }
             let (source_insets, target_insets, slice_mode, fill_center) = nine_slice.map(|layout| (layout.source_insets_px.map(|value| value as f32), layout.target_insets, match layout.mode { neon_ui_schema::UiNineSliceMode::Stretch => 0, neon_ui_schema::UiNineSliceMode::Tile => 1, neon_ui_schema::UiNineSliceMode::Mirror => 2 }, u32::from(layout.fill_center))).unwrap_or(([0.0; 4], [0.0; 4], 0, 1));
             let (rect, uv) = fit_image_rect_and_uv(visual.bounds, image.uv, image.width, image.height, fit);
-            images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, _padding: [0; 2] });
+            images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, clip_shape: 0.0, _pad: 0 });
         }
         // Combo / Dropdown / Tabs / Selectable skins render a body image with
         // hover / pressed / disabled state support (same fallback chain as Button).
@@ -6182,7 +6349,7 @@ impl UiWgpuRenderer {
             if nine_slice.is_some_and(|layout| !layout.validate_for_image(image.width, image.height)) { continue; }
             let (source_insets, target_insets, slice_mode, fill_center) = nine_slice.map(|layout| (layout.source_insets_px.map(|value| value as f32), layout.target_insets, match layout.mode { neon_ui_schema::UiNineSliceMode::Stretch => 0, neon_ui_schema::UiNineSliceMode::Tile => 1, neon_ui_schema::UiNineSliceMode::Mirror => 2 }, u32::from(layout.fill_center))).unwrap_or(([0.0; 4], [0.0; 4], 0, 1));
             let (rect, uv) = fit_image_rect_and_uv(visual.bounds, image.uv, image.width, image.height, fit);
-            images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, _padding: [0; 2] });
+            images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, clip_shape: 0.0, _pad: 0 });
         }
         // DragValue skins render a track background plus an optional body overlay.
         for (index, visual) in self.sampled.iter().enumerate() {
@@ -6206,7 +6373,7 @@ impl UiWgpuRenderer {
                     if !nine_slice.is_some_and(|layout| !layout.validate_for_image(image.width, image.height)) {
                         let (source_insets, target_insets, slice_mode, fill_center) = nine_slice.map(|layout| (layout.source_insets_px.map(|value| value as f32), layout.target_insets, match layout.mode { neon_ui_schema::UiNineSliceMode::Stretch => 0, neon_ui_schema::UiNineSliceMode::Tile => 1, neon_ui_schema::UiNineSliceMode::Mirror => 2 }, u32::from(layout.fill_center))).unwrap_or(([0.0; 4], [0.0; 4], 0, 1));
                         let (rect, uv) = fit_image_rect_and_uv(visual.bounds, image.uv, image.width, image.height, fit);
-                        images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, _padding: [0; 2] });
+                        images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, clip_shape: 0.0, _pad: 0 });
                     }
                 }
             }
@@ -6222,7 +6389,7 @@ impl UiWgpuRenderer {
                     if !nine_slice.is_some_and(|layout| !layout.validate_for_image(image.width, image.height)) {
                         let (source_insets, target_insets, slice_mode, fill_center) = nine_slice.map(|layout| (layout.source_insets_px.map(|value| value as f32), layout.target_insets, match layout.mode { neon_ui_schema::UiNineSliceMode::Stretch => 0, neon_ui_schema::UiNineSliceMode::Tile => 1, neon_ui_schema::UiNineSliceMode::Mirror => 2 }, u32::from(layout.fill_center))).unwrap_or(([0.0; 4], [0.0; 4], 0, 1));
                         let (rect, uv) = fit_image_rect_and_uv(visual.bounds, image.uv, image.width, image.height, fit);
-                        images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, _padding: [0; 2] });
+                        images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, clip_shape: 0.0, _pad: 0 });
                     }
                 }
             }
@@ -6276,7 +6443,7 @@ impl UiWgpuRenderer {
                             target_insets: [0.0; 4],
                             mode: 0,
                             fill_center: 1,
-                            _padding: [0; 2],
+                            clip_shape: 0.0, _pad: 0,
                         },
                     ))
             })
@@ -8103,6 +8270,11 @@ impl UiWgpuRenderer {
             ],
             animation: [0.0; 4],
             cut: [0.0; 4],
+            clip_shape: match visual.clip_shape {
+                UiClipShape::Rect => 0.0,
+                UiClipShape::Circle => 1.0,
+                UiClipShape::Ellipse => 2.0,
+            },
         };
         if let Some(cut) = self.node_cuts.get(
             node_path
@@ -9507,26 +9679,51 @@ fn component_chrome_instances(visual: &UiVisual) -> Vec<UiInstance> {
             _ => Vec::new(),
         },
         UiNodeKind::Scrollbar => {
-            let track = UiBounds {
-                x: bounds.x + 10.0,
-                y: center_y - 3.0,
-                width: (bounds.width - 20.0).max(0.0),
-                height: 6.0,
-            };
-            vec![
-                chrome(track, muted, muted, 3.0),
-                chrome(
-                    UiBounds {
-                        x: track.x + (track.width - track.width * 0.28) * normalized,
-                        y: center_y - 5.0,
-                        width: track.width * 0.28,
-                        height: 10.0,
-                    },
-                    mint,
-                    mint,
-                    5.0,
-                ),
-            ]
+            let horizontal = bounds.width > bounds.height;
+            if horizontal {
+                let track = UiBounds {
+                    x: bounds.x + 10.0,
+                    y: center_y - 3.0,
+                    width: (bounds.width - 20.0).max(0.0),
+                    height: 6.0,
+                };
+                vec![
+                    chrome(track, muted, muted, 3.0),
+                    chrome(
+                        UiBounds {
+                            x: track.x + (track.width - track.width * 0.28) * normalized,
+                            y: center_y - 5.0,
+                            width: track.width * 0.28,
+                            height: 10.0,
+                        },
+                        mint,
+                        mint,
+                        5.0,
+                    ),
+                ]
+            } else {
+                let center_x = bounds.x + bounds.width * 0.5;
+                let track = UiBounds {
+                    x: center_x - 3.0,
+                    y: bounds.y + 10.0,
+                    width: 6.0,
+                    height: (bounds.height - 20.0).max(0.0),
+                };
+                vec![
+                    chrome(track, muted, muted, 3.0),
+                    chrome(
+                        UiBounds {
+                            x: center_x - 5.0,
+                            y: track.y + (track.height - track.height * 0.28) * normalized,
+                            width: 10.0,
+                            height: track.height * 0.28,
+                        },
+                        mint,
+                        mint,
+                        5.0,
+                    ),
+                ]
+            }
         }
         UiNodeKind::Image => vec![chrome(
             UiBounds {
@@ -10638,6 +10835,7 @@ fn flatten_fragments_with_data_grid_display_cache(
             [0.0, 0.0],
             authored_root_clip,
             None,
+            UiClipShape::Rect,
             None,
             font,
             root_uses_viewport.then_some(viewport_logical_size),
@@ -10856,6 +11054,7 @@ fn append_data_grid_frames(
                     height: row_height,
                 },
                 clip_radius: 0.0,
+                clip_shape: UiClipShape::Rect,
                 image: None,
                 surface: None,
                 text: None,
@@ -10942,6 +11141,7 @@ fn append_data_grid_frames(
                     enabled: false,
                     clip: body_clip,
                     clip_radius: 0.0,
+                    clip_shape: UiClipShape::Rect,
                     image: None,
                     surface: None,
                     text: None,
@@ -11350,6 +11550,7 @@ fn append_canvas_marks(
                 enabled: false,
                 clip,
                 clip_radius: 0.0,
+                clip_shape: UiClipShape::Rect,
                 image: None,
                 surface: None,
                 text: None,
@@ -11401,6 +11602,7 @@ fn flatten_node(
     parent_offset: [f32; 2],
     inherited_clip: Option<UiBounds>,
     inherited_clip_radius: Option<f32>,
+    inherited_clip_shape: UiClipShape,
     parent_id: Option<&str>,
     font: Option<&ResidentFont>,
     assigned_size: Option<[f32; 2]>,
@@ -11452,9 +11654,20 @@ fn flatten_node(
     } else {
         match node_layout.clip {
             UiClipPolicy::Rounded => Some(node.style.corner_radius),
-            UiClipPolicy::None => inherited_clip_radius,
-            UiClipPolicy::Bounds | UiClipPolicy::Scroll => None,
+            // Bounds/Scroll/None all inherit the ancestor's clip radius so
+            // nested content stays inside a rounded parent panel.
+            UiClipPolicy::None | UiClipPolicy::Bounds | UiClipPolicy::Scroll => {
+                inherited_clip_radius
+            }
         }
+    };
+    // Clip shape inheritance: if an ancestor uses circle/ellipse, descendants
+    // stay inside that shape. A node may only tighten its own clip when the
+    // inherited shape is Rect.
+    let own_clip_shape = if inherited_clip_shape != UiClipShape::Rect {
+        inherited_clip_shape
+    } else {
+        node.clip_shape
     };
     let effective_clip = own_clip.unwrap_or(UiBounds {
         x: -1_000_000.0,
@@ -11496,6 +11709,7 @@ fn flatten_node(
                 enabled: node.enabled,
                 clip: scale_world_bounds(effective_clip, world_scale, world_origin),
                 clip_radius: own_clip_radius.unwrap_or(0.0),
+                clip_shape: own_clip_shape,
                 image: external_image_bindings
                     .get(&node.node_id.0)
                     .map(|image_id| AssetRef {
@@ -11534,6 +11748,11 @@ fn flatten_node(
     } else {
         own_clip_radius
     };
+    let child_inherited_clip_shape = if node_layout.clip == UiClipPolicy::Scroll {
+        UiClipShape::Rect
+    } else {
+        own_clip_shape
+    };
     for (child, child_bounds) in node.children.iter().zip(child_bounds) {
         let offset = [
             child_bounds.x - child.bounds.x,
@@ -11547,6 +11766,7 @@ fn flatten_node(
             offset,
             child_inherited_clip,
             child_inherited_clip_radius,
+            child_inherited_clip_shape,
             Some(&node_path),
             font,
             Some([child_bounds.width, child_bounds.height]),
@@ -11972,6 +12192,7 @@ fn transition_source(target: &UiVisual, transition: &UiTransition) -> UiVisual {
         enabled: target.enabled,
         clip: target.clip,
         clip_radius: target.clip_radius,
+        clip_shape: target.clip_shape,
         image: target.image.clone(),
         surface: target.surface.clone(),
         text: target.text.clone(),
@@ -12045,6 +12266,7 @@ fn sample_transition(active: &ActiveTransition, time_seconds: f32) -> UiVisual {
         enabled: active.target.enabled,
         clip: active.target.clip,
         clip_radius: active.target.clip_radius,
+        clip_shape: active.target.clip_shape,
         image: active.target.image.clone(),
         surface: active.target.surface.clone(),
         text: active.target.text.clone(),
@@ -12871,6 +13093,7 @@ mod tests {
                 enabled: true,
                 clip: bounds,
                 clip_radius: 0.0,
+                clip_shape: UiClipShape::Rect,
                 image: None,
                 surface: None,
                 text: Some(TextRef::Literal {
@@ -12962,6 +13185,7 @@ mod tests {
                 enabled: true,
                 clip: input.bounds,
                 clip_radius: 0.0,
+                clip_shape: UiClipShape::Rect,
                 image: None,
                 surface: None,
                 text: Some(TextRef::Literal {
@@ -13143,6 +13367,7 @@ mod tests {
                     height: 160.0,
                 },
                 clip_radius: 0.0,
+                clip_shape: UiClipShape::Rect,
                 image: None,
                 surface: None,
                 text: Some(TextRef::Literal {

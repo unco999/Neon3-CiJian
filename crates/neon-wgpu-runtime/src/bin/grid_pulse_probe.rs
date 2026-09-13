@@ -17,7 +17,7 @@ use neon_protocol::{
     ServiceName,
 };
 use neon_ui_schema::{
-    UiBounds, UiCommand, UiEffect, UiFragment, UiFragmentId, UiFragmentSubmission, UiNode,
+    UiBounds, UiClipShape, UiCommand, UiEffect, UiFragment, UiFragmentId, UiFragmentSubmission, UiNode,
     UiNodeId, UiNodeKind, UiStyle,
 };
 use serde_json::json;
@@ -88,6 +88,7 @@ fn panel(id: &str, x: f32, y: f32, w: f32, h: f32, color: [f32; 4], visible: boo
         enter_transition: None,
         world_depth: None,
         world_scale: None,
+        clip_shape: UiClipShape::default(),
         children: Vec::new(),
     }
 }
@@ -150,6 +151,7 @@ fn grid_fragment(seed: u32, revision: u32) -> (UiFragment, usize) {
         enter_transition: None,
         world_depth: None,
         world_scale: None,
+        clip_shape: UiClipShape::default(),
         children: cells,
     };
 

@@ -8,7 +8,7 @@ use neon_protocol::{
     ProtocolVersion, RequestId, Revision, RpcRequest, RpcResponse, RpcStatus, ServiceName,
 };
 use neon_ui_schema::{
-    TextRef, UiBounds, UiCommand, UiEffect, UiFragment, UiFragmentId, UiFragmentRevision,
+    TextRef, UiBounds, UiClipShape, UiCommand, UiEffect, UiFragment, UiFragmentId, UiFragmentRevision,
     UiFragmentSubmission, UiIntent, UiNode, UiNodeId, UiNodeKind, UiPointerMetadata,
     UiSemanticEvent, UiSemanticEventType, UiStyle,
 };
@@ -628,6 +628,7 @@ pub fn detail_fragment(revision: Revision, detail_visible: bool) -> UiFragment {
             enter_transition: None,
             world_depth: None,
             world_scale: None,
+            clip_shape: UiClipShape::default(),
             children: vec![
                 UiNode {
                     node_id: UiNodeId("title".into()),
@@ -651,6 +652,7 @@ pub fn detail_fragment(revision: Revision, detail_visible: bool) -> UiFragment {
                     enter_transition: None,
                     world_depth: None,
                     world_scale: None,
+                    clip_shape: UiClipShape::default(),
                     children: Vec::new(),
                 },
                 UiNode {
@@ -675,6 +677,7 @@ pub fn detail_fragment(revision: Revision, detail_visible: bool) -> UiFragment {
                     enter_transition: None,
                     world_depth: None,
                     world_scale: None,
+                    clip_shape: UiClipShape::default(),
                     children: Vec::new(),
                 },
                 UiNode {
@@ -699,6 +702,7 @@ pub fn detail_fragment(revision: Revision, detail_visible: bool) -> UiFragment {
                     enter_transition: None,
                     world_depth: None,
                     world_scale: None,
+                    clip_shape: UiClipShape::default(),
                     children: Vec::new(),
                 },
             ],
@@ -736,6 +740,7 @@ pub fn static_fragment(revision: Revision) -> UiFragment {
             enter_transition: None,
             world_depth: None,
             world_scale: None,
+            clip_shape: UiClipShape::default(),
             children: Vec::new(),
         },
         effects: vec![UiEffect::SemanticAction {

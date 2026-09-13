@@ -11,7 +11,7 @@ use neon_ui_schema::{
     NuiFlowMotion, NuiFlowParseDiagnostic, NuiFlowState, NuiFlowStateMachine, NuiFlowStateStyle,
     NuiFlowStateTransition, NuiFlowStateTrigger, NuiFlowWorldPanelDeclaration, NuiSourceSpan,
     RenderSurfaceRef, TextRef, UiAlignItems, UiBoundProperty, UiBounds, UiBranchDeclaration,
-    UiBranchLayoutParticipation, UiBranchPredicate, UiCameraVisibilityBinding, UiClipPolicy,
+    UiBranchLayoutParticipation, UiBranchPredicate, UiCameraVisibilityBinding, UiClipPolicy, UiClipShape,
     UiDataGridColumn, UiDataGridDeclaration, UiDataGridPresentation, UiDiagnosticSeverity,
     UiDragAxis, UiDragBinding, UiDragBoundary, UiDropBinding, UiDropPlacement, UiEasing, UiEffect,
     UiGridInputSlot, UiGeometry, UiInputKind, UiInputPacking, UiInputSchema, UiInputSlot, UiInputUpdateClass,
@@ -2892,6 +2892,7 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
         enter_transition: None,
         world_depth: None,
         world_scale: None,
+        clip_shape: UiClipShape::default(),
         children: Vec::new(),
     };
     if component == "branch" {
@@ -2952,7 +2953,7 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
             "x" | "y" | "w" | "h" | "minw" | "maxw" | "grow" | "shrink" | "basis" | "gap"
             | "pad" | "fill" | "line" | "ink" | "opacity" | "radius" | "border_width" | "value"
             | "checked" | "selected" | "state" | "numeric" | "scroll" | "scroll_offset" | "enabled" | "visible"
-            | "event" | "token" | "align" | "clip" | "fit" | "justify" | "data" | "rich" | "skin" | "context_menu"
+            | "event" | "token" | "align" | "clip" | "clip_shape" | "fit" | "justify" | "data" | "rich" | "skin" | "context_menu"
             | "composition_layer" | "layer" => {
                 let value = *parts.get(index + 1).ok_or_else(|| {
                     error(
@@ -3976,6 +3977,21 @@ fn parse_attribute(
         "radius" => {
             node.style.corner_radius = number(value, line)?.max(0.0);
         }
+        "clip_shape" => {
+            node.clip_shape = match value {
+                "circle" => UiClipShape::Circle,
+                "ellipse" => UiClipShape::Ellipse,
+                "rect" => UiClipShape::Rect,
+                _ => {
+                    return Err(error(
+                        "nui_flow_invalid_clip_shape",
+                        "clip_shape must be: circle, ellipse, or rect",
+                        line,
+                        1,
+                    ));
+                }
+            };
+        }
         "border_width" => {
             node.style.border_width = number(value, line)?.max(0.0);
         }
@@ -4991,6 +5007,7 @@ fn insert_node(
         enter_transition: None,
         world_depth: None,
         world_scale: None,
+        clip_shape: UiClipShape::default(),
         children: Vec::new(),
     });
     Ok(())

@@ -818,7 +818,31 @@ pub struct UiNode {
     /// glyph/bar shares one distance-based scale instead of re-layouting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub world_scale: Option<f32>,
+    /// Clipping shape for this node and its subtree. `Rect` (default) clips to
+    /// the node bounds with optional corner radius; `Circle` clips to a circle
+    /// inscribed in the bounds; `Ellipse` clips to an ellipse matching bounds.
+    #[serde(default, skip_serializing_if = "UiClipShape::is_rect")]
+    pub clip_shape: UiClipShape,
     pub children: Vec<UiNode>,
+}
+
+/// Shape used to clip a node and its subtree.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UiClipShape {
+    /// Rectangular clip with optional corner radius (default).
+    #[default]
+    Rect,
+    /// Circular clip inscribed in the node bounds (radius = min(w,h)/2).
+    Circle,
+    /// Elliptical clip matching the node bounds (rx=w/2, ry=h/2).
+    Ellipse,
+}
+
+impl UiClipShape {
+    pub fn is_rect(&self) -> bool {
+        matches!(self, UiClipShape::Rect)
+    }
 }
 
 /// Composition destination for a node subtree. `Normal` is the legacy path,

@@ -592,6 +592,20 @@ impl AppState {
     }
 
     fn handle_action(&mut self, action: &str) {
+        // 处理 F32 控制值（Slider/Scrollbar 拖拽提交）
+        if let Some(rest) = action.strip_prefix("__control_value:") {
+            if let Some((name, val_str)) = rest.rsplit_once(':') {
+                if let Ok(value) = val_str.parse::<f32>() {
+                    match name {
+                        "demo.slider.commit" => self.slider_val = value.clamp(0.0, 100.0),
+                        "demo.scroll.change" => self.scroll_pos = value.clamp(0.0, 1.0),
+                        _ => {}
+                    }
+                    println!("[control] {name} = {value}");
+                    return;
+                }
+            }
+        }
         // 点击任何非菜单元素时关闭下拉
         if !action.starts_with("demo.mb.") && self.active_menu.is_some() {
             self.active_menu = None;
@@ -689,15 +703,21 @@ fn start_ui_host_server(click_queue: Arc<Mutex<Vec<String>>>) {
                 }, false);
             }
             if req.method == "ui.host.inbound" {
-                if let Some(action) = serde_json::from_value::<UiSemanticEvent>(req.params.clone())
-                    .ok()
-                    .and_then(|event| {
-                        let neon_ui_schema::UiIntent::Invoke { action, .. } = event.intent;
-                        Some(action)
-                    })
-                {
-                    println!("[ui-host] click: {action}");
-                    if let Ok(mut q) = click_queue.lock() { q.push(action); }
+                if let Ok(event) = serde_json::from_value::<UiSemanticEvent>(req.params.clone()) {
+                    // 处理 F32 控制值（Slider/Scrollbar 拖拽提交）
+                    if let Some(neon_ui_schema::UiSemanticPayloadValue::F32 { value }) = &event.control_value {
+                        if let neon_ui_schema::UiIntent::Invoke { action, .. } = &event.intent {
+                            println!("[ui-host] control_value {action} = {value}");
+                            if let Ok(mut q) = click_queue.lock() {
+                                q.push(format!("__control_value:{}:{}", action, value));
+                            }
+                        }
+                    }
+                    // 处理字符串 action
+                    if let neon_ui_schema::UiIntent::Invoke { action, .. } = event.intent {
+                        println!("[ui-host] click: {action}");
+                        if let Ok(mut q) = click_queue.lock() { q.push(action); }
+                    }
                 }
             }
             (RpcResponse {
