@@ -24,6 +24,27 @@ pub use symbols::{SymbolIndex, SymbolKind};
 /// Facade tying buffer, highlight cache, symbol index, and the edit session
 /// together. This is the type embedders hold; individual modules stay usable
 /// on their own for tests and tooling.
+/// One character-level edit the renderer can turn into a transient shader
+/// (delete -> fragment burst, insert -> type-in). Recorded at the moment the
+/// edit lands so the renderer knows *what* changed; it resolves screen
+/// positions from the current layout, so no editor-core dependency on fonts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EditEvent {
+    pub kind: EditEventKind,
+    /// Line of the edit (0-based).
+    pub row: u32,
+    /// Column of the edit (0-based, char units).
+    pub column: u32,
+    /// Inserted text (Insert) or the exact deleted text (Delete).
+    pub text: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EditEventKind {
+    Insert,
+    Delete,
+}
+
 pub struct EditorCore {
     buffer: TextBuffer,
     grammar: FlowGrammar,
@@ -34,6 +55,10 @@ pub struct EditorCore {
     /// adoption diverges the buffer from this mirror, the next ChangeSet is a
     /// full resync instead of incremental ops.
     host_text: String,
+    /// Character-level edits since the renderer last took them, front to
+    /// back. Bounded FIFO: the renderer drains it every frame, so it stays
+    /// tiny; the cap only guards against a stalled renderer.
+    edit_events: std::collections::VecDeque<EditEvent>,
 }
 
 impl EditorCore {
@@ -48,6 +73,7 @@ impl EditorCore {
             symbols,
             session: EditSession::default(),
             host_text: source.to_string(),
+            edit_events: std::collections::VecDeque::new(),
         }
     }
 
@@ -87,6 +113,15 @@ impl EditorCore {
         let past = self.buffer.insert(at, text);
         self.after_edit(at.line);
         self.session.record_insert(at, past, text);
+        if !text.is_empty() {
+            self.edit_events.push_back(EditEvent {
+                kind: EditEventKind::Insert,
+                row: at.line,
+                column: at.column,
+                text: text.to_string(),
+            });
+            Self::trim_edit_events(&mut self.edit_events);
+        }
         past
     }
 
@@ -100,6 +135,15 @@ impl EditorCore {
         let removed = self.buffer.delete(start, end);
         self.after_edit(removed.line);
         self.session.record_delete(removed, end, &deleted);
+        if !deleted.is_empty() {
+            self.edit_events.push_back(EditEvent {
+                kind: EditEventKind::Delete,
+                row: start.line,
+                column: start.column,
+                text: deleted,
+            });
+            Self::trim_edit_events(&mut self.edit_events);
+        }
         removed
     }
 
@@ -154,6 +198,20 @@ impl EditorCore {
                 },
             ],
         })
+    }
+
+    /// Drains the pending character-level edits. Called by the renderer once
+    /// per frame before layout; events not consumed here are lost, so the
+    /// renderer must call this exactly once per redraw.
+    pub fn take_edit_events(&mut self) -> Vec<EditEvent> {
+        self.edit_events.drain(..).collect()
+    }
+
+    fn trim_edit_events(events: &mut std::collections::VecDeque<EditEvent>) {
+        const MAX_EDIT_EVENTS: usize = 256;
+        while events.len() > MAX_EDIT_EVENTS {
+            events.pop_front();
+        }
     }
 
     pub fn completions(&self, position: Position) -> Vec<CompletionItem> {

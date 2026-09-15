@@ -8,6 +8,8 @@
 
 use std::collections::BTreeMap;
 
+use crate::highlight::{ClassifyRule, TokenClass};
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FlowGrammar {
     /// Top-level statement keywords (`input`, `surface`, `machine`, ...).
@@ -20,6 +22,9 @@ pub struct FlowGrammar {
     pub node_attributes: BTreeMap<&'static str, Vec<&'static str>>,
     /// Input kinds accepted after `input <key>`.
     pub input_kinds: Vec<&'static str>,
+    /// Ordered classification rules consulted by the highlighter. Rule-table
+    /// driven so new languages (or tweaks to NUI Flow) only edit data.
+    pub classify_rules: Vec<ClassifyRule>,
 }
 
 impl FlowGrammar {
@@ -154,6 +159,22 @@ pub fn nui_flow_default() -> FlowGrammar {
         common_attributes: common,
         node_attributes,
         input_kinds,
+        // NUI Flow classification precedence (mirrors the old hand-written
+        // classify() order exactly): prefix rules first, color before generic
+        // `#` ident, then numeric/intent, grammar tables, and the two
+        // line-context rules, ending with the Ident fallback.
+        classify_rules: vec![
+            ClassifyRule::StartsWith("$", TokenClass::InputRef),
+            ClassifyRule::HexColor,
+            ClassifyRule::StartsWith("#", TokenClass::Ident),
+            ClassifyRule::Numeric,
+            ClassifyRule::Intent,
+            ClassifyRule::Keyword,
+            ClassifyRule::NodeKind,
+            ClassifyRule::NodeKeyAfterNodeKind,
+            ClassifyRule::AttributeOfNodeKind,
+            ClassifyRule::Fallback(TokenClass::Ident),
+        ],
     }
 }
 

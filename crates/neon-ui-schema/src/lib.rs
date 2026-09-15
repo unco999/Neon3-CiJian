@@ -3781,6 +3781,13 @@ pub struct UiCodeEditorDeclaration {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completion_input_key: Option<String>,
     pub gutter_diagnostics: bool,
+    /// Per token-class text material for syntax-specific shader styling.
+    /// Key is the stable TokenClass name produced by the editor-core
+    /// highlighter ("Keyword", "StringLiteral", ...). Glyphs whose class has
+    /// an entry here route to the package pass with the declared overflow;
+    /// classes without an entry render as ordinary token-colored text.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub token_materials: std::collections::BTreeMap<String, UiTextMaterialRef>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -25,6 +25,27 @@ pub enum TokenClass {
     Ident,
 }
 
+impl TokenClass {
+    /// Stable string key used by renderer-side `token_shader` lookups. The
+    /// spelling is part of the NUI Flow declaration contract (`token_shader
+    /// Keyword ...`), so it must not change casually.
+    pub fn name(self) -> &'static str {
+        match self {
+            TokenClass::Keyword => "Keyword",
+            TokenClass::NodeKind => "NodeKind",
+            TokenClass::NodeKey => "NodeKey",
+            TokenClass::Attribute => "Attribute",
+            TokenClass::InputRef => "InputRef",
+            TokenClass::ColorLiteral => "ColorLiteral",
+            TokenClass::NumericLiteral => "NumericLiteral",
+            TokenClass::StringLiteral => "StringLiteral",
+            TokenClass::Intent => "Intent",
+            TokenClass::Comment => "Comment",
+            TokenClass::Ident => "Ident",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Span {
     /// Char offset of the first character of the span within its line.
@@ -149,6 +170,33 @@ pub fn tokenize_line(line: &str, mut state: LineState, grammar: &FlowGrammar) ->
     LineTokens { spans, state }
 }
 
+/// A single classification rule for the rule-table driven highlighter.
+/// Rules are tried in order; the first one that matches wins. Rules that
+/// inspect grammar tables (`Keyword`, `NodeKind`, `AttributeOfNodeKind`) stay
+/// grammar-agnostic, so a different language only supplies a different table
+/// plus its own rule list -- the classify() kernel never changes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClassifyRule {
+    /// Token starts with a literal prefix.
+    StartsWith(&'static str, TokenClass),
+    /// Plain numeric literal or typed range (`i32:0..24`).
+    Numeric,
+    /// Dotted lowercase intent (`asset.review.publish`).
+    Intent,
+    /// `#` followed by 6/8 hex digits at a token boundary.
+    HexColor,
+    /// Present in the grammar keyword table.
+    Keyword,
+    /// Present in the grammar node-kind table.
+    NodeKind,
+    /// Token directly follows a NodeKind token on the same line.
+    NodeKeyAfterNodeKind,
+    /// Listed as an attribute of the line's current node kind.
+    AttributeOfNodeKind,
+    /// Terminal fallback.
+    Fallback(TokenClass),
+}
+
 fn starts_color_literal(rest: &[char]) -> bool {
     let mut count = 0usize;
     for character in rest {
@@ -165,41 +213,50 @@ fn starts_color_literal(rest: &[char]) -> bool {
         .is_none_or(|character| character.is_whitespace())
 }
 
-fn classify(
+/// Classifies one whitespace-separated token by walking the grammar's rule
+/// table in order. The old hand-written if-else chain is now data: NUI Flow
+/// keeps the same precedence by ordering its rules (prefix `$`/`#` first,
+/// color before generic `#` ident, context rules before the fallback).
+pub fn classify(
     token: &str,
     previous_class: Option<TokenClass>,
     node_kind_in_line: &Option<String>,
     grammar: &FlowGrammar,
 ) -> TokenClass {
-    if token.starts_with('$') {
-        return TokenClass::InputRef;
-    }
-    if token.starts_with('#') {
-        if starts_color_literal(&token.chars().skip(1).collect::<Vec<char>>()) {
-            return TokenClass::ColorLiteral;
+    for rule in &grammar.classify_rules {
+        let class = match rule {
+            ClassifyRule::StartsWith(prefix, class) => {
+                token.starts_with(prefix).then_some(*class)
+            }
+            ClassifyRule::Numeric => {
+                is_numeric_token(token).then_some(TokenClass::NumericLiteral)
+            }
+            ClassifyRule::Intent => is_intent_token(token).then_some(TokenClass::Intent),
+            ClassifyRule::HexColor => {
+                let rest = token.chars().skip(1).collect::<Vec<char>>();
+                (token.starts_with('#') && starts_color_literal(&rest))
+                    .then_some(TokenClass::ColorLiteral)
+            }
+            ClassifyRule::Keyword => {
+                grammar.is_keyword(token).then_some(TokenClass::Keyword)
+            }
+            ClassifyRule::NodeKind => {
+                grammar.is_node_kind(token).then_some(TokenClass::NodeKind)
+            }
+            // The token directly after a node kind is the node's semantic key.
+            ClassifyRule::NodeKeyAfterNodeKind => {
+                (previous_class == Some(TokenClass::NodeKind)).then_some(TokenClass::NodeKey)
+            }
+            ClassifyRule::AttributeOfNodeKind => node_kind_in_line.as_ref().and_then(|kind| {
+                grammar
+                    .is_attribute_of(kind, token)
+                    .then_some(TokenClass::Attribute)
+            }),
+            ClassifyRule::Fallback(class) => Some(*class),
+        };
+        if let Some(class) = class {
+            return class;
         }
-        return TokenClass::Ident;
-    }
-    if is_numeric_token(token) {
-        return TokenClass::NumericLiteral;
-    }
-    if is_intent_token(token) {
-        return TokenClass::Intent;
-    }
-    if grammar.is_keyword(token) {
-        return TokenClass::Keyword;
-    }
-    if grammar.is_node_kind(token) {
-        return TokenClass::NodeKind;
-    }
-    // The token directly after a node kind is the node's semantic key.
-    if previous_class == Some(TokenClass::NodeKind) {
-        return TokenClass::NodeKey;
-    }
-    if let Some(node_kind) = node_kind_in_line
-        && grammar.is_attribute_of(node_kind, token)
-    {
-        return TokenClass::Attribute;
     }
     TokenClass::Ident
 }

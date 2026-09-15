@@ -46,7 +46,7 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
     let mut branches = Vec::new();
     let mut templates = Vec::new();
     let mut data_grids = Vec::new();
-    let mut code_editors = BTreeMap::new();
+    let mut code_editors: BTreeMap<String, neon_ui_schema::UiCodeEditorDeclaration> = BTreeMap::new();
     let mut state_machines = Vec::new();
     let mut motions = Vec::new();
     let mut pending_keyframes: Vec<(String, UiAnimationKeyframe)> = Vec::new();
@@ -256,7 +256,8 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
         if indent >= 2
             && (content.starts_with("geometry ")
                 || content.starts_with("material ")
-                || content.starts_with("text_material "))
+                || content.starts_with("text_material ")
+                || content.starts_with("token_shader "))
         {
             let parent = stack.last_mut().ok_or_else(|| {
                 error(
@@ -270,6 +271,22 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
                 parent.1.geometry = Some(parse_geometry_line(content, line)?);
             } else if content.starts_with("material ") {
                 parent.1.material = Some(parse_material_line(content, line)?);
+            } else if content.starts_with("token_shader ") {
+                // The code_editor declaration is moved out of the node build
+                // into `code_editors` right after parse_node, so look it up by
+                // the parent node key instead of the build struct.
+                let (class, material) = parse_token_shader_line(content, line)?;
+                let editor = code_editors
+                    .get_mut(&parent.1.node.node_id.0)
+                    .ok_or_else(|| {
+                        error(
+                            "nui_flow_orphan_token_shader",
+                            "token_shader requires a code_editor parent",
+                            line,
+                            1,
+                        )
+                    })?;
+                editor.token_materials.insert(class, material);
             } else {
                 parent.1.text_material = Some(parse_text_material_line(content, line)?);
             }
@@ -4360,6 +4377,7 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
             read_only_input_key: code_editor_read_only,
             completion_input_key: code_editor_completions,
             gutter_diagnostics: code_editor_gutter_diagnostics,
+            token_materials: BTreeMap::new(),
         })
     } else {
         None
@@ -4953,6 +4971,42 @@ fn parse_text_material_line(text: &str, line: u32) -> FlowResult<UiTextMaterialR
         )
     })?;
     Ok(material)
+}
+
+/// Parses `token_shader <class> <package> [overflow L T R B] [duration ms]`.
+/// The class is the highlighter's stable TokenClass name (Keyword,
+/// StringLiteral, ...) used to look up which package styles that class.
+/// Material options are identical to `text_material`, so the remainder is
+/// forwarded to `parse_text_material_line` (zero duplicated parsing logic).
+fn parse_token_shader_line(text: &str, line: u32) -> FlowResult<(String, UiTextMaterialRef)> {
+    let mut parts = text.splitn(3, ' ');
+    if parts.next() != Some("token_shader") {
+        return Err(error(
+            "nui_flow_invalid_token_shader",
+            "token_shader line must start with token_shader",
+            line,
+            1,
+        ));
+    }
+    let class = parts.next().ok_or_else(|| {
+        error(
+            "nui_flow_invalid_token_shader",
+            "token_shader requires a token class name",
+            line,
+            1,
+        )
+    })?;
+    let rest = parts.next().unwrap_or_default();
+    if rest.is_empty() {
+        return Err(error(
+            "nui_flow_invalid_token_shader",
+            "token_shader requires a registered shader package key",
+            line,
+            1,
+        ));
+    }
+    let material = parse_text_material_line(&format!("text_material {rest}"), line)?;
+    Ok((class.to_string(), material))
 }
 
 fn parse_attribute(

@@ -6004,6 +6004,23 @@ impl UiWgpuRenderer {
     /// Runs on every refresh (before the plan-reuse early return) and inside
     /// `has_active_animation`, so a static fragment still falls back to the
     /// default text pass once `duration_ms` elapses.
+    /// Whether any editor needs a layout pass this frame: pending edits that
+    /// have not been drained into fx yet, or transient fx still inside their
+    /// playback window. The plan-reuse early return must not skip layout while
+    /// either is true, or edit events would pile up in editor-core forever.
+    fn has_editor_activity(&self) -> bool {
+        self.editors.values().any(|state| {
+            state.pending_edits
+                || state
+                    .edit_fx
+                    .iter()
+                    .any(|fx| {
+                        fx.started_seconds + fx.duration_ms as f32 / 1000.0
+                            > self.animation_clock_seconds
+                    })
+        })
+    }
+
     pub(crate) fn expire_one_shot_text_materials(&mut self, time_seconds: f32) -> bool {
         let mut expired_text_materials = false;
         let mut active_text_materials = false;
@@ -6048,6 +6065,17 @@ impl UiWgpuRenderer {
             .node_text_materials
             .values()
             .any(|material| material.duration_ms.is_none());
+        // Transient edit fx (type-in / delete fragment) are running shaders
+        // too: keep the loop redrawing until they expire.
+        let mut active_edit_fx = false;
+        for state in self.editors.values_mut() {
+            state.edit_fx.retain(|fx| {
+                let alive =
+                    time_seconds - fx.started_seconds < fx.duration_ms as f32 / 1000.0;
+                active_edit_fx |= alive;
+                alive
+            });
+        }
         let mut timeline_updates = Vec::new();
         for id in self.active.keys().cloned().collect::<Vec<_>>() {
             if self.paused_animations.contains_key(&id) {
@@ -6204,6 +6232,7 @@ impl UiWgpuRenderer {
             || expired_exits
             || active_text_materials
             || expired_text_materials
+            || active_edit_fx
     }
 
     pub(crate) fn cancel_animation(&mut self, node_path: &str) -> bool {
@@ -9425,9 +9454,13 @@ impl UiWgpuRenderer {
         // labels into the popup text pass (both carry their own clip rects).
         let mut texts = texts;
         let mut popup_texts = popup_texts;
-        let text_material_batches = text_material_batches;
+        let mut text_material_batches = text_material_batches;
         texts.extend(editor_layout.editor_texts);
         popup_texts.extend(editor_layout.editor_popup_texts);
+        // Whole-editor text materials: code glyphs already carry the expanded
+        // rect/clip/overflow from layout_editors, so they join the same
+        // per-package material pass as text-node batches.
+        text_material_batches.extend(editor_layout.editor_text_materials);
         let text_layout_ms = stage.elapsed().as_secs_f32() * 1000.0;
         if texts.len() > self.text_capacity {
             self.text_capacity = texts.len().next_power_of_two();
@@ -10166,7 +10199,8 @@ impl UiWgpuRenderer {
         // fragment never changes, so run expiry before the plan-reuse early
         // return.
         self.expire_one_shot_text_materials(self.animation_clock_seconds);
-        if matches && !data_grid_hold_changed && !stale_exiting_plan {
+        if matches && !data_grid_hold_changed && !stale_exiting_plan && !self.has_editor_activity()
+        {
             return false;
         }
         let previous_text_materials = self.node_text_materials.clone();

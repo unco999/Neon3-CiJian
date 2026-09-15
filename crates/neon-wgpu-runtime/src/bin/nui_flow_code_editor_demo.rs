@@ -225,6 +225,55 @@ fn main() {
     }
 }
 
+/// Transient type-in: the glyph materializes with a holographic scan band,
+/// a cyan energy lift, and an inner white flash, then settles into the token
+/// color. The renderer expires the fx after ~420 ms, so only the leading edge
+/// shows; fract() keeps the shader self-contained if a frame lingers.
+const TEXT_TYPE_IN_SOURCE: &str = r#"
+fn text_material(input: TextMaterialInput) -> vec4<f32> {
+    let t = fract(input.time_seconds * 2.4);
+    let appear = smoothstep(0.0, 0.35, t);
+    let core = smoothstep(0.08, 0.55, input.coverage);
+    // Holographic scan band sweeping top -> bottom once across the glyph box.
+    let scan_y = input.local_position.y / max(input.glyph_quad.w, 1.0);
+    let scan = smoothstep(0.10, 0.0, abs(scan_y - t));
+    // Energy lift: the glyph rises out of the baseline.
+    let lift = (1.0 - appear) * 12.0;
+    let holo = vec3<f32>(0.35, 1.0, 0.95);
+    let base = input.base_color.rgb;
+    let energy = (1.0 - appear) * 1.2;
+    let rgb = mix(base, holo, 0.55) * (0.72 + 0.55 * scan + energy * 0.5);
+    let glow = pow(input.edge_ink, 2.0) * (0.9 + scan * 1.4) * (1.0 - t * 0.4);
+    let alpha = clamp(core * appear + glow * 0.55, 0.0, 1.0);
+    return vec4<f32>(rgb + holo * glow * 0.9, alpha);
+}
+"#;
+
+/// Transient delete: the ghost detonates into cyan energy -- a leading white
+/// flash, a fast exponential boom, per-pixel particle jitter, and a flickering
+/// ember tail as it fades (A-route, no SDF; the renderer snaps the ghost at the
+/// pre-delete position and expires the fx after ~620 ms).
+const TEXT_DELETE_FRAGMENT_SOURCE: &str = r#"
+fn text_material(input: TextMaterialInput) -> vec4<f32> {
+    let t = fract(input.time_seconds * 1.65);
+    let seed = dot(input.local_position, vec2<f32>(3.7, 11.3)) + 0.31;
+    let core = smoothstep(0.08, 0.55, input.coverage);
+    // Particle jitter: per-pixel phase grows with t^2 so the glyph shreds.
+    let shake = (sin(seed * 7.0 + t * 44.0) + cos(seed * 5.0 - t * 31.0)) * 0.5;
+    let jitter = shake * t * t * 4.0;
+    // Energy boom: bright cyan flash at t=0, exponential decay.
+    let boom = exp(-t * 6.5);
+    let holo = vec3<f32>(0.3, 0.95, 1.0);
+    let flicker = 0.5 + 0.5 * sin(input.time_seconds * 71.0 + seed * 13.0);
+    let base = input.base_color.rgb;
+    let rgb = mix(base, holo, 0.45 + 0.45 * boom) * (0.7 + flicker * 0.35 + boom * 1.5);
+    let edge = pow(input.edge_ink, 2.0) * boom * 1.3;
+    let fade = 1.0 - smoothstep(0.0, 1.0, t);
+    let alpha = clamp(core * fade + edge * 0.7 * fade, 0.0, 1.0);
+    return vec4<f32>(rgb + holo * edge * 1.1, alpha);
+}
+"#;
+
 fn register_text_shader_package(wgpu_endpoint: SocketAddr) {
     let packages = [
         (
@@ -251,6 +300,16 @@ fn register_text_shader_package(wgpu_endpoint: SocketAddr) {
             "aurora-glow",
             AURORA_SOURCE,
             "code-editor-demo-register-aurora-v1",
+        ),
+        (
+            "text-type-in",
+            TEXT_TYPE_IN_SOURCE,
+            "code-editor-demo-register-type-in-v1",
+        ),
+        (
+            "text-delete-fragment",
+            TEXT_DELETE_FRAGMENT_SOURCE,
+            "code-editor-demo-register-delete-fragment-v1",
         ),
     ];
     let mut last_error = String::new();

@@ -14,7 +14,9 @@
 use std::collections::HashMap;
 
 use neon_editor_core::grammar::nui_flow_default;
-use neon_editor_core::{CompletionItem, CompletionKind, EditorCore, Position, TokenClass};
+use neon_editor_core::{
+    CompletionItem, CompletionKind, EditEventKind, EditorCore, Position, TokenClass,
+};
 use neon_ui_schema::{TextRef, UiCodeEditorDeclaration, UiEditorLanguage, UiNodeKind};
 use winit::keyboard::{Key, NamedKey};
 
@@ -50,6 +52,38 @@ pub(super) struct EditorCompletionState {
     pub selected: usize,
 }
 
+/// Transient shader packages applied to character-level edits. Inserted
+/// glyphs get a quick type-in (fade + lift); deleted glyphs keep a snapshot
+/// fragment that bursts away. The renderer owns the lifecycle: an fx lives
+/// for `duration_ms` after the edit event landed, then disappears, mirroring
+/// how one-shot node text materials expire.
+const EDIT_FX_INSERT_PACKAGE: &str = "text-type-in";
+const EDIT_FX_DELETE_PACKAGE: &str = "text-delete-fragment";
+const EDIT_FX_INSERT_DURATION_MS: u32 = 420;
+const EDIT_FX_DELETE_DURATION_MS: u32 = 620;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum EditFxKind {
+    Insert,
+    Delete,
+}
+
+/// One transient edit effect. `instances` is populated during layout:
+/// Insert fx resolve glyphs from the current layout every frame (so they
+/// follow scroll), Delete fx snapshot their ghost glyphs once (`generated`)
+/// at the pre-delete estimate position.
+pub(super) struct EditorEditFx {
+    pub kind: EditFxKind,
+    pub package_id: String,
+    pub row: u32,
+    pub col: u32,
+    pub len: usize,
+    pub instances: Vec<UiTextInstance>,
+    pub generated: bool,
+    pub started_seconds: f32,
+    pub duration_ms: u32,
+}
+
 /// Renderer-local state for one code-editor component.
 pub(super) struct EditorRuntimeState {
     pub declaration: UiCodeEditorDeclaration,
@@ -69,6 +103,9 @@ pub(super) struct EditorRuntimeState {
     pub preedit: String,
     pub last_edit_seconds: f32,
     pub pending_edits: bool,
+    /// Active transient edit effects (type-in / delete fragment). Bounded:
+    /// every layout retires entries older than their duration.
+    pub edit_fx: Vec<EditorEditFx>,
 }
 
 impl EditorRuntimeState {
@@ -90,6 +127,7 @@ impl EditorRuntimeState {
             preedit: String::new(),
             last_edit_seconds: 0.0,
             pending_edits: false,
+            edit_fx: Vec::new(),
         }
     }
 }
@@ -110,6 +148,12 @@ pub(super) struct EditorLayoutOutput {
     /// Caret + completion popup background/selected-item highlight (drawn
     /// above glyphs, in the popup instance pass).
     pub editor_popup_rects: Vec<UiInstance>,
+    /// Code-glyph instances routed to the per-package text-material pass when
+    /// the code_editor node declares a `text_material`. Each entry is
+    /// `(package_id, instances)`; glyph rects/clips are pre-expanded by the
+    /// material overflow, mirroring how text nodes route into
+    /// `text_material_batches`. Line numbers stay in `editor_texts`.
+    pub editor_text_materials: Vec<(String, Vec<UiTextInstance>)>,
 }
 
 /// Raster/metrics pixel size for an editor: glyphs are rasterized 1:1 at the
@@ -354,13 +398,13 @@ impl super::UiWgpuRenderer {
         let Some(font) = self.resident_font.as_mut() else {
             return output;
         };
-        let editors = &self.editors;
+        let editors = &mut self.editors;
         let sampled = &self.sampled;
         let plan = &self.plan;
         let plan_index = &self.plan_index;
         let viewport_logical_size = self.viewport_logical_size;
-        let paths: Vec<&String> = editors.keys().collect();
-        for path in paths {
+        let paths: Vec<String> = editors.keys().cloned().collect();
+        for path in &paths {
             let Some(index) = plan_index.get(path).copied() else {
                 continue;
             };
@@ -375,8 +419,47 @@ impl super::UiWgpuRenderer {
             if plan[index].instance_index.is_none() {
                 continue;
             }
-            let state = editors.get(path).expect("path from editors keys");
+            let state = editors.get_mut(path).expect("path from editors keys");
             let declaration = &state.declaration;
+            // Whole-editor text material: the code_editor node declares a
+            // `text_material` clause like any text node, the effect lands in
+            // node_text_materials under the full fragment/node path, and this
+            // layout routes every code glyph through the package pass while
+            // keeping the line-number gutter in the ordinary text pass.
+            let editor_material = self.node_text_materials.get(path).cloned();
+            let mut editor_material_instances: Vec<UiTextInstance> = Vec::new();
+            // Per-token-class shader routing: each entry is (package_id,
+            // instances). Instances are pre-expanded by the declaring class
+            // material's overflow, mirroring the whole-node text material.
+            let mut token_material_batches: Vec<(String, Vec<UiTextInstance>)> = Vec::new();
+            // Drain character-level edits into transient fx (type-in for
+            // inserts, fragment burst for deletes). Instances are resolved
+            // during the visible-rows loop below.
+            for event in state.core.take_edit_events() {
+                let (kind, package_id, duration_ms) = match event.kind {
+                    EditEventKind::Insert => (
+                        EditFxKind::Insert,
+                        EDIT_FX_INSERT_PACKAGE,
+                        EDIT_FX_INSERT_DURATION_MS,
+                    ),
+                    EditEventKind::Delete => (
+                        EditFxKind::Delete,
+                        EDIT_FX_DELETE_PACKAGE,
+                        EDIT_FX_DELETE_DURATION_MS,
+                    ),
+                };
+                state.edit_fx.push(EditorEditFx {
+                    kind,
+                    package_id: package_id.into(),
+                    row: event.row,
+                    col: event.column,
+                    len: event.text.chars().count(),
+                    instances: Vec::new(),
+                    generated: false,
+                    started_seconds: time_seconds,
+                    duration_ms,
+                });
+            }
             let raster_px = editor_px(declaration);
             let row_height = editor_row_height(font, declaration);
             if row_height <= 0.0 || visual.bounds.width <= 0.0 || visual.bounds.height <= 0.0 {
@@ -516,7 +599,80 @@ impl super::UiWgpuRenderer {
                     let Ok(glyph) = ensure_glyph(device, queue, font, ch, raster_px) else {
                         continue;
                     };
-                    output.editor_texts.push(UiTextInstance {
+                    // Transient edit fx: inserted glyphs in the fx column
+                    // range ride the type-in package; a delete fx snapshots
+                    // its ghost at the pre-delete estimate position once.
+                    for fx in state.edit_fx.iter_mut() {
+                        if fx.kind == EditFxKind::Insert
+                            && fx.row == row
+                            && column >= fx.col
+                            && column < fx.col + fx.len as u32
+                        {
+                            let mut inst = UiTextInstance {
+                                rect: [
+                                    (x + glyph.xmin).floor(),
+                                    baseline + glyph.plane_min_y.floor(),
+                                    glyph.width,
+                                    glyph.height,
+                                ],
+                                color,
+                                clip,
+                                uv: glyph.uv,
+                                depth,
+                                paint_group_id,
+                                animation: base_track,
+                                transform_from: [0.0, 0.0, 1.0, 1.0],
+                                transform_to: [0.0, 0.0, 1.0, 1.0],
+                                rotation_pivot: [0.0; 4],
+                                overflow: [0.0; 4],
+                            };
+                            inst.rect[0] -= 6.0;
+                            inst.rect[1] -= 6.0;
+                            inst.rect[2] += 12.0;
+                            inst.rect[3] += 12.0;
+                            inst.clip[0] -= 6.0;
+                            inst.clip[1] -= 6.0;
+                            inst.clip[2] += 12.0;
+                            inst.clip[3] += 12.0;
+                            inst.overflow = [6.0, 6.0, 6.0, 6.0];
+                            fx.instances.push(inst);
+                        } else if fx.kind == EditFxKind::Delete
+                            && fx.row == row
+                            && !fx.generated
+                            && column == fx.col
+                        {
+                            let mut ghost = UiTextInstance {
+                                rect: [
+                                    (x + glyph.xmin).floor(),
+                                    baseline + glyph.plane_min_y.floor(),
+                                    glyph.width,
+                                    glyph.height,
+                                ],
+                                color,
+                                clip,
+                                uv: glyph.uv,
+                                depth,
+                                paint_group_id,
+                                animation: base_track,
+                                transform_from: [0.0, 0.0, 1.0, 1.0],
+                                transform_to: [0.0, 0.0, 1.0, 1.0],
+                                rotation_pivot: [0.0; 4],
+                                overflow: [0.0; 4],
+                            };
+                            ghost.rect[0] -= 8.0;
+                            ghost.rect[1] -= 8.0;
+                            ghost.rect[2] += 16.0;
+                            ghost.rect[3] += 16.0;
+                            ghost.clip[0] -= 8.0;
+                            ghost.clip[1] -= 8.0;
+                            ghost.clip[2] += 16.0;
+                            ghost.clip[3] += 16.0;
+                            ghost.overflow = [8.0, 8.0, 8.0, 8.0];
+                            fx.instances.push(ghost);
+                            fx.generated = true;
+                        }
+                    }
+                    let mut instance = UiTextInstance {
                         rect: [
                             (x + glyph.xmin).floor(),
                             baseline + glyph.plane_min_y.floor(),
@@ -533,7 +689,57 @@ impl super::UiWgpuRenderer {
                         transform_to: [0.0, 0.0, 1.0, 1.0],
                         rotation_pivot: [0.0; 4],
                         overflow: [0.0; 4],
-                    });
+                    };
+                    // Token-class shader takes precedence; the whole-node
+                    // text material is the fallback for classes without a
+                    // dedicated entry. Glyph routing mirrors the text-node
+                    // path: expand rect/clip by the material overflow so a
+                    // glow can paint outside the glyph box.
+                    let class_material = highlight
+                        .and_then(|tokens| tokens.class_at(column))
+                        .and_then(|class| declaration.token_materials.get(class.name()));
+                    if let Some(text_material) = class_material {
+                        instance.rect[0] -= text_material.overflow[0];
+                        instance.rect[1] -= text_material.overflow[1];
+                        instance.rect[2] +=
+                            text_material.overflow[0] + text_material.overflow[2];
+                        instance.rect[3] +=
+                            text_material.overflow[1] + text_material.overflow[3];
+                        instance.clip[0] -= text_material.overflow[0];
+                        instance.clip[1] -= text_material.overflow[1];
+                        instance.clip[2] +=
+                            text_material.overflow[0] + text_material.overflow[2];
+                        instance.clip[3] +=
+                            text_material.overflow[1] + text_material.overflow[3];
+                        instance.overflow = text_material.overflow;
+                        match token_material_batches
+                            .iter_mut()
+                            .find(|(package, _)| *package == text_material.package_id)
+                        {
+                            Some((_, instances)) => instances.push(instance),
+                            None => token_material_batches.push((
+                                text_material.package_id.clone(),
+                                vec![instance],
+                            )),
+                        }
+                    } else if let Some(text_material) = &editor_material {
+                        instance.rect[0] -= text_material.overflow[0];
+                        instance.rect[1] -= text_material.overflow[1];
+                        instance.rect[2] +=
+                            text_material.overflow[0] + text_material.overflow[2];
+                        instance.rect[3] +=
+                            text_material.overflow[1] + text_material.overflow[3];
+                        instance.clip[0] -= text_material.overflow[0];
+                        instance.clip[1] -= text_material.overflow[1];
+                        instance.clip[2] +=
+                            text_material.overflow[0] + text_material.overflow[2];
+                        instance.clip[3] +=
+                            text_material.overflow[1] + text_material.overflow[3];
+                        instance.overflow = text_material.overflow;
+                        editor_material_instances.push(instance);
+                    } else {
+                        output.editor_texts.push(instance);
+                    }
                     x += glyph.advance;
                     column += 1;
                 }
@@ -569,6 +775,33 @@ impl super::UiWgpuRenderer {
                         px += glyph.advance;
                     }
                 }
+            }
+
+            // Retire expired fx and flush their material batches alongside the
+            // static token/whole-node materials.
+            state
+                .edit_fx
+                .retain(|fx| time_seconds - fx.started_seconds < fx.duration_ms as f32 / 1000.0);
+            for fx in &state.edit_fx {
+                if !fx.instances.is_empty() {
+                    output
+                        .editor_text_materials
+                        .push((fx.package_id.clone(), fx.instances.clone()));
+                }
+            }
+            // Flush token-class batches, then the whole-node material (line
+            // numbers are intentionally excluded above; only token-colored
+            // code glyphs route to shaders).
+            output
+                .editor_text_materials
+                .append(&mut token_material_batches);
+            if !editor_material_instances.is_empty()
+                && let Some(text_material) = &editor_material
+            {
+                output.editor_text_materials.push((
+                    text_material.package_id.clone(),
+                    editor_material_instances,
+                ));
             }
 
             // 4) Caret (focused editors; blink unless recently edited or a
