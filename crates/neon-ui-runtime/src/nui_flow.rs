@@ -966,6 +966,16 @@ pub fn lower_nui_flow_effects(document: &NuiFlowDocument) -> Vec<UiEffect> {
     effects.extend(
         document
             .ir
+            .code_editors
+            .iter()
+            .map(|(node_key, declaration)| UiEffect::CodeEditorDeclaration {
+                node_key: node_key.clone(),
+                declaration: declaration.clone(),
+            }),
+    );
+    effects.extend(
+        document
+            .ir
             .image_resources
             .iter()
             .filter(|(_, resource_key)| {

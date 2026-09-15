@@ -18,6 +18,8 @@ use neon_ui_schema::{
 };
 use serde_json::{Value, json};
 
+pub(crate) mod editor_renderer;
+
 const SHADER: &str = r#"
 struct View { viewport: vec2<f32>, color_mode: u32, time_seconds: f32, extras: array<vec4<f32>, 10> }
 @group(0) @binding(0) var<uniform> view: View;
@@ -1076,7 +1078,7 @@ struct ResidentFont {
     font: fontdue::Font,
     _atlas: wgpu::Texture,
     bind_group: wgpu::BindGroup,
-    glyphs: HashMap<char, AtlasGlyph>,
+    glyphs: HashMap<(char, u32), AtlasGlyph>,
     ascent: f32,
     line_height: f32,
     next_x: u32,
@@ -1945,6 +1947,20 @@ pub struct UiWgpuRenderer {
     available_cameras: HashSet<(neon_world_bridge::CameraId, neon_world_bridge::CameraKind)>,
     last_stage_timings: UiDrawStageTimings,
     layout_counters: UiLayoutCounters,
+    /// Renderer-local code-editor mirrors (one per CodeEditorDeclaration).
+    /// The editor-core instances own buffer/highlight/completion/undo state;
+    /// the renderer only presents and forwards commit events to the host.
+    editors: std::collections::HashMap<String, editor_renderer::EditorRuntimeState>,
+    /// Node path of the code editor that currently owns keyboard focus.
+    focused_editor: Option<String>,
+    /// Whether a pointer selection drag is active inside the focused editor.
+    editor_selection_drag: bool,
+    /// Renderer-local clipboard for editor cut/copy/paste (system clipboard
+    /// integration is a later slice).
+    editor_clipboard: String,
+    /// Queued editor commits (one per blur/save) forwarded to ui-runtime
+    /// through the UiHostInbound RPC after the draw loop.
+    editor_pending_commits: Vec<editor_renderer::EditorCommit>,
 }
 
 impl UiWgpuRenderer {
@@ -2922,6 +2938,11 @@ impl UiWgpuRenderer {
             available_cameras: HashSet::new(),
             last_stage_timings: UiDrawStageTimings::default(),
             layout_counters: UiLayoutCounters::default(),
+            editors: HashMap::new(),
+            focused_editor: None,
+            editor_selection_drag: false,
+            editor_clipboard: String::new(),
+            editor_pending_commits: Vec::new(),
         }
     }
 
@@ -6576,6 +6597,10 @@ impl UiWgpuRenderer {
         self.view_buffer_viewport_revision = self.viewport_revision;
         let stage = Instant::now();
         self.refresh_plan(fragments, viewport_logical_size);
+        // Code-editor mirrors reconcile against the (possibly new) plan and
+        // fragment declarations. Adopting host document frames only while
+        // unfocused keeps local typing authoritative.
+        self.reconcile_editors(fragments);
         let refresh_plan_ms = stage.elapsed().as_secs_f32() * 1000.0;
         self.instances.clear();
         let stage = Instant::now();
@@ -6668,6 +6693,10 @@ impl UiWgpuRenderer {
         // CPU first-press handling must be ready as soon as the visible frame is
         // drawn; asynchronous GPU hit readback is only supplemental.
         self.refresh_hit_bindings(fragments);
+        // Code-editor chrome is renderer-local presentation: layout it from
+        // the fresh plan so caret/selection/popup instances join the passes
+        // below.
+        let editor_layout = self.layout_editors(device, queue, time_seconds);
         // Dropdown/modal/tooltip chrome is screen-UI presentation; the world
         // target never carries it. World panels are only emitted through the
         // ordinary instance loop above, so a World pass emits zero popups.
@@ -6749,6 +6778,11 @@ impl UiWgpuRenderer {
             // selection above glyphs so a focused virtual-list cell has a
             // visible insertion point.
             popup_instances.extend(self.text_input_overlay_instances());
+            // Editor caret + completion popup draw above glyphs; the
+            // current-line/selection rects draw beneath glyphs (in the
+            // ordinary instance pass, after every panel).
+            popup_instances.extend(editor_layout.editor_popup_rects);
+            self.instances.extend(editor_layout.editor_rects);
         }
         self.last_panel_instance_count = self.instances.len();
         if self.instances.len() > self.instance_capacity {
@@ -7744,6 +7778,12 @@ impl UiWgpuRenderer {
                 (texts, popup_texts)
             })
             .unwrap_or_default();
+        // Merge editor glyphs into the ordinary text pass and the completion
+        // labels into the popup text pass (both carry their own clip rects).
+        let mut texts = texts;
+        let mut popup_texts = popup_texts;
+        texts.extend(editor_layout.editor_texts);
+        popup_texts.extend(editor_layout.editor_popup_texts);
         let text_layout_ms = stage.elapsed().as_secs_f32() * 1000.0;
         if texts.len() > self.text_capacity {
             self.text_capacity = texts.len().next_power_of_two();
@@ -11801,11 +11841,13 @@ fn ensure_glyph(
     queue: &wgpu::Queue,
     font: &mut ResidentFont,
     ch: char,
+    px: f32,
 ) -> Result<AtlasGlyph, &'static str> {
-    if let Some(glyph) = font.glyphs.get(&ch).copied() {
+    let px_key = px.round().max(1.0) as u32;
+    if let Some(glyph) = font.glyphs.get(&(ch, px_key)).copied() {
         return Ok(glyph);
     }
-    let (metrics, bitmap) = font.font.rasterize(ch, FONT_RASTER_SIZE);
+    let (metrics, bitmap) = font.font.rasterize(ch, px);
     let width = metrics.width as u32;
     let height = metrics.height as u32;
     if width == 0 || height == 0 {
@@ -11817,7 +11859,7 @@ fn ensure_glyph(
             plane_min_y: 0.0,
             advance: metrics.advance_width,
         };
-        font.glyphs.insert(ch, glyph);
+        font.glyphs.insert((ch, px_key), glyph);
         return Ok(glyph);
     }
     let padding = 1;
@@ -11877,7 +11919,7 @@ fn ensure_glyph(
         plane_min_y,
         advance: metrics.advance_width,
     };
-    font.glyphs.insert(ch, glyph);
+    font.glyphs.insert((ch, px_key), glyph);
     Ok(glyph)
 }
 
@@ -12156,7 +12198,7 @@ fn layout_text(
         let mut glyphs = Vec::new();
         let mut line_advance = 0.0;
         for ch in glyph_chars {
-            let glyph = ensure_glyph(device, queue, font, ch).ok()?;
+            let glyph = ensure_glyph(device, queue, font, ch, FONT_RASTER_SIZE).ok()?;
             line_advance += glyph.advance * text_scale;
             glyphs.push(glyph);
         }
@@ -12175,13 +12217,12 @@ fn layout_text(
                     10.0 * text_scale
                 }
         };
-        let baseline =
-            top + font.ascent * text_scale + line_index as f32 * font.line_height * text_scale;
+        let baseline = (top + font.ascent * text_scale + line_index as f32 * font.line_height * text_scale).floor();
         for glyph in glyphs {
             result.push(UiTextInstance {
                 rect: [
-                    x + glyph.xmin * text_scale,
-                    baseline + glyph.plane_min_y * text_scale,
+                    (x + glyph.xmin * text_scale).floor(),
+                    baseline + (glyph.plane_min_y * text_scale).floor(),
                     glyph.width * text_scale,
                     glyph.height * text_scale,
                 ],
@@ -12266,7 +12307,7 @@ fn layout_rich_text(
     let mut result = Vec::new();
     let mut global_idx = 0usize;
     for (line_index, line_chars) in char_lines.into_iter().enumerate() {
-        let baseline = top + font.ascent * max_scale + line_index as f32 * line_height;
+        let baseline = (top + font.ascent * max_scale + line_index as f32 * line_height).floor();
         // Compute line advance first for Button centering.
         let line_advance: f32 = line_chars
             .iter()
@@ -12293,11 +12334,11 @@ fn layout_rich_text(
         };
         for _ch in line_chars {
             let s = styled[global_idx];
-            let glyph = ensure_glyph(device, queue, font, s.ch).ok()?;
+            let glyph = ensure_glyph(device, queue, font, s.ch, FONT_RASTER_SIZE).ok()?;
             result.push(UiTextInstance {
                 rect: [
-                    x + glyph.xmin * s.scale,
-                    baseline + glyph.plane_min_y * s.scale,
+                    (x + glyph.xmin * s.scale).floor(),
+                    baseline + (glyph.plane_min_y * s.scale).floor(),
                     glyph.width * s.scale,
                     glyph.height * s.scale,
                 ],

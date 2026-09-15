@@ -1106,6 +1106,7 @@ version = "0.2.10"
 dependencies = [
  "bytemuck",
  "fontdue",
+ "neon-editor-core",
  "neon-ipc",
  "neon-observability",
  "neon-projectd",

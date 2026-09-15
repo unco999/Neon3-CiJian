@@ -44,3 +44,6 @@
 /update_flow_behind.py
 /crates/neon-wgpu-runtime/src/lib.rs.broken-backup
 *.py
+/.ai-tmp
+*.bak_baseline
+*.bak_fontalign

@@ -1,0 +1,12 @@
+# NUI Flow fixture: standalone `code_editor` component demo.
+# The renderer draws the editor from the declaration + this fragment; the
+# document source shown below is the literal adopted by the renderer (the
+# host document-frame path is a later slice, see docs/nui-flow-code-editor.md).
+version 1
+surface surface.editor.code-demo revision 1
+input document text default text:empty
+input locked bool default false
+surface root column w 960 h 680 fill #0B1216
+  panel header row gap 8 pad 10 h 42 fill #0E1A22 line #1F3A4A radius 6
+    text title value "NUI Flow code_editor 组件演示" w 940 h 22
+  code_editor source-view source $document language nui_flow line_numbers true wrap none font_size 14 tab_size 4 gutter_diagnostics true value "surface root column w 600 h 420 gap 8\n  panel header row gap 6 fill #102030\n    text title value \"Neon3 地形工作台\"\n    button open value \"打开\" event terrain.open\n    button run value \"运行\" event terrain.run\n  panel body column gap 4 fill #0C1820\n    text hint value \"按 Ctrl+Space 触发补全，Ctrl+Z/Y 撤销重做，Ctrl+S 提交\"\n" event editor.commit

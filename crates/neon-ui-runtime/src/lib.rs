@@ -1578,6 +1578,7 @@ fn program_semantic_event_kind(
             UiProgramSemanticEventKind::InteractionCancel
         }
         UiSemanticEventType::DragDrop => UiProgramSemanticEventKind::ValueCommit,
+        UiSemanticEventType::DocumentCommit => UiProgramSemanticEventKind::ValueCommit,
         UiSemanticEventType::PointerClick
         | UiSemanticEventType::ValueCommit
         | UiSemanticEventType::SelectionChanged

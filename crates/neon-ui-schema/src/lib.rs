@@ -1841,6 +1841,15 @@ pub enum UiEffect {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         image_id: Option<String>,
     },
+    /// Declares one code-editor component in the fragment. The lowered node
+    /// keeps its ordinary Panel kind; this effect is what instructs the unified
+    /// renderer to draw editor chrome (line numbers, token-colored text, caret,
+    /// selection, completion popup) for that node and to route local editing
+    /// semantics through the shared editor kernel.
+    CodeEditorDeclaration {
+        node_key: String,
+        declaration: UiCodeEditorDeclaration,
+    },
 }
 
 /// A world panel is rendered only while its declared camera has supplied a
@@ -1953,6 +1962,7 @@ pub enum UiSemanticEventType {
     ValueCommit,
     SelectionChanged,
     TextInputCommit,
+    DocumentCommit,
     DragDrop,
     FocusChanged,
     InteractionCancelled,
@@ -3454,6 +3464,11 @@ impl UiFragment {
                 {
                     return Err(UiSchemaError::InvalidProgramEvent);
                 }
+                UiEffect::CodeEditorDeclaration { node_key, .. }
+                    if !nodes.contains(node_key) =>
+                {
+                    return Err(UiSchemaError::InvalidProgramEvent);
+                }
                 UiEffect::ImageBinding { node_id, image_id }
                     if !nodes.contains(&node_id.0)
                         || image_id.trim().is_empty()
@@ -3911,6 +3926,13 @@ impl UiEffect {
                         .is_some_and(|asset| asset.kind != "image")
                 {
                     Err(UiSchemaError::InvalidControlSkin)
+                } else {
+                    Ok(())
+                }
+            }
+            Self::CodeEditorDeclaration { node_key, declaration } => {
+                if node_key.trim().is_empty() || !declaration.validate() {
+                    Err(UiSchemaError::InvalidProgramEvent)
                 } else {
                     Ok(())
                 }

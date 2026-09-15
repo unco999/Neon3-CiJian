@@ -7514,6 +7514,77 @@ fn forward_text_input_commit(
     });
 }
 
+/// Forwards one renderer-local code-editor commit to the UI host through the
+/// ui.host.inbound RPC. The event carries DocumentCommit, the declared
+/// event intent of the node, and the full document text as the value.
+fn forward_editor_commit(
+    endpoint: SocketAddr,
+    renderer_epoch: u64,
+    composition_revision: Revision,
+    sequence: u64,
+    commit: ui_renderer::editor_renderer::EditorCommit,
+    fragment_revision: Option<u64>,
+    proxy: Option<EventLoopProxy<WindowCommand>>,
+) {
+    let node_path = commit.node_path.clone();
+    let Some(event_action) = commit.event_action.clone() else {
+        return;
+    };
+    let fragment_id = node_path.rsplit('/').next().unwrap_or("").to_string();
+    let event = UiSemanticEvent {
+        event: neon_ui_schema::UiSemanticEventType::DocumentCommit,
+        event_id: format!("wgpu-editor-commit-{sequence}"),
+        renderer_epoch,
+        composition_revision,
+        fragment: neon_ui_schema::UiFragmentRevision {
+            id: neon_ui_schema::UiFragmentId(fragment_id),
+            revision: neon_protocol::Revision(fragment_revision.unwrap_or(0)),
+        },
+        intent: neon_ui_schema::UiIntent::Invoke {
+            action: event_action,
+            params: json!({}),
+        },
+        pointer: None,
+        focus: Some(neon_ui_schema::UiFocusMetadata { focused: true }),
+        data_grid_cell: None,
+        text: Some(neon_ui_schema::UiTextInputCommit { value: commit.document }),
+        control_value: None,
+        drag_drop: None,
+    };
+    thread::spawn(move || {
+        let request_id = RequestId(event.event_id.clone());
+        let request = RpcRequest {
+            protocol: "neon3.rpc".into(),
+            version: PROTOCOL_VERSION,
+            request_id: request_id.clone(),
+            client: ClientIdentity {
+                kind: ClientKind::WgpuRuntime,
+                instance_id: format!("window-{renderer_epoch}"),
+                pid: std::process::id(),
+                origin: "neon-wgpu-runtime".into(),
+            },
+            target: ServiceName("ui-runtime".into()),
+            method: "ui.host.inbound".into(),
+            params: json!(&event),
+            expected_revision: Some(event.fragment.revision),
+            idempotency_key: Some(format!("wgpu-editor-commit:{renderer_epoch}:{sequence}")),
+        };
+        match RpcClient::connect(endpoint).and_then(|mut client| client.call(&request)) {
+            Ok(response) if response.status == RpcStatus::Accepted => {
+                if let Some(proxy) = proxy
+                    && let Some(result) = response.result
+                    && let Ok(publication) =
+                        serde_json::from_value::<neon_ui_schema::UiHostPublication>(result)
+                {
+                    let _ = proxy.send_event(WindowCommand::ApplyHostPublication(publication));
+                }
+            }
+            Ok(response) => eprintln!("ui editor commit rejected: {:?}", response.error),
+            Err(error) => eprintln!("ui editor commit delivery failed: {error}"),
+        }
+    });
+}
+
 fn text_input_commit_event(
     renderer_epoch: u64,
     composition_revision: Revision,
@@ -7790,7 +7861,6 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
             event_loop.exit();
         }
     }
-
     fn window_event(
         &mut self,
         event_loop: &ActiveEventLoop,
@@ -7878,6 +7948,7 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                         gpu.ui
                             .set_text_input_caret_from_pointer([logical.x, logical.y], true);
                     }
+                    gpu.ui.editor_pointer_drag([logical.x, logical.y]);
                     if gpu.ui.drag_active() && gpu.ui.update_drag_preview() {
                         drag_preview =
                             gpu.active_interaction_id
@@ -7948,6 +8019,31 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                 if state == winit::event::ElementState::Pressed
                     && button == winit::event::MouseButton::Left =>
             {
+                // Code editor press: focus, place the caret, begin a selection
+                // drag. Renderer-local; the previously focused editor commits
+                // immediately through the UiHostInbound RPC.
+                if self.gpu.as_mut().is_some_and(|gpu| {
+                    gpu.ui
+                        .pointer_position()
+                        .is_some_and(|pointer| gpu.ui.editor_pointer_press(pointer))
+                }) {
+                    if let Some(window) = self.window.as_ref() {
+                        window.set_ime_allowed(true);
+                        if let Some(rect) = self
+                            .gpu
+                            .as_ref()
+                            .and_then(|gpu| gpu.ui.editor_ime_rect())
+                        {
+                            window.set_ime_cursor_area(
+                                LogicalPosition::new(rect.x, rect.y),
+                                LogicalSize::new(rect.width.max(1.0), rect.height.max(1.0)),
+                            );
+                        }
+                    }
+                    self.flush_editor_commits();
+                    self.redraw_pending = true;
+                    return;
+                }
                 // Splitter drag: check if pressing on a splitter
                 if let Some(gpu) = self.gpu.as_mut() {
                     if let Some((_, binding)) = gpu.ui.hit_binding_at_pointer()
@@ -8332,6 +8428,10 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                 if state == winit::event::ElementState::Released
                     && button == winit::event::MouseButton::Left =>
             {
+                // End any editor selection drag.
+                if let Some(gpu) = self.gpu.as_mut() {
+                    gpu.ui.editor_pointer_release();
+                }
                 // Splitter drag: finish
                 if let Some(gpu) = self.gpu.as_mut() {
                     gpu.ui.finish_splitter_drag();
@@ -8650,7 +8750,10 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                     } else {
                         delta
                     };
-                    gpu.ui.scroll_wheel_at_pointer(delta)
+                    // Code editors scroll themselves; other widgets use the
+                    // ordinary scroll path.
+                    gpu.ui.editor_scroll_at_pointer(delta)
+                        || gpu.ui.scroll_wheel_at_pointer(delta)
                 });
                 if scrolled {
                     self.redraw_pending = true;
@@ -8678,11 +8781,24 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
             WindowEvent::Ime(winit::event::Ime::Preedit(value, _)) => {
                 if let Some(gpu) = self.gpu.as_mut() {
                     gpu.ime_active = true;
-                    gpu.ui.set_ime_preedit(value);
+                    if gpu.ui.editor_focused() {
+                        gpu.ui.editor_ime_preedit(&value);
+                    } else {
+                        gpu.ui.set_ime_preedit(value);
+                    }
                     self.redraw_pending = true;
                 }
             }
             WindowEvent::Ime(winit::event::Ime::Commit(value)) => {
+                // Code editors consume IME commits while focused.
+                let editor_committed = self.gpu.as_mut().is_some_and(|gpu| {
+                    gpu.ui.editor_focused() && gpu.ui.editor_ime_commit(&value)
+                });
+                if editor_committed {
+                    self.flush_editor_commits();
+                    self.redraw_pending = true;
+                    return;
+                }
                 let committed = self.gpu.as_mut().and_then(|gpu| {
                     let result = gpu.ui.commit_ime_text(&value);
                     if result.is_some() {
@@ -8764,6 +8880,32 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                 }
                 if event.state != ElementState::Pressed {
                     return;
+                }
+                // Code editors own the keyboard while focused. Every consumed
+                // key is Layer 1 presentation; commits flush on blur/save.
+                if self.gpu.as_ref().is_some_and(|gpu| gpu.ui.editor_focused()) {
+                    let consumed = self.gpu.as_mut().is_some_and(|gpu| {
+                        gpu.ui.editor_handle_key(
+                            &event.logical_key,
+                            event.text.as_deref(),
+                            gpu.shift_down,
+                            gpu.control_down,
+                        )
+                    });
+                    if consumed {
+                        self.flush_editor_commits();
+                        if let (Some(window), Some(rect)) = (
+                            self.window.as_ref(),
+                            self.gpu.as_ref().and_then(|gpu| gpu.ui.editor_ime_rect()),
+                        ) {
+                            window.set_ime_cursor_area(
+                                LogicalPosition::new(rect.x, rect.y),
+                                LogicalSize::new(rect.width.max(1.0), rect.height.max(1.0)),
+                            );
+                        }
+                        self.redraw_pending = true;
+                        return;
+                    }
                 }
                 if self.gpu.as_ref().is_some_and(|gpu| gpu.control_down)
                     && matches!(event.physical_key, PhysicalKey::Code(KeyCode::KeyO))
@@ -8943,6 +9085,8 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                 if let Some(window) = self.window.as_ref() {
                     window.set_ime_allowed(false);
                 }
+                self.gpu.as_mut().map(|gpu| gpu.ui.blur_editor());
+                self.flush_editor_commits();
                 if let Some(gpu) = self.gpu.as_mut() {
                     if gpu.ui.drag_active() {
                         cancelled_drag =
@@ -10825,6 +10969,39 @@ fn handle_window_external_pointer(
 }
 
 impl WindowedRuntime {
+    /// Forwards any queued editor commits to the UI host. Called after every
+    /// interaction that can blur an editor (pointer press, Escape, focus loss)
+    /// and after explicit saves; commits remain renderer-local otherwise.
+    fn flush_editor_commits(&mut self) {
+        let Some(gpu) = self.gpu.as_mut() else { return };
+        let commits = gpu.ui.take_editor_commits();
+        if commits.is_empty() {
+            return;
+        }
+        let Some(endpoint) = self.ui_endpoint else { return };
+        let epoch = self.epoch;
+        let composition_revision = self.applied_composition_revision;
+        let proxy = self.event_proxy.clone();
+        for commit in commits {
+            let node_path = &commit.node_path;
+            let fragment_revision = self.fragments.iter().find_map(|(fragment_id, fragment)| {
+                node_path
+                    .strip_prefix(&format!("{}/", fragment_id.0))
+                    .map(|_| fragment.revision.0)
+            });
+            gpu.next_semantic_sequence += 1;
+            forward_editor_commit(
+                endpoint,
+                epoch,
+                composition_revision,
+                gpu.next_semantic_sequence,
+                commit,
+                fragment_revision,
+                proxy.clone(),
+            );
+        }
+    }
+
     fn demo_fragments(&self) -> HashMap<UiFragmentId, UiFragment> {
         let root = UiNode {
             node_id: neon_ui_schema::UiNodeId("demo-shell".into()),
