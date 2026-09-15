@@ -3479,6 +3479,7 @@ impl UiRuntime {
                 neon_ui_schema::UI_COMPONENT_SKIN_CAPABILITY_NAME,
                 neon_ui_schema::UI_CANVAS_POINTS_LINES_CAPABILITY_NAME,
                 neon_ui_schema::UI_TIMELINE_ANIMATION_CAPABILITY_NAME,
+                neon_ui_schema::UI_CODE_EDITOR_CAPABILITY_NAME,
             ]
             .into_iter()
             .map(|name| UiProgramCapability {
@@ -7538,6 +7539,7 @@ mod tests {
             branches: Vec::new(),
             templates: Vec::new(),
             data_grids: Vec::new(),
+            code_editors: BTreeMap::new(),
             resource_budget: UiResourceBudget {
                 max_nodes: 2,
                 max_bindings: 1,

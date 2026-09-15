@@ -46,6 +46,7 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
     let mut branches = Vec::new();
     let mut templates = Vec::new();
     let mut data_grids = Vec::new();
+    let mut code_editors = BTreeMap::new();
     let mut state_machines = Vec::new();
     let mut motions = Vec::new();
     let mut pending_keyframes: Vec<(String, UiAnimationKeyframe)> = Vec::new();
@@ -80,7 +81,7 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
         let without_comment = if raw.trim_start().starts_with('#') {
             ""
         } else {
-            raw
+            strip_flow_comment(raw)
         };
         if without_comment.trim().is_empty() {
             continue;
@@ -423,6 +424,19 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
                 ..grid.clone()
             });
         }
+        if let Some(editor) = node.code_editor.take() {
+            if code_editors
+                .insert(editor.node_key.clone(), editor)
+                .is_some()
+            {
+                return Err(error(
+                    "nui_flow_duplicate_code_editor",
+                    "code editor node keys must be unique",
+                    line,
+                    1,
+                ));
+            }
+        }
         if let Some(world_panel) = &node.world_panel {
             world_panels.push(NuiFlowWorldPanelDeclaration {
                 node_key: node.node.node_id.0.clone(),
@@ -548,6 +562,48 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
                 "binding property is incompatible with its declared input kind",
                 binding_span,
             ));
+        }
+    }
+    for editor in code_editors.values() {
+        let source_kind = resolve_binding_kind(&schema, &editor.source_input_key).ok_or_else(|| {
+            error_at(
+                "ui_program_unknown_binding_target",
+                "code_editor source references an input that is not declared",
+                source_map
+                    .get(&editor.node_key)
+                    .expect("code editor node has a source span"),
+            )
+        })?;
+        if !matches!(source_kind, UiInputKind::TextHandle) {
+            return Err(error_at(
+                "ui_program_input_type_mismatch",
+                "code_editor source must use a text/document handle input",
+                source_map
+                    .get(&editor.node_key)
+                    .expect("code editor node has a source span"),
+            ));
+        }
+        if let Some(key) = &editor.read_only_input_key {
+            if !matches!(resolve_binding_kind(&schema, key), Some(UiInputKind::Bool)) {
+                return Err(error_at(
+                    "ui_program_input_type_mismatch",
+                    "code_editor read_only must use a bool input",
+                    source_map
+                        .get(&editor.node_key)
+                        .expect("code editor node has a source span"),
+                ));
+            }
+        }
+        if let Some(key) = &editor.completion_input_key {
+            if !matches!(resolve_binding_kind(&schema, key), Some(UiInputKind::TextHandle)) {
+                return Err(error_at(
+                    "ui_program_input_type_mismatch",
+                    "code_editor completions must use a text handle input",
+                    source_map
+                        .get(&editor.node_key)
+                        .expect("code editor node has a source span"),
+                ));
+            }
         }
     }
     for branch in &branches {
@@ -753,6 +809,7 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
         branches,
         templates,
         data_grids,
+        code_editors,
         resource_budget: header.budget,
     };
     match ir.validate() {
@@ -1307,6 +1364,7 @@ pub fn format_nui_flow(source: &str) -> FlowResult<String> {
         &parsed.ir.material_records,
         &parsed.ir.composition_layer_records,
         &parsed.ir.exit_transition_records,
+        &parsed.ir.code_editors,
         &mut lines,
     );
     Ok(lines.join("\n") + "\n")
@@ -1474,8 +1532,12 @@ pub fn parse_nui_flow_patch(source: &str) -> FlowResult<UiIrPatch> {
     let mut operations = Vec::new();
     for (index, raw) in source.lines().enumerate() {
         let line = (index + 1) as u32;
-        let text = raw.trim();
-        if text.is_empty() || text.starts_with('#') {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let text = strip_flow_comment(trimmed).trim();
+        if text.is_empty() {
             continue;
         }
         reject_forbidden(text, line)?;
@@ -1704,6 +1766,7 @@ struct NodeBuild {
     branch_predicate: Option<UiBranchPredicate>,
     template: Option<(u32, BTreeMap<String, UiInputKind>, String, bool)>,
     data_grid: Option<UiDataGridDeclaration>,
+    code_editor: Option<neon_ui_schema::UiCodeEditorDeclaration>,
     image_resource: Option<String>,
     nine_slice: Option<UiNineSlice>,
     world_panel: Option<NuiFlowWorldPanelDeclaration>,
@@ -3417,6 +3480,7 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
             UiNodeKind::Panel
         }
         "data_grid" => UiNodeKind::DataGrid,
+        "code_editor" => UiNodeKind::Panel,
         "tooltip" => UiNodeKind::Tooltip,
         "modal" => UiNodeKind::Modal,
         "dialog" => UiNodeKind::Dialog,
@@ -3525,6 +3589,15 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
     let mut data_grid_overscan = None;
     let mut data_grid_columns = None;
     let mut data_grid_source = None;
+    let mut code_editor_source = None;
+    let mut code_editor_language = neon_ui_schema::UiEditorLanguage::NuiFlow;
+    let mut code_editor_line_numbers = true;
+    let mut code_editor_wrap = neon_ui_schema::UiEditorWrap::None;
+    let mut code_editor_font_size = 14.0_f32;
+    let mut code_editor_tab_size = 4_u8;
+    let mut code_editor_read_only: Option<String> = None;
+    let mut code_editor_completions: Option<String> = None;
+    let mut code_editor_gutter_diagnostics = true;
     let mut image_resource = None;
     let mut nine_slice = None;
     let mut skin_key = None;
@@ -3878,6 +3951,129 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
                 }
                 data_grid_source = Some(key.into());
             }
+            "source" if component == "code_editor" => {
+                let value = *parts.get(index + 1).ok_or_else(|| {
+                    error(
+                        "nui_flow_missing_value",
+                        "code_editor source requires an input binding",
+                        line,
+                        1,
+                    )
+                })?;
+                index += 1;
+                let Some(key) = value.strip_prefix('$') else {
+                    return Err(error(
+                        "nui_flow_invalid_code_editor",
+                        "code_editor source must use $input",
+                        line,
+                        1,
+                    ));
+                };
+                if !valid_key(key) {
+                    return Err(error(
+                        "nui_flow_invalid_code_editor",
+                        "code_editor source input key is invalid",
+                        line,
+                        1,
+                    ));
+                }
+                code_editor_source = Some(key.into());
+            }
+            "language" if component == "code_editor" => {
+                let value = *parts.get(index + 1).ok_or_else(|| {
+                    error("nui_flow_missing_value", "language requires a value", line, 1)
+                })?;
+                index += 1;
+                code_editor_language = match value {
+                    "nui_flow" => neon_ui_schema::UiEditorLanguage::NuiFlow,
+                    _ => return Err(error(
+                        "nui_flow_invalid_code_editor",
+                        "code_editor language must be nui_flow",
+                        line,
+                        1,
+                    )),
+                };
+            }
+            "line_numbers" if component == "code_editor" => {
+                let value = *parts.get(index + 1).ok_or_else(|| {
+                    error("nui_flow_missing_value", "line_numbers requires a bool", line, 1)
+                })?;
+                index += 1;
+                code_editor_line_numbers = boolean(value, line)?;
+            }
+            "wrap" if component == "code_editor" => {
+                let value = *parts.get(index + 1).ok_or_else(|| {
+                    error("nui_flow_missing_value", "wrap requires a value", line, 1)
+                })?;
+                index += 1;
+                code_editor_wrap = match value {
+                    "none" => neon_ui_schema::UiEditorWrap::None,
+                    _ => return Err(error(
+                        "nui_flow_invalid_code_editor",
+                        "code_editor wrap must be none in V1",
+                        line,
+                        1,
+                    )),
+                };
+            }
+            "font_size" if component == "code_editor" => {
+                let value = *parts.get(index + 1).ok_or_else(|| {
+                    error("nui_flow_missing_value", "font_size requires a number", line, 1)
+                })?;
+                index += 1;
+                code_editor_font_size = number(value, line)?;
+                if !(6.0..=48.0).contains(&code_editor_font_size) {
+                    return Err(error(
+                        "nui_flow_invalid_code_editor",
+                        "code_editor font_size must be between 6 and 48",
+                        line,
+                        1,
+                    ));
+                }
+            }
+            "tab_size" if component == "code_editor" => {
+                let value = *parts.get(index + 1).ok_or_else(|| {
+                    error("nui_flow_missing_value", "tab_size requires an integer", line, 1)
+                })?;
+                index += 1;
+                code_editor_tab_size = u8::try_from(parse_u64(value, line, "tab_size")?)
+                    .map_err(|_| error("nui_flow_invalid_code_editor", "tab_size is too large", line, 1))?;
+                if !(1..=8).contains(&code_editor_tab_size) {
+                    return Err(error(
+                        "nui_flow_invalid_code_editor",
+                        "code_editor tab_size must be between 1 and 8",
+                        line,
+                        1,
+                    ));
+                }
+            }
+            "read_only" if component == "code_editor" => {
+                let value = *parts.get(index + 1).ok_or_else(|| {
+                    error("nui_flow_missing_value", "read_only requires $bool", line, 1)
+                })?;
+                index += 1;
+                let Some(key) = value.strip_prefix('$') else {
+                    return Err(error("nui_flow_invalid_code_editor", "read_only must use $bool", line, 1));
+                };
+                code_editor_read_only = Some(key.into());
+            }
+            "completions" if component == "code_editor" => {
+                let value = *parts.get(index + 1).ok_or_else(|| {
+                    error("nui_flow_missing_value", "completions requires $input", line, 1)
+                })?;
+                index += 1;
+                let Some(key) = value.strip_prefix('$') else {
+                    return Err(error("nui_flow_invalid_code_editor", "completions must use $input", line, 1));
+                };
+                code_editor_completions = Some(key.into());
+            }
+            "gutter_diagnostics" if component == "code_editor" => {
+                let value = *parts.get(index + 1).ok_or_else(|| {
+                    error("nui_flow_missing_value", "gutter_diagnostics requires a bool", line, 1)
+                })?;
+                index += 1;
+                code_editor_gutter_diagnostics = boolean(value, line)?;
+            }
             "resource" if component == "image" => {
                 let value = *parts.get(index + 1).ok_or_else(|| {
                     error(
@@ -4094,6 +4290,44 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
     } else {
         None
     };
+    let code_editor = if component == "code_editor" {
+        let source_input_key = code_editor_source.ok_or_else(|| {
+            error(
+                "nui_flow_invalid_code_editor",
+                "code_editor requires source $input",
+                line,
+                1,
+            )
+        })?;
+        for key in code_editor_read_only
+            .as_ref()
+            .into_iter()
+            .chain(code_editor_completions.as_ref())
+        {
+            if !valid_key(key) {
+                return Err(error(
+                    "nui_flow_invalid_code_editor",
+                    "code_editor bound input key is invalid",
+                    line,
+                    1,
+                ));
+            }
+        }
+        Some(neon_ui_schema::UiCodeEditorDeclaration {
+            node_key: node.node_id.0.clone(),
+            source_input_key,
+            language: code_editor_language,
+            line_numbers: code_editor_line_numbers,
+            wrap: code_editor_wrap,
+            font_size: code_editor_font_size,
+            tab_size: code_editor_tab_size,
+            read_only_input_key: code_editor_read_only,
+            completion_input_key: code_editor_completions,
+            gutter_diagnostics: code_editor_gutter_diagnostics,
+        })
+    } else {
+        None
+    };
     let world_panel = if is_world_panel {
         let (camera_id, camera_kind) = world_camera.ok_or_else(|| {
             error(
@@ -4122,6 +4356,7 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
         branch_predicate,
         template,
         data_grid,
+        code_editor,
         image_resource,
         nine_slice,
         world_panel,
@@ -5123,6 +5358,65 @@ fn binding_accepts(property: &UiBoundProperty, kind: &UiInputKind) -> bool {
 fn align_up(value: u32, alignment: u32) -> u32 {
     (value + alignment - 1) / alignment * alignment
 }
+/// Returns true when `rest` (the text immediately after a `#`) begins a color
+/// literal token: exactly 6 or 8 hex digits followed by whitespace or end of
+/// text. This keeps `#RRGGBB` / `#RRGGBBAA` values distinct from comments.
+fn starts_color_literal(rest: &str) -> bool {
+    let mut count = 0usize;
+    for character in rest.chars() {
+        if character.is_ascii_hexdigit() && count < 8 {
+            count += 1;
+        } else {
+            break;
+        }
+    }
+    if count != 6 && count != 8 {
+        return false;
+    }
+    rest.chars()
+        .nth(count)
+        .map_or(true, |character| character.is_whitespace())
+}
+
+/// Strips a trailing `#` comment from one Flow line. A `#` opens a comment
+/// only at a token boundary (start of text or after whitespace) and only when
+/// it does not begin a color literal. A `#` inside a quoted string never
+/// opens a comment. A full-line comment returns empty text.
+fn strip_flow_comment(raw: &str) -> &str {
+    let mut quoted = false;
+    let mut escaped = false;
+    let mut at_token_start = true;
+    for (index, character) in raw.char_indices() {
+        if escaped {
+            escaped = false;
+            at_token_start = false;
+            continue;
+        }
+        if quoted {
+            if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                quoted = false;
+                at_token_start = false;
+            }
+            continue;
+        }
+        if character == '"' {
+            quoted = true;
+            at_token_start = false;
+            continue;
+        }
+        if character.is_whitespace() {
+            at_token_start = true;
+            continue;
+        }
+        if character == '#' && at_token_start && !starts_color_literal(&raw[index + 1..]) {
+            return &raw[..index];
+        }
+        at_token_start = false;
+    }
+    raw
+}
 fn tokenize(text: &str, line: u32) -> FlowResult<Vec<String>> {
     let mut tokens = Vec::new();
     let mut current = String::new();
@@ -5207,9 +5501,13 @@ fn format_node(
     material_records: &BTreeMap<String, UiMaterialRef>,
     composition_layer_records: &BTreeMap<String, UiCompositionLayer>,
     exit_transition_records: &BTreeMap<String, UiTransition>,
+    code_editors: &BTreeMap<String, neon_ui_schema::UiCodeEditorDeclaration>,
     lines: &mut Vec<String>,
 ) {
-    let kind = match &node.kind {
+    let kind = if code_editors.contains_key(&node.node_id.0) {
+        "code_editor"
+    } else {
+        match &node.kind {
         UiNodeKind::Panel => "panel",
         UiNodeKind::Label => "text",
         UiNodeKind::Button => "button",
@@ -5241,9 +5539,27 @@ fn format_node(
         UiNodeKind::Accordion => "accordion",
         UiNodeKind::Spinner => "spinner",
         UiNodeKind::Divider => "divider",
-        UiNodeKind::Popup => "popup",
+            UiNodeKind::Popup => "popup",
+        }
     };
     let mut line = format!("{}{} {}", " ".repeat(indent), kind, node.node_id.0);
+    if let Some(editor) = code_editors.get(&node.node_id.0) {
+        line.push_str(&format!(" source ${} language nui_flow", editor.source_input_key));
+        if editor.line_numbers {
+            line.push_str(" line_numbers true");
+        } else {
+            line.push_str(" line_numbers false");
+        }
+        line.push_str(" wrap none");
+        line.push_str(&format!(" font_size {} tab_size {}", editor.font_size, editor.tab_size));
+        if let Some(key) = &editor.read_only_input_key {
+            line.push_str(&format!(" read_only ${key}"));
+        }
+        if let Some(key) = &editor.completion_input_key {
+            line.push_str(&format!(" completions ${key}"));
+        }
+        line.push_str(&format!(" gutter_diagnostics {}", editor.gutter_diagnostics));
+    }
     if let Some(skin) = skin_references.get(&node.node_id.0) {
         line.push_str(&format!(" skin {skin}"));
     }
@@ -5438,6 +5754,7 @@ fn format_node(
             material_records,
             composition_layer_records,
             exit_transition_records,
+            code_editors,
             lines,
         );
     }
@@ -5788,6 +6105,102 @@ panel workspace row gap 8
   panel inspector column gap 6
     text title value $terrain_name
 "#;
+
+    #[test]
+    fn trailing_comments_are_ignored() {
+        let document = parse_nui_flow(
+            "input show bool default true # declaration comment\nsurface root w 400 h 300 # surface comment\n  branch choices h 260 when $show # branch comment\n    text title value \"Title\" w 300 h 32 # node comment\n",
+        )
+        .expect("trailing comments must parse");
+        assert_eq!(document.ir.root.children.len(), 1);
+        assert_eq!(document.ir.root.children[0].node_id.0, "choices");
+    }
+
+    #[test]
+    fn comment_hash_inside_string_is_not_a_comment() {
+        let document = parse_nui_flow(
+            "surface root w 400 h 300\n  text title value \"a # b # not comment\"\n",
+        )
+        .expect("hash inside quoted text must parse");
+        let text = &document.ir.root.children[0];
+        match &text.text {
+            Some(TextRef::Literal { value }) => assert_eq!(value, "a # b # not comment"),
+            other => panic!("expected literal text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn color_literal_after_hash_is_not_a_comment() {
+        let document = parse_nui_flow(
+            "surface root w 400 h 300\n  panel box w 40 h 40 fill #101820 # panel note\n",
+        )
+        .expect("color literal must not open a comment");
+        let panel = &document.ir.root.children[0];
+        assert_eq!(panel.style.background_color[0], 0x10 as f32 / 255.0);
+        assert_eq!(panel.style.background_color[2], 0x20 as f32 / 255.0);
+    }
+
+    #[test]
+    fn color_literal_with_alpha_and_trailing_comment() {
+        let document = parse_nui_flow(
+            "surface root w 400 h 300 fill #101820FF\n  panel box w 40 h 40 fill #E6C36A80 # note # more\n",
+        )
+        .expect("8-digit color literal must parse with trailing comment");
+        let panel = &document.ir.root.children[0];
+        assert_eq!(panel.style.background_color[3], 0x80 as f32 / 255.0);
+    }
+
+    #[test]
+    fn full_line_and_indented_comments_are_skipped() {
+        let document = parse_nui_flow(
+            "# top comment\nsurface root w 400 h 300\n  # indented comment\n  text title value \"Title\"\n",
+        )
+        .expect("full-line comments must parse");
+        assert_eq!(document.ir.root.children.len(), 1);
+    }
+
+    #[test]
+    fn patch_lines_support_trailing_comments() {
+        let patch = parse_nui_flow_patch(
+            "@ revision 3 # expected revision\n+ surface.root panel extra # insert a panel\n",
+        )
+        .expect("patch comments must parse");
+        assert_eq!(patch.expected_revision, Revision(3));
+        assert_eq!(patch.operations.len(), 1);
+    }
+
+    #[test]
+    fn code_editor_lowers_to_a_panel_with_a_dedicated_declaration() {
+        let source = "input document text default text:empty\ninput locked bool default false\ninput completions text default text:empty\nsurface root column w 800 h 600\n  code_editor source-view source $document language nui_flow line_numbers true wrap none font_size 14 tab_size 2 read_only $locked completions $completions gutter_diagnostics true\n";
+        let document = parse_nui_flow(source).expect("code_editor fixture must parse");
+        assert_eq!(document.ir.root.children[0].kind, UiNodeKind::Panel);
+        let editor = document
+            .ir
+            .code_editors
+            .get("source-view")
+            .expect("code editor declaration");
+        assert_eq!(editor.source_input_key, "document");
+        assert_eq!(editor.tab_size, 2);
+        assert_eq!(editor.read_only_input_key.as_deref(), Some("locked"));
+        assert_eq!(editor.completion_input_key.as_deref(), Some("completions"));
+    }
+
+    #[test]
+    fn code_editor_formatter_round_trips_declaration() {
+        let source = "input document text default text:empty\nsurface root w 800 h 600\n  code_editor source-view source $document language nui_flow line_numbers false wrap none font_size 16 tab_size 4 gutter_diagnostics false\n";
+        let formatted = format_nui_flow(source).expect("code_editor formatter");
+        assert!(formatted.contains("code_editor source-view source $document"));
+        assert!(formatted.contains("line_numbers false"));
+        assert!(formatted.contains("gutter_diagnostics false"));
+        assert_eq!(format_nui_flow(&formatted).unwrap(), formatted);
+    }
+
+    #[test]
+    fn code_editor_rejects_non_text_source_input() {
+        let source = "input document bool default false\nsurface root w 800 h 600\n  code_editor source-view source $document language nui_flow\n";
+        let error = parse_nui_flow(source).expect_err("bool source must be rejected");
+        assert_eq!(error.diagnostics[0].code, "ui_program_input_type_mismatch");
+    }
 
     #[test]
     fn branch_is_a_transparent_column_layout_container() {

@@ -979,6 +979,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "neon-editor-core"
+version = "0.2.10"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "neon-editor-runtime"
+version = "0.2.10"
+dependencies = [
+ "neon-editor-core",
+ "neon-ipc",
+ "neon-observability",
+ "neon-protocol",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "neon-eventd"
 version = "0.2.10"
 dependencies = [

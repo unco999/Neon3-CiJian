@@ -64,7 +64,9 @@ state from an event payload.
 
 ## Components and attributes
 
-The closed V1 vocabulary is `surface`, `panel`, `text`, `button`, `input`, `checkbox`, `radio_button`, `slider`, `drag_value`, `combo`, `dropdown`, `tabs`, `selectable`, `list_box`, `scrollbar`, `progress_bar`, `image`, `render`, `scroll`, `overlay`, `branch`, `repeat`, and `template`. No other component name is valid. `surface`, `panel`, `scroll`, `overlay`, `branch`, `repeat`, and `template` lower through the current compatible panel topology; bounded branch and template records are completed by their dedicated runtime capability.
+The closed V1 vocabulary is `surface`, `panel`, `text`, `button`, `input`, `code_editor`, `checkbox`, `radio_button`, `slider`, `drag_value`, `combo`, `dropdown`, `tabs`, `selectable`, `list_box`, `scrollbar`, `progress_bar`, `image`, `render`, `scroll`, `overlay`, `branch`, `repeat`, and `template`. No other component name is valid. `surface`, `panel`, `scroll`, `overlay`, `branch`, `repeat`, `template`, and the compatibility `code_editor` declaration lower through the current compatible panel topology; bounded branch/template/code-editor records are completed by their dedicated runtime capability.
+
+`code_editor <key> source $text_input language nui_flow` declares a multiline NUI Flow editor contract. In the current compatibility slice it lowers to a Panel plus `UiIrDocument.code_editors`; document bytes, caret state, completion popup state, and editor rendering are not part of this Flow IR and require the editor protocol/WGPU slices.
 
 Supported layout tokens are `row`, `column`, `overlay`, `w`, `h`, `minw`, `maxw`, `grow`, `shrink`, `basis`, `pad`, `gap`, `align`, `justify`, and `clip`. Values are finite logical numbers. Alignment accepts `start`, `center`, `end`, and `stretch`; justification additionally accepts `between`, `around`, and `evenly`. Panels default to `clip bounds`; `clip none`, `clip bounds`, `clip rounded`, and `clip scroll` are explicit policies. Rounded clipping uses the panel corner radius for both pixels and hit tests; `scroll` also uses the existing layout scroll offset.
 

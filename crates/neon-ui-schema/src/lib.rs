@@ -33,6 +33,10 @@ pub const UI_SHADER_PACKAGE_CAPABILITY_NAME: &str = "ui.shader.package.v1";
 pub const UI_SHADER_MATERIAL_CAPABILITY_NAME: &str = "ui.shader.material.v1";
 /// Bounded keyframe/stagger/repeat playback for renderer-owned transitions.
 pub const UI_TIMELINE_ANIMATION_CAPABILITY_NAME: &str = "ui.timeline.animation.v1";
+/// Declarative multiline NUI Flow editor declaration. The first slice carries
+/// the renderer-neutral declaration; WGPU editing composition is negotiated by
+/// a later capability revision.
+pub const UI_CODE_EDITOR_CAPABILITY_NAME: &str = "ui.code_editor.v1";
 
 pub const ERROR_UI_PROGRAM_UNSUPPORTED_SCHEMA: &str = "ui_program_unsupported_schema";
 pub const ERROR_UI_PROGRAM_UNSUPPORTED_CAPABILITY: &str = "ui_program_unsupported_capability";
@@ -626,6 +630,7 @@ impl UiProgramRevision {
                     | UI_COMPONENT_SKIN_CAPABILITY_NAME
                     | UI_CANVAS_POINTS_LINES_CAPABILITY_NAME
                     | UI_TIMELINE_ANIMATION_CAPABILITY_NAME
+                    | UI_CODE_EDITOR_CAPABILITY_NAME
             ) || capability.version != 1
             {
                 return Err(UiSchemaError::UnsupportedProgramCapability);
@@ -2219,6 +2224,10 @@ pub struct UiIrDocument {
     /// Bounded virtual-grid declarations attached to `DataGrid` nodes.
     #[serde(default)]
     pub data_grids: Vec<UiDataGridDeclaration>,
+    /// Dedicated code-editor declarations. The compatibility node is lowered
+    /// as a Panel until the WGPU editor composition path is installed.
+    #[serde(default)]
+    pub code_editors: std::collections::BTreeMap<String, UiCodeEditorDeclaration>,
     pub resource_budget: UiResourceBudget,
 }
 
@@ -3629,6 +3638,62 @@ impl UiTransition {
                 .timeline
                 .as_ref()
                 .is_none_or(|timeline| timeline.is_valid(self.duration_ms))
+    }
+}
+
+/// Renderer-neutral declaration for the multiline editor component. The node
+/// remains a compatibility Panel until the dedicated WGPU editor paint path is
+/// installed; document bytes never enter UiNode or GPU input slots.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiCodeEditorDeclaration {
+    pub node_key: String,
+    pub source_input_key: String,
+    pub language: UiEditorLanguage,
+    pub line_numbers: bool,
+    pub wrap: UiEditorWrap,
+    pub font_size: f32,
+    pub tab_size: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_only_input_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_input_key: Option<String>,
+    pub gutter_diagnostics: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UiEditorLanguage {
+    NuiFlow,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UiEditorWrap {
+    None,
+}
+
+impl Default for UiEditorWrap {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
+impl UiCodeEditorDeclaration {
+    pub fn validate(&self) -> bool {
+        !self.node_key.trim().is_empty()
+            && !self.source_input_key.trim().is_empty()
+            && self.font_size.is_finite()
+            && (6.0..=48.0).contains(&self.font_size)
+            && (1..=8).contains(&self.tab_size)
+            && self
+                .read_only_input_key
+                .as_ref()
+                .is_none_or(|key| !key.trim().is_empty())
+            && self
+                .completion_input_key
+                .as_ref()
+                .is_none_or(|key| !key.trim().is_empty())
     }
 }
 
@@ -5057,6 +5122,15 @@ impl UiIrDocument {
         collect_data_grid_node_keys(&self.root, &mut declared_grid_nodes);
         if declared_grid_nodes != data_grid_node_keys {
             return Err(UiSchemaError::InvalidIrDocument);
+        }
+        for (node_key, editor) in &self.code_editors {
+            if node_key != &editor.node_key
+                || !editor.validate()
+                || !keys.contains(node_key)
+                || !matches!(find_ir_node(&self.root, node_key), Some(node) if node.kind == UiNodeKind::Panel)
+            {
+                return Err(UiSchemaError::InvalidIrDocument);
+            }
         }
         Ok(())
     }

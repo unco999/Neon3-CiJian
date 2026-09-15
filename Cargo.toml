@@ -7,6 +7,8 @@ members = [
     "crates/neon-projectd",
     "crates/neon-eventd",
     "crates/neon-ui-schema",
+    "crates/neon-editor-core",
+    "crates/neon-editor-runtime",
     "crates/neon-wgpu-runtime",
     "crates/neon-wgpu-ai",
     "crates/neon-gpu-ecs",

@@ -169,6 +169,28 @@ Rules:
 
 ## View Syntax
 
+### NUI Flow Code Editor
+
+`code_editor` is the planned multiline authoring surface for NUI Flow. Its
+schema/parser compatibility slice is available, but it does not make Flow
+executable or move source text into ordinary GPU input slots. The complete
+implementation and protocol are specified in
+[`plan/neon3-nui-flow-code-editor.md`](../plan/neon3-nui-flow-code-editor.md).
+
+```text
+input source_document text default text:empty
+surface editor column w 900 h 640
+  code_editor source_view source $source_document language nui_flow
+    line_numbers true
+    wrap none
+    font_size 14
+    tab_size 2
+```
+
+Document revision, ChangeSet, diagnostics, completion candidates, caret,
+selection, and IME state remain on their dedicated ownership paths. Do not put
+raw source text, cursor coordinates, renderer hit IDs, or callbacks in Flow.
+
 ```text
 input project_title text default text:empty
 input can_publish bool default false
