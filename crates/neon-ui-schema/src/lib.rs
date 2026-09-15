@@ -1451,6 +1451,90 @@ impl UiMaterialRef {
     }
 }
 
+/// Renderer-independent text-material reference attached to a text-bearing
+/// node. It mirrors [`UiMaterialRef`] for glyph rendering: the package is
+/// compiled into a renderer-owned text pipeline that samples the glyph atlas
+/// and calls `fn text_material(input: TextMaterialInput) -> vec4<f32>`.
+///
+/// `overflow` expands every glyph quad of the node by the same logical-pixel
+/// insets so a glow or halo can paint outside the glyph box without sampling
+/// neighbouring atlas glyphs (the wrapper clamps UVs back into the glyph quad).
+/// `duration_ms` makes the material one-shot: the renderer starts a timer when
+/// the material becomes active and removes it — falling back to ordinary text —
+/// once the duration elapses.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiTextMaterialRef {
+    pub package_id: String,
+    #[serde(default)]
+    pub version: u32,
+    #[serde(default)]
+    pub fallback: String,
+    /// Glyph-quad expansion on each side: [left, top, right, bottom].
+    #[serde(default)]
+    pub overflow: [f32; 4],
+    #[serde(default)]
+    pub parameters: std::collections::BTreeMap<String, serde_json::Value>,
+    /// One-shot playback duration in renderer milliseconds. When present, the
+    /// material is removed after the duration elapses and the node renders as
+    /// ordinary text again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u32>,
+}
+
+impl Default for UiTextMaterialRef {
+    fn default() -> Self {
+        Self {
+            package_id: String::new(),
+            version: 1,
+            fallback: "standard_text".into(),
+            overflow: [0.0; 4],
+            parameters: std::collections::BTreeMap::new(),
+            duration_ms: None,
+        }
+    }
+}
+
+impl UiTextMaterialRef {
+    /// Glyph quads are small; 64 logical px per side is far beyond any sane
+    /// glow and keeps the expanded draw area bounded.
+    pub const MAX_OVERFLOW: f32 = 64.0;
+    pub const MAX_DURATION_MS: u32 = 60_000;
+
+    pub fn validate(&self) -> Result<(), UiSchemaError> {
+        if self.package_id.trim().is_empty() {
+            return Err(UiSchemaError::EmptyShaderKey);
+        }
+        if self
+            .overflow
+            .iter()
+            .any(|value| !value.is_finite() || *value < 0.0 || *value > Self::MAX_OVERFLOW)
+        {
+            return Err(UiSchemaError::InvalidGeometry);
+        }
+        if self.duration_ms.is_some_and(|ms| ms == 0 || ms > Self::MAX_DURATION_MS) {
+            return Err(UiSchemaError::InvalidShaderParameter);
+        }
+        for (key, value) in &self.parameters {
+            if key.trim().is_empty() || value.is_null() {
+                return Err(UiSchemaError::InvalidShaderParameter);
+            }
+        }
+        Ok(())
+    }
+
+    /// Expanded glyph-quad bounds in logical UI units. Each glyph quad is grown
+    /// by `overflow`; the glyph itself stays centered inside the expanded quad.
+    pub fn draw_bounds(&self, glyph: UiBounds) -> UiBounds {
+        UiBounds {
+            x: glyph.x - self.overflow[0],
+            y: glyph.y - self.overflow[1],
+            width: glyph.width + self.overflow[0] + self.overflow[2],
+            height: glyph.height + self.overflow[1] + self.overflow[3],
+        }
+    }
+}
+
 impl UiAlignItems {
     fn is_start(value: &Self) -> bool {
         *value == Self::Start
@@ -1808,6 +1892,14 @@ pub enum UiEffect {
     Material {
         node_id: UiNodeId,
         material: UiMaterialRef,
+    },
+
+    /// Attaches a shader package to a text-bearing node. The unified renderer
+    /// draws the node's glyphs through `fn text_material(input)` on glyph quads
+    /// expanded by `overflow`; `duration_ms` makes the material one-shot.
+    TextMaterial {
+        node_id: UiNodeId,
+        material: UiTextMaterialRef,
     },
     /// Routes a node and all descendants to one of the window composition
     /// layers. The renderer applies inheritance from the declared node.
@@ -2206,6 +2298,12 @@ pub struct UiIrDocument {
     /// layout-only and mirrors the `skin_references` pattern.
     #[serde(default)]
     pub material_records: std::collections::BTreeMap<String, UiMaterialRef>,
+    /// Text-bearing node key to text-material reference. Mirrors
+    /// `material_records` for glyph rendering: the package compiles into a
+    /// renderer-owned text pipeline that samples the glyph atlas and calls
+    /// `fn text_material(input)`; `duration_ms` makes it one-shot.
+    #[serde(default)]
+    pub text_material_records: std::collections::BTreeMap<String, UiTextMaterialRef>,
     /// Node key to composition destination. Missing entries are `normal`.
     #[serde(default)]
     pub composition_layer_records: std::collections::BTreeMap<String, UiCompositionLayer>,
@@ -3094,6 +3192,10 @@ pub struct UiProgram {
     /// Graphical node key to material reference.
     #[serde(default)]
     pub material_records: std::collections::BTreeMap<String, UiMaterialRef>,
+    /// Text-bearing node key to text-material reference (mirrors
+    /// `material_records` for glyph rendering).
+    #[serde(default)]
+    pub text_material_records: std::collections::BTreeMap<String, UiTextMaterialRef>,
     #[serde(default)]
     pub composition_layer_records: std::collections::BTreeMap<String, UiCompositionLayer>,
     /// Visual node key to ContextMenu node key.
@@ -3466,6 +3568,11 @@ impl UiFragment {
                 }
                 UiEffect::CodeEditorDeclaration { node_key, .. }
                     if !nodes.contains(node_key) =>
+                {
+                    return Err(UiSchemaError::InvalidProgramEvent);
+                }
+                UiEffect::TextMaterial { node_id, material }
+                    if !nodes.contains(&node_id.0) || material.validate().is_err() =>
                 {
                     return Err(UiSchemaError::InvalidProgramEvent);
                 }
@@ -3884,6 +3991,13 @@ impl UiEffect {
                 }
             }
             Self::Material { node_id, material } => {
+                if node_id.0.trim().is_empty() {
+                    Err(UiSchemaError::InvalidProgramEvent)
+                } else {
+                    material.validate()
+                }
+            }
+            Self::TextMaterial { node_id, material } => {
                 if node_id.0.trim().is_empty() {
                     Err(UiSchemaError::InvalidProgramEvent)
                 } else {
@@ -5058,6 +5172,14 @@ impl UiIrDocument {
             }
         }
         for (node_key, material) in &self.material_records {
+            if material.validate().is_err()
+                || !shader_keys.contains(material.package_id.as_str())
+                || find_ir_node(&self.root, node_key).is_none()
+            {
+                geometry_material_valid = false;
+            }
+        }
+        for (node_key, material) in &self.text_material_records {
             if material.validate().is_err()
                 || !shader_keys.contains(material.package_id.as_str())
                 || find_ir_node(&self.root, node_key).is_none()

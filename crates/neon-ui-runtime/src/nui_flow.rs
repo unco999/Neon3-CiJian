@@ -1,4 +1,4 @@
-﻿//! Closed, line-oriented NUI Flow authoring notation.
+//! Closed, line-oriented NUI Flow authoring notation.
 //!
 //! Flow is deliberately parsed into the canonical JSON IR. It has no evaluator,
 //! expressions, callbacks, or source of domain truth.
@@ -18,7 +18,7 @@ use neon_ui_schema::{
     UiInputValue, UiIntent, UiIrBinding, UiIrDocument, UiIrPatch, UiIrPatchOperation,
     UiIrPatchOperationKind, UiJustifyContent, UiLayout, UiLayoutMode, UiMaterialRef, UiNineSlice, UiNineSliceMode,
     UiCompositionLayer, UiNode, UiNodeId, UiNodeKind, UiProgram, UiProgramEventDeclaration, UiProgramRevision,
-    UiResourceBudget, UiRichTextSpan, UiShaderPackage,
+    UiResourceBudget, UiRichTextSpan, UiShaderPackage, UiTextMaterialRef,
     UiSourceSpan, UiStyle, UiSurfaceId, UiTemplateDeclaration, UiTransform, UiTransition, UiTransitionState,
     UiAnimationGroup, UiAnimationKeyframe, UiAnimationRepeat, UiAnimationTimeline,
 };
@@ -60,6 +60,7 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
     let mut context_menu_records = BTreeMap::new();
     let mut geometry_records = BTreeMap::new();
     let mut material_records = BTreeMap::new();
+    let mut text_material_records = BTreeMap::new();
     let mut composition_layer_records = BTreeMap::new();
     let mut exit_transition_records = BTreeMap::new();
     let mut skins = Vec::new();
@@ -252,7 +253,11 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
                 continue;
             }
         }
-        if indent >= 2 && (content.starts_with("geometry ") || content.starts_with("material ")) {
+        if indent >= 2
+            && (content.starts_with("geometry ")
+                || content.starts_with("material ")
+                || content.starts_with("text_material "))
+        {
             let parent = stack.last_mut().ok_or_else(|| {
                 error(
                     "nui_flow_orphan_geometry",
@@ -263,8 +268,10 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
             })?;
             if content.starts_with("geometry ") {
                 parent.1.geometry = Some(parse_geometry_line(content, line)?);
-            } else {
+            } else if content.starts_with("material ") {
                 parent.1.material = Some(parse_material_line(content, line)?);
+            } else {
+                parent.1.text_material = Some(parse_text_material_line(content, line)?);
             }
             continue;
         }
@@ -338,6 +345,7 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
                 &mut root,
                 &mut geometry_records,
                 &mut material_records,
+                &mut text_material_records,
                 &mut composition_layer_records,
                 line,
             )?;
@@ -454,6 +462,7 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
             &mut root,
             &mut geometry_records,
             &mut material_records,
+            &mut text_material_records,
             &mut composition_layer_records,
             0,
         )?;
@@ -477,6 +486,9 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
     }
     if let Some(material) = root.material.take() {
         material_records.insert(root.node.node_id.0.clone(), material);
+    }
+    if let Some(text_material) = root.text_material.take() {
+        text_material_records.insert(root.node.node_id.0.clone(), text_material);
     }
     if root.composition_layer != UiCompositionLayer::Normal {
         composition_layer_records.insert(root.node.node_id.0.clone(), root.composition_layer);
@@ -803,6 +815,7 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
         shader_packages,
         geometry_records,
         material_records,
+        text_material_records,
         composition_layer_records,
         exit_transition_records,
         context_menu_records,
@@ -1030,6 +1043,16 @@ pub fn lower_nui_flow_effects(document: &NuiFlowDocument) -> Vec<UiEffect> {
             .material_records
             .iter()
             .map(|(node_key, material)| UiEffect::Material {
+                node_id: UiNodeId(node_key.clone()),
+                material: material.clone(),
+            }),
+    );
+    effects.extend(
+        document
+            .ir
+            .text_material_records
+            .iter()
+            .map(|(node_key, material)| UiEffect::TextMaterial {
                 node_id: UiNodeId(node_key.clone()),
                 material: material.clone(),
             }),
@@ -1372,6 +1395,7 @@ pub fn format_nui_flow(source: &str) -> FlowResult<String> {
         &parsed.ir.skin_references,
         &parsed.ir.geometry_records,
         &parsed.ir.material_records,
+        &parsed.ir.text_material_records,
         &parsed.ir.composition_layer_records,
         &parsed.ir.exit_transition_records,
         &parsed.ir.code_editors,
@@ -1784,6 +1808,7 @@ struct NodeBuild {
     context_menu: Option<String>,
     geometry: Option<UiGeometry>,
     material: Option<UiMaterialRef>,
+    text_material: Option<UiTextMaterialRef>,
     composition_layer: UiCompositionLayer,
 }
 
@@ -3614,6 +3639,7 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
     let mut context_menu = None;
     let geometry = None;
     let material = None;
+    let text_material = None;
     let mut composition_layer = UiCompositionLayer::Normal;
     let mut world_camera = None;
     let mut world_anchor = None;
@@ -4374,6 +4400,7 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
         context_menu,
         geometry,
         material,
+        text_material,
         composition_layer,
     })
 }
@@ -4806,6 +4833,128 @@ fn parse_material_line(text: &str, line: u32) -> FlowResult<UiMaterialRef> {
     Ok(material)
 }
 
+fn parse_text_material_line(text: &str, line: u32) -> FlowResult<UiTextMaterialRef> {
+    let mut parts = text.split_whitespace();
+    if parts.next() != Some("text_material") {
+        return Err(error(
+            "nui_flow_invalid_text_material",
+            "text_material line must start with text_material",
+            line,
+            1,
+        ));
+    }
+    let package_id = parts.next().ok_or_else(|| {
+        error(
+            "nui_flow_invalid_text_material",
+            "text_material requires a registered shader package key",
+            line,
+            1,
+        )
+    })?;
+    if !valid_key(package_id) {
+        return Err(error(
+            "nui_flow_invalid_text_material",
+            "text_material package key uses letters, digits, '.', '_' and '-'",
+            line,
+            1,
+        ));
+    }
+    let mut material = UiTextMaterialRef {
+        package_id: package_id.into(),
+        ..UiTextMaterialRef::default()
+    };
+    while let Some(token) = parts.next() {
+        match token {
+            "overflow" => {
+                for slot in material.overflow.iter_mut() {
+                    let value = parts.next().ok_or_else(|| {
+                        error(
+                            "nui_flow_invalid_text_material",
+                            "text_material overflow requires [left, top, right, bottom]",
+                            line,
+                            1,
+                        )
+                    })?;
+                    *slot = number(value, line)?.max(0.0);
+                }
+            }
+            "parameter" => {
+                let key = parts.next().ok_or_else(|| {
+                    error(
+                        "nui_flow_invalid_text_material",
+                        "text_material parameter requires a key",
+                        line,
+                        1,
+                    )
+                })?;
+                let raw = parts.next().ok_or_else(|| {
+                    error(
+                        "nui_flow_invalid_text_material",
+                        "text_material parameter requires a value",
+                        line,
+                        1,
+                    )
+                })?;
+                if raw.starts_with('$') {
+                    return Err(error(
+                        "nui_flow_invalid_text_material",
+                        "text_material parameters must be literal values",
+                        line,
+                        1,
+                    ));
+                }
+                if let Ok(value) = raw.parse::<f64>() {
+                    material.parameters.insert(key.into(), serde_json::json!(value));
+                } else if raw.starts_with('#') {
+                    let [r, g, b, a] = color(raw, line)?;
+                    material
+                        .parameters
+                        .insert(key.into(), serde_json::json!([r, g, b, a]));
+                } else {
+                    material.parameters.insert(key.into(), serde_json::json!(raw));
+                }
+            }
+            "duration" => {
+                let raw = parts.next().ok_or_else(|| {
+                    error(
+                        "nui_flow_invalid_text_material",
+                        "text_material duration requires milliseconds",
+                        line,
+                        1,
+                    )
+                })?;
+                let ms = number(raw, line)?;
+                if ms < 1.0 || ms > 60_000.0 {
+                    return Err(error(
+                        "nui_flow_invalid_text_material",
+                        "text_material duration must be within 1..60000 ms",
+                        line,
+                        1,
+                    ));
+                }
+                material.duration_ms = Some(ms as u32);
+            }
+            _ => {
+                return Err(error(
+                    "nui_flow_invalid_text_material",
+                    "text_material supports only overflow, parameter and duration clauses",
+                    line,
+                    1,
+                ));
+            }
+        }
+    }
+    material.validate().map_err(|_| {
+        error(
+            "nui_flow_invalid_text_material",
+            "text_material overflow or parameters are out of range",
+            line,
+            1,
+        )
+    })?;
+    Ok(material)
+}
+
 fn parse_attribute(
     node: &mut UiNode,
     bindings: &mut Vec<(UiBoundProperty, String)>,
@@ -5015,6 +5164,7 @@ fn attach(
     root: &mut Option<NodeBuild>,
     geometry_records: &mut BTreeMap<String, UiGeometry>,
     material_records: &mut BTreeMap<String, UiMaterialRef>,
+    text_material_records: &mut BTreeMap<String, UiTextMaterialRef>,
     composition_layer_records: &mut BTreeMap<String, UiCompositionLayer>,
     line: u32,
 ) -> FlowResult<()> {
@@ -5024,6 +5174,9 @@ fn attach(
     }
     if let Some(material) = child.material.take() {
         material_records.insert(child.node.node_id.0.clone(), material);
+    }
+    if let Some(text_material) = child.text_material.take() {
+        text_material_records.insert(child.node.node_id.0.clone(), text_material);
     }
     if child.composition_layer != UiCompositionLayer::Normal {
         composition_layer_records.insert(child.node.node_id.0.clone(), child.composition_layer);
@@ -5509,6 +5662,7 @@ fn format_node(
     skin_references: &BTreeMap<String, String>,
     geometry_records: &BTreeMap<String, UiGeometry>,
     material_records: &BTreeMap<String, UiMaterialRef>,
+    text_material_records: &BTreeMap<String, UiTextMaterialRef>,
     composition_layer_records: &BTreeMap<String, UiCompositionLayer>,
     exit_transition_records: &BTreeMap<String, UiTransition>,
     code_editors: &BTreeMap<String, neon_ui_schema::UiCodeEditorDeclaration>,
@@ -5750,6 +5904,41 @@ fn format_node(
         }
         lines.push(material_text);
     }
+    if let Some(material) = text_material_records.get(&node.node_id.0) {
+        let mut material_text =
+            format!("{}text_material {}", " ".repeat(child_indent), material.package_id);
+        if material.overflow != [0.0; 4] {
+            material_text.push_str(&format!(
+                " overflow {} {} {} {}",
+                material.overflow[0],
+                material.overflow[1],
+                material.overflow[2],
+                material.overflow[3]
+            ));
+        }
+        if let Some(duration) = material.duration_ms {
+            material_text.push_str(&format!(" duration {duration}"));
+        }
+        for (key, value) in &material.parameters {
+            if let Some(number) = value.as_f64() {
+                material_text.push_str(&format!(" parameter {key} {number}"));
+            } else if let Some(array) = value.as_array()
+                && array.len() == 4
+                && array.iter().all(|item| item.as_f64().is_some())
+            {
+                let color = format_color([
+                    array[0].as_f64().unwrap_or(0.0) as f32,
+                    array[1].as_f64().unwrap_or(0.0) as f32,
+                    array[2].as_f64().unwrap_or(0.0) as f32,
+                    array[3].as_f64().unwrap_or(0.0) as f32,
+                ]);
+                material_text.push_str(&format!(" parameter {key} {color}"));
+            } else if let Some(text) = value.as_str() {
+                material_text.push_str(&format!(" parameter {key} \"{text}\""));
+            }
+        }
+        lines.push(material_text);
+    }
     for child in &node.children {
         format_node(
             child,
@@ -5762,6 +5951,7 @@ fn format_node(
             skin_references,
             geometry_records,
             material_records,
+            text_material_records,
             composition_layer_records,
             exit_transition_records,
             code_editors,
@@ -7470,6 +7660,44 @@ panel workspace row gap 8
     }
 
     #[test]
+    #[test]
+    fn text_material_parse_into_document_records() {
+        let document = parse_nui_flow(
+            "shader pulse-neon-text version 1 fallback standard_text\nsurface root w 400 h 300\n  text title x 10 y 20\n    text_material pulse-neon-text overflow 8 6 8 6 parameter strength 1.25 duration 2000\n",
+        )
+        .expect("text_material must parse");
+        assert_eq!(document.ir.shader_packages.len(), 1);
+        assert_eq!(document.ir.shader_packages[0].package_id, "pulse-neon-text");
+        let material = document
+            .ir
+            .text_material_records
+            .get("title")
+            .expect("text material record must exist");
+        assert_eq!(material.package_id, "pulse-neon-text");
+        assert_eq!(material.overflow, [8.0, 6.0, 8.0, 6.0]);
+        assert_eq!(material.duration_ms, Some(2000));
+        assert_eq!(
+            material.parameters.get("strength").and_then(|v| v.as_f64()),
+            Some(1.25)
+        );
+        assert!(lower_nui_flow_effects(&document).iter().any(|effect| {
+            matches!(effect, UiEffect::TextMaterial { node_id, material }
+                if node_id.0 == "title" && material.package_id == "pulse-neon-text")
+        }));
+        let formatted = format_nui_flow(
+            "shader pulse-neon-text version 1 fallback standard_text\nsurface root w 400 h 300\n  text title x 10 y 20\n    text_material pulse-neon-text overflow 8 6 8 6 parameter strength 1.25 duration 2000\n",
+        )
+        .expect("format must succeed");
+        assert!(formatted.contains("text_material pulse-neon-text"), "{formatted}");
+        assert!(formatted.contains("duration 2000"), "{formatted}");
+        // duration out of range is rejected
+        let rejected = parse_nui_flow(
+            "shader pulse-neon-text version 1 fallback standard_text\nsurface root w 400 h 300\n  text title x 10 y 20\n    text_material pulse-neon-text duration 999999\n",
+        )
+        .unwrap_err();
+        assert_eq!(rejected.diagnostics[0].code, "nui_flow_invalid_text_material");
+    }
+
     fn geometry_and_material_reject_invalid_declarations() {
         let geometry_error = parse_nui_flow(
             "surface root\n  panel hero w 100 h 50\n    geometry skew 10\n",

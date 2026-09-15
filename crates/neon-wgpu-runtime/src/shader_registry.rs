@@ -47,10 +47,7 @@ impl ShaderRegistry {
     /// Register a package after full structural validation. Re-computes the
     /// source digest and compares it with the request digest so a corrupt
     /// transfer is rejected before the package is cached.
-    pub fn register(
-        &mut self,
-        package: &UiShaderPackage,
-    ) -> Result<ShaderPackageEntry, String> {
+    pub fn register(&mut self, package: &UiShaderPackage) -> Result<ShaderPackageEntry, String> {
         if !package.validate().is_ok() {
             return Err("shader package failed budget or parameter validation".into());
         }
@@ -177,7 +174,8 @@ mod tests {
     #[test]
     fn register_rejects_digest_mismatch_and_oversize() {
         let mut registry = ShaderRegistry::new();
-        let mut bad = package(b"@fragment fn material() -> @location(0) vec4<f32> { return vec4(0.0); }");
+        let mut bad =
+            package(b"@fragment fn material() -> @location(0) vec4<f32> { return vec4(0.0); }");
         bad.source_digest = "deadbeef".into();
         assert!(registry.register(&bad).is_err());
         let huge = package(&vec![0u8; UiShaderPackage::MAX_SOURCE_BYTES + 1]);
@@ -195,7 +193,11 @@ mod tests {
         assert_eq!(registry.snapshot()["count"], 1);
         registry.record_compile_result("pulse-glow", Some("naga: error".into()));
         assert_eq!(
-            registry.lookup("pulse-glow").unwrap().compile_error.as_deref(),
+            registry
+                .lookup("pulse-glow")
+                .unwrap()
+                .compile_error
+                .as_deref(),
             Some("naga: error")
         );
     }

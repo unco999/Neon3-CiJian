@@ -1,7 +1,11 @@
-# NUI Flow fixture: standalone `code_editor` component demo.
-# The renderer draws the editor from the declaration + this fragment; the
-# document source shown below is the literal adopted by the renderer (the
-# host document-frame path is a later slice, see docs/nui-flow-code-editor.md).
+# NUI Flow fixture: standalone `code_editor` component demo with text shader.
+# Five registered text-material styles: enhanced neon (persistent), sweep,
+# distortion, rainbow flow, aurora, plus a 5s one-shot that falls back.
+shader pulse-neon-text version 1 fallback standard_text
+shader text-sweep version 1 fallback standard_text
+shader text-distort version 1 fallback standard_text
+shader rainbow-chroma version 1 fallback standard_text
+shader aurora-glow version 1 fallback standard_text
 version 1
 surface surface.editor.code-demo revision 1
 input document text default text:empty
@@ -9,4 +13,19 @@ input locked bool default false
 surface root column w 960 h 680 fill #0B1216
   panel header row gap 8 pad 10 h 42 fill #0E1A22 line #1F3A4A radius 6
     text title value "NUI Flow code_editor 组件演示" w 940 h 22
+      text_material pulse-neon-text overflow 12 10 12 10
+  panel status row gap 8 pad 10 h 30 fill #0E1A22 line #1F3A4A radius 6
+    text hint value "霓虹标题为持续 text_material；本提示为 5 秒一次性播放，结束后回落默认文本" w 940 h 20
+      text_material pulse-neon-text overflow 10 8 10 8 duration 5000
+  panel swatches column gap 6 pad 10 h 156 fill #0E1A22 line #1F3A4A radius 6
+    text sweep_row value "扫光 Sweep —— 一道高光沿整行扫过" w 940 h 22
+      text_material text-sweep overflow 8 6 8 6
+    text distort_row value "扭曲场 Distort —— 字形随水波微微颤动" w 940 h 22
+      text_material text-distort overflow 8 6 8 6
+    text rainbow_row value "彩虹流光 Rainbow —— 色相沿文字流动" w 940 h 22
+      text_material rainbow-chroma overflow 8 6 8 6
+    text aurora_row value "极光 Aurora —— 绿紫极光在字形上流动" w 940 h 22
+      text_material aurora-glow overflow 8 6 8 6
+    text oneshot_row value "一次性霓虹 One-shot —— 5 秒后回落默认文本" w 940 h 22
+      text_material pulse-neon-text overflow 8 6 8 6 duration 5000
   code_editor source-view source $document language nui_flow line_numbers true wrap none font_size 14 tab_size 4 gutter_diagnostics true value "surface root column w 600 h 420 gap 8\n  panel header row gap 6 fill #102030\n    text title value \"Neon3 地形工作台\"\n    button open value \"打开\" event terrain.open\n    button run value \"运行\" event terrain.run\n  panel body column gap 4 fill #0C1820\n    text hint value \"按 Ctrl+Space 触发补全，Ctrl+Z/Y 撤销重做，Ctrl+S 提交\"\n" event editor.commit

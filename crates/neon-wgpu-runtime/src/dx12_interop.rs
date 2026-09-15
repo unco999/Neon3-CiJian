@@ -126,8 +126,12 @@ pub fn create_shared_surface(
     let raw_device: &ID3D12Device = hal_device.raw_device();
     let dxgi_format = match format {
         wgpu::TextureFormat::Rgba8Unorm => DXGI_FORMAT_R8G8B8A8_UNORM,
-        wgpu::TextureFormat::Rgba8UnormSrgb => windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(29),
-        wgpu::TextureFormat::Bgra8UnormSrgb => windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(88),
+        wgpu::TextureFormat::Rgba8UnormSrgb => {
+            windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(29)
+        }
+        wgpu::TextureFormat::Bgra8UnormSrgb => {
+            windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(88)
+        }
         wgpu::TextureFormat::R32Uint => DXGI_FORMAT_R32_UINT,
         wgpu::TextureFormat::R32Float => DXGI_FORMAT_R32_FLOAT,
         _ => {

@@ -1,4 +1,4 @@
-﻿//! Headless UI declaration runtime. It must not create windows or GPU objects.
+//! Headless UI declaration runtime. It must not create windows or GPU objects.
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
@@ -2303,6 +2303,7 @@ pub fn compile_ui_program(
         shader_packages: document.shader_packages.clone(),
         geometry_records: document.geometry_records.clone(),
         material_records: document.material_records.clone(),
+        text_material_records: document.text_material_records.clone(),
         composition_layer_records: document.composition_layer_records.clone(),
         context_menu_records: document.context_menu_records.clone(),
         resource_budget: document.resource_budget.clone(),
@@ -7533,6 +7534,7 @@ mod tests {
             skins: Vec::new(),
             geometry_records: BTreeMap::new(),
             material_records: BTreeMap::new(),
+            text_material_records: BTreeMap::new(),
             composition_layer_records: BTreeMap::new(),
             exit_transition_records: BTreeMap::new(),
             context_menu_records: BTreeMap::new(),

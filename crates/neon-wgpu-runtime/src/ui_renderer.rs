@@ -6,15 +6,17 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::Instant;
 
 use bytemuck::{Pod, Zeroable};
-use neon_protocol::{AssetBytes, AssetRef, Revision, UiImageSource, UiImageTextureRef, UiImageTextureRegion};
+use neon_protocol::{
+    AssetBytes, AssetRef, Revision, UiImageSource, UiImageTextureRef, UiImageTextureRegion,
+};
 use neon_ui_schema::{
-    RenderSurfaceRef, TextRef, UiAlignItems, UiBounds, UiClipPolicy, UiClipShape, UiControlPresentation,
-    UiDataGridCellTarget, UiDataGridWindowRequest, UiDragAxis, UiDragBinding, UiDragBoundary,
-    UiDropPlacement, UiEasing, UiFragment, UiFragmentRevision, UiImageFit, UiIntent, UiJustifyContent,
-    UiLayout, UiLayoutMode, UiNode, UiNodeKind, UiSemanticPayloadValue, UiStyle, UiTransform,
-    UiStylePatch as SchemaStylePatch, UiTransition, UiTransitionState, UiControlSkin,
-    UiSkinSlot, UiSkinSlotKind, UiVisualState, UiSkinPresentation, UiMaterialRef, UiShaderPackage,
-    UiAnimationRepeat, UiAnimationTimeline,
+    RenderSurfaceRef, TextRef, UiAlignItems, UiAnimationRepeat, UiAnimationTimeline, UiBounds,
+    UiClipPolicy, UiClipShape, UiControlPresentation, UiControlSkin, UiDataGridCellTarget,
+    UiDataGridWindowRequest, UiDragAxis, UiDragBinding, UiDragBoundary, UiDropPlacement, UiEasing,
+    UiFragment, UiFragmentRevision, UiImageFit, UiIntent, UiJustifyContent, UiLayout, UiLayoutMode,
+    UiMaterialRef, UiNode, UiNodeKind, UiSemanticPayloadValue, UiShaderPackage, UiSkinPresentation,
+    UiSkinSlot, UiSkinSlotKind, UiStyle, UiStylePatch as SchemaStylePatch, UiTransform,
+    UiTransition, UiTransitionState, UiVisualState,
 };
 use serde_json::{Value, json};
 
@@ -639,6 +641,100 @@ struct VsOut { @builtin(position) position: vec4<f32>, @location(0) local: vec2<
 }
 "#;
 
+const TEXT_MATERIAL_SHADER_PREFIX: &str = r#"
+struct View { viewport: vec2<f32>, color_mode: u32, time_seconds: f32, extras: array<vec4<f32>, 10> }
+@group(0) @binding(0) var<uniform> view: View;
+@group(1) @binding(0) var glyph_atlas: texture_2d<f32>;
+@group(1) @binding(1) var glyph_sampler: sampler;
+fn animation_progress(animation: vec4<f32>) -> f32 {
+ if (animation.w == 0.0 || animation.y <= 0.0) { return 1.0; }
+ let t=clamp((view.time_seconds-animation.x)/animation.y,0.0,1.0);
+ if(animation.z==1.0){return t*t;}
+ if(animation.z==2.0){return 1.0-(1.0-t)*(1.0-t);}
+ if(animation.z==3.0){return select(2.0*t*t,1.0-pow(-2.0*t+2.0,2.0)/2.0,t>=0.5);}
+   if(animation.z==4.0){if(t>=1.0){return 1.0;} let damping=6.0; let angular=16.0; let envelope=exp(-damping*t); return 1.0-envelope*(cos(angular*t)+damping/angular*sin(angular*t));} if(animation.z==5.0){let n1=7.5625;let d1=2.75;if(t<1.0/d1){return n1*t*t;}if(t<2.0/d1){let u=t-1.5/d1;return n1*u*u+0.75;}if(t<2.5/d1){let u=t-2.25/d1;return n1*u*u+0.9375;}let u=t-2.625/d1;return n1*u*u+0.984375;} if(animation.z==6.0){var low=0.0;var high=1.0;for(var i=0;i<10;i=i+1){let u=(low+high)*0.5;let v=1.0-u;let x=3.0*v*v*u*0.25+3.0*v*u*u*0.25+u*u*u;if(x<t){low=u;}else{high=u;}}let u=(low+high)*0.5;let v=1.0-u;return 3.0*v*v*u*0.1+3.0*v*u*u+u*u*u;}
+ return t;
+}
+fn transform_point(point: vec2<f32>, transform: vec4<f32>, angle: f32, pivot: vec2<f32>) -> vec2<f32> { let scaled=pivot+(point-pivot)*transform.zw+transform.xy; let delta=scaled-pivot; return pivot+vec2<f32>(delta.x*cos(angle)-delta.y*sin(angle),delta.x*sin(angle)+delta.y*cos(angle)); }
+fn transform_bounds(bounds: vec4<f32>, transform: vec4<f32>, angle: f32, pivot: vec2<f32>) -> vec4<f32> { let p0=transform_point(bounds.xy,transform,angle,pivot); let p1=transform_point(vec2<f32>(bounds.z,bounds.y),transform,angle,pivot); let p2=transform_point(bounds.zw,transform,angle,pivot); let p3=transform_point(vec2<f32>(bounds.x,bounds.w),transform,angle,pivot); return vec4<f32>(min(min(p0.x,p1.x),min(p2.x,p3.x)),min(min(p0.y,p1.y),min(p2.y,p3.y)),max(max(p0.x,p1.x),max(p2.x,p3.x)),max(max(p0.y,p1.y),max(p2.y,p3.y))); }
+fn srgb_to_linear(value: vec3<f32>) -> vec3<f32> {
+ let low = value / 12.92; let high = pow((value + vec3<f32>(0.055)) / 1.055, vec3<f32>(2.4)); return select(low, high, value > vec3<f32>(0.04045));
+}
+struct VsIn { @location(0) rect: vec4<f32>, @location(1) color: vec4<f32>, @location(2) clip: vec4<f32>, @location(3) uv: vec4<f32>, @location(4) depth: f32, @location(5) paint_group_id: f32, @location(6) animation: vec4<f32>, @location(7) transform_from: vec4<f32>, @location(8) transform_to: vec4<f32>, @location(9) rotation_pivot: vec4<f32>, @location(10) overflow: vec4<f32> }
+struct VsOut { @builtin(position) position: vec4<f32>, @location(0) local: vec2<f32>, @location(1) color: vec4<f32>, @location(2) clip: vec4<f32>, @location(3) pixel: vec2<f32>, @location(4) uv: vec2<f32>, @location(5) uv_size: vec2<f32>, @location(6) glyph_quad: vec4<f32>, @location(7) bounds: vec4<f32>, @location(8) uv_origin: vec2<f32>, @location(9) uv_per_px: vec2<f32> }
+@vertex fn vs_main(@builtin(vertex_index) index: u32, input: VsIn) -> VsOut {
+ var corners = array<vec2<f32>, 6>(vec2<f32>(0.0,0.0),vec2<f32>(1.0,0.0),vec2<f32>(0.0,1.0),vec2<f32>(0.0,1.0),vec2<f32>(1.0,0.0),vec2<f32>(1.0,1.0));
+ let local = corners[index]; let t=animation_progress(input.animation); let static_transform=select(vec4<f32>(0.0,0.0,1.0,1.0),input.transform_to,input.transform_to.z>0.0&&input.transform_to.w>0.0); let transform=select(static_transform,mix(input.transform_from,input.transform_to,t),input.animation.w != 0.0); let static_angle=select(0.0,input.rotation_pivot.y,input.transform_to.z>0.0&&input.transform_to.w>0.0); let angle=select(static_angle,mix(input.rotation_pivot.x,input.rotation_pivot.y,t),input.animation.w != 0.0); let pixel=transform_point(input.rect.xy+local*input.rect.zw,transform,angle,input.rotation_pivot.zw);
+ let rect_w=max(input.rect.z,0.0001); let rect_h=max(input.rect.w,0.0001);
+ let glyph_quad=vec4<f32>(input.overflow[0]/rect_w,input.overflow[1]/rect_h,max(rect_w-input.overflow[0]-input.overflow[2],0.0001)/rect_w,max(rect_h-input.overflow[1]-input.overflow[3],0.0001)/rect_h);
+ let glyph_local=(local-glyph_quad.xy)/glyph_quad.zw;
+ var output: VsOut;
+ output.position=vec4<f32>(pixel.x/view.viewport.x*2.0-1.0,1.0-pixel.y/view.viewport.y*2.0,input.depth,1.0); output.local=local; output.color=input.color; output.clip=transform_bounds(input.clip,transform,angle,input.rotation_pivot.zw); output.pixel=pixel; output.uv=input.uv.xy+glyph_local*input.uv.zw; output.uv_size=input.uv.zw; output.glyph_quad=glyph_quad; output.bounds=transform_bounds(input.rect,transform,angle,input.rotation_pivot.zw); let glyph_px=max(input.rect.zw*glyph_quad.zw,vec2<f32>(0.0001)); output.uv_origin=input.uv.xy; output.uv_per_px=input.uv.zw/glyph_px; return output;
+}
+struct TextMaterialInput {
+ local_position: vec2<f32>,
+ glyph_quad: vec4<f32>,
+ bounds: vec4<f32>,
+ uv: vec2<f32>,
+ uv_size: vec2<f32>,
+ coverage: f32,
+ edge_ink: f32,
+ base_color: vec4<f32>,
+ time_seconds: f32,
+ opacity: f32,
+ state_flags: u32,
+}
+"#;
+
+const TEXT_MATERIAL_SHADER_SUFFIX: &str = r#"
+fn glyph_safe_uv(sample_uv: vec2<f32>, origin: vec2<f32>, span: vec2<f32>, half_texel: vec2<f32>) -> vec2<f32> {
+  let min_uv = origin + half_texel;
+  let max_uv = max(origin + span - half_texel, min_uv);
+  return clamp(sample_uv, min_uv, max_uv);
+}
+fn sample_glyph_coverage(sample_uv: vec2<f32>, origin: vec2<f32>, span: vec2<f32>, half_texel: vec2<f32>) -> f32 {
+  let end_uv = origin + span;
+  let inside = all(sample_uv >= origin) && all(sample_uv <= end_uv);
+  if (!inside) { return 0.0; }
+  return textureSample(glyph_atlas, glyph_sampler, glyph_safe_uv(sample_uv, origin, span, half_texel)).a;
+}
+@fragment fn fs_text_material(input: VsOut) -> @location(0) vec4<f32> {
+ if (input.pixel.x < input.clip.x || input.pixel.y < input.clip.y || input.pixel.x > input.clip.z || input.pixel.y > input.clip.w) { discard; }
+  // The expanded quad is a visual halo area, not part of the glyph bitmap.
+  // Samples outside the original glyph rect must be zero; clamping them to
+  // the rect edge turns narrow Latin glyphs into solid bars and can also make
+  // the first/last atlas texel select the one-pixel separator or next glyph.
+  let uv_origin = input.uv_origin;
+  let uv_span = max(input.uv_size, vec2<f32>(0.0001));
+  let half_texel = 0.5 / vec2<f32>(textureDimensions(glyph_atlas));
+  // @@TEXT_MATERIAL_SAMPLE_UV@@
+  let coverage = sample_glyph_coverage(uv, uv_origin, uv_span, half_texel);
+ var edge_ink = coverage;
+ if (coverage <= 0.95) {
+  // Four rings (1..4px, 8 directions) attenuated by distance. Ring offsets
+  // are in true pixel units (uv_per_px), not glyph spans.
+  for (var ring = 1; ring <= 4; ring = ring + 1) {
+   let radius = f32(ring);
+   let weight = select(1.0, 0.6, ring == 2);
+   let weight2 = select(weight, 0.35, ring == 3);
+   let w = select(weight2, 0.2, ring == 4);
+   for (var i = 0; i < 8; i = i + 1) {
+    let dir = vec2<f32>(cos(f32(i) * 0.785398163), sin(f32(i) * 0.785398163)) * radius * input.uv_per_px;
+     edge_ink = max(edge_ink, sample_glyph_coverage(uv + dir, uv_origin, uv_span, half_texel) * w);
+   }
+  }
+ }
+ let base = text_material(TextMaterialInput(
+   input.local, input.glyph_quad, input.bounds, glyph_safe_uv(uv, uv_origin, uv_span, half_texel), input.uv_size,
+  coverage, edge_ink, input.color, view.time_seconds, input.color.a, 0u,
+ ));
+ let alpha = clamp(base.a, 0.0, 1.0) * input.color.a;
+ if (alpha <= 0.001) { discard; }
+ let final_color = select(srgb_to_linear(base.rgb), base.rgb, view.color_mode == 1u);
+ return vec4<f32>(final_color * alpha, alpha);
+}
+"#;
+
 const CANVAS_SHADER: &str = r#"
 struct View { viewport: vec2<f32>, color_mode: u32, time_seconds: f32, extras: array<vec4<f32>, 10> }
 @group(0) @binding(0) var<uniform> view: View;
@@ -708,8 +804,7 @@ struct UiView {
 /// render loop. The runtime never interprets the content — shaders are
 /// free to use the 40 f32 slots for audio spectrum, sensor data, IRC
 /// counters, or any other per-frame data.
-static GLOBAL_VIEW_EXTRAS: std::sync::Mutex<[[f32; 4]; 10]> =
-    std::sync::Mutex::new([[0.0; 4]; 10]);
+static GLOBAL_VIEW_EXTRAS: std::sync::Mutex<[[f32; 4]; 10]> = std::sync::Mutex::new([[0.0; 4]; 10]);
 
 pub(crate) fn set_global_view_extras(extras: [[f32; 4]; 10]) {
     if let Ok(mut guard) = GLOBAL_VIEW_EXTRAS.lock() {
@@ -718,9 +813,11 @@ pub(crate) fn set_global_view_extras(extras: [[f32; 4]; 10]) {
 }
 
 pub(crate) fn get_global_view_extras() -> [[f32; 4]; 10] {
-    GLOBAL_VIEW_EXTRAS.lock().map(|g| *g).unwrap_or([[0.0; 4]; 10])
+    GLOBAL_VIEW_EXTRAS
+        .lock()
+        .map(|g| *g)
+        .unwrap_or([[0.0; 4]; 10])
 }
-
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -1001,6 +1098,11 @@ struct UiTextInstance {
     transform_from: [f32; 4],
     transform_to: [f32; 4],
     rotation_pivot: [f32; 4],
+    /// Glyph-quad expansion [left, top, right, bottom] applied by the layout
+    /// pass when the node carries a text material (glow/halo). Zero for
+    /// ordinary text. The text-material vertex shader uses it to rebuild the
+    /// glyph quad inside the expanded rect and remap UVs back into it.
+    overflow: [f32; 4],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1636,7 +1738,9 @@ fn composition_layer_is(layer: neon_ui_schema::UiCompositionLayer, mode: UiDrawM
     match mode {
         UiDrawMode::BehindGlass => layer == neon_ui_schema::UiCompositionLayer::BehindGlass,
         UiDrawMode::All => true,
-        UiDrawMode::Screen | UiDrawMode::World => layer != neon_ui_schema::UiCompositionLayer::BehindGlass,
+        UiDrawMode::Screen | UiDrawMode::World => {
+            layer != neon_ui_schema::UiCompositionLayer::BehindGlass
+        }
     }
 }
 
@@ -1760,7 +1864,16 @@ fn resolve_shell_cut(size: [f32; 2], declared: [f32; 4]) -> [f32; 4] {
     let height = size[1].max(0.0);
     let max_corner = (width.min(height) * 0.5).max(0.0);
     let mut cut = declared.map(|value| value.max(0.0).min(max_corner));
-    for (a, b, limit) in [(0usize, 3usize, width), (3, 2, width), (2, 1, width), (1, 0, width), (0, 1, height), (1, 2, height), (2, 3, height), (3, 0, height)] {
+    for (a, b, limit) in [
+        (0usize, 3usize, width),
+        (3, 2, width),
+        (2, 1, width),
+        (1, 0, width),
+        (0, 1, height),
+        (1, 2, height),
+        (2, 3, height),
+        (3, 0, height),
+    ] {
         let total = cut[a] + cut[b];
         if total > limit && total > 0.0 {
             let scale = limit / total;
@@ -1891,11 +2004,21 @@ pub struct UiWgpuRenderer {
     canvas_buffer: wgpu::Buffer,
     canvas_capacity: usize,
     text_pipeline: wgpu::RenderPipeline,
+    text_layout: wgpu::PipelineLayout,
+    text_material_pipelines: BTreeMap<String, wgpu::RenderPipeline>,
+    text_material_buffer: wgpu::Buffer,
+    text_material_capacity: usize,
+    node_text_materials: BTreeMap<String, neon_ui_schema::UiTextMaterialRef>,
+    /// Renderer-time seconds when a one-shot text material started playing.
+    text_material_started: BTreeMap<String, f32>,
+    /// One-shot text materials that already played to completion; they stay
+    /// suppressed while the fragment keeps declaring them.
+    text_material_consumed: std::collections::HashSet<String>,
     text_buffer: wgpu::Buffer,
     text_capacity: usize,
     popup_text_buffer: wgpu::Buffer,
     popup_text_capacity: usize,
-    _text_texture_layout: wgpu::BindGroupLayout,
+    text_texture_layout: wgpu::BindGroupLayout,
     resident_font: Option<ResidentFont>,
     last_panel_instance_count: usize,
     pointer_visual_dirty: bool,
@@ -1967,12 +2090,11 @@ impl UiWgpuRenderer {
     /// Compiles package-local fragment functions into renderer-owned material
     /// pipelines. Sources never receive a device, texture, sampler, or bind
     /// group: the fixed wrapper supplies the only ABI and GPU bindings.
-    pub fn sync_material_packages(
-        &mut self,
-        device: &wgpu::Device,
-        packages: &[UiShaderPackage],
-    ) {
+    pub fn sync_material_packages(&mut self, device: &wgpu::Device, packages: &[UiShaderPackage]) {
         for package in packages {
+            if package.entry_point != "material" {
+                continue;
+            }
             if self.material_pipelines.contains_key(&package.package_id) {
                 continue;
             }
@@ -1990,30 +2112,101 @@ impl UiWgpuRenderer {
                 immediate_size: 0,
             });
             let attributes = [
-                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 0, shader_location: 0 },
-                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 16, shader_location: 1 },
-                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 32, shader_location: 2 },
-                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 48, shader_location: 3 },
-                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 64, shader_location: 4 },
-                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32, offset: 80, shader_location: 5 },
-                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 88, shader_location: 6 },
-                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 104, shader_location: 7 },
-                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 120, shader_location: 8 },
-                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 136, shader_location: 9 },
-                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 152, shader_location: 10 },
-                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 168, shader_location: 11 },
-                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32, offset: 184, shader_location: 12 },
-                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 188, shader_location: 13 },
-                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 204, shader_location: 14 },
-                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 220, shader_location: 15 },
+                wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Float32x4,
+                    offset: 0,
+                    shader_location: 0,
+                },
+                wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Float32x4,
+                    offset: 16,
+                    shader_location: 1,
+                },
+                wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Float32x4,
+                    offset: 32,
+                    shader_location: 2,
+                },
+                wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Float32x4,
+                    offset: 48,
+                    shader_location: 3,
+                },
+                wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Float32x4,
+                    offset: 64,
+                    shader_location: 4,
+                },
+                wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Float32,
+                    offset: 80,
+                    shader_location: 5,
+                },
+                wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Float32x4,
+                    offset: 88,
+                    shader_location: 6,
+                },
+                wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Float32x4,
+                    offset: 104,
+                    shader_location: 7,
+                },
+                wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Float32x4,
+                    offset: 120,
+                    shader_location: 8,
+                },
+                wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Float32x4,
+                    offset: 136,
+                    shader_location: 9,
+                },
+                wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Float32x4,
+                    offset: 152,
+                    shader_location: 10,
+                },
+                wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Float32x4,
+                    offset: 168,
+                    shader_location: 11,
+                },
+                wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Float32,
+                    offset: 184,
+                    shader_location: 12,
+                },
+                wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Float32x4,
+                    offset: 188,
+                    shader_location: 13,
+                },
+                wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Float32x4,
+                    offset: 204,
+                    shader_location: 14,
+                },
+                wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Float32x4,
+                    offset: 220,
+                    shader_location: 15,
+                },
             ];
             let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(&format!("neon3-ui-material-pipeline-{}", package.package_id)),
+                label: Some(&format!(
+                    "neon3-ui-material-pipeline-{}",
+                    package.package_id
+                )),
                 layout: Some(&layout),
                 vertex: wgpu::VertexState {
                     module: &shader,
                     entry_point: Some("vs_main"),
-                    buffers: &[Some(wgpu::VertexBufferLayout { array_stride: std::mem::size_of::<UiInstance>() as u64, step_mode: wgpu::VertexStepMode::Instance, attributes: &attributes })],
+                    buffers: &[Some(wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<UiInstance>() as u64,
+                        step_mode: wgpu::VertexStepMode::Instance,
+                        attributes: &attributes,
+                    })],
                     compilation_options: Default::default(),
                 },
                 fragment: Some(wgpu::FragmentState {
@@ -2032,7 +2225,149 @@ impl UiWgpuRenderer {
                 multiview_mask: None,
                 cache: None,
             });
-            self.material_pipelines.insert(package.package_id.clone(), pipeline);
+            self.material_pipelines
+                .insert(package.package_id.clone(), pipeline);
+        }
+    }
+    /// Compiles registered text-material packages into per-package render
+    /// pipelines. The wrapper owns every GPU binding and the vertex ABI; a
+    /// package source only provides `fn text_material(TextMaterialInput) ->
+    /// vec4<f32>` — it never receives a device, texture, sampler, or bind
+    /// group.
+    pub fn sync_text_material_packages(
+        &mut self,
+        device: &wgpu::Device,
+        packages: &[UiShaderPackage],
+    ) {
+        for package in packages {
+            if package.entry_point != "text_material" {
+                continue;
+            }
+            if self
+                .text_material_pipelines
+                .contains_key(&package.package_id)
+            {
+                continue;
+            }
+            let Ok(source) = std::str::from_utf8(&package.source_bytes) else {
+                continue;
+            };
+            // Optional displacement hook: a package that defines
+            // `text_material_displace` (see the demo styles) warps the glyph
+            // sample coordinates in UV space; without it the raw interpolated
+            // UV is used. Renderer owns the ABI, the package only supplies the
+            // pure function.
+            let sample_line = if source.contains("fn text_material_displace") {
+                "let uv = text_material_displace(input.uv, input.uv_origin, input.uv_size, input.pixel, input.local, view.time_seconds);"
+            } else {
+                "let uv = input.uv;"
+            };
+            let source =
+                format!("{TEXT_MATERIAL_SHADER_PREFIX}\n{source}\n{}",
+                    TEXT_MATERIAL_SHADER_SUFFIX.replace(
+                        "// @@TEXT_MATERIAL_SAMPLE_UV@@",
+                        sample_line,
+                    ));
+            let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some(&format!("neon3-ui-text-material-{}", package.package_id)),
+                source: wgpu::ShaderSource::Wgsl(source.into()),
+            });
+            let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("neon3-ui-text-material-layout"),
+                bind_group_layouts: &[Some(&self.view_layout), Some(&self.text_texture_layout)],
+                immediate_size: 0,
+            });
+            let attributes = [
+                wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Float32x4,
+                    offset: 0,
+                    shader_location: 0,
+                },
+                wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Float32x4,
+                    offset: 16,
+                    shader_location: 1,
+                },
+                wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Float32x4,
+                    offset: 32,
+                    shader_location: 2,
+                },
+                wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Float32x4,
+                    offset: 48,
+                    shader_location: 3,
+                },
+                wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Float32,
+                    offset: 64,
+                    shader_location: 4,
+                },
+                wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Float32,
+                    offset: 68,
+                    shader_location: 5,
+                },
+                wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Float32x4,
+                    offset: 72,
+                    shader_location: 6,
+                },
+                wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Float32x4,
+                    offset: 88,
+                    shader_location: 7,
+                },
+                wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Float32x4,
+                    offset: 104,
+                    shader_location: 8,
+                },
+                wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Float32x4,
+                    offset: 120,
+                    shader_location: 9,
+                },
+                wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Float32x4,
+                    offset: 136,
+                    shader_location: 10,
+                },
+            ];
+            let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(&format!(
+                    "neon3-ui-text-material-pipeline-{}",
+                    package.package_id
+                )),
+                layout: Some(&layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_main"),
+                    buffers: &[Some(wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<UiTextInstance>() as u64,
+                        step_mode: wgpu::VertexStepMode::Instance,
+                        attributes: &attributes,
+                    })],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_text_material"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: self.color_format,
+                        blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            });
+            self.text_material_pipelines
+                .insert(package.package_id.clone(), pipeline);
         }
     }
     pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
@@ -2094,7 +2429,9 @@ impl UiWgpuRenderer {
         let event_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("neon3-ui-shader-events"),
             size: SHADER_EVENT_BUFFER_SIZE,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         let event_staging_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -2901,11 +3238,18 @@ impl UiWgpuRenderer {
             canvas_buffer: create_canvas_buffer(device, 512),
             canvas_capacity: 512,
             text_pipeline,
+            text_layout,
+            text_material_pipelines: BTreeMap::new(),
+            text_material_buffer: create_text_buffer(device, 512),
+            text_material_capacity: 512,
+            node_text_materials: BTreeMap::new(),
+            text_material_started: BTreeMap::new(),
+            text_material_consumed: std::collections::HashSet::new(),
             text_buffer: create_text_buffer(device, 512),
             text_capacity: 512,
             popup_text_buffer: create_text_buffer(device, 512),
             popup_text_capacity: 512,
-            _text_texture_layout: text_texture_layout,
+            text_texture_layout,
             resident_font: None,
             last_panel_instance_count: 0,
             pointer_visual_dirty: false,
@@ -3130,16 +3474,15 @@ impl UiWgpuRenderer {
                 .unwrap_or(Revision(0));
             // Always begin with a canonical transition sample. Inherited composition
             // below must never accumulate in `sampled` across renderer entry points.
-            self.sampled[index] =
-                self.sample_with_history(
-                    &node_id,
-                    &target,
-                    transition.as_ref(),
-                    node_generation,
-                    program_revision,
-                    frame_sequence,
-                    time_seconds,
-                );
+            self.sampled[index] = self.sample_with_history(
+                &node_id,
+                &target,
+                transition.as_ref(),
+                node_generation,
+                program_revision,
+                frame_sequence,
+                time_seconds,
+            );
             if target.world_scale.is_some() && self.sampled[index].bounds != target.bounds {
                 self.layout_counters.world_transform_update_count = self
                     .layout_counters
@@ -3335,10 +3678,15 @@ impl UiWgpuRenderer {
             let Some(selected) = self.builtin_choices.get(&node.id) else {
                 continue;
             };
-            if !matches!(node.target.kind, UiNodeKind::ListBox | UiNodeKind::Tabs | UiNodeKind::Combo | UiNodeKind::Dropdown) {
+            if !matches!(
+                node.target.kind,
+                UiNodeKind::ListBox | UiNodeKind::Tabs | UiNodeKind::Combo | UiNodeKind::Dropdown
+            ) {
                 continue;
             }
-            if let Some(UiControlPresentation::Choice { options, .. }) = &self.sampled[index].presentation {
+            if let Some(UiControlPresentation::Choice { options, .. }) =
+                &self.sampled[index].presentation
+            {
                 self.sampled[index].presentation = Some(UiControlPresentation::Choice {
                     token: selected.clone(),
                     options: options.clone(),
@@ -3353,20 +3701,22 @@ impl UiWgpuRenderer {
             let Some(&(value, min, max)) = self.builtin_numerics.get(&node.id) else {
                 continue;
             };
-            if !matches!(node.target.kind, UiNodeKind::Slider | UiNodeKind::DragValue | UiNodeKind::Scrollbar | UiNodeKind::ProgressBar) {
+            if !matches!(
+                node.target.kind,
+                UiNodeKind::Slider
+                    | UiNodeKind::DragValue
+                    | UiNodeKind::Scrollbar
+                    | UiNodeKind::ProgressBar
+            ) {
                 continue;
             }
             if let Some(UiControlPresentation::Numeric { .. }) = &self.sampled[index].presentation {
-                self.sampled[index].presentation = Some(UiControlPresentation::Numeric {
-                    value,
-                    min,
-                    max,
-                });
+                self.sampled[index].presentation =
+                    Some(UiControlPresentation::Numeric { value, min, max });
             }
             if let Some(UiControlPresentation::Scroll { .. }) = &self.sampled[index].presentation {
-                self.sampled[index].presentation = Some(UiControlPresentation::Scroll {
-                    position: value,
-                });
+                self.sampled[index].presentation =
+                    Some(UiControlPresentation::Scroll { position: value });
             }
         }
         // Local numeric gestures update the renderer presentation before an
@@ -3378,7 +3728,10 @@ impl UiWgpuRenderer {
             else {
                 continue;
             };
-            if !matches!(node.target.kind, UiNodeKind::Slider | UiNodeKind::DragValue | UiNodeKind::Scrollbar) {
+            if !matches!(
+                node.target.kind,
+                UiNodeKind::Slider | UiNodeKind::DragValue | UiNodeKind::Scrollbar
+            ) {
                 continue;
             }
             if let Some(UiControlPresentation::Numeric { min, max, .. }) =
@@ -3391,9 +3744,8 @@ impl UiWgpuRenderer {
                 });
             }
             if let Some(UiControlPresentation::Scroll { .. }) = &self.sampled[index].presentation {
-                self.sampled[index].presentation = Some(UiControlPresentation::Scroll {
-                    position: *value,
-                });
+                self.sampled[index].presentation =
+                    Some(UiControlPresentation::Scroll { position: *value });
             }
             if node.target.kind == UiNodeKind::Slider {
                 if let Some(TextRef::Literal { value: label }) = &node.target.text {
@@ -3421,20 +3773,12 @@ impl UiWgpuRenderer {
                     let is_exiting = self.exiting.keys().any(|identity| {
                         identity.node_id == node.id
                             && identity.generation
-                                == self
-                                    .node_generations
-                                    .get(&node.id)
-                                    .copied()
-                                    .unwrap_or(1)
+                                == self.node_generations.get(&node.id).copied().unwrap_or(1)
                     });
                     SampledNodeVisual {
                         identity: AnimationIdentity {
                             node_id: node.id.clone(),
-                            generation: self
-                                .node_generations
-                                .get(&node.id)
-                                .copied()
-                                .unwrap_or(1),
+                            generation: self.node_generations.get(&node.id).copied().unwrap_or(1),
                         },
                         transition_id: active.map(|active| active.transition_id),
                         // Keep the diagnostic snapshot honest about what the
@@ -3485,9 +3829,7 @@ impl UiWgpuRenderer {
             .rev()
             .find_map(|(index, node)| {
                 let visual = self.visual_at(index);
-                if !visual.enabled
-                    || !self.pointer_inside_visual(index, pointer)
-                {
+                if !visual.enabled || !self.pointer_inside_visual(index, pointer) {
                     return None;
                 }
                 if let Some(modal) = modal
@@ -3513,9 +3855,7 @@ impl UiWgpuRenderer {
             .rev()
             .find_map(|(index, node)| {
                 let visual = self.visual_at(index);
-                if !visual.enabled
-                    || !self.pointer_inside_visual(index, pointer)
-                {
+                if !visual.enabled || !self.pointer_inside_visual(index, pointer) {
                     return None;
                 }
                 if let Some(modal) = modal
@@ -3804,6 +4144,8 @@ impl UiWgpuRenderer {
         }
         let mut requests = Vec::new();
         let mut settled = Vec::new();
+        let mut declared_text_materials: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
         for fragment in fragments.values() {
             for effect in &fragment.effects {
                 let neon_ui_schema::UiEffect::DataGridFrame { declaration, frame } = effect else {
@@ -4146,11 +4488,16 @@ impl UiWgpuRenderer {
                         height: (visual.bounds.height - 20.0).max(1.0),
                     }
                 }
-            },
+            }
             UiNodeKind::DragValue => drag_value_bounds(visual.bounds),
             UiNodeKind::Splitter => {
                 // Use parent container bounds as the drag range
-                if let Some(parent_id) = self.plan.iter().find(|n| n.id == binding.node_path).and_then(|n| n.parent_id.clone()) {
+                if let Some(parent_id) = self
+                    .plan
+                    .iter()
+                    .find(|n| n.id == binding.node_path)
+                    .and_then(|n| n.parent_id.clone())
+                {
                     if let Some(parent) = self.plan.iter().find(|n| n.id == parent_id) {
                         parent.target.bounds
                     } else {
@@ -4186,7 +4533,10 @@ impl UiWgpuRenderer {
             .is_some_and(|node| {
                 matches!(
                     node.target.kind,
-                    UiNodeKind::Slider | UiNodeKind::DragValue | UiNodeKind::Scrollbar | UiNodeKind::Splitter
+                    UiNodeKind::Slider
+                        | UiNodeKind::DragValue
+                        | UiNodeKind::Scrollbar
+                        | UiNodeKind::Splitter
                 )
             })
     }
@@ -4198,7 +4548,9 @@ impl UiWgpuRenderer {
         let Some(pointer) = self.pointer_position else {
             return false;
         };
-        let fraction = if gesture.kind == UiNodeKind::Scrollbar && gesture.bounds.height > gesture.bounds.width {
+        let fraction = if gesture.kind == UiNodeKind::Scrollbar
+            && gesture.bounds.height > gesture.bounds.width
+        {
             ((pointer[1] - gesture.bounds.y) / gesture.bounds.height.max(1.0)).clamp(0.0, 1.0)
         } else {
             ((pointer[0] - gesture.bounds.x) / gesture.bounds.width.max(1.0)).clamp(0.0, 1.0)
@@ -4228,8 +4580,10 @@ impl UiWgpuRenderer {
                 .insert(gesture.node_path.clone(), (*v, gesture.min, gesture.max));
         }
         if let UiSemanticPayloadValue::I32 { value: v } = &value {
-            self.builtin_numerics
-                .insert(gesture.node_path.clone(), (*v as f32, gesture.min, gesture.max));
+            self.builtin_numerics.insert(
+                gesture.node_path.clone(),
+                (*v as f32, gesture.min, gesture.max),
+            );
         }
         Some((
             value.clone(),
@@ -4267,9 +4621,12 @@ impl UiWgpuRenderer {
                 _ => None,
             })?;
         let new_selected = !selected;
-        let value = UiSemanticPayloadValue::Bool { value: new_selected };
+        let value = UiSemanticPayloadValue::Bool {
+            value: new_selected,
+        };
         // Persist to built-in state (survives fragment re-submission)
-        self.builtin_toggles.insert(node_path.to_owned(), new_selected);
+        self.builtin_toggles
+            .insert(node_path.to_owned(), new_selected);
         // Also set transient preview for immediate visual feedback
         self.value_previews
             .insert(node_path.to_owned(), value.clone());
@@ -4285,7 +4642,8 @@ impl UiWgpuRenderer {
 
     /// Set persistent built-in choice selection for ListBox/Tabs/Combo/Dropdown.
     pub(crate) fn set_choice(&mut self, node_path: &str, value: &str) {
-        self.builtin_choices.insert(node_path.to_owned(), value.to_owned());
+        self.builtin_choices
+            .insert(node_path.to_owned(), value.to_owned());
         self.pointer_visual_dirty = true;
     }
 
@@ -4307,9 +4665,9 @@ impl UiWgpuRenderer {
         let Some(parent_id) = self.plan[index].parent_id.as_ref() else {
             return false;
         };
-        self.plan.iter().any(|node| {
-            node.id == *parent_id && matches!(node.target.kind, UiNodeKind::TreeView)
-        })
+        self.plan
+            .iter()
+            .any(|node| node.id == *parent_id && matches!(node.target.kind, UiNodeKind::TreeView))
     }
 
     /// Whether a splitter drag is currently active.
@@ -4319,9 +4677,9 @@ impl UiWgpuRenderer {
 
     /// Check if the node at the given path is a Splitter.
     pub(crate) fn is_splitter_binding(&self, node_path: &str) -> bool {
-        self.plan.iter().any(|node| {
-            node.id == node_path && matches!(node.target.kind, UiNodeKind::Splitter)
-        })
+        self.plan
+            .iter()
+            .any(|node| node.id == node_path && matches!(node.target.kind, UiNodeKind::Splitter))
     }
 
     /// Begin a splitter drag. Finds the left and right sibling panels around
@@ -4336,7 +4694,10 @@ impl UiWgpuRenderer {
             None => return false,
         };
         // Find siblings: children of the same parent, in plan order.
-        let siblings: Vec<usize> = self.plan.iter().enumerate()
+        let siblings: Vec<usize> = self
+            .plan
+            .iter()
+            .enumerate()
             .filter(|(_, n)| n.parent_id.as_deref() == Some(parent_id.as_str()))
             .map(|(i, _)| i)
             .collect();
@@ -4357,8 +4718,16 @@ impl UiWgpuRenderer {
         }
         let horizontal = splitter.target.bounds.width < splitter.target.bounds.height;
         let container_start = if horizontal { left.x } else { left.y };
-        let splitter_size = if horizontal { splitter.target.bounds.width } else { splitter.target.bounds.height };
-        let splitter_lead = if horizontal { splitter.target.bounds.x } else { splitter.target.bounds.y };
+        let splitter_size = if horizontal {
+            splitter.target.bounds.width
+        } else {
+            splitter.target.bounds.height
+        };
+        let splitter_lead = if horizontal {
+            splitter.target.bounds.x
+        } else {
+            splitter.target.bounds.y
+        };
         // Record pointer offset so the grab point stays stable during drag.
         let pointer_pos = if horizontal {
             self.pointer_position.map(|p| p[0]).unwrap_or(splitter_lead)
@@ -4369,7 +4738,9 @@ impl UiWgpuRenderer {
         // Capture original bounds for panels, splitter, and all descendants.
         let mut original_bounds = Vec::new();
         for idx in 0..self.plan.len() {
-            if idx == left_idx || idx == right_idx || idx == split_idx
+            if idx == left_idx
+                || idx == right_idx
+                || idx == split_idx
                 || is_descendant(&self.plan, idx, left_idx)
                 || is_descendant(&self.plan, idx, right_idx)
             {
@@ -4394,9 +4765,17 @@ impl UiWgpuRenderer {
 
     /// Update the splitter drag based on current pointer position.
     pub(crate) fn update_splitter_drag(&mut self) {
-        let Some(drag) = self.splitter_drag.as_mut() else { return };
-        let Some(pointer) = self.pointer_position else { return };
-        let pos = if drag.horizontal { pointer[0] } else { pointer[1] };
+        let Some(drag) = self.splitter_drag.as_mut() else {
+            return;
+        };
+        let Some(pointer) = self.pointer_position else {
+            return;
+        };
+        let pos = if drag.horizontal {
+            pointer[0]
+        } else {
+            pointer[1]
+        };
         // Splitter leading edge follows pointer with the original grab offset.
         let min_pos = drag.container_start + 8.0; // minimum left panel width
         let max_pos = drag.container_start + drag.container_size - drag.splitter_size - 8.0;
@@ -4408,7 +4787,8 @@ impl UiWgpuRenderer {
     /// Finish the splitter drag and persist the final position.
     pub(crate) fn finish_splitter_drag(&mut self) {
         if let Some(drag) = self.splitter_drag.take() {
-            self.splitter_positions.insert(drag.splitter_path.clone(), drag.splitter_pos);
+            self.splitter_positions
+                .insert(drag.splitter_path.clone(), drag.splitter_pos);
             self.pointer_visual_dirty = true;
         }
     }
@@ -4417,7 +4797,9 @@ impl UiWgpuRenderer {
     /// This modifies plan[index].target.bounds so sampling, inherited transforms,
     /// hit testing, and vertex submission all see the drag geometry natively.
     fn apply_splitter_drag_to_targets(&mut self) {
-        let Some(drag) = self.splitter_drag.as_ref() else { return };
+        let Some(drag) = self.splitter_drag.as_ref() else {
+            return;
+        };
         let left_idx = drag.left_index;
         let right_idx = drag.right_index;
         let split_idx = match self.plan.iter().position(|n| n.id == drag.splitter_path) {
@@ -4441,12 +4823,24 @@ impl UiWgpuRenderer {
         self.plan[right_idx].target.bounds.x = right_x;
         self.plan[right_idx].target.bounds.width = new_right_w;
         // Step 4: Get original bounds for delta calculation.
-        let orig_left_w = drag.original_bounds.iter()
-            .find(|(i, _)| *i == left_idx).map(|(_, b)| b.width).unwrap_or(new_left_w);
-        let orig_right_x = drag.original_bounds.iter()
-            .find(|(i, _)| *i == right_idx).map(|(_, b)| b.x).unwrap_or(right_x);
-        let orig_right_w = drag.original_bounds.iter()
-            .find(|(i, _)| *i == right_idx).map(|(_, b)| b.width).unwrap_or(new_right_w);
+        let orig_left_w = drag
+            .original_bounds
+            .iter()
+            .find(|(i, _)| *i == left_idx)
+            .map(|(_, b)| b.width)
+            .unwrap_or(new_left_w);
+        let orig_right_x = drag
+            .original_bounds
+            .iter()
+            .find(|(i, _)| *i == right_idx)
+            .map(|(_, b)| b.x)
+            .unwrap_or(right_x);
+        let orig_right_w = drag
+            .original_bounds
+            .iter()
+            .find(|(i, _)| *i == right_idx)
+            .map(|(_, b)| b.width)
+            .unwrap_or(new_right_w);
         let left_dw = new_left_w - orig_left_w;
         let right_dx = right_x - orig_right_x;
         let right_dw = new_right_w - orig_right_w;
@@ -4474,7 +4868,12 @@ impl UiWgpuRenderer {
             let cy = panel_bounds.y.max(cb.y);
             let cw = (panel_bounds.x + panel_bounds.width).min(cb.x + cb.width) - cx;
             let ch = (panel_bounds.y + panel_bounds.height).min(cb.y + cb.height) - cy;
-            self.plan[*idx].target.clip = UiBounds { x: cx, y: cy, width: cw.max(0.0), height: ch.max(0.0) };
+            self.plan[*idx].target.clip = UiBounds {
+                x: cx,
+                y: cy,
+                width: cw.max(0.0),
+                height: ch.max(0.0),
+            };
         }
         self.plan[left_idx].target.clip = self.plan[left_idx].target.bounds;
         self.plan[right_idx].target.clip = self.plan[right_idx].target.bounds;
@@ -4488,25 +4887,38 @@ impl UiWgpuRenderer {
     /// Runs every frame so drag results survive fragment re-submissions.
     fn apply_persisted_splitter_positions(&mut self) {
         // Collect splitter nodes with persisted positions first.
-        let splitters: Vec<(usize, f32)> = self.plan.iter().enumerate()
+        let splitters: Vec<(usize, f32)> = self
+            .plan
+            .iter()
+            .enumerate()
             .filter(|(_, n)| n.target.kind == UiNodeKind::Splitter)
             .filter_map(|(i, n)| self.splitter_positions.get(&n.id).map(|&pos| (i, pos)))
             .collect();
         for (split_idx, splitter_x) in splitters {
             let splitter = &self.plan[split_idx];
-            let Some(parent_id) = splitter.parent_id.clone() else { continue };
+            let Some(parent_id) = splitter.parent_id.clone() else {
+                continue;
+            };
             // Find siblings in plan order.
-            let siblings: Vec<usize> = self.plan.iter().enumerate()
+            let siblings: Vec<usize> = self
+                .plan
+                .iter()
+                .enumerate()
                 .filter(|(_, n)| n.parent_id.as_deref() == Some(parent_id.as_str()))
                 .map(|(i, _)| i)
                 .collect();
-            let Some(pos) = siblings.iter().position(|&i| i == split_idx) else { continue };
-            if pos == 0 || pos >= siblings.len() - 1 { continue; }
+            let Some(pos) = siblings.iter().position(|&i| i == split_idx) else {
+                continue;
+            };
+            if pos == 0 || pos >= siblings.len() - 1 {
+                continue;
+            }
             let left_idx = siblings[pos - 1];
             let right_idx = siblings[pos + 1];
             let split_w = splitter.target.bounds.width;
             let container_start = self.plan[left_idx].target.bounds.x;
-            let container_end = self.plan[right_idx].target.bounds.x + self.plan[right_idx].target.bounds.width;
+            let container_end =
+                self.plan[right_idx].target.bounds.x + self.plan[right_idx].target.bounds.width;
             let container_size = container_end - container_start;
             // Clamp position.
             let min_pos = container_start + 8.0;
@@ -4531,10 +4943,14 @@ impl UiWgpuRenderer {
             // absolute children keep their own width.  Clip intersects the
             // resized panel and is clamped to zero.
             for idx in 0..self.plan.len() {
-                if idx == left_idx || idx == right_idx || idx == split_idx { continue; }
+                if idx == left_idx || idx == right_idx || idx == split_idx {
+                    continue;
+                }
                 let is_left = is_descendant(&self.plan, idx, left_idx);
                 let is_right = is_descendant(&self.plan, idx, right_idx);
-                if !is_left && !is_right { continue; }
+                if !is_left && !is_right {
+                    continue;
+                }
                 if is_right {
                     self.plan[idx].target.bounds.x += right_dx;
                 }
@@ -4548,7 +4964,12 @@ impl UiWgpuRenderer {
                 let cy = panel_bounds.y.max(cb.y);
                 let cw = (panel_bounds.x + panel_bounds.width).min(cb.x + cb.width) - cx;
                 let ch = (panel_bounds.y + panel_bounds.height).min(cb.y + cb.height) - cy;
-                self.plan[idx].target.clip = UiBounds { x: cx, y: cy, width: cw.max(0.0), height: ch.max(0.0) };
+                self.plan[idx].target.clip = UiBounds {
+                    x: cx,
+                    y: cy,
+                    width: cw.max(0.0),
+                    height: ch.max(0.0),
+                };
             }
             self.plan[left_idx].target.clip = self.plan[left_idx].target.bounds;
             self.plan[right_idx].target.clip = self.plan[right_idx].target.bounds;
@@ -4570,23 +4991,32 @@ impl UiWgpuRenderer {
     /// Find the context menu bound to the node under the pointer (or ancestor).
     pub(crate) fn context_menu_at_pointer(&self) -> Option<String> {
         let pointer = self.pointer_position?;
-        let hit_index = self.plan.iter().enumerate().rev().find_map(|(index, node)| {
-            let b = node.target.bounds;
-            if pointer[0] >= b.x && pointer[0] <= b.x + b.width
-                && pointer[1] >= b.y && pointer[1] <= b.y + b.height
-            {
-                Some(index)
-            } else {
-                None
-            }
-        })?;
+        let hit_index = self
+            .plan
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, node)| {
+                let b = node.target.bounds;
+                if pointer[0] >= b.x
+                    && pointer[0] <= b.x + b.width
+                    && pointer[1] >= b.y
+                    && pointer[1] <= b.y + b.height
+                {
+                    Some(index)
+                } else {
+                    None
+                }
+            })?;
         let mut current = Some(hit_index);
         while let Some(idx) = current {
             let node = &self.plan[idx];
             if let Some(menu_id) = self.context_menu_bindings.get(&node.id) {
                 return Some(menu_id.clone());
             }
-            current = node.parent_id.as_deref()
+            current = node
+                .parent_id
+                .as_deref()
                 .and_then(|pid| self.plan.iter().position(|n| n.id == pid));
         }
         None
@@ -4603,7 +5033,10 @@ impl UiWgpuRenderer {
 
     /// Check if a context menu is currently visible.
     pub(crate) fn context_menu_visible(&self, node_path: &str) -> bool {
-        self.builtin_toggles.get(node_path).copied().unwrap_or(false)
+        self.builtin_toggles
+            .get(node_path)
+            .copied()
+            .unwrap_or(false)
     }
 
     pub(crate) fn cancel_value_gesture(&mut self) {
@@ -5567,6 +6000,37 @@ impl UiWgpuRenderer {
         })
     }
 
+    /// Expire one-shot text materials whose wall-clock window has passed.
+    /// Runs on every refresh (before the plan-reuse early return) and inside
+    /// `has_active_animation`, so a static fragment still falls back to the
+    /// default text pass once `duration_ms` elapses.
+    pub(crate) fn expire_one_shot_text_materials(&mut self, time_seconds: f32) -> bool {
+        let mut expired_text_materials = false;
+        let mut active_text_materials = false;
+        let expired_text_material_keys = self
+            .node_text_materials
+            .iter()
+            .filter_map(|(node, material)| {
+                let duration_ms = material.duration_ms?;
+                let started_at = self.text_material_started.get(node).copied()?;
+                let end = started_at + duration_ms as f32 / 1000.0;
+                if time_seconds >= end {
+                    Some(node.clone())
+                } else {
+                    active_text_materials = true;
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        for node in expired_text_material_keys {
+            self.node_text_materials.remove(&node);
+            self.text_material_started.remove(&node);
+            self.text_material_consumed.insert(node);
+            expired_text_materials = true;
+        }
+        expired_text_materials
+    }
+
     pub(crate) fn has_active_animation(&mut self, time_seconds: f32) -> bool {
         let mut expired_exits = false;
         self.exiting.retain(|_, exiting| {
@@ -5576,6 +6040,14 @@ impl UiWgpuRenderer {
             }
             keep
         });
+        let expired_text_materials = self.expire_one_shot_text_materials(time_seconds);
+        // Any persistent (non one-shot) text material is a running shader
+        // animation: keep the frame loop redrawing so time-driven effects
+        // (neon pulse, sweep, distortion, ...) advance without input.
+        let active_text_materials = self
+            .node_text_materials
+            .values()
+            .any(|material| material.duration_ms.is_none());
         let mut timeline_updates = Vec::new();
         for id in self.active.keys().cloned().collect::<Vec<_>>() {
             if self.paused_animations.contains_key(&id) {
@@ -5683,7 +6155,8 @@ impl UiWgpuRenderer {
             // re-starts a no-op motion against the still-present
             // `enter_transition` — the endless start/complete churn.
             self.current.insert(node.clone(), target.clone());
-            self.current_identities.insert(node.clone(), identity.clone());
+            self.current_identities
+                .insert(node.clone(), identity.clone());
             self.settled_transition_targets
                 .insert(node.clone(), target.clone());
             self.timeline_playbacks.remove(node);
@@ -5729,6 +6202,8 @@ impl UiWgpuRenderer {
             || time_seconds < self.pressed_until_seconds
             || completion_redraw
             || expired_exits
+            || active_text_materials
+            || expired_text_materials
     }
 
     pub(crate) fn cancel_animation(&mut self, node_path: &str) -> bool {
@@ -5838,7 +6313,8 @@ impl UiWgpuRenderer {
                 self.active.insert(node_path.to_owned(), resumed.clone());
                 if let Some(mut playback) = paused.playback {
                     playback.stagger_delay_ms = 0;
-                    self.timeline_playbacks.insert(node_path.to_owned(), playback);
+                    self.timeline_playbacks
+                        .insert(node_path.to_owned(), playback);
                 }
                 Ok(json!({
                     "state": "running",
@@ -5902,8 +6378,7 @@ impl UiWgpuRenderer {
                 let duration_ms = active.transition.duration_ms.max(1_000);
                 active.transition.duration_ms = duration_ms;
                 active.transition.delay_ms = 0;
-                active.started_at_seconds =
-                    time_seconds - progress * duration_ms as f32 / 1000.0;
+                active.started_at_seconds = time_seconds - progress * duration_ms as f32 / 1000.0;
                 Ok(json!({
                     "state": "running",
                     "node_path": node_path,
@@ -6530,7 +7005,7 @@ impl UiWgpuRenderer {
         });
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("neon3-ui-font-atlas-bind-group"),
-            layout: &self._text_texture_layout,
+            layout: &self.text_texture_layout,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
@@ -6650,10 +7125,30 @@ impl UiWgpuRenderer {
                     self.decorate_chrome_instance(visual, instance, chrome_index, chrome)
                 })
                 .collect::<Vec<_>>();
-            let material_instance = self.node_materials.get(
-                self.plan[index].id.rsplit('/').next().unwrap_or(self.plan[index].id.as_str()),
-            ).and_then(|material| self.material_pipelines.contains_key(&material.package_id)
-                .then(|| (material.package_id.clone(), self.material_instance(visual, &self.plan[index].id, material, time_seconds))));
+            let material_instance = self
+                .node_materials
+                .get(
+                    self.plan[index]
+                        .id
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or(self.plan[index].id.as_str()),
+                )
+                .and_then(|material| {
+                    self.material_pipelines
+                        .contains_key(&material.package_id)
+                        .then(|| {
+                            (
+                                material.package_id.clone(),
+                                self.material_instance(
+                                    visual,
+                                    &self.plan[index].id,
+                                    material,
+                                    time_seconds,
+                                ),
+                            )
+                        })
+                });
             let destination = if self.drag_offset_for_node(index, &plan_index).is_some() {
                 &mut drag_preview_instances
             } else {
@@ -6748,11 +7243,8 @@ impl UiWgpuRenderer {
             if self.plan[index].instance_index.is_some()
                 && sampled_in_mode(&self.sampled[index], mode)
             {
-                let instance = self.instance(
-                    &self.sampled[index],
-                    &self.plan[index].id,
-                    time_seconds,
-                );
+                let instance =
+                    self.instance(&self.sampled[index], &self.plan[index].id, time_seconds);
                 popup_instances.push(instance);
                 popup_instances.extend(
                     self.component_chrome_instances(&self.sampled[index], &self.plan[index].id)
@@ -6872,8 +7364,13 @@ impl UiWgpuRenderer {
                 for value in &mut target_insets {
                     *value = value.max(0.0);
                 }
-                let fit = self.image_fits.get(node_key).copied().unwrap_or(UiImageFit::Stretch);
-                let (rect, uv) = fit_image_rect_and_uv(visual.bounds, image.uv, image.width, image.height, fit);
+                let fit = self
+                    .image_fits
+                    .get(node_key)
+                    .copied()
+                    .unwrap_or(UiImageFit::Stretch);
+                let (rect, uv) =
+                    fit_image_rect_and_uv(visual.bounds, image.uv, image.width, image.height, fit);
                 Some(UiImageInstance {
                     rect,
                     tint: [1.0, 1.0, 1.0, visual.style.opacity],
@@ -6890,7 +7387,8 @@ impl UiWgpuRenderer {
                     target_insets,
                     mode,
                     fill_center,
-                    clip_shape: 0.0, _pad: 0,
+                    clip_shape: 0.0,
+                    _pad: 0,
                     ..UiImageInstance::zeroed()
                 })
             })();
@@ -6922,7 +7420,9 @@ impl UiWgpuRenderer {
             let Some(skin) = self.skins.get(skin_key) else {
                 continue;
             };
-            let hovered = self.pointer_position.is_some_and(|position| contains(visual.bounds, position));
+            let hovered = self
+                .pointer_position
+                .is_some_and(|position| contains(visual.bounds, position));
             let pressed = hovered && time_seconds < self.pressed_until_seconds;
             let enabled = visual.enabled;
             let Some(slot) = select_button_skin_slot(skin, hovered, pressed, enabled) else {
@@ -6930,34 +7430,61 @@ impl UiWgpuRenderer {
             };
             let (resource_key, fit, nine_slice) = match &slot.presentation {
                 UiSkinPresentation::Image { resource_key, fit } => (resource_key, *fit, None),
-                UiSkinPresentation::NineSlice { resource_key, layout } => {
-                    (resource_key, UiImageFit::Stretch, Some(*layout))
-                }
+                UiSkinPresentation::NineSlice {
+                    resource_key,
+                    layout,
+                } => (resource_key, UiImageFit::Stretch, Some(*layout)),
                 _ => continue,
             };
             let binding_key = format!("{skin_key}/{resource_key}");
-            let image = self.skin_assets.get(&binding_key).and_then(|asset| {
-                self.resident_images.get(&(asset.project_id.clone(), asset.asset_id, asset.revision.0))
-            }).or_else(|| {
-                self.skin_image_ids.get(&binding_key).and_then(|image_id| self.external_images.get(image_id))
-            });
+            let image = self
+                .skin_assets
+                .get(&binding_key)
+                .and_then(|asset| {
+                    self.resident_images.get(&(
+                        asset.project_id.clone(),
+                        asset.asset_id,
+                        asset.revision.0,
+                    ))
+                })
+                .or_else(|| {
+                    self.skin_image_ids
+                        .get(&binding_key)
+                        .and_then(|image_id| self.external_images.get(image_id))
+                });
             let Some(image) = image else {
                 continue;
             };
-            if nine_slice.is_some_and(|layout| !layout.validate_for_image(image.width, image.height)) {
+            if nine_slice
+                .is_some_and(|layout| !layout.validate_for_image(image.width, image.height))
+            {
                 continue;
             }
-            let (source_insets, target_insets, slice_mode, fill_center) = nine_slice.map(|layout| (
-                layout.source_insets_px.map(|value| value as f32),
-                layout.target_insets,
-                match layout.mode { neon_ui_schema::UiNineSliceMode::Stretch => 0, neon_ui_schema::UiNineSliceMode::Tile => 1, neon_ui_schema::UiNineSliceMode::Mirror => 2 },
-                u32::from(layout.fill_center),
-            )).unwrap_or(([0.0; 4], [0.0; 4], 0, 1));
-            let (rect, uv) = fit_image_rect_and_uv(visual.bounds, image.uv, image.width, image.height, fit);
+            let (source_insets, target_insets, slice_mode, fill_center) = nine_slice
+                .map(|layout| {
+                    (
+                        layout.source_insets_px.map(|value| value as f32),
+                        layout.target_insets,
+                        match layout.mode {
+                            neon_ui_schema::UiNineSliceMode::Stretch => 0,
+                            neon_ui_schema::UiNineSliceMode::Tile => 1,
+                            neon_ui_schema::UiNineSliceMode::Mirror => 2,
+                        },
+                        u32::from(layout.fill_center),
+                    )
+                })
+                .unwrap_or(([0.0; 4], [0.0; 4], 0, 1));
+            let (rect, uv) =
+                fit_image_rect_and_uv(visual.bounds, image.uv, image.width, image.height, fit);
             images.push(UiImageInstance {
                 rect,
                 tint: [1.0, 1.0, 1.0, visual.style.opacity],
-                clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height],
+                clip: [
+                    visual.clip.x,
+                    visual.clip.y,
+                    visual.clip.x + visual.clip.width,
+                    visual.clip.y + visual.clip.height,
+                ],
                 uv,
                 depth: color_pass_depth(visual.world_depth),
                 paint_group_id: self.plan[index].paint_group_id,
@@ -6965,7 +7492,8 @@ impl UiWgpuRenderer {
                 target_insets,
                 mode: slice_mode,
                 fill_center,
-                clip_shape: 0.0, _pad: 0,
+                clip_shape: 0.0,
+                _pad: 0,
                 ..UiImageInstance::zeroed()
             });
         }
@@ -6975,35 +7503,120 @@ impl UiWgpuRenderer {
             if visual.kind != UiNodeKind::Slider || !sampled_in_mode(visual, mode) {
                 continue;
             }
-            let Some(skin_key) = self.skin_references.get(&self.plan[index].id) else { continue };
-            let Some(skin) = self.skins.get(skin_key) else { continue };
+            let Some(skin_key) = self.skin_references.get(&self.plan[index].id) else {
+                continue;
+            };
+            let Some(skin) = self.skins.get(skin_key) else {
+                continue;
+            };
             let normalized = match &visual.presentation {
-                Some(UiControlPresentation::Numeric { value, min, max }) => ((value - min) / (max - min)).clamp(0.0, 1.0),
+                Some(UiControlPresentation::Numeric { value, min, max }) => {
+                    ((value - min) / (max - min)).clamp(0.0, 1.0)
+                }
                 _ => continue,
             };
-            let hovered = self.pointer_position.is_some_and(|position| contains(visual.bounds, position));
+            let hovered = self
+                .pointer_position
+                .is_some_and(|position| contains(visual.bounds, position));
             let pressed = hovered && time_seconds < self.pressed_until_seconds;
             let enabled = visual.enabled;
             // Track height and thumb size scale with component height for distinct skin variants
             let track_h = (visual.bounds.height * 0.18).clamp(2.0, 8.0);
             let thumb_s = (visual.bounds.height * 0.55).clamp(8.0, 24.0);
-            let track = UiBounds { x: visual.bounds.x + 12.0, y: visual.bounds.y + visual.bounds.height * 0.5 - track_h * 0.5, width: (visual.bounds.width - 24.0).max(1.0), height: track_h };
-            let fill = UiBounds { x: track.x, y: track.y, width: track.width * normalized, height: track.height };
-            let thumb = UiBounds { x: track.x + track.width * normalized - thumb_s * 0.5, y: track.y + track_h * 0.5 - thumb_s * 0.5, width: thumb_s, height: thumb_s };
-            for (slot_kind, bounds) in [(UiSkinSlotKind::Track, track), (UiSkinSlotKind::Fill, fill), (UiSkinSlotKind::Thumb, thumb)] {
-                let Some(slot) = select_slider_skin_slot(skin, slot_kind, hovered, pressed, enabled) else { continue };
+            let track = UiBounds {
+                x: visual.bounds.x + 12.0,
+                y: visual.bounds.y + visual.bounds.height * 0.5 - track_h * 0.5,
+                width: (visual.bounds.width - 24.0).max(1.0),
+                height: track_h,
+            };
+            let fill = UiBounds {
+                x: track.x,
+                y: track.y,
+                width: track.width * normalized,
+                height: track.height,
+            };
+            let thumb = UiBounds {
+                x: track.x + track.width * normalized - thumb_s * 0.5,
+                y: track.y + track_h * 0.5 - thumb_s * 0.5,
+                width: thumb_s,
+                height: thumb_s,
+            };
+            for (slot_kind, bounds) in [
+                (UiSkinSlotKind::Track, track),
+                (UiSkinSlotKind::Fill, fill),
+                (UiSkinSlotKind::Thumb, thumb),
+            ] {
+                let Some(slot) =
+                    select_slider_skin_slot(skin, slot_kind, hovered, pressed, enabled)
+                else {
+                    continue;
+                };
                 let (resource_key, fit, nine_slice) = match &slot.presentation {
                     UiSkinPresentation::Image { resource_key, fit } => (resource_key, *fit, None),
-                    UiSkinPresentation::NineSlice { resource_key, layout } => (resource_key, UiImageFit::Stretch, Some(*layout)),
+                    UiSkinPresentation::NineSlice {
+                        resource_key,
+                        layout,
+                    } => (resource_key, UiImageFit::Stretch, Some(*layout)),
                     _ => continue,
                 };
                 let binding_key = format!("{skin_key}/{resource_key}");
-                let image = self.skin_assets.get(&binding_key).and_then(|asset| self.resident_images.get(&(asset.project_id.clone(), asset.asset_id, asset.revision.0))).or_else(|| self.skin_image_ids.get(&binding_key).and_then(|image_id| self.external_images.get(image_id)));
+                let image = self
+                    .skin_assets
+                    .get(&binding_key)
+                    .and_then(|asset| {
+                        self.resident_images.get(&(
+                            asset.project_id.clone(),
+                            asset.asset_id,
+                            asset.revision.0,
+                        ))
+                    })
+                    .or_else(|| {
+                        self.skin_image_ids
+                            .get(&binding_key)
+                            .and_then(|image_id| self.external_images.get(image_id))
+                    });
                 let Some(image) = image else { continue };
-                if nine_slice.is_some_and(|layout| !layout.validate_for_image(image.width, image.height)) { continue; }
-                let (source_insets, target_insets, slice_mode, fill_center) = nine_slice.map(|layout| (layout.source_insets_px.map(|value| value as f32), layout.target_insets, match layout.mode { neon_ui_schema::UiNineSliceMode::Stretch => 0, neon_ui_schema::UiNineSliceMode::Tile => 1, neon_ui_schema::UiNineSliceMode::Mirror => 2 }, u32::from(layout.fill_center))).unwrap_or(([0.0; 4], [0.0; 4], 0, 1));
-                let (rect, uv) = fit_image_rect_and_uv(bounds, image.uv, image.width, image.height, fit);
-                images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, clip_shape: 0.0, _pad: 0, ..UiImageInstance::zeroed() });
+                if nine_slice
+                    .is_some_and(|layout| !layout.validate_for_image(image.width, image.height))
+                {
+                    continue;
+                }
+                let (source_insets, target_insets, slice_mode, fill_center) = nine_slice
+                    .map(|layout| {
+                        (
+                            layout.source_insets_px.map(|value| value as f32),
+                            layout.target_insets,
+                            match layout.mode {
+                                neon_ui_schema::UiNineSliceMode::Stretch => 0,
+                                neon_ui_schema::UiNineSliceMode::Tile => 1,
+                                neon_ui_schema::UiNineSliceMode::Mirror => 2,
+                            },
+                            u32::from(layout.fill_center),
+                        )
+                    })
+                    .unwrap_or(([0.0; 4], [0.0; 4], 0, 1));
+                let (rect, uv) =
+                    fit_image_rect_and_uv(bounds, image.uv, image.width, image.height, fit);
+                images.push(UiImageInstance {
+                    rect,
+                    tint: [1.0, 1.0, 1.0, visual.style.opacity],
+                    clip: [
+                        visual.clip.x,
+                        visual.clip.y,
+                        visual.clip.x + visual.clip.width,
+                        visual.clip.y + visual.clip.height,
+                    ],
+                    uv,
+                    depth: color_pass_depth(visual.world_depth),
+                    paint_group_id: self.plan[index].paint_group_id,
+                    source_insets,
+                    target_insets,
+                    mode: slice_mode,
+                    fill_center,
+                    clip_shape: 0.0,
+                    _pad: 0,
+                    ..UiImageInstance::zeroed()
+                });
             }
         }
         // Panel / Dialog / ContextMenu / Splitter / ListBox / Modal / TreeView
@@ -7011,26 +7624,102 @@ impl UiWgpuRenderer {
         // standard fill with a skinned body image. These are non-interactive
         // body-only components; only the Normal state is consulted.
         for (index, visual) in self.sampled.iter().enumerate() {
-            if !matches!(visual.kind, UiNodeKind::Panel | UiNodeKind::Dialog | UiNodeKind::ContextMenu | UiNodeKind::Splitter | UiNodeKind::ListBox | UiNodeKind::Modal | UiNodeKind::TreeView | UiNodeKind::Toast | UiNodeKind::MenuBar | UiNodeKind::Accordion | UiNodeKind::Spinner | UiNodeKind::Divider | UiNodeKind::Popup)
-                || !sampled_in_mode(visual, mode)
+            if !matches!(
+                visual.kind,
+                UiNodeKind::Panel
+                    | UiNodeKind::Dialog
+                    | UiNodeKind::ContextMenu
+                    | UiNodeKind::Splitter
+                    | UiNodeKind::ListBox
+                    | UiNodeKind::Modal
+                    | UiNodeKind::TreeView
+                    | UiNodeKind::Toast
+                    | UiNodeKind::MenuBar
+                    | UiNodeKind::Accordion
+                    | UiNodeKind::Spinner
+                    | UiNodeKind::Divider
+                    | UiNodeKind::Popup
+            ) || !sampled_in_mode(visual, mode)
             {
                 continue;
             }
-            let Some(skin_key) = self.skin_references.get(&self.plan[index].id) else { continue };
-            let Some(skin) = self.skins.get(skin_key) else { continue };
-            let Some(slot) = skin.slots.iter().find(|slot| slot.slot_kind == UiSkinSlotKind::Body && slot.state == UiVisualState::Normal) else { continue };
+            let Some(skin_key) = self.skin_references.get(&self.plan[index].id) else {
+                continue;
+            };
+            let Some(skin) = self.skins.get(skin_key) else {
+                continue;
+            };
+            let Some(slot) = skin.slots.iter().find(|slot| {
+                slot.slot_kind == UiSkinSlotKind::Body && slot.state == UiVisualState::Normal
+            }) else {
+                continue;
+            };
             let (resource_key, fit, nine_slice) = match &slot.presentation {
                 UiSkinPresentation::Image { resource_key, fit } => (resource_key, *fit, None),
-                UiSkinPresentation::NineSlice { resource_key, layout } => (resource_key, UiImageFit::Stretch, Some(*layout)),
+                UiSkinPresentation::NineSlice {
+                    resource_key,
+                    layout,
+                } => (resource_key, UiImageFit::Stretch, Some(*layout)),
                 _ => continue,
             };
             let binding_key = format!("{skin_key}/{resource_key}");
-            let image = self.skin_assets.get(&binding_key).and_then(|asset| self.resident_images.get(&(asset.project_id.clone(), asset.asset_id, asset.revision.0))).or_else(|| self.skin_image_ids.get(&binding_key).and_then(|image_id| self.external_images.get(image_id)));
+            let image = self
+                .skin_assets
+                .get(&binding_key)
+                .and_then(|asset| {
+                    self.resident_images.get(&(
+                        asset.project_id.clone(),
+                        asset.asset_id,
+                        asset.revision.0,
+                    ))
+                })
+                .or_else(|| {
+                    self.skin_image_ids
+                        .get(&binding_key)
+                        .and_then(|image_id| self.external_images.get(image_id))
+                });
             let Some(image) = image else { continue };
-            if nine_slice.is_some_and(|layout| !layout.validate_for_image(image.width, image.height)) { continue; }
-            let (source_insets, target_insets, slice_mode, fill_center) = nine_slice.map(|layout| (layout.source_insets_px.map(|value| value as f32), layout.target_insets, match layout.mode { neon_ui_schema::UiNineSliceMode::Stretch => 0, neon_ui_schema::UiNineSliceMode::Tile => 1, neon_ui_schema::UiNineSliceMode::Mirror => 2 }, u32::from(layout.fill_center))).unwrap_or(([0.0; 4], [0.0; 4], 0, 1));
-            let (rect, uv) = fit_image_rect_and_uv(visual.bounds, image.uv, image.width, image.height, fit);
-            images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, clip_shape: 0.0, _pad: 0, ..UiImageInstance::zeroed() });
+            if nine_slice
+                .is_some_and(|layout| !layout.validate_for_image(image.width, image.height))
+            {
+                continue;
+            }
+            let (source_insets, target_insets, slice_mode, fill_center) = nine_slice
+                .map(|layout| {
+                    (
+                        layout.source_insets_px.map(|value| value as f32),
+                        layout.target_insets,
+                        match layout.mode {
+                            neon_ui_schema::UiNineSliceMode::Stretch => 0,
+                            neon_ui_schema::UiNineSliceMode::Tile => 1,
+                            neon_ui_schema::UiNineSliceMode::Mirror => 2,
+                        },
+                        u32::from(layout.fill_center),
+                    )
+                })
+                .unwrap_or(([0.0; 4], [0.0; 4], 0, 1));
+            let (rect, uv) =
+                fit_image_rect_and_uv(visual.bounds, image.uv, image.width, image.height, fit);
+            images.push(UiImageInstance {
+                rect,
+                tint: [1.0, 1.0, 1.0, visual.style.opacity],
+                clip: [
+                    visual.clip.x,
+                    visual.clip.y,
+                    visual.clip.x + visual.clip.width,
+                    visual.clip.y + visual.clip.height,
+                ],
+                uv,
+                depth: color_pass_depth(visual.world_depth),
+                paint_group_id: self.plan[index].paint_group_id,
+                source_insets,
+                target_insets,
+                mode: slice_mode,
+                fill_center,
+                clip_shape: 0.0,
+                _pad: 0,
+                ..UiImageInstance::zeroed()
+            });
         }
         // Switch skins render track + sliding thumb. Thumb position is driven by
         // the Toggle presentation (selected = on). Track and thumb support
@@ -7039,30 +7728,106 @@ impl UiWgpuRenderer {
             if visual.kind != UiNodeKind::Switch || !sampled_in_mode(visual, mode) {
                 continue;
             }
-            let Some(skin_key) = self.skin_references.get(&self.plan[index].id) else { continue };
-            let Some(skin) = self.skins.get(skin_key) else { continue };
+            let Some(skin_key) = self.skin_references.get(&self.plan[index].id) else {
+                continue;
+            };
+            let Some(skin) = self.skins.get(skin_key) else {
+                continue;
+            };
             let selected = matches!(&visual.presentation, Some(UiControlPresentation::Toggle { selected }) if *selected);
-            let hovered = self.pointer_position.is_some_and(|position| contains(visual.bounds, position));
+            let hovered = self
+                .pointer_position
+                .is_some_and(|position| contains(visual.bounds, position));
             let pressed = hovered && time_seconds < self.pressed_until_seconds;
             let enabled = visual.enabled;
             let track = visual.bounds;
             let thumb_size = track.height.min(24.0).max(8.0);
-            let thumb_x = if selected { track.x + track.width - thumb_size - 2.0 } else { track.x + 2.0 };
-            let thumb = UiBounds { x: thumb_x, y: track.y + (track.height - thumb_size) * 0.5, width: thumb_size, height: thumb_size };
-            for (slot_kind, bounds) in [(UiSkinSlotKind::Track, track), (UiSkinSlotKind::Thumb, thumb)] {
-                let Some(slot) = select_toggle_skin_slot(skin, slot_kind, hovered, pressed, enabled) else { continue };
+            let thumb_x = if selected {
+                track.x + track.width - thumb_size - 2.0
+            } else {
+                track.x + 2.0
+            };
+            let thumb = UiBounds {
+                x: thumb_x,
+                y: track.y + (track.height - thumb_size) * 0.5,
+                width: thumb_size,
+                height: thumb_size,
+            };
+            for (slot_kind, bounds) in [
+                (UiSkinSlotKind::Track, track),
+                (UiSkinSlotKind::Thumb, thumb),
+            ] {
+                let Some(slot) =
+                    select_toggle_skin_slot(skin, slot_kind, hovered, pressed, enabled)
+                else {
+                    continue;
+                };
                 let (resource_key, fit, nine_slice) = match &slot.presentation {
                     UiSkinPresentation::Image { resource_key, fit } => (resource_key, *fit, None),
-                    UiSkinPresentation::NineSlice { resource_key, layout } => (resource_key, UiImageFit::Stretch, Some(*layout)),
+                    UiSkinPresentation::NineSlice {
+                        resource_key,
+                        layout,
+                    } => (resource_key, UiImageFit::Stretch, Some(*layout)),
                     _ => continue,
                 };
                 let binding_key = format!("{skin_key}/{resource_key}");
-                let image = self.skin_assets.get(&binding_key).and_then(|asset| self.resident_images.get(&(asset.project_id.clone(), asset.asset_id, asset.revision.0))).or_else(|| self.skin_image_ids.get(&binding_key).and_then(|image_id| self.external_images.get(image_id)));
+                let image = self
+                    .skin_assets
+                    .get(&binding_key)
+                    .and_then(|asset| {
+                        self.resident_images.get(&(
+                            asset.project_id.clone(),
+                            asset.asset_id,
+                            asset.revision.0,
+                        ))
+                    })
+                    .or_else(|| {
+                        self.skin_image_ids
+                            .get(&binding_key)
+                            .and_then(|image_id| self.external_images.get(image_id))
+                    });
                 let Some(image) = image else { continue };
-                if nine_slice.is_some_and(|layout| !layout.validate_for_image(image.width, image.height)) { continue; }
-                let (source_insets, target_insets, slice_mode, fill_center) = nine_slice.map(|layout| (layout.source_insets_px.map(|value| value as f32), layout.target_insets, match layout.mode { neon_ui_schema::UiNineSliceMode::Stretch => 0, neon_ui_schema::UiNineSliceMode::Tile => 1, neon_ui_schema::UiNineSliceMode::Mirror => 2 }, u32::from(layout.fill_center))).unwrap_or(([0.0; 4], [0.0; 4], 0, 1));
-                let (rect, uv) = fit_image_rect_and_uv(bounds, image.uv, image.width, image.height, fit);
-                images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, clip_shape: 0.0, _pad: 0, ..UiImageInstance::zeroed() });
+                if nine_slice
+                    .is_some_and(|layout| !layout.validate_for_image(image.width, image.height))
+                {
+                    continue;
+                }
+                let (source_insets, target_insets, slice_mode, fill_center) = nine_slice
+                    .map(|layout| {
+                        (
+                            layout.source_insets_px.map(|value| value as f32),
+                            layout.target_insets,
+                            match layout.mode {
+                                neon_ui_schema::UiNineSliceMode::Stretch => 0,
+                                neon_ui_schema::UiNineSliceMode::Tile => 1,
+                                neon_ui_schema::UiNineSliceMode::Mirror => 2,
+                            },
+                            u32::from(layout.fill_center),
+                        )
+                    })
+                    .unwrap_or(([0.0; 4], [0.0; 4], 0, 1));
+                let (rect, uv) =
+                    fit_image_rect_and_uv(bounds, image.uv, image.width, image.height, fit);
+                images.push(UiImageInstance {
+                    rect,
+                    tint: [1.0, 1.0, 1.0, visual.style.opacity],
+                    clip: [
+                        visual.clip.x,
+                        visual.clip.y,
+                        visual.clip.x + visual.clip.width,
+                        visual.clip.y + visual.clip.height,
+                    ],
+                    uv,
+                    depth: color_pass_depth(visual.world_depth),
+                    paint_group_id: self.plan[index].paint_group_id,
+                    source_insets,
+                    target_insets,
+                    mode: slice_mode,
+                    fill_center,
+                    clip_shape: 0.0,
+                    _pad: 0,
+                    ..UiImageInstance::zeroed()
+                });
             }
         }
         // ProgressBar skins render track + fill using the normalized value.
@@ -7070,29 +7835,106 @@ impl UiWgpuRenderer {
             if visual.kind != UiNodeKind::ProgressBar || !sampled_in_mode(visual, mode) {
                 continue;
             }
-            let Some(skin_key) = self.skin_references.get(&self.plan[index].id) else { continue };
-            let Some(skin) = self.skins.get(skin_key) else { continue };
+            let Some(skin_key) = self.skin_references.get(&self.plan[index].id) else {
+                continue;
+            };
+            let Some(skin) = self.skins.get(skin_key) else {
+                continue;
+            };
             let normalized = match &visual.presentation {
-                Some(UiControlPresentation::Numeric { value, min, max }) => ((value - min) / (max - min)).clamp(0.0, 1.0),
+                Some(UiControlPresentation::Numeric { value, min, max }) => {
+                    ((value - min) / (max - min)).clamp(0.0, 1.0)
+                }
                 _ => 0.0,
             };
             let track = visual.bounds;
-            let fill = UiBounds { x: track.x, y: track.y, width: track.width * normalized, height: track.height };
-            for (slot_kind, bounds) in [(UiSkinSlotKind::Track, track), (UiSkinSlotKind::Fill, fill)] {
-                let target_state = if slot_kind == UiSkinSlotKind::Fill { UiVisualState::Active } else { UiVisualState::Normal };
-                let Some(slot) = skin.slots.iter().find(|slot| slot.slot_kind == slot_kind && slot.state == target_state) else { continue };
+            let fill = UiBounds {
+                x: track.x,
+                y: track.y,
+                width: track.width * normalized,
+                height: track.height,
+            };
+            for (slot_kind, bounds) in
+                [(UiSkinSlotKind::Track, track), (UiSkinSlotKind::Fill, fill)]
+            {
+                let target_state = if slot_kind == UiSkinSlotKind::Fill {
+                    UiVisualState::Active
+                } else {
+                    UiVisualState::Normal
+                };
+                let Some(slot) = skin
+                    .slots
+                    .iter()
+                    .find(|slot| slot.slot_kind == slot_kind && slot.state == target_state)
+                else {
+                    continue;
+                };
                 let (resource_key, fit, nine_slice) = match &slot.presentation {
                     UiSkinPresentation::Image { resource_key, fit } => (resource_key, *fit, None),
-                    UiSkinPresentation::NineSlice { resource_key, layout } => (resource_key, UiImageFit::Stretch, Some(*layout)),
+                    UiSkinPresentation::NineSlice {
+                        resource_key,
+                        layout,
+                    } => (resource_key, UiImageFit::Stretch, Some(*layout)),
                     _ => continue,
                 };
                 let binding_key = format!("{skin_key}/{resource_key}");
-                let image = self.skin_assets.get(&binding_key).and_then(|asset| self.resident_images.get(&(asset.project_id.clone(), asset.asset_id, asset.revision.0))).or_else(|| self.skin_image_ids.get(&binding_key).and_then(|image_id| self.external_images.get(image_id)));
+                let image = self
+                    .skin_assets
+                    .get(&binding_key)
+                    .and_then(|asset| {
+                        self.resident_images.get(&(
+                            asset.project_id.clone(),
+                            asset.asset_id,
+                            asset.revision.0,
+                        ))
+                    })
+                    .or_else(|| {
+                        self.skin_image_ids
+                            .get(&binding_key)
+                            .and_then(|image_id| self.external_images.get(image_id))
+                    });
                 let Some(image) = image else { continue };
-                if nine_slice.is_some_and(|layout| !layout.validate_for_image(image.width, image.height)) { continue; }
-                let (source_insets, target_insets, slice_mode, fill_center) = nine_slice.map(|layout| (layout.source_insets_px.map(|value| value as f32), layout.target_insets, match layout.mode { neon_ui_schema::UiNineSliceMode::Stretch => 0, neon_ui_schema::UiNineSliceMode::Tile => 1, neon_ui_schema::UiNineSliceMode::Mirror => 2 }, u32::from(layout.fill_center))).unwrap_or(([0.0; 4], [0.0; 4], 0, 1));
-                let (rect, uv) = fit_image_rect_and_uv(bounds, image.uv, image.width, image.height, fit);
-                images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, clip_shape: 0.0, _pad: 0, ..UiImageInstance::zeroed() });
+                if nine_slice
+                    .is_some_and(|layout| !layout.validate_for_image(image.width, image.height))
+                {
+                    continue;
+                }
+                let (source_insets, target_insets, slice_mode, fill_center) = nine_slice
+                    .map(|layout| {
+                        (
+                            layout.source_insets_px.map(|value| value as f32),
+                            layout.target_insets,
+                            match layout.mode {
+                                neon_ui_schema::UiNineSliceMode::Stretch => 0,
+                                neon_ui_schema::UiNineSliceMode::Tile => 1,
+                                neon_ui_schema::UiNineSliceMode::Mirror => 2,
+                            },
+                            u32::from(layout.fill_center),
+                        )
+                    })
+                    .unwrap_or(([0.0; 4], [0.0; 4], 0, 1));
+                let (rect, uv) =
+                    fit_image_rect_and_uv(bounds, image.uv, image.width, image.height, fit);
+                images.push(UiImageInstance {
+                    rect,
+                    tint: [1.0, 1.0, 1.0, visual.style.opacity],
+                    clip: [
+                        visual.clip.x,
+                        visual.clip.y,
+                        visual.clip.x + visual.clip.width,
+                        visual.clip.y + visual.clip.height,
+                    ],
+                    uv,
+                    depth: color_pass_depth(visual.world_depth),
+                    paint_group_id: self.plan[index].paint_group_id,
+                    source_insets,
+                    target_insets,
+                    mode: slice_mode,
+                    fill_center,
+                    clip_shape: 0.0,
+                    _pad: 0,
+                    ..UiImageInstance::zeroed()
+                });
             }
         }
         // Scrollbar skins render track + thumb using the normalized scroll value.
@@ -7101,20 +7943,40 @@ impl UiWgpuRenderer {
             if visual.kind != UiNodeKind::Scrollbar || !sampled_in_mode(visual, mode) {
                 continue;
             }
-            let Some(skin_key) = self.skin_references.get(&self.plan[index].id) else { continue };
-            let Some(skin) = self.skins.get(skin_key) else { continue };
+            let Some(skin_key) = self.skin_references.get(&self.plan[index].id) else {
+                continue;
+            };
+            let Some(skin) = self.skins.get(skin_key) else {
+                continue;
+            };
             let normalized = match &visual.presentation {
-                Some(UiControlPresentation::Numeric { value, min, max }) => ((value - min) / (max - min)).clamp(0.0, 1.0),
+                Some(UiControlPresentation::Numeric { value, min, max }) => {
+                    ((value - min) / (max - min)).clamp(0.0, 1.0)
+                }
                 Some(UiControlPresentation::Scroll { position }) => position.clamp(0.0, 1.0),
                 _ => 0.0,
             };
             let horizontal = visual.bounds.width > visual.bounds.height;
             let track = visual.bounds;
-            let thumb_size = if horizontal { visual.bounds.height.min(24.0) } else { visual.bounds.width.min(24.0) };
-            let thumb = if horizontal {
-                UiBounds { x: track.x + (track.width - thumb_size) * normalized, y: track.y, width: thumb_size, height: track.height }
+            let thumb_size = if horizontal {
+                visual.bounds.height.min(24.0)
             } else {
-                UiBounds { x: track.x, y: track.y + (track.height - thumb_size) * normalized, width: track.width, height: thumb_size }
+                visual.bounds.width.min(24.0)
+            };
+            let thumb = if horizontal {
+                UiBounds {
+                    x: track.x + (track.width - thumb_size) * normalized,
+                    y: track.y,
+                    width: thumb_size,
+                    height: track.height,
+                }
+            } else {
+                UiBounds {
+                    x: track.x,
+                    y: track.y + (track.height - thumb_size) * normalized,
+                    width: track.width,
+                    height: thumb_size,
+                }
             };
             let pointer = self.pointer_position;
             let track_hovered = pointer.is_some_and(|p| contains(track, p));
@@ -7124,19 +7986,76 @@ impl UiWgpuRenderer {
                 (UiSkinSlotKind::Track, track, track_hovered, false),
                 (UiSkinSlotKind::Thumb, thumb, thumb_hovered, thumb_pressed),
             ] {
-                let Some(slot) = select_scrollbar_skin_slot(skin, slot_kind, hovered, pressed) else { continue };
+                let Some(slot) = select_scrollbar_skin_slot(skin, slot_kind, hovered, pressed)
+                else {
+                    continue;
+                };
                 let (resource_key, fit, nine_slice) = match &slot.presentation {
                     UiSkinPresentation::Image { resource_key, fit } => (resource_key, *fit, None),
-                    UiSkinPresentation::NineSlice { resource_key, layout } => (resource_key, UiImageFit::Stretch, Some(*layout)),
+                    UiSkinPresentation::NineSlice {
+                        resource_key,
+                        layout,
+                    } => (resource_key, UiImageFit::Stretch, Some(*layout)),
                     _ => continue,
                 };
                 let binding_key = format!("{skin_key}/{resource_key}");
-                let image = self.skin_assets.get(&binding_key).and_then(|asset| self.resident_images.get(&(asset.project_id.clone(), asset.asset_id, asset.revision.0))).or_else(|| self.skin_image_ids.get(&binding_key).and_then(|image_id| self.external_images.get(image_id)));
+                let image = self
+                    .skin_assets
+                    .get(&binding_key)
+                    .and_then(|asset| {
+                        self.resident_images.get(&(
+                            asset.project_id.clone(),
+                            asset.asset_id,
+                            asset.revision.0,
+                        ))
+                    })
+                    .or_else(|| {
+                        self.skin_image_ids
+                            .get(&binding_key)
+                            .and_then(|image_id| self.external_images.get(image_id))
+                    });
                 let Some(image) = image else { continue };
-                if nine_slice.is_some_and(|layout| !layout.validate_for_image(image.width, image.height)) { continue; }
-                let (source_insets, target_insets, slice_mode, fill_center) = nine_slice.map(|layout| (layout.source_insets_px.map(|value| value as f32), layout.target_insets, match layout.mode { neon_ui_schema::UiNineSliceMode::Stretch => 0, neon_ui_schema::UiNineSliceMode::Tile => 1, neon_ui_schema::UiNineSliceMode::Mirror => 2 }, u32::from(layout.fill_center))).unwrap_or(([0.0; 4], [0.0; 4], 0, 1));
-                let (rect, uv) = fit_image_rect_and_uv(bounds, image.uv, image.width, image.height, fit);
-                images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, clip_shape: 0.0, _pad: 0, ..UiImageInstance::zeroed() });
+                if nine_slice
+                    .is_some_and(|layout| !layout.validate_for_image(image.width, image.height))
+                {
+                    continue;
+                }
+                let (source_insets, target_insets, slice_mode, fill_center) = nine_slice
+                    .map(|layout| {
+                        (
+                            layout.source_insets_px.map(|value| value as f32),
+                            layout.target_insets,
+                            match layout.mode {
+                                neon_ui_schema::UiNineSliceMode::Stretch => 0,
+                                neon_ui_schema::UiNineSliceMode::Tile => 1,
+                                neon_ui_schema::UiNineSliceMode::Mirror => 2,
+                            },
+                            u32::from(layout.fill_center),
+                        )
+                    })
+                    .unwrap_or(([0.0; 4], [0.0; 4], 0, 1));
+                let (rect, uv) =
+                    fit_image_rect_and_uv(bounds, image.uv, image.width, image.height, fit);
+                images.push(UiImageInstance {
+                    rect,
+                    tint: [1.0, 1.0, 1.0, visual.style.opacity],
+                    clip: [
+                        visual.clip.x,
+                        visual.clip.y,
+                        visual.clip.x + visual.clip.width,
+                        visual.clip.y + visual.clip.height,
+                    ],
+                    uv,
+                    depth: color_pass_depth(visual.world_depth),
+                    paint_group_id: self.plan[index].paint_group_id,
+                    source_insets,
+                    target_insets,
+                    mode: slice_mode,
+                    fill_center,
+                    clip_shape: 0.0,
+                    _pad: 0,
+                    ..UiImageInstance::zeroed()
+                });
             }
         }
         // Checkbox skins render body + check mark based on selected state.
@@ -7145,10 +8064,16 @@ impl UiWgpuRenderer {
             if visual.kind != UiNodeKind::Checkbox || !sampled_in_mode(visual, mode) {
                 continue;
             }
-            let Some(skin_key) = self.skin_references.get(&self.plan[index].id) else { continue };
-            let Some(skin) = self.skins.get(skin_key) else { continue };
+            let Some(skin_key) = self.skin_references.get(&self.plan[index].id) else {
+                continue;
+            };
+            let Some(skin) = self.skins.get(skin_key) else {
+                continue;
+            };
             let selected = matches!(&visual.presentation, Some(UiControlPresentation::Toggle { selected }) if *selected);
-            let hovered = self.pointer_position.is_some_and(|position| contains(visual.bounds, position));
+            let hovered = self
+                .pointer_position
+                .is_some_and(|position| contains(visual.bounds, position));
             let pressed = hovered && time_seconds < self.pressed_until_seconds;
             let enabled = visual.enabled;
             // Box area: square on the left, vertically centered (matches default checkbox layout)
@@ -7160,39 +8085,171 @@ impl UiWgpuRenderer {
                 height: box_size,
             };
             // Body (supports Disabled → Pressed → Hover → Normal fallback)
-            if let Some(slot) = select_toggle_skin_slot(skin, UiSkinSlotKind::Body, hovered, pressed, enabled) {
+            if let Some(slot) =
+                select_toggle_skin_slot(skin, UiSkinSlotKind::Body, hovered, pressed, enabled)
+            {
                 let (resource_key, fit, nine_slice) = match &slot.presentation {
                     UiSkinPresentation::Image { resource_key, fit } => (resource_key, *fit, None),
-                    UiSkinPresentation::NineSlice { resource_key, layout } => (resource_key, UiImageFit::Stretch, Some(*layout)),
+                    UiSkinPresentation::NineSlice {
+                        resource_key,
+                        layout,
+                    } => (resource_key, UiImageFit::Stretch, Some(*layout)),
                     _ => continue,
                 };
                 let binding_key = format!("{skin_key}/{resource_key}");
-                if let Some(image) = self.skin_assets.get(&binding_key).and_then(|asset| self.resident_images.get(&(asset.project_id.clone(), asset.asset_id, asset.revision.0))).or_else(|| self.skin_image_ids.get(&binding_key).and_then(|image_id| self.external_images.get(image_id))) {
-                    if !nine_slice.is_some_and(|layout| !layout.validate_for_image(image.width, image.height)) {
-                        let (source_insets, target_insets, slice_mode, fill_center) = nine_slice.map(|layout| (layout.source_insets_px.map(|value| value as f32), layout.target_insets, match layout.mode { neon_ui_schema::UiNineSliceMode::Stretch => 0, neon_ui_schema::UiNineSliceMode::Tile => 1, neon_ui_schema::UiNineSliceMode::Mirror => 2 }, u32::from(layout.fill_center))).unwrap_or(([0.0; 4], [0.0; 4], 0, 1));
-                        let (rect, uv) = fit_image_rect_and_uv(box_bounds, image.uv, image.width, image.height, fit);
-                        images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, clip_shape: 0.0, _pad: 0, ..UiImageInstance::zeroed() });
+                if let Some(image) = self
+                    .skin_assets
+                    .get(&binding_key)
+                    .and_then(|asset| {
+                        self.resident_images.get(&(
+                            asset.project_id.clone(),
+                            asset.asset_id,
+                            asset.revision.0,
+                        ))
+                    })
+                    .or_else(|| {
+                        self.skin_image_ids
+                            .get(&binding_key)
+                            .and_then(|image_id| self.external_images.get(image_id))
+                    })
+                {
+                    if !nine_slice
+                        .is_some_and(|layout| !layout.validate_for_image(image.width, image.height))
+                    {
+                        let (source_insets, target_insets, slice_mode, fill_center) = nine_slice
+                            .map(|layout| {
+                                (
+                                    layout.source_insets_px.map(|value| value as f32),
+                                    layout.target_insets,
+                                    match layout.mode {
+                                        neon_ui_schema::UiNineSliceMode::Stretch => 0,
+                                        neon_ui_schema::UiNineSliceMode::Tile => 1,
+                                        neon_ui_schema::UiNineSliceMode::Mirror => 2,
+                                    },
+                                    u32::from(layout.fill_center),
+                                )
+                            })
+                            .unwrap_or(([0.0; 4], [0.0; 4], 0, 1));
+                        let (rect, uv) = fit_image_rect_and_uv(
+                            box_bounds,
+                            image.uv,
+                            image.width,
+                            image.height,
+                            fit,
+                        );
+                        images.push(UiImageInstance {
+                            rect,
+                            tint: [1.0, 1.0, 1.0, visual.style.opacity],
+                            clip: [
+                                visual.clip.x,
+                                visual.clip.y,
+                                visual.clip.x + visual.clip.width,
+                                visual.clip.y + visual.clip.height,
+                            ],
+                            uv,
+                            depth: color_pass_depth(visual.world_depth),
+                            paint_group_id: self.plan[index].paint_group_id,
+                            source_insets,
+                            target_insets,
+                            mode: slice_mode,
+                            fill_center,
+                            clip_shape: 0.0,
+                            _pad: 0,
+                            ..UiImageInstance::zeroed()
+                        });
                     }
                 }
             }
             // Check mark (only when selected) - use Fill slot, centered in box
             if selected {
-                if let Some(slot) = select_toggle_skin_slot(skin, UiSkinSlotKind::Fill, hovered, pressed, enabled)
-                    .or_else(|| skin.slots.iter().find(|s| s.slot_kind == UiSkinSlotKind::Fill && s.state == UiVisualState::Active))
+                if let Some(slot) =
+                    select_toggle_skin_slot(skin, UiSkinSlotKind::Fill, hovered, pressed, enabled)
+                        .or_else(|| {
+                            skin.slots.iter().find(|s| {
+                                s.slot_kind == UiSkinSlotKind::Fill
+                                    && s.state == UiVisualState::Active
+                            })
+                        })
                 {
                     let (resource_key, fit, nine_slice) = match &slot.presentation {
-                        UiSkinPresentation::Image { resource_key, fit } => (resource_key, *fit, None),
-                        UiSkinPresentation::NineSlice { resource_key, layout } => (resource_key, UiImageFit::Stretch, Some(*layout)),
+                        UiSkinPresentation::Image { resource_key, fit } => {
+                            (resource_key, *fit, None)
+                        }
+                        UiSkinPresentation::NineSlice {
+                            resource_key,
+                            layout,
+                        } => (resource_key, UiImageFit::Stretch, Some(*layout)),
                         _ => continue,
                     };
                     let binding_key = format!("{skin_key}/{resource_key}");
-                    if let Some(image) = self.skin_assets.get(&binding_key).and_then(|asset| self.resident_images.get(&(asset.project_id.clone(), asset.asset_id, asset.revision.0))).or_else(|| self.skin_image_ids.get(&binding_key).and_then(|image_id| self.external_images.get(image_id))) {
-                        if !nine_slice.is_some_and(|layout| !layout.validate_for_image(image.width, image.height)) {
-                            let (source_insets, target_insets, slice_mode, fill_center) = nine_slice.map(|layout| (layout.source_insets_px.map(|value| value as f32), layout.target_insets, match layout.mode { neon_ui_schema::UiNineSliceMode::Stretch => 0, neon_ui_schema::UiNineSliceMode::Tile => 1, neon_ui_schema::UiNineSliceMode::Mirror => 2 }, u32::from(layout.fill_center))).unwrap_or(([0.0; 4], [0.0; 4], 0, 1));
+                    if let Some(image) = self
+                        .skin_assets
+                        .get(&binding_key)
+                        .and_then(|asset| {
+                            self.resident_images.get(&(
+                                asset.project_id.clone(),
+                                asset.asset_id,
+                                asset.revision.0,
+                            ))
+                        })
+                        .or_else(|| {
+                            self.skin_image_ids
+                                .get(&binding_key)
+                                .and_then(|image_id| self.external_images.get(image_id))
+                        })
+                    {
+                        if !nine_slice.is_some_and(|layout| {
+                            !layout.validate_for_image(image.width, image.height)
+                        }) {
+                            let (source_insets, target_insets, slice_mode, fill_center) =
+                                nine_slice
+                                    .map(|layout| {
+                                        (
+                                            layout.source_insets_px.map(|value| value as f32),
+                                            layout.target_insets,
+                                            match layout.mode {
+                                                neon_ui_schema::UiNineSliceMode::Stretch => 0,
+                                                neon_ui_schema::UiNineSliceMode::Tile => 1,
+                                                neon_ui_schema::UiNineSliceMode::Mirror => 2,
+                                            },
+                                            u32::from(layout.fill_center),
+                                        )
+                                    })
+                                    .unwrap_or(([0.0; 4], [0.0; 4], 0, 1));
                             let mark_size = box_size * 0.6;
-                            let mark_bounds = UiBounds { x: box_bounds.x + (box_size - mark_size) * 0.5, y: box_bounds.y + (box_size - mark_size) * 0.5, width: mark_size, height: mark_size };
-                            let (rect, uv) = fit_image_rect_and_uv(mark_bounds, image.uv, image.width, image.height, fit);
-                            images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, clip_shape: 0.0, _pad: 0, ..UiImageInstance::zeroed() });
+                            let mark_bounds = UiBounds {
+                                x: box_bounds.x + (box_size - mark_size) * 0.5,
+                                y: box_bounds.y + (box_size - mark_size) * 0.5,
+                                width: mark_size,
+                                height: mark_size,
+                            };
+                            let (rect, uv) = fit_image_rect_and_uv(
+                                mark_bounds,
+                                image.uv,
+                                image.width,
+                                image.height,
+                                fit,
+                            );
+                            images.push(UiImageInstance {
+                                rect,
+                                tint: [1.0, 1.0, 1.0, visual.style.opacity],
+                                clip: [
+                                    visual.clip.x,
+                                    visual.clip.y,
+                                    visual.clip.x + visual.clip.width,
+                                    visual.clip.y + visual.clip.height,
+                                ],
+                                uv,
+                                depth: color_pass_depth(visual.world_depth),
+                                paint_group_id: self.plan[index].paint_group_id,
+                                source_insets,
+                                target_insets,
+                                mode: slice_mode,
+                                fill_center,
+                                clip_shape: 0.0,
+                                _pad: 0,
+                                ..UiImageInstance::zeroed()
+                            });
                         }
                     }
                 }
@@ -7204,10 +8261,16 @@ impl UiWgpuRenderer {
             if visual.kind != UiNodeKind::RadioButton || !sampled_in_mode(visual, mode) {
                 continue;
             }
-            let Some(skin_key) = self.skin_references.get(&self.plan[index].id) else { continue };
-            let Some(skin) = self.skins.get(skin_key) else { continue };
+            let Some(skin_key) = self.skin_references.get(&self.plan[index].id) else {
+                continue;
+            };
+            let Some(skin) = self.skins.get(skin_key) else {
+                continue;
+            };
             let selected = matches!(&visual.presentation, Some(UiControlPresentation::Toggle { selected }) if *selected);
-            let hovered = self.pointer_position.is_some_and(|position| contains(visual.bounds, position));
+            let hovered = self
+                .pointer_position
+                .is_some_and(|position| contains(visual.bounds, position));
             let pressed = hovered && time_seconds < self.pressed_until_seconds;
             let enabled = visual.enabled;
             // Box area: square on the left, vertically centered (matches default radio layout)
@@ -7219,39 +8282,171 @@ impl UiWgpuRenderer {
                 height: box_size,
             };
             // Body (supports Disabled → Pressed → Hover → Normal fallback)
-            if let Some(slot) = select_toggle_skin_slot(skin, UiSkinSlotKind::Body, hovered, pressed, enabled) {
+            if let Some(slot) =
+                select_toggle_skin_slot(skin, UiSkinSlotKind::Body, hovered, pressed, enabled)
+            {
                 let (resource_key, fit, nine_slice) = match &slot.presentation {
                     UiSkinPresentation::Image { resource_key, fit } => (resource_key, *fit, None),
-                    UiSkinPresentation::NineSlice { resource_key, layout } => (resource_key, UiImageFit::Stretch, Some(*layout)),
+                    UiSkinPresentation::NineSlice {
+                        resource_key,
+                        layout,
+                    } => (resource_key, UiImageFit::Stretch, Some(*layout)),
                     _ => continue,
                 };
                 let binding_key = format!("{skin_key}/{resource_key}");
-                if let Some(image) = self.skin_assets.get(&binding_key).and_then(|asset| self.resident_images.get(&(asset.project_id.clone(), asset.asset_id, asset.revision.0))).or_else(|| self.skin_image_ids.get(&binding_key).and_then(|image_id| self.external_images.get(image_id))) {
-                    if !nine_slice.is_some_and(|layout| !layout.validate_for_image(image.width, image.height)) {
-                        let (source_insets, target_insets, slice_mode, fill_center) = nine_slice.map(|layout| (layout.source_insets_px.map(|value| value as f32), layout.target_insets, match layout.mode { neon_ui_schema::UiNineSliceMode::Stretch => 0, neon_ui_schema::UiNineSliceMode::Tile => 1, neon_ui_schema::UiNineSliceMode::Mirror => 2 }, u32::from(layout.fill_center))).unwrap_or(([0.0; 4], [0.0; 4], 0, 1));
-                        let (rect, uv) = fit_image_rect_and_uv(box_bounds, image.uv, image.width, image.height, fit);
-                        images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, clip_shape: 1.0, _pad: 0, ..UiImageInstance::zeroed() });
+                if let Some(image) = self
+                    .skin_assets
+                    .get(&binding_key)
+                    .and_then(|asset| {
+                        self.resident_images.get(&(
+                            asset.project_id.clone(),
+                            asset.asset_id,
+                            asset.revision.0,
+                        ))
+                    })
+                    .or_else(|| {
+                        self.skin_image_ids
+                            .get(&binding_key)
+                            .and_then(|image_id| self.external_images.get(image_id))
+                    })
+                {
+                    if !nine_slice
+                        .is_some_and(|layout| !layout.validate_for_image(image.width, image.height))
+                    {
+                        let (source_insets, target_insets, slice_mode, fill_center) = nine_slice
+                            .map(|layout| {
+                                (
+                                    layout.source_insets_px.map(|value| value as f32),
+                                    layout.target_insets,
+                                    match layout.mode {
+                                        neon_ui_schema::UiNineSliceMode::Stretch => 0,
+                                        neon_ui_schema::UiNineSliceMode::Tile => 1,
+                                        neon_ui_schema::UiNineSliceMode::Mirror => 2,
+                                    },
+                                    u32::from(layout.fill_center),
+                                )
+                            })
+                            .unwrap_or(([0.0; 4], [0.0; 4], 0, 1));
+                        let (rect, uv) = fit_image_rect_and_uv(
+                            box_bounds,
+                            image.uv,
+                            image.width,
+                            image.height,
+                            fit,
+                        );
+                        images.push(UiImageInstance {
+                            rect,
+                            tint: [1.0, 1.0, 1.0, visual.style.opacity],
+                            clip: [
+                                visual.clip.x,
+                                visual.clip.y,
+                                visual.clip.x + visual.clip.width,
+                                visual.clip.y + visual.clip.height,
+                            ],
+                            uv,
+                            depth: color_pass_depth(visual.world_depth),
+                            paint_group_id: self.plan[index].paint_group_id,
+                            source_insets,
+                            target_insets,
+                            mode: slice_mode,
+                            fill_center,
+                            clip_shape: 1.0,
+                            _pad: 0,
+                            ..UiImageInstance::zeroed()
+                        });
                     }
                 }
             }
             // Dot (only when selected) - use Fill slot, centered in box
             if selected {
-                if let Some(slot) = select_toggle_skin_slot(skin, UiSkinSlotKind::Fill, hovered, pressed, enabled)
-                    .or_else(|| skin.slots.iter().find(|s| s.slot_kind == UiSkinSlotKind::Fill && s.state == UiVisualState::Active))
+                if let Some(slot) =
+                    select_toggle_skin_slot(skin, UiSkinSlotKind::Fill, hovered, pressed, enabled)
+                        .or_else(|| {
+                            skin.slots.iter().find(|s| {
+                                s.slot_kind == UiSkinSlotKind::Fill
+                                    && s.state == UiVisualState::Active
+                            })
+                        })
                 {
                     let (resource_key, fit, nine_slice) = match &slot.presentation {
-                        UiSkinPresentation::Image { resource_key, fit } => (resource_key, *fit, None),
-                        UiSkinPresentation::NineSlice { resource_key, layout } => (resource_key, UiImageFit::Stretch, Some(*layout)),
+                        UiSkinPresentation::Image { resource_key, fit } => {
+                            (resource_key, *fit, None)
+                        }
+                        UiSkinPresentation::NineSlice {
+                            resource_key,
+                            layout,
+                        } => (resource_key, UiImageFit::Stretch, Some(*layout)),
                         _ => continue,
                     };
                     let binding_key = format!("{skin_key}/{resource_key}");
-                    if let Some(image) = self.skin_assets.get(&binding_key).and_then(|asset| self.resident_images.get(&(asset.project_id.clone(), asset.asset_id, asset.revision.0))).or_else(|| self.skin_image_ids.get(&binding_key).and_then(|image_id| self.external_images.get(image_id))) {
-                        if !nine_slice.is_some_and(|layout| !layout.validate_for_image(image.width, image.height)) {
-                            let (source_insets, target_insets, slice_mode, fill_center) = nine_slice.map(|layout| (layout.source_insets_px.map(|value| value as f32), layout.target_insets, match layout.mode { neon_ui_schema::UiNineSliceMode::Stretch => 0, neon_ui_schema::UiNineSliceMode::Tile => 1, neon_ui_schema::UiNineSliceMode::Mirror => 2 }, u32::from(layout.fill_center))).unwrap_or(([0.0; 4], [0.0; 4], 0, 1));
+                    if let Some(image) = self
+                        .skin_assets
+                        .get(&binding_key)
+                        .and_then(|asset| {
+                            self.resident_images.get(&(
+                                asset.project_id.clone(),
+                                asset.asset_id,
+                                asset.revision.0,
+                            ))
+                        })
+                        .or_else(|| {
+                            self.skin_image_ids
+                                .get(&binding_key)
+                                .and_then(|image_id| self.external_images.get(image_id))
+                        })
+                    {
+                        if !nine_slice.is_some_and(|layout| {
+                            !layout.validate_for_image(image.width, image.height)
+                        }) {
+                            let (source_insets, target_insets, slice_mode, fill_center) =
+                                nine_slice
+                                    .map(|layout| {
+                                        (
+                                            layout.source_insets_px.map(|value| value as f32),
+                                            layout.target_insets,
+                                            match layout.mode {
+                                                neon_ui_schema::UiNineSliceMode::Stretch => 0,
+                                                neon_ui_schema::UiNineSliceMode::Tile => 1,
+                                                neon_ui_schema::UiNineSliceMode::Mirror => 2,
+                                            },
+                                            u32::from(layout.fill_center),
+                                        )
+                                    })
+                                    .unwrap_or(([0.0; 4], [0.0; 4], 0, 1));
                             let dot_size = box_size * 0.5;
-                            let dot_bounds = UiBounds { x: box_bounds.x + (box_size - dot_size) * 0.5, y: box_bounds.y + (box_size - dot_size) * 0.5, width: dot_size, height: dot_size };
-                            let (rect, uv) = fit_image_rect_and_uv(dot_bounds, image.uv, image.width, image.height, fit);
-                            images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, clip_shape: 1.0, _pad: 0, ..UiImageInstance::zeroed() });
+                            let dot_bounds = UiBounds {
+                                x: box_bounds.x + (box_size - dot_size) * 0.5,
+                                y: box_bounds.y + (box_size - dot_size) * 0.5,
+                                width: dot_size,
+                                height: dot_size,
+                            };
+                            let (rect, uv) = fit_image_rect_and_uv(
+                                dot_bounds,
+                                image.uv,
+                                image.width,
+                                image.height,
+                                fit,
+                            );
+                            images.push(UiImageInstance {
+                                rect,
+                                tint: [1.0, 1.0, 1.0, visual.style.opacity],
+                                clip: [
+                                    visual.clip.x,
+                                    visual.clip.y,
+                                    visual.clip.x + visual.clip.width,
+                                    visual.clip.y + visual.clip.height,
+                                ],
+                                uv,
+                                depth: color_pass_depth(visual.world_depth),
+                                paint_group_id: self.plan[index].paint_group_id,
+                                source_insets,
+                                target_insets,
+                                mode: slice_mode,
+                                fill_center,
+                                clip_shape: 1.0,
+                                _pad: 0,
+                                ..UiImageInstance::zeroed()
+                            });
                         }
                     }
                 }
@@ -7262,41 +8457,183 @@ impl UiWgpuRenderer {
             if visual.kind != UiNodeKind::TextInput || !sampled_in_mode(visual, mode) {
                 continue;
             }
-            let Some(skin_key) = self.skin_references.get(&self.plan[index].id) else { continue };
-            let Some(skin) = self.skins.get(skin_key) else { continue };
-            let focused = self.editing.node_path.as_ref().is_some_and(|path| path == &self.plan[index].id);
-            let hovered = self.pointer_position.is_some_and(|position| contains(visual.bounds, position));
-            let body_state = if focused { UiVisualState::Active } else if hovered { UiVisualState::Hover } else { UiVisualState::Normal };
+            let Some(skin_key) = self.skin_references.get(&self.plan[index].id) else {
+                continue;
+            };
+            let Some(skin) = self.skins.get(skin_key) else {
+                continue;
+            };
+            let focused = self
+                .editing
+                .node_path
+                .as_ref()
+                .is_some_and(|path| path == &self.plan[index].id);
+            let hovered = self
+                .pointer_position
+                .is_some_and(|position| contains(visual.bounds, position));
+            let body_state = if focused {
+                UiVisualState::Active
+            } else if hovered {
+                UiVisualState::Hover
+            } else {
+                UiVisualState::Normal
+            };
             // Body
-            if let Some(slot) = skin.slots.iter().find(|slot| slot.slot_kind == UiSkinSlotKind::Body && slot.state == body_state) {
+            if let Some(slot) = skin
+                .slots
+                .iter()
+                .find(|slot| slot.slot_kind == UiSkinSlotKind::Body && slot.state == body_state)
+            {
                 let (resource_key, fit, nine_slice) = match &slot.presentation {
                     UiSkinPresentation::Image { resource_key, fit } => (resource_key, *fit, None),
-                    UiSkinPresentation::NineSlice { resource_key, layout } => (resource_key, UiImageFit::Stretch, Some(*layout)),
+                    UiSkinPresentation::NineSlice {
+                        resource_key,
+                        layout,
+                    } => (resource_key, UiImageFit::Stretch, Some(*layout)),
                     _ => continue,
                 };
                 let binding_key = format!("{skin_key}/{resource_key}");
-                if let Some(image) = self.skin_assets.get(&binding_key).and_then(|asset| self.resident_images.get(&(asset.project_id.clone(), asset.asset_id, asset.revision.0))).or_else(|| self.skin_image_ids.get(&binding_key).and_then(|image_id| self.external_images.get(image_id))) {
-                    if !nine_slice.is_some_and(|layout| !layout.validate_for_image(image.width, image.height)) {
-                        let (source_insets, target_insets, slice_mode, fill_center) = nine_slice.map(|layout| (layout.source_insets_px.map(|value| value as f32), layout.target_insets, match layout.mode { neon_ui_schema::UiNineSliceMode::Stretch => 0, neon_ui_schema::UiNineSliceMode::Tile => 1, neon_ui_schema::UiNineSliceMode::Mirror => 2 }, u32::from(layout.fill_center))).unwrap_or(([0.0; 4], [0.0; 4], 0, 1));
-                        let (rect, uv) = fit_image_rect_and_uv(visual.bounds, image.uv, image.width, image.height, fit);
-                        images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, clip_shape: 0.0, _pad: 0, ..UiImageInstance::zeroed() });
+                if let Some(image) = self
+                    .skin_assets
+                    .get(&binding_key)
+                    .and_then(|asset| {
+                        self.resident_images.get(&(
+                            asset.project_id.clone(),
+                            asset.asset_id,
+                            asset.revision.0,
+                        ))
+                    })
+                    .or_else(|| {
+                        self.skin_image_ids
+                            .get(&binding_key)
+                            .and_then(|image_id| self.external_images.get(image_id))
+                    })
+                {
+                    if !nine_slice
+                        .is_some_and(|layout| !layout.validate_for_image(image.width, image.height))
+                    {
+                        let (source_insets, target_insets, slice_mode, fill_center) = nine_slice
+                            .map(|layout| {
+                                (
+                                    layout.source_insets_px.map(|value| value as f32),
+                                    layout.target_insets,
+                                    match layout.mode {
+                                        neon_ui_schema::UiNineSliceMode::Stretch => 0,
+                                        neon_ui_schema::UiNineSliceMode::Tile => 1,
+                                        neon_ui_schema::UiNineSliceMode::Mirror => 2,
+                                    },
+                                    u32::from(layout.fill_center),
+                                )
+                            })
+                            .unwrap_or(([0.0; 4], [0.0; 4], 0, 1));
+                        let (rect, uv) = fit_image_rect_and_uv(
+                            visual.bounds,
+                            image.uv,
+                            image.width,
+                            image.height,
+                            fit,
+                        );
+                        images.push(UiImageInstance {
+                            rect,
+                            tint: [1.0, 1.0, 1.0, visual.style.opacity],
+                            clip: [
+                                visual.clip.x,
+                                visual.clip.y,
+                                visual.clip.x + visual.clip.width,
+                                visual.clip.y + visual.clip.height,
+                            ],
+                            uv,
+                            depth: color_pass_depth(visual.world_depth),
+                            paint_group_id: self.plan[index].paint_group_id,
+                            source_insets,
+                            target_insets,
+                            mode: slice_mode,
+                            fill_center,
+                            clip_shape: 0.0,
+                            _pad: 0,
+                            ..UiImageInstance::zeroed()
+                        });
                     }
                 }
             }
             // Focus ring (only when focused)
             if focused {
-                if let Some(slot) = skin.slots.iter().find(|slot| slot.slot_kind == UiSkinSlotKind::FocusRing && slot.state == UiVisualState::Active) {
+                if let Some(slot) = skin.slots.iter().find(|slot| {
+                    slot.slot_kind == UiSkinSlotKind::FocusRing
+                        && slot.state == UiVisualState::Active
+                }) {
                     let (resource_key, fit, nine_slice) = match &slot.presentation {
-                        UiSkinPresentation::Image { resource_key, fit } => (resource_key, *fit, None),
-                        UiSkinPresentation::NineSlice { resource_key, layout } => (resource_key, UiImageFit::Stretch, Some(*layout)),
+                        UiSkinPresentation::Image { resource_key, fit } => {
+                            (resource_key, *fit, None)
+                        }
+                        UiSkinPresentation::NineSlice {
+                            resource_key,
+                            layout,
+                        } => (resource_key, UiImageFit::Stretch, Some(*layout)),
                         _ => continue,
                     };
                     let binding_key = format!("{skin_key}/{resource_key}");
-                    if let Some(image) = self.skin_assets.get(&binding_key).and_then(|asset| self.resident_images.get(&(asset.project_id.clone(), asset.asset_id, asset.revision.0))).or_else(|| self.skin_image_ids.get(&binding_key).and_then(|image_id| self.external_images.get(image_id))) {
-                        if !nine_slice.is_some_and(|layout| !layout.validate_for_image(image.width, image.height)) {
-                            let (source_insets, target_insets, slice_mode, fill_center) = nine_slice.map(|layout| (layout.source_insets_px.map(|value| value as f32), layout.target_insets, match layout.mode { neon_ui_schema::UiNineSliceMode::Stretch => 0, neon_ui_schema::UiNineSliceMode::Tile => 1, neon_ui_schema::UiNineSliceMode::Mirror => 2 }, u32::from(layout.fill_center))).unwrap_or(([0.0; 4], [0.0; 4], 0, 1));
-                            let (rect, uv) = fit_image_rect_and_uv(visual.bounds, image.uv, image.width, image.height, fit);
-                            images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, clip_shape: 0.0, _pad: 0, ..UiImageInstance::zeroed() });
+                    if let Some(image) = self
+                        .skin_assets
+                        .get(&binding_key)
+                        .and_then(|asset| {
+                            self.resident_images.get(&(
+                                asset.project_id.clone(),
+                                asset.asset_id,
+                                asset.revision.0,
+                            ))
+                        })
+                        .or_else(|| {
+                            self.skin_image_ids
+                                .get(&binding_key)
+                                .and_then(|image_id| self.external_images.get(image_id))
+                        })
+                    {
+                        if !nine_slice.is_some_and(|layout| {
+                            !layout.validate_for_image(image.width, image.height)
+                        }) {
+                            let (source_insets, target_insets, slice_mode, fill_center) =
+                                nine_slice
+                                    .map(|layout| {
+                                        (
+                                            layout.source_insets_px.map(|value| value as f32),
+                                            layout.target_insets,
+                                            match layout.mode {
+                                                neon_ui_schema::UiNineSliceMode::Stretch => 0,
+                                                neon_ui_schema::UiNineSliceMode::Tile => 1,
+                                                neon_ui_schema::UiNineSliceMode::Mirror => 2,
+                                            },
+                                            u32::from(layout.fill_center),
+                                        )
+                                    })
+                                    .unwrap_or(([0.0; 4], [0.0; 4], 0, 1));
+                            let (rect, uv) = fit_image_rect_and_uv(
+                                visual.bounds,
+                                image.uv,
+                                image.width,
+                                image.height,
+                                fit,
+                            );
+                            images.push(UiImageInstance {
+                                rect,
+                                tint: [1.0, 1.0, 1.0, visual.style.opacity],
+                                clip: [
+                                    visual.clip.x,
+                                    visual.clip.y,
+                                    visual.clip.x + visual.clip.width,
+                                    visual.clip.y + visual.clip.height,
+                                ],
+                                uv,
+                                depth: color_pass_depth(visual.world_depth),
+                                paint_group_id: self.plan[index].paint_group_id,
+                                source_insets,
+                                target_insets,
+                                mode: slice_mode,
+                                fill_center,
+                                clip_shape: 0.0,
+                                _pad: 0,
+                                ..UiImageInstance::zeroed()
+                            });
                         }
                     }
                 }
@@ -7307,88 +8644,345 @@ impl UiWgpuRenderer {
             if visual.kind != UiNodeKind::Tooltip || !sampled_in_mode(visual, mode) {
                 continue;
             }
-            let Some(skin_key) = self.skin_references.get(&self.plan[index].id) else { continue };
-            let Some(skin) = self.skins.get(skin_key) else { continue };
-            let Some(slot) = skin.slots.iter().find(|slot| slot.slot_kind == UiSkinSlotKind::Body && slot.state == UiVisualState::Normal) else { continue };
+            let Some(skin_key) = self.skin_references.get(&self.plan[index].id) else {
+                continue;
+            };
+            let Some(skin) = self.skins.get(skin_key) else {
+                continue;
+            };
+            let Some(slot) = skin.slots.iter().find(|slot| {
+                slot.slot_kind == UiSkinSlotKind::Body && slot.state == UiVisualState::Normal
+            }) else {
+                continue;
+            };
             let (resource_key, fit, nine_slice) = match &slot.presentation {
                 UiSkinPresentation::Image { resource_key, fit } => (resource_key, *fit, None),
-                UiSkinPresentation::NineSlice { resource_key, layout } => (resource_key, UiImageFit::Stretch, Some(*layout)),
+                UiSkinPresentation::NineSlice {
+                    resource_key,
+                    layout,
+                } => (resource_key, UiImageFit::Stretch, Some(*layout)),
                 _ => continue,
             };
             let binding_key = format!("{skin_key}/{resource_key}");
-            let image = self.skin_assets.get(&binding_key).and_then(|asset| self.resident_images.get(&(asset.project_id.clone(), asset.asset_id, asset.revision.0))).or_else(|| self.skin_image_ids.get(&binding_key).and_then(|image_id| self.external_images.get(image_id)));
+            let image = self
+                .skin_assets
+                .get(&binding_key)
+                .and_then(|asset| {
+                    self.resident_images.get(&(
+                        asset.project_id.clone(),
+                        asset.asset_id,
+                        asset.revision.0,
+                    ))
+                })
+                .or_else(|| {
+                    self.skin_image_ids
+                        .get(&binding_key)
+                        .and_then(|image_id| self.external_images.get(image_id))
+                });
             let Some(image) = image else { continue };
-            if nine_slice.is_some_and(|layout| !layout.validate_for_image(image.width, image.height)) { continue; }
-            let (source_insets, target_insets, slice_mode, fill_center) = nine_slice.map(|layout| (layout.source_insets_px.map(|value| value as f32), layout.target_insets, match layout.mode { neon_ui_schema::UiNineSliceMode::Stretch => 0, neon_ui_schema::UiNineSliceMode::Tile => 1, neon_ui_schema::UiNineSliceMode::Mirror => 2 }, u32::from(layout.fill_center))).unwrap_or(([0.0; 4], [0.0; 4], 0, 1));
-            let (rect, uv) = fit_image_rect_and_uv(visual.bounds, image.uv, image.width, image.height, fit);
-            images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, clip_shape: 0.0, _pad: 0, ..UiImageInstance::zeroed() });
+            if nine_slice
+                .is_some_and(|layout| !layout.validate_for_image(image.width, image.height))
+            {
+                continue;
+            }
+            let (source_insets, target_insets, slice_mode, fill_center) = nine_slice
+                .map(|layout| {
+                    (
+                        layout.source_insets_px.map(|value| value as f32),
+                        layout.target_insets,
+                        match layout.mode {
+                            neon_ui_schema::UiNineSliceMode::Stretch => 0,
+                            neon_ui_schema::UiNineSliceMode::Tile => 1,
+                            neon_ui_schema::UiNineSliceMode::Mirror => 2,
+                        },
+                        u32::from(layout.fill_center),
+                    )
+                })
+                .unwrap_or(([0.0; 4], [0.0; 4], 0, 1));
+            let (rect, uv) =
+                fit_image_rect_and_uv(visual.bounds, image.uv, image.width, image.height, fit);
+            images.push(UiImageInstance {
+                rect,
+                tint: [1.0, 1.0, 1.0, visual.style.opacity],
+                clip: [
+                    visual.clip.x,
+                    visual.clip.y,
+                    visual.clip.x + visual.clip.width,
+                    visual.clip.y + visual.clip.height,
+                ],
+                uv,
+                depth: color_pass_depth(visual.world_depth),
+                paint_group_id: self.plan[index].paint_group_id,
+                source_insets,
+                target_insets,
+                mode: slice_mode,
+                fill_center,
+                clip_shape: 0.0,
+                _pad: 0,
+                ..UiImageInstance::zeroed()
+            });
         }
         // Combo / Dropdown / Tabs / Selectable skins render a body image with
         // hover / pressed / disabled state support (same fallback chain as Button).
         for (index, visual) in self.sampled.iter().enumerate() {
-            if !matches!(visual.kind, UiNodeKind::Combo | UiNodeKind::Dropdown | UiNodeKind::Tabs | UiNodeKind::Selectable)
-                || !sampled_in_mode(visual, mode)
+            if !matches!(
+                visual.kind,
+                UiNodeKind::Combo
+                    | UiNodeKind::Dropdown
+                    | UiNodeKind::Tabs
+                    | UiNodeKind::Selectable
+            ) || !sampled_in_mode(visual, mode)
             {
                 continue;
             }
-            let Some(skin_key) = self.skin_references.get(&self.plan[index].id) else { continue };
-            let Some(skin) = self.skins.get(skin_key) else { continue };
-            let hovered = self.pointer_position.is_some_and(|position| contains(visual.bounds, position));
+            let Some(skin_key) = self.skin_references.get(&self.plan[index].id) else {
+                continue;
+            };
+            let Some(skin) = self.skins.get(skin_key) else {
+                continue;
+            };
+            let hovered = self
+                .pointer_position
+                .is_some_and(|position| contains(visual.bounds, position));
             let pressed = hovered && time_seconds < self.pressed_until_seconds;
             let enabled = visual.enabled;
-            let Some(slot) = select_toggle_skin_slot(skin, UiSkinSlotKind::Body, hovered, pressed, enabled) else { continue };
+            let Some(slot) =
+                select_toggle_skin_slot(skin, UiSkinSlotKind::Body, hovered, pressed, enabled)
+            else {
+                continue;
+            };
             let (resource_key, fit, nine_slice) = match &slot.presentation {
                 UiSkinPresentation::Image { resource_key, fit } => (resource_key, *fit, None),
-                UiSkinPresentation::NineSlice { resource_key, layout } => (resource_key, UiImageFit::Stretch, Some(*layout)),
+                UiSkinPresentation::NineSlice {
+                    resource_key,
+                    layout,
+                } => (resource_key, UiImageFit::Stretch, Some(*layout)),
                 _ => continue,
             };
             let binding_key = format!("{skin_key}/{resource_key}");
-            let image = self.skin_assets.get(&binding_key).and_then(|asset| self.resident_images.get(&(asset.project_id.clone(), asset.asset_id, asset.revision.0))).or_else(|| self.skin_image_ids.get(&binding_key).and_then(|image_id| self.external_images.get(image_id)));
+            let image = self
+                .skin_assets
+                .get(&binding_key)
+                .and_then(|asset| {
+                    self.resident_images.get(&(
+                        asset.project_id.clone(),
+                        asset.asset_id,
+                        asset.revision.0,
+                    ))
+                })
+                .or_else(|| {
+                    self.skin_image_ids
+                        .get(&binding_key)
+                        .and_then(|image_id| self.external_images.get(image_id))
+                });
             let Some(image) = image else { continue };
-            if nine_slice.is_some_and(|layout| !layout.validate_for_image(image.width, image.height)) { continue; }
-            let (source_insets, target_insets, slice_mode, fill_center) = nine_slice.map(|layout| (layout.source_insets_px.map(|value| value as f32), layout.target_insets, match layout.mode { neon_ui_schema::UiNineSliceMode::Stretch => 0, neon_ui_schema::UiNineSliceMode::Tile => 1, neon_ui_schema::UiNineSliceMode::Mirror => 2 }, u32::from(layout.fill_center))).unwrap_or(([0.0; 4], [0.0; 4], 0, 1));
-            let (rect, uv) = fit_image_rect_and_uv(visual.bounds, image.uv, image.width, image.height, fit);
-            images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, clip_shape: 0.0, _pad: 0, ..UiImageInstance::zeroed() });
+            if nine_slice
+                .is_some_and(|layout| !layout.validate_for_image(image.width, image.height))
+            {
+                continue;
+            }
+            let (source_insets, target_insets, slice_mode, fill_center) = nine_slice
+                .map(|layout| {
+                    (
+                        layout.source_insets_px.map(|value| value as f32),
+                        layout.target_insets,
+                        match layout.mode {
+                            neon_ui_schema::UiNineSliceMode::Stretch => 0,
+                            neon_ui_schema::UiNineSliceMode::Tile => 1,
+                            neon_ui_schema::UiNineSliceMode::Mirror => 2,
+                        },
+                        u32::from(layout.fill_center),
+                    )
+                })
+                .unwrap_or(([0.0; 4], [0.0; 4], 0, 1));
+            let (rect, uv) =
+                fit_image_rect_and_uv(visual.bounds, image.uv, image.width, image.height, fit);
+            images.push(UiImageInstance {
+                rect,
+                tint: [1.0, 1.0, 1.0, visual.style.opacity],
+                clip: [
+                    visual.clip.x,
+                    visual.clip.y,
+                    visual.clip.x + visual.clip.width,
+                    visual.clip.y + visual.clip.height,
+                ],
+                uv,
+                depth: color_pass_depth(visual.world_depth),
+                paint_group_id: self.plan[index].paint_group_id,
+                source_insets,
+                target_insets,
+                mode: slice_mode,
+                fill_center,
+                clip_shape: 0.0,
+                _pad: 0,
+                ..UiImageInstance::zeroed()
+            });
         }
         // DragValue skins render a track background plus an optional body overlay.
         for (index, visual) in self.sampled.iter().enumerate() {
             if visual.kind != UiNodeKind::DragValue || !sampled_in_mode(visual, mode) {
                 continue;
             }
-            let Some(skin_key) = self.skin_references.get(&self.plan[index].id) else { continue };
-            let Some(skin) = self.skins.get(skin_key) else { continue };
-            let hovered = self.pointer_position.is_some_and(|position| contains(visual.bounds, position));
+            let Some(skin_key) = self.skin_references.get(&self.plan[index].id) else {
+                continue;
+            };
+            let Some(skin) = self.skins.get(skin_key) else {
+                continue;
+            };
+            let hovered = self
+                .pointer_position
+                .is_some_and(|position| contains(visual.bounds, position));
             let pressed = hovered && time_seconds < self.pressed_until_seconds;
             let enabled = visual.enabled;
             // Track (base background)
-            if let Some(slot) = select_toggle_skin_slot(skin, UiSkinSlotKind::Track, hovered, pressed, enabled) {
+            if let Some(slot) =
+                select_toggle_skin_slot(skin, UiSkinSlotKind::Track, hovered, pressed, enabled)
+            {
                 let (resource_key, fit, nine_slice) = match &slot.presentation {
                     UiSkinPresentation::Image { resource_key, fit } => (resource_key, *fit, None),
-                    UiSkinPresentation::NineSlice { resource_key, layout } => (resource_key, UiImageFit::Stretch, Some(*layout)),
+                    UiSkinPresentation::NineSlice {
+                        resource_key,
+                        layout,
+                    } => (resource_key, UiImageFit::Stretch, Some(*layout)),
                     _ => continue,
                 };
                 let binding_key = format!("{skin_key}/{resource_key}");
-                if let Some(image) = self.skin_assets.get(&binding_key).and_then(|asset| self.resident_images.get(&(asset.project_id.clone(), asset.asset_id, asset.revision.0))).or_else(|| self.skin_image_ids.get(&binding_key).and_then(|image_id| self.external_images.get(image_id))) {
-                    if !nine_slice.is_some_and(|layout| !layout.validate_for_image(image.width, image.height)) {
-                        let (source_insets, target_insets, slice_mode, fill_center) = nine_slice.map(|layout| (layout.source_insets_px.map(|value| value as f32), layout.target_insets, match layout.mode { neon_ui_schema::UiNineSliceMode::Stretch => 0, neon_ui_schema::UiNineSliceMode::Tile => 1, neon_ui_schema::UiNineSliceMode::Mirror => 2 }, u32::from(layout.fill_center))).unwrap_or(([0.0; 4], [0.0; 4], 0, 1));
-                        let (rect, uv) = fit_image_rect_and_uv(visual.bounds, image.uv, image.width, image.height, fit);
-                        images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, clip_shape: 0.0, _pad: 0, ..UiImageInstance::zeroed() });
+                if let Some(image) = self
+                    .skin_assets
+                    .get(&binding_key)
+                    .and_then(|asset| {
+                        self.resident_images.get(&(
+                            asset.project_id.clone(),
+                            asset.asset_id,
+                            asset.revision.0,
+                        ))
+                    })
+                    .or_else(|| {
+                        self.skin_image_ids
+                            .get(&binding_key)
+                            .and_then(|image_id| self.external_images.get(image_id))
+                    })
+                {
+                    if !nine_slice
+                        .is_some_and(|layout| !layout.validate_for_image(image.width, image.height))
+                    {
+                        let (source_insets, target_insets, slice_mode, fill_center) = nine_slice
+                            .map(|layout| {
+                                (
+                                    layout.source_insets_px.map(|value| value as f32),
+                                    layout.target_insets,
+                                    match layout.mode {
+                                        neon_ui_schema::UiNineSliceMode::Stretch => 0,
+                                        neon_ui_schema::UiNineSliceMode::Tile => 1,
+                                        neon_ui_schema::UiNineSliceMode::Mirror => 2,
+                                    },
+                                    u32::from(layout.fill_center),
+                                )
+                            })
+                            .unwrap_or(([0.0; 4], [0.0; 4], 0, 1));
+                        let (rect, uv) = fit_image_rect_and_uv(
+                            visual.bounds,
+                            image.uv,
+                            image.width,
+                            image.height,
+                            fit,
+                        );
+                        images.push(UiImageInstance {
+                            rect,
+                            tint: [1.0, 1.0, 1.0, visual.style.opacity],
+                            clip: [
+                                visual.clip.x,
+                                visual.clip.y,
+                                visual.clip.x + visual.clip.width,
+                                visual.clip.y + visual.clip.height,
+                            ],
+                            uv,
+                            depth: color_pass_depth(visual.world_depth),
+                            paint_group_id: self.plan[index].paint_group_id,
+                            source_insets,
+                            target_insets,
+                            mode: slice_mode,
+                            fill_center,
+                            clip_shape: 0.0,
+                            _pad: 0,
+                            ..UiImageInstance::zeroed()
+                        });
                     }
                 }
             }
             // Body (overlay on top of track)
-            if let Some(slot) = select_toggle_skin_slot(skin, UiSkinSlotKind::Body, hovered, pressed, enabled) {
+            if let Some(slot) =
+                select_toggle_skin_slot(skin, UiSkinSlotKind::Body, hovered, pressed, enabled)
+            {
                 let (resource_key, fit, nine_slice) = match &slot.presentation {
                     UiSkinPresentation::Image { resource_key, fit } => (resource_key, *fit, None),
-                    UiSkinPresentation::NineSlice { resource_key, layout } => (resource_key, UiImageFit::Stretch, Some(*layout)),
+                    UiSkinPresentation::NineSlice {
+                        resource_key,
+                        layout,
+                    } => (resource_key, UiImageFit::Stretch, Some(*layout)),
                     _ => continue,
                 };
                 let binding_key = format!("{skin_key}/{resource_key}");
-                if let Some(image) = self.skin_assets.get(&binding_key).and_then(|asset| self.resident_images.get(&(asset.project_id.clone(), asset.asset_id, asset.revision.0))).or_else(|| self.skin_image_ids.get(&binding_key).and_then(|image_id| self.external_images.get(image_id))) {
-                    if !nine_slice.is_some_and(|layout| !layout.validate_for_image(image.width, image.height)) {
-                        let (source_insets, target_insets, slice_mode, fill_center) = nine_slice.map(|layout| (layout.source_insets_px.map(|value| value as f32), layout.target_insets, match layout.mode { neon_ui_schema::UiNineSliceMode::Stretch => 0, neon_ui_schema::UiNineSliceMode::Tile => 1, neon_ui_schema::UiNineSliceMode::Mirror => 2 }, u32::from(layout.fill_center))).unwrap_or(([0.0; 4], [0.0; 4], 0, 1));
-                        let (rect, uv) = fit_image_rect_and_uv(visual.bounds, image.uv, image.width, image.height, fit);
-                        images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, clip_shape: 0.0, _pad: 0, ..UiImageInstance::zeroed() });
+                if let Some(image) = self
+                    .skin_assets
+                    .get(&binding_key)
+                    .and_then(|asset| {
+                        self.resident_images.get(&(
+                            asset.project_id.clone(),
+                            asset.asset_id,
+                            asset.revision.0,
+                        ))
+                    })
+                    .or_else(|| {
+                        self.skin_image_ids
+                            .get(&binding_key)
+                            .and_then(|image_id| self.external_images.get(image_id))
+                    })
+                {
+                    if !nine_slice
+                        .is_some_and(|layout| !layout.validate_for_image(image.width, image.height))
+                    {
+                        let (source_insets, target_insets, slice_mode, fill_center) = nine_slice
+                            .map(|layout| {
+                                (
+                                    layout.source_insets_px.map(|value| value as f32),
+                                    layout.target_insets,
+                                    match layout.mode {
+                                        neon_ui_schema::UiNineSliceMode::Stretch => 0,
+                                        neon_ui_schema::UiNineSliceMode::Tile => 1,
+                                        neon_ui_schema::UiNineSliceMode::Mirror => 2,
+                                    },
+                                    u32::from(layout.fill_center),
+                                )
+                            })
+                            .unwrap_or(([0.0; 4], [0.0; 4], 0, 1));
+                        let (rect, uv) = fit_image_rect_and_uv(
+                            visual.bounds,
+                            image.uv,
+                            image.width,
+                            image.height,
+                            fit,
+                        );
+                        images.push(UiImageInstance {
+                            rect,
+                            tint: [1.0, 1.0, 1.0, visual.style.opacity],
+                            clip: [
+                                visual.clip.x,
+                                visual.clip.y,
+                                visual.clip.x + visual.clip.width,
+                                visual.clip.y + visual.clip.height,
+                            ],
+                            uv,
+                            depth: color_pass_depth(visual.world_depth),
+                            paint_group_id: self.plan[index].paint_group_id,
+                            source_insets,
+                            target_insets,
+                            mode: slice_mode,
+                            fill_center,
+                            clip_shape: 0.0,
+                            _pad: 0,
+                            ..UiImageInstance::zeroed()
+                        });
                     }
                 }
             }
@@ -7460,7 +9054,8 @@ impl UiWgpuRenderer {
                             target_insets: [0.0; 4],
                             mode: 0,
                             fill_center: 1,
-                            clip_shape: 0.0, _pad: 0,
+                            clip_shape: 0.0,
+                            _pad: 0,
                             ..UiImageInstance::zeroed()
                         },
                     ))
@@ -7552,10 +9147,11 @@ impl UiWgpuRenderer {
             .map(|index| Self::has_scroll_ancestor_in_plan(&self.plan, index))
             .collect::<Vec<_>>();
         let stage = Instant::now();
-        let (texts, popup_texts) = self
+        let (texts, popup_texts, text_material_batches) = self
             .resident_font
             .as_mut()
             .map(|font| {
+                let mut text_material_batches: Vec<(String, Vec<UiTextInstance>)> = Vec::new();
                 let texts = self
                     .sampled
                     .iter()
@@ -7602,7 +9198,8 @@ impl UiWgpuRenderer {
                         // so rich spans take a separate path for now.)
                         if text.is_none() {
                             if let Some(TextRef::Rich { spans }) = visual.text.as_ref() {
-                                let mut instances = layout_rich_text(device, queue, font, visual, spans)?;
+                                let mut instances =
+                                    layout_rich_text(device, queue, font, visual, spans)?;
                                 apply_text_transform_track(&mut instances, transform_track);
                                 return Some(instances);
                             }
@@ -7639,7 +9236,14 @@ impl UiWgpuRenderer {
                         // logical cache for static nodes, but rebuild text in
                         // a scrolling subtree so the current panel position
                         // and viewport clip are authoritative.
-                        if !scroll_dynamic[index]
+                        // Plan ids are "{fragment_id}/{node_id}"; keep text
+                        // materials fully qualified so equal node keys in
+                        // different fragments cannot share a timer or shader.
+                        let text_material_key = node_path.as_str();
+                        let node_text_material =
+                            self.node_text_materials.get(text_material_key).cloned();
+                        if node_text_material.is_none()
+                            && !scroll_dynamic[index]
                             && let Some(cached) = self.text_layout_cache.get(&cache_key)
                         {
                             let mut instances = cached.text_instances.clone();
@@ -7672,6 +9276,31 @@ impl UiWgpuRenderer {
                             layout_text(device, queue, font, visual, text, horizontal_scroll);
                         if let Some(instances) = instances.as_mut() {
                             apply_text_transform_track(instances, transform_track);
+                        }
+                        if let Some(text_material) = node_text_material {
+                            // Text-material glyphs: expand every glyph quad and
+                            // its clip by the material overflow so a glow can
+                            // paint outside the glyph box, then route the
+                            // instances to the per-package material pass.
+                            let mut material_instances = instances.unwrap_or_default();
+                            for instance in &mut material_instances {
+                                instance.rect[0] -= text_material.overflow[0];
+                                instance.rect[1] -= text_material.overflow[1];
+                                instance.rect[2] +=
+                                    text_material.overflow[0] + text_material.overflow[2];
+                                instance.rect[3] +=
+                                    text_material.overflow[1] + text_material.overflow[3];
+                                instance.clip[0] -= text_material.overflow[0];
+                                instance.clip[1] -= text_material.overflow[1];
+                                instance.clip[2] +=
+                                    text_material.overflow[0] + text_material.overflow[2];
+                                instance.clip[3] +=
+                                    text_material.overflow[1] + text_material.overflow[3];
+                                instance.overflow = text_material.overflow;
+                            }
+                            text_material_batches
+                                .push((text_material.package_id.clone(), material_instances));
+                            return None;
                         }
                         if let Some(instances) = instances {
                             self.layout_counters.text_layout_count =
@@ -7735,26 +9364,30 @@ impl UiWgpuRenderer {
                             continue;
                         }
                         if matches!(
-                                visual.kind,
-                                UiNodeKind::Label
-                                    | UiNodeKind::Button
-                                    | UiNodeKind::TextInput
-                                    | UiNodeKind::Checkbox
-                                    | UiNodeKind::RadioButton
-                                    | UiNodeKind::Slider
-                                    | UiNodeKind::DragValue
-                                    | UiNodeKind::Combo
-                                    | UiNodeKind::Dropdown
-                                    | UiNodeKind::Tabs
-                                    | UiNodeKind::Selectable
-                                    | UiNodeKind::Scrollbar
-                                    | UiNodeKind::ProgressBar
-                                    | UiNodeKind::Tooltip
-                            ) {
+                            visual.kind,
+                            UiNodeKind::Label
+                                | UiNodeKind::Button
+                                | UiNodeKind::TextInput
+                                | UiNodeKind::Checkbox
+                                | UiNodeKind::RadioButton
+                                | UiNodeKind::Slider
+                                | UiNodeKind::DragValue
+                                | UiNodeKind::Combo
+                                | UiNodeKind::Dropdown
+                                | UiNodeKind::Tabs
+                                | UiNodeKind::Selectable
+                                | UiNodeKind::Scrollbar
+                                | UiNodeKind::ProgressBar
+                                | UiNodeKind::Tooltip
+                        ) {
                             match visual.text.as_ref() {
                                 Some(TextRef::Rich { spans }) => {
-                                    let mut instances = layout_rich_text(device, queue, font, visual, spans).unwrap_or_default();
-                                    if let Some(track) = text_transform_tracks.get(&self.plan[index].id).copied() {
+                                    let mut instances =
+                                        layout_rich_text(device, queue, font, visual, spans)
+                                            .unwrap_or_default();
+                                    if let Some(track) =
+                                        text_transform_tracks.get(&self.plan[index].id).copied()
+                                    {
                                         apply_text_transform_track(&mut instances, track);
                                     }
                                     if !instances.is_empty() {
@@ -7762,8 +9395,18 @@ impl UiWgpuRenderer {
                                     }
                                 }
                                 Some(text) if text_ref_value(text).is_some() => {
-                                    let mut instances = layout_text(device, queue, font, visual, text_ref_value(text).unwrap(), None).unwrap_or_default();
-                                    if let Some(track) = text_transform_tracks.get(&self.plan[index].id).copied() {
+                                    let mut instances = layout_text(
+                                        device,
+                                        queue,
+                                        font,
+                                        visual,
+                                        text_ref_value(text).unwrap(),
+                                        None,
+                                    )
+                                    .unwrap_or_default();
+                                    if let Some(track) =
+                                        text_transform_tracks.get(&self.plan[index].id).copied()
+                                    {
                                         apply_text_transform_track(&mut instances, track);
                                     }
                                     if !instances.is_empty() {
@@ -7775,13 +9418,14 @@ impl UiWgpuRenderer {
                         }
                     }
                 }
-                (texts, popup_texts)
+                (texts, popup_texts, text_material_batches)
             })
             .unwrap_or_default();
         // Merge editor glyphs into the ordinary text pass and the completion
         // labels into the popup text pass (both carry their own clip rects).
         let mut texts = texts;
         let mut popup_texts = popup_texts;
+        let text_material_batches = text_material_batches;
         texts.extend(editor_layout.editor_texts);
         popup_texts.extend(editor_layout.editor_popup_texts);
         let text_layout_ms = stage.elapsed().as_secs_f32() * 1000.0;
@@ -7865,13 +9509,15 @@ impl UiWgpuRenderer {
             .chain(canvas_groups.iter().map(|(key, _)| *key))
             .chain(text_groups.iter().map(|(key, _)| *key))
             .collect::<Vec<_>>();
-        let group_depths = self
-            .plan
-            .iter()
-            .fold(HashMap::<u32, Option<f32>>::new(), |mut depths, node| {
-                depths.entry(node.paint_group_id).or_insert(node.target.world_depth);
-                depths
-            });
+        let group_depths =
+            self.plan
+                .iter()
+                .fold(HashMap::<u32, Option<f32>>::new(), |mut depths, node| {
+                    depths
+                        .entry(node.paint_group_id)
+                        .or_insert(node.target.world_depth);
+                    depths
+                });
         // World groups are emitted far-to-near. Screen groups have no GPU depth,
         // so their stable declaration order is the group-id tie-breaker.
         depth_keys.sort_by(|a, b| compare_paint_group_order(*a, *b, &group_depths));
@@ -7879,12 +9525,38 @@ impl UiWgpuRenderer {
         let mut ordered_rects = Vec::new();
         let mut ordered_images = Vec::new();
         let mut ordered_texts = Vec::new();
+        let mut ordered_text_materials = Vec::new();
         let mut rect_ranges = HashMap::new();
         let mut image_ranges = HashMap::new();
         let mut text_ranges = HashMap::new();
+        let mut text_material_ranges: HashMap<u32, Vec<(String, u32, u32)>> = HashMap::new();
         let mut ordered_canvas = Vec::new();
         let mut canvas_ranges = HashMap::new();
         let group_order = depth_keys.clone();
+        // Group text-material instances by paint group and package so each
+        // package draws as one batch right after the ordinary text of the
+        // same group.
+        let mut text_material_groups: Vec<(u32, Vec<(String, Vec<UiTextInstance>)>)> = Vec::new();
+        for (package_id, instances) in text_material_batches {
+            let Some(first) = instances.first() else {
+                continue;
+            };
+            let key = first.paint_group_id;
+            if let Some((_, groups)) = text_material_groups
+                .iter_mut()
+                .find(|(group_key, _)| *group_key == key)
+            {
+                if let Some((last_pkg, last_vec)) = groups.last_mut()
+                    && last_pkg == &package_id
+                {
+                    last_vec.extend(instances);
+                } else {
+                    groups.push((package_id, instances));
+                }
+            } else {
+                text_material_groups.push((key, vec![(package_id, instances)]));
+            }
+        }
         for key in depth_keys {
             if let Some((_, group)) = rect_groups.iter().find(|(group_key, _)| *group_key == key) {
                 let start = ordered_rects.len() as u32;
@@ -7900,6 +9572,21 @@ impl UiWgpuRenderer {
                 let start = ordered_texts.len() as u32;
                 ordered_texts.extend_from_slice(group);
                 text_ranges.insert(key, (start, group.len() as u32));
+            }
+            if let Some((_, groups)) = text_material_groups
+                .iter()
+                .find(|(group_key, _)| *group_key == key)
+            {
+                for (package_id, instances) in groups {
+                    let start = ordered_text_materials.len() as u32;
+                    ordered_text_materials.extend_from_slice(instances);
+                    let count = instances.len() as u32;
+                    text_material_ranges.entry(key).or_default().push((
+                        package_id.clone(),
+                        start,
+                        count,
+                    ));
+                }
             }
             if let Some((_, group)) = canvas_groups
                 .iter()
@@ -7932,6 +9619,10 @@ impl UiWgpuRenderer {
             self.text_capacity = ordered_texts.len().next_power_of_two();
             self.text_buffer = create_text_buffer(device, self.text_capacity);
         }
+        if ordered_text_materials.len() > self.text_material_capacity {
+            self.text_material_capacity = ordered_text_materials.len().next_power_of_two().max(16);
+            self.text_material_buffer = create_text_buffer(device, self.text_material_capacity);
+        }
         if ordered_canvas.len() > self.canvas_capacity {
             self.canvas_capacity = ordered_canvas.len().next_power_of_two();
             self.canvas_buffer = create_canvas_buffer(device, self.canvas_capacity);
@@ -7958,6 +9649,13 @@ impl UiWgpuRenderer {
         if !ordered_texts.is_empty() {
             queue.write_buffer(&self.text_buffer, 0, bytemuck::cast_slice(&ordered_texts));
         }
+        if !ordered_text_materials.is_empty() {
+            queue.write_buffer(
+                &self.text_material_buffer,
+                0,
+                bytemuck::cast_slice(&ordered_text_materials),
+            );
+        }
         if !ordered_canvas.is_empty() {
             queue.write_buffer(
                 &self.canvas_buffer,
@@ -7978,7 +9676,9 @@ impl UiWgpuRenderer {
             // filter over the player artwork and controls.
             if let Some(packages) = material_batches.get(&key) {
                 for (package_id, start, count) in packages {
-                    let Some(pipeline) = self.material_pipelines.get(package_id) else { continue };
+                    let Some(pipeline) = self.material_pipelines.get(package_id) else {
+                        continue;
+                    };
                     pass.set_pipeline(pipeline);
                     pass.set_bind_group(0, &self.view_bind_group, &[]);
                     pass.set_vertex_buffer(0, self.material_instance_buffer.slice(..));
@@ -8024,6 +9724,21 @@ impl UiWgpuRenderer {
                 pass.set_bind_group(1, &self.resident_font.as_ref().unwrap().bind_group, &[]);
                 pass.set_vertex_buffer(0, self.text_buffer.slice(..));
                 pass.draw(0..6, *start..*start + *count);
+            }
+            // Text-material batches composite right after the ordinary glyphs
+            // of the same paint group, keeping the material on top of the
+            // group's own text while a nearer group still covers it.
+            if let Some(packages) = text_material_ranges.get(&key) {
+                for (package_id, start, count) in packages {
+                    let Some(pipeline) = self.text_material_pipelines.get(package_id) else {
+                        continue;
+                    };
+                    pass.set_pipeline(pipeline);
+                    pass.set_bind_group(0, &self.view_bind_group, &[]);
+                    pass.set_bind_group(1, &self.resident_font.as_ref().unwrap().bind_group, &[]);
+                    pass.set_vertex_buffer(0, self.text_material_buffer.slice(..));
+                    pass.draw(0..6, *start..*start + *count);
+                }
             }
         }
 
@@ -8146,15 +9861,12 @@ impl UiWgpuRenderer {
             if base + 32 > data.len() {
                 break;
             }
-            let event_id = u32::from_le_bytes([
-                data[base], data[base + 1], data[base + 2], data[base + 3],
-            ]);
+            let event_id =
+                u32::from_le_bytes([data[base], data[base + 1], data[base + 2], data[base + 3]]);
             let mut payload = [0.0f32; 4];
             for j in 0..4 {
                 let p = base + 16 + j * 4;
-                payload[j] = f32::from_le_bytes([
-                    data[p], data[p + 1], data[p + 2], data[p + 3],
-                ]);
+                payload[j] = f32::from_le_bytes([data[p], data[p + 1], data[p + 2], data[p + 3]]);
             }
             self.pending_shader_events.push((event_id, payload));
         }
@@ -8300,13 +10012,15 @@ impl UiWgpuRenderer {
                 .push(*instance);
         }
         let mut group_ids = groups.keys().copied().collect::<Vec<_>>();
-        let group_depths = self
-            .plan
-            .iter()
-            .fold(HashMap::<u32, Option<f32>>::new(), |mut depths, node| {
-                depths.entry(node.paint_group_id).or_insert(node.target.world_depth);
-                depths
-            });
+        let group_depths =
+            self.plan
+                .iter()
+                .fold(HashMap::<u32, Option<f32>>::new(), |mut depths, node| {
+                    depths
+                        .entry(node.paint_group_id)
+                        .or_insert(node.target.world_depth);
+                    depths
+                });
         group_ids.sort_by(|a, b| compare_paint_group_order(*a, *b, &group_depths));
         let mut ordered_depth_instances = Vec::new();
         let mut ranges = Vec::new();
@@ -8385,9 +10099,7 @@ impl UiWgpuRenderer {
                 }));
         }
         let mut group_order = group_nodes.keys().copied().collect::<Vec<_>>();
-        group_order.sort_by(|left, right| {
-            compare_paint_group_order(*left, *right, &group_depths)
-        });
+        group_order.sort_by(|left, right| compare_paint_group_order(*left, *right, &group_depths));
         let groups = group_order
             .iter()
             .filter_map(|group_id| {
@@ -8450,18 +10162,26 @@ impl UiWgpuRenderer {
                 .plan
                 .iter()
                 .any(|node| !self.live_node_ids.contains(&node.id));
+        // One-shot text materials must expire on wall-clock time even when the
+        // fragment never changes, so run expiry before the plan-reuse early
+        // return.
+        self.expire_one_shot_text_materials(self.animation_clock_seconds);
         if matches && !data_grid_hold_changed && !stale_exiting_plan {
             return false;
         }
+        let previous_text_materials = self.node_text_materials.clone();
         self.nine_slices.clear();
         self.node_cuts.clear();
         self.node_materials.clear();
+        self.node_text_materials.clear();
         self.composition_layers.clear();
         self.image_fits.clear();
         self.skins.clear();
         self.skin_references.clear();
         self.skin_image_ids.clear();
         self.skin_assets.clear();
+        let mut declared_text_materials: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
         for fragment in fragments.values() {
             for effect in &fragment.effects {
                 match effect {
@@ -8474,21 +10194,43 @@ impl UiWgpuRenderer {
                         }
                     }
                     neon_ui_schema::UiEffect::Material { node_id, material } => {
-                        self.node_materials.insert(node_id.0.clone(), material.clone());
+                        self.node_materials
+                            .insert(node_id.0.clone(), material.clone());
+                    }
+                    neon_ui_schema::UiEffect::TextMaterial { node_id, material } => {
+                        let node = format!("{}/{}", fragment.fragment_id.0, node_id.0);
+                        declared_text_materials.insert(node.clone());
+                        if previous_text_materials.get(&node) != Some(material) {
+                            self.text_material_started.remove(&node);
+                            self.text_material_consumed.remove(&node);
+                        }
+                        // A consumed one-shot stays suppressed while the
+                        // fragment keeps declaring it; the declaration itself
+                        // is never rewritten.
+                        if !self.text_material_consumed.contains(&node) {
+                            self.text_material_started
+                                .entry(node.clone())
+                                .or_insert(self.animation_clock_seconds);
+                            self.node_text_materials.insert(node, material.clone());
+                        }
                     }
                     neon_ui_schema::UiEffect::CompositionLayer { node_id, layer } => {
-                        self.composition_layers.insert(
-                            format!("{}/{}", fragment.fragment_id.0, node_id.0),
-                            *layer,
-                        );
+                        self.composition_layers
+                            .insert(format!("{}/{}", fragment.fragment_id.0, node_id.0), *layer);
                     }
-                    neon_ui_schema::UiEffect::ExitTransition { node_id, transition } => {
+                    neon_ui_schema::UiEffect::ExitTransition {
+                        node_id,
+                        transition,
+                    } => {
                         self.exit_transitions.insert(
                             format!("{}/{}", fragment.fragment_id.0, node_id.0),
                             transition.clone(),
                         );
                     }
-                    neon_ui_schema::UiEffect::ContextMenuBinding { node_id, context_menu_id } => {
+                    neon_ui_schema::UiEffect::ContextMenuBinding {
+                        node_id,
+                        context_menu_id,
+                    } => {
                         self.context_menu_bindings.insert(
                             format!("{}/{}", fragment.fragment_id.0, node_id.0),
                             context_menu_id.clone(),
@@ -8522,6 +10264,10 @@ impl UiWgpuRenderer {
             }
             collect_image_fits(&fragment.root, &mut self.image_fits);
         }
+        self.text_material_started
+            .retain(|node, _| declared_text_materials.contains(node));
+        self.text_material_consumed
+            .retain(|node| declared_text_materials.contains(node));
         self.layout_counters.layout_count = self.layout_counters.layout_count.saturating_add(1);
         let display_fragments = self.data_grid_display_fragments(fragments);
         self.reconcile_data_grid_text_display_cache(&display_fragments);
@@ -8562,24 +10308,34 @@ impl UiWgpuRenderer {
         // TreeView children are flat Label nodes; hierarchy is expressed by x indent.
         // A collapsed parent hides all subsequent more-indented siblings until the
         // next node at the same or lesser indent.
-        let treeview_parents: HashSet<String> = nodes.iter()
+        let treeview_parents: HashSet<String> = nodes
+            .iter()
             .filter(|(_, _, t, _)| matches!(t.kind, UiNodeKind::TreeView))
             .map(|(id, _, _, _)| id.clone())
             .collect();
-        let parent_map: std::collections::HashMap<String, Option<String>> = nodes.iter()
+        let parent_map: std::collections::HashMap<String, Option<String>> = nodes
+            .iter()
             .map(|(id, pid, _, _)| (id.clone(), pid.clone()))
             .collect();
         // Collect IDs of hidden context menus for descendant filtering.
         // Only the active context menu is visible; all others are hidden.
         // Active ID may be stored without fragment prefix, so match by suffix.
-        let active_suffix = self.active_context_menu_id.as_deref()
+        let active_suffix = self
+            .active_context_menu_id
+            .as_deref()
             .map(|active| format!("/{}", active));
         let is_active_ctx = |id: &str| -> bool {
-            self.active_context_menu_id.as_deref().map_or(false, |active| {
-                id == active || active_suffix.as_deref().map_or(false, |suf| id.ends_with(suf))
-            })
+            self.active_context_menu_id
+                .as_deref()
+                .map_or(false, |active| {
+                    id == active
+                        || active_suffix
+                            .as_deref()
+                            .map_or(false, |suf| id.ends_with(suf))
+                })
         };
-        let hidden_ctx_ids: std::collections::HashSet<String> = nodes.iter()
+        let hidden_ctx_ids: std::collections::HashSet<String> = nodes
+            .iter()
             .filter(|(id, _, target, _)| {
                 matches!(target.kind, UiNodeKind::ContextMenu)
                     && (!self.context_menus_visible || !is_active_ctx(id))
@@ -8597,7 +10353,8 @@ impl UiWgpuRenderer {
             false
         };
         // Compute position deltas for visible context menus (anchor placement).
-        let mut ctx_deltas: std::collections::HashMap<String, (f32, f32)> = std::collections::HashMap::new();
+        let mut ctx_deltas: std::collections::HashMap<String, (f32, f32)> =
+            std::collections::HashMap::new();
         if let Some([ax, ay]) = self.context_menu_anchor {
             if self.context_menus_visible {
                 for (id, _, target, _) in &nodes {
@@ -8631,7 +10388,8 @@ impl UiWgpuRenderer {
                 target.bounds.x += dx;
                 target.bounds.y += dy;
             }
-            let parent_is_treeview = parent_id.as_ref()
+            let parent_is_treeview = parent_id
+                .as_ref()
                 .is_some_and(|pid| treeview_parents.contains(pid));
             if parent_is_treeview && matches!(target.kind, UiNodeKind::Label) {
                 let indent = target.bounds.x;
@@ -8677,10 +10435,7 @@ impl UiWgpuRenderer {
             self.last_frame_snapshot = None;
             self.animation_epoch = self.animation_epoch.saturating_add(1).max(1);
         } else {
-            let removed = previous_live
-                .difference(&live)
-                .cloned()
-                .collect::<Vec<_>>();
+            let removed = previous_live.difference(&live).cloned().collect::<Vec<_>>();
             for id in removed {
                 self.settled_transition_targets.remove(&id);
                 self.timeline_playbacks.remove(&id);
@@ -8690,11 +10445,8 @@ impl UiWgpuRenderer {
                     "exit_transition_available": self.exit_transitions.contains_key(&id),
                     "known_exit_transition_keys": self.exit_transitions.keys().cloned().collect::<Vec<_>>(),
                 }));
-                let Some((order, old_node)) = self
-                    .plan
-                    .iter()
-                    .enumerate()
-                    .find(|(_, node)| node.id == id)
+                let Some((order, old_node)) =
+                    self.plan.iter().enumerate().find(|(_, node)| node.id == id)
                 else {
                     continue;
                 };
@@ -8703,11 +10455,12 @@ impl UiWgpuRenderer {
                         diagnostic["result"] = json!("cancelled_without_exit_motion");
                     }
                     if let Some(active) = self.active.remove(&id) {
-                        self.animation_history.push_back(animation_instance_from_active(
-                            &id,
-                            &active,
-                            UiAnimationStatus::Cancelled,
-                        ));
+                        self.animation_history
+                            .push_back(animation_instance_from_active(
+                                &id,
+                                &active,
+                                UiAnimationStatus::Cancelled,
+                            ));
                     }
                     self.current.remove(&id);
                     self.current_identities.remove(&id);
@@ -8716,34 +10469,30 @@ impl UiWgpuRenderer {
                 let source = self
                     .last_frame_snapshot
                     .as_ref()
-                    .and_then(|frame| {
-                        frame
-                            .nodes
-                            .iter()
-                            .find(|node| node.identity.node_id == id)
-                    })
+                    .and_then(|frame| frame.nodes.iter().find(|node| node.identity.node_id == id))
                     .map(|node| node.visual.clone())
                     .or_else(|| self.current.get(&id).cloned())
                     .unwrap_or_else(|| old_node.target.clone());
                 if let Some(previous) = self.active.remove(&id) {
-                    self.animation_history.push_back(animation_instance_from_active(
-                        &id,
-                        &previous,
-                        UiAnimationStatus::Superseded,
-                    ));
+                    self.animation_history
+                        .push_back(animation_instance_from_active(
+                            &id,
+                            &previous,
+                            UiAnimationStatus::Superseded,
+                        ));
                 }
                 let mut target = source.clone();
                 target.style.opacity = 0.0;
                 target.enabled = false;
                 exit_transition.from = UiTransitionState::default();
-                let identity = self
-                    .current_identities
-                    .get(&id)
-                    .cloned()
-                    .unwrap_or(AnimationIdentity {
-                        node_id: id.clone(),
-                        generation: self.node_generations.get(&id).copied().unwrap_or(1),
-                    });
+                let identity =
+                    self.current_identities
+                        .get(&id)
+                        .cloned()
+                        .unwrap_or(AnimationIdentity {
+                            node_id: id.clone(),
+                            generation: self.node_generations.get(&id).copied().unwrap_or(1),
+                        });
                 let active = ActiveTransition {
                     identity: identity.clone(),
                     transition_id: self.next_transition_id,
@@ -8777,10 +10526,12 @@ impl UiWgpuRenderer {
                     ExitingNode {
                         transition: active.clone(),
                         remove_after_seconds: self.animation_clock_seconds
-                            + exit_transition.delay_ms.saturating_add(exit_transition.duration_ms)
+                            + exit_transition
+                                .delay_ms
+                                .saturating_add(exit_transition.duration_ms)
                                 as f32
                                 / 1000.0
-                                + 0.05,
+                            + 0.05,
                         target,
                         order,
                     },
@@ -8799,21 +10550,27 @@ impl UiWgpuRenderer {
                     diagnostic["duration_ms"] = json!(active.transition.duration_ms);
                     diagnostic["from"] = Self::visual_debug_value(&active.from);
                     diagnostic["target"] = Self::visual_debug_value(&active.target);
-                    diagnostic["from_transform"] = Self::transform_debug_value(active.from_transform);
-                    diagnostic["target_transform"] = Self::transform_debug_value(active.target_transform);
-                    diagnostic["remove_after_seconds"] = json!(self.animation_clock_seconds
-                        + exit_transition.delay_ms.saturating_add(exit_transition.duration_ms) as f32
-                            / 1000.0
-                        + 0.05);
+                    diagnostic["from_transform"] =
+                        Self::transform_debug_value(active.from_transform);
+                    diagnostic["target_transform"] =
+                        Self::transform_debug_value(active.target_transform);
+                    diagnostic["remove_after_seconds"] = json!(
+                        self.animation_clock_seconds
+                            + exit_transition
+                                .delay_ms
+                                .saturating_add(exit_transition.duration_ms)
+                                as f32
+                                / 1000.0
+                            + 0.05
+                    );
                 }
             }
             self.current.retain(|id, _| live.contains(id));
             self.current_identities.retain(|id, _| live.contains(id));
             self.settled_transition_targets
                 .retain(|id, _| live.contains(id));
-            self.active.retain(|id, active| {
-                live.contains(id) || active.reason == AnimationReason::Exit
-            });
+            self.active
+                .retain(|id, active| live.contains(id) || active.reason == AnimationReason::Exit);
         }
         let resurrected = self
             .exiting
@@ -8847,7 +10604,8 @@ impl UiWgpuRenderer {
             self.timeline_playbacks.remove(&identity.node_id);
             self.paused_animations.remove(&identity.node_id);
             self.settled_transition_targets.remove(&identity.node_id);
-            self.current.insert(identity.node_id.clone(), source.clone());
+            self.current
+                .insert(identity.node_id.clone(), source.clone());
             self.current_identities
                 .insert(identity.node_id.clone(), new_identity.clone());
             self.active.insert(
@@ -8885,11 +10643,7 @@ impl UiWgpuRenderer {
             }
         }
         self.exit_transitions.retain(|id, _| {
-            live.contains(id)
-                || self
-                    .exiting
-                    .keys()
-                    .any(|identity| identity.node_id == *id)
+            live.contains(id) || self.exiting.keys().any(|identity| identity.node_id == *id)
         });
         let mut exiting = self.exiting.values().collect::<Vec<_>>();
         exiting.sort_by_key(|entry| entry.order);
@@ -9403,9 +11157,7 @@ impl UiWgpuRenderer {
                         .is_some()
             })
             .count() as u32;
-        let stagger_delay_ms = timeline
-            .stagger_ms
-            .saturating_mul(stagger_index);
+        let stagger_delay_ms = timeline.stagger_ms.saturating_mul(stagger_index);
         let first = segments[0].clone();
         self.timeline_playbacks.insert(
             node_path.to_owned(),
@@ -9507,8 +11259,7 @@ impl UiWgpuRenderer {
             transition,
             time_seconds,
         );
-        let starts_new_track = target_changed
-            || (self.active.contains_key(id) && !had_previous);
+        let starts_new_track = target_changed || (self.active.contains_key(id) && !had_previous);
         if let Some(previous) = superseded {
             if transition.is_some() && target_changed {
                 self.animation_history
@@ -9761,7 +11512,10 @@ impl UiWgpuRenderer {
             UiStateFlags {
                 hovered: pointer_over,
                 pressed: (pointer_over && time_seconds < self.pressed_until_seconds)
-                    || self.splitter_drag.as_ref().is_some_and(|d| d.splitter_path == node_path),
+                    || self
+                        .splitter_drag
+                        .as_ref()
+                        .is_some_and(|d| d.splitter_path == node_path),
                 focused: self.focused_control.as_deref() == Some(node_path),
                 disabled: !visual.enabled,
                 selected,
@@ -9840,12 +11594,10 @@ impl UiWgpuRenderer {
                 transform_pivot(bounds, style.transform)[1],
             ],
         };
-        if let Some(cut) = self.node_cuts.get(
-            node_path
-                .rsplit('/')
-                .next()
-                .unwrap_or(node_path),
-        ) {
+        if let Some(cut) = self
+            .node_cuts
+            .get(node_path.rsplit('/').next().unwrap_or(node_path))
+        {
             instance.cut = resolve_shell_cut([bounds.width, bounds.height], *cut);
         }
         if let Some(active) = self.active.get(node_path) {
@@ -10003,20 +11755,28 @@ impl UiWgpuRenderer {
                 self.node_materials.get(key).map(|_| {
                     let bounds = node.target.bounds;
                     let cut = self.node_cuts.get(key).copied().unwrap_or([0.0; 4]);
-                    (bounds, resolve_shell_cut([bounds.width, bounds.height], cut))
+                    (
+                        bounds,
+                        resolve_shell_cut([bounds.width, bounds.height], cut),
+                    )
                 })
             })
             .max_by(|(left_bounds, left_cut), (right_bounds, right_cut)| {
                 let left_area = left_bounds.width * left_bounds.height;
                 let right_area = right_bounds.width * right_bounds.height;
-                match left_area.partial_cmp(&right_area).unwrap_or(std::cmp::Ordering::Equal) {
+                match left_area
+                    .partial_cmp(&right_area)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                {
                     // Equal area: prefer the node that actually declares cut
                     // corners so rectangular splash/transition overlays cannot
                     // win the shell selection on the first frame.
                     std::cmp::Ordering::Equal => {
                         let left_cut_sum: f32 = left_cut.iter().sum();
                         let right_cut_sum: f32 = right_cut.iter().sum();
-                        left_cut_sum.partial_cmp(&right_cut_sum).unwrap_or(std::cmp::Ordering::Equal)
+                        left_cut_sum
+                            .partial_cmp(&right_cut_sum)
+                            .unwrap_or(std::cmp::Ordering::Equal)
                     }
                     other => other,
                 }
@@ -10050,7 +11810,11 @@ impl UiWgpuRenderer {
         instance.border = border;
         instance.from_fill = fill;
         instance.from_border = border;
-        instance.params[0] = if material.package_id == "pulse-neon-edge" { 1.25 } else { 0.8 };
+        instance.params[0] = if material.package_id == "pulse-neon-edge" {
+            1.25
+        } else {
+            0.8
+        };
         instance.params[1] = 0.0;
         instance.params[2] = 1.0;
         instance.from_params = instance.params;
@@ -10091,10 +11855,7 @@ impl UiWgpuRenderer {
         })
     }
 
-    fn parent_visual_transform(
-        &self,
-        node_path: &str,
-    ) -> Option<(UiTransform, UiBounds)> {
+    fn parent_visual_transform(&self, node_path: &str) -> Option<(UiTransform, UiBounds)> {
         let mut parent = self
             .plan
             .iter()
@@ -10752,9 +12513,11 @@ fn component_spec(kind: &UiNodeKind) -> UiComponentSpec {
             | UiNodeKind::DragValue
             | UiNodeKind::Selectable
             | UiNodeKind::Switch => 30.0,
-            UiNodeKind::TextInput | UiNodeKind::Combo | UiNodeKind::Dropdown | UiNodeKind::Tabs | UiNodeKind::MenuBar => {
-                32.0
-            }
+            UiNodeKind::TextInput
+            | UiNodeKind::Combo
+            | UiNodeKind::Dropdown
+            | UiNodeKind::Tabs
+            | UiNodeKind::MenuBar => 32.0,
             UiNodeKind::ListBox => 90.0,
             UiNodeKind::Scrollbar => 20.0,
             UiNodeKind::ProgressBar => 24.0,
@@ -10803,7 +12566,10 @@ fn component_spec(kind: &UiNodeKind) -> UiComponentSpec {
             ),
             toggle: matches!(
                 kind,
-                UiNodeKind::Checkbox | UiNodeKind::RadioButton | UiNodeKind::Selectable | UiNodeKind::Switch
+                UiNodeKind::Checkbox
+                    | UiNodeKind::RadioButton
+                    | UiNodeKind::Selectable
+                    | UiNodeKind::Switch
             ),
             popup: matches!(kind, UiNodeKind::Combo | UiNodeKind::Dropdown),
             scroll: matches!(
@@ -10812,7 +12578,12 @@ fn component_spec(kind: &UiNodeKind) -> UiComponentSpec {
             ),
             top_layer: matches!(
                 kind,
-                UiNodeKind::Tooltip | UiNodeKind::Modal | UiNodeKind::Dialog | UiNodeKind::ContextMenu | UiNodeKind::Toast | UiNodeKind::Popup
+                UiNodeKind::Tooltip
+                    | UiNodeKind::Modal
+                    | UiNodeKind::Dialog
+                    | UiNodeKind::ContextMenu
+                    | UiNodeKind::Toast
+                    | UiNodeKind::Popup
             ),
             virtualized: *kind == UiNodeKind::DataGrid,
         },
@@ -10830,34 +12601,87 @@ fn collect_image_fits(node: &UiNode, output: &mut HashMap<String, UiImageFit>) {
     }
 }
 
-fn select_button_skin_slot<'a>(skin: &'a UiControlSkin, hovered: bool, pressed: bool, enabled: bool) -> Option<&'a UiSkinSlot> {
+fn select_button_skin_slot<'a>(
+    skin: &'a UiControlSkin,
+    hovered: bool,
+    pressed: bool,
+    enabled: bool,
+) -> Option<&'a UiSkinSlot> {
     let states = if !enabled {
-        [UiVisualState::Disabled, UiVisualState::Normal, UiVisualState::Normal]
+        [
+            UiVisualState::Disabled,
+            UiVisualState::Normal,
+            UiVisualState::Normal,
+        ]
     } else if pressed {
-        [UiVisualState::Pressed, UiVisualState::Hover, UiVisualState::Normal]
+        [
+            UiVisualState::Pressed,
+            UiVisualState::Hover,
+            UiVisualState::Normal,
+        ]
     } else if hovered {
-        [UiVisualState::Hover, UiVisualState::Normal, UiVisualState::Normal]
+        [
+            UiVisualState::Hover,
+            UiVisualState::Normal,
+            UiVisualState::Normal,
+        ]
     } else {
-        [UiVisualState::Normal, UiVisualState::Normal, UiVisualState::Normal]
+        [
+            UiVisualState::Normal,
+            UiVisualState::Normal,
+            UiVisualState::Normal,
+        ]
     };
     states.iter().find_map(|state| {
-        skin.slots.iter().find(|slot| slot.slot_kind == UiSkinSlotKind::Body && slot.state == *state)
+        skin.slots
+            .iter()
+            .find(|slot| slot.slot_kind == UiSkinSlotKind::Body && slot.state == *state)
     })
 }
 
-fn select_slider_skin_slot<'a>(skin: &'a UiControlSkin, kind: UiSkinSlotKind, hovered: bool, pressed: bool, enabled: bool) -> Option<&'a UiSkinSlot> {
+fn select_slider_skin_slot<'a>(
+    skin: &'a UiControlSkin,
+    kind: UiSkinSlotKind,
+    hovered: bool,
+    pressed: bool,
+    enabled: bool,
+) -> Option<&'a UiSkinSlot> {
     let states = if !enabled {
-        [UiVisualState::Disabled, UiVisualState::Normal, UiVisualState::Normal]
+        [
+            UiVisualState::Disabled,
+            UiVisualState::Normal,
+            UiVisualState::Normal,
+        ]
     } else if kind == UiSkinSlotKind::Fill {
-        [UiVisualState::Active, UiVisualState::Normal, UiVisualState::Normal]
+        [
+            UiVisualState::Active,
+            UiVisualState::Normal,
+            UiVisualState::Normal,
+        ]
     } else if pressed {
-        [UiVisualState::Pressed, UiVisualState::Hover, UiVisualState::Normal]
+        [
+            UiVisualState::Pressed,
+            UiVisualState::Hover,
+            UiVisualState::Normal,
+        ]
     } else if hovered {
-        [UiVisualState::Hover, UiVisualState::Normal, UiVisualState::Normal]
+        [
+            UiVisualState::Hover,
+            UiVisualState::Normal,
+            UiVisualState::Normal,
+        ]
     } else {
-        [UiVisualState::Normal, UiVisualState::Normal, UiVisualState::Normal]
+        [
+            UiVisualState::Normal,
+            UiVisualState::Normal,
+            UiVisualState::Normal,
+        ]
     };
-    states.iter().find_map(|state| skin.slots.iter().find(|slot| slot.slot_kind == kind && slot.state == *state))
+    states.iter().find_map(|state| {
+        skin.slots
+            .iter()
+            .find(|slot| slot.slot_kind == kind && slot.state == *state)
+    })
 }
 
 /// Select a skin slot for toggle controls (Checkbox / RadioButton).
@@ -10870,15 +12694,35 @@ fn select_toggle_skin_slot<'a>(
     enabled: bool,
 ) -> Option<&'a UiSkinSlot> {
     let states = if !enabled {
-        [UiVisualState::Disabled, UiVisualState::Normal, UiVisualState::Normal]
+        [
+            UiVisualState::Disabled,
+            UiVisualState::Normal,
+            UiVisualState::Normal,
+        ]
     } else if pressed {
-        [UiVisualState::Pressed, UiVisualState::Hover, UiVisualState::Normal]
+        [
+            UiVisualState::Pressed,
+            UiVisualState::Hover,
+            UiVisualState::Normal,
+        ]
     } else if hovered {
-        [UiVisualState::Hover, UiVisualState::Normal, UiVisualState::Normal]
+        [
+            UiVisualState::Hover,
+            UiVisualState::Normal,
+            UiVisualState::Normal,
+        ]
     } else {
-        [UiVisualState::Normal, UiVisualState::Normal, UiVisualState::Normal]
+        [
+            UiVisualState::Normal,
+            UiVisualState::Normal,
+            UiVisualState::Normal,
+        ]
     };
-    states.iter().find_map(|state| skin.slots.iter().find(|slot| slot.slot_kind == kind && slot.state == *state))
+    states.iter().find_map(|state| {
+        skin.slots
+            .iter()
+            .find(|slot| slot.slot_kind == kind && slot.state == *state)
+    })
 }
 
 /// Select a skin slot for Scrollbar track / thumb.
@@ -10890,13 +12734,29 @@ fn select_scrollbar_skin_slot<'a>(
     pressed: bool,
 ) -> Option<&'a UiSkinSlot> {
     let states = if pressed {
-        [UiVisualState::Pressed, UiVisualState::Hover, UiVisualState::Normal]
+        [
+            UiVisualState::Pressed,
+            UiVisualState::Hover,
+            UiVisualState::Normal,
+        ]
     } else if hovered {
-        [UiVisualState::Hover, UiVisualState::Normal, UiVisualState::Normal]
+        [
+            UiVisualState::Hover,
+            UiVisualState::Normal,
+            UiVisualState::Normal,
+        ]
     } else {
-        [UiVisualState::Normal, UiVisualState::Normal, UiVisualState::Normal]
+        [
+            UiVisualState::Normal,
+            UiVisualState::Normal,
+            UiVisualState::Normal,
+        ]
     };
-    states.iter().find_map(|state| skin.slots.iter().find(|slot| slot.slot_kind == kind && slot.state == *state))
+    states.iter().find_map(|state| {
+        skin.slots
+            .iter()
+            .find(|slot| slot.slot_kind == kind && slot.state == *state)
+    })
 }
 
 fn fit_image_rect_and_uv(
@@ -10907,7 +12767,12 @@ fn fit_image_rect_and_uv(
     fit: UiImageFit,
 ) -> ([f32; 4], [f32; 4]) {
     let mut rect = [bounds.x, bounds.y, bounds.width, bounds.height];
-    if image_width == 0 || image_height == 0 || bounds.width <= 0.0 || bounds.height <= 0.0 || fit == UiImageFit::Stretch {
+    if image_width == 0
+        || image_height == 0
+        || bounds.width <= 0.0
+        || bounds.height <= 0.0
+        || fit == UiImageFit::Stretch
+    {
         return (rect, uv);
     }
     let source_aspect = image_width as f32 / image_height as f32;
@@ -11285,7 +13150,12 @@ fn component_chrome_instances(visual: &UiVisual) -> Vec<UiInstance> {
                 .map(|i| {
                     let y = bounds.y + 8.0 + i as f32 * row_height;
                     chrome(
-                        UiBounds { x: bounds.x + 4.0, y, width: bounds.width - 8.0, height: 1.0 },
+                        UiBounds {
+                            x: bounds.x + 4.0,
+                            y,
+                            width: bounds.width - 8.0,
+                            height: 1.0,
+                        },
                         [0.12, 0.16, 0.15, 0.5],
                         [0.0, 0.0, 0.0, 0.0],
                         0.0,
@@ -11296,7 +13166,12 @@ fn component_chrome_instances(visual: &UiVisual) -> Vec<UiInstance> {
         UiNodeKind::ContextMenu | UiNodeKind::Popup => {
             // ContextMenu/Popup chrome: subtle inner border highlight
             vec![chrome(
-                UiBounds { x: bounds.x + 1.0, y: bounds.y + 1.0, width: bounds.width - 2.0, height: bounds.height - 2.0 },
+                UiBounds {
+                    x: bounds.x + 1.0,
+                    y: bounds.y + 1.0,
+                    width: bounds.width - 2.0,
+                    height: bounds.height - 2.0,
+                },
                 [0.0, 0.0, 0.0, 0.0],
                 [0.25, 0.32, 0.38, 0.4],
                 4.0,
@@ -11308,14 +13183,24 @@ fn component_chrome_instances(visual: &UiVisual) -> Vec<UiInstance> {
             let horizontal = bounds.width < bounds.height;
             if horizontal {
                 vec![chrome(
-                    UiBounds { x: bounds.x + bounds.width * 0.5 - 1.0, y: bounds.y + 4.0, width: 2.0, height: bounds.height - 8.0 },
+                    UiBounds {
+                        x: bounds.x + bounds.width * 0.5 - 1.0,
+                        y: bounds.y + 4.0,
+                        width: 2.0,
+                        height: bounds.height - 8.0,
+                    },
                     [0.30, 0.38, 0.35, 0.6],
                     [0.0, 0.0, 0.0, 0.0],
                     1.0,
                 )]
             } else {
                 vec![chrome(
-                    UiBounds { x: bounds.x + 4.0, y: bounds.y + bounds.height * 0.5 - 1.0, width: bounds.width - 8.0, height: 2.0 },
+                    UiBounds {
+                        x: bounds.x + 4.0,
+                        y: bounds.y + bounds.height * 0.5 - 1.0,
+                        width: bounds.width - 8.0,
+                        height: 2.0,
+                    },
                     [0.30, 0.38, 0.35, 0.6],
                     [0.0, 0.0, 0.0, 0.0],
                     1.0,
@@ -11440,9 +13325,27 @@ fn component_chrome_instances(visual: &UiVisual) -> Vec<UiInstance> {
                 track.x + 2.0
             };
             vec![
-                chrome(track, if selected { [0.16, 0.35, 0.28, 1.0] } else { muted }, if selected { mint } else { [0.40, 0.44, 0.50, 0.8] }, 7.0),
                 chrome(
-                    UiBounds { x: thumb_x, y: center_y - thumb_size * 0.5, width: thumb_size, height: thumb_size },
+                    track,
+                    if selected {
+                        [0.16, 0.35, 0.28, 1.0]
+                    } else {
+                        muted
+                    },
+                    if selected {
+                        mint
+                    } else {
+                        [0.40, 0.44, 0.50, 0.8]
+                    },
+                    7.0,
+                ),
+                chrome(
+                    UiBounds {
+                        x: thumb_x,
+                        y: center_y - thumb_size * 0.5,
+                        width: thumb_size,
+                        height: thumb_size,
+                    },
                     [0.90, 0.92, 0.95, 1.0],
                     [0.90, 0.92, 0.95, 1.0],
                     5.0,
@@ -11459,14 +13362,24 @@ fn component_chrome_instances(visual: &UiVisual) -> Vec<UiInstance> {
             vec![
                 // Background ring (full circle, muted)
                 chrome(
-                    UiBounds { x: cx - half, y: cy - half, width: size, height: size },
+                    UiBounds {
+                        x: cx - half,
+                        y: cy - half,
+                        width: size,
+                        height: size,
+                    },
                     [0.0, 0.0, 0.0, 0.0],
                     [0.25, 0.30, 0.35, 0.6],
                     half,
                 ),
                 // Foreground arc (top-right quarter, accent)
                 chrome(
-                    UiBounds { x: cx - half + 1.0, y: cy - half + 1.0, width: size - 2.0, height: (size - 2.0) * 0.5 },
+                    UiBounds {
+                        x: cx - half + 1.0,
+                        y: cy - half + 1.0,
+                        width: size - 2.0,
+                        height: (size - 2.0) * 0.5,
+                    },
                     [0.0, 0.0, 0.0, 0.0],
                     mint,
                     half - 1.0,
@@ -12169,8 +14082,10 @@ fn layout_text(
     horizontal_scroll: Option<f32>,
 ) -> Option<Vec<UiTextInstance>> {
     let clip = text_clip(visual)?;
-    if clip[2] <= 0.0 || clip[3] <= 0.0
-        || visual.bounds.width <= 0.0 || visual.bounds.height <= 0.0
+    if clip[2] <= 0.0
+        || clip[3] <= 0.0
+        || visual.bounds.width <= 0.0
+        || visual.bounds.height <= 0.0
         || visual.logical_bounds.width <= 0.0
     {
         return None;
@@ -12217,7 +14132,9 @@ fn layout_text(
                     10.0 * text_scale
                 }
         };
-        let baseline = (top + font.ascent * text_scale + line_index as f32 * font.line_height * text_scale).floor();
+        let baseline =
+            (top + font.ascent * text_scale + line_index as f32 * font.line_height * text_scale)
+                .floor();
         for glyph in glyphs {
             result.push(UiTextInstance {
                 rect: [
@@ -12235,6 +14152,7 @@ fn layout_text(
                 transform_from: [0.0, 0.0, 1.0, 1.0],
                 transform_to: [0.0, 0.0, 1.0, 1.0],
                 rotation_pivot: [0.0; 4],
+                overflow: [0.0; 4],
             });
             x += glyph.advance * text_scale;
         }
@@ -12250,8 +14168,10 @@ fn layout_rich_text(
     spans: &[neon_ui_schema::UiRichTextSpan],
 ) -> Option<Vec<UiTextInstance>> {
     let clip = text_clip(visual)?;
-    if clip[2] <= 0.0 || clip[3] <= 0.0
-        || visual.bounds.width <= 0.0 || visual.bounds.height <= 0.0
+    if clip[2] <= 0.0
+        || clip[3] <= 0.0
+        || visual.bounds.width <= 0.0
+        || visual.bounds.height <= 0.0
         || visual.logical_bounds.width <= 0.0
     {
         return None;
@@ -12351,6 +14271,7 @@ fn layout_rich_text(
                 transform_from: [0.0, 0.0, 1.0, 1.0],
                 transform_to: [0.0, 0.0, 1.0, 1.0],
                 rotation_pivot: [0.0; 4],
+                overflow: [0.0; 4],
             });
             x += glyph.advance * s.scale;
             global_idx += 1;
@@ -12423,7 +14344,11 @@ fn top_layer_roots(plan: &[PlannedNode], indices: &HashMap<&str, usize>) -> Vec<
         roots[index] = if node.target.world_depth.is_none()
             && matches!(
                 node.target.kind,
-                UiNodeKind::Tooltip | UiNodeKind::Modal | UiNodeKind::Dialog | UiNodeKind::ContextMenu | UiNodeKind::Popup
+                UiNodeKind::Tooltip
+                    | UiNodeKind::Modal
+                    | UiNodeKind::Dialog
+                    | UiNodeKind::ContextMenu
+                    | UiNodeKind::Popup
             ) {
             Some(index)
         } else {
@@ -12879,7 +14804,8 @@ fn append_data_grid_frames(
                         if matches!(
                             column.presentation,
                             neon_ui_schema::UiDataGridPresentation::Select { .. }
-                        ) && matches!(cell.value, neon_ui_schema::UiInputValue::Bool { .. }) {
+                        ) && matches!(cell.value, neon_ui_schema::UiInputValue::Bool { .. })
+                        {
                             presentation = (
                                 UiNodeKind::Selectable,
                                 Some(UiControlPresentation::Toggle {
@@ -12972,7 +14898,9 @@ fn data_grid_cell_display_text(
         }
         neon_ui_schema::UiInputValue::CanvasData { .. } => "canvas_data".into(),
         neon_ui_schema::UiInputValue::Struct { fields } => format!("{{{} fields}}", fields.len()),
-        neon_ui_schema::UiInputValue::Array { elements, .. } => format!("[{} elements]", elements.len()),
+        neon_ui_schema::UiInputValue::Array { elements, .. } => {
+            format!("[{} elements]", elements.len())
+        }
     }
 }
 
@@ -13340,7 +15268,11 @@ fn flatten_node(
     let top_layer = inherited_top_layer
         || matches!(
             node.kind,
-            UiNodeKind::Tooltip | UiNodeKind::Modal | UiNodeKind::Dialog | UiNodeKind::ContextMenu | UiNodeKind::Popup
+            UiNodeKind::Tooltip
+                | UiNodeKind::Modal
+                | UiNodeKind::Dialog
+                | UiNodeKind::ContextMenu
+                | UiNodeKind::Popup
         );
     let own_clip = if top_layer {
         None
@@ -13554,7 +15486,10 @@ fn intrinsic_size(node: &UiNode, font: Option<&ResidentFont>) -> [f32; 2] {
         let rich_text;
         let text = match text_ref {
             TextRef::Rich { spans } => {
-                rich_text = spans.iter().map(|span| span.value.as_str()).collect::<String>();
+                rich_text = spans
+                    .iter()
+                    .map(|span| span.value.as_str())
+                    .collect::<String>();
                 rich_text.as_str()
             }
             _ => match text_ref_value(text_ref) {
@@ -13581,7 +15516,10 @@ fn intrinsic_size(node: &UiNode, font: Option<&ResidentFont>) -> [f32; 2] {
         let available_width = if node.bounds.width > text_inset {
             (node.bounds.width - text_inset).max(1.0)
         } else {
-            text.chars().enumerate().map(|(i, ch)| advance(i, ch)).sum::<f32>()
+            text.chars()
+                .enumerate()
+                .map(|(i, ch)| advance(i, ch))
+                .sum::<f32>()
         };
         // intrinsic_size and layout_text share break_text_lines via
         // measure_text_lines, so the line count and max width always match
@@ -13681,10 +15619,13 @@ fn resolve_children(
     // box, does not consume a flex track, and therefore cannot shift siblings.
     // Previously offsets were silently ignored by row/column layout, which made
     // expanded branch content overlap at the flow origin.
-    let participates_in_flow = |child: &UiNode| {
-        child.visible && child.bounds.x == 0.0 && child.bounds.y == 0.0
-    };
-    let participating_count = node.children.iter().filter(|child| participates_in_flow(child)).count();
+    let participates_in_flow =
+        |child: &UiNode| child.visible && child.bounds.x == 0.0 && child.bounds.y == 0.0;
+    let participating_count = node
+        .children
+        .iter()
+        .filter(|child| participates_in_flow(child))
+        .count();
     let mut main_sizes = node
         .children
         .iter()
@@ -13942,11 +15883,7 @@ fn apply_animation_state(mut visual: UiVisual, state: UiTransitionState) -> UiVi
     }
     if let Some(value) = state.numeric_value {
         if let Some(UiControlPresentation::Numeric { min, max, .. }) = visual.presentation {
-            visual.presentation = Some(UiControlPresentation::Numeric {
-                value,
-                min,
-                max,
-            });
+            visual.presentation = Some(UiControlPresentation::Numeric { value, min, max });
         }
     }
     visual
@@ -14008,9 +15945,15 @@ fn lerp_transform(from: UiTransform, to: UiTransform, t: f32) -> UiTransform {
             lerp(from.translation[0], to.translation[0], t),
             lerp(from.translation[1], to.translation[1], t),
         ],
-        scale: [lerp(from.scale[0], to.scale[0], t), lerp(from.scale[1], to.scale[1], t)],
+        scale: [
+            lerp(from.scale[0], to.scale[0], t),
+            lerp(from.scale[1], to.scale[1], t),
+        ],
         rotation_degrees: lerp(from.rotation_degrees, to.rotation_degrees, t),
-        origin: [lerp(from.origin[0], to.origin[0], t), lerp(from.origin[1], to.origin[1], t)],
+        origin: [
+            lerp(from.origin[0], to.origin[0], t),
+            lerp(from.origin[1], to.origin[1], t),
+        ],
     }
 }
 
@@ -14029,7 +15972,10 @@ fn inverse_transform_point(point: [f32; 2], bounds: UiBounds, transform: UiTrans
         delta[0] * radians.cos() + delta[1] * radians.sin(),
         -delta[0] * radians.sin() + delta[1] * radians.cos(),
     ];
-    let translated = [unrotated[0] + pivot[0] - transform.translation[0], unrotated[1] + pivot[1] - transform.translation[1]];
+    let translated = [
+        unrotated[0] + pivot[0] - transform.translation[0],
+        unrotated[1] + pivot[1] - transform.translation[1],
+    ];
     [
         pivot[0] + (translated[0] - pivot[0]) / transform.scale[0].max(0.0001),
         pivot[1] + (translated[1] - pivot[1]) / transform.scale[1].max(0.0001),
@@ -14040,7 +15986,10 @@ fn sample_transform(active: &ActiveTransition, time_seconds: f32) -> UiTransform
     lerp_transform(
         active.from_transform,
         active.target_transform,
-        ease(transition_progress(active, time_seconds), active.transition.easing),
+        ease(
+            transition_progress(active, time_seconds),
+            active.transition.easing,
+        ),
     )
 }
 
@@ -14090,11 +16039,7 @@ fn sample_transition(active: &ActiveTransition, time_seconds: f32) -> UiVisual {
                 t,
             ),
             opacity: lerp(active.from.style.opacity, active.target.style.opacity, t),
-            transform: lerp_transform(
-                active.from_transform,
-                active.target_transform,
-                t,
-            ),
+            transform: lerp_transform(active.from_transform, active.target_transform, t),
         },
         kind: active.target.kind.clone(),
         enabled: active.target.enabled,
@@ -14173,8 +16118,7 @@ fn ease(t: f32, easing: UiEasing) -> f32 {
                 let damping: f32 = 6.0;
                 let angular: f32 = 16.0;
                 let envelope = (-damping * t).exp();
-                1.0 - envelope
-                    * ((angular * t).cos() + damping / angular * (angular * t).sin())
+                1.0 - envelope * ((angular * t).cos() + damping / angular * (angular * t).sin())
             }
         }
         UiEasing::Bounce => bounce_out(t),
@@ -14224,9 +16168,7 @@ fn cubic_bezier(t: f32) -> f32 {
     }
     let u = (low + high) * 0.5;
     let one_minus_u = 1.0 - u;
-    3.0 * one_minus_u * one_minus_u * u * 0.1
-        + 3.0 * one_minus_u * u * u
-        + u * u * u
+    3.0 * one_minus_u * one_minus_u * u * 0.1 + 3.0 * one_minus_u * u * u + u * u * u
 }
 
 fn format_easing(easing: UiEasing) -> &'static str {
@@ -14391,9 +16333,9 @@ mod tests {
         UiRuntime, demo_domain::DemoDragDropDomain, lower_nui_flow_effects, parse_nui_flow,
     };
     use neon_ui_schema::{
-        TextRef, UiAlignItems, UiCommand, UiDropPlacement, UiEffect, UiFragmentId,
-        UiFragmentSubmission, UiIntent, UiJustifyContent, UiLayout, UiNodeId, UiSemanticEvent,
-        UiSemanticEventType, UiTransitionState, UiAnimationKeyframe,
+        TextRef, UiAlignItems, UiAnimationKeyframe, UiCommand, UiDropPlacement, UiEffect,
+        UiFragmentId, UiFragmentSubmission, UiIntent, UiJustifyContent, UiLayout, UiNodeId,
+        UiSemanticEvent, UiSemanticEventType, UiTransitionState,
     };
     use serde_json::json;
     use std::sync::Mutex;
@@ -14449,19 +16391,29 @@ mod tests {
                 UiSkinSlot {
                     slot_kind: UiSkinSlotKind::Body,
                     state: UiVisualState::Normal,
-                    presentation: UiSkinPresentation::Image { resource_key: "idle".into(), fit: UiImageFit::Stretch },
+                    presentation: UiSkinPresentation::Image {
+                        resource_key: "idle".into(),
+                        fit: UiImageFit::Stretch,
+                    },
                 },
                 UiSkinSlot {
                     slot_kind: UiSkinSlotKind::Body,
                     state: UiVisualState::Hover,
-                    presentation: UiSkinPresentation::Image { resource_key: "hover".into(), fit: UiImageFit::Stretch },
+                    presentation: UiSkinPresentation::Image {
+                        resource_key: "hover".into(),
+                        fit: UiImageFit::Stretch,
+                    },
                 },
             ],
         };
-        let resource = |hovered, pressed| match &select_button_skin_slot(&skin, hovered, pressed, true).unwrap().presentation {
-            UiSkinPresentation::Image { resource_key, .. } => resource_key.as_str(),
-            _ => unreachable!(),
-        };
+        let resource =
+            |hovered, pressed| match &select_button_skin_slot(&skin, hovered, pressed, true)
+                .unwrap()
+                .presentation
+            {
+                UiSkinPresentation::Image { resource_key, .. } => resource_key.as_str(),
+                _ => unreachable!(),
+            };
         assert_eq!(resource(false, false), "idle");
         assert_eq!(resource(true, false), "hover");
         assert_eq!(resource(true, true), "hover");
@@ -14473,14 +16425,41 @@ mod tests {
             key: "volume".into(),
             component_kind: UiNodeKind::Slider,
             slots: vec![
-                UiSkinSlot { slot_kind: UiSkinSlotKind::Track, state: UiVisualState::Normal, presentation: UiSkinPresentation::Default },
-                UiSkinSlot { slot_kind: UiSkinSlotKind::Fill, state: UiVisualState::Active, presentation: UiSkinPresentation::Default },
-                UiSkinSlot { slot_kind: UiSkinSlotKind::Thumb, state: UiVisualState::Hover, presentation: UiSkinPresentation::Default },
+                UiSkinSlot {
+                    slot_kind: UiSkinSlotKind::Track,
+                    state: UiVisualState::Normal,
+                    presentation: UiSkinPresentation::Default,
+                },
+                UiSkinSlot {
+                    slot_kind: UiSkinSlotKind::Fill,
+                    state: UiVisualState::Active,
+                    presentation: UiSkinPresentation::Default,
+                },
+                UiSkinSlot {
+                    slot_kind: UiSkinSlotKind::Thumb,
+                    state: UiVisualState::Hover,
+                    presentation: UiSkinPresentation::Default,
+                },
             ],
         };
-        assert_eq!(select_slider_skin_slot(&skin, UiSkinSlotKind::Track, false, false, true).unwrap().slot_kind, UiSkinSlotKind::Track);
-        assert_eq!(select_slider_skin_slot(&skin, UiSkinSlotKind::Fill, true, true, true).unwrap().state, UiVisualState::Active);
-        assert_eq!(select_slider_skin_slot(&skin, UiSkinSlotKind::Thumb, true, true, true).unwrap().state, UiVisualState::Hover);
+        assert_eq!(
+            select_slider_skin_slot(&skin, UiSkinSlotKind::Track, false, false, true)
+                .unwrap()
+                .slot_kind,
+            UiSkinSlotKind::Track
+        );
+        assert_eq!(
+            select_slider_skin_slot(&skin, UiSkinSlotKind::Fill, true, true, true)
+                .unwrap()
+                .state,
+            UiVisualState::Active
+        );
+        assert_eq!(
+            select_slider_skin_slot(&skin, UiSkinSlotKind::Thumb, true, true, true)
+                .unwrap()
+                .state,
+            UiVisualState::Hover
+        );
     }
 
     #[test]
@@ -15326,9 +17305,11 @@ mod tests {
         renderer.plan[0].target.kind = UiNodeKind::Combo;
         renderer.set_pointer_position([30.0, 40.0]);
         assert!(renderer.toggle_dropdown_at_pointer());
-        assert!(renderer.dropdown_debug_snapshot()["popup"]["rows"]
-            .as_array()
-            .is_some_and(|rows| rows.len() == 2));
+        assert!(
+            renderer.dropdown_debug_snapshot()["popup"]["rows"]
+                .as_array()
+                .is_some_and(|rows| rows.len() == 2)
+        );
     }
 
     #[test]
@@ -15652,7 +17633,12 @@ mod tests {
             if spec.capabilities.top_layer {
                 assert!(matches!(
                     kind,
-                    UiNodeKind::Tooltip | UiNodeKind::Modal | UiNodeKind::Dialog | UiNodeKind::ContextMenu | UiNodeKind::Toast | UiNodeKind::Popup
+                    UiNodeKind::Tooltip
+                        | UiNodeKind::Modal
+                        | UiNodeKind::Dialog
+                        | UiNodeKind::ContextMenu
+                        | UiNodeKind::Toast
+                        | UiNodeKind::Popup
                 ));
             }
         }
@@ -17462,20 +19448,61 @@ mod tests {
                 return vec4<f32>(0.5 + edge * 0.2, 0.9, 0.1, 0.2 + edge * 0.4);
             }
         "#;
-        renderer.sync_material_packages(&device, &[UiShaderPackage {
-            package_id: "test-pulse-material".into(),
-            version: 1,
-            source_digest: "0000000000000000".into(),
-            source_bytes: source.to_vec(),
-            entry_point: "material".into(),
-            fallback: "standard_ui".into(),
-            parameters: Vec::new(),
-        }]);
-        assert!(renderer.material_pipelines.contains_key("test-pulse-material"));
+        renderer.sync_material_packages(
+            &device,
+            &[UiShaderPackage {
+                package_id: "test-pulse-material".into(),
+                version: 1,
+                source_digest: "0000000000000000".into(),
+                source_bytes: source.to_vec(),
+                entry_point: "material".into(),
+                fallback: "standard_ui".into(),
+                parameters: Vec::new(),
+            }],
+        );
+        assert!(
+            renderer
+                .material_pipelines
+                .contains_key("test-pulse-material")
+        );
         assert_eq!(renderer.material_pipelines.len(), 1);
     }
 
     #[test]
+    #[test]
+    fn registered_text_material_source_compiles_into_an_isolated_pipeline() {
+        let _gpu_test = GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let (device, _queue) = test_device("neon3-ui-text-material-pipeline");
+        let mut renderer = UiWgpuRenderer::new(&device, wgpu::TextureFormat::Rgba8Unorm);
+        let source = br#"
+            fn text_material(input: TextMaterialInput) -> vec4<f32> {
+                let glow = (input.edge_ink + 0.02) * 2.0;
+                let color = vec3<f32>(0.2 + glow * 0.8, 0.1 + glow * 0.5, 0.9);
+                return vec4<f32>(color * input.coverage, input.coverage);
+            }
+        "#;
+        renderer.sync_text_material_packages(
+            &device,
+            &[UiShaderPackage {
+                package_id: "test-pulse-neon-text".into(),
+                version: 1,
+                source_digest: "0000000000000000".into(),
+                source_bytes: source.to_vec(),
+                entry_point: "text_material".into(),
+                fallback: "standard_text".into(),
+                parameters: Vec::new(),
+            }],
+        );
+        assert!(
+            renderer
+                .text_material_pipelines
+                .contains_key("test-pulse-neon-text")
+        );
+        assert_eq!(renderer.text_material_pipelines.len(), 1);
+    }
+
     fn shell_resolver_keeps_cut_polygon_convex_on_narrow_bounds() {
         let cut = resolve_shell_cut([100.0, 40.0], [40.0, 40.0, 40.0, 40.0]);
         assert_eq!(cut, [20.0, 20.0, 20.0, 20.0]);
@@ -18485,7 +20512,8 @@ mod tests {
         root.style = transparent;
         root.enter_transition = None;
 
-        let package = |package_id: &str, color: &str| UiShaderPackage {
+        let package = |package_id: &str, color: &str| {
+            UiShaderPackage {
             package_id: package_id.into(),
             version: 1,
             source_digest: format!("test-{package_id}"),
@@ -18496,6 +20524,7 @@ mod tests {
             entry_point: "material".into(),
             fallback: "standard_ui".into(),
             parameters: Vec::new(),
+        }
         };
         let material = |package_id: &str| UiMaterialRef {
             package_id: package_id.into(),
@@ -18625,7 +20654,10 @@ mod tests {
                 "pass": pass,
             })
         );
-        assert!(pass, "material instances must retain their own geometry ranges");
+        assert!(
+            pass,
+            "material instances must retain their own geometry ranges"
+        );
     }
 
     #[test]
@@ -20999,7 +23031,10 @@ mod tests {
         );
         let active = renderer.active.get("retarget/node").unwrap();
         assert_eq!(active.from.bounds.x, midpoint.bounds.x);
-        assert_eq!(active.retarget_source.as_ref().unwrap().bounds.x, midpoint.bounds.x);
+        assert_eq!(
+            active.retarget_source.as_ref().unwrap().bounds.x,
+            midpoint.bounds.x
+        );
         assert_eq!(active.transition_id, first_transition_id + 1);
         assert_eq!(active.identity.generation, 1);
         assert_eq!(active.reason, AnimationReason::Retarget);
@@ -21335,22 +23370,40 @@ mod tests {
             1,
             0.0,
         );
-        assert_eq!(renderer.timeline_playbacks["timeline/panel"].segments.len(), 2);
-        assert_eq!(renderer.active["timeline/panel"].transition.duration_ms, 150);
+        assert_eq!(
+            renderer.timeline_playbacks["timeline/panel"].segments.len(),
+            2
+        );
+        assert_eq!(
+            renderer.active["timeline/panel"].transition.duration_ms,
+            150
+        );
         assert_eq!(renderer.active["timeline/panel"].target.style.opacity, 0.5);
 
         assert!(renderer.has_active_animation(0.16));
-        assert_eq!(renderer.timeline_playbacks["timeline/panel"].segment_index, 1);
+        assert_eq!(
+            renderer.timeline_playbacks["timeline/panel"].segment_index,
+            1
+        );
         assert_eq!(renderer.active["timeline/panel"].target.style.opacity, 1.0);
-        assert_eq!(renderer.active["timeline/panel"].transition.easing, UiEasing::EaseOut);
+        assert_eq!(
+            renderer.active["timeline/panel"].transition.easing,
+            UiEasing::EaseOut
+        );
 
         assert!(renderer.has_active_animation(0.32));
         assert_eq!(renderer.timeline_playbacks["timeline/panel"].cycle, 1);
-        assert_eq!(renderer.timeline_playbacks["timeline/panel"].segment_index, 0);
+        assert_eq!(
+            renderer.timeline_playbacks["timeline/panel"].segment_index,
+            0
+        );
         assert_eq!(renderer.active["timeline/panel"].target.style.opacity, 0.5);
 
         assert!(renderer.has_active_animation(0.48));
-        assert_eq!(renderer.timeline_playbacks["timeline/panel"].segment_index, 1);
+        assert_eq!(
+            renderer.timeline_playbacks["timeline/panel"].segment_index,
+            1
+        );
         assert!(renderer.has_active_animation(0.64));
         assert!(renderer.active.get("timeline/panel").is_none());
         assert_eq!(renderer.current["timeline/panel"].style.opacity, 1.0);
@@ -21395,7 +23448,10 @@ mod tests {
             0.0,
         );
         assert_eq!(stagger_renderer.active["timeline/a"].transition.delay_ms, 0);
-        assert_eq!(stagger_renderer.active["timeline/b"].transition.delay_ms, 20);
+        assert_eq!(
+            stagger_renderer.active["timeline/b"].transition.delay_ms,
+            20
+        );
     }
 
     #[test]
@@ -21476,16 +23532,20 @@ mod tests {
             .animation_control("seek", "controls/panel", Some(0.5), 2.1)
             .unwrap();
         assert_eq!(seek["progress"], 0.5);
-        assert!(renderer
-            .active
-            .get("controls/panel")
-            .is_some_and(|active| (transition_progress(active, 2.1) - 0.5).abs() < 0.001));
+        assert!(
+            renderer
+                .active
+                .get("controls/panel")
+                .is_some_and(|active| (transition_progress(active, 2.1) - 0.5).abs() < 0.001)
+        );
         let cancelled = renderer
             .animation_control("cancel", "controls/panel", None, 2.1)
             .unwrap();
         assert_eq!(cancelled["state"], "cancelled");
         assert!(renderer.active.get("controls/panel").is_none());
-        assert!(matches!(renderer.animation_history.back(), Some(animation) if animation.status == UiAnimationStatus::Cancelled));
+        assert!(
+            matches!(renderer.animation_history.back(), Some(animation) if animation.status == UiAnimationStatus::Cancelled)
+        );
 
         let target_zero = visual(0.0);
         renderer.sample_with_history(
@@ -22027,8 +24087,14 @@ mod tests {
             .flat_map(|x| (4..24).map(move |y| (x, y)))
             .filter(|(x, y)| pixel_alpha(*x, *y) > 0)
             .count();
-        assert!(target_pixels > 200, "target transform must move the panel pixels");
-        assert!(old_pixels < 4, "untransformed source bounds must remain empty");
+        assert!(
+            target_pixels > 200,
+            "target transform must move the panel pixels"
+        );
+        assert!(
+            old_pixels < 4,
+            "untransformed source bounds must remain empty"
+        );
     }
 
     #[test]
@@ -22094,7 +24160,10 @@ mod tests {
         );
         let target_pixel = gpu_hits[30 * 160 + 80];
         let source_pixel = gpu_hits[30 * 160 + 30];
-        assert_ne!(target_pixel, 0, "GPU hit pass must follow transformed geometry");
+        assert_ne!(
+            target_pixel, 0,
+            "GPU hit pass must follow transformed geometry"
+        );
         assert_eq!(
             source_pixel,
             u32::MAX,
@@ -22181,11 +24250,7 @@ mod tests {
                     media_type: "application/x-neon-rgba8".into(),
                     width: Some(2),
                     height: Some(2),
-                    bytes: [40, 220, 160, 255]
-                        .into_iter()
-                        .cycle()
-                        .take(16)
-                        .collect(),
+                    bytes: [40, 220, 160, 255].into_iter().cycle().take(16).collect(),
                 },
             )
             .unwrap();
@@ -22205,7 +24270,10 @@ mod tests {
             .flat_map(|x| (15..50).map(move |y| (x, y)))
             .filter(|(x, y)| pixel(*x, *y)[3] > 0)
             .count();
-        assert!(translated_text_pixels > 0, "text glyphs must follow the panel transform");
+        assert!(
+            translated_text_pixels > 0,
+            "text glyphs must follow the panel transform"
+        );
     }
 
     #[test]
@@ -22255,28 +24323,28 @@ mod tests {
             },
         )]);
         renderer.prepare_interaction(&new_fragments, [200, 100], [200.0, 100.0], 1.1);
-        assert!(renderer
-            .active
-            .get("exit-test/gone")
-            .is_some_and(|active| active.reason == AnimationReason::Exit));
+        assert!(
+            renderer
+                .active
+                .get("exit-test/gone")
+                .is_some_and(|active| active.reason == AnimationReason::Exit)
+        );
         assert_eq!(renderer.exiting.len(), 1);
-        assert!(renderer
-            .last_frame_snapshot
-            .as_ref()
-            .is_some_and(|frame| frame
+        assert!(renderer.last_frame_snapshot.as_ref().is_some_and(|frame| {
+            frame
                 .nodes
                 .iter()
-                .any(|node| node.identity.node_id == "exit-test/gone")));
+                .any(|node| node.identity.node_id == "exit-test/gone")
+        }));
 
         assert!(renderer.has_active_animation(1.2));
         renderer.prepare_interaction(&new_fragments, [200, 100], [200.0, 100.0], 1.2);
-        assert!(renderer
-            .last_frame_snapshot
-            .as_ref()
-            .is_some_and(|frame| frame
+        assert!(renderer.last_frame_snapshot.as_ref().is_some_and(|frame| {
+            frame
                 .nodes
                 .iter()
-                .any(|node| node.identity.node_id == "exit-test/gone")));
+                .any(|node| node.identity.node_id == "exit-test/gone")
+        }));
 
         let mut reappeared_root = node();
         reappeared_root.enter_transition = None;
@@ -22332,40 +24400,50 @@ mod tests {
 
         assert!(renderer.has_active_animation(1.5));
         renderer.prepare_interaction(&reappeared_fragments, [200, 100], [200.0, 100.0], 1.5);
-        assert!(renderer
-            .last_frame_snapshot
-            .as_ref()
-            .is_some_and(|frame| frame.nodes.iter().any(|node| {
-                node.identity.node_id == "exit-test/gone" && node.identity.generation == 2
-            })));
+        assert!(
+            renderer
+                .last_frame_snapshot
+                .as_ref()
+                .is_some_and(|frame| frame.nodes.iter().any(|node| {
+                    node.identity.node_id == "exit-test/gone" && node.identity.generation == 2
+                }))
+        );
         renderer.has_active_animation(1.9);
         renderer.prepare_interaction(&reappeared_fragments, [200, 100], [200.0, 100.0], 1.9);
         assert!(renderer.active.get("exit-test/gone").is_none());
-        assert!(renderer
-            .last_frame_snapshot
-            .as_ref()
-            .is_some_and(|frame| frame.nodes.iter().any(|node| {
-                node.identity.node_id == "exit-test/gone" && node.identity.generation == 2
-            })));
+        assert!(
+            renderer
+                .last_frame_snapshot
+                .as_ref()
+                .is_some_and(|frame| frame.nodes.iter().any(|node| {
+                    node.identity.node_id == "exit-test/gone" && node.identity.generation == 2
+                }))
+        );
 
         let mut removed_again = new_fragments
             .get(&UiFragmentId("exit-test".into()))
             .cloned()
             .expect("initial hidden fragment exists");
         removed_again.revision = Revision(4);
-        let removed_again_fragments = HashMap::from([(UiFragmentId("exit-test".into()), removed_again)]);
+        let removed_again_fragments =
+            HashMap::from([(UiFragmentId("exit-test".into()), removed_again)]);
         renderer.prepare_interaction(&removed_again_fragments, [200, 100], [200.0, 100.0], 2.0);
-        assert!(renderer
-            .active
-            .get("exit-test/gone")
-            .is_some_and(|active| active.reason == AnimationReason::Exit && active.identity.generation == 2));
+        assert!(
+            renderer
+                .active
+                .get("exit-test/gone")
+                .is_some_and(|active| active.reason == AnimationReason::Exit
+                    && active.identity.generation == 2)
+        );
         renderer.has_active_animation(2.4);
         renderer.prepare_interaction(&removed_again_fragments, [200, 100], [200.0, 100.0], 2.4);
         assert_eq!(renderer.exiting.len(), 0);
-        assert!(!renderer
-            .last_frame_snapshot
-            .as_ref()
-            .is_some_and(|frame| frame.nodes.iter().any(|node| node.identity.node_id == "exit-test/gone")));
+        assert!(!renderer.last_frame_snapshot.as_ref().is_some_and(|frame| {
+            frame
+                .nodes
+                .iter()
+                .any(|node| node.identity.node_id == "exit-test/gone")
+        }));
     }
 
     #[test]
@@ -22639,7 +24717,12 @@ mod tests {
         let child = |id: &str, x: f32, y: f32, height: f32| UiNode {
             node_id: UiNodeId(id.into()),
             kind: UiNodeKind::Panel,
-            bounds: UiBounds { x, y, width: 40.0, height },
+            bounds: UiBounds {
+                x,
+                y,
+                width: 40.0,
+                height,
+            },
             layout: Some(UiLayout::default()),
             visible: true,
             enabled: true,
@@ -22657,8 +24740,18 @@ mod tests {
         let root = UiNode {
             node_id: UiNodeId("root".into()),
             kind: UiNodeKind::Panel,
-            bounds: UiBounds { x: 0.0, y: 0.0, width: 200.0, height: 160.0 },
-            layout: Some(UiLayout { mode: UiLayoutMode::Column, gap: 6.0, padding: [4.0, 4.0, 4.0, 4.0], ..UiLayout::default() }),
+            bounds: UiBounds {
+                x: 0.0,
+                y: 0.0,
+                width: 200.0,
+                height: 160.0,
+            },
+            layout: Some(UiLayout {
+                mode: UiLayoutMode::Column,
+                gap: 6.0,
+                padding: [4.0, 4.0, 4.0, 4.0],
+                ..UiLayout::default()
+            }),
             visible: true,
             enabled: true,
             text_key: None,
@@ -22670,13 +24763,22 @@ mod tests {
             world_depth: None,
             world_scale: None,
             clip_shape: UiClipShape::default(),
-            children: vec![child("first", 0.0, 0.0, 20.0), child("overlay", 60.0, 48.0, 30.0), child("second", 0.0, 0.0, 20.0)],
+            children: vec![
+                child("first", 0.0, 0.0, 20.0),
+                child("overlay", 60.0, 48.0, 30.0),
+                child("second", 0.0, 0.0, 20.0),
+            ],
         };
         let bounds = resolve_children(
             &root,
             root.bounds,
             root.layout.unwrap(),
-            UiBounds { x: 4.0, y: 4.0, width: 192.0, height: 152.0 },
+            UiBounds {
+                x: 4.0,
+                y: 4.0,
+                width: 192.0,
+                height: 152.0,
+            },
             None,
         );
         assert_eq!(bounds[0].y, 4.0);
@@ -22689,18 +24791,36 @@ mod tests {
     fn absolute_children_use_parent_content_origin() {
         let mut child = node();
         child.node_id = UiNodeId("child".into());
-        child.bounds = UiBounds { x: 0.0, y: 0.0, width: 20.0, height: 10.0 };
+        child.bounds = UiBounds {
+            x: 0.0,
+            y: 0.0,
+            width: 20.0,
+            height: 10.0,
+        };
         child.enter_transition = None;
         let mut root = node();
         root.node_id = UiNodeId("root".into());
-        root.bounds = UiBounds { x: 100.0, y: 50.0, width: 200.0, height: 160.0 };
-        root.layout = Some(UiLayout { padding: [11.0, 13.0, 17.0, 19.0], ..UiLayout::default() });
+        root.bounds = UiBounds {
+            x: 100.0,
+            y: 50.0,
+            width: 200.0,
+            height: 160.0,
+        };
+        root.layout = Some(UiLayout {
+            padding: [11.0, 13.0, 17.0, 19.0],
+            ..UiLayout::default()
+        });
         root.children = vec![child];
         let bounds = resolve_children(
             &root,
             root.bounds,
             root.layout.unwrap(),
-            UiBounds { x: 119.0, y: 61.0, width: 168.0, height: 132.0 },
+            UiBounds {
+                x: 119.0,
+                y: 61.0,
+                width: 168.0,
+                height: 132.0,
+            },
             None,
         );
         assert_eq!(bounds[0].x, 119.0);

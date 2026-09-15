@@ -1,4 +1,4 @@
-﻿//! Renderer-local code editor: state, layout, and interaction.
+//! Renderer-local code editor: state, layout, and interaction.
 //!
 //! Per `docs/nui-flow-code-editor.md` (M4/M5): the unified WGPU renderer owns
 //! the frame-rate local editor presentation (line numbers, token-colored text,
@@ -13,16 +13,14 @@
 
 use std::collections::HashMap;
 
-use neon_editor_core::{
-    CompletionItem, CompletionKind, EditorCore, Position, TokenClass,
-};
 use neon_editor_core::grammar::nui_flow_default;
+use neon_editor_core::{CompletionItem, CompletionKind, EditorCore, Position, TokenClass};
 use neon_ui_schema::{TextRef, UiCodeEditorDeclaration, UiEditorLanguage, UiNodeKind};
 use winit::keyboard::{Key, NamedKey};
 
 use super::{
-    color_pass_depth, contains, ensure_glyph, overlay_instance, ResidentFont, UiBounds,
-    UiFragment, UiInstance, UiTextInstance,
+    ResidentFont, UiBounds, UiFragment, UiInstance, UiTextInstance, color_pass_depth, contains,
+    ensure_glyph, overlay_instance,
 };
 
 /// How many completion items the popup shows before scrolling internally.
@@ -193,11 +191,11 @@ fn column_from_x(font: &ResidentFont, line_text: &str, x: f32, px: f32) -> u32 {
 fn token_color(class: TokenClass, opacity: f32) -> [f32; 4] {
     let rgb: [f32; 3] = match class {
         TokenClass::Keyword => [0.78, 0.55, 0.91],      // #C678DD
-        TokenClass::NodeKind => [0.31, 0.76, 1.0],       // #4FC1FF
-        TokenClass::NodeKey => [0.90, 0.75, 0.48],       // #E5C07B
-        TokenClass::Attribute => [0.34, 0.71, 0.76],     // #56B6C2
-        TokenClass::InputRef => [0.38, 0.69, 0.94],      // #61AFEF
-        TokenClass::ColorLiteral => [0.82, 0.60, 0.40],  // #D19A66
+        TokenClass::NodeKind => [0.31, 0.76, 1.0],      // #4FC1FF
+        TokenClass::NodeKey => [0.90, 0.75, 0.48],      // #E5C07B
+        TokenClass::Attribute => [0.34, 0.71, 0.76],    // #56B6C2
+        TokenClass::InputRef => [0.38, 0.69, 0.94],     // #61AFEF
+        TokenClass::ColorLiteral => [0.82, 0.60, 0.40], // #D19A66
         TokenClass::NumericLiteral => [0.82, 0.60, 0.40],
         TokenClass::StringLiteral => [0.60, 0.76, 0.47], // #98C379
         TokenClass::Intent => [0.78, 0.47, 0.87],        // #C678DD
@@ -244,9 +242,7 @@ fn completion_kind_color(kind: CompletionKind) -> [f32; 4] {
         CompletionKind::Keyword => token_color(TokenClass::Keyword, 1.0),
         CompletionKind::NodeKind => token_color(TokenClass::NodeKind, 1.0),
         CompletionKind::Attribute => token_color(TokenClass::Attribute, 1.0),
-        CompletionKind::Input | CompletionKind::InputKind => {
-            token_color(TokenClass::InputRef, 1.0)
-        }
+        CompletionKind::Input | CompletionKind::InputKind => token_color(TokenClass::InputRef, 1.0),
     }
 }
 
@@ -364,118 +360,159 @@ impl super::UiWgpuRenderer {
         let plan_index = &self.plan_index;
         let viewport_logical_size = self.viewport_logical_size;
         let paths: Vec<&String> = editors.keys().collect();
-    for path in paths {
-        let Some(index) = plan_index.get(path).copied() else {
-            continue;
-        };
-        let visual = &sampled[index];
-        // Code editors are screen-UI presentation; projected world panels are
-        // not yet supported for editor chrome.
-        if visual.world_depth.is_some() {
-            continue;
-        }
-        // The lowered node keeps its Panel kind; only an editor state makes it
-        // an editor. Exiting/removed nodes are skipped (instance_index None).
-        if plan[index].instance_index.is_none() {
-            continue;
-        }
-        let state = editors.get(path).expect("path from editors keys");
-        let declaration = &state.declaration;
-        let raster_px = editor_px(declaration);
-        let row_height = editor_row_height(font, declaration);
-        if row_height <= 0.0 || visual.bounds.width <= 0.0 || visual.bounds.height <= 0.0 {
-            continue;
-        }
-        let line_count = state.core.buffer().line_count();
-        let gutter_width = editor_gutter_width(declaration, line_count);
-        let content_x = visual.bounds.x + gutter_width;
-        let content_width = (visual.bounds.width - gutter_width).max(1.0);
-        let clip = [
-            visual.clip.x,
-            visual.clip.y,
-            visual.clip.x + visual.clip.width,
-            visual.clip.y + visual.clip.height,
-        ];
-        let opacity = visual.style.opacity;
-        let depth = color_pass_depth(visual.world_depth);
-        let paint_group_id = visual.paint_group_id;
-        let base_track = [0.0_f32; 4];
-
-        let first_row = (state.scroll_y / row_height).floor().max(0.0) as u32;
-        let visible_rows = (visual.bounds.height / row_height).ceil() as u32 + 1;
-        let last_row = first_row.saturating_add(visible_rows).min(line_count);
-
-        // 1) Current-line highlight (focused editors only).
-        if state.focus {
-            let row_y = visual.bounds.y + state.caret.line as f32 * row_height - state.scroll_y;
-            if row_y + row_height >= visual.bounds.y
-                && row_y <= visual.bounds.y + visual.bounds.height
-            {
-                output.editor_rects.push(overlay_instance(
-                    UiBounds {
-                        x: visual.bounds.x,
-                        y: row_y,
-                        width: visual.bounds.width,
-                        height: row_height,
-                    },
-                    visual.clip,
-                    current_line_color(),
-                ));
+        for path in paths {
+            let Some(index) = plan_index.get(path).copied() else {
+                continue;
+            };
+            let visual = &sampled[index];
+            // Code editors are screen-UI presentation; projected world panels are
+            // not yet supported for editor chrome.
+            if visual.world_depth.is_some() {
+                continue;
             }
-        }
+            // The lowered node keeps its Panel kind; only an editor state makes it
+            // an editor. Exiting/removed nodes are skipped (instance_index None).
+            if plan[index].instance_index.is_none() {
+                continue;
+            }
+            let state = editors.get(path).expect("path from editors keys");
+            let declaration = &state.declaration;
+            let raster_px = editor_px(declaration);
+            let row_height = editor_row_height(font, declaration);
+            if row_height <= 0.0 || visual.bounds.width <= 0.0 || visual.bounds.height <= 0.0 {
+                continue;
+            }
+            let line_count = state.core.buffer().line_count();
+            let gutter_width = editor_gutter_width(declaration, line_count);
+            let content_x = visual.bounds.x + gutter_width;
+            let content_width = (visual.bounds.width - gutter_width).max(1.0);
+            let clip = [
+                visual.clip.x,
+                visual.clip.y,
+                visual.clip.x + visual.clip.width,
+                visual.clip.y + visual.clip.height,
+            ];
+            let opacity = visual.style.opacity;
+            let depth = color_pass_depth(visual.world_depth);
+            let paint_group_id = visual.paint_group_id;
+            let base_track = [0.0_f32; 4];
 
-        // 2) Selection rectangles.
-        if let Some(anchor) = state.selection_anchor {
+            let first_row = (state.scroll_y / row_height).floor().max(0.0) as u32;
+            let visible_rows = (visual.bounds.height / row_height).ceil() as u32 + 1;
+            let last_row = first_row.saturating_add(visible_rows).min(line_count);
+
+            // 1) Current-line highlight (focused editors only).
+            if state.focus {
+                let row_y = visual.bounds.y + state.caret.line as f32 * row_height - state.scroll_y;
+                if row_y + row_height >= visual.bounds.y
+                    && row_y <= visual.bounds.y + visual.bounds.height
+                {
+                    output.editor_rects.push(overlay_instance(
+                        UiBounds {
+                            x: visual.bounds.x,
+                            y: row_y,
+                            width: visual.bounds.width,
+                            height: row_height,
+                        },
+                        visual.clip,
+                        current_line_color(),
+                    ));
+                }
+            }
+
+            // 2) Selection rectangles.
+            if let Some(anchor) = state.selection_anchor {
+                for row in first_row..last_row {
+                    let line_text = state.core.buffer().line(row).unwrap_or_default();
+                    let Some((from, to)) = selected_range_for_row(
+                        anchor,
+                        state.caret,
+                        row,
+                        line_text.chars().count() as u32,
+                    ) else {
+                        continue;
+                    };
+                    let row_y = visual.bounds.y + row as f32 * row_height - state.scroll_y;
+                    if row_y + row_height < visual.bounds.y
+                        || row_y > visual.bounds.y + visual.bounds.height
+                    {
+                        continue;
+                    }
+                    let x_from = content_x + line_prefix_advance(font, line_text, from, raster_px)
+                        - state.scroll_x;
+                    let x_to = content_x + line_prefix_advance(font, line_text, to, raster_px)
+                        - state.scroll_x;
+                    let rect_x = x_from.min(x_to);
+                    let rect_width = (x_to - x_from).abs().max(1.0);
+                    output.editor_rects.push(overlay_instance(
+                        UiBounds {
+                            x: rect_x,
+                            y: row_y,
+                            width: rect_width,
+                            height: row_height,
+                        },
+                        visual.clip,
+                        selection_color(),
+                    ));
+                }
+            }
+
+            // 3) Visible rows: line numbers + token-colored text.
             for row in first_row..last_row {
                 let line_text = state.core.buffer().line(row).unwrap_or_default();
-                let Some((from, to)) =
-                    selected_range_for_row(anchor, state.caret, row, line_text.chars().count() as u32)
-                else {
-                    continue;
-                };
                 let row_y = visual.bounds.y + row as f32 * row_height - state.scroll_y;
                 if row_y + row_height < visual.bounds.y
                     || row_y > visual.bounds.y + visual.bounds.height
                 {
                     continue;
                 }
-                let x_from =
-                    content_x + line_prefix_advance(font, line_text, from, raster_px) - state.scroll_x;
-                let x_to =
-                    content_x + line_prefix_advance(font, line_text, to, raster_px) - state.scroll_x;
-                let rect_x = x_from.min(x_to);
-                let rect_width = (x_to - x_from).abs().max(1.0);
-                output.editor_rects.push(overlay_instance(
-                    UiBounds {
-                        x: rect_x,
-                        y: row_y,
-                        width: rect_width,
-                        height: row_height,
-                    },
-                    visual.clip,
-                    selection_color(),
-                ));
-            }
-        }
+                let baseline = (row_y + editor_line_metrics(font, declaration).ascent).floor();
 
-        // 3) Visible rows: line numbers + token-colored text.
-        for row in first_row..last_row {
-            let line_text = state.core.buffer().line(row).unwrap_or_default();
-            let row_y = visual.bounds.y + row as f32 * row_height - state.scroll_y;
-            if row_y + row_height < visual.bounds.y || row_y > visual.bounds.y + visual.bounds.height
-            {
-                continue;
-            }
-            let baseline = (row_y + editor_line_metrics(font, declaration).ascent).floor();
+                // Line-number gutter.
+                if declaration.line_numbers {
+                    let number_text = (row + 1).to_string();
+                    let number_width = line_full_advance(font, &number_text, raster_px);
+                    let mut x = visual.bounds.x + (gutter_width - 10.0) - number_width;
+                    let is_current = state.focus && row == state.caret.line;
+                    let color = line_number_color(is_current, opacity);
+                    for ch in number_text.chars() {
+                        let Ok(glyph) = ensure_glyph(device, queue, font, ch, raster_px) else {
+                            continue;
+                        };
+                        output.editor_texts.push(UiTextInstance {
+                            rect: [
+                                (x + glyph.xmin).floor(),
+                                baseline + glyph.plane_min_y.floor(),
+                                glyph.width,
+                                glyph.height,
+                            ],
+                            color,
+                            clip,
+                            uv: glyph.uv,
+                            depth,
+                            paint_group_id,
+                            animation: base_track,
+                            transform_from: [0.0, 0.0, 1.0, 1.0],
+                            transform_to: [0.0, 0.0, 1.0, 1.0],
+                            rotation_pivot: [0.0; 4],
+                            overflow: [0.0; 4],
+                        });
+                        x += glyph.advance;
+                    }
+                }
 
-            // Line-number gutter.
-            if declaration.line_numbers {
-                let number_text = (row + 1).to_string();
-                let number_width = line_full_advance(font, &number_text, raster_px);
-                let mut x = visual.bounds.x + (gutter_width - 10.0) - number_width;
-                let is_current = state.focus && row == state.caret.line;
-                let color = line_number_color(is_current, opacity);
-                for ch in number_text.chars() {
+                // Token-colored code text. Whitespace between spans renders in the
+                // default color so proportional fonts keep their natural spacing.
+                let highlight = state.core.line_spans(row);
+                let mut column = 0u32;
+                let mut x = content_x - state.scroll_x;
+                for ch in line_text.chars() {
+                    let color = highlight
+                        .and_then(|tokens| tokens.class_at(column))
+                        .map_or_else(
+                            || default_text_color(opacity),
+                            |class| token_color(class, opacity),
+                        );
                     let Ok(glyph) = ensure_glyph(device, queue, font, ch, raster_px) else {
                         continue;
                     };
@@ -495,234 +532,216 @@ impl super::UiWgpuRenderer {
                         transform_from: [0.0, 0.0, 1.0, 1.0],
                         transform_to: [0.0, 0.0, 1.0, 1.0],
                         rotation_pivot: [0.0; 4],
+                        overflow: [0.0; 4],
                     });
                     x += glyph.advance;
+                    column += 1;
+                }
+
+                // IME preedit text renders at the caret position with a dim color.
+                if state.focus && row == state.caret.line && !state.preedit.is_empty() {
+                    let preedit_x = content_x
+                        + line_prefix_advance(font, line_text, state.caret.column, raster_px)
+                        - state.scroll_x;
+                    let mut px = preedit_x;
+                    for ch in state.preedit.chars() {
+                        let Ok(glyph) = ensure_glyph(device, queue, font, ch, raster_px) else {
+                            continue;
+                        };
+                        output.editor_texts.push(UiTextInstance {
+                            rect: [
+                                (px + glyph.xmin).floor(),
+                                baseline + glyph.plane_min_y.floor(),
+                                glyph.width,
+                                glyph.height,
+                            ],
+                            color: [0.62, 0.72, 0.90, opacity],
+                            clip,
+                            uv: glyph.uv,
+                            depth,
+                            paint_group_id,
+                            animation: base_track,
+                            transform_from: [0.0, 0.0, 1.0, 1.0],
+                            transform_to: [0.0, 0.0, 1.0, 1.0],
+                            rotation_pivot: [0.0; 4],
+                            overflow: [0.0; 4],
+                        });
+                        px += glyph.advance;
+                    }
                 }
             }
 
-            // Token-colored code text. Whitespace between spans renders in the
-            // default color so proportional fonts keep their natural spacing.
-            let highlight = state.core.line_spans(row);
-            let mut column = 0u32;
-            let mut x = content_x - state.scroll_x;
-            for ch in line_text.chars() {
-                let color = highlight
-                    .and_then(|tokens| tokens.class_at(column))
-                    .map_or_else(|| default_text_color(opacity), |class| token_color(class, opacity));
-                let Ok(glyph) = ensure_glyph(device, queue, font, ch, raster_px) else {
-                    continue;
-                };
-                output.editor_texts.push(UiTextInstance {
-                    rect: [
-                        (x + glyph.xmin).floor(),
-                        baseline + glyph.plane_min_y.floor(),
-                        glyph.width,
-                        glyph.height,
-                    ],
-                    color,
-                    clip,
-                    uv: glyph.uv,
-                    depth,
-                    paint_group_id,
-                    animation: base_track,
-                    transform_from: [0.0, 0.0, 1.0, 1.0],
-                    transform_to: [0.0, 0.0, 1.0, 1.0],
-                    rotation_pivot: [0.0; 4],
-                });
-                x += glyph.advance;
-                column += 1;
+            // 4) Caret (focused editors; blink unless recently edited or a
+            //    completion popup is open).
+            if state.focus {
+                let just_edited =
+                    time_seconds - state.last_edit_seconds < CARET_SOLID_AFTER_EDIT_SECONDS;
+                let visible = state.completion.is_some()
+                    || just_edited
+                    || (time_seconds / CARET_BLINK_SECONDS).fract() < 0.5;
+                if visible {
+                    let caret_line = state
+                        .core
+                        .buffer()
+                        .line(state.caret.line)
+                        .unwrap_or_default();
+                    let caret_x = content_x
+                        + line_prefix_advance(font, caret_line, state.caret.column, raster_px)
+                        - state.scroll_x;
+                    let caret_y = visual.bounds.y + state.caret.line as f32 * row_height
+                        - state.scroll_y
+                        + 1.0;
+                    output.editor_popup_rects.push(overlay_instance(
+                        UiBounds {
+                            x: caret_x,
+                            y: caret_y,
+                            width: 2.0,
+                            height: (row_height - 2.0).max(2.0),
+                        },
+                        visual.clip,
+                        caret_color(),
+                    ));
+                }
             }
 
-            // IME preedit text renders at the caret position with a dim color.
-            if state.focus && row == state.caret.line && !state.preedit.is_empty() {
-                let preedit_x = content_x
-                    + line_prefix_advance(font, line_text, state.caret.column, raster_px)
-                    - state.scroll_x;
-                let mut px = preedit_x;
-                for ch in state.preedit.chars() {
-                    let Ok(glyph) = ensure_glyph(device, queue, font, ch, raster_px) else {
-                        continue;
+            // 5) Completion popup (top layer).
+            if let Some(completion) = &state.completion {
+                if !completion.items.is_empty() {
+                    let caret_line = state
+                        .core
+                        .buffer()
+                        .line(state.caret.line)
+                        .unwrap_or_default();
+                    let caret_x = content_x
+                        + line_prefix_advance(font, caret_line, state.caret.column, raster_px)
+                        - state.scroll_x;
+                    let caret_y = visual.bounds.y + state.caret.line as f32 * row_height
+                        - state.scroll_y
+                        + row_height;
+                    let mut popup_width = 0.0_f32;
+                    for item in &completion.items {
+                        let label_width = line_full_advance(font, &item.label, raster_px)
+                            + line_full_advance(font, &item.detail, raster_px) * 0.8;
+                        popup_width = popup_width.max(label_width);
+                    }
+                    popup_width = (popup_width + COMPLETION_PAD * 2.0 + 14.0)
+                        .clamp(120.0, content_width - 8.0);
+                    let item_height = row_height * 0.92;
+                    let popup_height = item_height
+                        * completion.items.len().min(COMPLETION_VISIBLE_ITEMS) as f32
+                        + COMPLETION_PAD;
+                    let popup_x = caret_x.clamp(
+                        visual.bounds.x + 2.0,
+                        (visual.bounds.x + visual.bounds.width - popup_width)
+                            .max(visual.bounds.x + 2.0),
+                    );
+                    let mut popup_y = caret_y;
+                    if popup_y + popup_height > visual.bounds.y + visual.bounds.height {
+                        popup_y = (caret_y - row_height - popup_height).max(visual.bounds.y + 2.0);
+                    }
+                    let popup_bounds = UiBounds {
+                        x: popup_x,
+                        y: popup_y,
+                        width: popup_width,
+                        height: popup_height,
                     };
-                    output.editor_texts.push(UiTextInstance {
-                        rect: [
-                            (px + glyph.xmin).floor(),
-                            baseline + glyph.plane_min_y.floor(),
-                            glyph.width,
-                            glyph.height,
-                        ],
-                        color: [0.62, 0.72, 0.90, opacity],
-                        clip,
-                        uv: glyph.uv,
-                        depth,
-                        paint_group_id,
-                        animation: base_track,
-                        transform_from: [0.0, 0.0, 1.0, 1.0],
-                        transform_to: [0.0, 0.0, 1.0, 1.0],
-                        rotation_pivot: [0.0; 4],
-                    });
-                    px += glyph.advance;
-                }
-            }
-        }
-
-        // 4) Caret (focused editors; blink unless recently edited or a
-        //    completion popup is open).
-        if state.focus {
-            let just_edited =
-                time_seconds - state.last_edit_seconds < CARET_SOLID_AFTER_EDIT_SECONDS;
-            let visible = state.completion.is_some()
-                || just_edited
-                || (time_seconds / CARET_BLINK_SECONDS).fract() < 0.5;
-            if visible {
-                let caret_line = state.core.buffer().line(state.caret.line).unwrap_or_default();
-                let caret_x = content_x
-                    + line_prefix_advance(font, caret_line, state.caret.column, raster_px)
-                    - state.scroll_x;
-                let caret_y =
-                    visual.bounds.y + state.caret.line as f32 * row_height - state.scroll_y + 1.0;
-                output.editor_popup_rects.push(overlay_instance(
-                    UiBounds {
-                        x: caret_x,
-                        y: caret_y,
-                        width: 2.0,
-                        height: (row_height - 2.0).max(2.0),
-                    },
-                    visual.clip,
-                    caret_color(),
-                ));
-            }
-        }
-
-        // 5) Completion popup (top layer).
-        if let Some(completion) = &state.completion {
-            if !completion.items.is_empty() {
-                let caret_line = state.core.buffer().line(state.caret.line).unwrap_or_default();
-                let caret_x = content_x
-                    + line_prefix_advance(font, caret_line, state.caret.column, raster_px)
-                    - state.scroll_x;
-                let caret_y = visual.bounds.y + state.caret.line as f32 * row_height
-                    - state.scroll_y
-                    + row_height;
-                let mut popup_width = 0.0_f32;
-                for item in &completion.items {
-                    let label_width = line_full_advance(font, &item.label, raster_px)
-                        + line_full_advance(font, &item.detail, raster_px) * 0.8;
-                    popup_width = popup_width.max(label_width);
-                }
-                popup_width = (popup_width + COMPLETION_PAD * 2.0 + 14.0)
-                    .clamp(120.0, content_width - 8.0);
-                let item_height = row_height * 0.92;
-                let popup_height = item_height
-                    * completion.items.len().min(COMPLETION_VISIBLE_ITEMS) as f32
-                    + COMPLETION_PAD;
-                let popup_x = caret_x.clamp(
-                    visual.bounds.x + 2.0,
-                    (visual.bounds.x + visual.bounds.width - popup_width).max(visual.bounds.x + 2.0),
-                );
-                let mut popup_y = caret_y;
-                if popup_y + popup_height > visual.bounds.y + visual.bounds.height {
-                    popup_y = (caret_y - row_height - popup_height).max(visual.bounds.y + 2.0);
-                }
-                let popup_bounds = UiBounds {
-                    x: popup_x,
-                    y: popup_y,
-                    width: popup_width,
-                    height: popup_height,
-                };
-                let popup_clip = UiBounds {
-                    x: 0.0,
-                    y: 0.0,
-                    width: viewport_logical_size[0],
-                    height: viewport_logical_size[1],
-                };
-                output.editor_popup_rects.push(overlay_instance(
-                    popup_bounds,
-                    popup_clip,
-                    completion_background_color(),
-                ));
-                let text_start_y = popup_y + COMPLETION_PAD * 0.5;
-                for (item_index, item) in completion.items.iter().enumerate() {
-                    if item_index >= COMPLETION_VISIBLE_ITEMS {
-                        break;
-                    }
-                    let item_y = text_start_y + item_index as f32 * item_height;
-                    if item_index == completion.selected {
-                        output.editor_popup_rects.push(overlay_instance(
-                            UiBounds {
-                                x: popup_x + 2.0,
-                                y: item_y,
-                                width: popup_width - 4.0,
-                                height: item_height,
-                            },
-                            popup_clip,
-                            completion_selection_color(),
-                        ));
-                    }
-                    let mut ix = popup_x + COMPLETION_PAD;
-                    let baseline = (item_y + editor_line_metrics(font, declaration).ascent).floor();
-                    for ch in kind_prefix(item.kind).chars() {
-                        let Ok(glyph) = ensure_glyph(device, queue, font, ch, raster_px) else {
-                            continue;
-                        };
-                        output.editor_popup_texts.push(UiTextInstance {
-                            rect: [
-                                (ix + glyph.xmin).floor(),
-                                baseline + glyph.plane_min_y.floor(),
-                                glyph.width,
-                                glyph.height,
-                            ],
-                            color: completion_kind_color(item.kind),
-                            clip: [
-                                popup_clip.x,
-                                popup_clip.y,
-                                popup_clip.x + popup_clip.width,
-                                popup_clip.y + popup_clip.height,
-                            ],
-                            uv: glyph.uv,
-                            depth,
-                            paint_group_id,
-                            animation: base_track,
-                            transform_from: [0.0, 0.0, 1.0, 1.0],
-                            transform_to: [0.0, 0.0, 1.0, 1.0],
-                            rotation_pivot: [0.0; 4],
-                        });
-                        ix += glyph.advance;
-                    }
-                    ix += 6.0;
-                    for ch in item.label.chars() {
-                        let Ok(glyph) = ensure_glyph(device, queue, font, ch, raster_px) else {
-                            continue;
-                        };
-                        output.editor_popup_texts.push(UiTextInstance {
-                            rect: [
-                                (ix + glyph.xmin).floor(),
-                                baseline + glyph.plane_min_y.floor(),
-                                glyph.width,
-                                glyph.height,
-                            ],
-                            color: [0.86, 0.90, 0.95, 1.0],
-                            clip: [
-                                popup_clip.x,
-                                popup_clip.y,
-                                popup_clip.x + popup_clip.width,
-                                popup_clip.y + popup_clip.height,
-                            ],
-                            uv: glyph.uv,
-                            depth,
-                            paint_group_id,
-                            animation: base_track,
-                            transform_from: [0.0, 0.0, 1.0, 1.0],
-                            transform_to: [0.0, 0.0, 1.0, 1.0],
-                            rotation_pivot: [0.0; 4],
-                        });
-                        ix += glyph.advance;
+                    let popup_clip = UiBounds {
+                        x: 0.0,
+                        y: 0.0,
+                        width: viewport_logical_size[0],
+                        height: viewport_logical_size[1],
+                    };
+                    output.editor_popup_rects.push(overlay_instance(
+                        popup_bounds,
+                        popup_clip,
+                        completion_background_color(),
+                    ));
+                    let text_start_y = popup_y + COMPLETION_PAD * 0.5;
+                    for (item_index, item) in completion.items.iter().enumerate() {
+                        if item_index >= COMPLETION_VISIBLE_ITEMS {
+                            break;
+                        }
+                        let item_y = text_start_y + item_index as f32 * item_height;
+                        if item_index == completion.selected {
+                            output.editor_popup_rects.push(overlay_instance(
+                                UiBounds {
+                                    x: popup_x + 2.0,
+                                    y: item_y,
+                                    width: popup_width - 4.0,
+                                    height: item_height,
+                                },
+                                popup_clip,
+                                completion_selection_color(),
+                            ));
+                        }
+                        let mut ix = popup_x + COMPLETION_PAD;
+                        let baseline =
+                            (item_y + editor_line_metrics(font, declaration).ascent).floor();
+                        for ch in kind_prefix(item.kind).chars() {
+                            let Ok(glyph) = ensure_glyph(device, queue, font, ch, raster_px) else {
+                                continue;
+                            };
+                            output.editor_popup_texts.push(UiTextInstance {
+                                rect: [
+                                    (ix + glyph.xmin).floor(),
+                                    baseline + glyph.plane_min_y.floor(),
+                                    glyph.width,
+                                    glyph.height,
+                                ],
+                                color: completion_kind_color(item.kind),
+                                clip: [
+                                    popup_clip.x,
+                                    popup_clip.y,
+                                    popup_clip.x + popup_clip.width,
+                                    popup_clip.y + popup_clip.height,
+                                ],
+                                uv: glyph.uv,
+                                depth,
+                                paint_group_id,
+                                animation: base_track,
+                                transform_from: [0.0, 0.0, 1.0, 1.0],
+                                transform_to: [0.0, 0.0, 1.0, 1.0],
+                                rotation_pivot: [0.0; 4],
+                                overflow: [0.0; 4],
+                            });
+                            ix += glyph.advance;
+                        }
+                        ix += 6.0;
+                        for ch in item.label.chars() {
+                            let Ok(glyph) = ensure_glyph(device, queue, font, ch, raster_px) else {
+                                continue;
+                            };
+                            output.editor_popup_texts.push(UiTextInstance {
+                                rect: [
+                                    (ix + glyph.xmin).floor(),
+                                    baseline + glyph.plane_min_y.floor(),
+                                    glyph.width,
+                                    glyph.height,
+                                ],
+                                color: [0.86, 0.90, 0.95, 1.0],
+                                clip: [
+                                    popup_clip.x,
+                                    popup_clip.y,
+                                    popup_clip.x + popup_clip.width,
+                                    popup_clip.y + popup_clip.height,
+                                ],
+                                uv: glyph.uv,
+                                depth,
+                                paint_group_id,
+                                animation: base_track,
+                                transform_from: [0.0, 0.0, 1.0, 1.0],
+                                transform_to: [0.0, 0.0, 1.0, 1.0],
+                                rotation_pivot: [0.0; 4],
+                                overflow: [0.0; 4],
+                            });
+                            ix += glyph.advance;
+                        }
                     }
                 }
             }
         }
+        output
     }
-    output
-}
 }
 
 fn collect_node_kinds(node: &neon_ui_schema::UiNode, out: &mut HashMap<String, UiNodeKind>) {
@@ -765,8 +784,10 @@ impl super::UiWgpuRenderer {
                 }
             }
             for effect in &fragment.effects {
-                let neon_ui_schema::UiEffect::CodeEditorDeclaration { node_key, declaration } =
-                    effect
+                let neon_ui_schema::UiEffect::CodeEditorDeclaration {
+                    node_key,
+                    declaration,
+                } = effect
                 else {
                     continue;
                 };
@@ -779,11 +800,7 @@ impl super::UiWgpuRenderer {
                 let source = sources.get(node_key).cloned().unwrap_or_default();
                 desired.insert(
                     path,
-                    (
-                        declaration.clone(),
-                        events.get(node_key).cloned(),
-                        source,
-                    ),
+                    (declaration.clone(), events.get(node_key).cloned(), source),
                 );
             }
         }
@@ -835,8 +852,13 @@ impl super::UiWgpuRenderer {
         let raster_px = editor_px(&state.declaration);
         let row_height = editor_row_height(font, &state.declaration);
         let gutter = editor_gutter_width(&state.declaration, state.core.buffer().line_count());
-        let line_text = state.core.buffer().line(state.caret.line).unwrap_or_default();
-        let x = visual.bounds.x + gutter
+        let line_text = state
+            .core
+            .buffer()
+            .line(state.caret.line)
+            .unwrap_or_default();
+        let x = visual.bounds.x
+            + gutter
             + line_prefix_advance(font, line_text, state.caret.column, raster_px)
             - state.scroll_x;
         let y = visual.bounds.y + state.caret.line as f32 * row_height - state.scroll_y;
@@ -1016,8 +1038,7 @@ impl super::UiWgpuRenderer {
         let now = self.animation_clock_seconds;
         let editor_bounds = self.sampled[index].bounds;
         let editor_height = editor_bounds.height;
-        let (Some(state), Some(font)) =
-            (self.editors.get_mut(&path), self.resident_font.as_ref())
+        let (Some(state), Some(font)) = (self.editors.get_mut(&path), self.resident_font.as_ref())
         else {
             return false;
         };
@@ -1099,22 +1120,21 @@ impl super::UiWgpuRenderer {
         };
         // Commit pending edits inline (disjoint field writes only; the state
         // borrow is alive so no `self` method may run here).
-        let commit_now = |state: &mut EditorRuntimeState,
-                          path: &str,
-                          pending: &mut Vec<EditorCommit>| {
-            if state.pending_edits {
-                state.pending_edits = false;
-                let document = state.core.buffer().text();
-                state.core.commit();
-                state.completion = None;
-                state.preedit.clear();
-                pending.push(EditorCommit {
-                    node_path: path.to_string(),
-                    event_action: state.event_action.clone(),
-                    document,
-                });
-            }
-        };
+        let commit_now =
+            |state: &mut EditorRuntimeState, path: &str, pending: &mut Vec<EditorCommit>| {
+                if state.pending_edits {
+                    state.pending_edits = false;
+                    let document = state.core.buffer().text();
+                    state.core.commit();
+                    state.completion = None;
+                    state.preedit.clear();
+                    pending.push(EditorCommit {
+                        node_path: path.to_string(),
+                        event_action: state.event_action.clone(),
+                        document,
+                    });
+                }
+            };
         let open_completion = |state: &mut EditorRuntimeState| {
             let items = state.core.completions(state.caret);
             state.completion = Some(EditorCompletionState { items, selected: 0 });
@@ -1216,8 +1236,7 @@ impl super::UiWgpuRenderer {
                     let count = state.completion.as_ref().map_or(0, |c| c.items.len());
                     if count > 0 {
                         let selected = state.completion.as_mut().unwrap().selected;
-                        state.completion.as_mut().unwrap().selected =
-                            (selected + 1).min(count - 1);
+                        state.completion.as_mut().unwrap().selected = (selected + 1).min(count - 1);
                     }
                     return true;
                 }
@@ -1238,8 +1257,10 @@ impl super::UiWgpuRenderer {
                         state.selection_anchor = None;
                         state.completion = None;
                         mark_edit(state, now);
-                        let gutter =
-                            editor_gutter_width(&state.declaration, state.core.buffer().line_count());
+                        let gutter = editor_gutter_width(
+                            &state.declaration,
+                            state.core.buffer().line_count(),
+                        );
                         scroll_caret_into_view(state, font, editor_bounds, gutter);
                         return true;
                     }
@@ -1260,7 +1281,11 @@ impl super::UiWgpuRenderer {
                 true
             }
             NamedKey::Enter => {
-                let line_text = state.core.buffer().line(state.caret.line).unwrap_or_default();
+                let line_text = state
+                    .core
+                    .buffer()
+                    .line(state.caret.line)
+                    .unwrap_or_default();
                 let indent: String = line_text
                     .chars()
                     .take_while(|ch| *ch == ' ' || *ch == '\t')
@@ -1275,15 +1300,17 @@ impl super::UiWgpuRenderer {
             }
             NamedKey::Backspace => {
                 if ctrl {
-                    let line = state.core.buffer().line(state.caret.line).unwrap_or_default();
+                    let line = state
+                        .core
+                        .buffer()
+                        .line(state.caret.line)
+                        .unwrap_or_default();
                     let chars: Vec<char> = line.chars().collect();
                     let mut column = state.caret.column as usize;
                     while column > 0 && chars.get(column - 1).is_some_and(|c| c.is_whitespace()) {
                         column -= 1;
                     }
-                    while column > 0
-                        && chars.get(column - 1).is_some_and(|c| !c.is_whitespace())
-                    {
+                    while column > 0 && chars.get(column - 1).is_some_and(|c| !c.is_whitespace()) {
                         column -= 1;
                     }
                     let start = Position::new(state.caret.line, column as u32);
@@ -1297,7 +1324,11 @@ impl super::UiWgpuRenderer {
             }
             NamedKey::Delete => {
                 if ctrl {
-                    let line = state.core.buffer().line(state.caret.line).unwrap_or_default();
+                    let line = state
+                        .core
+                        .buffer()
+                        .line(state.caret.line)
+                        .unwrap_or_default();
                     let chars: Vec<char> = line.chars().collect();
                     let mut column = state.caret.column as usize;
                     let len = chars.len();
@@ -1318,15 +1349,17 @@ impl super::UiWgpuRenderer {
             }
             NamedKey::ArrowLeft => {
                 if ctrl {
-                    let line = state.core.buffer().line(state.caret.line).unwrap_or_default();
+                    let line = state
+                        .core
+                        .buffer()
+                        .line(state.caret.line)
+                        .unwrap_or_default();
                     let chars: Vec<char> = line.chars().collect();
                     let mut column = state.caret.column as usize;
                     while column > 0 && chars.get(column - 1).is_some_and(|c| c.is_whitespace()) {
                         column -= 1;
                     }
-                    while column > 0
-                        && chars.get(column - 1).is_some_and(|c| !c.is_whitespace())
-                    {
+                    while column > 0 && chars.get(column - 1).is_some_and(|c| !c.is_whitespace()) {
                         column -= 1;
                     }
                     move_caret(state, Position::new(state.caret.line, column as u32), shift);
@@ -1357,7 +1390,11 @@ impl super::UiWgpuRenderer {
                     .line(state.caret.line)
                     .map_or(0, |line| line.chars().count() as u32);
                 if ctrl {
-                    let line = state.core.buffer().line(state.caret.line).unwrap_or_default();
+                    let line = state
+                        .core
+                        .buffer()
+                        .line(state.caret.line)
+                        .unwrap_or_default();
                     let chars: Vec<char> = line.chars().collect();
                     let mut column = state.caret.column as usize;
                     let len = chars.len();

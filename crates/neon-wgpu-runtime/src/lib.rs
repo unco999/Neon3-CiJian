@@ -41,10 +41,10 @@ use neon_ui_runtime::{
 #[cfg(test)]
 use neon_ui_schema::UiFragmentSubmission;
 use neon_ui_schema::{
-    TextRef, UiBounds, UiClipShape, UiCommand, UiDataGridWindowRequest, UiFragment, UiFragmentId, UiHostInbound,
-    UiNode, UiNodeId, UiNodeKind, UiPointerEvent, UiPointerEventType, UiProgramRevision,
-    UiSemanticEvent, UiSemanticEventType, UiSemanticPayloadValue, UiStyle, UiTransition,
-    UiTransitionState, UiWindowRequest,
+    TextRef, UiBounds, UiClipShape, UiCommand, UiDataGridWindowRequest, UiFragment, UiFragmentId,
+    UiHostInbound, UiNode, UiNodeId, UiNodeKind, UiPointerEvent, UiPointerEventType,
+    UiProgramRevision, UiSemanticEvent, UiSemanticEventType, UiSemanticPayloadValue, UiStyle,
+    UiTransition, UiTransitionState, UiWindowRequest,
 };
 use neon_world_bridge::{
     CameraControlSample, CameraFrame, CameraFramePayload, CameraId, WorldInformationBridge,
@@ -238,8 +238,7 @@ mod world_ui_pipeline;
 use gpu_preview::HeightmapPreviewConverter;
 pub use ui_program_gpu::GpuUiProgramBackend;
 use ui_renderer::{
-    set_global_view_extras, LocalPresentationCommit, PendingLocalPresentationKey,
-    UiHitBinding,
+    LocalPresentationCommit, PendingLocalPresentationKey, UiHitBinding, set_global_view_extras,
 };
 pub use ui_renderer::{UiDrawMode, UiWgpuRenderer};
 use world_ui_pipeline::{WorldUiCamera, WorldUiCameraState, WorldUiPipeline};
@@ -389,7 +388,10 @@ fn parse_view_extras(params: &Value) -> Result<[[f32; 4]; 10], String> {
         .and_then(Value::as_array)
         .ok_or_else(|| "extras must be a 10-element array of [f32;4]".to_string())?;
     if arr.len() != 10 {
-        return Err(format!("extras must have exactly 10 slots, got {}", arr.len()));
+        return Err(format!(
+            "extras must have exactly 10 slots, got {}",
+            arr.len()
+        ));
     }
     let mut out = [[0.0f32; 4]; 10];
     for (i, slot) in arr.iter().enumerate() {
@@ -397,7 +399,10 @@ fn parse_view_extras(params: &Value) -> Result<[[f32; 4]; 10], String> {
             .as_array()
             .ok_or_else(|| format!("extras[{i}] must be an array of 4 numbers"))?;
         if vals.len() != 4 {
-            return Err(format!("extras[{i}] must have exactly 4 elements, got {}", vals.len()));
+            return Err(format!(
+                "extras[{i}] must have exactly 4 elements, got {}",
+                vals.len()
+            ));
         }
         for (j, v) in vals.iter().enumerate() {
             out[i][j] = v
@@ -500,7 +505,9 @@ fn clear_transparent_window_backdrop(window: &Window) -> Result<(), String> {
             std::mem::size_of_val(&border_color) as u32,
         )
     }
-    .unwrap_or_else(|error| eprintln!("[neon-wgpu-runtime] DWM border color unavailable (pre-Win11): {error}"));
+    .unwrap_or_else(|error| {
+        eprintln!("[neon-wgpu-runtime] DWM border color unavailable (pre-Win11): {error}")
+    });
     // DWMWA_WINDOW_CORNER_PREFERENCE = 33. DWMWCP_DONOTROUND = 1 stops Win11
     // from applying its rounded-corner mask, which otherwise adds a 1px
     // lighter ring where the region and the rounded frame disagree.
@@ -513,15 +520,17 @@ fn clear_transparent_window_backdrop(window: &Window) -> Result<(), String> {
             std::mem::size_of_val(&corner_preference) as u32,
         )
     }
-    .unwrap_or_else(|error| eprintln!("[neon-wgpu-runtime] DWM corner preference unavailable: {error}"));
+    .unwrap_or_else(|error| {
+        eprintln!("[neon-wgpu-runtime] DWM corner preference unavailable: {error}")
+    });
     // Strip every frame/caption style so DWM has nothing to draw around the
     // shell. winit borderless still leaves WS_BORDER / WS_SYSMENU / min/max
     // boxes on this path, and a layered window keeps painting the theme
     // border for those styles even with DWMWA_NCRENDERING_POLICY disabled.
     use windows::Win32::UI::WindowsAndMessaging::{
-        GetWindowLongPtrW, SetWindowLongPtrW, SetWindowPos, GWL_STYLE, SWP_FRAMECHANGED,
-        SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WS_BORDER, WS_CAPTION, WS_DLGFRAME,
-        WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_SYSMENU, WS_THICKFRAME,
+        GWL_STYLE, GetWindowLongPtrW, SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+        SetWindowLongPtrW, SetWindowPos, WS_BORDER, WS_CAPTION, WS_DLGFRAME, WS_MAXIMIZEBOX,
+        WS_MINIMIZEBOX, WS_SYSMENU, WS_THICKFRAME,
     };
     let frame_mask = WS_BORDER.0
         | WS_CAPTION.0
@@ -537,7 +546,15 @@ fn clear_transparent_window_backdrop(window: &Window) -> Result<(), String> {
         // Style changes only take effect after the frame is re-evaluated;
         // without SWP_FRAMECHANGED DWM keeps painting the old resize border.
         let _ = unsafe {
-            SetWindowPos(hwnd, None, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER)
+            SetWindowPos(
+                hwnd,
+                None,
+                0,
+                0,
+                0,
+                0,
+                SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER,
+            )
         };
     }
     Ok(())
@@ -1502,7 +1519,9 @@ pub struct ComponentStateStore {
 }
 
 impl ComponentStateStore {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
     /// Toggle a boolean value, returning the new value.
     pub fn toggle(&mut self, key: &str, default: bool) -> bool {
@@ -2172,7 +2191,9 @@ impl WindowedRuntime {
         #[cfg(windows)]
         if backdrop.requests_transparency() {
             if let Err(error) = clear_transparent_window_backdrop(&window) {
-                eprintln!("[neon-wgpu-runtime] transparent window non-client clear failed: {error}");
+                eprintln!(
+                    "[neon-wgpu-runtime] transparent window non-client clear failed: {error}"
+                );
             }
         }
         #[cfg(windows)]
@@ -2360,10 +2381,9 @@ impl WindowedRuntime {
                 };
                 match client.publish(&publish) {
                     Ok(ack) if ack.status == neon_protocol::EventAckStatus::Accepted => {}
-                    Ok(ack) => eprintln!(
-                        "[neon-wgpu-runtime] shader event rejected: {:?}",
-                        ack.error
-                    ),
+                    Ok(ack) => {
+                        eprintln!("[neon-wgpu-runtime] shader event rejected: {:?}", ack.error)
+                    }
                     Err(error) => {
                         eprintln!("[neon-wgpu-runtime] shader event publish failed: {error}");
                     }
@@ -2554,12 +2574,16 @@ impl WindowedRuntime {
             match surface.get_current_texture() {
                 wgpu::CurrentSurfaceTexture::Success(texture)
                 | wgpu::CurrentSurfaceTexture::Suboptimal(texture) => Some(texture),
-                wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => return Ok(()),
+                wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
+                    return Ok(());
+                }
                 wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
                     surface.configure(&gpu.device, &gpu.config);
                     return Ok(());
                 }
-                wgpu::CurrentSurfaceTexture::Validation => return Err("acquire behind composition surface: validation error".into()),
+                wgpu::CurrentSurfaceTexture::Validation => {
+                    return Err("acquire behind composition surface: validation error".into());
+                }
             }
         } else {
             None
@@ -2590,7 +2614,10 @@ impl WindowedRuntime {
                     view: &behind_view,
                     depth_slice: None,
                     resolve_target: None,
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store },
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
                 })],
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
@@ -2598,9 +2625,14 @@ impl WindowedRuntime {
                 multiview_mask: None,
             });
             gpu.behind_ui.draw(
-                &gpu.device, &gpu.queue, &mut pass, &self.fragments,
-                gpu.physical_viewport_size(), gpu.logical_viewport_size(),
-                gpu.started_at.elapsed().as_secs_f32(), UiDrawMode::BehindGlass,
+                &gpu.device,
+                &gpu.queue,
+                &mut pass,
+                &self.fragments,
+                gpu.physical_viewport_size(),
+                gpu.logical_viewport_size(),
+                gpu.started_at.elapsed().as_secs_f32(),
+                UiDrawMode::BehindGlass,
             );
         }
         let (lab_active, camera_state) = gpu
@@ -2905,7 +2937,9 @@ impl WindowedRuntime {
                                 ack.error
                             ),
                             Err(error) => {
-                                eprintln!("[neon-wgpu-runtime] shader event publish failed: {error}");
+                                eprintln!(
+                                    "[neon-wgpu-runtime] shader event publish failed: {error}"
+                                );
                             }
                         }
                     }
@@ -4105,7 +4139,10 @@ impl HeadlessExternalGpu {
                 self.perf.pointer_down_received += 1;
                 // Secondary (right-click) requests a context menu at the pointer.
                 // The semantic layer can use this to show a ContextMenu component.
-                if matches!(event.button, Some(neon_ui_schema::UiPointerButton::Secondary)) {
+                if matches!(
+                    event.button,
+                    Some(neon_ui_schema::UiPointerButton::Secondary)
+                ) {
                     let current_hit = ui.hit_binding_at_pointer();
                     return Ok(json!({
                         "state": "context_menu_requested",
@@ -4742,18 +4779,16 @@ impl HeadlessExternalGpu {
         // bounds actually reach the color/depth pass; otherwise the world UI
         // freezes at its first projected position.
         let stage = Instant::now();
-        let has_world_hit_snapshot = snapshots
-            .get(&RenderSurfaceKind::WorldUi)
-            .is_some_and(|fragments| {
-                fragments.values().any(|fragment| {
-                    fragment.effects.iter().any(|effect| {
-                        matches!(
-                            effect,
-                            neon_ui_schema::UiEffect::CameraVisibility { .. }
-                        )
+        let has_world_hit_snapshot =
+            snapshots
+                .get(&RenderSurfaceKind::WorldUi)
+                .is_some_and(|fragments| {
+                    fragments.values().any(|fragment| {
+                        fragment.effects.iter().any(|effect| {
+                            matches!(effect, neon_ui_schema::UiEffect::CameraVisibility { .. })
+                        })
                     })
-                })
-            });
+                });
         if has_world_hit_snapshot {
             self.ui.invalidate_plan();
         }
@@ -7547,7 +7582,9 @@ fn forward_editor_commit(
         pointer: None,
         focus: Some(neon_ui_schema::UiFocusMetadata { focused: true }),
         data_grid_cell: None,
-        text: Some(neon_ui_schema::UiTextInputCommit { value: commit.document }),
+        text: Some(neon_ui_schema::UiTextInputCommit {
+            value: commit.document,
+        }),
         control_value: None,
         drag_drop: None,
     };
@@ -8029,10 +8066,8 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                 }) {
                     if let Some(window) = self.window.as_ref() {
                         window.set_ime_allowed(true);
-                        if let Some(rect) = self
-                            .gpu
-                            .as_ref()
-                            .and_then(|gpu| gpu.ui.editor_ime_rect())
+                        if let Some(rect) =
+                            self.gpu.as_ref().and_then(|gpu| gpu.ui.editor_ime_rect())
                         {
                             window.set_ime_cursor_area(
                                 LogicalPosition::new(rect.x, rect.y),
@@ -8656,10 +8691,15 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                         && let Some(endpoint) = self.ui_endpoint
                     {
                         // 有 binding 但无 intent（点击无事件组件），也发送 ui.click_blank
-                        let sequence = self.gpu.as_mut().map(|gpu| {
-                            gpu.next_semantic_sequence = gpu.next_semantic_sequence.saturating_add(1);
-                            gpu.next_semantic_sequence
-                        }).unwrap_or(0);
+                        let sequence = self
+                            .gpu
+                            .as_mut()
+                            .map(|gpu| {
+                                gpu.next_semantic_sequence =
+                                    gpu.next_semantic_sequence.saturating_add(1);
+                                gpu.next_semantic_sequence
+                            })
+                            .unwrap_or(0);
                         let mut blank_binding = released.binding.clone();
                         blank_binding.intent = Some(neon_ui_schema::UiIntent::Invoke {
                             action: "ui.click_blank".into(),
@@ -8690,10 +8730,15 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                 } else if binding.is_none() {
                     // ID 图返回空 = 点击空白区域，发送 ui.click_blank 语义事件
                     if let Some(endpoint) = self.ui_endpoint {
-                        let sequence = self.gpu.as_mut().map(|gpu| {
-                            gpu.next_semantic_sequence = gpu.next_semantic_sequence.saturating_add(1);
-                            gpu.next_semantic_sequence
-                        }).unwrap_or(0);
+                        let sequence = self
+                            .gpu
+                            .as_mut()
+                            .map(|gpu| {
+                                gpu.next_semantic_sequence =
+                                    gpu.next_semantic_sequence.saturating_add(1);
+                                gpu.next_semantic_sequence
+                            })
+                            .unwrap_or(0);
                         let fragment = neon_ui_schema::UiFragmentRevision {
                             id: neon_ui_schema::UiFragmentId("showcase".into()),
                             revision: self.applied_composition_revision,
@@ -8752,8 +8797,7 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                     };
                     // Code editors scroll themselves; other widgets use the
                     // ordinary scroll path.
-                    gpu.ui.editor_scroll_at_pointer(delta)
-                        || gpu.ui.scroll_wheel_at_pointer(delta)
+                    gpu.ui.editor_scroll_at_pointer(delta) || gpu.ui.scroll_wheel_at_pointer(delta)
                 });
                 if scrolled {
                     self.redraw_pending = true;
@@ -8791,9 +8835,10 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
             }
             WindowEvent::Ime(winit::event::Ime::Commit(value)) => {
                 // Code editors consume IME commits while focused.
-                let editor_committed = self.gpu.as_mut().is_some_and(|gpu| {
-                    gpu.ui.editor_focused() && gpu.ui.editor_ime_commit(&value)
-                });
+                let editor_committed = self
+                    .gpu
+                    .as_mut()
+                    .is_some_and(|gpu| gpu.ui.editor_focused() && gpu.ui.editor_ime_commit(&value));
                 if editor_committed {
                     self.flush_editor_commits();
                     self.redraw_pending = true;
@@ -9163,6 +9208,9 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                 if let Some(gpu) = self.gpu.as_mut() {
                     gpu.ui.sync_material_packages(&gpu.device, &packages);
                     gpu.behind_ui.sync_material_packages(&gpu.device, &packages);
+                    gpu.ui.sync_text_material_packages(&gpu.device, &packages);
+                    gpu.behind_ui
+                        .sync_text_material_packages(&gpu.device, &packages);
                     self.redraw_pending = true;
                 }
             }
@@ -9429,8 +9477,8 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
         if let Some(deadline) = self.data_grid_window_requests.next_deadline() {
             event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
         }
-        let continuous = std::env::var("NEON_CONTINUOUS_RENDER")
-            .is_ok_and(|v| v == "1" || v == "true");
+        let continuous =
+            std::env::var("NEON_CONTINUOUS_RENDER").is_ok_and(|v| v == "1" || v == "true");
         if continuous {
             static CONTINUOUS_LOGGED: std::sync::atomic::AtomicBool =
                 std::sync::atomic::AtomicBool::new(false);
@@ -9770,9 +9818,7 @@ fn handle_window_animation_control(
     let progress = match request.params.get("progress") {
         None => None,
         Some(value) => match value.as_f64() {
-            Some(value) if value.is_finite() && (0.0..=1.0).contains(&value) => {
-                Some(value as f32)
-            }
+            Some(value) if value.is_finite() && (0.0..=1.0).contains(&value) => Some(value as f32),
             _ => {
                 return runtime.reject(
                     request.request_id,
@@ -9802,12 +9848,7 @@ fn handle_window_animation_control(
     }
     match completed_rx.recv_timeout(Duration::from_secs(5)) {
         Ok(Ok(result)) => runtime.accept(request.request_id, result),
-        Ok(Err(code)) => runtime.reject(
-            request.request_id,
-            code,
-            code,
-            None,
-        ),
+        Ok(Err(code)) => runtime.reject(request.request_id, code, code, None),
         Err(_) => runtime.reject(
             request.request_id,
             "window_compositor_timeout",
@@ -10978,7 +11019,9 @@ impl WindowedRuntime {
         if commits.is_empty() {
             return;
         }
-        let Some(endpoint) = self.ui_endpoint else { return };
+        let Some(endpoint) = self.ui_endpoint else {
+            return;
+        };
         let epoch = self.epoch;
         let composition_revision = self.applied_composition_revision;
         let proxy = self.event_proxy.clone();
@@ -12336,8 +12379,13 @@ impl WgpuRuntime {
                     None,
                 );
             }
-            Err(_) => {
-                return self.reject(request_id, "invalid_request", "invalid UI command", None);
+            Err(error) => {
+                return self.reject(
+                    request_id,
+                    "invalid_request",
+                    &format!("invalid UI command: {error}"),
+                    None,
+                );
             }
         };
         let UiCommand::SubmitFragment { submission } = command else {
@@ -14875,13 +14923,13 @@ mod tests {
             text: None,
             image: None,
             surface: None,
-        style: UiStyle {
-            background_color: [0.0, 0.7, 0.9, 1.0],
-            border_color: [1.0; 4],
-            border_width: 0.0,
-            corner_radius: 0.0,
-            opacity: 1.0,
-            transform: neon_ui_schema::UiTransform::default(),
+            style: UiStyle {
+                background_color: [0.0, 0.7, 0.9, 1.0],
+                border_color: [1.0; 4],
+                border_width: 0.0,
+                corner_radius: 0.0,
+                opacity: 1.0,
+                transform: neon_ui_schema::UiTransform::default(),
             },
             enter_transition: None,
             children: Vec::new(),
@@ -14947,10 +14995,10 @@ mod tests {
                     ..UiStyle::default()
                 },
                 enter_transition: None,
-            world_depth: None,
-            world_scale: None,
-            clip_shape: UiClipShape::default(),
-            children: Vec::new(),
+                world_depth: None,
+                world_scale: None,
+                clip_shape: UiClipShape::default(),
+                children: Vec::new(),
             },
             UiNode {
                 node_id: UiNodeId("front".into()),
@@ -14970,10 +15018,10 @@ mod tests {
                 surface: None,
                 style: UiStyle::default(),
                 enter_transition: None,
-            world_depth: None,
-            world_scale: None,
-            clip_shape: UiClipShape::default(),
-            children: Vec::new(),
+                world_depth: None,
+                world_scale: None,
+                clip_shape: UiClipShape::default(),
+                children: Vec::new(),
             },
             UiNode {
                 node_id: UiNodeId("disabled".into()),
@@ -14993,10 +15041,10 @@ mod tests {
                 surface: None,
                 style: UiStyle::default(),
                 enter_transition: None,
-            world_depth: None,
-            world_scale: None,
-            clip_shape: UiClipShape::default(),
-            children: Vec::new(),
+                world_depth: None,
+                world_scale: None,
+                clip_shape: UiClipShape::default(),
+                children: Vec::new(),
             },
             UiNode {
                 node_id: UiNodeId("transparent".into()),

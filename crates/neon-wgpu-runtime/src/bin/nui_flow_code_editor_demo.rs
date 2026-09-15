@@ -35,6 +35,153 @@ const WGPU_ENDPOINT: &str = "127.0.0.1:43110";
 const HOST_ENDPOINT: &str = "127.0.0.1:43111";
 const FIXTURE: &str = include_str!("../../tests/fixtures/ui/code-editor-demo.nui");
 
+/// `pulse-neon-text` — A-route bitmap neon for editor/UI text. The unified
+/// text pipeline samples the glyph atlas with 1px + 2px rings and hands the
+/// package `edge_ink`; the package only mixes colors (pure function, no GPU
+/// bindings of its own). Tuning comes from `view.extras[0]`:
+///   x: glow strength (default 1.0), y: pulse Hz (0 = steady),
+///   z: hue drift speed (default 0.15), w: chroma mix (default 0.9).
+const PULSE_NEON_SOURCE: &str = r#"
+fn text_material(input: TextMaterialInput) -> vec4<f32> {
+    let tuning = view.extras[0];
+    let strength = select(1.6, tuning.x, tuning.x > 0.0);
+    let pulse_hz = max(0.0, tuning.y);
+    let hue_speed = select(0.12, tuning.z, tuning.z > 0.0);
+    let chroma = select(0.95, tuning.w, tuning.w > 0.0);
+    let time = input.time_seconds;
+    let ink = input.edge_ink;
+    let core = smoothstep(0.08, 0.55, input.coverage);
+    // Cyan -> violet -> pink travelling palette (per-glyph phase so the
+    // gradient shimmers along the line instead of blinking uniformly).
+    let a = vec3<f32>(0.35, 0.85, 1.0);
+    let b = vec3<f32>(0.60, 0.35, 1.0);
+    let c = vec3<f32>(1.0, 0.32, 0.72);
+    let d = vec3<f32>(0.0, 0.4, 0.8);
+    let hue = a + b * cos(6.283185307 * (c * (time * hue_speed + input.local_position.x * 0.22) + d));
+    // Layered A-route glow: tight halo, wide bloom, and an inner hot core.
+    let halo = pow(ink, 3.0) * strength * 1.5;
+    let bloom = pow(ink, 1.35) * strength * 0.85;
+    let inner = core * core * 1.9;
+    let pulse = 0.75 + 0.25 * sin(time * 6.283185307 * pulse_hz);
+    let base = input.base_color.rgb;
+    let hue_mix = mix(base, hue, chroma * (1.0 - core * 0.45));
+    let rgb = hue_mix * (inner + (halo + bloom) * pulse * (1.0 - core * 0.5));
+    let alpha = clamp(max(core * 1.25, (halo + bloom) * 0.48), 0.0, 1.0);
+    return vec4<f32>(rgb, alpha);
+}
+"#;
+const TEXT_SWEEP_SOURCE: &str = r#"
+fn text_material(input: TextMaterialInput) -> vec4<f32> {
+    let tuning = view.extras[0];
+    let speed = select(1.2, tuning.x, tuning.x > 0.0);
+    let block_w = select(0.035, tuning.y, tuning.y > 0.0);
+    let strength = select(3.0, tuning.z, tuning.z > 0.0);
+    let slope = select(0.8, tuning.w, tuning.w > 0.0);
+    let time = input.time_seconds;
+    let core = smoothstep(0.08, 0.6, input.coverage);
+    // ONE small diagonal highlight. `p` is the block position along the line
+    // (wraps via fract); `g` is each glyph's position in the same period
+    // (period ~833px > line width, so at most one block is visible). Only the
+    // glyph nearest the block centre lights up; the block centre's y follows
+    // the block position so the highlight sweeps left -> right on a diagonal.
+    let p = fract(time * speed);
+    let g = fract(input.bounds.x * 0.0012 + 0.5);
+    let d = fract(p - g + 0.5) - 0.5;
+    let gx = exp(-pow(d / block_w, 2.0));
+    let block_cy = 0.5 + (p - 0.5) * slope;
+    let gy = exp(-pow((input.local_position.y - block_cy) / 0.22, 2.0));
+    let block = gx * gy;
+    // Very dark ink base; only the block inside glyph strokes brightens.
+    let base = input.base_color.rgb * (0.22 + 0.22 * core);
+    let light = vec3<f32>(0.85, 0.97, 1.0);
+    let lit = base + light * block * strength * core;
+    return vec4<f32>(lit, core);
+}
+"#;
+const TEXT_DISTORT_SOURCE: &str = r#"
+// Displacement hook: warps the glyph sample coordinates in UV space. The
+// renderer detects this function and routes every glyph sample through it.
+fn text_material_displace(uv: vec2<f32>, origin: vec2<f32>, span: vec2<f32>, pixel: vec2<f32>, local: vec2<f32>, time: f32) -> vec2<f32> {
+    let atlas = vec2<f32>(textureDimensions(glyph_atlas));
+    let amp = 0.55;
+    let wob_x = sin(time * 3.2 + pixel.y * 0.09 + local.y * 7.0) * amp;
+    let wob_y = sin(time * 2.4 + pixel.x * 0.07 + local.x * 9.0) * amp * 0.6;
+    let uv_space = vec2<f32>(wob_x, wob_y) / atlas;
+    // Keep the warp inside the glyph's own rect so neighbours never bleed in.
+    let max_warp = min(span * 0.45, vec2<f32>(0.5) / atlas);
+    return uv + clamp(uv_space, -max_warp, max_warp);
+}
+fn text_material(input: TextMaterialInput) -> vec4<f32> {
+    let tuning = view.extras[0];
+    let strength = select(1.1, tuning.x, tuning.x > 0.0);
+    let time = input.time_seconds;
+    let core = smoothstep(0.06, 0.55, input.coverage);
+    let water = vec3<f32>(0.25, 0.8, 1.0);
+    let deep = vec3<f32>(0.1, 0.4, 0.9);
+    let sheen = 0.5 + 0.5 * sin(time * 3.2 + input.bounds.x * 0.02 + input.local_position.y * 6.0);
+    let hue = mix(deep, water, sheen);
+    let base = mix(input.base_color.rgb, hue, 0.6);
+    let halo = pow(input.edge_ink, 2.2) * strength * 0.7;
+    let rgb = base * (0.7 + 0.5 * core) + hue * halo * 0.8;
+    let alpha = clamp(max(core, halo * 0.5), 0.0, 1.0);
+    return vec4<f32>(rgb, alpha);
+}
+"#;
+const RAINBOW_SOURCE: &str = r#"
+fn hsv_to_rgb(h: f32) -> vec3<f32> {
+    let r = 0.5 + 0.5 * cos(6.283185307 * h);
+    let g = 0.5 + 0.5 * cos(6.283185307 * (h + 0.3333333));
+    let b = 0.5 + 0.5 * cos(6.283185307 * (h + 0.6666667));
+    return vec3<f32>(r, g, b);
+}
+fn text_material(input: TextMaterialInput) -> vec4<f32> {
+    let tuning = view.extras[0];
+    let speed = select(0.22, tuning.x, tuning.x > 0.0);
+    let chroma = select(0.95, tuning.y, tuning.y > 0.0);
+    let time = input.time_seconds;
+    let core = smoothstep(0.06, 0.55, input.coverage);
+    // Hue travels along the line (bounds.x) and drifts with time; the glyph
+    // quad's local y adds a soft vertical gradient for a prism feel.
+    let h = fract(time * speed + input.bounds.x * 0.012 + input.local_position.y * 0.35);
+    let hue = hsv_to_rgb(h);
+    let base = input.base_color.rgb;
+    let rgb = mix(base, hue * (0.7 + 0.5 * input.coverage), chroma * (0.55 + 0.45 * input.coverage));
+    let fringe = pow(input.edge_ink, 1.8) * 0.4;
+    let rgb_fringe = rgb + hue * fringe;
+    let alpha = clamp(max(core, fringe * 0.6), 0.0, 1.0);
+    return vec4<f32>(rgb, alpha);
+}
+"#;
+const AURORA_SOURCE: &str = r#"
+fn text_material(input: TextMaterialInput) -> vec4<f32> {
+    let tuning = view.extras[0];
+    let speed = select(0.18, tuning.x, tuning.x > 0.0);
+    let strength = select(1.2, tuning.y, tuning.y > 0.0);
+    let time = input.time_seconds;
+    let core = smoothstep(0.06, 0.55, input.coverage);
+    // Two flowing aurora bands (green-teal and violet) crossing the glyph.
+    let g = sin(time * speed * 6.283185307 + input.bounds.x * 0.013 + input.local_position.y * 5.0);
+    let v = sin(time * speed * 6.283185307 * 0.7 + input.bounds.x * 0.009 - input.local_position.y * 4.0 + 2.0);
+    let aurora = vec3<f32>(0.15, 0.9, 0.55) * (0.55 + 0.45 * g)
+               + vec3<f32>(0.55, 0.35, 1.0) * (0.45 - 0.35 * v);
+    let base = mix(input.base_color.rgb, aurora, 0.6 * (1.0 - core * 0.35));
+    let halo = pow(input.edge_ink, 2.5) * strength * 0.8;
+    let rgb = base * (0.65 + 0.6 * core) + aurora * halo;
+    let alpha = clamp(max(core, halo * 0.5), 0.0, 1.0);
+    return vec4<f32>(rgb, alpha);
+}
+"#;
+/// FNV-1a 64, identical to `neon-wgpu-runtime::shader_registry::shader_source_digest`
+/// so the control-plane digest check accepts the demo package.
+fn shader_digest(bytes: &[u8]) -> String {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
 fn main() {
     let wgpu_endpoint: SocketAddr = WGPU_ENDPOINT.parse().expect("wgpu endpoint is valid");
     let host_endpoint: SocketAddr = HOST_ENDPOINT.parse().expect("host endpoint is valid");
@@ -57,6 +204,7 @@ fn main() {
     //    The window event loop must live on the main thread, so the submitter
     //    retries from a helper thread until the window server is ready.
     let submitter = std::thread::spawn(move || {
+        register_text_shader_package(wgpu_endpoint);
         submit_code_editor_fragment(wgpu_endpoint, fragment);
     });
 
@@ -77,6 +225,90 @@ fn main() {
     }
 }
 
+fn register_text_shader_package(wgpu_endpoint: SocketAddr) {
+    let packages = [
+        (
+            "pulse-neon-text",
+            PULSE_NEON_SOURCE,
+            "code-editor-demo-register-neon-text-v1",
+        ),
+        (
+            "text-sweep",
+            TEXT_SWEEP_SOURCE,
+            "code-editor-demo-register-sweep-v1",
+        ),
+        (
+            "text-distort",
+            TEXT_DISTORT_SOURCE,
+            "code-editor-demo-register-distort-v1",
+        ),
+        (
+            "rainbow-chroma",
+            RAINBOW_SOURCE,
+            "code-editor-demo-register-rainbow-v1",
+        ),
+        (
+            "aurora-glow",
+            AURORA_SOURCE,
+            "code-editor-demo-register-aurora-v1",
+        ),
+    ];
+    let mut last_error = String::new();
+    for (package_id, source, idem_key) in packages {
+        let package = neon_ui_schema::UiShaderPackage {
+            package_id: package_id.into(),
+            version: 1,
+            source_digest: shader_digest(source.as_bytes()),
+            source_bytes: source.as_bytes().to_vec(),
+            entry_point: "text_material".into(),
+            fallback: "standard_text".into(),
+            parameters: Vec::new(),
+        };
+        let registration = RpcRequest {
+            protocol: "neon3.rpc".into(),
+            version: ProtocolVersion { major: 1, minor: 0 },
+            request_id: RequestId(format!("code-editor-demo-register-{package_id}")),
+            client: ClientIdentity {
+                kind: ClientKind::Cli,
+                instance_id: "nui-flow-code-editor-demo".into(),
+                pid: std::process::id(),
+                origin: "nui-flow-code-editor-demo".into(),
+            },
+            target: ServiceName("wgpu-runtime".into()),
+            method: "wgpu.shader.register".into(),
+            params: json!({ "package": package }),
+            expected_revision: None,
+            idempotency_key: Some(idem_key.into()),
+        };
+        let mut registered = false;
+        for attempt in 1..=40 {
+            match RpcClient::connect(wgpu_endpoint)
+                .and_then(|mut client| client.call(&registration))
+            {
+                Ok(response) if response.status == RpcStatus::Accepted => {
+                    eprintln!(
+                        "{{\"probe\":\"code-editor-demo\",\"stage\":\"text_shader_registered\",\"package\":\"{package_id}\",\"attempt\":{attempt}}}"
+                    );
+                    registered = true;
+                    break;
+                }
+                Ok(response) => {
+                    last_error = format!("{response:?}");
+                }
+                Err(err) => {
+                    last_error = format!("{err}");
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(125));
+        }
+        if !registered {
+            eprintln!(
+                "{{\"probe\":\"code-editor-demo\",\"stage\":\"text_shader_register_failed\",\"package\":\"{package_id}\",\"error\":\"{last_error}\"}}"
+            );
+            std::process::exit(1);
+        }
+    }
+}
 fn submit_code_editor_fragment(wgpu_endpoint: SocketAddr, fragment: UiFragment) {
     let submission = RpcRequest {
         protocol: "neon3.rpc".into(),

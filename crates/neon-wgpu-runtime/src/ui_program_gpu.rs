@@ -1,4 +1,4 @@
-﻿//! Renderer-private adapter for the static UI program contract.
+//! Renderer-private adapter for the static UI program contract.
 //!
 //! This module is intentionally the only place that turns a `UiProgram` into
 //! WGPU buffers.  Its sampled layout output is diagnostic data, never an input
@@ -395,9 +395,13 @@ fn pack_inputs(inputs: &UiResolvedInputs, budget: &UiResourceBudget) -> Vec<u8> 
     let mut bytes = vec![0; (budget.max_bindings.max(1) as usize) * 16];
     let mut slot_cursor = 0usize;
     for value in inputs.values.values() {
-        if slot_cursor >= budget.max_bindings as usize { break; }
+        if slot_cursor >= budget.max_bindings as usize {
+            break;
+        }
         for slot in flatten_value(&value.value) {
-            if slot_cursor >= budget.max_bindings as usize { break; }
+            if slot_cursor >= budget.max_bindings as usize {
+                break;
+            }
             bytes[slot_cursor * 16..slot_cursor * 16 + 16].copy_from_slice(&slot);
             slot_cursor += 1;
         }
@@ -410,12 +414,16 @@ fn flatten_value(value: &UiInputValue) -> Vec<[u8; 16]> {
     match value {
         UiInputValue::Struct { fields } => {
             let mut slots = Vec::with_capacity(fields.len());
-            for field_value in fields.values() { slots.extend(flatten_value(field_value)); }
+            for field_value in fields.values() {
+                slots.extend(flatten_value(field_value));
+            }
             slots
         }
         UiInputValue::Array { elements, .. } => {
             let mut slots = Vec::with_capacity(elements.len());
-            for element in elements { slots.extend(flatten_value(element)); }
+            for element in elements {
+                slots.extend(flatten_value(element));
+            }
             slots
         }
         scalar => vec![pack_single_slot(scalar)],
@@ -454,7 +462,10 @@ fn pack_single_slot(value: &UiInputValue) -> [u8; 16] {
         }
         // Enum is resolved on the CPU side (branch predicates), not sampled in shaders.
         // CanvasData has no scalar GPU representation.
-        UiInputValue::Enum { .. } | UiInputValue::CanvasData { .. } | UiInputValue::Struct { .. } | UiInputValue::Array { .. } => {}
+        UiInputValue::Enum { .. }
+        | UiInputValue::CanvasData { .. }
+        | UiInputValue::Struct { .. }
+        | UiInputValue::Array { .. } => {}
     }
     bytes
 }
@@ -464,7 +475,9 @@ fn slot_index_map(inputs: &UiResolvedInputs, budget: &UiResourceBudget) -> BTree
     let mut map = BTreeMap::new();
     let mut cursor = 0usize;
     for (key, value) in inputs.values.iter() {
-        if cursor >= budget.max_bindings as usize { break; }
+        if cursor >= budget.max_bindings as usize {
+            break;
+        }
         map.insert(key.clone(), cursor);
         cursor += flatten_value(&value.value).len();
     }
@@ -476,7 +489,9 @@ fn resolve_field_path<'a>(value: &'a UiInputValue, path: &str) -> Option<&'a UiI
     let mut current = value;
     for segment in path.split('.') {
         match current {
-            UiInputValue::Struct { fields } => { current = fields.get(segment)?; }
+            UiInputValue::Struct { fields } => {
+                current = fields.get(segment)?;
+            }
             _ => return None,
         }
     }
@@ -488,7 +503,9 @@ fn pack_changed_slots(
     inputs: &UiResolvedInputs,
     budget: &UiResourceBudget,
 ) -> Vec<(u64, [u8; 16])> {
-    if inputs.changed_slots.is_empty() { return Vec::new(); }
+    if inputs.changed_slots.is_empty() {
+        return Vec::new();
+    }
     let index_map = slot_index_map(inputs, budget);
     let mut updates = Vec::with_capacity(inputs.changed_slots.len());
     for key in &inputs.changed_slots {
@@ -496,13 +513,19 @@ fn pack_changed_slots(
             Some((top, rest)) => (top, Some(rest)),
             None => (key.as_str(), None),
         };
-        let Some(&base_index) = index_map.get(top_key) else { continue; };
-        let Some(resolved) = inputs.values.get(top_key) else { continue; };
+        let Some(&base_index) = index_map.get(top_key) else {
+            continue;
+        };
+        let Some(resolved) = inputs.values.get(top_key) else {
+            continue;
+        };
         match field_path {
             None => {
                 for (i, slot) in flatten_value(&resolved.value).iter().enumerate() {
                     let idx = base_index + i;
-                    if idx < budget.max_bindings as usize { updates.push(((idx * 16) as u64, *slot)); }
+                    if idx < budget.max_bindings as usize {
+                        updates.push(((idx * 16) as u64, *slot));
+                    }
                 }
             }
             Some(path) => {
@@ -512,14 +535,19 @@ fn pack_changed_slots(
                     for segment in path.split('.') {
                         if let UiInputValue::Struct { fields } = current {
                             for (k, v) in fields {
-                                if k == segment { current = v; break; }
+                                if k == segment {
+                                    current = v;
+                                    break;
+                                }
                                 offset += flatten_value(v).len();
                             }
                         }
                     }
                     for (i, slot) in flatten_value(field_value).iter().enumerate() {
                         let idx = base_index + offset + i;
-                        if idx < budget.max_bindings as usize { updates.push(((idx * 16) as u64, *slot)); }
+                        if idx < budget.max_bindings as usize {
+                            updates.push(((idx * 16) as u64, *slot));
+                        }
                     }
                 }
             }
@@ -666,7 +694,12 @@ mod tests {
 
     #[test]
     fn pack_inputs_vec4_packs_xyzw_full_slot() {
-        let inputs = make_inputs(vec![("v", UiInputValue::Vec4 { value: [0.1, 0.2, 0.3, 0.4] })]);
+        let inputs = make_inputs(vec![(
+            "v",
+            UiInputValue::Vec4 {
+                value: [0.1, 0.2, 0.3, 0.4],
+            },
+        )]);
         let bytes = pack_inputs(&inputs, &test_budget(4));
         let expected: [f32; 4] = [0.1, 0.2, 0.3, 0.4];
         for i in 0..4 {
@@ -676,7 +709,12 @@ mod tests {
 
     #[test]
     fn pack_inputs_color_packs_rgba_full_slot() {
-        let inputs = make_inputs(vec![("c", UiInputValue::Color { value: [1.0, 0.5, 0.0, 0.8] })]);
+        let inputs = make_inputs(vec![(
+            "c",
+            UiInputValue::Color {
+                value: [1.0, 0.5, 0.0, 0.8],
+            },
+        )]);
         let bytes = pack_inputs(&inputs, &test_budget(4));
         let expected: [f32; 4] = [1.0, 0.5, 0.0, 0.8];
         for i in 0..4 {
@@ -689,7 +727,12 @@ mod tests {
         let inputs = make_inputs(vec![
             ("a", UiInputValue::F32 { value: 1.0 }),
             ("b", UiInputValue::Vec2 { value: [2.0, 3.0] }),
-            ("c", UiInputValue::Vec4 { value: [4.0, 5.0, 6.0, 7.0] }),
+            (
+                "c",
+                UiInputValue::Vec4 {
+                    value: [4.0, 5.0, 6.0, 7.0],
+                },
+            ),
         ]);
         let bytes = pack_inputs(&inputs, &test_budget(4));
         // BTreeMap sorts by key: a, b, c
@@ -716,7 +759,12 @@ mod tests {
     #[test]
     fn pack_inputs_enum_leaves_slot_zero() {
         // Enum is CPU-side only; GPU slot should be zeroed.
-        let inputs = make_inputs(vec![("mode", UiInputValue::Enum { value: "compact".into() })]);
+        let inputs = make_inputs(vec![(
+            "mode",
+            UiInputValue::Enum {
+                value: "compact".into(),
+            },
+        )]);
         let bytes = pack_inputs(&inputs, &test_budget(2));
         assert_eq!(&bytes[0..16], &[0u8; 16]);
     }
@@ -790,8 +838,18 @@ mod tests {
         // 16-byte region in the full pack.
         let inputs = make_inputs_with_changes(
             vec![
-                ("a", UiInputValue::Vec4 { value: [0.1, 0.2, 0.3, 0.4] }),
-                ("b", UiInputValue::Color { value: [1.0, 0.0, 0.0, 1.0] }),
+                (
+                    "a",
+                    UiInputValue::Vec4 {
+                        value: [0.1, 0.2, 0.3, 0.4],
+                    },
+                ),
+                (
+                    "b",
+                    UiInputValue::Color {
+                        value: [1.0, 0.0, 0.0, 1.0],
+                    },
+                ),
             ],
             vec!["b"],
         );
@@ -806,7 +864,9 @@ mod tests {
 
     fn struct_value(fields: Vec<(&str, UiInputValue)>) -> UiInputValue {
         let mut map = TestBTreeMap::new();
-        for (k, v) in fields { map.insert(k.to_string(), v); }
+        for (k, v) in fields {
+            map.insert(k.to_string(), v);
+        }
         UiInputValue::Struct { fields: map }
     }
 
@@ -816,7 +876,15 @@ mod tests {
         let player = struct_value(vec![
             ("hp", UiInputValue::F32 { value: 0.8 }),
             ("level", UiInputValue::U32 { value: 42 }),
-            ("name", UiInputValue::TextHandle { value: neon_ui_schema::UiTextHandle { id: 7, generation: 1 } }),
+            (
+                "name",
+                UiInputValue::TextHandle {
+                    value: neon_ui_schema::UiTextHandle {
+                        id: 7,
+                        generation: 1,
+                    },
+                },
+            ),
         ]);
         let inputs = make_inputs(vec![("player", player)]);
         let bytes = pack_inputs(&inputs, &test_budget(8));
@@ -894,7 +962,7 @@ mod tests {
         let inputs = make_inputs_with_changes(vec![("player", player)], vec!["player"]);
         let updates = pack_changed_slots(&inputs, &test_budget(4));
         assert_eq!(updates.len(), 2);
-        assert_eq!(updates[0].0, 0);  // hp
+        assert_eq!(updates[0].0, 0); // hp
         assert_eq!(updates[1].0, 16); // mp
     }
 
@@ -919,14 +987,27 @@ mod tests {
     fn array_of_struct_flattens_all_fields_contiguously() {
         let make_slot = |count: u32| {
             struct_value(vec![
-                ("item", UiInputValue::TextHandle { value: neon_ui_schema::UiTextHandle { id: 0, generation: 0 } }),
+                (
+                    "item",
+                    UiInputValue::TextHandle {
+                        value: neon_ui_schema::UiTextHandle {
+                            id: 0,
+                            generation: 0,
+                        },
+                    },
+                ),
                 ("count", UiInputValue::U32 { value: count }),
             ])
         };
         let arr = UiInputValue::Array {
             elements: vec![make_slot(3), make_slot(5)],
             element_kind: Box::new(neon_ui_schema::UiInputKind::Struct {
-                fields: [("item".into(), neon_ui_schema::UiInputKind::TextHandle), ("count".into(), neon_ui_schema::UiInputKind::U32)].into_iter().collect()
+                fields: [
+                    ("item".into(), neon_ui_schema::UiInputKind::TextHandle),
+                    ("count".into(), neon_ui_schema::UiInputKind::U32),
+                ]
+                .into_iter()
+                .collect(),
             }),
         };
         let slots = flatten_value(&arr);
@@ -940,11 +1021,19 @@ mod tests {
     #[test]
     fn array_gpu_slot_count_matches_length() {
         use neon_ui_schema::UiInputKind;
-        let kind = UiInputKind::Array { element_kind: Box::new(UiInputKind::F32), length: 24 };
+        let kind = UiInputKind::Array {
+            element_kind: Box::new(UiInputKind::F32),
+            length: 24,
+        };
         assert_eq!(kind.gpu_slot_count(), 24);
         let struct_kind = UiInputKind::Array {
             element_kind: Box::new(UiInputKind::Struct {
-                fields: [("a".into(), UiInputKind::F32), ("b".into(), UiInputKind::F32)].into_iter().collect()
+                fields: [
+                    ("a".into(), UiInputKind::F32),
+                    ("b".into(), UiInputKind::F32),
+                ]
+                .into_iter()
+                .collect(),
             }),
             length: 10,
         };

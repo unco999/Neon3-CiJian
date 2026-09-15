@@ -4,38 +4,39 @@
 //! DirectComposition surface handle, and WinRT Composition consumes that same
 //! surface in the single DesktopWindowTarget tree.
 
-use windows::core::{implement, Interface, PCWSTR};
-use windows::Graphics::IGeometrySource2D;
 use windows::Foundation::{IPropertyValue, PropertyValue};
 use windows::Graphics::Effects::{
-    IGraphicsEffect, IGraphicsEffectSource, IGraphicsEffectSource_Impl, IGraphicsEffect_Impl,
+    IGraphicsEffect, IGraphicsEffect_Impl, IGraphicsEffectSource, IGraphicsEffectSource_Impl,
 };
+use windows::Graphics::IGeometrySource2D;
+use windows::UI::Color;
 use windows::UI::Composition::Desktop::DesktopWindowTarget;
 use windows::UI::Composition::{
-    Compositor, CompositionEffectBrush, CompositionEffectSourceParameter, CompositionPath,
-    CompositionSurfaceBrush, ContainerVisual, SpriteVisual,
+    CompositionEffectBrush, CompositionEffectSourceParameter, CompositionPath,
+    CompositionSurfaceBrush, Compositor, ContainerVisual, SpriteVisual,
 };
-use windows::UI::Color;
 use windows::Win32::Foundation::{GENERIC_ALL, HANDLE, HWND};
-use windows::Win32::Graphics::Direct2D::{
-    D2D1CreateFactory, ID2D1Factory, D2D1_FACTORY_TYPE_SINGLE_THREADED,
-};
 use windows::Win32::Graphics::Direct2D::Common::{
     D2D1_FIGURE_BEGIN_FILLED, D2D1_FIGURE_END_CLOSED, D2D1_FILL_MODE_WINDING,
 };
-use windows::Win32::Graphics::DirectComposition::DCompositionCreateSurfaceHandle;
-use windows::Win32::System::WinRT::Composition::{
-    ICompositorDesktopInterop, ICompositorInterop,
+use windows::Win32::Graphics::Direct2D::{
+    D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1CreateFactory, ID2D1Factory,
 };
+use windows::Win32::Graphics::DirectComposition::DCompositionCreateSurfaceHandle;
+use windows::Win32::System::WinRT::Composition::{ICompositorDesktopInterop, ICompositorInterop};
 use windows::Win32::System::WinRT::Graphics::Direct2D::{
     GRAPHICS_EFFECT_PROPERTY_MAPPING, GRAPHICS_EFFECT_PROPERTY_MAPPING_DIRECT,
     IGeometrySource2DInterop, IGeometrySource2DInterop_Impl, IGraphicsEffectD2D1Interop,
     IGraphicsEffectD2D1Interop_Impl,
 };
+use windows::core::{Interface, PCWSTR, implement};
 use windows_numerics::{Vector2, Vector3};
 
 const CLSID_D2D1_GAUSSIAN_BLUR: windows::core::GUID = windows::core::GUID::from_values(
-    0x1feb6d69, 0x2fe6, 0x4ac9, [0x8c, 0x58, 0x1d, 0x7f, 0x93, 0xe7, 0xa6, 0xa5],
+    0x1feb6d69,
+    0x2fe6,
+    0x4ac9,
+    [0x8c, 0x58, 0x1d, 0x7f, 0x93, 0xe7, 0xa6, 0xa5],
 );
 
 fn invalid_param() -> windows::core::Error {
@@ -90,7 +91,9 @@ impl IGraphicsEffectD2D1Interop_Impl for GaussianBlurEffect_Impl {
         }
         Ok(())
     }
-    fn GetPropertyCount(&self) -> windows::core::Result<u32> { Ok(3) }
+    fn GetPropertyCount(&self) -> windows::core::Result<u32> {
+        Ok(3)
+    }
     fn GetProperty(&self, index: u32) -> windows::core::Result<IPropertyValue> {
         let value = match index {
             0 => PropertyValue::CreateSingle(self.blur_amount)?,
@@ -101,9 +104,13 @@ impl IGraphicsEffectD2D1Interop_Impl for GaussianBlurEffect_Impl {
         value.cast()
     }
     fn GetSource(&self, index: u32) -> windows::core::Result<IGraphicsEffectSource> {
-        (index == 0).then(|| self.source.clone()).ok_or_else(invalid_param)
+        (index == 0)
+            .then(|| self.source.clone())
+            .ok_or_else(invalid_param)
     }
-    fn GetSourceCount(&self) -> windows::core::Result<u32> { Ok(1) }
+    fn GetSourceCount(&self) -> windows::core::Result<u32> {
+        Ok(1)
+    }
 }
 
 /// `ID2D1PathGeometry` is a native Direct2D object and does not implement the
@@ -125,24 +132,34 @@ impl IGeometrySource2DInterop_Impl for GeometrySource2D_Impl {
 
     fn TryGetGeometryUsingFactory(
         &self,
-        _factory: windows::core::Ref<
-            windows::Win32::Graphics::Direct2D::ID2D1Factory,
-        >,
+        _factory: windows::core::Ref<windows::Win32::Graphics::Direct2D::ID2D1Factory>,
     ) -> windows::core::Result<windows::Win32::Graphics::Direct2D::ID2D1Geometry> {
         Ok(self.geometry.clone())
     }
 }
 
 fn backdrop_tint() -> (Color, f32) {
-    let rgb = std::env::var("NEON_BACKDROP_TINT").ok()
+    let rgb = std::env::var("NEON_BACKDROP_TINT")
+        .ok()
         .and_then(|s| s.strip_prefix('#').map(str::to_owned))
         .filter(|s| s.len() == 6)
         .and_then(|s| u32::from_str_radix(&s, 16).ok())
         .map(|v| ((v >> 16) as u8, (v >> 8) as u8, v as u8))
         .unwrap_or((0, 0, 0));
-    let opacity = std::env::var("NEON_BACKDROP_TINT_OPACITY").ok()
-        .and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.28).clamp(0.0, 1.0);
-    (Color { A: 255, R: rgb.0, G: rgb.1, B: rgb.2 }, opacity)
+    let opacity = std::env::var("NEON_BACKDROP_TINT_OPACITY")
+        .ok()
+        .and_then(|s| s.parse::<f32>().ok())
+        .unwrap_or(0.28)
+        .clamp(0.0, 1.0);
+    (
+        Color {
+            A: 255,
+            R: rgb.0,
+            G: rgb.1,
+            B: rgb.2,
+        },
+        opacity,
+    )
 }
 
 /// Resolve the shell polygon in the same local coordinate space as the
@@ -170,10 +187,9 @@ fn create_shell_clip(
     bounds: [f32; 4],
     cut: [f32; 4],
 ) -> Result<windows::UI::Composition::CompositionGeometricClip, AcrylicError> {
-    let factory: ID2D1Factory = unsafe {
-        D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)
-    }
-    .map_err(|e| AcrylicError::Message(format!("D2D1CreateFactory: {e:?}")))?;
+    let factory: ID2D1Factory =
+        unsafe { D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None) }
+            .map_err(|e| AcrylicError::Message(format!("D2D1CreateFactory: {e:?}")))?;
     let geometry = unsafe { factory.CreatePathGeometry() }
         .map_err(|e| AcrylicError::Message(format!("CreatePathGeometry: {e:?}")))?;
     let sink = unsafe { geometry.Open() }
@@ -238,7 +254,9 @@ impl Clone for ShellGeometryCache {
 }
 
 #[derive(Debug)]
-pub enum AcrylicError { Message(String) }
+pub enum AcrylicError {
+    Message(String),
+}
 impl std::fmt::Display for AcrylicError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let Self::Message(message) = self;
@@ -249,78 +267,177 @@ impl std::error::Error for AcrylicError {}
 
 impl AcrylicHost {
     pub fn new(hwnd: HWND, width: u32, height: u32) -> Result<Self, AcrylicError> {
-        let compositor = Compositor::new().map_err(|e| AcrylicError::Message(format!("Compositor::new: {e:?}")))?;
-        let desktop: ICompositorDesktopInterop = compositor.cast().map_err(|e| AcrylicError::Message(format!("desktop interop: {e:?}")))?;
-        let target = unsafe { desktop.CreateDesktopWindowTarget(hwnd, false) }.map_err(|e| AcrylicError::Message(format!("desktop target: {e:?}")))?;
-        let source: IGraphicsEffectSource = CompositionEffectSourceParameter::Create(&windows::core::HSTRING::from("backdrop"))
-            .map_err(|e| AcrylicError::Message(format!("source parameter: {e:?}")))?.cast()
-            .map_err(|e| AcrylicError::Message(format!("source cast: {e:?}")))?;
+        let compositor = Compositor::new()
+            .map_err(|e| AcrylicError::Message(format!("Compositor::new: {e:?}")))?;
+        let desktop: ICompositorDesktopInterop = compositor
+            .cast()
+            .map_err(|e| AcrylicError::Message(format!("desktop interop: {e:?}")))?;
+        let target = unsafe { desktop.CreateDesktopWindowTarget(hwnd, false) }
+            .map_err(|e| AcrylicError::Message(format!("desktop target: {e:?}")))?;
+        let source: IGraphicsEffectSource =
+            CompositionEffectSourceParameter::Create(&windows::core::HSTRING::from("backdrop"))
+                .map_err(|e| AcrylicError::Message(format!("source parameter: {e:?}")))?
+                .cast()
+                .map_err(|e| AcrylicError::Message(format!("source cast: {e:?}")))?;
         let effect = GaussianBlurEffect {
             name: std::cell::RefCell::new(windows::core::HSTRING::from("GaussianBlurEffect")),
-            blur_amount: std::env::var("NEON_BLUR_AMOUNT").ok().and_then(|s| s.parse().ok()).unwrap_or(8.0),
-            optimization: 1, border_mode: 1, source,
+            blur_amount: std::env::var("NEON_BLUR_AMOUNT")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(8.0),
+            optimization: 1,
+            border_mode: 1,
+            source,
         };
         let effect_interface: IGraphicsEffect = effect.into();
-        let factory = compositor.CreateEffectFactory(&effect_interface).map_err(|e| AcrylicError::Message(format!("effect factory: {e:?}")))?;
-        let effect_brush = factory.CreateBrush().map_err(|e| AcrylicError::Message(format!("effect brush: {e:?}")))?;
-        let backdrop_brush = compositor.CreateBackdropBrush().map_err(|e| AcrylicError::Message(format!("backdrop brush: {e:?}")))?;
-        effect_brush.SetSourceParameter(&windows::core::HSTRING::from("backdrop"), &backdrop_brush)
+        let factory = compositor
+            .CreateEffectFactory(&effect_interface)
+            .map_err(|e| AcrylicError::Message(format!("effect factory: {e:?}")))?;
+        let effect_brush = factory
+            .CreateBrush()
+            .map_err(|e| AcrylicError::Message(format!("effect brush: {e:?}")))?;
+        let backdrop_brush = compositor
+            .CreateBackdropBrush()
+            .map_err(|e| AcrylicError::Message(format!("backdrop brush: {e:?}")))?;
+        effect_brush
+            .SetSourceParameter(&windows::core::HSTRING::from("backdrop"), &backdrop_brush)
             .map_err(|e| AcrylicError::Message(format!("bind backdrop: {e:?}")))?;
         let size = Vector2::new(width.max(1) as f32, height.max(1) as f32);
-        let blur_sprite = compositor.CreateSpriteVisual().map_err(|e| AcrylicError::Message(format!("blur visual: {e:?}")))?;
-        blur_sprite.SetBrush(&effect_brush).and_then(|_| blur_sprite.SetSize(size)).map_err(|e| AcrylicError::Message(format!("blur visual setup: {e:?}")))?;
+        let blur_sprite = compositor
+            .CreateSpriteVisual()
+            .map_err(|e| AcrylicError::Message(format!("blur visual: {e:?}")))?;
+        blur_sprite
+            .SetBrush(&effect_brush)
+            .and_then(|_| blur_sprite.SetSize(size))
+            .map_err(|e| AcrylicError::Message(format!("blur visual setup: {e:?}")))?;
         let (tint, opacity) = backdrop_tint();
-        let tint_brush = compositor.CreateColorBrushWithColor(tint).map_err(|e| AcrylicError::Message(format!("tint brush: {e:?}")))?;
-        let tint_sprite = compositor.CreateSpriteVisual().map_err(|e| AcrylicError::Message(format!("tint visual: {e:?}")))?;
-        tint_sprite.SetBrush(&tint_brush).and_then(|_| tint_sprite.SetSize(size)).and_then(|_| tint_sprite.SetOpacity(opacity)).map_err(|e| AcrylicError::Message(format!("tint visual setup: {e:?}")))?;
-        let handle = unsafe { DCompositionCreateSurfaceHandle(GENERIC_ALL.0, None) }.map_err(|e| AcrylicError::Message(format!("surface handle: {e:?}")))?;
-        let behind_handle = unsafe { DCompositionCreateSurfaceHandle(GENERIC_ALL.0, None) }.map_err(|e| AcrylicError::Message(format!("behind surface handle: {e:?}")))?;
-        let interop: ICompositorInterop = compositor.cast().map_err(|e| AcrylicError::Message(format!("compositor interop: {e:?}")))?;
-        let surface = unsafe { interop.CreateCompositionSurfaceForHandle(handle) }.map_err(|e| AcrylicError::Message(format!("composition surface: {e:?}")))?;
-        let behind_surface = unsafe { interop.CreateCompositionSurfaceForHandle(behind_handle) }.map_err(|e| AcrylicError::Message(format!("behind composition surface: {e:?}")))?;
-        let content_brush = compositor.CreateSurfaceBrushWithSurface(&surface).map_err(|e| AcrylicError::Message(format!("content brush: {e:?}")))?;
-        let content_sprite = compositor.CreateSpriteVisual().map_err(|e| AcrylicError::Message(format!("content visual: {e:?}")))?;
-        content_sprite.SetBrush(&content_brush).and_then(|_| content_sprite.SetSize(size)).map_err(|e| AcrylicError::Message(format!("content visual setup: {e:?}")))?;
-        let behind_brush = compositor.CreateSurfaceBrushWithSurface(&behind_surface).map_err(|e| AcrylicError::Message(format!("behind brush: {e:?}")))?;
-        let behind_source: IGraphicsEffectSource = CompositionEffectSourceParameter::Create(&windows::core::HSTRING::from("behind"))
-            .map_err(|e| AcrylicError::Message(format!("behind source parameter: {e:?}")))?.cast()
-            .map_err(|e| AcrylicError::Message(format!("behind source cast: {e:?}")))?;
+        let tint_brush = compositor
+            .CreateColorBrushWithColor(tint)
+            .map_err(|e| AcrylicError::Message(format!("tint brush: {e:?}")))?;
+        let tint_sprite = compositor
+            .CreateSpriteVisual()
+            .map_err(|e| AcrylicError::Message(format!("tint visual: {e:?}")))?;
+        tint_sprite
+            .SetBrush(&tint_brush)
+            .and_then(|_| tint_sprite.SetSize(size))
+            .and_then(|_| tint_sprite.SetOpacity(opacity))
+            .map_err(|e| AcrylicError::Message(format!("tint visual setup: {e:?}")))?;
+        let handle = unsafe { DCompositionCreateSurfaceHandle(GENERIC_ALL.0, None) }
+            .map_err(|e| AcrylicError::Message(format!("surface handle: {e:?}")))?;
+        let behind_handle = unsafe { DCompositionCreateSurfaceHandle(GENERIC_ALL.0, None) }
+            .map_err(|e| AcrylicError::Message(format!("behind surface handle: {e:?}")))?;
+        let interop: ICompositorInterop = compositor
+            .cast()
+            .map_err(|e| AcrylicError::Message(format!("compositor interop: {e:?}")))?;
+        let surface = unsafe { interop.CreateCompositionSurfaceForHandle(handle) }
+            .map_err(|e| AcrylicError::Message(format!("composition surface: {e:?}")))?;
+        let behind_surface = unsafe { interop.CreateCompositionSurfaceForHandle(behind_handle) }
+            .map_err(|e| AcrylicError::Message(format!("behind composition surface: {e:?}")))?;
+        let content_brush = compositor
+            .CreateSurfaceBrushWithSurface(&surface)
+            .map_err(|e| AcrylicError::Message(format!("content brush: {e:?}")))?;
+        let content_sprite = compositor
+            .CreateSpriteVisual()
+            .map_err(|e| AcrylicError::Message(format!("content visual: {e:?}")))?;
+        content_sprite
+            .SetBrush(&content_brush)
+            .and_then(|_| content_sprite.SetSize(size))
+            .map_err(|e| AcrylicError::Message(format!("content visual setup: {e:?}")))?;
+        let behind_brush = compositor
+            .CreateSurfaceBrushWithSurface(&behind_surface)
+            .map_err(|e| AcrylicError::Message(format!("behind brush: {e:?}")))?;
+        let behind_source: IGraphicsEffectSource =
+            CompositionEffectSourceParameter::Create(&windows::core::HSTRING::from("behind"))
+                .map_err(|e| AcrylicError::Message(format!("behind source parameter: {e:?}")))?
+                .cast()
+                .map_err(|e| AcrylicError::Message(format!("behind source cast: {e:?}")))?;
         let behind_effect = GaussianBlurEffect {
             name: std::cell::RefCell::new(windows::core::HSTRING::from("BehindGlassBlurEffect")),
-            blur_amount: std::env::var("NEON_BLUR_AMOUNT").ok().and_then(|s| s.parse().ok()).unwrap_or(8.0),
-            optimization: 1, border_mode: 1, source: behind_source,
+            blur_amount: std::env::var("NEON_BLUR_AMOUNT")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(8.0),
+            optimization: 1,
+            border_mode: 1,
+            source: behind_source,
         };
         let behind_effect_interface: IGraphicsEffect = behind_effect.into();
-        let behind_factory = compositor.CreateEffectFactory(&behind_effect_interface).map_err(|e| AcrylicError::Message(format!("behind blur factory: {e:?}")))?;
-        let behind_effect_brush = behind_factory.CreateBrush().map_err(|e| AcrylicError::Message(format!("behind blur brush: {e:?}")))?;
-        behind_effect_brush.SetSourceParameter(&windows::core::HSTRING::from("behind"), &behind_brush)
+        let behind_factory = compositor
+            .CreateEffectFactory(&behind_effect_interface)
+            .map_err(|e| AcrylicError::Message(format!("behind blur factory: {e:?}")))?;
+        let behind_effect_brush = behind_factory
+            .CreateBrush()
+            .map_err(|e| AcrylicError::Message(format!("behind blur brush: {e:?}")))?;
+        behind_effect_brush
+            .SetSourceParameter(&windows::core::HSTRING::from("behind"), &behind_brush)
             .map_err(|e| AcrylicError::Message(format!("bind behind blur: {e:?}")))?;
-        let behind_blur_sprite = compositor.CreateSpriteVisual().map_err(|e| AcrylicError::Message(format!("behind blur visual: {e:?}")))?;
-        behind_blur_sprite.SetBrush(&behind_effect_brush).and_then(|_| behind_blur_sprite.SetSize(size)).map_err(|e| AcrylicError::Message(format!("behind blur visual setup: {e:?}")))?;
-        let root = compositor.CreateContainerVisual().map_err(|e| AcrylicError::Message(format!("root: {e:?}")))?;
-        let children = root.Children().map_err(|e| AcrylicError::Message(format!("root children: {e:?}")))?;
+        let behind_blur_sprite = compositor
+            .CreateSpriteVisual()
+            .map_err(|e| AcrylicError::Message(format!("behind blur visual: {e:?}")))?;
+        behind_blur_sprite
+            .SetBrush(&behind_effect_brush)
+            .and_then(|_| behind_blur_sprite.SetSize(size))
+            .map_err(|e| AcrylicError::Message(format!("behind blur visual setup: {e:?}")))?;
+        let root = compositor
+            .CreateContainerVisual()
+            .map_err(|e| AcrylicError::Message(format!("root: {e:?}")))?;
+        let children = root
+            .Children()
+            .map_err(|e| AcrylicError::Message(format!("root children: {e:?}")))?;
         // The dark tint is the glass body and must sit below the animated
         // behind-glass surface. Putting tint above it attenuates the lime
         // emission and makes the shell read as a flat silver panel.
-        children.InsertAtTop(&blur_sprite)
+        children
+            .InsertAtTop(&blur_sprite)
             .and_then(|_| children.InsertAtTop(&tint_sprite))
             .and_then(|_| children.InsertAtTop(&behind_blur_sprite))
             .and_then(|_| children.InsertAtTop(&content_sprite))
             .map_err(|e| AcrylicError::Message(format!("root children insert: {e:?}")))?;
-        target.SetRoot(&root).map_err(|e| AcrylicError::Message(format!("target root: {e:?}")))?;
-        Ok(Self { _compositor: compositor, _target: target, _effect_brush: effect_brush, _behind_effect_brush: behind_effect_brush, _blur_sprite: blur_sprite, _behind_blur_sprite: behind_blur_sprite, _tint_sprite: tint_sprite, _content_brush: content_brush, _content_sprite: content_sprite, _behind_brush: behind_brush, _root: root, surface_handle: handle, behind_surface_handle: behind_handle, shell_geometry: std::cell::RefCell::new(None) })
+        target
+            .SetRoot(&root)
+            .map_err(|e| AcrylicError::Message(format!("target root: {e:?}")))?;
+        Ok(Self {
+            _compositor: compositor,
+            _target: target,
+            _effect_brush: effect_brush,
+            _behind_effect_brush: behind_effect_brush,
+            _blur_sprite: blur_sprite,
+            _behind_blur_sprite: behind_blur_sprite,
+            _tint_sprite: tint_sprite,
+            _content_brush: content_brush,
+            _content_sprite: content_sprite,
+            _behind_brush: behind_brush,
+            _root: root,
+            surface_handle: handle,
+            behind_surface_handle: behind_handle,
+            shell_geometry: std::cell::RefCell::new(None),
+        })
     }
 
-    pub fn surface_handle(&self) -> HANDLE { self.surface_handle }
-    pub fn behind_surface_handle(&self) -> HANDLE { self.behind_surface_handle }
+    pub fn surface_handle(&self) -> HANDLE {
+        self.surface_handle
+    }
+    pub fn behind_surface_handle(&self) -> HANDLE {
+        self.behind_surface_handle
+    }
 
-    pub fn set_backdrop_shell_bounds(&self, x: f32, y: f32, width: f32, height: f32, cut: [f32; 4]) -> Result<(), AcrylicError> {
+    pub fn set_backdrop_shell_bounds(
+        &self,
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        cut: [f32; 4],
+    ) -> Result<(), AcrylicError> {
         let bounds = [x, y, width.max(1.0), height.max(1.0)];
         // Cache the shell geometry so the composition clip stays in lockstep
         // with the HWND `SetWindowRgn` polygon: both use the exact same
         // eight-vertex cut shape.
         let cached = { self.shell_geometry.borrow().clone() };
-        let clip = if cached.as_ref().is_some_and(|cached| cached.bounds == bounds && cached.cut == cut) {
+        let clip = if cached
+            .as_ref()
+            .is_some_and(|cached| cached.bounds == bounds && cached.cut == cut)
+        {
             cached.unwrap().clip
         } else {
             let clip = create_shell_clip(&self._compositor, bounds, cut)?;
@@ -340,9 +457,9 @@ impl AcrylicHost {
         // to the root so no visual can light up the shell edge.
         let bleed = 2.0_f32;
         let bleed_offset = Vector3::new(x - bleed, y - bleed, 0.0);
-        let bleed_size =
-            Vector2::new(width.max(1.0) + bleed * 2.0, height.max(1.0) + bleed * 2.0);
-        self._blur_sprite.SetOffset(bleed_offset)
+        let bleed_size = Vector2::new(width.max(1.0) + bleed * 2.0, height.max(1.0) + bleed * 2.0);
+        self._blur_sprite
+            .SetOffset(bleed_offset)
             .and_then(|_| self._blur_sprite.SetSize(bleed_size))
             .and_then(|_| self._behind_blur_sprite.SetOffset(bleed_offset))
             .and_then(|_| self._behind_blur_sprite.SetSize(bleed_size))
@@ -366,7 +483,8 @@ impl AcrylicHost {
             let bleed_offset = Vector3::new(bounds[0] - bleed, bounds[1] - bleed, 0.0);
             let shell_size = Vector2::new(bounds[2], bounds[3]);
             let bleed_size = Vector2::new(bounds[2] + bleed * 2.0, bounds[3] + bleed * 2.0);
-            self._blur_sprite.SetOffset(bleed_offset)
+            self._blur_sprite
+                .SetOffset(bleed_offset)
                 .and_then(|_| self._blur_sprite.SetSize(bleed_size))
                 .and_then(|_| self._behind_blur_sprite.SetOffset(bleed_offset))
                 .and_then(|_| self._behind_blur_sprite.SetSize(bleed_size))
@@ -376,12 +494,13 @@ impl AcrylicHost {
                 .and_then(|_| self._content_sprite.SetSize(bleed_size))
                 .and_then(|_| self._root.SetClip(&clip))
         } else {
-            self._blur_sprite.SetSize(size)
+            self._blur_sprite
+                .SetSize(size)
                 .and_then(|_| self._behind_blur_sprite.SetSize(size))
                 .and_then(|_| self._tint_sprite.SetSize(size))
                 .and_then(|_| self._content_sprite.SetSize(size))
         }
-            .map_err(|e| AcrylicError::Message(format!("resize composition visuals: {e:?}")))
+        .map_err(|e| AcrylicError::Message(format!("resize composition visuals: {e:?}")))
     }
 }
 
