@@ -31,6 +31,8 @@ pub const UI_GEOMETRY_CUT_CAPABILITY_NAME: &str = "ui.geometry.cut.v1";
 pub const UI_SHADER_PACKAGE_CAPABILITY_NAME: &str = "ui.shader.package.v1";
 /// Per-node material references resolved against registered packages.
 pub const UI_SHADER_MATERIAL_CAPABILITY_NAME: &str = "ui.shader.material.v1";
+/// Bounded keyframe/stagger/repeat playback for renderer-owned transitions.
+pub const UI_TIMELINE_ANIMATION_CAPABILITY_NAME: &str = "ui.timeline.animation.v1";
 
 pub const ERROR_UI_PROGRAM_UNSUPPORTED_SCHEMA: &str = "ui_program_unsupported_schema";
 pub const ERROR_UI_PROGRAM_UNSUPPORTED_CAPABILITY: &str = "ui_program_unsupported_capability";
@@ -623,6 +625,7 @@ impl UiProgramRevision {
                     | UI_NINE_SLICE_CAPABILITY_NAME
                     | UI_COMPONENT_SKIN_CAPABILITY_NAME
                     | UI_CANVAS_POINTS_LINES_CAPABILITY_NAME
+                    | UI_TIMELINE_ANIMATION_CAPABILITY_NAME
             ) || capability.version != 1
             {
                 return Err(UiSchemaError::UnsupportedProgramCapability);
@@ -1507,7 +1510,9 @@ impl Default for UiLayout {
     }
 }
 
-/// Renderer-independent visual properties for a screen-space UI node.
+/// Renderer-independent visual properties for a screen-space UI node. Transform
+/// is part of the canonical target style; transition source transforms remain
+/// optional overrides on `UiTransitionState`.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct UiStyle {
@@ -1516,6 +1521,8 @@ pub struct UiStyle {
     pub border_width: f32,
     pub corner_radius: f32,
     pub opacity: f32,
+    #[serde(default, skip_serializing_if = "UiTransform::is_identity")]
+    pub transform: UiTransform,
 }
 
 impl Default for UiStyle {
@@ -1526,12 +1533,14 @@ impl Default for UiStyle {
             border_width: 1.0,
             corner_radius: 4.0,
             opacity: 1.0,
+            transform: UiTransform::default(),
         }
     }
 }
 
 /// A transition starts from the supplied overrides and ends at the node's bounds and style.
 /// Omitted properties sample the currently rendered node state, making updates concise.
+/// An optional timeline replaces the single segment with bounded keyframe segments.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UiTransition {
@@ -1547,6 +1556,11 @@ pub struct UiTransition {
     /// renderer never interprets it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub motion_key: Option<String>,
+    /// Optional bounded multi-segment playback policy. The base transition
+    /// remains the compatibility representation for renderers that do not
+    /// advertise timeline support.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeline: Option<UiAnimationTimeline>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1556,11 +1570,46 @@ pub enum UiEasing {
     EaseIn,
     EaseOut,
     EaseInOut,
+    Spring,
+    Bounce,
+    /// Fixed CSS-compatible cubic-bezier(0.25, 0.1, 0.25, 1.0).
+    CubicBezier,
 }
 
 impl Default for UiEasing {
     fn default() -> Self {
         Self::EaseOut
+    }
+}
+
+/// Renderer-local transform sampled by a transition. Transform values are part
+/// of the canonical target style; the optional transition value supplies an
+/// entry/retarget source or a keyframe override.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct UiTransform {
+    pub translation: [f32; 2],
+    pub scale: [f32; 2],
+    pub rotation_degrees: f32,
+    /// Normalized pivot inside the target bounds. Values outside 0..=1 are
+    /// allowed for deliberate hinge/orbit effects.
+    pub origin: [f32; 2],
+}
+
+impl Default for UiTransform {
+    fn default() -> Self {
+        Self {
+            translation: [0.0, 0.0],
+            scale: [1.0, 1.0],
+            rotation_degrees: 0.0,
+            origin: [0.5, 0.5],
+        }
+    }
+}
+
+impl UiTransform {
+    pub fn is_identity(value: &Self) -> bool {
+        *value == Self::default()
     }
 }
 
@@ -1574,6 +1623,57 @@ pub struct UiTransitionState {
     pub corner_radius: Option<f32>,
     pub opacity: Option<f32>,
     pub numeric_value: Option<f32>,
+    pub transform: Option<UiTransform>,
+}
+
+/// How keyframe segments are ordered. A node's keyframes are always evaluated
+/// in declaration order; `parallel` is retained as explicit metadata for
+/// grouped declarations and future multi-track expansion.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UiAnimationGroup {
+    #[default]
+    Sequence,
+    Parallel,
+}
+
+/// Repeat policy for a bounded animation timeline. `Count(n)` means n total
+/// plays, while `Infinite` is allowed only for explicitly local presentation
+/// tracks and is never expanded into an unbounded queue.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "count", rename_all = "snake_case")]
+pub enum UiAnimationRepeat {
+    #[default]
+    Once,
+    Count(u32),
+    Infinite,
+}
+
+/// One partial visual state at a timeline offset. Omitted properties inherit
+/// the preceding keyframe and ultimately the transition target.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiAnimationKeyframe {
+    pub offset_ms: u32,
+    #[serde(default)]
+    pub state: UiTransitionState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub easing: Option<UiEasing>,
+}
+
+/// Bounded renderer-neutral timeline metadata. Values are resolved against the
+/// node's current visual target by the WGPU runtime at command creation time.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiAnimationTimeline {
+    #[serde(default)]
+    pub group: UiAnimationGroup,
+    #[serde(default)]
+    pub keyframes: Vec<UiAnimationKeyframe>,
+    #[serde(default)]
+    pub stagger_ms: u32,
+    #[serde(default)]
+    pub repeat: UiAnimationRepeat,
 }
 
 /// Declarative visual state names. These are presentation states, not domain
@@ -1633,6 +1733,7 @@ pub enum UiAnimationProperty {
     BorderWidth,
     CornerRadius,
     NumericValue,
+    Transform,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1709,6 +1810,11 @@ pub enum UiEffect {
         node_id: UiNodeId,
         #[serde(default)]
         layer: UiCompositionLayer,
+    },
+    /// Retains a removed node for a renderer-owned exit/unmount transition.
+    ExitTransition {
+        node_id: UiNodeId,
+        transition: UiTransition,
     },
     /// A validated finite skin recipe. Resource resolution and drawing remain
     /// renderer-owned; this effect contains no GPU identity.
@@ -2088,6 +2194,10 @@ pub struct UiIrDocument {
     /// Node key to composition destination. Missing entries are `normal`.
     #[serde(default)]
     pub composition_layer_records: std::collections::BTreeMap<String, UiCompositionLayer>,
+    /// Node key to renderer-owned exit transition. The renderer retains the
+    /// last visual for this node until the transition has completed.
+    #[serde(default)]
+    pub exit_transition_records: std::collections::BTreeMap<String, UiTransition>,
     /// Visual node key to ContextMenu node key. Right-clicking within the host
     /// node shows the referenced context menu at the cursor position.
     #[serde(default)]
@@ -2194,7 +2304,8 @@ pub struct NuiFlowState {
 
 /// Per-node style snapshot declared inside a presentation state. Fields mirror
 /// `UiTransitionState` so a state transition can seed the animation `from`
-/// directly from the previous state.
+/// directly from the previous state. The transform is also written to the
+/// canonical target node style and therefore survives transition completion.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NuiFlowStateStyle {
@@ -2211,6 +2322,8 @@ pub struct NuiFlowStateStyle {
     pub corner_radius: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub opacity: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transform: Option<UiTransform>,
 }
 
 impl NuiFlowState {
@@ -3498,6 +3611,10 @@ impl UiStyle {
             && self.border_width.is_finite()
             && self.corner_radius.is_finite()
             && self.opacity.is_finite()
+            && self.transform.scale.iter().all(|value| value.is_finite() && *value >= 0.0)
+            && self.transform.translation.iter().all(|value| value.is_finite())
+            && self.transform.rotation_degrees.is_finite()
+            && self.transform.origin.iter().all(|value| value.is_finite())
             && self.border_width >= 0.0
             && self.corner_radius >= 0.0
             && (0.0..=1.0).contains(&self.opacity)
@@ -3506,12 +3623,45 @@ impl UiStyle {
 
 impl UiTransition {
     pub fn is_valid(&self) -> bool {
-        self.duration_ms > 0 && self.from.is_valid()
+        self.duration_ms > 0
+            && self.from.is_valid()
+            && self
+                .timeline
+                .as_ref()
+                .is_none_or(|timeline| timeline.is_valid(self.duration_ms))
+    }
+}
+
+impl UiAnimationTimeline {
+    pub fn is_valid(&self, duration_ms: u32) -> bool {
+        !self.keyframes.is_empty()
+            && self.keyframes.len() <= 32
+            && self.stagger_ms <= 60_000
+            && self.keyframes.windows(2).all(|pair| {
+                pair[0].offset_ms < pair[1].offset_ms
+                    && pair[0].offset_ms <= duration_ms
+                    && pair[1].offset_ms <= duration_ms
+            })
+            && self
+                .keyframes
+                .first()
+                .is_some_and(|keyframe| keyframe.offset_ms == 0 && keyframe.state.is_valid())
+            && self
+                .keyframes
+                .last()
+                .is_some_and(|keyframe| {
+                    keyframe.offset_ms == duration_ms && keyframe.state.is_valid()
+                })
+            && self.keyframes.iter().all(|keyframe| keyframe.state.is_valid())
+            && match self.repeat {
+                UiAnimationRepeat::Once | UiAnimationRepeat::Infinite => true,
+                UiAnimationRepeat::Count(count) => (1..=64).contains(&count),
+            }
     }
 }
 
 impl UiTransitionState {
-    fn is_valid(self) -> bool {
+    pub fn is_valid(self) -> bool {
         self.bounds.is_none_or(UiBounds::is_valid)
             && self
                 .background_color
@@ -3528,6 +3678,13 @@ impl UiTransitionState {
             && self
                 .opacity
                 .is_none_or(|value| value.is_finite() && (0.0..=1.0).contains(&value))
+            && self.transform.is_none_or(|transform| {
+                transform.translation.iter().all(|value| value.is_finite())
+                    && transform.scale.iter().all(|value| value.is_finite())
+                    && transform.rotation_degrees.is_finite()
+                    && transform.origin.iter().all(|value| value.is_finite())
+                    && transform.scale.iter().all(|value| *value >= 0.0)
+            })
     }
 }
 
@@ -3655,6 +3812,13 @@ impl UiEffect {
             }
             Self::CompositionLayer { node_id, .. } => {
                 if node_id.0.trim().is_empty() {
+                    Err(UiSchemaError::InvalidProgramEvent)
+                } else {
+                    Ok(())
+                }
+            }
+            Self::ExitTransition { node_id, transition } => {
+                if node_id.0.trim().is_empty() || !transition.is_valid() {
                     Err(UiSchemaError::InvalidProgramEvent)
                 } else {
                     Ok(())
@@ -3847,6 +4011,10 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&UiAnimationProperty::NumericValue).unwrap(),
             "\"numeric_value\""
+        );
+        assert_eq!(
+            serde_json::to_string(&UiAnimationProperty::Transform).unwrap(),
+            "\"transform\""
         );
     }
 
@@ -4066,10 +4234,60 @@ mod tests {
                 ..UiTransitionState::default()
             },
             motion_key: None,
+            timeline: None,
         });
         fragment.validate().unwrap();
         fragment.root.enter_transition.as_mut().unwrap().duration_ms = 0;
         assert_eq!(fragment.validate(), Err(UiSchemaError::InvalidTransition));
+    }
+
+    #[test]
+    fn timeline_transition_validates_bounds_and_repeat_policy() {
+        let transition = UiTransition {
+            delay_ms: 0,
+            duration_ms: 300,
+            easing: UiEasing::Linear,
+            from: UiTransitionState {
+                opacity: Some(0.0),
+                ..UiTransitionState::default()
+            },
+            motion_key: Some("pulse".into()),
+            timeline: Some(UiAnimationTimeline {
+                keyframes: vec![
+                    UiAnimationKeyframe {
+                        offset_ms: 0,
+                        state: UiTransitionState {
+                            opacity: Some(0.0),
+                            ..UiTransitionState::default()
+                        },
+                        easing: Some(UiEasing::Linear),
+                    },
+                    UiAnimationKeyframe {
+                        offset_ms: 300,
+                        state: UiTransitionState {
+                            opacity: Some(1.0),
+                            ..UiTransitionState::default()
+                        },
+                        easing: Some(UiEasing::EaseOut),
+                    },
+                ],
+                stagger_ms: 20,
+                repeat: UiAnimationRepeat::Count(2),
+                ..UiAnimationTimeline::default()
+            }),
+        };
+        assert!(transition.is_valid());
+        let invalid = UiTransition {
+            timeline: Some(UiAnimationTimeline {
+                keyframes: vec![UiAnimationKeyframe {
+                    offset_ms: 301,
+                    ..UiAnimationKeyframe::default()
+                }],
+                ..UiAnimationTimeline::default()
+            }),
+            ..transition
+        };
+        assert!(!invalid.is_valid());
     }
 
     #[test]
@@ -4196,6 +4414,7 @@ mod tests {
             enter_transition: None,
             world_depth: None,
             world_scale: None,
+            clip_shape: UiClipShape::default(),
             children: vec![
                 UiNode {
                     node_id: UiNodeId("a".into()),
@@ -4220,6 +4439,7 @@ mod tests {
                     enter_transition: None,
                     world_depth: None,
                     world_scale: None,
+                    clip_shape: UiClipShape::default(),
                     children: Vec::new(),
                 },
                 UiNode {
@@ -4242,6 +4462,7 @@ mod tests {
                     enter_transition: None,
                     world_depth: None,
                     world_scale: None,
+                    clip_shape: UiClipShape::default(),
                     children: Vec::new(),
                 },
             ],

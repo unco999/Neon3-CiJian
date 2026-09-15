@@ -18,6 +18,7 @@
 | --- | --- | --- |
 | [Neon3 背包案例](https://github.com/unco999/Neon3-example) | Python / Node.js：背包、拖拽、容量切换、真实 runtime probe | [查看并运行](https://github.com/unco999/Neon3-example#快速开始) |
 | `component-gallery` | Rust：完整控件、DataGrid、Tooltip、拖拽、下拉框和世界 UI smoke test | `cargo run -p neon-dev -- case component-gallery --show-logs` |
+| [`animation-showcase`](cases/animation-showcase/) | Rust：A-M 声明式动画、timeline、retarget、exit 生命周期和真实 WGPU JSONL probe | [测试方法](cases/animation-showcase/) |
 
 ```powershell
 cargo build -p neon-projectd -p neon-eventd -p neon-ui-runtime -p neon-wgpu-runtime -p neon-dev --bins

@@ -2,6 +2,40 @@
 
 All notable changes to Neon3 are recorded in this file.
 
+## v0.2.10 — 2026-09-15
+
+### Added
+
+- **Declarative animation timelines.** `UiAnimationTimeline` supports bounded
+  keyframes, per-segment easing, repeat policies, fixed stagger, and explicit
+  sequence/parallel metadata while keeping the public schema renderer-neutral.
+- **Additional V1 easing curves.** Added bounce and fixed CSS-compatible
+  `cubic_bezier` easing alongside linear, quadratic ease variants, and spring.
+- **Renderer-owned animation controls.** WGPU RPC now exposes pause, resume,
+  seek, and cancel receipts for active transitions without moving animation
+  authority into the UI client.
+- **A-M animation showcase and probes.** The new case covers property tracks,
+  transforms, nested propagation, retargeting, exit/remount generation
+  protection, timelines, and structured JSONL/PNG acceptance artifacts.
+
+### Fixed
+
+- Exit transitions retain removed nodes until their deadline, then emit a
+  completion event and remove the node; a remount during exit gets a fresh
+  generation and starts from the sampled visual state.
+- Timeline playback survives fragment refreshes without replaying already-settled
+  target values.
+
+### Verification
+
+- `cargo check --workspace --all-targets` passes.
+- `neon-ui-schema`: 39 tests passed.
+- `neon-ui-runtime`: 155 tests passed.
+- Renderer-focused timeline, curve, control, exit, transform, and spinner tests
+  passed.
+- Real `animation_showcase_interactive_probe` passed with `EXIT_CODE=0`; the
+  retarget probe passed all 100 target updates with `EXIT_CODE=0`.
+
 ## v0.2.9 — 2026-09-12
 
 ### Added

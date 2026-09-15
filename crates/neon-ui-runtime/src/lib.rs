@@ -49,7 +49,7 @@ use neon_ui_schema::{
     UiSurfaceEventKind, UiSurfaceEventRequest, UiSurfaceId, UiSurfaceSnapshot, UiSurfaceState,
     UiTemplateRecord, UiTextHandle, UiTextHandleDiagnostic, UiTextHandleStatus, UiTextRecord,
     UiTextRegistryDebugSnapshot, UiTextRegistryEntryMetadata, UiTextRegistrySnapshot,
-    UiTextSourceCategory, UiTransition, UiTransitionState,
+    UiTextSourceCategory, UiTransform, UiTransition, UiTransitionState,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -88,6 +88,8 @@ pub const CAPABILITY_STATE_ANIMATION: &str = "ui.state.animation.v1";
 /// Advertised explicitly so hosts can gate on it before relying on smooth
 /// progress-bar updates without generating intermediate input frames.
 pub const CAPABILITY_NUMERIC_ANIMATION: &str = "ui.numeric.animation.v1";
+pub const CAPABILITY_TRANSFORM_ANIMATION: &str = "ui.transform.animation.v1";
+pub const CAPABILITY_TIMELINE_ANIMATION: &str = "ui.timeline.animation.v1";
 const INTERACTION_TRACE_CAPACITY: usize = 256;
 
 /// Materializes one visible instance from a hidden declarative template prototype.
@@ -1472,6 +1474,9 @@ fn apply_transitions_to_fragment(fragment: &mut UiFragment, motions: &[PendingSt
                 if style.opacity.is_some() {
                     transition.from.opacity = style.opacity;
                 }
+                if style.transform.is_some() {
+                    transition.from.transform = style.transform;
+                }
             }
             // Apply the target state's style record directly to the node; the
             // renderer interpolates from `from` (old state) to these values.
@@ -1497,6 +1502,9 @@ fn apply_transitions_to_fragment(fragment: &mut UiFragment, motions: &[PendingSt
                 }
                 if let Some(opacity) = style.opacity {
                     node.style.opacity = opacity;
+                }
+                if let Some(transform) = style.transform {
+                    node.style.transform = transform;
                 }
             }
             node.enter_transition = Some(transition);
@@ -2881,6 +2889,7 @@ fn pending_motion_debug(motion: &PendingStateMotion) -> Value {
         "delay_ms": motion.transition.delay_ms,
         "duration_ms": motion.transition.duration_ms,
         "easing": format!("{:?}", motion.transition.easing),
+        "timeline": &motion.transition.timeline,
         "previous_styles": motion.previous_styles,
         "target_styles": motion.target_styles,
     })
@@ -2948,7 +2957,6 @@ struct ForwardHostPrep {
     forwarded: RpcRequest,
     local_semantic_event: Option<UiProgramSemanticEvent>,
     selected_motions: Vec<PendingStateMotion>,
-    optimistic_motion_submitted: bool,
     context: Option<InteractionTraceContext>,
     semantic_feedback: Option<Value>,
     // The state machine has already been advanced during the sync prep.
@@ -3031,6 +3039,8 @@ impl UiRuntime {
                 "ui.host.pointer_event.v1".into(),
                 CAPABILITY_STATE_ANIMATION.into(),
                 CAPABILITY_NUMERIC_ANIMATION.into(),
+                CAPABILITY_TRANSFORM_ANIMATION.into(),
+                CAPABILITY_TIMELINE_ANIMATION.into(),
                 CAPABILITY_DEBUG_INTERACTION.into(),
                 "ui.animation.debug.v1".into(),
             ],
@@ -3468,6 +3478,7 @@ impl UiRuntime {
                 neon_ui_schema::UI_NINE_SLICE_CAPABILITY_NAME,
                 neon_ui_schema::UI_COMPONENT_SKIN_CAPABILITY_NAME,
                 neon_ui_schema::UI_CANVAS_POINTS_LINES_CAPABILITY_NAME,
+                neon_ui_schema::UI_TIMELINE_ANIMATION_CAPABILITY_NAME,
             ]
             .into_iter()
             .map(|name| UiProgramCapability {
@@ -3781,20 +3792,14 @@ impl UiRuntime {
         // host response. A slow domain must not delay the panel's visual state
         // transition; the later publication retargets the same renderer-owned
         // animation from its current sampled value.
-        let optimistic_motion_submitted = if !selected_motions.is_empty()
+        if !selected_motions.is_empty()
             && self.wgpu_endpoint.is_some()
             && self.cached_fragment.is_some()
         {
             let motions = self.pending_motions.clone();
-            match self.apply_motions_to_current_fragment(&motions) {
-                Ok(()) => true,
-                Err(error) => {
-                    eprintln!("[neon-ui] optimistic motion submit failed: {error}");
-                    false
-                }
+            if let Err(error) = self.apply_motions_to_current_fragment(&motions) {
+                eprintln!("[neon-ui] optimistic motion submit failed: {error}");
             }
-        } else {
-            false
         };
         if let Some(context) = &context {
             self.record_interaction(
@@ -3839,7 +3844,6 @@ impl UiRuntime {
             forwarded: forwarded.clone(),
             local_semantic_event: local_semantic_event.clone(),
             selected_motions: selected_motions.clone(),
-            optimistic_motion_submitted,
             context: context.clone(),
             semantic_feedback: semantic_feedback.clone(),
         };
@@ -3922,7 +3926,6 @@ impl UiRuntime {
         let context = prep.context.clone();
         let forwarded = prep.forwarded.clone();
         let selected_motions = prep.selected_motions.clone();
-        let optimistic_motion_submitted = prep.optimistic_motion_submitted;
         if host_response.status != RpcStatus::Accepted {
             if let Some(context) = &context {
                 let error = host_response
@@ -4060,7 +4063,11 @@ impl UiRuntime {
             );
             updated
         };
-        if !optimistic_motion_submitted && !selected_motions.is_empty() {
+        // Re-apply the selected motion after the authoritative publication.
+        // The publication refreshes bound values such as opacity and numeric
+        // presentation, so an optimistic fragment must not replace the new
+        // state target with the declaration's base value.
+        if !selected_motions.is_empty() {
             apply_transitions_to_fragment(&mut updated, &selected_motions);
         }
         if let Some(publication_result) = &publication_result {
@@ -5284,6 +5291,7 @@ impl UiRuntime {
                     border_width: 1.0,
                     corner_radius: 6.0,
                     opacity: 1.0,
+                    transform: UiTransform::default(),
                 },
                 enter_transition: Some(UiTransition {
                     delay_ms: 0,
@@ -5300,6 +5308,7 @@ impl UiRuntime {
                         ..UiTransitionState::default()
                     },
                     motion_key: None,
+                    timeline: None,
                 }),
                 world_depth: None,
                 world_scale: None,
@@ -5334,6 +5343,7 @@ impl UiRuntime {
                             ..UiTransitionState::default()
                         },
                         motion_key: None,
+                        timeline: None,
                     }),
                     world_depth: None,
                     world_scale: None,
@@ -7522,6 +7532,7 @@ mod tests {
             geometry_records: BTreeMap::new(),
             material_records: BTreeMap::new(),
             composition_layer_records: BTreeMap::new(),
+            exit_transition_records: BTreeMap::new(),
             context_menu_records: BTreeMap::new(),
             shader_packages: Vec::new(),
             branches: Vec::new(),
@@ -8445,8 +8456,10 @@ mod tests {
                 corner_radius: None,
                 opacity: None,
                 numeric_value: None,
+                transform: None,
             },
             motion_key: Some("health-change".into()),
+            timeline: None,
         };
         let pending_motion = PendingStateMotion {
             machine_key: "test-machine".into(),
@@ -8463,6 +8476,7 @@ mod tests {
                 border_width: None,
                 corner_radius: None,
                 opacity: Some(1.0),
+                transform: None,
             }],
         };
         apply_transitions_to_fragment(&mut updated, std::slice::from_ref(&pending_motion));
@@ -8582,8 +8596,10 @@ mod tests {
                     corner_radius: None,
                     opacity: None,
                     numeric_value: None,
+                    transform: None,
                 },
                 motion_key: Some(format!("motion-{node_key}")),
+                timeline: None,
             },
             previous_styles: Vec::new(),
             target_styles: vec![NuiFlowStateStyle {
@@ -8599,6 +8615,7 @@ mod tests {
                 border_width: None,
                 corner_radius: None,
                 opacity: None,
+                transform: None,
             }],
         };
         let motions = vec![motion("panel-a", 180), motion("panel-b", 320)];
@@ -8695,8 +8712,10 @@ mod tests {
                     corner_radius: None,
                     opacity: None,
                     numeric_value: None,
+                    transform: None,
                 },
                 motion_key: Some(format!("motion-{node_key}")),
+                timeline: None,
             },
             previous_styles: Vec::new(),
             target_styles: vec![NuiFlowStateStyle {
@@ -8712,6 +8731,7 @@ mod tests {
                 border_width: None,
                 corner_radius: None,
                 opacity: None,
+                transform: None,
             }],
         };
         let motions = vec![
@@ -8751,8 +8771,10 @@ mod tests {
                     corner_radius: None,
                     opacity: None,
                     numeric_value: None,
+                    transform: None,
                 },
                 motion_key: Some(format!("motion-{node_key}")),
+                timeline: None,
             },
             previous_styles: Vec::new(),
             target_styles: vec![NuiFlowStateStyle {
@@ -8763,6 +8785,7 @@ mod tests {
                 border_width: None,
                 corner_radius: None,
                 opacity: None,
+                transform: None,
             }],
         };
         let mut pending = Vec::new();

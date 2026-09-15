@@ -1983,6 +1983,7 @@ fn run_component_gallery_scenario_inner() -> io::Result<serde_json::Value> {
             request_id: format!("gallery-request-{index}"),
             idempotency_key: format!("gallery-key-{index}"),
             requested_value: None,
+            committed_text: None,
             interaction: UiSemanticInteractionMetadata {
                 interaction_id: format!("gallery-interaction-{index}"),
                 sequence: index as u64 + 1,

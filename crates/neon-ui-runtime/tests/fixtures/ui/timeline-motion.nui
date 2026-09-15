@@ -1,0 +1,9 @@
+version 1
+surface timeline-test revision 1
+motion pulse duration 300 easing linear repeat 2 stagger 20 group sequence
+keyframe pulse 0 opacity 0
+keyframe pulse 150 opacity 0.5
+keyframe pulse 300 opacity 1
+
+surface timeline-test w 240 h 120 fill #17201E
+  panel pulse-panel x 20 y 20 w 160 h 60 fill #38BFA7 radius 8 enter pulse

@@ -7,6 +7,7 @@ use neon_protocol::{
 use neon_ui_schema::{
     UI_FRAGMENT_SCHEMA_VERSION, UiBounds, UiCommand, UiFragment, UiFragmentId,
     UiFragmentSubmission, UiNode, UiNodeId, UiNodeKind, UiStyle,
+    UiClipShape,
 };
 use serde_json::json;
 
@@ -35,6 +36,7 @@ fn request(sequence: u64) -> RpcRequest {
             world_depth: None,
             world_scale: None,
             children: Vec::new(),
+            clip_shape: UiClipShape::default(),
         },
         effects: Vec::new(),
     };

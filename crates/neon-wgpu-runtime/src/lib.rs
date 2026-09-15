@@ -238,9 +238,10 @@ mod world_ui_pipeline;
 use gpu_preview::HeightmapPreviewConverter;
 pub use ui_program_gpu::GpuUiProgramBackend;
 use ui_renderer::{
-    set_global_view_extras, LocalPresentationCommit, PendingLocalPresentationKey, UiDrawMode,
-    UiHitBinding, UiWgpuRenderer,
+    set_global_view_extras, LocalPresentationCommit, PendingLocalPresentationKey,
+    UiHitBinding,
 };
+pub use ui_renderer::{UiDrawMode, UiWgpuRenderer};
 use world_ui_pipeline::{WorldUiCamera, WorldUiCameraState, WorldUiPipeline};
 
 pub const SERVICE_NAME: &str = "wgpu-runtime";
@@ -262,6 +263,8 @@ pub const CAPABILITY_STATE_ANIMATION: &str = "wgpu.ui.state.animation.v1";
 /// Numeric presentation interpolation in the renderer. Explicit so hosts can
 /// gate on it before relying on smooth progress-bar updates.
 pub const CAPABILITY_NUMERIC_ANIMATION: &str = "wgpu.ui.numeric.animation.v1";
+pub const CAPABILITY_TRANSFORM_ANIMATION: &str = "wgpu.ui.transform.animation.v1";
+pub const CAPABILITY_TIMELINE_ANIMATION: &str = "wgpu.ui.timeline.animation.v1";
 pub const UI_HIT_TARGET: &str = "ui.hit_id.v1";
 pub const UI_COLOR_TARGET: &str = "ui.color.v1";
 pub const RENDER_HIT_NONE: u32 = u32::MAX;
@@ -1626,6 +1629,12 @@ enum WindowCommand {
     InputDebugDragGesture {
         source_node_key: String,
         target_node_key: String,
+        completed: std::sync::mpsc::Sender<Result<Value, &'static str>>,
+    },
+    AnimationControl {
+        action: String,
+        node_path: String,
+        progress: Option<f32>,
         completed: std::sync::mpsc::Sender<Result<Value, &'static str>>,
     },
     CaptureWorldUiLab {
@@ -4733,7 +4742,19 @@ impl HeadlessExternalGpu {
         // bounds actually reach the color/depth pass; otherwise the world UI
         // freezes at its first projected position.
         let stage = Instant::now();
-        if !self.external_surfaces.is_empty() {
+        let has_world_hit_snapshot = snapshots
+            .get(&RenderSurfaceKind::WorldUi)
+            .is_some_and(|fragments| {
+                fragments.values().any(|fragment| {
+                    fragment.effects.iter().any(|effect| {
+                        matches!(
+                            effect,
+                            neon_ui_schema::UiEffect::CameraVisibility { .. }
+                        )
+                    })
+                })
+            });
+        if has_world_hit_snapshot {
             self.ui.invalidate_plan();
         }
         self.world_ui.invalidate_plan_for_world_transform();
@@ -7109,6 +7130,7 @@ fn world_ui_lab_fragment() -> HashMap<UiFragmentId, UiFragment> {
             border_width: 0.0,
             corner_radius: 2.0,
             opacity: 1.0,
+            transform: neon_ui_schema::UiTransform::default(),
         },
         enter_transition: None,
         world_depth: None,
@@ -7138,6 +7160,7 @@ fn world_ui_lab_fragment() -> HashMap<UiFragmentId, UiFragment> {
             border_width: 2.0,
             corner_radius: 8.0,
             opacity: 1.0,
+            transform: neon_ui_schema::UiTransform::default(),
         },
         enter_transition: None,
         world_depth: None,
@@ -9148,6 +9171,29 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                 let _ =
                     completed.send(self.input_debug_drag_gesture(source_node_key, target_node_key));
             }
+            WindowCommand::AnimationControl {
+                action,
+                node_path,
+                progress,
+                completed,
+            } => {
+                let result = self
+                    .gpu
+                    .as_mut()
+                    .ok_or("window_gpu_unavailable")
+                    .and_then(|gpu| {
+                        gpu.ui.animation_control(
+                            &action,
+                            &node_path,
+                            progress,
+                            gpu.started_at.elapsed().as_secs_f32(),
+                        )
+                    });
+                if result.is_ok() {
+                    self.redraw_pending = true;
+                }
+                let _ = completed.send(result);
+            }
             WindowCommand::CaptureFinalTarget {
                 artifact_path,
                 redraw,
@@ -9547,6 +9593,81 @@ fn handle_window_debug_snapshot(
             request_id,
             "window_compositor_timeout",
             "window compositor did not report its debug snapshot",
+            None,
+        ),
+    }
+}
+
+fn handle_window_animation_control(
+    runtime: &mut WgpuRuntime,
+    proxy: &EventLoopProxy<WindowCommand>,
+    request: RpcRequest,
+) -> RpcResponse {
+    let node_path = request
+        .params
+        .get("node_path")
+        .and_then(Value::as_str)
+        .filter(|path| !path.trim().is_empty())
+        .map(str::to_owned);
+    let Some(node_path) = node_path else {
+        return runtime.reject(
+            request.request_id,
+            "animation_node_required",
+            "animation control requires node_path",
+            None,
+        );
+    };
+    let action = request
+        .method
+        .rsplit('.')
+        .next()
+        .unwrap_or_default()
+        .to_owned();
+    let progress = match request.params.get("progress") {
+        None => None,
+        Some(value) => match value.as_f64() {
+            Some(value) if value.is_finite() && (0.0..=1.0).contains(&value) => {
+                Some(value as f32)
+            }
+            _ => {
+                return runtime.reject(
+                    request.request_id,
+                    "animation_progress_invalid",
+                    "animation progress must be a finite number in 0..=1",
+                    None,
+                );
+            }
+        },
+    };
+    let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+    if proxy
+        .send_event(WindowCommand::AnimationControl {
+            action,
+            node_path,
+            progress,
+            completed: completed_tx,
+        })
+        .is_err()
+    {
+        return runtime.reject(
+            request.request_id,
+            "window_compositor_unavailable",
+            "window compositor is unavailable",
+            None,
+        );
+    }
+    match completed_rx.recv_timeout(Duration::from_secs(5)) {
+        Ok(Ok(result)) => runtime.accept(request.request_id, result),
+        Ok(Err(code)) => runtime.reject(
+            request.request_id,
+            code,
+            code,
+            None,
+        ),
+        Err(_) => runtime.reject(
+            request.request_id,
+            "window_compositor_timeout",
+            "window compositor did not apply animation control",
             None,
         ),
     }
@@ -10286,6 +10407,29 @@ fn spawn_window_server(
                         | "wgpu.world_ui.lab.camera.register"
                         | "debug.window.file_drop"
                 );
+                let animation_control = matches!(
+                    request.method.as_str(),
+                    "wgpu.ui.animation.cancel"
+                        | "wgpu.ui.animation.pause"
+                        | "wgpu.ui.animation.resume"
+                        | "wgpu.ui.animation.seek"
+                );
+                let animation_control_key = request.idempotency_key.clone();
+                if animation_control {
+                    let Some(key) = request.idempotency_key.as_ref() else {
+                        return runtime.reject(
+                            request.request_id,
+                            "invalid_request",
+                            "idempotency_key is required",
+                            None,
+                        );
+                    };
+                    if let Some(response) = runtime.idempotent_responses.get(key) {
+                        let mut response = response.clone();
+                        response.request_id = request.request_id;
+                        return response;
+                    }
+                }
                 let response = if request.method == "wgpu.ai.terrain.generate" {
                     handle_window_ai_generate(&mut runtime, &proxy, request)
                 } else if request.method == "android.host.open_surface" {
@@ -10300,6 +10444,8 @@ fn spawn_window_server(
                     handle_window_external_pointer(&mut runtime, &proxy, request)
                 } else if request.method == "wgpu.ai.model.status" {
                     handle_window_ai_model_status(&mut runtime, &proxy, request.request_id)
+                } else if animation_control {
+                    handle_window_animation_control(&mut runtime, &proxy, request)
                 } else if request.method == "debug.snapshot.get" {
                     handle_window_debug_snapshot(&mut runtime, &proxy, request.request_id)
                 } else if request.method == "debug.window.input.snapshot" {
@@ -10411,6 +10557,12 @@ fn spawn_window_server(
                             None,
                         );
                     }
+                }
+                if animation_control
+                    && response.status == RpcStatus::Accepted
+                    && let Some(key) = animation_control_key
+                {
+                    runtime.idempotent_responses.insert(key, response.clone());
                 }
                 if registering_shader && response.status == RpcStatus::Accepted {
                     let _ = proxy.send_event(WindowCommand::ShaderPackages {
@@ -10696,6 +10848,7 @@ impl WindowedRuntime {
                 border_width: 1.0,
                 corner_radius: 8.0,
                 opacity: 1.0,
+                transform: neon_ui_schema::UiTransform::default(),
             },
             enter_transition: Some(UiTransition {
                 delay_ms: 0,
@@ -10712,6 +10865,7 @@ impl WindowedRuntime {
                     ..UiTransitionState::default()
                 },
                 motion_key: None,
+                timeline: None,
             }),
             world_depth: None,
             world_scale: None,
@@ -10739,6 +10893,7 @@ impl WindowedRuntime {
                         border_width: 1.0,
                         corner_radius: 4.0,
                         opacity: 1.0,
+                        transform: neon_ui_schema::UiTransform::default(),
                     },
                     enter_transition: Some(UiTransition {
                         delay_ms: 100,
@@ -10749,6 +10904,7 @@ impl WindowedRuntime {
                             ..UiTransitionState::default()
                         },
                         motion_key: None,
+                        timeline: None,
                     }),
                     world_depth: None,
                     world_scale: None,
@@ -10777,6 +10933,7 @@ impl WindowedRuntime {
                         border_width: 1.0,
                         corner_radius: 5.0,
                         opacity: 1.0,
+                        transform: neon_ui_schema::UiTransform::default(),
                     },
                     enter_transition: Some(UiTransition {
                         delay_ms: 180,
@@ -10793,6 +10950,7 @@ impl WindowedRuntime {
                             ..UiTransitionState::default()
                         },
                         motion_key: None,
+                        timeline: None,
                     }),
                     world_depth: None,
                     world_scale: None,
@@ -10928,6 +11086,9 @@ impl WgpuRuntime {
             "wgpu.world.ui.anchor.batch.v1".into(),
             CAPABILITY_STATE_ANIMATION.into(),
             CAPABILITY_NUMERIC_ANIMATION.into(),
+            CAPABILITY_TRANSFORM_ANIMATION.into(),
+            CAPABILITY_TIMELINE_ANIMATION.into(),
+            "wgpu.ui.animation.control.v1".into(),
         ];
         if self.window_gpu_available {
             capabilities.push(CAPABILITY_AI_TERRAIN_GENERATION.into());
@@ -11721,6 +11882,15 @@ impl WgpuRuntime {
             "wgpu.ui.fragment.snapshot" => self.fragment_snapshot(request_id, request.params),
             "wgpu.render.target.capture" => self.target_capture(request_id, request.params),
             "wgpu.render.target.assert" => self.target_assert(request_id, request.params),
+            "wgpu.ui.animation.cancel"
+            | "wgpu.ui.animation.pause"
+            | "wgpu.ui.animation.resume"
+            | "wgpu.ui.animation.seek" => self.reject(
+                request_id,
+                "backend_not_available",
+                "animation control requires the windowed renderer",
+                None,
+            ),
             "wgpu.world.info.snapshot" => self.accept(request_id, self.world_bridge_snapshot()),
             "wgpu.world.info.configure" => {
                 self.configure_world_information(request_id, request.params)
@@ -14528,12 +14698,13 @@ mod tests {
             text: None,
             image: None,
             surface: None,
-            style: UiStyle {
-                background_color: [0.0, 0.7, 0.9, 1.0],
-                border_color: [1.0; 4],
-                border_width: 0.0,
-                corner_radius: 0.0,
-                opacity: 1.0,
+        style: UiStyle {
+            background_color: [0.0, 0.7, 0.9, 1.0],
+            border_color: [1.0; 4],
+            border_width: 0.0,
+            corner_radius: 0.0,
+            opacity: 1.0,
+            transform: neon_ui_schema::UiTransform::default(),
             },
             enter_transition: None,
             children: Vec::new(),
@@ -15508,6 +15679,7 @@ mod tests {
             border_width: 0.0,
             corner_radius: 0.0,
             opacity: 1.0,
+            transform: neon_ui_schema::UiTransform::default(),
         };
         let fragments = HashMap::from([(
             UiFragmentId("image".into()),
@@ -15702,6 +15874,7 @@ mod tests {
             border_width: 0.0,
             corner_radius: 0.0,
             opacity: 1.0,
+            transform: neon_ui_schema::UiTransform::default(),
         };
         let fragments = HashMap::from([(
             UiFragmentId("font-glyph".into()),

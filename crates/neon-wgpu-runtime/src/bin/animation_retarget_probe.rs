@@ -95,8 +95,10 @@ fn transition() -> UiTransition {
             corner_radius: None,
             opacity: None,
             numeric_value: None,
+            transform: None,
         },
         motion_key: Some("probe.retarget".into()),
+        timeline: None,
     }
 }
 

@@ -19,7 +19,8 @@ use neon_ui_schema::{
     UiIrPatchOperationKind, UiJustifyContent, UiLayout, UiLayoutMode, UiMaterialRef, UiNineSlice, UiNineSliceMode,
     UiCompositionLayer, UiNode, UiNodeId, UiNodeKind, UiProgram, UiProgramEventDeclaration, UiProgramRevision,
     UiResourceBudget, UiRichTextSpan, UiShaderPackage,
-    UiSourceSpan, UiStyle, UiSurfaceId, UiTemplateDeclaration, UiTransition, UiTransitionState,
+    UiSourceSpan, UiStyle, UiSurfaceId, UiTemplateDeclaration, UiTransform, UiTransition, UiTransitionState,
+    UiAnimationGroup, UiAnimationKeyframe, UiAnimationRepeat, UiAnimationTimeline,
 };
 use neon_world_bridge::{CameraId, CameraKind, WorldAnchorId};
 use serde_json::json;
@@ -47,6 +48,7 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
     let mut data_grids = Vec::new();
     let mut state_machines = Vec::new();
     let mut motions = Vec::new();
+    let mut pending_keyframes: Vec<(String, UiAnimationKeyframe)> = Vec::new();
     let mut drags = Vec::new();
     let mut drops = Vec::new();
     let mut world_panels = Vec::new();
@@ -58,6 +60,7 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
     let mut geometry_records = BTreeMap::new();
     let mut material_records = BTreeMap::new();
     let mut composition_layer_records = BTreeMap::new();
+    let mut exit_transition_records = BTreeMap::new();
     let mut skins = Vec::new();
     let mut shader_packages = Vec::new();
     let mut current_skin: Option<neon_ui_schema::UiControlSkin> = None;
@@ -218,6 +221,10 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
                 motions.push(motion);
                 continue;
             }
+            if let Some((motion_key, keyframe)) = parse_keyframe_declaration(content, line)? {
+                pending_keyframes.push((motion_key, keyframe));
+                continue;
+            }
             if let Some((input, emit_event)) = parse_input(content, line)? {
                 let key = match &input {
                     ParsedInput::Scalar(slot) => &slot.key,
@@ -264,8 +271,9 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
         node_motion_refs.insert(
             node.node.node_id.0.clone(),
             NodeMotionRefs {
-                enter: node.enter_motion.take(),
-                transition: node.transition_motion.take(),
+            enter: node.enter_motion.take(),
+            transition: node.transition_motion.take(),
+            exit: node.exit_motion.take(),
             },
         );
         if let Some(resource_key) = node.image_resource.take() {
@@ -459,7 +467,47 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
     if root.composition_layer != UiCompositionLayer::Normal {
         composition_layer_records.insert(root.node.node_id.0.clone(), root.composition_layer);
     }
+    for (motion_key, keyframe) in pending_keyframes {
+        let motion = motions
+            .iter_mut()
+            .find(|motion| motion.key == motion_key)
+            .ok_or_else(|| {
+                error(
+                    "nui_flow_unknown_motion",
+                    "keyframe references an undeclared motion",
+                    1,
+                    1,
+                )
+            })?;
+        let timeline = motion
+            .transition
+            .timeline
+            .get_or_insert_with(UiAnimationTimeline::default);
+        timeline.keyframes.push(keyframe);
+    }
+    for motion in &motions {
+        if let Some(timeline) = &motion.transition.timeline {
+            if !timeline.is_valid(motion.transition.duration_ms) {
+                return Err(error(
+                    "nui_flow_invalid_timeline",
+                    "timeline keyframes must start at 0, end at motion duration, and use strictly increasing offsets",
+                    1,
+                    1,
+                ));
+            }
+        }
+    }
     apply_node_motion_refs(&mut root.node, &node_motion_refs, &motions)?;
+    for (node_key, motion_refs) in &node_motion_refs {
+        let Some(exit_key) = motion_refs.exit.as_ref() else {
+            continue;
+        };
+        let motion = motions
+            .iter()
+            .find(|motion| motion.key == *exit_key)
+            .expect("exit motion was validated while resolving node motion refs");
+        exit_transition_records.insert(node_key.clone(), motion.transition.clone());
+    }
     let mut offset = 0;
     for slot in &mut input_slots {
         offset = align_up(offset, slot.packing.alignment);
@@ -700,6 +748,7 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
         geometry_records,
         material_records,
         composition_layer_records,
+        exit_transition_records,
         context_menu_records,
         branches,
         templates,
@@ -924,6 +973,12 @@ pub fn lower_nui_flow_effects(document: &NuiFlowDocument) -> Vec<UiEffect> {
             layer: *layer,
         }
     }));
+    effects.extend(document.ir.exit_transition_records.iter().map(|(node_key, transition)| {
+        UiEffect::ExitTransition {
+            node_id: UiNodeId(node_key.clone()),
+            transition: transition.clone(),
+        }
+    }));
     effects.extend(document.ir.context_menu_records.iter().map(|(node_id, menu_id)| UiEffect::ContextMenuBinding {
         node_id: UiNodeId(node_id.clone()),
         context_menu_id: menu_id.clone(),
@@ -1110,8 +1165,33 @@ pub fn format_nui_flow(source: &str) -> FlowResult<String> {
         if motion.transition.delay_ms > 0 {
             line.push_str(&format!(" delay {}", motion.transition.delay_ms));
         }
+        if let Some(timeline) = &motion.transition.timeline {
+            if timeline.stagger_ms > 0 {
+                line.push_str(&format!(" stagger {}", timeline.stagger_ms));
+            }
+            if !matches!(timeline.repeat, UiAnimationRepeat::Once) {
+                match timeline.repeat {
+                    UiAnimationRepeat::Count(count) => line.push_str(&format!(" repeat {count}")),
+                    UiAnimationRepeat::Infinite => line.push_str(" repeat infinite"),
+                    UiAnimationRepeat::Once => {}
+                }
+            }
+            if timeline.group != UiAnimationGroup::Sequence {
+                line.push_str(" group parallel");
+            }
+        }
         append_motion_from(&mut line, motion.transition.from);
         lines.push(line);
+        if let Some(timeline) = &motion.transition.timeline {
+            for keyframe in &timeline.keyframes {
+                let mut keyframe_line = format!("keyframe {} {}", motion.key, keyframe.offset_ms);
+                append_keyframe_state(&mut keyframe_line, keyframe.state);
+                if let Some(easing) = keyframe.easing {
+                    keyframe_line.push_str(&format!(" easing {}", format_easing(easing)));
+                }
+                lines.push(keyframe_line);
+            }
+        }
     }
     for machine in &parsed.state_machines {
         lines.push(format!(
@@ -1226,6 +1306,7 @@ pub fn format_nui_flow(source: &str) -> FlowResult<String> {
         &parsed.ir.geometry_records,
         &parsed.ir.material_records,
         &parsed.ir.composition_layer_records,
+        &parsed.ir.exit_transition_records,
         &mut lines,
     );
     Ok(lines.join("\n") + "\n")
@@ -1310,6 +1391,9 @@ fn format_easing(easing: UiEasing) -> &'static str {
         UiEasing::EaseIn => "ease_in",
         UiEasing::EaseOut => "ease_out",
         UiEasing::EaseInOut => "ease_in_out",
+        UiEasing::Spring => "spring",
+        UiEasing::Bounce => "bounce",
+        UiEasing::CubicBezier => "cubic_bezier",
     }
 }
 
@@ -1351,6 +1435,25 @@ fn format_state_style(style: &NuiFlowStateStyle) -> String {
             out.push(' ');
         }
         out.push_str(&format!("opacity {opacity}"));
+    }
+    if let Some(transform) = style.transform {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(&format!(
+            "transform {} {} {} {} {}",
+            transform.translation[0],
+            transform.translation[1],
+            transform.scale[0],
+            transform.scale[1],
+            transform.rotation_degrees
+        ));
+        if transform.origin != UiTransform::default().origin {
+            out.push_str(&format!(
+                " origin {} {}",
+                transform.origin[0], transform.origin[1]
+            ));
+        }
     }
     out
 }
@@ -1597,6 +1700,7 @@ struct NodeBuild {
     intents: Vec<String>,
     enter_motion: Option<String>,
     transition_motion: Option<String>,
+    exit_motion: Option<String>,
     branch_predicate: Option<UiBranchPredicate>,
     template: Option<(u32, BTreeMap<String, UiInputKind>, String, bool)>,
     data_grid: Option<UiDataGridDeclaration>,
@@ -1614,6 +1718,43 @@ struct NodeBuild {
 struct NodeMotionRefs {
     enter: Option<String>,
     transition: Option<String>,
+    exit: Option<String>,
+}
+
+fn append_keyframe_state(line: &mut String, state: UiTransitionState) {
+    if let Some(bounds) = state.bounds {
+        line.push_str(&format!(" bounds {} {} {} {}", bounds.x, bounds.y, bounds.width, bounds.height));
+    }
+    if let Some(transform) = state.transform {
+        line.push_str(&format!(
+            " transform {} {} {} {} {} origin {} {}",
+            transform.translation[0],
+            transform.translation[1],
+            transform.scale[0],
+            transform.scale[1],
+            transform.rotation_degrees,
+            transform.origin[0],
+            transform.origin[1]
+        ));
+    }
+    if let Some(color) = state.background_color {
+        line.push_str(&format!(" fill {}", format_color(color)));
+    }
+    if let Some(color) = state.border_color {
+        line.push_str(&format!(" line {}", format_color(color)));
+    }
+    if let Some(value) = state.border_width {
+        line.push_str(&format!(" border_width {value}"));
+    }
+    if let Some(value) = state.corner_radius {
+        line.push_str(&format!(" corner_radius {value}"));
+    }
+    if let Some(value) = state.opacity {
+        line.push_str(&format!(" opacity {value}"));
+    }
+    if let Some(value) = state.numeric_value {
+        line.push_str(&format!(" numeric {value}"));
+    }
 }
 
 /// Resolves node-local motion references after the complete document has been
@@ -1633,6 +1774,16 @@ fn apply_node_motion_refs(
                 1,
                 1,
             ));
+        }
+        if let Some(key) = reference.exit.as_ref() {
+            if !motions.iter().any(|motion| motion.key == *key) {
+                return Err(error(
+                    "nui_flow_unknown_motion",
+                    "node references an undeclared exit motion",
+                    1,
+                    1,
+                ));
+            }
         }
         let key = reference.enter.as_ref().or(reference.transition.as_ref());
         if let Some(key) = key {
@@ -1894,6 +2045,125 @@ fn parse_header(text: &str, header: &mut Header, line: u32) -> FlowResult<bool> 
     }
 }
 
+fn is_motion_tail_clause(word: &str) -> bool {
+    matches!(word, "delay" | "repeat" | "stagger" | "group" | "from")
+}
+
+fn parse_keyframe_declaration(
+    text: &str,
+    line: u32,
+) -> FlowResult<Option<(String, UiAnimationKeyframe)>> {
+    let words = tokenize(text, line)?;
+    if words.first().map(String::as_str) != Some("keyframe") {
+        return Ok(None);
+    }
+    if words.len() < 4 || !valid_key(&words[1]) {
+        return Err(error(
+            "nui_flow_invalid_keyframe",
+            "keyframe syntax is: keyframe <motion> <offset_ms> <property> <value> ...",
+            line,
+            1,
+        ));
+    }
+    let offset_ms = u32::try_from(parse_u64(&words[2], line, "keyframe offset")?).map_err(|_| {
+        error("nui_flow_invalid_keyframe", "keyframe offset exceeds the supported range", line, 1)
+    })?;
+    let mut state = UiTransitionState::default();
+    let mut easing = None;
+    let mut index = 3;
+    while index < words.len() {
+        match words[index].as_str() {
+            "easing" => {
+                let value = words.get(index + 1).ok_or_else(|| {
+                    error("nui_flow_invalid_keyframe", "keyframe easing requires a value", line, 1)
+                })?;
+                easing = Some(parse_flow_easing(value, line)?);
+                index += 2;
+            }
+            "opacity" => {
+                state.opacity = Some(number(words.get(index + 1).ok_or_else(|| error("nui_flow_invalid_keyframe", "keyframe opacity requires a value", line, 1))?, line)?.clamp(0.0, 1.0));
+                index += 2;
+            }
+            "fill" | "background" => {
+                state.background_color = Some(color(words.get(index + 1).ok_or_else(|| error("nui_flow_invalid_keyframe", "keyframe fill requires a color", line, 1))?, line)?);
+                index += 2;
+            }
+            "line" | "border" => {
+                state.border_color = Some(color(words.get(index + 1).ok_or_else(|| error("nui_flow_invalid_keyframe", "keyframe border requires a color", line, 1))?, line)?);
+                index += 2;
+            }
+            "border_width" => {
+                state.border_width = Some(number(words.get(index + 1).ok_or_else(|| error("nui_flow_invalid_keyframe", "keyframe border_width requires a value", line, 1))?, line)?.max(0.0));
+                index += 2;
+            }
+            "corner_radius" | "radius" => {
+                state.corner_radius = Some(number(words.get(index + 1).ok_or_else(|| error("nui_flow_invalid_keyframe", "keyframe corner_radius requires a value", line, 1))?, line)?.max(0.0));
+                index += 2;
+            }
+            "numeric" => {
+                state.numeric_value = Some(number(words.get(index + 1).ok_or_else(|| error("nui_flow_invalid_keyframe", "keyframe numeric requires a value", line, 1))?, line)?);
+                index += 2;
+            }
+            "bounds" => {
+                let values = words.get(index + 1..index + 5).ok_or_else(|| error("nui_flow_invalid_keyframe", "keyframe bounds requires x y width height", line, 1))?;
+                state.bounds = Some(UiBounds {
+                    x: number(&values[0], line)?,
+                    y: number(&values[1], line)?,
+                    width: number(&values[2], line)?.max(0.0),
+                    height: number(&values[3], line)?.max(0.0),
+                });
+                index += 5;
+            }
+            "transform" => {
+                let values = words.get(index + 1..index + 6).ok_or_else(|| error("nui_flow_invalid_keyframe", "keyframe transform requires tx ty sx sy rotate_deg", line, 1))?;
+                let scale_x = number(&values[2], line)?;
+                let scale_y = number(&values[3], line)?;
+                if scale_x < 0.0 || scale_y < 0.0 {
+                    return Err(error("nui_flow_invalid_keyframe", "keyframe transform scale must be non-negative", line, 1));
+                }
+                state.transform = Some(UiTransform {
+                    translation: [number(&values[0], line)?, number(&values[1], line)?],
+                    scale: [scale_x, scale_y],
+                    rotation_degrees: number(&values[4], line)?,
+                    ..UiTransform::default()
+                });
+                index += 6;
+            }
+            "origin" => {
+                let values = words.get(index + 1..index + 3).ok_or_else(|| error("nui_flow_invalid_keyframe", "keyframe origin requires normalized x y", line, 1))?;
+                let transform = state.transform.get_or_insert_with(UiTransform::default);
+                transform.origin = [number(&values[0], line)?, number(&values[1], line)?];
+                index += 3;
+            }
+            _ => return Err(error("nui_flow_invalid_keyframe", "unknown keyframe property", line, 1)),
+        }
+    }
+    if !state.is_valid() {
+        return Err(error("nui_flow_invalid_keyframe", "keyframe state contains an invalid value", line, 1));
+    }
+    Ok(Some((
+        words[1].clone(),
+        UiAnimationKeyframe {
+            offset_ms,
+            state,
+            easing,
+        },
+    )))
+}
+
+fn parse_flow_easing(value: &str, line: u32) -> FlowResult<UiEasing> {
+    match value {
+        "linear" => Ok(UiEasing::Linear),
+        "ease_in" => Ok(UiEasing::EaseIn),
+        "ease_out" => Ok(UiEasing::EaseOut),
+        "ease_in_out" => Ok(UiEasing::EaseInOut),
+        "spring" => Ok(UiEasing::Spring),
+        "bounce" => Ok(UiEasing::Bounce),
+        "cubic_bezier" => Ok(UiEasing::CubicBezier),
+        _ => Err(error("nui_flow_invalid_easing", "animation easing is not supported", line, 1)),
+    }
+}
+
 fn parse_motion_declaration(text: &str, line: u32) -> FlowResult<Option<NuiFlowMotion>> {
     let words = tokenize(text, line)?;
     if words.first().map(String::as_str) != Some("motion") {
@@ -1902,7 +2172,7 @@ fn parse_motion_declaration(text: &str, line: u32) -> FlowResult<Option<NuiFlowM
     if words.len() < 6 || !valid_key(&words[1]) || words[2] != "duration" || words[4] != "easing" {
         return Err(error(
             "nui_flow_invalid_motion",
-            "motion syntax is: motion <key> duration <ms> easing <linear|ease_in|ease_out|ease_in_out> [delay <ms>] [from <property> <value> ...]",
+            "motion syntax is: motion <key> duration <ms> easing <linear|ease_in|ease_out|ease_in_out|spring|bounce|cubic_bezier> [delay <ms>] [repeat <count|infinite>] [stagger <ms>] [group <sequence|parallel>] [from <property> <value> ...]",
             line,
             1,
         ));
@@ -1929,6 +2199,9 @@ fn parse_motion_declaration(text: &str, line: u32) -> FlowResult<Option<NuiFlowM
         "ease_in" => UiEasing::EaseIn,
         "ease_out" => UiEasing::EaseOut,
         "ease_in_out" => UiEasing::EaseInOut,
+        "spring" => UiEasing::Spring,
+        "bounce" => UiEasing::Bounce,
+        "cubic_bezier" => UiEasing::CubicBezier,
         _ => {
             return Err(error(
                 "nui_flow_invalid_motion",
@@ -1940,6 +2213,8 @@ fn parse_motion_declaration(text: &str, line: u32) -> FlowResult<Option<NuiFlowM
     };
     let mut delay_ms = 0_u32;
     let mut from = UiTransitionState::default();
+    let mut timeline = UiAnimationTimeline::default();
+    let mut timeline_declared = false;
     let mut index = 6;
     while index < words.len() {
         match words[index].as_str() {
@@ -1952,12 +2227,49 @@ fn parse_motion_declaration(text: &str, line: u32) -> FlowResult<Option<NuiFlowM
                 })?;
                 index += 2;
             }
+            "repeat" => {
+                let value = words.get(index + 1).ok_or_else(|| {
+                    error("nui_flow_invalid_motion", "repeat requires a count or infinite", line, 1)
+                })?;
+                timeline.repeat = if value == "infinite" {
+                    UiAnimationRepeat::Infinite
+                } else {
+                    let count = u32::try_from(parse_u64(value, line, "repeat")?).map_err(|_| {
+                        error("nui_flow_invalid_motion", "repeat count exceeds the supported range", line, 1)
+                    })?;
+                    if !(1..=64).contains(&count) {
+                        return Err(error("nui_flow_invalid_motion", "repeat count must be in 1..=64", line, 1));
+                    }
+                    UiAnimationRepeat::Count(count)
+                };
+                timeline_declared = true;
+                index += 2;
+            }
+            "stagger" => {
+                let value = words.get(index + 1).ok_or_else(|| {
+                    error("nui_flow_invalid_motion", "stagger requires milliseconds", line, 1)
+                })?;
+                timeline.stagger_ms = u32::try_from(parse_u64(value, line, "stagger")?).map_err(|_| {
+                    error("nui_flow_invalid_motion", "stagger exceeds the supported range", line, 1)
+                })?;
+                timeline_declared = true;
+                index += 2;
+            }
+            "group" => {
+                timeline.group = match words.get(index + 1).map(String::as_str) {
+                    Some("sequence") => UiAnimationGroup::Sequence,
+                    Some("parallel") => UiAnimationGroup::Parallel,
+                    _ => return Err(error("nui_flow_invalid_motion", "group must be sequence or parallel", line, 1)),
+                };
+                timeline_declared = true;
+                index += 2;
+            }
             "from" => {
                 index += 1;
                 if index >= words.len() {
                     return Err(error("nui_flow_invalid_motion", "from requires at least one property", line, 1));
                 }
-                while index < words.len() && words[index] != "delay" && words[index] != "from" {
+                while index < words.len() && !is_motion_tail_clause(&words[index]) {
                     let property = words[index].as_str();
                     match property {
                         "opacity" => {
@@ -1995,6 +2307,36 @@ fn parse_motion_declaration(text: &str, line: u32) -> FlowResult<Option<NuiFlowM
                             });
                             index += 5;
                         }
+                        "transform" => {
+                            let values = words.get(index + 1..index + 6).ok_or_else(|| {
+                                error(
+                                    "nui_flow_invalid_motion",
+                                    "from transform requires translate_x translate_y scale_x scale_y rotate_degrees",
+                                    line,
+                                    1,
+                                )
+                            })?;
+                            from.transform = Some(UiTransform {
+                                translation: [number(&values[0], line)?, number(&values[1], line)?],
+                                scale: [number(&values[2], line)?, number(&values[3], line)?],
+                                rotation_degrees: number(&values[4], line)?,
+                                ..UiTransform::default()
+                            });
+                            index += 6;
+                        }
+                        "origin" => {
+                            let values = words.get(index + 1..index + 3).ok_or_else(|| {
+                                error(
+                                    "nui_flow_invalid_motion",
+                                    "from origin requires normalized x y",
+                                    line,
+                                    1,
+                                )
+                            })?;
+                            let transform = from.transform.get_or_insert_with(UiTransform::default);
+                            transform.origin = [number(&values[0], line)?, number(&values[1], line)?];
+                            index += 3;
+                        }
                         "numeric" => {
                             let value = words.get(index + 1).ok_or_else(|| error("nui_flow_invalid_motion", "from numeric requires a value", line, 1))?;
                             from.numeric_value = Some(number(value, line)?);
@@ -2003,7 +2345,7 @@ fn parse_motion_declaration(text: &str, line: u32) -> FlowResult<Option<NuiFlowM
                         _ => {
                             return Err(error(
                                 "nui_flow_invalid_motion",
-                                "supported from properties are bounds, opacity, fill, line, border_width, corner_radius, and numeric",
+                                "supported from properties are bounds, transform, origin, opacity, fill, line, border_width, corner_radius, and numeric",
                                 line,
                                 1,
                             ));
@@ -2014,7 +2356,7 @@ fn parse_motion_declaration(text: &str, line: u32) -> FlowResult<Option<NuiFlowM
             _ => {
                 return Err(error(
                     "nui_flow_invalid_motion",
-                    "motion tail accepts delay and from clauses",
+                    "motion tail accepts delay, repeat, stagger, group, and from clauses",
                     line,
                     1,
                 ));
@@ -2029,6 +2371,7 @@ fn parse_motion_declaration(text: &str, line: u32) -> FlowResult<Option<NuiFlowM
             easing,
             from,
             motion_key: Some(words[1].clone()),
+            timeline: timeline_declared.then_some(timeline),
         },
     }))
 }
@@ -2085,6 +2428,7 @@ fn parse_state_machine_declaration(
             // style <machine>.<state>.<node_key> [x <n>] [y <n>] [w <n>] [h <n>]
             //     [fill <color>] [line <color>] [border_width <n>]
             //     [corner_radius <n>] [opacity <n>]
+            //     [transform <tx> <ty> <sx> <sy> <rotate_deg>]
             if words.len() < 4 {
                 return Err(invalid(
                     "style syntax is: style <machine.state.node_key> <attributes>",
@@ -2112,6 +2456,7 @@ fn parse_state_machine_declaration(
                 border_width: None,
                 corner_radius: None,
                 opacity: None,
+                transform: None,
             };
             let mut bounds = style.bounds;
             let mut i = 2;
@@ -2190,6 +2535,36 @@ fn parse_state_machine_declaration(
                         style.opacity = Some(v);
                         i += 2;
                     }
+                    "transform" => {
+                        let values = words
+                            .get(i + 1..i + 6)
+                            .ok_or_else(|| invalid("transform requires tx ty sx sy rotate_deg"))?;
+                        let translation_x = number(values[0], line)?;
+                        let translation_y = number(values[1], line)?;
+                        let scale_x = number(values[2], line)?;
+                        let scale_y = number(values[3], line)?;
+                        let rotation_degrees = number(values[4], line)?;
+                        if scale_x < 0.0 || scale_y < 0.0 {
+                            return Err(invalid("transform scale must be non-negative"));
+                        }
+                        style.transform = Some(UiTransform {
+                            translation: [translation_x, translation_y],
+                            scale: [scale_x, scale_y],
+                            rotation_degrees,
+                            ..UiTransform::default()
+                        });
+                        i += 6;
+                    }
+                    "origin" => {
+                        let values = words
+                            .get(i + 1..i + 3)
+                            .ok_or_else(|| invalid("origin requires normalized x y"))?;
+                        let transform = style
+                            .transform
+                            .get_or_insert_with(UiTransform::default);
+                        transform.origin = [number(values[0], line)?, number(values[1], line)?];
+                        i += 3;
+                    }
                     _ => {
                         return Err(invalid("unknown style attribute"));
                     }
@@ -2202,6 +2577,7 @@ fn parse_state_machine_declaration(
                 && style.border_width.is_none()
                 && style.corner_radius.is_none()
                 && style.opacity.is_none()
+                && style.transform.is_none()
             {
                 return Err(invalid("style must declare at least one attribute"));
             }
@@ -3160,6 +3536,7 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
     let mut world_anchor = None;
     let mut enter_motion = None;
     let mut transition_motion = None;
+    let mut exit_motion = None;
     let mut used = HashSet::new();
     let mut index = key_index + 1;
     while index < parts.len() {
@@ -3181,7 +3558,7 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
             | "pad" | "fill" | "line" | "ink" | "opacity" | "radius" | "border_width" | "value"
             | "checked" | "selected" | "state" | "numeric" | "scroll" | "scroll_offset" | "enabled" | "visible"
              | "event" | "token" | "align" | "clip" | "clip_shape" | "fit" | "justify" | "data" | "rich" | "skin" | "context_menu" | "enter" | "transition"
-             | "composition_layer" | "layer" => {
+             | "composition_layer" | "layer" | "exit" => {
                 let value = *parts.get(index + 1).ok_or_else(|| {
                     error(
                         "nui_flow_missing_value",
@@ -3191,7 +3568,7 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
                     )
                 })?;
                 index += 1;
-                if token == "enter" || token == "transition" {
+                 if token == "enter" || token == "transition" || token == "exit" {
                     if !valid_key(value) {
                         return Err(error(
                             "nui_flow_invalid_motion",
@@ -3200,10 +3577,12 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
                             1,
                         ));
                     }
-                    let slot = if token == "enter" {
+                     let slot = if token == "enter" {
                         &mut enter_motion
-                    } else {
+                    } else if token == "transition" {
                         &mut transition_motion
+                    } else {
+                        &mut exit_motion
                     };
                     if slot.replace(value.into()).is_some() {
                         return Err(error(
@@ -3739,6 +4118,7 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
         intents,
         enter_motion,
         transition_motion,
+        exit_motion,
         branch_predicate,
         template,
         data_grid,
@@ -4826,6 +5206,7 @@ fn format_node(
     geometry_records: &BTreeMap<String, UiGeometry>,
     material_records: &BTreeMap<String, UiMaterialRef>,
     composition_layer_records: &BTreeMap<String, UiCompositionLayer>,
+    exit_transition_records: &BTreeMap<String, UiTransition>,
     lines: &mut Vec<String>,
 ) {
     let kind = match &node.kind {
@@ -4969,6 +5350,11 @@ fn format_node(
     {
         line.push_str(&format!(" transition {motion_key}"));
     }
+    if let Some(transition) = exit_transition_records.get(&node.node_id.0)
+        && let Some(motion_key) = &transition.motion_key
+    {
+        line.push_str(&format!(" exit {motion_key}"));
+    }
     for binding in bindings
         .iter()
         .filter(|binding| binding.node_key == node.node_id.0)
@@ -5051,6 +5437,7 @@ fn format_node(
             geometry_records,
             material_records,
             composition_layer_records,
+            exit_transition_records,
             lines,
         );
     }
@@ -5062,6 +5449,21 @@ fn append_motion_from(line: &mut String, from: UiTransitionState) {
         fields.push(format!(
             "bounds {} {} {} {}",
             bounds.x, bounds.y, bounds.width, bounds.height
+        ));
+    }
+    if let Some(transform) = from.transform {
+        fields.push(format!(
+            "transform {} {} {} {} {}{}",
+            transform.translation[0],
+            transform.translation[1],
+            transform.scale[0],
+            transform.scale[1],
+            transform.rotation_degrees,
+            if transform.origin != UiTransform::default().origin {
+                format!(" origin {} {}", transform.origin[0], transform.origin[1])
+            } else {
+                String::new()
+            }
         ));
     }
     if let Some(value) = from.opacity {
@@ -6293,8 +6695,42 @@ panel workspace row gap 8
         ))
         .expect("animation showcase fixture must exist");
         let document = parse_nui_flow(&source).expect("animation showcase must parse");
-        assert_eq!(document.motions.len(), 8);
-        assert_eq!(document.state_machines.len(), 8);
+        assert_eq!(document.motions.len(), 14);
+        assert_eq!(document.state_machines.len(), 12);
+        let timeline = document
+            .motions
+            .iter()
+            .find(|motion| motion.key == "timeline-pulse")
+            .and_then(|motion| motion.transition.timeline.as_ref())
+            .expect("timeline motion must be declared");
+        assert_eq!(timeline.keyframes.len(), 3);
+        assert_eq!(timeline.repeat, UiAnimationRepeat::Count(2));
+        assert_eq!(timeline.group, UiAnimationGroup::Sequence);
+        assert!(document.motions.iter().any(|motion| {
+            motion.key == "linear-fill"
+                && motion.transition.easing == UiEasing::Linear
+                && motion.transition.from.numeric_value == Some(0.0)
+        }));
+        assert!(document.motions.iter().any(|motion| {
+            motion.key == "exit-fade" && motion.transition.easing == UiEasing::EaseIn
+        }));
+        assert!(document.motions.iter().any(|motion| {
+            motion.key == "spring-expand" && motion.transition.easing == UiEasing::Spring
+        }));
+        assert!(document.motions.iter().any(|motion| {
+            motion.key == "transform-enter"
+                && motion.transition.from.transform.is_some_and(|transform| {
+                        transform.translation == [120.0, -24.0]
+                            && transform.scale == [0.72, 0.72]
+                            && transform.rotation_degrees == -12.0
+                            && transform.origin == [0.0, 0.0]
+                })
+        }));
+        assert!(document
+            .input_schema
+            .slots
+            .iter()
+            .any(|slot| slot.key == "fill_progress"));
         assert!(document
             .motions
             .iter()
@@ -6317,6 +6753,95 @@ panel workspace row gap 8
         assert!(panel_a.transitions.iter().any(|transition| {
             transition.from_state == "expanded" && transition.target_state == "compact"
         }));
+        let panel_f = document
+            .state_machines
+            .iter()
+            .find(|machine| machine.key == "panel-f")
+            .expect("panel-f state machine");
+        assert!(panel_f.transitions.iter().any(|transition| {
+            transition.from_state == "small"
+                && transition.target_state == "large"
+                && matches!(
+                    transition.trigger,
+                    NuiFlowStateTrigger::Intent { ref name } if name == "anim.f.large"
+                )
+        }));
+        assert!(panel_f.transitions.iter().any(|transition| {
+            transition.from_state == "small"
+                && transition.target_state == "large"
+                && transition.motion_key.as_deref() == Some("expand")
+        }));
+        let panel_i = document
+            .state_machines
+            .iter()
+            .find(|machine| machine.key == "panel-i")
+            .expect("panel-i state machine");
+        assert!(panel_i.transitions.iter().any(|transition| {
+            transition.from_state == "empty"
+                && transition.target_state == "full"
+                && transition.motion_key.as_deref() == Some("linear-fill")
+        }));
+        let panel_j = document
+            .state_machines
+            .iter()
+            .find(|machine| machine.key == "panel-j")
+            .expect("panel-j state machine");
+        assert!(panel_j.transitions.iter().any(|transition| {
+            transition.from_state == "rest"
+                && transition.target_state == "bounced"
+                && transition.motion_key.as_deref() == Some("spring-expand")
+        }));
+        let panel_k = document
+            .state_machines
+            .iter()
+            .find(|machine| machine.key == "panel-k")
+            .expect("panel-k state machine");
+        assert!(panel_k.transitions.iter().any(|transition| {
+            transition.from_state == "rest"
+                && transition.target_state == "settled"
+                && transition.motion_key.as_deref() == Some("transform-enter")
+        }));
+        let panel_k_rest = panel_k
+            .states
+            .iter()
+            .find(|state| state.name == "rest")
+            .and_then(|state| state.style_for("anim-panel-k"))
+            .expect("panel-k rest style");
+        assert_eq!(
+            panel_k_rest.transform,
+            Some(UiTransform {
+                translation: [0.0, 0.0],
+                scale: [1.0, 1.0],
+                rotation_degrees: 0.0,
+                origin: [0.0, 0.0],
+                ..UiTransform::default()
+            })
+        );
+        let panel_k_settled = panel_k
+            .states
+            .iter()
+            .find(|state| state.name == "settled")
+            .and_then(|state| state.style_for("anim-panel-k"))
+            .expect("panel-k settled style");
+        assert_eq!(
+            panel_k_settled
+                .transform
+                .map(|transform| transform.rotation_degrees),
+            Some(9.0)
+        );
+        assert_eq!(
+            panel_k_settled.transform.map(|transform| transform.origin),
+            Some([0.0, 0.0])
+        );
+        assert_eq!(
+            document.ir.exit_transition_records["anim-panel-l"]
+                .motion_key
+                .as_deref(),
+            Some("exit-fade")
+        );
+        assert!(lower_nui_flow_effects(&document).iter().any(|effect| {
+            matches!(effect, UiEffect::ExitTransition { node_id, transition } if node_id.0 == "anim-panel-l" && transition.motion_key.as_deref() == Some("exit-fade"))
+        }));
         fn find<'a>(node: &'a UiNode, key: &str) -> Option<&'a UiNode> {
             if node.node_id.0 == key {
                 return Some(node);
@@ -6329,11 +6854,30 @@ panel workspace row gap 8
                 .and_then(|transition| transition.motion_key.as_deref()),
             Some("delayed-reveal")
         );
+        assert_eq!(
+            find(&document.ir.root, "anim-panel-i")
+                .and_then(|node| node.enter_transition.as_ref())
+                .and_then(|transition| transition.motion_key.as_deref()),
+            Some("linear-enter")
+        );
+        assert_eq!(
+            find(&document.ir.root, "anim-panel-j")
+                .and_then(|node| node.enter_transition.as_ref())
+                .and_then(|transition| transition.motion_key.as_deref()),
+            Some("spring-expand")
+        );
+        assert_eq!(
+            find(&document.ir.root, "anim-panel-k")
+                .and_then(|node| node.enter_transition.as_ref())
+                .and_then(|transition| transition.motion_key.as_deref()),
+            Some("transform-enter")
+        );
         assert!(document.ir.events.iter().any(|event| {
             event.node_key == "btn-a-toggle" && event.intent == "anim.a.toggle"
         }));
         let formatted = format_nui_flow(&source).expect("showcase formatter must accept the catalog");
         assert!(formatted.contains("delay 90 from bounds 840 760 80 40 opacity 0"));
+        assert!(formatted.contains("transform 32 8 1.12 1.12 9 origin 0 0"));
         assert!(formatted.contains("on panel-a anim.a.toggle from compact -> expanded"));
         parse_nui_flow(&formatted).expect("formatted showcase must remain parseable");
     }
@@ -6903,5 +7447,52 @@ panel workspace row gap 8
         assert!(formatted.contains("context_menu menu"));
         assert!(formatted.contains("tree_view tree"));
         assert_eq!(format_nui_flow(&formatted).unwrap(), formatted);
+    }
+
+    #[test]
+    fn timeline_motion_parses_keyframes_repeat_stagger_and_formats_idempotently() {
+        let source = include_str!("../tests/fixtures/ui/timeline-motion.nui");
+        let document = parse_nui_flow(source).expect("timeline fixture must parse");
+        let motion = document
+            .motions
+            .iter()
+            .find(|motion| motion.key == "pulse")
+            .expect("pulse motion");
+        let timeline = motion
+            .transition
+            .timeline
+            .as_ref()
+            .expect("timeline metadata");
+        assert_eq!(timeline.group, UiAnimationGroup::Sequence);
+        assert_eq!(timeline.repeat, UiAnimationRepeat::Count(2));
+        assert_eq!(timeline.stagger_ms, 20);
+        assert_eq!(
+            timeline
+                .keyframes
+                .iter()
+                .map(|keyframe| keyframe.offset_ms)
+                .collect::<Vec<_>>(),
+            vec![0, 150, 300]
+        );
+        assert_eq!(timeline.keyframes[1].state.opacity, Some(0.5));
+        let formatted = format_nui_flow(source).expect("timeline fixture must format");
+        assert_eq!(format_nui_flow(&formatted).unwrap(), formatted);
+    }
+
+    #[test]
+    fn timeline_motion_rejects_non_monotonic_or_out_of_range_keyframes() {
+        let source = "version 1\nmotion pulse duration 300 easing linear\nkeyframe pulse 200 opacity 0\nkeyframe pulse 100 opacity 1\nsurface root w 10 h 10\n";
+        let error = parse_nui_flow(source).expect_err("non-monotonic keyframes must be rejected");
+        assert!(error
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "nui_flow_invalid_timeline"), "diagnostics: {:?}", error.diagnostics);
+
+        let source = "version 1\nmotion pulse duration 300 easing linear\nkeyframe pulse 0 opacity 0\nkeyframe pulse 301 opacity 1\nsurface root w 10 h 10\n";
+        let error = parse_nui_flow(source).expect_err("out-of-range keyframes must be rejected");
+        assert!(error
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "nui_flow_invalid_timeline"));
     }
 }

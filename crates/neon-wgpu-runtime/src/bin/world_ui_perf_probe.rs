@@ -19,8 +19,8 @@ use neon_protocol::{
     ClientIdentity, ClientKind, ProtocolVersion, RequestId, RpcRequest, RpcStatus, ServiceName,
 };
 use neon_ui_schema::{
-    UI_FRAGMENT_SCHEMA_VERSION, UiBounds, UiCommand, UiFragment, UiFragmentId,
-    UiFragmentSubmission, UiNode, UiNodeId, UiNodeKind, UiStyle,
+    UI_FRAGMENT_SCHEMA_VERSION, UiBounds, UiClipShape, UiCommand, UiFragment, UiFragmentId,
+    UiFragmentSubmission, UiNode, UiNodeId, UiNodeKind, UiStyle, UiTransform,
 };
 use serde_json::{Value, json};
 
@@ -254,6 +254,7 @@ fn main() {
             enter_transition: None,
             world_depth: None,
             world_scale: None,
+            clip_shape: UiClipShape::default(),
             children: vec![
                 // Monster 0 panel — clickable
                 UiNode {
@@ -278,11 +279,13 @@ fn main() {
                         border_width: 1.0,
                         corner_radius: 5.0,
                         opacity: 1.0,
+                        transform: UiTransform::default(),
                     },
                     enter_transition: None,
-                    world_depth: None,
-                    world_scale: None,
-                    children: vec![],
+                        world_depth: None,
+                        world_scale: None,
+                        clip_shape: UiClipShape::default(),
+                        children: vec![],
                 },
                 // Monster 1 panel — clickable
                 UiNode {
@@ -307,11 +310,13 @@ fn main() {
                         border_width: 1.0,
                         corner_radius: 5.0,
                         opacity: 1.0,
+                        transform: UiTransform::default(),
                     },
                     enter_transition: None,
-                    world_depth: None,
-                    world_scale: None,
-                    children: vec![],
+                        world_depth: None,
+                        world_scale: None,
+                        clip_shape: UiClipShape::default(),
+                        children: vec![],
                 },
             ],
         },

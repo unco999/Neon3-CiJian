@@ -21,7 +21,7 @@ use neon_protocol::{
     ServiceName,
 };
 use neon_ui_schema::{
-    UiBounds, UiCanvasData, UiCanvasLine, UiCommand, UiFragment, UiFragmentId,
+        UiBounds, UiCanvasData, UiCanvasLine, UiClipShape, UiCommand, UiFragment, UiFragmentId,
     UiFragmentSubmission, UiNode, UiNodeId, UiNodeKind, UiRichTextSpan, UiStyle, TextRef,
 };
 use serde_json::json;
@@ -87,6 +87,7 @@ fn label_node(id: &str, x: f32, y: f32, w: f32, h: f32, text: TextRef) -> UiNode
         enter_transition: None,
         world_depth: None,
         world_scale: None,
+        clip_shape: UiClipShape::default(),
         children: Vec::new(),
     }
 }
@@ -265,6 +266,7 @@ fn test_fragment() -> UiFragment {
         enter_transition: None,
         world_depth: None,
         world_scale: None,
+        clip_shape: UiClipShape::default(),
         children: Vec::new(),
     });
 
@@ -289,6 +291,7 @@ fn test_fragment() -> UiFragment {
             enter_transition: None,
             world_depth: None,
             world_scale: None,
+            clip_shape: UiClipShape::default(),
             children,
         },
         effects: vec![neon_ui_schema::UiEffect::CanvasData {

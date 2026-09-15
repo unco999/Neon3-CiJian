@@ -16,6 +16,7 @@ Neon3 owns the window and GPU. Applications in any language submit UI, state, an
 | --- | --- | --- |
 | [Neon3 Inventory Example](https://github.com/unco999/Neon3-example) | Python / Node.js inventory, drag and drop, capacity switching, real runtime probe | [Open and run](https://github.com/unco999/Neon3-example#quick-start) |
 | `component-gallery` | Rust smoke test for controls, DataGrid, Tooltip, drag and drop, dropdowns, and world UI | `cargo run -p neon-dev -- case component-gallery --show-logs` |
+| [`animation-showcase`](cases/animation-showcase/) | Rust showcase for declarative A-M animations, timelines, retargeting, exit lifecycle, and the real WGPU JSONL probe | [Test method](cases/animation-showcase/) |
 
 ```powershell
 cargo build -p neon-projectd -p neon-eventd -p neon-ui-runtime -p neon-wgpu-runtime -p neon-dev --bins

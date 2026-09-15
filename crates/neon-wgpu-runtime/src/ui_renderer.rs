@@ -11,9 +11,10 @@ use neon_ui_schema::{
     RenderSurfaceRef, TextRef, UiAlignItems, UiBounds, UiClipPolicy, UiClipShape, UiControlPresentation,
     UiDataGridCellTarget, UiDataGridWindowRequest, UiDragAxis, UiDragBinding, UiDragBoundary,
     UiDropPlacement, UiEasing, UiFragment, UiFragmentRevision, UiImageFit, UiIntent, UiJustifyContent,
-    UiLayout, UiLayoutMode, UiNode, UiNodeKind, UiSemanticPayloadValue, UiStyle,
+    UiLayout, UiLayoutMode, UiNode, UiNodeKind, UiSemanticPayloadValue, UiStyle, UiTransform,
     UiStylePatch as SchemaStylePatch, UiTransition, UiTransitionState, UiControlSkin,
     UiSkinSlot, UiSkinSlotKind, UiVisualState, UiSkinPresentation, UiMaterialRef, UiShaderPackage,
+    UiAnimationRepeat, UiAnimationTimeline,
 };
 use serde_json::{Value, json};
 
@@ -23,8 +24,7 @@ struct View { viewport: vec2<f32>, color_mode: u32, time_seconds: f32, extras: a
 struct ShaderEvent { event_id: u32, payload: vec4<f32> }
 struct ShaderEventBuffer { counter: atomic<u32>, events: array<ShaderEvent> }
 @group(0) @binding(1) var<storage, read_write> shader_events: ShaderEventBuffer;
-fn emit_shader_event(event_id: u32, payload: vec4<f32>) { let slot = atomicAdd(&shader_events.counter, 1u); if (slot < 256u) { shader_events.events[slot].event_id = event_id; shader_events.events[slot].payload = payload; } }
-
+ fn emit_shader_event(event_id: u32, payload: vec4<f32>) { let slot = atomicAdd(&shader_events.counter, 1u); if (slot < 256u) { shader_events.events[slot].event_id = event_id; shader_events.events[slot].payload = payload; } }
 fn animation_progress(animation: vec4<f32>) -> f32 {
     if (animation.w == 0.0 || animation.y <= 0.0) { return 1.0; }
     let t = clamp((view.time_seconds - animation.x) / animation.y, 0.0, 1.0);
@@ -32,6 +32,37 @@ fn animation_progress(animation: vec4<f32>) -> f32 {
     if (animation.z == 2.0) { return 1.0 - (1.0 - t) * (1.0 - t); }
     if (animation.z == 3.0) {
         return select(2.0 * t * t, 1.0 - pow(-2.0 * t + 2.0, 2.0) / 2.0, t >= 0.5);
+    }
+    if (animation.z == 4.0) {
+        if (t >= 1.0) { return 1.0; }
+        let damping = 6.0;
+        let angular = 16.0;
+        let envelope = exp(-damping * t);
+        return 1.0 - envelope * (cos(angular * t) + damping / angular * sin(angular * t));
+    }
+    if (animation.z == 5.0) {
+        let n1 = 7.5625;
+        let d1 = 2.75;
+        if (t < 1.0 / d1) { return n1 * t * t; }
+        if (t < 2.0 / d1) { let u = t - 1.5 / d1; return n1 * u * u + 0.75; }
+        if (t < 2.5 / d1) { let u = t - 2.25 / d1; return n1 * u * u + 0.9375; }
+        let u = t - 2.625 / d1;
+        return n1 * u * u + 0.984375;
+    }
+    if (animation.z == 6.0) {
+        var low = 0.0;
+        var high = 1.0;
+        for (var i = 0; i < 10; i = i + 1) {
+            let u = (low + high) * 0.5;
+            let one_minus_u = 1.0 - u;
+            let x = 3.0 * one_minus_u * one_minus_u * u * 0.25
+                + 3.0 * one_minus_u * u * u * 0.25 + u * u * u;
+            if (x < t) { low = u; } else { high = u; }
+        }
+        let u = (low + high) * 0.5;
+        let one_minus_u = 1.0 - u;
+        return 3.0 * one_minus_u * one_minus_u * u * 0.1
+            + 3.0 * one_minus_u * u * u + u * u * u;
     }
     return t;
 }
@@ -163,6 +194,9 @@ struct VsIn {
     @location(10) animation: vec4<f32>,
     @location(11) cut: vec4<f32>,
     @location(12) clip_shape: f32,
+    @location(13) transform_from: vec4<f32>,
+    @location(14) transform_to: vec4<f32>,
+    @location(15) rotation_pivot: vec4<f32>,
 }
 
 struct VsOut {
@@ -190,7 +224,31 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32, input: VsIn) -> VsOut {
     let fill = mix(input.from_fill, input.fill, t);
     let border = mix(input.from_border, input.border, t);
     let params = mix(input.from_params, input.params, t);
-    let pixel = rect.xy + local * rect.zw;
+    let base_pixel = rect.xy + local * rect.zw;
+    let static_transform = select(
+        vec4<f32>(0.0, 0.0, 1.0, 1.0),
+        input.transform_to,
+        input.transform_to.z > 0.0 && input.transform_to.w > 0.0,
+    );
+    let transform = select(
+        static_transform,
+        mix(input.transform_from, input.transform_to, t),
+        input.animation.w != 0.0,
+    );
+    let static_rotation = select(
+        0.0,
+        input.rotation_pivot.y,
+        input.transform_to.z > 0.0 && input.transform_to.w > 0.0,
+    );
+    let rotation = select(static_rotation, mix(input.rotation_pivot.x, input.rotation_pivot.y, t), input.animation.w != 0.0);
+    let pivot = input.rotation_pivot.zw;
+    let scaled = pivot + (base_pixel - pivot) * transform.zw + transform.xy;
+    let delta = scaled - pivot;
+    let rotated = pivot + vec2<f32>(
+        delta.x * cos(rotation) - delta.y * sin(rotation),
+        delta.x * sin(rotation) + delta.y * cos(rotation),
+    );
+    let pixel = rotated;
     var output: VsOut;
     output.position = vec4<f32>(pixel.x / view.viewport.x * 2.0 - 1.0, 1.0 - pixel.y / view.viewport.y * 2.0, input.depth, 1.0);
     output.local = local;
@@ -252,15 +310,17 @@ let color = mix(input.fill, input.border, border_alpha);
 const HIT_SHADER: &str = r#"
 struct View { viewport: vec2<f32>, color_mode: u32, time_seconds: f32, extras: array<vec4<f32>, 10> }
 @group(0) @binding(0) var<uniform> view: View;
-fn animation_progress(animation: vec4<f32>) -> f32 { if (animation.w == 0.0 || animation.y <= 0.0) { return 1.0; } let t=clamp((view.time_seconds-animation.x)/animation.y,0.0,1.0); if(animation.z==1.0){return t*t;} if(animation.z==2.0){return 1.0-(1.0-t)*(1.0-t);} if(animation.z==3.0){return select(2.0*t*t,1.0-pow(-2.0*t+2.0,2.0)/2.0,t>=0.5);} return t; }
-fn outside_clip_shape(pixel: vec2<f32>, clip: vec4<f32>, radius: f32, shape: f32) -> bool { if (pixel.x < clip.x || pixel.y < clip.y || pixel.x > clip.z || pixel.y > clip.w) { return true; } if (shape < 0.5) { if (radius <= 0.0) { return false; } let size=clip.zw-clip.xy; let r=min(radius,min(size.x,size.y)*0.5); let point=pixel-(clip.xy+size*0.5); let extent=max(size*0.5-vec2<f32>(r),vec2<f32>(0.0)); return length(max(abs(point)-extent,vec2<f32>(0.0)))>r; } let center=(clip.xy+clip.zw)*0.5; let half=(clip.zw-clip.xy)*0.5; if (shape < 1.5) { let r=min(half.x,half.y); return distance(pixel,center)>r; } let d=(pixel-center)/max(half,vec2<f32>(0.001)); return dot(d,d)>1.0; }
+fn animation_progress(animation: vec4<f32>) -> f32 { if (animation.w == 0.0 || animation.y <= 0.0) { return 1.0; } let t=clamp((view.time_seconds-animation.x)/animation.y,0.0,1.0); if(animation.z==1.0){return t*t;} if(animation.z==2.0){return 1.0-(1.0-t)*(1.0-t);} if(animation.z==3.0){return select(2.0*t*t,1.0-pow(-2.0*t+2.0,2.0)/2.0,t>=0.5);} if(animation.z==4.0){if(t>=1.0){return 1.0;} let damping=6.0; let angular=16.0; let envelope=exp(-damping*t); return 1.0-envelope*(cos(angular*t)+damping/angular*sin(angular*t));} if(animation.z==5.0){let n1=7.5625;let d1=2.75;if(t<1.0/d1){return n1*t*t;}if(t<2.0/d1){let u=t-1.5/d1;return n1*u*u+0.75;}if(t<2.5/d1){let u=t-2.25/d1;return n1*u*u+0.9375;}let u=t-2.625/d1;return n1*u*u+0.984375;} if(animation.z==6.0){var low=0.0;var high=1.0;for(var i=0;i<10;i=i+1){let u=(low+high)*0.5;let v=1.0-u;let x=3.0*v*v*u*0.25+3.0*v*u*u*0.25+u*u*u;if(x<t){low=u;}else{high=u;}}let u=(low+high)*0.5;let v=1.0-u;return 3.0*v*v*u*0.1+3.0*v*u*u+u*u*u;} return t; }
+ fn outside_clip_shape(pixel: vec2<f32>, clip: vec4<f32>, radius: f32, shape: f32) -> bool { if (pixel.x < clip.x || pixel.y < clip.y || pixel.x > clip.z || pixel.y > clip.w) { return true; } if (shape < 0.5) { if (radius <= 0.0) { return false; } let size=clip.zw-clip.xy; let r=min(radius,min(size.x,size.y)*0.5); let point=pixel-(clip.xy+size*0.5); let extent=max(size*0.5-vec2<f32>(r),vec2<f32>(0.0)); return length(max(abs(point)-extent,vec2<f32>(0.0)))>r; } let center=(clip.xy+clip.zw)*0.5; let half=(clip.zw-clip.xy)*0.5; if (shape < 1.5) { let r=min(half.x,half.y); return distance(pixel,center)>r; } let d=(pixel-center)/max(half,vec2<f32>(0.001)); return dot(d,d)>1.0; }
+ fn transform_point(point: vec2<f32>, transform: vec4<f32>, angle: f32, pivot: vec2<f32>) -> vec2<f32> { let scaled=pivot+(point-pivot)*transform.zw+transform.xy; let delta=scaled-pivot; return pivot+vec2<f32>(delta.x*cos(angle)-delta.y*sin(angle),delta.x*sin(angle)+delta.y*cos(angle)); }
+ fn transform_bounds(bounds: vec4<f32>, transform: vec4<f32>, angle: f32, pivot: vec2<f32>) -> vec4<f32> { let p0=transform_point(bounds.xy,transform,angle,pivot); let p1=transform_point(vec2<f32>(bounds.z,bounds.y),transform,angle,pivot); let p2=transform_point(bounds.zw,transform,angle,pivot); let p3=transform_point(vec2<f32>(bounds.x,bounds.w),transform,angle,pivot); return vec4<f32>(min(min(p0.x,p1.x),min(p2.x,p3.x)),min(min(p0.y,p1.y),min(p2.y,p3.y)),max(max(p0.x,p1.x),max(p2.x,p3.x)),max(max(p0.y,p1.y),max(p2.y,p3.y))); }
 fn outside_cut(local: vec2<f32>, size: vec2<f32>, cut: vec4<f32>) -> bool { let p = local * size; let bl = min(cut.x, min(size.x, size.y)); let br = min(cut.y, min(size.x, size.y)); let tr = min(cut.z, min(size.x, size.y)); let tl = min(cut.w, min(size.x, size.y)); if (bl > 0.0 && p.x < bl && p.y < bl && p.x + p.y < bl) { return true; } let rx = size.x - p.x; if (br > 0.0 && rx < br && p.y < br && rx + p.y < br) { return true; } let ty = size.y - p.y; if (tr > 0.0 && rx < tr && ty < tr && rx + ty < tr) { return true; } if (tl > 0.0 && p.x < tl && p.y < tl && p.x + p.y < tl) { return true; } return false; }
-struct VsIn { @location(0) rect: vec4<f32>, @location(1) params: vec4<f32>, @location(2) hit_id: u32, @location(3) clip: vec4<f32>, @location(4) cut: vec4<f32>, @location(5) clip_shape: f32 }
+ struct VsIn { @location(0) rect: vec4<f32>, @location(1) params: vec4<f32>, @location(2) hit_id: u32, @location(3) clip: vec4<f32>, @location(4) cut: vec4<f32>, @location(5) clip_shape: f32, @location(6) transform_from: vec4<f32>, @location(7) transform_to: vec4<f32>, @location(8) rotation_pivot: vec4<f32>, @location(9) animation: vec4<f32> }
 struct VsOut { @builtin(position) position: vec4<f32>, @location(0) local: vec2<f32>, @location(1) size: vec2<f32>, @location(2) params: vec4<f32>, @location(3) @interpolate(flat) hit_id: u32, @location(4) clip: vec4<f32>, @location(5) pixel: vec2<f32>, @location(6) cut: vec4<f32>, @location(7) @interpolate(flat) clip_shape: f32 }
 @vertex fn vs_main(@builtin(vertex_index) vertex_index: u32, input: VsIn) -> VsOut {
  var corners = array<vec2<f32>, 6>(vec2<f32>(0.0,0.0),vec2<f32>(1.0,0.0),vec2<f32>(0.0,1.0),vec2<f32>(0.0,1.0),vec2<f32>(1.0,0.0),vec2<f32>(1.0,1.0));
- let local = corners[vertex_index]; let pixel = input.rect.xy + local * input.rect.zw; var output: VsOut;
- output.position = vec4<f32>(pixel.x / view.viewport.x * 2.0 - 1.0, 1.0 - pixel.y / view.viewport.y * 2.0, 0.0, 1.0); output.local = local; output.size = input.rect.zw; output.params = input.params; output.hit_id = input.hit_id; output.clip = input.clip; output.pixel = pixel; output.cut = input.cut; output.clip_shape = input.clip_shape; return output;
+ let local = corners[vertex_index]; let t=animation_progress(input.animation); let static_transform=select(vec4<f32>(0.0,0.0,1.0,1.0),input.transform_to,input.transform_to.z>0.0&&input.transform_to.w>0.0); let transform=select(static_transform,mix(input.transform_from,input.transform_to,t),input.animation.w != 0.0); let static_angle=select(0.0,input.rotation_pivot.y,input.transform_to.z>0.0&&input.transform_to.w>0.0); let angle=select(static_angle,mix(input.rotation_pivot.x,input.rotation_pivot.y,t),input.animation.w != 0.0); let pixel=transform_point(input.rect.xy+local*input.rect.zw,transform,angle,input.rotation_pivot.zw); var output: VsOut;
+  output.position = vec4<f32>(pixel.x / view.viewport.x * 2.0 - 1.0, 1.0 - pixel.y / view.viewport.y * 2.0, 0.0, 1.0); output.local = local; output.size = input.rect.zw; output.params = input.params; output.hit_id = input.hit_id; output.clip = transform_bounds(input.clip,transform,angle,input.rotation_pivot.zw); output.pixel = pixel; output.cut = input.cut; output.clip_shape = input.clip_shape; return output;
 }
 @fragment fn fs_main(input: VsOut) -> @location(0) u32 {
    if (outside_clip_shape(input.pixel, input.clip, input.params.w, input.clip_shape)) { discard; }
@@ -300,13 +360,16 @@ struct ShaderEvent { event_id: u32, payload: vec4<f32> }
 struct ShaderEventBuffer { counter: atomic<u32>, events: array<ShaderEvent> }
 @group(0) @binding(1) var<storage, read_write> shader_events: ShaderEventBuffer;
 fn emit_shader_event(event_id: u32, payload: vec4<f32>) { let slot = atomicAdd(&shader_events.counter, 1u); if (slot < 256u) { shader_events.events[slot].event_id = event_id; shader_events.events[slot].payload = payload; } }
+fn animation_progress(animation: vec4<f32>) -> f32 { if (animation.w == 0.0 || animation.y <= 0.0) { return 1.0; } let t=clamp((view.time_seconds-animation.x)/animation.y,0.0,1.0); if(animation.z==1.0){return t*t;} if(animation.z==2.0){return 1.0-(1.0-t)*(1.0-t);} if(animation.z==3.0){return select(2.0*t*t,1.0-pow(-2.0*t+2.0,2.0)/2.0,t>=0.5);} if(animation.z==4.0){if(t>=1.0){return 1.0;} let damping=6.0; let angular=16.0; let envelope=exp(-damping*t); return 1.0-envelope*(cos(angular*t)+damping/angular*sin(angular*t));} if(animation.z==5.0){let n1=7.5625;let d1=2.75;if(t<1.0/d1){return n1*t*t;}if(t<2.0/d1){let u=t-1.5/d1;return n1*u*u+0.75;}if(t<2.5/d1){let u=t-2.25/d1;return n1*u*u+0.9375;}let u=t-2.625/d1;return n1*u*u+0.984375;} if(animation.z==6.0){var low=0.0;var high=1.0;for(var i=0;i<10;i=i+1){let u=(low+high)*0.5;let v=1.0-u;let x=3.0*v*v*u*0.25+3.0*v*u*u*0.25+u*u*u;if(x<t){low=u;}else{high=u;}}let u=(low+high)*0.5;let v=1.0-u;return 3.0*v*v*u*0.1+3.0*v*u*u+u*u*u;} return t; }
+fn transform_point(point: vec2<f32>, transform: vec4<f32>, angle: f32, pivot: vec2<f32>) -> vec2<f32> { let scaled=pivot+(point-pivot)*transform.zw+transform.xy; let delta=scaled-pivot; return pivot+vec2<f32>(delta.x*cos(angle)-delta.y*sin(angle),delta.x*sin(angle)+delta.y*cos(angle)); }
+fn transform_bounds(bounds: vec4<f32>, transform: vec4<f32>, angle: f32, pivot: vec2<f32>) -> vec4<f32> { let p0=transform_point(bounds.xy,transform,angle,pivot); let p1=transform_point(vec2<f32>(bounds.z,bounds.y),transform,angle,pivot); let p2=transform_point(bounds.zw,transform,angle,pivot); let p3=transform_point(vec2<f32>(bounds.x,bounds.w),transform,angle,pivot); return vec4<f32>(min(min(p0.x,p1.x),min(p2.x,p3.x)),min(min(p0.y,p1.y),min(p2.y,p3.y)),max(max(p0.x,p1.x),max(p2.x,p3.x)),max(max(p0.y,p1.y),max(p2.y,p3.y))); }
 fn srgb_to_linear(value: vec3<f32>) -> vec3<f32> { let low=value/12.92; let high=pow((value+vec3<f32>(0.055))/1.055,vec3<f32>(2.4)); return select(low,high,value>vec3<f32>(0.04045)); }
 fn outside_clip_shape(pixel: vec2<f32>, clip: vec4<f32>, radius: f32, shape: f32) -> bool { if (pixel.x < clip.x || pixel.y < clip.y || pixel.x > clip.z || pixel.y > clip.w) { return true; } if (shape < 0.5) { if (radius <= 0.0) { return false; } let size=clip.zw-clip.xy; let r=min(radius,min(size.x,size.y)*0.5); let point=pixel-(clip.xy+size*0.5); let extent=max(size*0.5-vec2<f32>(r),vec2<f32>(0.0)); return length(max(abs(point)-extent,vec2<f32>(0.0)))>r; } let center=(clip.xy+clip.zw)*0.5; let half=(clip.zw-clip.xy)*0.5; if (shape < 1.5) { let r=min(half.x,half.y); return distance(pixel,center)>r; } let d=(pixel-center)/max(half,vec2<f32>(0.001)); return dot(d,d)>1.0; }
 fn clip_alpha(pixel: vec2<f32>, clip: vec4<f32>, radius: f32, shape: f32) -> f32 { var sdf: f32; if (shape < 0.5) { let size=clip.zw-clip.xy; let r=min(radius,min(size.x,size.y)*0.5); let center=clip.xy+size*0.5; let extent=max(size*0.5-vec2<f32>(r),vec2<f32>(0.0)); let p=abs(pixel-center)-extent; let q=max(p,vec2<f32>(0.0)); sdf=length(q)+min(max(p.x,p.y),0.0)-r; } else if (shape < 1.5) { let center=(clip.xy+clip.zw)*0.5; let half=(clip.zw-clip.xy)*0.5; let r=min(half.x,half.y); sdf=distance(pixel,center)-r; } else { let center=(clip.xy+clip.zw)*0.5; let half=(clip.zw-clip.xy)*0.5; let d=(pixel-center)/max(half,vec2<f32>(0.001)); sdf=(length(d)-1.0)*min(half.x,half.y); } return clamp(0.5-sdf,0.0,1.0); }
 fn outside_cut(local: vec2<f32>, size: vec2<f32>, cut: vec4<f32>) -> bool { let p=local*size; let bl=min(cut.x,min(size.x,size.y)); let br=min(cut.y,min(size.x,size.y)); let tr=min(cut.z,min(size.x,size.y)); let tl=min(cut.w,min(size.x,size.y)); if(bl>0.0&&p.x<bl&&p.y<bl&&p.x+p.y<bl){return true;} let rx=size.x-p.x; if(br>0.0&&rx<br&&p.y<br&&rx+p.y<br){return true;} let ty=size.y-p.y; if(tr>0.0&&rx<tr&&ty<tr&&rx+ty<tr){return true;} if(tl>0.0&&p.x<tl&&p.y<tl&&p.x+p.y<tl){return true;} return false; }
-struct VsIn { @location(0) rect: vec4<f32>, @location(1) fill: vec4<f32>, @location(2) border: vec4<f32>, @location(3) params: vec4<f32>, @location(4) clip: vec4<f32>, @location(5) depth: f32, @location(6) from_rect: vec4<f32>, @location(7) from_fill: vec4<f32>, @location(8) from_border: vec4<f32>, @location(9) from_params: vec4<f32>, @location(10) animation: vec4<f32>, @location(11) cut: vec4<f32>, @location(12) clip_shape: f32 }
+ struct VsIn { @location(0) rect: vec4<f32>, @location(1) fill: vec4<f32>, @location(2) border: vec4<f32>, @location(3) params: vec4<f32>, @location(4) clip: vec4<f32>, @location(5) depth: f32, @location(6) from_rect: vec4<f32>, @location(7) from_fill: vec4<f32>, @location(8) from_border: vec4<f32>, @location(9) from_params: vec4<f32>, @location(10) animation: vec4<f32>, @location(11) cut: vec4<f32>, @location(12) clip_shape: f32, @location(13) transform_from: vec4<f32>, @location(14) transform_to: vec4<f32>, @location(15) rotation_pivot: vec4<f32> }
 struct VsOut { @builtin(position) position: vec4<f32>, @location(0) local: vec2<f32>, @location(1) size: vec2<f32>, @location(2) fill: vec4<f32>, @location(3) border: vec4<f32>, @location(4) params: vec4<f32>, @location(5) clip: vec4<f32>, @location(6) pixel: vec2<f32>, @location(7) cut: vec4<f32>, @location(8) @interpolate(flat) clip_shape: f32 }
-@vertex fn vs_main(@builtin(vertex_index) index: u32, input: VsIn) -> VsOut { var corners=array<vec2<f32>,6>(vec2<f32>(0.0,0.0),vec2<f32>(1.0,0.0),vec2<f32>(0.0,1.0),vec2<f32>(0.0,1.0),vec2<f32>(1.0,0.0),vec2<f32>(1.0,1.0)); let local=corners[index]; let pixel=input.rect.xy+local*input.rect.zw; var output:VsOut; output.position=vec4<f32>(pixel.x/view.viewport.x*2.0-1.0,1.0-pixel.y/view.viewport.y*2.0,input.depth,1.0); output.local=local; output.size=input.rect.zw; output.fill=input.fill; output.border=input.border; output.params=input.params; output.clip=input.clip; output.pixel=pixel; output.cut=input.cut; output.clip_shape=input.clip_shape; return output; }
+ @vertex fn vs_main(@builtin(vertex_index) index: u32, input: VsIn) -> VsOut { var corners=array<vec2<f32>,6>(vec2<f32>(0.0,0.0),vec2<f32>(1.0,0.0),vec2<f32>(0.0,1.0),vec2<f32>(0.0,1.0),vec2<f32>(1.0,0.0),vec2<f32>(1.0,1.0)); let local=corners[index]; let t=animation_progress(input.animation); let static_transform=select(vec4<f32>(0.0,0.0,1.0,1.0),input.transform_to,input.transform_to.z>0.0&&input.transform_to.w>0.0); let transform=select(static_transform,mix(input.transform_from,input.transform_to,t),input.animation.w != 0.0); let static_angle=select(0.0,input.rotation_pivot.y,input.transform_to.z>0.0&&input.transform_to.w>0.0); let angle=select(static_angle,mix(input.rotation_pivot.x,input.rotation_pivot.y,t),input.animation.w != 0.0); let pivot=input.rotation_pivot.zw; let pixel_base=input.rect.xy+local*input.rect.zw; let scaled=pivot+(pixel_base-pivot)*transform.zw+transform.xy; let delta=scaled-pivot; let pixel=pivot+vec2<f32>(delta.x*cos(angle)-delta.y*sin(angle),delta.x*sin(angle)+delta.y*cos(angle)); var output:VsOut; output.position=vec4<f32>(pixel.x/view.viewport.x*2.0-1.0,1.0-pixel.y/view.viewport.y*2.0,input.depth,1.0); output.local=local; output.size=input.rect.zw; output.fill=input.fill; output.border=input.border; output.params=input.params; output.clip=transform_bounds(input.clip,transform,angle,pivot); output.pixel=pixel; output.cut=input.cut; output.clip_shape=input.clip_shape; return output; }
 struct MaterialInput { local_position: vec2<f32>, bounds: vec4<f32>, base_color: vec4<f32>, border_color: vec4<f32>, time_seconds: f32, opacity: f32, geometry_edge: f32, state_flags: u32 }
 "#;
 const MATERIAL_SHADER_SUFFIX: &str = r#"
@@ -316,7 +379,7 @@ const MATERIAL_SHADER_SUFFIX: &str = r#"
 const DEPTH_SHADER: &str = r#"
 struct View { viewport: vec2<f32>, color_mode: u32, time_seconds: f32, extras: array<vec4<f32>, 10> }
 @group(0) @binding(0) var<uniform> view: View;
-fn animation_progress(animation: vec4<f32>) -> f32 { if (animation.w == 0.0 || animation.y <= 0.0) { return 1.0; } let t=clamp((view.time_seconds-animation.x)/animation.y,0.0,1.0); if(animation.z==1.0){return t*t;} if(animation.z==2.0){return 1.0-(1.0-t)*(1.0-t);} if(animation.z==3.0){return select(2.0*t*t,1.0-pow(-2.0*t+2.0,2.0)/2.0,t>=0.5);} return t; }
+fn animation_progress(animation: vec4<f32>) -> f32 { if (animation.w == 0.0 || animation.y <= 0.0) { return 1.0; } let t=clamp((view.time_seconds-animation.x)/animation.y,0.0,1.0); if(animation.z==1.0){return t*t;} if(animation.z==2.0){return 1.0-(1.0-t)*(1.0-t);} if(animation.z==3.0){return select(2.0*t*t,1.0-pow(-2.0*t+2.0,2.0)/2.0,t>=0.5);} if(animation.z==4.0){if(t>=1.0){return 1.0;} let damping=6.0; let angular=16.0; let envelope=exp(-damping*t); return 1.0-envelope*(cos(angular*t)+damping/angular*sin(angular*t));} if(animation.z==5.0){let n1=7.5625;let d1=2.75;if(t<1.0/d1){return n1*t*t;}if(t<2.0/d1){let u=t-1.5/d1;return n1*u*u+0.75;}if(t<2.5/d1){let u=t-2.25/d1;return n1*u*u+0.9375;}let u=t-2.625/d1;return n1*u*u+0.984375;} if(animation.z==6.0){var low=0.0;var high=1.0;for(var i=0;i<10;i=i+1){let u=(low+high)*0.5;let v=1.0-u;let x=3.0*v*v*u*0.25+3.0*v*u*u*0.25+u*u*u;if(x<t){low=u;}else{high=u;}}let u=(low+high)*0.5;let v=1.0-u;return 3.0*v*v*u*0.1+3.0*v*u*u+u*u*u;} return t; }
 fn outside_clip(pixel: vec2<f32>, clip: vec4<f32>, radius: f32) -> bool {
     if (pixel.x < clip.x || pixel.y < clip.y || pixel.x > clip.z || pixel.y > clip.w) { return true; }
     if (radius <= 0.0) { return false; }
@@ -379,6 +442,9 @@ struct VsIn {
     @location(9) from_params: vec4<f32>,
     @location(10) animation: vec4<f32>,
     @location(12) clip_shape: f32,
+    @location(13) transform_from: vec4<f32>,
+    @location(14) transform_to: vec4<f32>,
+    @location(15) rotation_pivot: vec4<f32>,
 }
 struct VsOut {
     @builtin(position) position: vec4<f32>,
@@ -395,7 +461,7 @@ struct VsOut {
         vec2<f32>(0.0, 0.0), vec2<f32>(1.0, 0.0), vec2<f32>(0.0, 1.0),
         vec2<f32>(0.0, 1.0), vec2<f32>(1.0, 0.0), vec2<f32>(1.0, 1.0)
     );
-    let local = corners[vertex_index]; let t = animation_progress(input.animation); let rect=mix(input.from_rect,input.rect,t); let params=mix(input.from_params,input.params,t); let pixel = rect.xy + local * rect.zw;
+    let local = corners[vertex_index]; let t = animation_progress(input.animation); let rect=mix(input.from_rect,input.rect,t); let params=mix(input.from_params,input.params,t); let base_pixel = rect.xy + local * rect.zw; let static_transform=select(vec4<f32>(0.0,0.0,1.0,1.0),input.transform_to,input.transform_to.z>0.0&&input.transform_to.w>0.0); let transform=select(static_transform,mix(input.transform_from,input.transform_to,t),input.animation.w != 0.0); let static_rotation=select(0.0,input.rotation_pivot.y,input.transform_to.z>0.0&&input.transform_to.w>0.0); let rotation=select(static_rotation,mix(input.rotation_pivot.x,input.rotation_pivot.y,t),input.animation.w != 0.0); let pivot=input.rotation_pivot.zw; let scaled=pivot+(base_pixel-pivot)*transform.zw+transform.xy; let delta=scaled-pivot; let pixel=pivot+vec2<f32>(delta.x*cos(rotation)-delta.y*sin(rotation),delta.x*sin(rotation)+delta.y*cos(rotation));
     var output: VsOut;
     output.position = vec4<f32>(pixel.x / view.viewport.x * 2.0 - 1.0, 1.0 - pixel.y / view.viewport.y * 2.0, 0.0, 1.0);
     output.clip = input.clip;
@@ -446,16 +512,27 @@ struct View { viewport: vec2<f32>, color_mode: u32, time_seconds: f32, extras: a
 @group(0) @binding(0) var<uniform> view: View;
 @group(1) @binding(0) var image_texture: texture_2d<f32>;
 @group(1) @binding(1) var image_sampler: sampler;
+fn animation_progress(animation: vec4<f32>) -> f32 {
+ if (animation.w == 0.0 || animation.y <= 0.0) { return 1.0; }
+ let t=clamp((view.time_seconds-animation.x)/animation.y,0.0,1.0);
+ if(animation.z==1.0){return t*t;}
+ if(animation.z==2.0){return 1.0-(1.0-t)*(1.0-t);}
+ if(animation.z==3.0){return select(2.0*t*t,1.0-pow(-2.0*t+2.0,2.0)/2.0,t>=0.5);}
+   if(animation.z==4.0){if(t>=1.0){return 1.0;} let damping=6.0; let angular=16.0; let envelope=exp(-damping*t); return 1.0-envelope*(cos(angular*t)+damping/angular*sin(angular*t));} if(animation.z==5.0){let n1=7.5625;let d1=2.75;if(t<1.0/d1){return n1*t*t;}if(t<2.0/d1){let u=t-1.5/d1;return n1*u*u+0.75;}if(t<2.5/d1){let u=t-2.25/d1;return n1*u*u+0.9375;}let u=t-2.625/d1;return n1*u*u+0.984375;} if(animation.z==6.0){var low=0.0;var high=1.0;for(var i=0;i<10;i=i+1){let u=(low+high)*0.5;let v=1.0-u;let x=3.0*v*v*u*0.25+3.0*v*u*u*0.25+u*u*u;if(x<t){low=u;}else{high=u;}}let u=(low+high)*0.5;let v=1.0-u;return 3.0*v*v*u*0.1+3.0*v*u*u+u*u*u;}
+ return t;
+}
+fn transform_point(point: vec2<f32>, transform: vec4<f32>, angle: f32, pivot: vec2<f32>) -> vec2<f32> { let scaled=pivot+(point-pivot)*transform.zw+transform.xy; let delta=scaled-pivot; return pivot+vec2<f32>(delta.x*cos(angle)-delta.y*sin(angle),delta.x*sin(angle)+delta.y*cos(angle)); }
+fn transform_bounds(bounds: vec4<f32>, transform: vec4<f32>, angle: f32, pivot: vec2<f32>) -> vec4<f32> { let p0=transform_point(bounds.xy,transform,angle,pivot); let p1=transform_point(vec2<f32>(bounds.z,bounds.y),transform,angle,pivot); let p2=transform_point(bounds.zw,transform,angle,pivot); let p3=transform_point(vec2<f32>(bounds.x,bounds.w),transform,angle,pivot); return vec4<f32>(min(min(p0.x,p1.x),min(p2.x,p3.x)),min(min(p0.y,p1.y),min(p2.y,p3.y)),max(max(p0.x,p1.x),max(p2.x,p3.x)),max(max(p0.y,p1.y),max(p2.y,p3.y))); }
 fn srgb_to_linear(value: vec3<f32>) -> vec3<f32> {
  let low = value / 12.92; let high = pow((value + vec3<f32>(0.055)) / 1.055, vec3<f32>(2.4)); return select(low, high, value > vec3<f32>(0.04045));
 }
 fn clip_alpha(pixel: vec2<f32>, clip: vec4<f32>, radius: f32, shape: f32) -> f32 { var sdf: f32; if (shape < 0.5) { let size=clip.zw-clip.xy; let r=min(radius,min(size.x,size.y)*0.5); let center=clip.xy+size*0.5; let extent=max(size*0.5-vec2<f32>(r),vec2<f32>(0.0)); let p=abs(pixel-center)-extent; let q=max(p,vec2<f32>(0.0)); sdf=length(q)+min(max(p.x,p.y),0.0)-r; } else if (shape < 1.5) { let center=(clip.xy+clip.zw)*0.5; let half=(clip.zw-clip.xy)*0.5; let r=min(half.x,half.y); sdf=distance(pixel,center)-r; } else { let center=(clip.xy+clip.zw)*0.5; let half=(clip.zw-clip.xy)*0.5; let d=(pixel-center)/max(half,vec2<f32>(0.001)); sdf=(length(d)-1.0)*min(half.x,half.y); } return clamp(0.5-sdf,0.0,1.0); }
-struct VsIn { @location(0) rect: vec4<f32>, @location(1) tint: vec4<f32>, @location(2) clip: vec4<f32>, @location(3) uv: vec4<f32>, @location(4) depth: f32, @location(5) source_insets: vec4<f32>, @location(6) target_insets: vec4<f32>, @location(7) mode: u32, @location(8) fill_center: u32, @location(9) clip_shape: f32 }
-struct VsOut { @builtin(position) position: vec4<f32>, @location(0) local: vec2<f32>, @location(1) tint: vec4<f32>, @location(2) clip: vec4<f32>, @location(3) pixel: vec2<f32>, @location(4) uv: vec4<f32>, @location(5) source_insets: vec4<f32>, @location(6) target_insets: vec4<f32>, @location(7) @interpolate(flat) mode: u32, @location(8) @interpolate(flat) fill_center: u32, @location(9) rect_size: vec2<f32>, @location(10) @interpolate(flat) clip_shape: f32 }
+ struct VsIn { @location(0) rect: vec4<f32>, @location(1) tint: vec4<f32>, @location(2) clip: vec4<f32>, @location(3) uv: vec4<f32>, @location(4) depth: f32, @location(5) source_insets: vec4<f32>, @location(6) target_insets: vec4<f32>, @location(7) mode: u32, @location(8) fill_center: u32, @location(9) clip_shape: f32, @location(10) animation: vec4<f32>, @location(11) transform_from: vec4<f32>, @location(12) transform_to: vec4<f32>, @location(13) rotation_pivot: vec4<f32> }
+ struct VsOut { @builtin(position) position: vec4<f32>, @location(0) local: vec2<f32>, @location(1) tint: vec4<f32>, @location(2) clip: vec4<f32>, @location(3) pixel: vec2<f32>, @location(4) uv: vec4<f32>, @location(5) source_insets: vec4<f32>, @location(6) target_insets: vec4<f32>, @location(7) @interpolate(flat) mode: u32, @location(8) @interpolate(flat) fill_center: u32, @location(9) rect_size: vec2<f32>, @location(10) @interpolate(flat) clip_shape: f32 }
 @vertex fn vs_main(@builtin(vertex_index) index: u32, input: VsIn) -> VsOut {
  var corners = array<vec2<f32>, 6>(vec2<f32>(0.0,0.0),vec2<f32>(1.0,0.0),vec2<f32>(0.0,1.0),vec2<f32>(0.0,1.0),vec2<f32>(1.0,0.0),vec2<f32>(1.0,1.0));
- let local = corners[index]; let pixel = input.rect.xy + local * input.rect.zw; var output: VsOut;
-    output.position = vec4<f32>(pixel.x / view.viewport.x * 2.0 - 1.0, 1.0 - pixel.y / view.viewport.y * 2.0, input.depth, 1.0); output.local = local; output.tint = input.tint; output.clip = input.clip; output.pixel = pixel; output.uv = input.uv; output.source_insets = input.source_insets; output.target_insets = input.target_insets; output.mode = input.mode; output.fill_center = input.fill_center; output.rect_size = input.rect.zw; output.clip_shape = input.clip_shape; return output;
+ let local = corners[index]; let t=animation_progress(input.animation); let static_transform=select(vec4<f32>(0.0,0.0,1.0,1.0),input.transform_to,input.transform_to.z>0.0&&input.transform_to.w>0.0); let transform=select(static_transform,mix(input.transform_from,input.transform_to,t),input.animation.w != 0.0); let static_angle=select(0.0,input.rotation_pivot.y,input.transform_to.z>0.0&&input.transform_to.w>0.0); let angle=select(static_angle,mix(input.rotation_pivot.x,input.rotation_pivot.y,t),input.animation.w != 0.0); let pixel=transform_point(input.rect.xy+local*input.rect.zw,transform,angle,input.rotation_pivot.zw); var output: VsOut;
+     output.position = vec4<f32>(pixel.x / view.viewport.x * 2.0 - 1.0, 1.0 - pixel.y / view.viewport.y * 2.0, input.depth, 1.0); output.local = local; output.tint = input.tint; output.clip = transform_bounds(input.clip,transform,angle,input.rotation_pivot.zw); output.pixel = pixel; output.uv = input.uv; output.source_insets = input.source_insets; output.target_insets = input.target_insets; output.mode = input.mode; output.fill_center = input.fill_center; output.rect_size = input.rect.zw; output.clip_shape = input.clip_shape; return output;
  }
 fn compressed_insets(size: f32, left: f32, right: f32) -> vec2<f32> {
   let total = left + right;
@@ -529,15 +606,26 @@ struct View { viewport: vec2<f32>, color_mode: u32, time_seconds: f32, extras: a
 @group(0) @binding(0) var<uniform> view: View;
 @group(1) @binding(0) var glyph_atlas: texture_2d<f32>;
 @group(1) @binding(1) var glyph_sampler: sampler;
+fn animation_progress(animation: vec4<f32>) -> f32 {
+ if (animation.w == 0.0 || animation.y <= 0.0) { return 1.0; }
+ let t=clamp((view.time_seconds-animation.x)/animation.y,0.0,1.0);
+ if(animation.z==1.0){return t*t;}
+ if(animation.z==2.0){return 1.0-(1.0-t)*(1.0-t);}
+ if(animation.z==3.0){return select(2.0*t*t,1.0-pow(-2.0*t+2.0,2.0)/2.0,t>=0.5);}
+   if(animation.z==4.0){if(t>=1.0){return 1.0;} let damping=6.0; let angular=16.0; let envelope=exp(-damping*t); return 1.0-envelope*(cos(angular*t)+damping/angular*sin(angular*t));} if(animation.z==5.0){let n1=7.5625;let d1=2.75;if(t<1.0/d1){return n1*t*t;}if(t<2.0/d1){let u=t-1.5/d1;return n1*u*u+0.75;}if(t<2.5/d1){let u=t-2.25/d1;return n1*u*u+0.9375;}let u=t-2.625/d1;return n1*u*u+0.984375;} if(animation.z==6.0){var low=0.0;var high=1.0;for(var i=0;i<10;i=i+1){let u=(low+high)*0.5;let v=1.0-u;let x=3.0*v*v*u*0.25+3.0*v*u*u*0.25+u*u*u;if(x<t){low=u;}else{high=u;}}let u=(low+high)*0.5;let v=1.0-u;return 3.0*v*v*u*0.1+3.0*v*u*u+u*u*u;}
+ return t;
+}
+fn transform_point(point: vec2<f32>, transform: vec4<f32>, angle: f32, pivot: vec2<f32>) -> vec2<f32> { let scaled=pivot+(point-pivot)*transform.zw+transform.xy; let delta=scaled-pivot; return pivot+vec2<f32>(delta.x*cos(angle)-delta.y*sin(angle),delta.x*sin(angle)+delta.y*cos(angle)); }
+fn transform_bounds(bounds: vec4<f32>, transform: vec4<f32>, angle: f32, pivot: vec2<f32>) -> vec4<f32> { let p0=transform_point(bounds.xy,transform,angle,pivot); let p1=transform_point(vec2<f32>(bounds.z,bounds.y),transform,angle,pivot); let p2=transform_point(bounds.zw,transform,angle,pivot); let p3=transform_point(vec2<f32>(bounds.x,bounds.w),transform,angle,pivot); return vec4<f32>(min(min(p0.x,p1.x),min(p2.x,p3.x)),min(min(p0.y,p1.y),min(p2.y,p3.y)),max(max(p0.x,p1.x),max(p2.x,p3.x)),max(max(p0.y,p1.y),max(p2.y,p3.y))); }
 fn srgb_to_linear(value: vec3<f32>) -> vec3<f32> {
  let low = value / 12.92; let high = pow((value + vec3<f32>(0.055)) / 1.055, vec3<f32>(2.4)); return select(low, high, value > vec3<f32>(0.04045));
 }
-struct VsIn { @location(0) rect: vec4<f32>, @location(1) color: vec4<f32>, @location(2) clip: vec4<f32>, @location(3) uv: vec4<f32>, @location(4) depth: f32 }
+struct VsIn { @location(0) rect: vec4<f32>, @location(1) color: vec4<f32>, @location(2) clip: vec4<f32>, @location(3) uv: vec4<f32>, @location(4) depth: f32, @location(5) animation: vec4<f32>, @location(6) transform_from: vec4<f32>, @location(7) transform_to: vec4<f32>, @location(8) rotation_pivot: vec4<f32> }
 struct VsOut { @builtin(position) position: vec4<f32>, @location(0) local: vec2<f32>, @location(1) color: vec4<f32>, @location(2) clip: vec4<f32>, @location(3) pixel: vec2<f32>, @location(4) uv: vec2<f32> }
 @vertex fn vs_main(@builtin(vertex_index) index: u32, input: VsIn) -> VsOut {
  var corners = array<vec2<f32>, 6>(vec2<f32>(0.0,0.0),vec2<f32>(1.0,0.0),vec2<f32>(0.0,1.0),vec2<f32>(0.0,1.0),vec2<f32>(1.0,0.0),vec2<f32>(1.0,1.0));
- let local = corners[index]; let pixel = input.rect.xy + local * input.rect.zw; var output: VsOut;
-  output.position=vec4<f32>(pixel.x/view.viewport.x*2.0-1.0,1.0-pixel.y/view.viewport.y*2.0,input.depth,1.0); output.local=local; output.color=input.color; output.clip=input.clip; output.pixel=pixel; output.uv=input.uv.xy + local * input.uv.zw; return output;
+ let local = corners[index]; let t=animation_progress(input.animation); let static_transform=select(vec4<f32>(0.0,0.0,1.0,1.0),input.transform_to,input.transform_to.z>0.0&&input.transform_to.w>0.0); let transform=select(static_transform,mix(input.transform_from,input.transform_to,t),input.animation.w != 0.0); let static_angle=select(0.0,input.rotation_pivot.y,input.transform_to.z>0.0&&input.transform_to.w>0.0); let angle=select(static_angle,mix(input.rotation_pivot.x,input.rotation_pivot.y,t),input.animation.w != 0.0); let pixel=transform_point(input.rect.xy+local*input.rect.zw,transform,angle,input.rotation_pivot.zw); var output: VsOut;
+ output.position=vec4<f32>(pixel.x/view.viewport.x*2.0-1.0,1.0-pixel.y/view.viewport.y*2.0,input.depth,1.0); output.local=local; output.color=input.color; output.clip=transform_bounds(input.clip,transform,angle,input.rotation_pivot.zw); output.pixel=pixel; output.uv=input.uv.xy + local * input.uv.zw; return output;
 }
 @fragment fn fs_main(input: VsOut) -> @location(0) vec4<f32> {
  if (input.pixel.x < input.clip.x || input.pixel.y < input.clip.y || input.pixel.x > input.clip.z || input.pixel.y > input.clip.w) { discard; }
@@ -596,6 +684,12 @@ struct UiInstance {
     /// Clip shape code: 0.0 = rect (default), 1.0 = circle, 2.0 = ellipse.
     /// Passed as f32 for WGSL vertex attribute compatibility.
     clip_shape: f32,
+    /// Entry/retarget transform source and identity target: translation x/y,
+    /// scale x/y, rotation is carried separately in radians.
+    transform_from: [f32; 4],
+    transform_to: [f32; 4],
+    rotation: [f32; 2],
+    pivot: [f32; 2],
 }
 
 #[repr(C)]
@@ -639,6 +733,10 @@ struct UiHitInstance {
     /// Clip shape code: 0.0 = rect, 1.0 = circle, 2.0 = ellipse.
     clip_shape: f32,
     _pad2: [f32; 3],
+    transform_from: [f32; 4],
+    transform_to: [f32; 4],
+    rotation_pivot: [f32; 4],
+    animation: [f32; 4],
 }
 
 #[derive(Clone, Debug)]
@@ -879,6 +977,10 @@ struct UiImageInstance {
     fill_center: u32,
     clip_shape: f32,
     _pad: u32,
+    animation: [f32; 4],
+    transform_from: [f32; 4],
+    transform_to: [f32; 4],
+    rotation_pivot: [f32; 4],
 }
 
 #[repr(C)]
@@ -892,6 +994,46 @@ struct UiTextInstance {
     /// ignores this field; the CPU uses it to keep panel and text together.
     depth: f32,
     paint_group_id: u32,
+    /// The same frame-time transform track used by panel instances.
+    animation: [f32; 4],
+    transform_from: [f32; 4],
+    transform_to: [f32; 4],
+    rotation_pivot: [f32; 4],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct UiTextTransformTrack {
+    animation: [f32; 4],
+    transform_from: [f32; 4],
+    transform_to: [f32; 4],
+    rotation_pivot: [f32; 4],
+}
+
+impl Default for UiTextTransformTrack {
+    fn default() -> Self {
+        Self {
+            animation: [0.0; 4],
+            transform_from: [0.0, 0.0, 1.0, 1.0],
+            transform_to: [0.0, 0.0, 1.0, 1.0],
+            rotation_pivot: [0.0; 4],
+        }
+    }
+}
+
+fn apply_text_transform_track(instances: &mut [UiTextInstance], track: UiTextTransformTrack) {
+    for instance in instances {
+        instance.animation = track.animation;
+        instance.transform_from = track.transform_from;
+        instance.transform_to = track.transform_to;
+        instance.rotation_pivot = track.rotation_pivot;
+    }
+}
+
+fn apply_image_transform_track(instance: &mut UiImageInstance, track: UiTextTransformTrack) {
+    instance.animation = track.animation;
+    instance.transform_from = track.transform_from;
+    instance.transform_to = track.transform_to;
+    instance.rotation_pivot = track.rotation_pivot;
 }
 
 #[repr(C)]
@@ -1228,6 +1370,35 @@ struct VisualFrameSnapshot {
 struct ExitingNode {
     transition: ActiveTransition,
     remove_after_seconds: f32,
+    target: UiVisual,
+    order: usize,
+}
+
+#[derive(Clone, Debug)]
+struct TimelineSegment {
+    from: UiVisual,
+    target: UiVisual,
+    duration_ms: u32,
+    easing: UiEasing,
+}
+
+#[derive(Clone, Debug)]
+struct TimelinePlayback {
+    segments: Vec<TimelineSegment>,
+    final_target: UiVisual,
+    segment_index: usize,
+    cycle: u32,
+    repeat: UiAnimationRepeat,
+    stagger_delay_ms: u32,
+}
+
+#[derive(Clone, Debug)]
+struct PausedAnimation {
+    transition: ActiveTransition,
+    final_target: UiVisual,
+    visual: UiVisual,
+    playback: Option<TimelinePlayback>,
+    progress: f32,
 }
 
 #[derive(Clone, Debug)]
@@ -1244,6 +1415,8 @@ struct ActiveTransition {
     retarget_source: Option<UiVisual>,
     from: UiVisual,
     target: UiVisual,
+    from_transform: UiTransform,
+    target_transform: UiTransform,
     started_at_seconds: f32,
     transition: UiTransition,
 }
@@ -1265,6 +1438,7 @@ struct UiAnimationSpec {
     duration_ms: u32,
     easing: UiEasing,
     from: UiTransitionState,
+    timeline: Option<UiAnimationTimeline>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1301,6 +1475,7 @@ fn animation_instance_from_active(
             duration_ms: active.transition.duration_ms,
             easing: active.transition.easing,
             from: active.transition.from,
+            timeline: active.transition.timeline.clone(),
         },
         status,
     }
@@ -1329,6 +1504,7 @@ impl ActiveTransition {
                 duration_ms: self.transition.duration_ms,
                 easing: self.transition.easing,
                 from: self.transition.from,
+                timeline: self.transition.timeline.clone(),
             },
             status: if finished {
                 UiAnimationStatus::Completed
@@ -1443,7 +1619,7 @@ struct UiLayoutCounters {
 /// target (color + occlusion depth) and the screen target (color only) from the
 /// same buffer index / frame sequence.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum UiDrawMode {
+pub enum UiDrawMode {
     /// Every node (used by the unified ID pass).
     All,
     /// Only projected world panels and their descendants.
@@ -1551,6 +1727,9 @@ fn gpu_easing(easing: UiEasing) -> f32 {
         UiEasing::EaseIn => 1.0,
         UiEasing::EaseOut => 2.0,
         UiEasing::EaseInOut => 3.0,
+        UiEasing::Spring => 4.0,
+        UiEasing::Bounce => 5.0,
+        UiEasing::CubicBezier => 6.0,
     }
 }
 
@@ -1655,13 +1834,22 @@ pub struct UiWgpuRenderer {
     view_buffer_viewport_revision: u64,
     current: HashMap<String, UiVisual>,
     current_identities: HashMap<String, AnimationIdentity>,
+    /// Last target reached by a persistent node transition. Node declarations
+    /// keep their motion metadata after completion; remember the settled target
+    /// so plan invalidation cannot replay the same enter track every frame.
+    settled_transition_targets: HashMap<String, UiVisual>,
     active: HashMap<String, ActiveTransition>,
     exiting: HashMap<AnimationIdentity, ExitingNode>,
+    exit_transitions: HashMap<String, UiTransition>,
+    last_exit_reconciliation: Option<Value>,
+    timeline_playbacks: HashMap<String, TimelinePlayback>,
+    paused_animations: HashMap<String, PausedAnimation>,
     node_generations: HashMap<String, u64>,
     live_node_ids: HashSet<String>,
     next_transition_id: u64,
     animation_frame_sequence: u64,
     animation_epoch: u64,
+    animation_clock_seconds: f32,
     last_frame_snapshot: Option<VisualFrameSnapshot>,
     animation_history: VecDeque<UiAnimationInstance>,
     pointer_position: Option<[f32; 2]>,
@@ -1763,7 +1951,7 @@ impl UiWgpuRenderer {
     /// Compiles package-local fragment functions into renderer-owned material
     /// pipelines. Sources never receive a device, texture, sampler, or bind
     /// group: the fixed wrapper supplies the only ABI and GPU bindings.
-    pub(crate) fn sync_material_packages(
+    pub fn sync_material_packages(
         &mut self,
         device: &wgpu::Device,
         packages: &[UiShaderPackage],
@@ -1799,6 +1987,9 @@ impl UiWgpuRenderer {
                 wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 152, shader_location: 10 },
                 wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 168, shader_location: 11 },
                 wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32, offset: 184, shader_location: 12 },
+                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 188, shader_location: 13 },
+                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 204, shader_location: 14 },
+                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 220, shader_location: 15 },
             ];
             let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(&format!("neon3-ui-material-pipeline-{}", package.package_id)),
@@ -2006,6 +2197,21 @@ impl UiWgpuRenderer {
                             offset: 184,
                             shader_location: 12,
                         },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x4,
+                            offset: 188,
+                            shader_location: 13,
+                        },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x4,
+                            offset: 204,
+                            shader_location: 14,
+                        },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x4,
+                            offset: 220,
+                            shader_location: 15,
+                        },
                     ],
                 })],
                 compilation_options: Default::default(),
@@ -2082,6 +2288,26 @@ impl UiWgpuRenderer {
                             format: wgpu::VertexFormat::Float32,
                             offset: 80,
                             shader_location: 5,
+                        },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x4,
+                            offset: 96,
+                            shader_location: 6,
+                        },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x4,
+                            offset: 112,
+                            shader_location: 7,
+                        },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x4,
+                            offset: 128,
+                            shader_location: 8,
+                        },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x4,
+                            offset: 144,
+                            shader_location: 9,
                         },
                     ],
                 })],
@@ -2299,6 +2525,26 @@ impl UiWgpuRenderer {
                             offset: 112,
                             shader_location: 9,
                         },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x4,
+                            offset: 120,
+                            shader_location: 10,
+                        },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x4,
+                            offset: 136,
+                            shader_location: 11,
+                        },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x4,
+                            offset: 152,
+                            shader_location: 12,
+                        },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x4,
+                            offset: 168,
+                            shader_location: 13,
+                        },
                     ],
                 })],
                 compilation_options: Default::default(),
@@ -2394,6 +2640,26 @@ impl UiWgpuRenderer {
                             format: wgpu::VertexFormat::Float32,
                             offset: 64,
                             shader_location: 4,
+                        },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x4,
+                            offset: 72,
+                            shader_location: 5,
+                        },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x4,
+                            offset: 88,
+                            shader_location: 6,
+                        },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x4,
+                            offset: 104,
+                            shader_location: 7,
+                        },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x4,
+                            offset: 120,
+                            shader_location: 8,
                         },
                     ],
                 })],
@@ -2496,6 +2762,21 @@ impl UiWgpuRenderer {
                                 offset: 184,
                                 shader_location: 12,
                             },
+                            wgpu::VertexAttribute {
+                                format: wgpu::VertexFormat::Float32x4,
+                                offset: 188,
+                                shader_location: 13,
+                            },
+                            wgpu::VertexAttribute {
+                                format: wgpu::VertexFormat::Float32x4,
+                                offset: 204,
+                                shader_location: 14,
+                            },
+                            wgpu::VertexAttribute {
+                                format: wgpu::VertexFormat::Float32x4,
+                                offset: 220,
+                                shader_location: 15,
+                            },
                         ],
                     })],
                     compilation_options: Default::default(),
@@ -2557,13 +2838,19 @@ impl UiWgpuRenderer {
             view_buffer_viewport_revision: 0,
             current: HashMap::new(),
             current_identities: HashMap::new(),
+            settled_transition_targets: HashMap::new(),
             active: HashMap::new(),
             exiting: HashMap::new(),
+            exit_transitions: HashMap::new(),
+            last_exit_reconciliation: None,
+            timeline_playbacks: HashMap::new(),
+            paused_animations: HashMap::new(),
             node_generations: HashMap::new(),
             live_node_ids: HashSet::new(),
             next_transition_id: 1,
             animation_frame_sequence: 0,
             animation_epoch: 1,
+            animation_clock_seconds: 0.0,
             last_frame_snapshot: None,
             animation_history: VecDeque::with_capacity(64),
             pointer_position: None,
@@ -2648,6 +2935,7 @@ impl UiWgpuRenderer {
         viewport_logical_size: [f32; 2],
         time_seconds: f32,
     ) {
+        self.animation_clock_seconds = time_seconds;
         pass.set_pipeline(&self.hit_clear_pipeline);
         pass.draw(0..3, 0..1);
         self.update_viewport(viewport_physical_size, viewport_logical_size);
@@ -2657,6 +2945,8 @@ impl UiWgpuRenderer {
         let mut instances = Vec::new();
         for (hit_id, index) in hit_nodes {
             let visual = self.visual_at(index);
+            let node_path = &self.plan[index].id;
+            let panel_instance = self.instance(visual, node_path, time_seconds);
             let short_key = self.plan[index]
                 .id
                 .rsplit('/')
@@ -2690,6 +2980,15 @@ impl UiWgpuRenderer {
                     UiClipShape::Ellipse => 2.0,
                 },
                 _pad2: [0.0; 3],
+                transform_from: panel_instance.transform_from,
+                transform_to: panel_instance.transform_to,
+                rotation_pivot: [
+                    panel_instance.rotation[0],
+                    panel_instance.rotation[1],
+                    panel_instance.pivot[0],
+                    panel_instance.pivot[1],
+                ],
+                animation: panel_instance.animation,
             });
         }
         if instances.is_empty() {
@@ -2774,6 +3073,7 @@ impl UiWgpuRenderer {
         viewport_logical_size: [f32; 2],
         time_seconds: f32,
     ) {
+        self.animation_clock_seconds = time_seconds;
         self.update_viewport(viewport_physical_size, viewport_logical_size);
         self.refresh_plan(fragments, viewport_logical_size);
         self.compose_sampled_visuals(time_seconds);
@@ -3097,6 +3397,15 @@ impl UiWgpuRenderer {
                 .enumerate()
                 .map(|(index, node)| {
                     let active = self.active.get(&node.id);
+                    let is_exiting = self.exiting.keys().any(|identity| {
+                        identity.node_id == node.id
+                            && identity.generation
+                                == self
+                                    .node_generations
+                                    .get(&node.id)
+                                    .copied()
+                                    .unwrap_or(1)
+                    });
                     SampledNodeVisual {
                         identity: AnimationIdentity {
                             node_id: node.id.clone(),
@@ -3115,7 +3424,9 @@ impl UiWgpuRenderer {
                         visual: active
                             .map(|active| sample_transition(active, time_seconds))
                             .unwrap_or_else(|| self.sampled[index].clone()),
-                        lifecycle: if active.is_some() {
+                        lifecycle: if is_exiting {
+                            LifecycleState::Exiting
+                        } else if active.is_some() {
                             LifecycleState::Active
                         } else {
                             LifecycleState::Current
@@ -3154,8 +3465,7 @@ impl UiWgpuRenderer {
             .find_map(|(index, node)| {
                 let visual = self.visual_at(index);
                 if !visual.enabled
-                    || !contains(visual.bounds, pointer)
-                    || !contains(visual.clip, pointer)
+                    || !self.pointer_inside_visual(index, pointer)
                 {
                     return None;
                 }
@@ -3183,8 +3493,7 @@ impl UiWgpuRenderer {
             .find_map(|(index, node)| {
                 let visual = self.visual_at(index);
                 if !visual.enabled
-                    || !contains(visual.bounds, pointer)
-                    || !contains(visual.clip, pointer)
+                    || !self.pointer_inside_visual(index, pointer)
                 {
                     return None;
                 }
@@ -3209,9 +3518,49 @@ impl UiWgpuRenderer {
                     .surface
                     .as_ref()
                     .is_some_and(|surface| surface.target_id == target_id)
-                && contains(visual.bounds, pointer)
-                && contains(visual.clip, pointer)
+                && self.pointer_inside_visual(index, pointer)
         })
+    }
+
+    fn frame_transform_for_node(&self, node_path: &str) -> UiTransform {
+        self.last_frame_snapshot
+            .as_ref()
+            .and_then(|frame| {
+                frame
+                    .nodes
+                    .iter()
+                    .find(|node| node.identity.node_id == node_path)
+            })
+            .map(|node| node.visual.style.transform)
+            .or_else(|| {
+                self.plan
+                    .iter()
+                    .find(|node| node.id == node_path)
+                    .map(|node| node.target.style.transform)
+            })
+            .unwrap_or_default()
+    }
+
+    fn pointer_inside_visual(&self, index: usize, pointer: [f32; 2]) -> bool {
+        let mut point = pointer;
+        let mut chain = Vec::new();
+        let mut current = Some(index);
+        while let Some(node_index) = current {
+            chain.push(node_index);
+            current = self.plan[node_index]
+                .parent_id
+                .as_deref()
+                .and_then(|parent| self.plan.iter().position(|node| node.id == parent));
+        }
+        for node_index in chain.into_iter().rev() {
+            let node = &self.plan[node_index];
+            let transform = self.frame_transform_for_node(&node.id);
+            if !UiTransform::is_identity(&transform) {
+                point = inverse_transform_point(point, node.target.bounds, transform);
+            }
+        }
+        let visual = self.visual_at(index);
+        contains(visual.bounds, point) && contains(visual.clip, point)
     }
 
     /// Debug-only semantic diagnostics for a prepared pointer sample. Renderer
@@ -5198,8 +5547,75 @@ impl UiWgpuRenderer {
     }
 
     pub(crate) fn has_active_animation(&mut self, time_seconds: f32) -> bool {
+        let mut expired_exits = false;
+        self.exiting.retain(|_, exiting| {
+            let keep = time_seconds < exiting.remove_after_seconds;
+            if !keep {
+                expired_exits = true;
+            }
+            keep
+        });
+        let mut timeline_updates = Vec::new();
+        for id in self.active.keys().cloned().collect::<Vec<_>>() {
+            if self.paused_animations.contains_key(&id) {
+                continue;
+            }
+            let Some(active) = self.active.get(&id) else {
+                continue;
+            };
+            if !transition_finished(active, time_seconds) {
+                continue;
+            }
+            let Some(playback) = self.timeline_playbacks.get_mut(&id) else {
+                continue;
+            };
+            let next_index = if playback.segment_index + 1 < playback.segments.len() {
+                Some((playback.segment_index + 1, false))
+            } else {
+                let can_repeat = match playback.repeat {
+                    UiAnimationRepeat::Once => false,
+                    UiAnimationRepeat::Infinite => true,
+                    UiAnimationRepeat::Count(count) => playback.cycle + 1 < count,
+                };
+                can_repeat.then_some((0, true))
+            };
+            let Some((segment_index, new_cycle)) = next_index else {
+                continue;
+            };
+            if new_cycle {
+                playback.cycle = playback.cycle.saturating_add(1);
+            }
+            playback.segment_index = segment_index;
+            timeline_updates.push((
+                id,
+                playback.segments[segment_index].clone(),
+                playback.cycle,
+                playback.segment_index,
+                playback.stagger_delay_ms,
+            ));
+        }
+        for (id, segment, cycle, segment_index, stagger_delay_ms) in timeline_updates {
+            if let Some(active) = self.active.get_mut(&id) {
+                active.from = segment.from.clone();
+                active.target = segment.target.clone();
+                active.from_transform = segment.from.style.transform;
+                active.target_transform = segment.target.style.transform;
+                active.started_at_seconds = time_seconds;
+                active.transition.delay_ms = if cycle == 0 && segment_index == 0 {
+                    stagger_delay_ms
+                } else {
+                    0
+                };
+                active.transition.duration_ms = segment.duration_ms;
+                active.transition.easing = segment.easing;
+                active.retarget_source = None;
+            }
+        }
         let mut completed = Vec::new();
         self.active.retain(|id, active| {
+            if self.paused_animations.contains_key(id) {
+                return true;
+            }
             let end = active.started_at_seconds
                 + active
                     .transition
@@ -5226,7 +5642,7 @@ impl UiWgpuRenderer {
                 false
             }
         });
-        for (node, target, identity, motion_key, start_seconds, duration_ms) in completed {
+        for (node, target, identity, motion_key, start_seconds, duration_ms) in &completed {
             if self.trace_role != "screen" && is_world_panel_path(&node) {
                 eprintln!(
                     "{}",
@@ -5245,11 +5661,53 @@ impl UiWgpuRenderer {
             // `current`, so the next `sample` treats it as a fresh source and
             // re-starts a no-op motion against the still-present
             // `enter_transition` — the endless start/complete churn.
-            self.current.insert(node.clone(), target);
-            self.current_identities.insert(node, identity);
+            self.current.insert(node.clone(), target.clone());
+            self.current_identities.insert(node.clone(), identity.clone());
+            self.settled_transition_targets
+                .insert(node.clone(), target.clone());
+            self.timeline_playbacks.remove(node);
+            if self.exiting.contains_key(identity) {
+                self.current.remove(node);
+                self.current_identities.remove(node);
+            }
         }
-        !self.active.is_empty()
+        let completion_redraw = !completed.is_empty();
+        if completion_redraw {
+            // The completion check runs after the draw that sampled the
+            // transition clock. Keep the diagnostic frame and the next draw
+            // in lockstep with the exact target instead of leaving the last
+            // pre-completion sample visible when the window goes idle.
+            if let Some(frame) = self.last_frame_snapshot.as_mut() {
+                for (node, target, identity, ..) in &completed {
+                    if let Some(sampled) = frame
+                        .nodes
+                        .iter_mut()
+                        .find(|sampled| sampled.identity.node_id == *node)
+                    {
+                        sampled.identity = identity.clone();
+                        sampled.transition_id = None;
+                        sampled.visual = target.clone();
+                        sampled.lifecycle = if self.exiting.contains_key(identity) {
+                            LifecycleState::Exiting
+                        } else {
+                            LifecycleState::Current
+                        };
+                    }
+                }
+            }
+        }
+        self.active
+            .iter()
+            .any(|(id, _)| !self.paused_animations.contains_key(id))
+            || !self.exiting.is_empty()
+            || self.plan.iter().any(|node| {
+                node.target.kind == UiNodeKind::Spinner
+                    && node.target.enabled
+                    && node.target.style.opacity > 0.001
+            })
             || time_seconds < self.pressed_until_seconds
+            || completion_redraw
+            || expired_exits
     }
 
     pub(crate) fn cancel_animation(&mut self, node_path: &str) -> bool {
@@ -5265,10 +5723,176 @@ impl UiWgpuRenderer {
         while self.animation_history.len() > 64 {
             self.animation_history.pop_front();
         }
+        self.timeline_playbacks.remove(node_path);
+        self.paused_animations.remove(node_path);
         self.current_identities
             .insert(node_path.to_owned(), active.identity.clone());
         self.current.insert(node_path.to_owned(), active.target);
         true
+    }
+
+    pub(crate) fn animation_control(
+        &mut self,
+        action: &str,
+        node_path: &str,
+        progress: Option<f32>,
+        time_seconds: f32,
+    ) -> Result<Value, &'static str> {
+        if node_path.trim().is_empty() {
+            return Err("animation_node_required");
+        }
+        match action {
+            "cancel" => {
+                if !self.cancel_animation(node_path) {
+                    return Err("animation_not_found");
+                }
+                Ok(json!({
+                    "state": "cancelled",
+                    "node_path": node_path,
+                    "paused": false,
+                }))
+            }
+            "pause" => {
+                if self.paused_animations.contains_key(node_path) {
+                    return Ok(json!({
+                        "state": "paused",
+                        "node_path": node_path,
+                    }));
+                }
+                let Some(active) = self.active.get(node_path).cloned() else {
+                    return Err("animation_not_found");
+                };
+                let progress = transition_progress(&active, time_seconds);
+                let visual = sample_transition(&active, time_seconds);
+                let playback = self.timeline_playbacks.remove(node_path);
+                let final_target = playback
+                    .as_ref()
+                    .map(|playback| playback.final_target.clone())
+                    .unwrap_or_else(|| active.target.clone());
+                let mut frozen = active.clone();
+                frozen.from = visual.clone();
+                frozen.target = visual.clone();
+                frozen.from_transform = visual.style.transform;
+                frozen.target_transform = visual.style.transform;
+                frozen.started_at_seconds = time_seconds;
+                frozen.transition.delay_ms = 0;
+                frozen.transition.duration_ms = u32::MAX;
+                frozen.transition.timeline = None;
+                self.active.insert(node_path.to_owned(), frozen);
+                self.paused_animations.insert(
+                    node_path.to_owned(),
+                    PausedAnimation {
+                        transition: active.clone(),
+                        final_target,
+                        visual: visual.clone(),
+                        playback,
+                        progress,
+                    },
+                );
+                Ok(json!({
+                    "state": "paused",
+                    "node_path": node_path,
+                    "transition_id": active.transition_id,
+                    "generation": active.identity.generation,
+                    "progress": progress,
+                    "visual": Self::visual_debug_value(&visual),
+                }))
+            }
+            "resume" => {
+                let Some(paused) = self.paused_animations.remove(node_path) else {
+                    return Err("animation_not_paused");
+                };
+                let mut resumed = paused.transition.clone();
+                let remaining = ((1.0 - paused.progress).clamp(0.0, 1.0)
+                    * resumed.transition.duration_ms as f32)
+                    .round() as u32;
+                resumed.from = paused.visual.clone();
+                resumed.target = paused.transition.target.clone();
+                resumed.from_transform = paused.visual.style.transform;
+                resumed.target_transform = resumed.target.style.transform;
+                resumed.started_at_seconds = time_seconds;
+                resumed.transition.delay_ms = 0;
+                resumed.transition.duration_ms = remaining.max(1);
+                resumed.retarget_source = Some(paused.visual.clone());
+                self.active.insert(node_path.to_owned(), resumed.clone());
+                if let Some(mut playback) = paused.playback {
+                    playback.stagger_delay_ms = 0;
+                    self.timeline_playbacks.insert(node_path.to_owned(), playback);
+                }
+                Ok(json!({
+                    "state": "running",
+                    "node_path": node_path,
+                    "transition_id": resumed.transition_id,
+                    "generation": resumed.identity.generation,
+                    "progress": paused.progress,
+                }))
+            }
+            "seek" => {
+                let progress = progress.ok_or("animation_progress_required")?;
+                if !progress.is_finite() || !(0.0..=1.0).contains(&progress) {
+                    return Err("animation_progress_invalid");
+                }
+                if self.paused_animations.contains_key(node_path) {
+                    return Err("animation_paused");
+                }
+                if progress >= 1.0 {
+                    let Some(active) = self.active.get(node_path).cloned() else {
+                        return Err("animation_not_found");
+                    };
+                    let target = active.target.clone();
+                    let identity = active.identity.clone();
+                    let transition_id = active.transition_id;
+                    self.active.remove(node_path);
+                    self.timeline_playbacks.remove(node_path);
+                    self.current.insert(node_path.to_owned(), target.clone());
+                    self.current_identities
+                        .insert(node_path.to_owned(), identity.clone());
+                    self.settled_transition_targets
+                        .insert(node_path.to_owned(), target.clone());
+                    self.animation_history
+                        .push_back(animation_instance_from_active(
+                            node_path,
+                            &active,
+                            UiAnimationStatus::Completed,
+                        ));
+                    while self.animation_history.len() > 64 {
+                        self.animation_history.pop_front();
+                    }
+                    return Ok(json!({
+                        "state": "completed",
+                        "node_path": node_path,
+                        "transition_id": transition_id,
+                        "progress": 1.0,
+                    }));
+                }
+                let Some(active) = self.active.get_mut(node_path) else {
+                    return Err("animation_not_found");
+                };
+                if let Some(playback) = self.timeline_playbacks.remove(node_path) {
+                    active.target = playback.final_target;
+                    active.target_transform = active.target.style.transform;
+                    active.transition.timeline = None;
+                }
+                // Keep a seeked track observable long enough for the control
+                // RPC response and the following diagnostic frame to pair.
+                // The seek operation changes the playback cursor, not the
+                // final target; a short remaining segment would otherwise
+                // expire before the consumer can inspect it.
+                let duration_ms = active.transition.duration_ms.max(1_000);
+                active.transition.duration_ms = duration_ms;
+                active.transition.delay_ms = 0;
+                active.started_at_seconds =
+                    time_seconds - progress * duration_ms as f32 / 1000.0;
+                Ok(json!({
+                    "state": "running",
+                    "node_path": node_path,
+                    "transition_id": active.transition_id,
+                    "generation": active.identity.generation,
+                    "progress": progress,
+                }))
+            }
+            _ => Err("animation_action_unsupported"),
+        }
     }
 
     fn visual_debug_value(visual: &UiVisual) -> Value {
@@ -5284,6 +5908,7 @@ impl UiWgpuRenderer {
             "border_color": visual.style.border_color,
             "border_width": visual.style.border_width,
             "corner_radius": visual.style.corner_radius,
+            "transform": Self::transform_debug_value(visual.style.transform),
             "clip_shape": match visual.clip_shape {
                 UiClipShape::Rect => "rect",
                 UiClipShape::Circle => "circle",
@@ -5295,6 +5920,15 @@ impl UiWgpuRenderer {
                 }
                 _ => Value::Null,
             },
+        })
+    }
+
+    fn transform_debug_value(transform: UiTransform) -> Value {
+        json!({
+            "translation": transform.translation,
+            "scale": transform.scale,
+            "rotation_degrees": transform.rotation_degrees,
+            "origin": transform.origin,
         })
     }
 
@@ -5346,6 +5980,21 @@ impl UiWgpuRenderer {
                     "target": Self::visual_debug_value(&active.target),
                     "from": Self::visual_debug_value(&active.from),
                     "sampled": Self::visual_debug_value(&sampled),
+                    "from_transform": Self::transform_debug_value(active.from_transform),
+                    "target_transform": Self::transform_debug_value(active.target_transform),
+                    "sampled_transform": Self::transform_debug_value(sample_transform(active, time_seconds)),
+                    "current_matches_target": self
+                        .current
+                        .get(node_key)
+                        .is_some_and(|current| Self::same_animation_visual(current, &active.target)),
+                    "timeline": self.timeline_playbacks.get(node_key).map(|playback| json!({
+                        "group": format!("{:?}", active.transition.timeline.as_ref().map(|timeline| timeline.group).unwrap_or_default()),
+                        "segment_index": playback.segment_index,
+                        "segment_count": playback.segments.len(),
+                        "cycle": playback.cycle,
+                        "repeat": format!("{:?}", playback.repeat),
+                        "stagger_delay_ms": playback.stagger_delay_ms,
+                    })),
                 })
             })
             .collect::<Vec<_>>();
@@ -5368,6 +6017,10 @@ impl UiWgpuRenderer {
                     "reason": animation.reason.as_str(),
                     "status": format!("{:?}", animation.status),
                     "motion_key": animation.spec.motion_key,
+                    "delay_ms": animation.spec.delay_ms,
+                    "duration_ms": animation.spec.duration_ms,
+                    "easing": format_easing(animation.spec.easing),
+                    "timeline": &animation.spec.timeline,
                     "started_at_seconds": animation.started_at_seconds,
                 })
             })
@@ -5378,25 +6031,53 @@ impl UiWgpuRenderer {
                 "frame_sequence": snapshot.frame_sequence,
                 "animation_epoch": snapshot.animation_epoch,
                 "nodes": snapshot.nodes.iter().map(|node| {
+                    let exiting = self.exiting.keys().any(|identity| {
+                        identity.node_id == node.identity.node_id
+                            && identity.generation == node.identity.generation
+                    });
                     json!({
                         "node_id": node.identity.node_id,
                         "generation": node.identity.generation,
                         "transition_id": node.transition_id,
-                        "lifecycle": match node.lifecycle {
+                        "lifecycle": if exiting && node.lifecycle == LifecycleState::Current {
+                            "exiting"
+                        } else { match node.lifecycle {
                             LifecycleState::Current => "current",
                             LifecycleState::Active => "active",
                             LifecycleState::Exiting => "exiting",
-                        },
+                        } },
                         "visual": Self::visual_debug_value(&node.visual),
                     })
                 }).collect::<Vec<_>>(),
             })
         });
+        let mut exit_transition_keys = self.exit_transitions.keys().cloned().collect::<Vec<_>>();
+        exit_transition_keys.sort();
         json!({
+            "clock_seconds": time_seconds,
             "count": transitions.len(),
             "transitions": transitions,
             "history": history,
             "exiting_count": self.exiting.len(),
+            "paused_count": self.paused_animations.len(),
+            "paused_nodes": self.paused_animations.keys().cloned().collect::<Vec<_>>(),
+            "exit_transition_keys": exit_transition_keys,
+            "live_node_count": self.live_node_ids.len(),
+            "last_exit_reconciliation": self.last_exit_reconciliation,
+            "exiting": self
+                .exiting
+                .values()
+                .map(|entry| {
+                    json!({
+                        "node_key": entry.transition.identity.node_id,
+                        "generation": entry.transition.identity.generation,
+                        "transition_id": entry.transition.transition_id,
+                        "motion_key": entry.transition.transition.motion_key,
+                        "remove_after_seconds": entry.remove_after_seconds,
+                        "status": if transition_finished(&entry.transition, time_seconds) { "completed" } else { "running" },
+                    })
+                })
+                .collect::<Vec<_>>(),
             "frame": frame,
         })
     }
@@ -5854,7 +6535,7 @@ impl UiWgpuRenderer {
         Ok(())
     }
 
-    pub(crate) fn draw<'a>(
+    pub fn draw<'a>(
         &'a mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -5865,6 +6546,7 @@ impl UiWgpuRenderer {
         time_seconds: f32,
         mode: UiDrawMode,
     ) {
+        self.animation_clock_seconds = time_seconds;
         /// Whether a sampled visual belongs to the requested emission subset.
         fn sampled_in_mode(visual: &UiVisual, mode: UiDrawMode) -> bool {
             match mode {
@@ -5935,7 +6617,14 @@ impl UiWgpuRenderer {
             }
             let visual = &self.sampled[index];
             let instance = self.instance(visual, &self.plan[index].id, time_seconds);
-            let chrome = self.component_chrome_instances(visual, &self.plan[index].id);
+            let chrome = self
+                .component_chrome_instances(visual, &self.plan[index].id)
+                .into_iter()
+                .enumerate()
+                .map(|(chrome_index, chrome)| {
+                    self.decorate_chrome_instance(visual, instance, chrome_index, chrome)
+                })
+                .collect::<Vec<_>>();
             let material_instance = self.node_materials.get(
                 self.plan[index].id.rsplit('/').next().unwrap_or(self.plan[index].id.as_str()),
             ).and_then(|material| self.material_pipelines.contains_key(&material.package_id)
@@ -6030,13 +6719,24 @@ impl UiWgpuRenderer {
             if self.plan[index].instance_index.is_some()
                 && sampled_in_mode(&self.sampled[index], mode)
             {
-                popup_instances.push(self.instance(
+                let instance = self.instance(
                     &self.sampled[index],
                     &self.plan[index].id,
                     time_seconds,
-                ));
+                );
+                popup_instances.push(instance);
                 popup_instances.extend(
-                    self.component_chrome_instances(&self.sampled[index], &self.plan[index].id),
+                    self.component_chrome_instances(&self.sampled[index], &self.plan[index].id)
+                        .into_iter()
+                        .enumerate()
+                        .map(|(chrome_index, chrome)| {
+                            self.decorate_chrome_instance(
+                                &self.sampled[index],
+                                instance,
+                                chrome_index,
+                                chrome,
+                            )
+                        }),
                 );
             }
         }
@@ -6096,6 +6796,7 @@ impl UiWgpuRenderer {
         }
         let mut images = Vec::new();
         let mut popup_images = Vec::new();
+        let text_transform_tracks = self.text_transform_tracks(time_seconds);
         for (index, visual) in self.sampled.iter().enumerate() {
             let image = (|| {
                 if !sampled_in_mode(visual, mode) {
@@ -6156,6 +6857,7 @@ impl UiWgpuRenderer {
                     mode,
                     fill_center,
                     clip_shape: 0.0, _pad: 0,
+                    ..UiImageInstance::zeroed()
                 })
             })();
             let Some(image) = image else {
@@ -6230,6 +6932,7 @@ impl UiWgpuRenderer {
                 mode: slice_mode,
                 fill_center,
                 clip_shape: 0.0, _pad: 0,
+                ..UiImageInstance::zeroed()
             });
         }
         // Slider skins replace the standard track/fill/thumb chrome only. The
@@ -6266,7 +6969,7 @@ impl UiWgpuRenderer {
                 if nine_slice.is_some_and(|layout| !layout.validate_for_image(image.width, image.height)) { continue; }
                 let (source_insets, target_insets, slice_mode, fill_center) = nine_slice.map(|layout| (layout.source_insets_px.map(|value| value as f32), layout.target_insets, match layout.mode { neon_ui_schema::UiNineSliceMode::Stretch => 0, neon_ui_schema::UiNineSliceMode::Tile => 1, neon_ui_schema::UiNineSliceMode::Mirror => 2 }, u32::from(layout.fill_center))).unwrap_or(([0.0; 4], [0.0; 4], 0, 1));
                 let (rect, uv) = fit_image_rect_and_uv(bounds, image.uv, image.width, image.height, fit);
-                images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, clip_shape: 0.0, _pad: 0 });
+                images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, clip_shape: 0.0, _pad: 0, ..UiImageInstance::zeroed() });
             }
         }
         // Panel / Dialog / ContextMenu / Splitter / ListBox / Modal / TreeView
@@ -6293,7 +6996,7 @@ impl UiWgpuRenderer {
             if nine_slice.is_some_and(|layout| !layout.validate_for_image(image.width, image.height)) { continue; }
             let (source_insets, target_insets, slice_mode, fill_center) = nine_slice.map(|layout| (layout.source_insets_px.map(|value| value as f32), layout.target_insets, match layout.mode { neon_ui_schema::UiNineSliceMode::Stretch => 0, neon_ui_schema::UiNineSliceMode::Tile => 1, neon_ui_schema::UiNineSliceMode::Mirror => 2 }, u32::from(layout.fill_center))).unwrap_or(([0.0; 4], [0.0; 4], 0, 1));
             let (rect, uv) = fit_image_rect_and_uv(visual.bounds, image.uv, image.width, image.height, fit);
-            images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, clip_shape: 0.0, _pad: 0 });
+            images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, clip_shape: 0.0, _pad: 0, ..UiImageInstance::zeroed() });
         }
         // Switch skins render track + sliding thumb. Thumb position is driven by
         // the Toggle presentation (selected = on). Track and thumb support
@@ -6325,7 +7028,7 @@ impl UiWgpuRenderer {
                 if nine_slice.is_some_and(|layout| !layout.validate_for_image(image.width, image.height)) { continue; }
                 let (source_insets, target_insets, slice_mode, fill_center) = nine_slice.map(|layout| (layout.source_insets_px.map(|value| value as f32), layout.target_insets, match layout.mode { neon_ui_schema::UiNineSliceMode::Stretch => 0, neon_ui_schema::UiNineSliceMode::Tile => 1, neon_ui_schema::UiNineSliceMode::Mirror => 2 }, u32::from(layout.fill_center))).unwrap_or(([0.0; 4], [0.0; 4], 0, 1));
                 let (rect, uv) = fit_image_rect_and_uv(bounds, image.uv, image.width, image.height, fit);
-                images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, clip_shape: 0.0, _pad: 0 });
+                images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, clip_shape: 0.0, _pad: 0, ..UiImageInstance::zeroed() });
             }
         }
         // ProgressBar skins render track + fill using the normalized value.
@@ -6355,7 +7058,7 @@ impl UiWgpuRenderer {
                 if nine_slice.is_some_and(|layout| !layout.validate_for_image(image.width, image.height)) { continue; }
                 let (source_insets, target_insets, slice_mode, fill_center) = nine_slice.map(|layout| (layout.source_insets_px.map(|value| value as f32), layout.target_insets, match layout.mode { neon_ui_schema::UiNineSliceMode::Stretch => 0, neon_ui_schema::UiNineSliceMode::Tile => 1, neon_ui_schema::UiNineSliceMode::Mirror => 2 }, u32::from(layout.fill_center))).unwrap_or(([0.0; 4], [0.0; 4], 0, 1));
                 let (rect, uv) = fit_image_rect_and_uv(bounds, image.uv, image.width, image.height, fit);
-                images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, clip_shape: 0.0, _pad: 0 });
+                images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, clip_shape: 0.0, _pad: 0, ..UiImageInstance::zeroed() });
             }
         }
         // Scrollbar skins render track + thumb using the normalized scroll value.
@@ -6399,7 +7102,7 @@ impl UiWgpuRenderer {
                 if nine_slice.is_some_and(|layout| !layout.validate_for_image(image.width, image.height)) { continue; }
                 let (source_insets, target_insets, slice_mode, fill_center) = nine_slice.map(|layout| (layout.source_insets_px.map(|value| value as f32), layout.target_insets, match layout.mode { neon_ui_schema::UiNineSliceMode::Stretch => 0, neon_ui_schema::UiNineSliceMode::Tile => 1, neon_ui_schema::UiNineSliceMode::Mirror => 2 }, u32::from(layout.fill_center))).unwrap_or(([0.0; 4], [0.0; 4], 0, 1));
                 let (rect, uv) = fit_image_rect_and_uv(bounds, image.uv, image.width, image.height, fit);
-                images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, clip_shape: 0.0, _pad: 0 });
+                images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, clip_shape: 0.0, _pad: 0, ..UiImageInstance::zeroed() });
             }
         }
         // Checkbox skins render body + check mark based on selected state.
@@ -6434,7 +7137,7 @@ impl UiWgpuRenderer {
                     if !nine_slice.is_some_and(|layout| !layout.validate_for_image(image.width, image.height)) {
                         let (source_insets, target_insets, slice_mode, fill_center) = nine_slice.map(|layout| (layout.source_insets_px.map(|value| value as f32), layout.target_insets, match layout.mode { neon_ui_schema::UiNineSliceMode::Stretch => 0, neon_ui_schema::UiNineSliceMode::Tile => 1, neon_ui_schema::UiNineSliceMode::Mirror => 2 }, u32::from(layout.fill_center))).unwrap_or(([0.0; 4], [0.0; 4], 0, 1));
                         let (rect, uv) = fit_image_rect_and_uv(box_bounds, image.uv, image.width, image.height, fit);
-                        images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, clip_shape: 0.0, _pad: 0 });
+                        images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, clip_shape: 0.0, _pad: 0, ..UiImageInstance::zeroed() });
                     }
                 }
             }
@@ -6455,7 +7158,7 @@ impl UiWgpuRenderer {
                             let mark_size = box_size * 0.6;
                             let mark_bounds = UiBounds { x: box_bounds.x + (box_size - mark_size) * 0.5, y: box_bounds.y + (box_size - mark_size) * 0.5, width: mark_size, height: mark_size };
                             let (rect, uv) = fit_image_rect_and_uv(mark_bounds, image.uv, image.width, image.height, fit);
-                            images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, clip_shape: 0.0, _pad: 0 });
+                            images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, clip_shape: 0.0, _pad: 0, ..UiImageInstance::zeroed() });
                         }
                     }
                 }
@@ -6493,7 +7196,7 @@ impl UiWgpuRenderer {
                     if !nine_slice.is_some_and(|layout| !layout.validate_for_image(image.width, image.height)) {
                         let (source_insets, target_insets, slice_mode, fill_center) = nine_slice.map(|layout| (layout.source_insets_px.map(|value| value as f32), layout.target_insets, match layout.mode { neon_ui_schema::UiNineSliceMode::Stretch => 0, neon_ui_schema::UiNineSliceMode::Tile => 1, neon_ui_schema::UiNineSliceMode::Mirror => 2 }, u32::from(layout.fill_center))).unwrap_or(([0.0; 4], [0.0; 4], 0, 1));
                         let (rect, uv) = fit_image_rect_and_uv(box_bounds, image.uv, image.width, image.height, fit);
-                        images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, clip_shape: 1.0, _pad: 0 });
+                        images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, clip_shape: 1.0, _pad: 0, ..UiImageInstance::zeroed() });
                     }
                 }
             }
@@ -6514,7 +7217,7 @@ impl UiWgpuRenderer {
                             let dot_size = box_size * 0.5;
                             let dot_bounds = UiBounds { x: box_bounds.x + (box_size - dot_size) * 0.5, y: box_bounds.y + (box_size - dot_size) * 0.5, width: dot_size, height: dot_size };
                             let (rect, uv) = fit_image_rect_and_uv(dot_bounds, image.uv, image.width, image.height, fit);
-                            images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, clip_shape: 1.0, _pad: 0 });
+                            images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, clip_shape: 1.0, _pad: 0, ..UiImageInstance::zeroed() });
                         }
                     }
                 }
@@ -6542,7 +7245,7 @@ impl UiWgpuRenderer {
                     if !nine_slice.is_some_and(|layout| !layout.validate_for_image(image.width, image.height)) {
                         let (source_insets, target_insets, slice_mode, fill_center) = nine_slice.map(|layout| (layout.source_insets_px.map(|value| value as f32), layout.target_insets, match layout.mode { neon_ui_schema::UiNineSliceMode::Stretch => 0, neon_ui_schema::UiNineSliceMode::Tile => 1, neon_ui_schema::UiNineSliceMode::Mirror => 2 }, u32::from(layout.fill_center))).unwrap_or(([0.0; 4], [0.0; 4], 0, 1));
                         let (rect, uv) = fit_image_rect_and_uv(visual.bounds, image.uv, image.width, image.height, fit);
-                        images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, clip_shape: 0.0, _pad: 0 });
+                        images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, clip_shape: 0.0, _pad: 0, ..UiImageInstance::zeroed() });
                     }
                 }
             }
@@ -6559,7 +7262,7 @@ impl UiWgpuRenderer {
                         if !nine_slice.is_some_and(|layout| !layout.validate_for_image(image.width, image.height)) {
                             let (source_insets, target_insets, slice_mode, fill_center) = nine_slice.map(|layout| (layout.source_insets_px.map(|value| value as f32), layout.target_insets, match layout.mode { neon_ui_schema::UiNineSliceMode::Stretch => 0, neon_ui_schema::UiNineSliceMode::Tile => 1, neon_ui_schema::UiNineSliceMode::Mirror => 2 }, u32::from(layout.fill_center))).unwrap_or(([0.0; 4], [0.0; 4], 0, 1));
                             let (rect, uv) = fit_image_rect_and_uv(visual.bounds, image.uv, image.width, image.height, fit);
-                            images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, clip_shape: 0.0, _pad: 0 });
+                            images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, clip_shape: 0.0, _pad: 0, ..UiImageInstance::zeroed() });
                         }
                     }
                 }
@@ -6584,7 +7287,7 @@ impl UiWgpuRenderer {
             if nine_slice.is_some_and(|layout| !layout.validate_for_image(image.width, image.height)) { continue; }
             let (source_insets, target_insets, slice_mode, fill_center) = nine_slice.map(|layout| (layout.source_insets_px.map(|value| value as f32), layout.target_insets, match layout.mode { neon_ui_schema::UiNineSliceMode::Stretch => 0, neon_ui_schema::UiNineSliceMode::Tile => 1, neon_ui_schema::UiNineSliceMode::Mirror => 2 }, u32::from(layout.fill_center))).unwrap_or(([0.0; 4], [0.0; 4], 0, 1));
             let (rect, uv) = fit_image_rect_and_uv(visual.bounds, image.uv, image.width, image.height, fit);
-            images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, clip_shape: 0.0, _pad: 0 });
+            images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, clip_shape: 0.0, _pad: 0, ..UiImageInstance::zeroed() });
         }
         // Combo / Dropdown / Tabs / Selectable skins render a body image with
         // hover / pressed / disabled state support (same fallback chain as Button).
@@ -6611,7 +7314,7 @@ impl UiWgpuRenderer {
             if nine_slice.is_some_and(|layout| !layout.validate_for_image(image.width, image.height)) { continue; }
             let (source_insets, target_insets, slice_mode, fill_center) = nine_slice.map(|layout| (layout.source_insets_px.map(|value| value as f32), layout.target_insets, match layout.mode { neon_ui_schema::UiNineSliceMode::Stretch => 0, neon_ui_schema::UiNineSliceMode::Tile => 1, neon_ui_schema::UiNineSliceMode::Mirror => 2 }, u32::from(layout.fill_center))).unwrap_or(([0.0; 4], [0.0; 4], 0, 1));
             let (rect, uv) = fit_image_rect_and_uv(visual.bounds, image.uv, image.width, image.height, fit);
-            images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, clip_shape: 0.0, _pad: 0 });
+            images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, clip_shape: 0.0, _pad: 0, ..UiImageInstance::zeroed() });
         }
         // DragValue skins render a track background plus an optional body overlay.
         for (index, visual) in self.sampled.iter().enumerate() {
@@ -6635,7 +7338,7 @@ impl UiWgpuRenderer {
                     if !nine_slice.is_some_and(|layout| !layout.validate_for_image(image.width, image.height)) {
                         let (source_insets, target_insets, slice_mode, fill_center) = nine_slice.map(|layout| (layout.source_insets_px.map(|value| value as f32), layout.target_insets, match layout.mode { neon_ui_schema::UiNineSliceMode::Stretch => 0, neon_ui_schema::UiNineSliceMode::Tile => 1, neon_ui_schema::UiNineSliceMode::Mirror => 2 }, u32::from(layout.fill_center))).unwrap_or(([0.0; 4], [0.0; 4], 0, 1));
                         let (rect, uv) = fit_image_rect_and_uv(visual.bounds, image.uv, image.width, image.height, fit);
-                        images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, clip_shape: 0.0, _pad: 0 });
+                        images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, clip_shape: 0.0, _pad: 0, ..UiImageInstance::zeroed() });
                     }
                 }
             }
@@ -6651,9 +7354,27 @@ impl UiWgpuRenderer {
                     if !nine_slice.is_some_and(|layout| !layout.validate_for_image(image.width, image.height)) {
                         let (source_insets, target_insets, slice_mode, fill_center) = nine_slice.map(|layout| (layout.source_insets_px.map(|value| value as f32), layout.target_insets, match layout.mode { neon_ui_schema::UiNineSliceMode::Stretch => 0, neon_ui_schema::UiNineSliceMode::Tile => 1, neon_ui_schema::UiNineSliceMode::Mirror => 2 }, u32::from(layout.fill_center))).unwrap_or(([0.0; 4], [0.0; 4], 0, 1));
                         let (rect, uv) = fit_image_rect_and_uv(visual.bounds, image.uv, image.width, image.height, fit);
-                        images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, clip_shape: 0.0, _pad: 0 });
+                        images.push(UiImageInstance { rect, tint: [1.0, 1.0, 1.0, visual.style.opacity], clip: [visual.clip.x, visual.clip.y, visual.clip.x + visual.clip.width, visual.clip.y + visual.clip.height], uv, depth: color_pass_depth(visual.world_depth), paint_group_id: self.plan[index].paint_group_id, source_insets, target_insets, mode: slice_mode, fill_center, clip_shape: 0.0, _pad: 0, ..UiImageInstance::zeroed() });
                     }
                 }
+            }
+        }
+        let mut image_transform_tracks_by_group = HashMap::new();
+        for node in &self.plan {
+            if let Some(track) = text_transform_tracks.get(&node.id).copied() {
+                // The first node in a paint group is its transform owner. Keep
+                // that root track for all image/material layers in the group.
+                image_transform_tracks_by_group
+                    .entry(node.paint_group_id)
+                    .or_insert(track);
+            }
+        }
+        for image in images.iter_mut().chain(popup_images.iter_mut()) {
+            if let Some(track) = image_transform_tracks_by_group
+                .get(&image.paint_group_id)
+                .copied()
+            {
+                apply_image_transform_track(image, track);
             }
         }
         let image_capacity = images.len().max(popup_images.len());
@@ -6666,7 +7387,7 @@ impl UiWgpuRenderer {
         // is the only image batch consumed by the render pass; uploading this
         // unsorted vector first duplicated every image buffer write once per
         // frame, which became expensive as soon as image UI was present.
-        let surfaces = self
+        let mut surfaces = self
             .sampled
             .iter()
             .filter_map(|visual| {
@@ -6706,10 +7427,19 @@ impl UiWgpuRenderer {
                             mode: 0,
                             fill_center: 1,
                             clip_shape: 0.0, _pad: 0,
+                            ..UiImageInstance::zeroed()
                         },
                     ))
             })
             .collect::<Vec<_>>();
+        for (_, surface) in &mut surfaces {
+            if let Some(track) = image_transform_tracks_by_group
+                .get(&surface.paint_group_id)
+                .copied()
+            {
+                apply_image_transform_track(surface, track);
+            }
+        }
         // Canvas data stays declarative until this renderer-owned final draw
         // pass. Expand it directly into point/line GPU instances, never into
         // Panel nodes or an intermediate texture.
@@ -6828,12 +7558,19 @@ impl UiWgpuRenderer {
                         ) {
                             return None;
                         }
+                        let node_path = &self.plan[index].id;
+                        let transform_track = text_transform_tracks
+                            .get(node_path)
+                            .copied()
+                            .unwrap_or_default();
                         // Rich text on non-top-layer nodes: layout directly.
                         // (Static text cache below is keyed on a plain &str,
                         // so rich spans take a separate path for now.)
                         if text.is_none() {
                             if let Some(TextRef::Rich { spans }) = visual.text.as_ref() {
-                                return layout_rich_text(device, queue, font, visual, spans);
+                                let mut instances = layout_rich_text(device, queue, font, visual, spans)?;
+                                apply_text_transform_track(&mut instances, transform_track);
+                                return Some(instances);
                             }
                             return None;
                         }
@@ -6847,7 +7584,6 @@ impl UiWgpuRenderer {
                         // layout instead of re-measuring it.
                         // includes the atlas generation so that new glyph
                         // rasterizations trigger a refresh.
-                        let node_path = &self.plan[index].id;
                         let horizontal_scroll = (visual.kind == UiNodeKind::TextInput
                             && local_text.is_some())
                         .then_some(self.editing.horizontal_scroll);
@@ -6895,10 +7631,14 @@ impl UiWgpuRenderer {
                                     instance.clip = clip;
                                 }
                             }
+                            apply_text_transform_track(&mut instances, transform_track);
                             return instances.into();
                         }
-                        let instances =
+                        let mut instances =
                             layout_text(device, queue, font, visual, text, horizontal_scroll);
+                        if let Some(instances) = instances.as_mut() {
+                            apply_text_transform_track(instances, transform_track);
+                        }
                         if let Some(instances) = instances {
                             self.layout_counters.text_layout_count =
                                 self.layout_counters.text_layout_count.saturating_add(1);
@@ -6979,12 +7719,20 @@ impl UiWgpuRenderer {
                             ) {
                             match visual.text.as_ref() {
                                 Some(TextRef::Rich { spans }) => {
-                                    if let Some(instances) = layout_rich_text(device, queue, font, visual, spans) {
+                                    let mut instances = layout_rich_text(device, queue, font, visual, spans).unwrap_or_default();
+                                    if let Some(track) = text_transform_tracks.get(&self.plan[index].id).copied() {
+                                        apply_text_transform_track(&mut instances, track);
+                                    }
+                                    if !instances.is_empty() {
                                         popup_texts.extend(instances);
                                     }
                                 }
                                 Some(text) if text_ref_value(text).is_some() => {
-                                    if let Some(instances) = layout_text(device, queue, font, visual, text_ref_value(text).unwrap(), None) {
+                                    let mut instances = layout_text(device, queue, font, visual, text_ref_value(text).unwrap(), None).unwrap_or_default();
+                                    if let Some(track) = text_transform_tracks.get(&self.plan[index].id).copied() {
+                                        apply_text_transform_track(&mut instances, track);
+                                    }
+                                    if !instances.is_empty() {
                                         popup_texts.extend(instances);
                                     }
                                 }
@@ -7623,6 +8371,21 @@ impl UiWgpuRenderer {
         })
     }
 
+    fn exit_transition_for_node(&self, node_id: &str) -> Option<UiTransition> {
+        let mut current = Some(node_id);
+        while let Some(id) = current {
+            if let Some(transition) = self.exit_transitions.get(id) {
+                return Some(transition.clone());
+            }
+            current = self
+                .plan
+                .iter()
+                .find(|node| node.id == id)
+                .and_then(|node| node.parent_id.as_deref());
+        }
+        None
+    }
+
     fn refresh_plan(
         &mut self,
         fragments: &HashMap<neon_ui_schema::UiFragmentId, UiFragment>,
@@ -7642,7 +8405,12 @@ impl UiWgpuRenderer {
             && fragments
                 .iter()
                 .all(|(id, fragment)| self.plan_revisions.get(id) == Some(&fragment.revision));
-        if matches && !data_grid_hold_changed {
+        let stale_exiting_plan = self.exiting.is_empty()
+            && self
+                .plan
+                .iter()
+                .any(|node| !self.live_node_ids.contains(&node.id));
+        if matches && !data_grid_hold_changed && !stale_exiting_plan {
             return false;
         }
         self.nine_slices.clear();
@@ -7672,6 +8440,12 @@ impl UiWgpuRenderer {
                         self.composition_layers.insert(
                             format!("{}/{}", fragment.fragment_id.0, node_id.0),
                             *layer,
+                        );
+                    }
+                    neon_ui_schema::UiEffect::ExitTransition { node_id, transition } => {
+                        self.exit_transitions.insert(
+                            format!("{}/{}", fragment.fragment_id.0, node_id.0),
+                            transition.clone(),
                         );
                     }
                     neon_ui_schema::UiEffect::ContextMenuBinding { node_id, context_menu_id } => {
@@ -7840,7 +8614,7 @@ impl UiWgpuRenderer {
             }
             filtered_nodes.push((id, parent_id, target, transition));
         }
-        let nodes = filtered_nodes;
+        let mut nodes = filtered_nodes;
         let live: HashSet<_> = nodes.iter().map(|(id, _, _, _)| id.clone()).collect();
         let previous_live = self.live_node_ids.clone();
         for id in &live {
@@ -7855,7 +8629,10 @@ impl UiWgpuRenderer {
         if viewport_changed {
             self.current.clear();
             self.current_identities.clear();
+            self.settled_transition_targets.clear();
             self.active.clear();
+            self.timeline_playbacks.clear();
+            self.paused_animations.clear();
             self.exiting.clear();
             self.last_frame_snapshot = None;
             self.animation_epoch = self.animation_epoch.saturating_add(1).max(1);
@@ -7865,20 +8642,225 @@ impl UiWgpuRenderer {
                 .cloned()
                 .collect::<Vec<_>>();
             for id in removed {
-                if let Some(active) = self.active.remove(&id) {
+                self.settled_transition_targets.remove(&id);
+                self.timeline_playbacks.remove(&id);
+                self.paused_animations.remove(&id);
+                self.last_exit_reconciliation = Some(json!({
+                    "node_id": id,
+                    "exit_transition_available": self.exit_transitions.contains_key(&id),
+                    "known_exit_transition_keys": self.exit_transitions.keys().cloned().collect::<Vec<_>>(),
+                }));
+                let Some((order, old_node)) = self
+                    .plan
+                    .iter()
+                    .enumerate()
+                    .find(|(_, node)| node.id == id)
+                else {
+                    continue;
+                };
+                let Some(mut exit_transition) = self.exit_transition_for_node(&id) else {
+                    if let Some(diagnostic) = self.last_exit_reconciliation.as_mut() {
+                        diagnostic["result"] = json!("cancelled_without_exit_motion");
+                    }
+                    if let Some(active) = self.active.remove(&id) {
+                        self.animation_history.push_back(animation_instance_from_active(
+                            &id,
+                            &active,
+                            UiAnimationStatus::Cancelled,
+                        ));
+                    }
+                    self.current.remove(&id);
+                    self.current_identities.remove(&id);
+                    continue;
+                };
+                let source = self
+                    .last_frame_snapshot
+                    .as_ref()
+                    .and_then(|frame| {
+                        frame
+                            .nodes
+                            .iter()
+                            .find(|node| node.identity.node_id == id)
+                    })
+                    .map(|node| node.visual.clone())
+                    .or_else(|| self.current.get(&id).cloned())
+                    .unwrap_or_else(|| old_node.target.clone());
+                if let Some(previous) = self.active.remove(&id) {
                     self.animation_history.push_back(animation_instance_from_active(
                         &id,
-                        &active,
-                        UiAnimationStatus::Cancelled,
+                        &previous,
+                        UiAnimationStatus::Superseded,
                     ));
                 }
+                let mut target = source.clone();
+                target.style.opacity = 0.0;
+                target.enabled = false;
+                exit_transition.from = UiTransitionState::default();
+                let identity = self
+                    .current_identities
+                    .get(&id)
+                    .cloned()
+                    .unwrap_or(AnimationIdentity {
+                        node_id: id.clone(),
+                        generation: self.node_generations.get(&id).copied().unwrap_or(1),
+                    });
+                let active = ActiveTransition {
+                    identity: identity.clone(),
+                    transition_id: self.next_transition_id,
+                    program_revision: self
+                        .plan_revisions
+                        .values()
+                        .copied()
+                        .max_by_key(|revision| revision.0)
+                        .unwrap_or(Revision(0)),
+                    source_frame_sequence: self
+                        .last_frame_snapshot
+                        .as_ref()
+                        .map(|frame| frame.frame_sequence)
+                        .unwrap_or(self.animation_frame_sequence),
+                    animation_epoch: self.animation_epoch,
+                    reason: AnimationReason::Exit,
+                    retarget_source: None,
+                    from: source.clone(),
+                    target: target.clone(),
+                    from_transform: source.style.transform,
+                    target_transform: target.style.transform,
+                    started_at_seconds: self.animation_clock_seconds,
+                    transition: exit_transition.clone(),
+                };
+                self.next_transition_id = self.next_transition_id.saturating_add(1).max(1);
+                self.active.insert(id.clone(), active.clone());
                 self.current.remove(&id);
                 self.current_identities.remove(&id);
+                self.exiting.insert(
+                    identity,
+                    ExitingNode {
+                        transition: active.clone(),
+                        remove_after_seconds: self.animation_clock_seconds
+                            + exit_transition.delay_ms.saturating_add(exit_transition.duration_ms)
+                                as f32
+                                / 1000.0
+                                + 0.05,
+                        target,
+                        order,
+                    },
+                );
+                if let Some(diagnostic) = self.last_exit_reconciliation.as_mut() {
+                    diagnostic["result"] = json!("exit_started");
+                    diagnostic["transition_id"] = json!(active.transition_id);
+                    diagnostic["generation"] = json!(active.identity.generation);
+                    diagnostic["source_frame_sequence"] = json!(active.source_frame_sequence);
+                    diagnostic["start_frame_sequence"] = json!(self.animation_frame_sequence);
+                    diagnostic["animation_epoch"] = json!(active.animation_epoch);
+                    diagnostic["started_at_seconds"] = json!(active.started_at_seconds);
+                    diagnostic["motion_key"] = json!(active.transition.motion_key);
+                    diagnostic["easing"] = json!(format_easing(active.transition.easing));
+                    diagnostic["delay_ms"] = json!(active.transition.delay_ms);
+                    diagnostic["duration_ms"] = json!(active.transition.duration_ms);
+                    diagnostic["from"] = Self::visual_debug_value(&active.from);
+                    diagnostic["target"] = Self::visual_debug_value(&active.target);
+                    diagnostic["from_transform"] = Self::transform_debug_value(active.from_transform);
+                    diagnostic["target_transform"] = Self::transform_debug_value(active.target_transform);
+                    diagnostic["remove_after_seconds"] = json!(self.animation_clock_seconds
+                        + exit_transition.delay_ms.saturating_add(exit_transition.duration_ms) as f32
+                            / 1000.0
+                        + 0.05);
+                }
             }
             self.current.retain(|id, _| live.contains(id));
             self.current_identities.retain(|id, _| live.contains(id));
-            self.active.retain(|id, _| live.contains(id));
+            self.settled_transition_targets
+                .retain(|id, _| live.contains(id));
+            self.active.retain(|id, active| {
+                live.contains(id) || active.reason == AnimationReason::Exit
+            });
         }
+        let resurrected = self
+            .exiting
+            .keys()
+            .filter(|identity| live.contains(&identity.node_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        for identity in resurrected {
+            let Some(exiting) = self.exiting.remove(&identity) else {
+                continue;
+            };
+            let Some(target) = nodes
+                .iter()
+                .find(|(id, _, _, _)| id == &identity.node_id)
+                .map(|(_, _, target, _)| target.clone())
+            else {
+                continue;
+            };
+            let source = sample_transition(&exiting.transition, self.animation_clock_seconds);
+            let generation = self
+                .node_generations
+                .get(&identity.node_id)
+                .copied()
+                .unwrap_or_else(|| identity.generation.saturating_add(1).max(1));
+            let new_identity = AnimationIdentity {
+                node_id: identity.node_id.clone(),
+                generation,
+            };
+            let transition = exiting.transition.transition.clone();
+            self.active.remove(&identity.node_id);
+            self.timeline_playbacks.remove(&identity.node_id);
+            self.paused_animations.remove(&identity.node_id);
+            self.settled_transition_targets.remove(&identity.node_id);
+            self.current.insert(identity.node_id.clone(), source.clone());
+            self.current_identities
+                .insert(identity.node_id.clone(), new_identity.clone());
+            self.active.insert(
+                identity.node_id.clone(),
+                ActiveTransition {
+                    identity: new_identity,
+                    transition_id: self.next_transition_id,
+                    program_revision: self
+                        .plan_revisions
+                        .values()
+                        .copied()
+                        .max_by_key(|revision| revision.0)
+                        .unwrap_or(Revision(0)),
+                    source_frame_sequence: self
+                        .last_frame_snapshot
+                        .as_ref()
+                        .map(|frame| frame.frame_sequence)
+                        .unwrap_or(self.animation_frame_sequence),
+                    animation_epoch: self.animation_epoch,
+                    reason: AnimationReason::Retarget,
+                    retarget_source: Some(source.clone()),
+                    from: source.clone(),
+                    target: target.clone(),
+                    from_transform: source.style.transform,
+                    target_transform: target.style.transform,
+                    started_at_seconds: self.animation_clock_seconds,
+                    transition,
+                },
+            );
+            self.next_transition_id = self.next_transition_id.saturating_add(1).max(1);
+            if let Some(diagnostic) = self.last_exit_reconciliation.as_mut() {
+                diagnostic["result"] = json!("exit_resurrected");
+                diagnostic["resurrected_generation"] = json!(generation);
+                diagnostic["resurrected_from_opacity"] = json!(source.style.opacity);
+            }
+        }
+        self.exit_transitions.retain(|id, _| {
+            live.contains(id)
+                || self
+                    .exiting
+                    .keys()
+                    .any(|identity| identity.node_id == *id)
+        });
+        let mut exiting = self.exiting.values().collect::<Vec<_>>();
+        exiting.sort_by_key(|entry| entry.order);
+        nodes.extend(exiting.into_iter().filter_map(|entry| {
+            (!live.contains(&entry.transition.identity.node_id)).then_some((
+                entry.transition.identity.node_id.clone(),
+                None,
+                entry.target.clone(),
+                None,
+            ))
+        }));
         self.plan.clear();
         self.debug_semantic_nodes.clear();
         self.sampled.clear();
@@ -8321,6 +9303,94 @@ impl UiWgpuRenderer {
             .collect()
     }
 
+    fn decorate_chrome_instance(
+        &self,
+        visual: &UiVisual,
+        parent: UiInstance,
+        chrome_index: usize,
+        mut chrome: UiInstance,
+    ) -> UiInstance {
+        chrome.transform_from = parent.transform_from;
+        chrome.transform_to = parent.transform_to;
+        chrome.rotation = parent.rotation;
+        chrome.pivot = parent.pivot;
+        chrome.animation = parent.animation;
+        if visual.kind == UiNodeKind::Spinner && chrome_index == 1 {
+            let angle = (self.animation_clock_seconds * 4.0) % std::f32::consts::TAU;
+            chrome.rotation = [angle, angle];
+            chrome.pivot = [
+                visual.bounds.x + visual.bounds.width * 0.5,
+                visual.bounds.y + visual.bounds.height * 0.5,
+            ];
+        }
+        chrome
+    }
+
+    fn start_timeline(
+        &mut self,
+        node_path: &str,
+        target: &UiVisual,
+        transition: &UiTransition,
+        time_seconds: f32,
+    ) {
+        let Some(timeline) = transition.timeline.as_ref() else {
+            self.timeline_playbacks.remove(node_path);
+            return;
+        };
+        let initial_from = self
+            .active
+            .get(node_path)
+            .map(|active| active.from.clone())
+            .unwrap_or_else(|| transition_source(target, transition));
+        let Some(segments) = resolve_timeline_segments(&initial_from, target, transition, timeline)
+        else {
+            self.timeline_playbacks.remove(node_path);
+            return;
+        };
+        let stagger_index = self
+            .plan
+            .iter()
+            .take_while(|node| node.id != node_path)
+            .filter(|node| {
+                node.transition
+                    .as_ref()
+                    .and_then(|motion| motion.motion_key.as_ref())
+                    == transition.motion_key.as_ref()
+                    && node
+                        .transition
+                        .as_ref()
+                        .and_then(|motion| motion.timeline.as_ref())
+                        .is_some()
+            })
+            .count() as u32;
+        let stagger_delay_ms = timeline
+            .stagger_ms
+            .saturating_mul(stagger_index);
+        let first = segments[0].clone();
+        self.timeline_playbacks.insert(
+            node_path.to_owned(),
+            TimelinePlayback {
+                segments,
+                final_target: target.clone(),
+                segment_index: 0,
+                cycle: 0,
+                repeat: timeline.repeat,
+                stagger_delay_ms,
+            },
+        );
+        if let Some(active) = self.active.get_mut(node_path) {
+            active.from = first.from.clone();
+            active.target = first.target.clone();
+            active.from_transform = first.from.style.transform;
+            active.target_transform = first.target.style.transform;
+            active.transition.delay_ms = transition.delay_ms.saturating_add(stagger_delay_ms);
+            active.transition.duration_ms = first.duration_ms;
+            active.transition.easing = first.easing;
+            active.started_at_seconds = time_seconds;
+            active.retarget_source = None;
+        }
+    }
+
     fn sample_with_history(
         &mut self,
         id: &str,
@@ -8331,16 +9401,64 @@ impl UiWgpuRenderer {
         source_frame_sequence: u64,
         time_seconds: f32,
     ) -> UiVisual {
+        if self
+            .paused_animations
+            .get(id)
+            .is_some_and(|paused| Self::same_animation_visual(&paused.final_target, target))
+        {
+            self.current.insert(id.to_owned(), target.clone());
+            self.current_identities.insert(
+                id.to_owned(),
+                AnimationIdentity {
+                    node_id: id.to_owned(),
+                    generation: node_generation,
+                },
+            );
+            return target.clone();
+        }
+        self.paused_animations.remove(id);
         let superseded = self.active.get(id).cloned();
+        if superseded.is_some()
+            && self
+                .timeline_playbacks
+                .get(id)
+                .is_some_and(|playback| Self::same_animation_visual(&playback.final_target, target))
+        {
+            self.current.insert(id.to_owned(), target.clone());
+            self.current_identities.insert(
+                id.to_owned(),
+                AnimationIdentity {
+                    node_id: id.to_owned(),
+                    generation: node_generation,
+                },
+            );
+            return target.clone();
+        }
         let target_changed = superseded
             .as_ref()
-            .is_some_and(|previous| previous.target != *target);
+            .is_some_and(|previous| !Self::same_animation_visual(&previous.target, target));
         let had_previous = superseded.is_some();
         let had_current = self.current.contains_key(id);
         let retarget_source = superseded
             .as_ref()
             .filter(|_| target_changed)
             .map(|previous| sample_transition(previous, time_seconds));
+        let retarget_transform = superseded
+            .as_ref()
+            .filter(|_| target_changed)
+            .map(|previous| sample_transform(previous, time_seconds));
+        if superseded.is_none() {
+            match self.settled_transition_targets.get(id) {
+                Some(settled) if Self::same_animation_visual(settled, target) => {
+                    self.current.insert(id.to_owned(), target.clone());
+                    return target.clone();
+                }
+                Some(_) => {
+                    self.settled_transition_targets.remove(id);
+                }
+                None => {}
+            }
+        }
         let sampled = Self::sample(
             &mut self.current,
             &mut self.active,
@@ -8349,6 +9467,8 @@ impl UiWgpuRenderer {
             transition,
             time_seconds,
         );
+        let starts_new_track = target_changed
+            || (self.active.contains_key(id) && !had_previous);
         if let Some(previous) = superseded {
             if transition.is_some() && target_changed {
                 self.animation_history
@@ -8359,7 +9479,7 @@ impl UiWgpuRenderer {
                     ));
             }
         }
-        if target_changed || (self.active.contains_key(id) && !had_previous) {
+        if starts_new_track {
             let transition_id = self.next_transition_id;
             self.next_transition_id = self.next_transition_id.saturating_add(1).max(1);
             if let Some(active) = self.active.get_mut(id) {
@@ -8371,6 +9491,13 @@ impl UiWgpuRenderer {
                 active.program_revision = program_revision;
                 active.source_frame_sequence = source_frame_sequence;
                 active.animation_epoch = self.animation_epoch;
+                active.from_transform = retarget_transform.unwrap_or_else(|| {
+                    transition
+                        .and_then(|transition| transition.from.transform)
+                        .or_else(|| self.current.get(id).map(|visual| visual.style.transform))
+                        .unwrap_or_default()
+                });
+                active.target_transform = target.style.transform;
                 active.reason = if target_changed {
                     AnimationReason::Retarget
                 } else if had_current {
@@ -8379,6 +9506,13 @@ impl UiWgpuRenderer {
                     AnimationReason::Enter
                 };
                 active.retarget_source = retarget_source;
+            }
+        }
+        if starts_new_track {
+            if let Some(transition) = transition {
+                self.start_timeline(id, target, transition, time_seconds);
+            } else {
+                self.timeline_playbacks.remove(id);
             }
         }
         while self.animation_history.len() > 64 {
@@ -8418,11 +9552,13 @@ impl UiWgpuRenderer {
             active_transition.from.bounds.y = target.bounds.y;
             active_transition.target.bounds.x = target.bounds.x;
             active_transition.target.bounds.y = target.bounds.y;
+            active_transition.from_transform.translation = target.style.transform.translation;
+            active_transition.target_transform.translation = target.style.transform.translation;
             current.insert(id.to_owned(), target.clone());
             return target.clone();
         }
         if let Some(active_transition) = active.get(id)
-            && active_transition.target == *target
+            && Self::same_animation_visual(&active_transition.target, target)
         {
             if transition_finished(active_transition, time_seconds) {
                 current.insert(id.to_owned(), target.clone());
@@ -8442,7 +9578,9 @@ impl UiWgpuRenderer {
         // already completed. If the current rendered value already equals the
         // target, re-starting the motion is a pure no-op that only reprints
         // "start"/"complete" and re-enters `active`. Skip it and stay settled.
-        if source.as_ref() == Some(target)
+        if source
+            .as_ref()
+            .is_some_and(|source| Self::same_animation_visual(source, target))
             || (target.world_depth.is_some()
                 && source
                     .as_ref()
@@ -8501,6 +9639,8 @@ impl UiWgpuRenderer {
                     retarget_source: None,
                     from,
                     target: target.clone(),
+                    from_transform: UiTransform::default(),
+                    target_transform: UiTransform::default(),
                     started_at_seconds: time_seconds,
                     transition: transition.clone(),
                 };
@@ -8530,6 +9670,18 @@ impl UiWgpuRenderer {
         left.clip.y = 0.0;
         right.clip.x = 0.0;
         right.clip.y = 0.0;
+        left == right
+    }
+
+    /// Paint-group assignment is a renderer routing detail, not an animated
+    /// visual value. A plan rebuild can assign the same node to the next group
+    /// slot while its target remains identical; ignoring that field prevents a
+    /// persistent transition from restarting or cancelling on every rebuild.
+    fn same_animation_visual(left: &UiVisual, right: &UiVisual) -> bool {
+        let mut left = left.clone();
+        let mut right = right.clone();
+        left.paint_group_id = 0;
+        right.paint_group_id = 0;
         left == right
     }
 
@@ -8627,6 +9779,26 @@ impl UiWgpuRenderer {
                 UiClipShape::Circle => 1.0,
                 UiClipShape::Ellipse => 2.0,
             },
+            transform_from: [
+                style.transform.translation[0],
+                style.transform.translation[1],
+                style.transform.scale[0],
+                style.transform.scale[1],
+            ],
+            transform_to: [
+                style.transform.translation[0],
+                style.transform.translation[1],
+                style.transform.scale[0],
+                style.transform.scale[1],
+            ],
+            rotation: [
+                style.transform.rotation_degrees.to_radians(),
+                style.transform.rotation_degrees.to_radians(),
+            ],
+            pivot: [
+                transform_pivot(bounds, style.transform)[0],
+                transform_pivot(bounds, style.transform)[1],
+            ],
         };
         if let Some(cut) = self.node_cuts.get(
             node_path
@@ -8662,6 +9834,26 @@ impl UiWgpuRenderer {
                 gpu_easing(active.transition.easing),
                 1.0,
             ];
+            instance.transform_from = [
+                active.from_transform.translation[0],
+                active.from_transform.translation[1],
+                active.from_transform.scale[0],
+                active.from_transform.scale[1],
+            ];
+            instance.transform_to = [
+                active.target_transform.translation[0],
+                active.target_transform.translation[1],
+                active.target_transform.scale[0],
+                active.target_transform.scale[1],
+            ];
+            instance.rotation = [
+                active.from_transform.rotation_degrees.to_radians(),
+                active.target_transform.rotation_degrees.to_radians(),
+            ];
+            instance.pivot = [
+                transform_pivot(active.target.bounds, active.target_transform)[0],
+                transform_pivot(active.target.bounds, active.target_transform)[1],
+            ];
         } else if let Some(offset) = parent_transition_offset {
             // A parent panel's GPU track also moves its descendants. Encode
             // the inherited start offset into the child's one-time record so
@@ -8676,10 +9868,76 @@ impl UiWgpuRenderer {
                     gpu_easing(active.transition.easing),
                     1.0,
                 ];
+                instance.transform_from = [
+                    active.from_transform.translation[0],
+                    active.from_transform.translation[1],
+                    active.from_transform.scale[0],
+                    active.from_transform.scale[1],
+                ];
+                instance.transform_to = [
+                    active.target_transform.translation[0],
+                    active.target_transform.translation[1],
+                    active.target_transform.scale[0],
+                    active.target_transform.scale[1],
+                ];
+                instance.rotation = [
+                    active.from_transform.rotation_degrees.to_radians(),
+                    active.target_transform.rotation_degrees.to_radians(),
+                ];
+                instance.pivot = [
+                    transform_pivot(active.target.bounds, active.target_transform)[0],
+                    transform_pivot(active.target.bounds, active.target_transform)[1],
+                ];
             }
+        } else if UiTransform::is_identity(&style.transform)
+            && let Some((transform, parent_bounds)) = self.parent_visual_transform(node_path)
+        {
+            // Keep a completed parent transform applied to descendants after
+            // the parent's active record has retired. This is the static
+            // counterpart of the active parent track above.
+            instance.transform_from = [
+                transform.translation[0],
+                transform.translation[1],
+                transform.scale[0],
+                transform.scale[1],
+            ];
+            instance.transform_to = instance.transform_from;
+            instance.rotation = [
+                transform.rotation_degrees.to_radians(),
+                transform.rotation_degrees.to_radians(),
+            ];
+            instance.pivot = [
+                transform_pivot(parent_bounds, transform)[0],
+                transform_pivot(parent_bounds, transform)[1],
+            ];
         }
         instance.cut = resolve_shell_cut([bounds.width, bounds.height], instance.cut);
         instance
+    }
+
+    fn text_transform_tracks(&self, time_seconds: f32) -> HashMap<String, UiTextTransformTrack> {
+        self.plan
+            .iter()
+            .enumerate()
+            .filter_map(|(index, node)| {
+                let visual = self.sampled.get(index)?;
+                let instance = self.instance(visual, &node.id, time_seconds);
+                Some((
+                    node.id.clone(),
+                    UiTextTransformTrack {
+                        animation: instance.animation,
+                        transform_from: instance.transform_from,
+                        transform_to: instance.transform_to,
+                        rotation_pivot: [
+                            instance.rotation[0],
+                            instance.rotation[1],
+                            instance.pivot[0],
+                            instance.pivot[1],
+                        ],
+                    },
+                ))
+            })
+            .collect()
     }
 
     /// Largest material-bearing panel after final layout. Windows Composition
@@ -8791,6 +10049,28 @@ impl UiWgpuRenderer {
                 active.from.bounds.y - active.target.bounds.y,
             ]
         })
+    }
+
+    fn parent_visual_transform(
+        &self,
+        node_path: &str,
+    ) -> Option<(UiTransform, UiBounds)> {
+        let mut parent = self
+            .plan
+            .iter()
+            .find(|node| node.id == node_path)
+            .and_then(|node| node.parent_id.as_deref());
+        while let Some(parent_id) = parent {
+            let Some(index) = self.plan.iter().position(|node| node.id == parent_id) else {
+                break;
+            };
+            let visual = self.visual_at(index);
+            if !UiTransform::is_identity(&visual.style.transform) {
+                return Some((visual.style.transform, visual.bounds));
+            }
+            parent = self.plan[index].parent_id.as_deref();
+        }
+        None
     }
 
     fn component_chrome_instances(&self, visual: &UiVisual, node_path: &str) -> Vec<UiInstance> {
@@ -9630,6 +10910,7 @@ fn default_component_style(kind: &UiNodeKind) -> UiStyle {
             border_width: 0.0,
             corner_radius: 0.0,
             opacity: 1.0,
+            transform: UiTransform::default(),
         },
         UiNodeKind::Checkbox | UiNodeKind::RadioButton | UiNodeKind::Selectable => UiStyle {
             background_color: [0.10, 0.15, 0.14, 1.0],
@@ -9637,6 +10918,7 @@ fn default_component_style(kind: &UiNodeKind) -> UiStyle {
             border_width: 1.0,
             corner_radius: 5.0,
             opacity: 1.0,
+            transform: UiTransform::default(),
         },
         UiNodeKind::Button => UiStyle {
             background_color: [0.0, 0.0, 0.0, 0.0],
@@ -9644,6 +10926,7 @@ fn default_component_style(kind: &UiNodeKind) -> UiStyle {
             border_width: 0.0,
             corner_radius: 0.0,
             opacity: 1.0,
+            transform: UiTransform::default(),
         },
         UiNodeKind::Slider | UiNodeKind::DragValue | UiNodeKind::Scrollbar => UiStyle {
             background_color: [0.09, 0.12, 0.12, 1.0],
@@ -9651,6 +10934,7 @@ fn default_component_style(kind: &UiNodeKind) -> UiStyle {
             border_width: 1.0,
             corner_radius: 5.0,
             opacity: 1.0,
+            transform: UiTransform::default(),
         },
         UiNodeKind::Tabs => UiStyle {
             background_color: [0.0, 0.0, 0.0, 0.0],
@@ -9658,6 +10942,7 @@ fn default_component_style(kind: &UiNodeKind) -> UiStyle {
             border_width: 0.0,
             corner_radius: 0.0,
             opacity: 1.0,
+            transform: UiTransform::default(),
         },
         UiNodeKind::Combo | UiNodeKind::Dropdown | UiNodeKind::ListBox => UiStyle {
             background_color: [0.11, 0.16, 0.15, 1.0],
@@ -9665,6 +10950,7 @@ fn default_component_style(kind: &UiNodeKind) -> UiStyle {
             border_width: 1.0,
             corner_radius: 5.0,
             opacity: 1.0,
+            transform: UiTransform::default(),
         },
         UiNodeKind::ProgressBar => UiStyle {
             background_color: [0.08, 0.10, 0.10, 1.0],
@@ -9672,6 +10958,7 @@ fn default_component_style(kind: &UiNodeKind) -> UiStyle {
             border_width: 1.0,
             corner_radius: 4.0,
             opacity: 1.0,
+            transform: UiTransform::default(),
         },
         UiNodeKind::Splitter => UiStyle {
             background_color: [0.0, 0.0, 0.0, 0.0],
@@ -9679,6 +10966,7 @@ fn default_component_style(kind: &UiNodeKind) -> UiStyle {
             border_width: 0.0,
             corner_radius: 0.0,
             opacity: 1.0,
+            transform: UiTransform::default(),
         },
         UiNodeKind::ContextMenu => UiStyle {
             background_color: [0.16, 0.19, 0.22, 0.98],
@@ -9686,6 +10974,7 @@ fn default_component_style(kind: &UiNodeKind) -> UiStyle {
             border_width: 1.0,
             corner_radius: 6.0,
             opacity: 1.0,
+            transform: UiTransform::default(),
         },
         UiNodeKind::TreeView => UiStyle {
             background_color: [0.10, 0.11, 0.13, 1.0],
@@ -9693,6 +10982,7 @@ fn default_component_style(kind: &UiNodeKind) -> UiStyle {
             border_width: 1.0,
             corner_radius: 4.0,
             opacity: 1.0,
+            transform: UiTransform::default(),
         },
         UiNodeKind::Switch => UiStyle {
             background_color: [0.09, 0.12, 0.12, 1.0],
@@ -9700,6 +10990,7 @@ fn default_component_style(kind: &UiNodeKind) -> UiStyle {
             border_width: 1.0,
             corner_radius: 10.0,
             opacity: 1.0,
+            transform: UiTransform::default(),
         },
         UiNodeKind::Toast => UiStyle {
             background_color: [0.14, 0.17, 0.20, 0.96],
@@ -9707,6 +10998,7 @@ fn default_component_style(kind: &UiNodeKind) -> UiStyle {
             border_width: 1.0,
             corner_radius: 6.0,
             opacity: 1.0,
+            transform: UiTransform::default(),
         },
         UiNodeKind::MenuBar => UiStyle {
             background_color: [0.12, 0.14, 0.16, 1.0],
@@ -9714,6 +11006,7 @@ fn default_component_style(kind: &UiNodeKind) -> UiStyle {
             border_width: 1.0,
             corner_radius: 0.0,
             opacity: 1.0,
+            transform: UiTransform::default(),
         },
         UiNodeKind::Accordion => UiStyle {
             background_color: [0.10, 0.12, 0.14, 1.0],
@@ -9721,6 +11014,7 @@ fn default_component_style(kind: &UiNodeKind) -> UiStyle {
             border_width: 1.0,
             corner_radius: 4.0,
             opacity: 1.0,
+            transform: UiTransform::default(),
         },
         UiNodeKind::Spinner => UiStyle {
             background_color: [0.0, 0.0, 0.0, 0.0],
@@ -9728,6 +11022,7 @@ fn default_component_style(kind: &UiNodeKind) -> UiStyle {
             border_width: 0.0,
             corner_radius: 0.0,
             opacity: 1.0,
+            transform: UiTransform::default(),
         },
         UiNodeKind::Divider => UiStyle {
             background_color: [0.22, 0.28, 0.32, 1.0],
@@ -9735,6 +11030,7 @@ fn default_component_style(kind: &UiNodeKind) -> UiStyle {
             border_width: 0.0,
             corner_radius: 0.0,
             opacity: 1.0,
+            transform: UiTransform::default(),
         },
         UiNodeKind::Popup => UiStyle {
             background_color: [0.10, 0.12, 0.15, 0.96],
@@ -9742,6 +11038,7 @@ fn default_component_style(kind: &UiNodeKind) -> UiStyle {
             border_width: 1.0,
             corner_radius: 6.0,
             opacity: 1.0,
+            transform: UiTransform::default(),
         },
         // Containers, labels, images, and render surfaces do not get implicit
         // component chrome. Their authored default is a sentinel used by the
@@ -9752,6 +11049,7 @@ fn default_component_style(kind: &UiNodeKind) -> UiStyle {
             border_width: 0.0,
             corner_radius: 0.0,
             opacity: 1.0,
+            transform: UiTransform::default(),
         },
     }
 }
@@ -10112,8 +11410,8 @@ fn component_chrome_instances(visual: &UiVisual) -> Vec<UiInstance> {
             ]
         }
         UiNodeKind::Spinner => {
-            // Static arc ring; animation is handled by the render loop via
-            // time-based rotation when a skin is not applied.
+            // The render loop rotates the accent arc from the same monotonic
+            // clock used by transition sampling; the ring remains stationary.
             let size = bounds.width.min(bounds.height).min(24.0).max(8.0);
             let cx = bounds.x + bounds.width * 0.5;
             let cy = bounds.y + bounds.height * 0.5;
@@ -10892,6 +12190,10 @@ fn layout_text(
                 uv: glyph.uv,
                 depth: color_pass_depth(visual.world_depth),
                 paint_group_id: visual.paint_group_id,
+                animation: [0.0; 4],
+                transform_from: [0.0, 0.0, 1.0, 1.0],
+                transform_to: [0.0, 0.0, 1.0, 1.0],
+                rotation_pivot: [0.0; 4],
             });
             x += glyph.advance * text_scale;
         }
@@ -11004,6 +12306,10 @@ fn layout_rich_text(
                 uv: glyph.uv,
                 depth: color_pass_depth(visual.world_depth),
                 paint_group_id: visual.paint_group_id,
+                animation: [0.0; 4],
+                transform_from: [0.0, 0.0, 1.0, 1.0],
+                transform_to: [0.0, 0.0, 1.0, 1.0],
+                rotation_pivot: [0.0; 4],
             });
             x += glyph.advance * s.scale;
             global_idx += 1;
@@ -11396,6 +12702,7 @@ fn append_data_grid_frames(
                     border_width: 1.0,
                     corner_radius: 0.0,
                     opacity: 1.0,
+                    transform: UiTransform::default(),
                 },
                 kind: UiNodeKind::Panel,
                 enabled: false,
@@ -11488,6 +12795,7 @@ fn append_data_grid_frames(
                         border_width: 1.0,
                         corner_radius: 0.0,
                         opacity: 1.0,
+                        transform: UiTransform::default(),
                     },
                     kind: UiNodeKind::Panel,
                     enabled: false,
@@ -11554,6 +12862,7 @@ fn append_data_grid_frames(
                                     border_width: 1.0,
                                     corner_radius: 4.0,
                                     opacity: 1.0,
+                                    transform: UiTransform::default(),
                                 }
                             } else {
                                 UiStyle {
@@ -11562,6 +12871,7 @@ fn append_data_grid_frames(
                                     border_width: 1.0,
                                     corner_radius: 4.0,
                                     opacity: 1.0,
+                                    transform: UiTransform::default(),
                                 }
                             };
                         }
@@ -12547,6 +13857,7 @@ fn transition_source(target: &UiVisual, transition: &UiTransition) -> UiVisual {
             border_width: from.border_width.unwrap_or(target.style.border_width),
             corner_radius: from.corner_radius.unwrap_or(target.style.corner_radius),
             opacity: from.opacity.unwrap_or(target.style.opacity),
+            transform: from.transform.unwrap_or(target.style.transform),
         },
         kind: target.kind.clone(),
         enabled: target.enabled,
@@ -12565,6 +13876,74 @@ fn transition_source(target: &UiVisual, transition: &UiTransition) -> UiVisual {
     }
 }
 
+fn apply_animation_state(mut visual: UiVisual, state: UiTransitionState) -> UiVisual {
+    if let Some(bounds) = state.bounds {
+        visual.bounds = bounds;
+        visual.logical_bounds = logical_box_from_bounds(bounds, visual.logical_bounds.clip);
+    }
+    if let Some(color) = state.background_color {
+        visual.style.background_color = color;
+    }
+    if let Some(color) = state.border_color {
+        visual.style.border_color = color;
+    }
+    if let Some(width) = state.border_width {
+        visual.style.border_width = width;
+    }
+    if let Some(radius) = state.corner_radius {
+        visual.style.corner_radius = radius;
+    }
+    if let Some(opacity) = state.opacity {
+        visual.style.opacity = opacity;
+    }
+    if let Some(transform) = state.transform {
+        visual.style.transform = transform;
+    }
+    if let Some(value) = state.numeric_value {
+        if let Some(UiControlPresentation::Numeric { min, max, .. }) = visual.presentation {
+            visual.presentation = Some(UiControlPresentation::Numeric {
+                value,
+                min,
+                max,
+            });
+        }
+    }
+    visual
+}
+
+fn resolve_timeline_segments(
+    initial_from: &UiVisual,
+    target: &UiVisual,
+    transition: &UiTransition,
+    timeline: &UiAnimationTimeline,
+) -> Option<Vec<TimelineSegment>> {
+    if !timeline.is_valid(transition.duration_ms) {
+        return None;
+    }
+    let mut segments = Vec::new();
+    let mut current = initial_from.clone();
+    let mut previous_offset = 0_u32;
+    for (index, keyframe) in timeline.keyframes.iter().enumerate() {
+        let next = if index + 1 == timeline.keyframes.len() {
+            apply_animation_state(target.clone(), keyframe.state)
+        } else {
+            apply_animation_state(current.clone(), keyframe.state)
+        };
+        let duration_ms = keyframe.offset_ms.saturating_sub(previous_offset);
+        if duration_ms > 0 {
+            segments.push(TimelineSegment {
+                from: current.clone(),
+                target: next.clone(),
+                duration_ms,
+                easing: keyframe.easing.unwrap_or(transition.easing),
+            });
+        }
+        current = next;
+        previous_offset = keyframe.offset_ms;
+    }
+    (!segments.is_empty()).then_some(segments)
+}
+
 fn from_bounds_clip(from: Option<UiBounds>, target: &UiVisual) -> Option<UiBounds> {
     // Logical clip follows the animated bounds box while keeping the inherited
     // projection clip unchanged.
@@ -12572,14 +13951,60 @@ fn from_bounds_clip(from: Option<UiBounds>, target: &UiVisual) -> Option<UiBound
         .or(target.logical_bounds.clip)
 }
 
-fn sample_transition(active: &ActiveTransition, time_seconds: f32) -> UiVisual {
+fn transition_progress(active: &ActiveTransition, time_seconds: f32) -> f32 {
     let elapsed_ms = ((time_seconds - active.started_at_seconds) * 1000.0).max(0.0);
-    let progress = if active.transition.duration_ms == 0 {
+    if active.transition.duration_ms == 0 {
         1.0
     } else {
         ((elapsed_ms - active.transition.delay_ms as f32) / active.transition.duration_ms as f32)
             .clamp(0.0, 1.0)
-    };
+    }
+}
+
+fn lerp_transform(from: UiTransform, to: UiTransform, t: f32) -> UiTransform {
+    UiTransform {
+        translation: [
+            lerp(from.translation[0], to.translation[0], t),
+            lerp(from.translation[1], to.translation[1], t),
+        ],
+        scale: [lerp(from.scale[0], to.scale[0], t), lerp(from.scale[1], to.scale[1], t)],
+        rotation_degrees: lerp(from.rotation_degrees, to.rotation_degrees, t),
+        origin: [lerp(from.origin[0], to.origin[0], t), lerp(from.origin[1], to.origin[1], t)],
+    }
+}
+
+fn transform_pivot(bounds: UiBounds, transform: UiTransform) -> [f32; 2] {
+    [
+        bounds.x + bounds.width * transform.origin[0],
+        bounds.y + bounds.height * transform.origin[1],
+    ]
+}
+
+fn inverse_transform_point(point: [f32; 2], bounds: UiBounds, transform: UiTransform) -> [f32; 2] {
+    let pivot = transform_pivot(bounds, transform);
+    let radians = transform.rotation_degrees.to_radians();
+    let delta = [point[0] - pivot[0], point[1] - pivot[1]];
+    let unrotated = [
+        delta[0] * radians.cos() + delta[1] * radians.sin(),
+        -delta[0] * radians.sin() + delta[1] * radians.cos(),
+    ];
+    let translated = [unrotated[0] + pivot[0] - transform.translation[0], unrotated[1] + pivot[1] - transform.translation[1]];
+    [
+        pivot[0] + (translated[0] - pivot[0]) / transform.scale[0].max(0.0001),
+        pivot[1] + (translated[1] - pivot[1]) / transform.scale[1].max(0.0001),
+    ]
+}
+
+fn sample_transform(active: &ActiveTransition, time_seconds: f32) -> UiTransform {
+    lerp_transform(
+        active.from_transform,
+        active.target_transform,
+        ease(transition_progress(active, time_seconds), active.transition.easing),
+    )
+}
+
+fn sample_transition(active: &ActiveTransition, time_seconds: f32) -> UiVisual {
+    let progress = transition_progress(active, time_seconds);
     let t = ease(progress, active.transition.easing);
     let presentation = match (&active.from.presentation, &active.target.presentation) {
         (
@@ -12624,6 +14049,11 @@ fn sample_transition(active: &ActiveTransition, time_seconds: f32) -> UiVisual {
                 t,
             ),
             opacity: lerp(active.from.style.opacity, active.target.style.opacity, t),
+            transform: lerp_transform(
+                active.from_transform,
+                active.target_transform,
+                t,
+            ),
         },
         kind: active.target.kind.clone(),
         enabled: active.target.enabled,
@@ -12693,7 +14123,69 @@ fn ease(t: f32, easing: UiEasing) -> f32 {
                 1.0 - (-2.0 * t + 2.0).powi(2) * 0.5
             }
         }
+        UiEasing::Spring => {
+            if t <= 0.0 {
+                0.0
+            } else if t >= 1.0 {
+                1.0
+            } else {
+                let damping: f32 = 6.0;
+                let angular: f32 = 16.0;
+                let envelope = (-damping * t).exp();
+                1.0 - envelope
+                    * ((angular * t).cos() + damping / angular * (angular * t).sin())
+            }
+        }
+        UiEasing::Bounce => bounce_out(t),
+        UiEasing::CubicBezier => cubic_bezier(t),
     }
+}
+
+fn bounce_out(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    let n1 = 7.5625;
+    let d1 = 2.75;
+    if t < 1.0 / d1 {
+        n1 * t * t
+    } else if t < 2.0 / d1 {
+        let t = t - 1.5 / d1;
+        n1 * t * t + 0.75
+    } else if t < 2.5 / d1 {
+        let t = t - 2.25 / d1;
+        n1 * t * t + 0.9375
+    } else {
+        let t = t - 2.625 / d1;
+        n1 * t * t + 0.984375
+    }
+}
+
+fn cubic_bezier(t: f32) -> f32 {
+    if t <= 0.0 {
+        return 0.0;
+    }
+    if t >= 1.0 {
+        return 1.0;
+    }
+    let t = t.clamp(0.0, 1.0);
+    let mut low = 0.0;
+    let mut high = 1.0;
+    for _ in 0..10 {
+        let u = (low + high) * 0.5;
+        let one_minus_u = 1.0 - u;
+        let x = 3.0 * one_minus_u * one_minus_u * u * 0.25
+            + 3.0 * one_minus_u * u * u * 0.25
+            + u * u * u;
+        if x < t {
+            low = u;
+        } else {
+            high = u;
+        }
+    }
+    let u = (low + high) * 0.5;
+    let one_minus_u = 1.0 - u;
+    3.0 * one_minus_u * one_minus_u * u * 0.1
+        + 3.0 * one_minus_u * u * u
+        + u * u * u
 }
 
 fn format_easing(easing: UiEasing) -> &'static str {
@@ -12702,6 +14194,9 @@ fn format_easing(easing: UiEasing) -> &'static str {
         UiEasing::EaseIn => "ease_in",
         UiEasing::EaseOut => "ease_out",
         UiEasing::EaseInOut => "ease_in_out",
+        UiEasing::Spring => "spring",
+        UiEasing::Bounce => "bounce",
+        UiEasing::CubicBezier => "cubic_bezier",
     }
 }
 
@@ -12857,7 +14352,7 @@ mod tests {
     use neon_ui_schema::{
         TextRef, UiAlignItems, UiCommand, UiDropPlacement, UiEffect, UiFragmentId,
         UiFragmentSubmission, UiIntent, UiJustifyContent, UiLayout, UiNodeId, UiSemanticEvent,
-        UiSemanticEventType, UiTransitionState,
+        UiSemanticEventType, UiTransitionState, UiAnimationKeyframe,
     };
     use serde_json::json;
     use std::sync::Mutex;
@@ -14366,6 +15861,7 @@ mod tests {
             border_width: 0.0,
             corner_radius: 0.0,
             opacity: 1.0,
+            transform: UiTransform::default(),
         };
         root.enter_transition = Some(UiTransition {
             delay_ms: 0,
@@ -14381,6 +15877,7 @@ mod tests {
                 ..UiTransitionState::default()
             },
             motion_key: None,
+            timeline: None,
         });
         root.children.push(UiNode {
             node_id: UiNodeId("child".into()),
@@ -14404,6 +15901,7 @@ mod tests {
                 border_width: 0.0,
                 corner_radius: 0.0,
                 opacity: 1.0,
+                transform: UiTransform::default(),
             },
             enter_transition: None,
             world_depth: None,
@@ -14972,6 +16470,7 @@ mod tests {
                 border_width: 0.0,
                 corner_radius: 0.0,
                 opacity: 1.0,
+                transform: UiTransform::default(),
             },
             enter_transition: None,
             world_depth: None,
@@ -15978,6 +17477,7 @@ mod tests {
                     ..UiTransitionState::default()
                 },
                 motion_key: None,
+                timeline: None,
             }),
             children: Vec::new(),
             world_depth: None,
@@ -16705,6 +18205,7 @@ mod tests {
             border_width: 0.0,
             corner_radius: 0.0,
             opacity: 1.0,
+            transform: UiTransform::default(),
         };
         let mut root = node();
         root.node_id = UiNodeId("surface".into());
@@ -16735,6 +18236,7 @@ mod tests {
             border_width: 0.0,
             corner_radius: 0.0,
             opacity: 1.0,
+            transform: UiTransform::default(),
         };
         lower.enter_transition = None;
         let image_asset = AssetRef {
@@ -16792,6 +18294,7 @@ mod tests {
             border_width: 0.0,
             corner_radius: 0.0,
             opacity: 1.0,
+            transform: UiTransform::default(),
         };
         upper.enter_transition = None;
         root.children = vec![lower, upper];
@@ -16924,6 +18427,7 @@ mod tests {
             border_width: 0.0,
             corner_radius: 0.0,
             opacity: 1.0,
+            transform: UiTransform::default(),
         };
         let mut root = node();
         root.node_id = UiNodeId("surface".into());
@@ -16984,6 +18488,10 @@ mod tests {
                 },
             ),
         ];
+        root.children[0].style.transform = UiTransform {
+            translation: [8.0, 0.0],
+            ..UiTransform::default()
+        };
         let fragment_id = UiFragmentId("material-ranges".into());
         let fragments = HashMap::from([(
             fragment_id.clone(),
@@ -17029,7 +18537,8 @@ mod tests {
                 pixels[offset + 3],
             ]
         };
-        let small_pixel = pixel(96, 76);
+        let small_pixel = pixel(116, 76);
+        let small_source_pixel = pixel(84, 76);
         let large_pixel = pixel(20, 20);
         let small_is_red = small_pixel[0] > 200
             && small_pixel[1] < 40
@@ -17040,7 +18549,7 @@ mod tests {
             && large_pixel[1] < 40
             && large_pixel[3] > 200;
         let diagnostics = renderer.paint_order_diagnostics();
-        let pass = small_is_red && large_is_blue;
+        let pass = small_is_red && large_is_blue && small_source_pixel[3] == 0;
         println!(
             "{}",
             json!({
@@ -17062,6 +18571,7 @@ mod tests {
                     "buffer_id": "offscreen:material-ranges:f1",
                     "coordinate_space": "logical-pixel",
                     "small_pixel": small_pixel,
+                    "small_source_pixel": small_source_pixel,
                     "large_pixel": large_pixel,
                 },
                 "diagnostic": {
@@ -18765,6 +20275,7 @@ mod tests {
                 border_width: 0.0,
                 corner_radius: 0.0,
                 opacity: 1.0,
+                transform: UiTransform::default(),
             },
             enter_transition: None,
             world_depth: None,
@@ -18824,6 +20335,7 @@ mod tests {
                 border_width: 0.0,
                 corner_radius: 0.0,
                 opacity: 1.0,
+                transform: UiTransform::default(),
             },
             enter_transition: None,
             children: Vec::new(),
@@ -18884,6 +20396,7 @@ mod tests {
                 border_width: 0.0,
                 corner_radius: 0.0,
                 opacity: 1.0,
+                transform: UiTransform::default(),
             },
             enter_transition: None,
             children: Vec::new(),
@@ -18916,6 +20429,7 @@ mod tests {
                 border_width: 0.0,
                 corner_radius: 0.0,
                 opacity: 1.0,
+                transform: UiTransform::default(),
             },
             enter_transition: None,
             children: vec![label],
@@ -19188,6 +20702,8 @@ mod tests {
             retarget_source: None,
             from: transition_source(&target, &transition),
             target: target.clone(),
+            from_transform: UiTransform::default(),
+            target_transform: UiTransform::default(),
             started_at_seconds: 1.0,
             transition,
         };
@@ -19246,6 +20762,7 @@ mod tests {
                 ..UiTransitionState::default()
             },
             motion_key: Some("test.motion".into()),
+            timeline: None,
         };
         let active = ActiveTransition {
             identity: AnimationIdentity {
@@ -19260,6 +20777,8 @@ mod tests {
             retarget_source: None,
             from: transition_source(&target, &transition),
             target,
+            from_transform: UiTransform::default(),
+            target_transform: UiTransform::default(),
             started_at_seconds: 1.0,
             transition,
         };
@@ -19327,6 +20846,7 @@ mod tests {
                 ..UiTransitionState::default()
             },
             motion_key: Some("cancel-test".into()),
+            timeline: None,
         };
         renderer.active.insert(
             "test/cancel".into(),
@@ -19343,6 +20863,8 @@ mod tests {
                 retarget_source: None,
                 from: transition_source(&target, &transition),
                 target: target.clone(),
+                from_transform: UiTransform::default(),
+                target_transform: UiTransform::default(),
                 started_at_seconds: 1.0,
                 transition,
             },
@@ -19410,6 +20932,7 @@ mod tests {
                 ..UiTransitionState::default()
             },
             motion_key: Some("retarget".into()),
+            timeline: None,
         };
         let first = visual(100.0);
         renderer.sample_with_history(
@@ -19503,6 +21026,7 @@ mod tests {
                 ..UiTransitionState::default()
             },
             motion_key: None,
+            timeline: None,
         };
         let active = ActiveTransition {
             identity: AnimationIdentity {
@@ -19517,6 +21041,8 @@ mod tests {
             retarget_source: None,
             from: transition_source(&target, &transition),
             target: target.clone(),
+            from_transform: UiTransform::default(),
+            target_transform: UiTransform::default(),
             started_at_seconds: 1.0,
             transition,
         };
@@ -19632,6 +21158,8 @@ mod tests {
             retarget_source: None,
             from: original,
             target,
+            from_transform: UiTransform::default(),
+            target_transform: UiTransform::default(),
             started_at_seconds: 0.0,
             transition: UiTransition {
                 delay_ms: 0,
@@ -19639,9 +21167,339 @@ mod tests {
                 easing: UiEasing::Linear,
                 from: UiTransitionState::default(),
                 motion_key: None,
+                timeline: None,
             },
         };
         assert_eq!(sample_transition(&active, 0.05).bounds.x, 50.0);
+    }
+
+    #[test]
+    fn spring_easing_has_exact_endpoints_and_a_damped_overshoot() {
+        assert_eq!(ease(0.0, UiEasing::Spring), 0.0);
+        assert_eq!(ease(1.0, UiEasing::Spring), 1.0);
+        assert!(ease(0.7, UiEasing::Spring) > 1.0);
+        assert!(ease(0.7, UiEasing::Spring) < 1.01);
+    }
+
+    #[test]
+    fn bounce_easing_has_exact_endpoints_and_a_rebound() {
+        assert_eq!(ease(0.0, UiEasing::Bounce), 0.0);
+        assert_eq!(ease(1.0, UiEasing::Bounce), 1.0);
+        assert!(ease(0.55, UiEasing::Bounce) < 1.0);
+        assert!(ease(0.8, UiEasing::Bounce) > ease(0.7, UiEasing::Bounce));
+    }
+
+    #[test]
+    fn cubic_bezier_easing_has_exact_endpoints_and_a_smooth_midpoint() {
+        assert_eq!(ease(0.0, UiEasing::CubicBezier), 0.0);
+        assert_eq!(ease(1.0, UiEasing::CubicBezier), 1.0);
+        let midpoint = ease(0.5, UiEasing::CubicBezier);
+        assert!(midpoint > 0.5);
+        assert!(midpoint < 0.9);
+    }
+
+    #[test]
+    fn timeline_segments_advance_repeat_and_finish_on_the_exact_target() {
+        let (device, _queue) = test_device("neon3-ui-timeline");
+        let mut renderer = UiWgpuRenderer::new(&device, wgpu::TextureFormat::Rgba8Unorm);
+        let visual = |opacity: f32| UiVisual {
+            bounds: UiBounds {
+                x: 0.0,
+                y: 0.0,
+                width: 100.0,
+                height: 40.0,
+            },
+            logical_bounds: logical_box_from_bounds(
+                UiBounds {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 100.0,
+                    height: 40.0,
+                },
+                None,
+            ),
+            style: UiStyle {
+                opacity,
+                ..UiStyle::default()
+            },
+            kind: UiNodeKind::Panel,
+            enabled: true,
+            clip: UiBounds {
+                x: 0.0,
+                y: 0.0,
+                width: 100.0,
+                height: 40.0,
+            },
+            clip_radius: 0.0,
+            clip_shape: UiClipShape::default(),
+            image: None,
+            surface: None,
+            text: None,
+            presentation: None,
+            scroll: false,
+            declared_scroll_offset: [0.0; 2],
+            world_depth: None,
+            world_scale: None,
+            paint_group_id: 0,
+        };
+        let target = visual(1.0);
+        let transition = UiTransition {
+            delay_ms: 0,
+            duration_ms: 300,
+            easing: UiEasing::Linear,
+            from: UiTransitionState {
+                opacity: Some(0.0),
+                ..UiTransitionState::default()
+            },
+            motion_key: Some("timeline-pulse".into()),
+            timeline: Some(UiAnimationTimeline {
+                keyframes: vec![
+                    UiAnimationKeyframe {
+                        offset_ms: 0,
+                        state: UiTransitionState {
+                            opacity: Some(0.0),
+                            ..UiTransitionState::default()
+                        },
+                        easing: Some(UiEasing::Linear),
+                    },
+                    UiAnimationKeyframe {
+                        offset_ms: 150,
+                        state: UiTransitionState {
+                            opacity: Some(0.5),
+                            ..UiTransitionState::default()
+                        },
+                        easing: Some(UiEasing::EaseIn),
+                    },
+                    UiAnimationKeyframe {
+                        offset_ms: 300,
+                        state: UiTransitionState {
+                            opacity: Some(1.0),
+                            ..UiTransitionState::default()
+                        },
+                        easing: Some(UiEasing::EaseOut),
+                    },
+                ],
+                repeat: UiAnimationRepeat::Count(2),
+                stagger_ms: 20,
+                ..UiAnimationTimeline::default()
+            }),
+        };
+        assert!(transition.timeline.as_ref().unwrap().is_valid(300));
+        renderer.sample_with_history(
+            "timeline/panel",
+            &target,
+            Some(&transition),
+            1,
+            Revision(1),
+            1,
+            0.0,
+        );
+        assert_eq!(renderer.timeline_playbacks["timeline/panel"].segments.len(), 2);
+        assert_eq!(renderer.active["timeline/panel"].transition.duration_ms, 150);
+        assert_eq!(renderer.active["timeline/panel"].target.style.opacity, 0.5);
+
+        assert!(renderer.has_active_animation(0.16));
+        assert_eq!(renderer.timeline_playbacks["timeline/panel"].segment_index, 1);
+        assert_eq!(renderer.active["timeline/panel"].target.style.opacity, 1.0);
+        assert_eq!(renderer.active["timeline/panel"].transition.easing, UiEasing::EaseOut);
+
+        assert!(renderer.has_active_animation(0.32));
+        assert_eq!(renderer.timeline_playbacks["timeline/panel"].cycle, 1);
+        assert_eq!(renderer.timeline_playbacks["timeline/panel"].segment_index, 0);
+        assert_eq!(renderer.active["timeline/panel"].target.style.opacity, 0.5);
+
+        assert!(renderer.has_active_animation(0.48));
+        assert_eq!(renderer.timeline_playbacks["timeline/panel"].segment_index, 1);
+        assert!(renderer.has_active_animation(0.64));
+        assert!(renderer.active.get("timeline/panel").is_none());
+        assert_eq!(renderer.current["timeline/panel"].style.opacity, 1.0);
+        assert!(renderer.timeline_playbacks.get("timeline/panel").is_none());
+        assert!(!renderer.has_active_animation(0.66));
+
+        let mut stagger_renderer = UiWgpuRenderer::new(&device, wgpu::TextureFormat::Rgba8Unorm);
+        stagger_renderer.plan = vec![
+            PlannedNode {
+                id: "timeline/a".into(),
+                parent_id: None,
+                target: target.clone(),
+                transition: Some(transition.clone()),
+                instance_index: Some(0),
+                paint_group_id: 0,
+            },
+            PlannedNode {
+                id: "timeline/b".into(),
+                parent_id: None,
+                target: target.clone(),
+                transition: Some(transition.clone()),
+                instance_index: Some(1),
+                paint_group_id: 0,
+            },
+        ];
+        stagger_renderer.sample_with_history(
+            "timeline/a",
+            &target,
+            Some(&transition),
+            1,
+            Revision(1),
+            1,
+            0.0,
+        );
+        stagger_renderer.sample_with_history(
+            "timeline/b",
+            &target,
+            Some(&transition),
+            1,
+            Revision(1),
+            1,
+            0.0,
+        );
+        assert_eq!(stagger_renderer.active["timeline/a"].transition.delay_ms, 0);
+        assert_eq!(stagger_renderer.active["timeline/b"].transition.delay_ms, 20);
+    }
+
+    #[test]
+    fn animation_controls_pause_resume_seek_and_cancel_are_renderer_owned() {
+        let (device, _queue) = test_device("neon3-ui-animation-controls");
+        let mut renderer = UiWgpuRenderer::new(&device, wgpu::TextureFormat::Rgba8Unorm);
+        let visual = |opacity: f32| UiVisual {
+            bounds: UiBounds {
+                x: 0.0,
+                y: 0.0,
+                width: 80.0,
+                height: 30.0,
+            },
+            logical_bounds: logical_box_from_bounds(
+                UiBounds {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 80.0,
+                    height: 30.0,
+                },
+                None,
+            ),
+            style: UiStyle {
+                opacity,
+                ..UiStyle::default()
+            },
+            kind: UiNodeKind::Panel,
+            enabled: true,
+            clip: UiBounds {
+                x: 0.0,
+                y: 0.0,
+                width: 80.0,
+                height: 30.0,
+            },
+            clip_radius: 0.0,
+            clip_shape: UiClipShape::default(),
+            image: None,
+            surface: None,
+            text: None,
+            presentation: None,
+            scroll: false,
+            declared_scroll_offset: [0.0; 2],
+            world_depth: None,
+            world_scale: None,
+            paint_group_id: 0,
+        };
+        let transition = UiTransition {
+            delay_ms: 0,
+            duration_ms: 300,
+            easing: UiEasing::Linear,
+            from: UiTransitionState {
+                opacity: Some(0.0),
+                ..UiTransitionState::default()
+            },
+            motion_key: Some("control-motion".into()),
+            timeline: None,
+        };
+        let target = visual(1.0);
+        renderer.sample_with_history(
+            "controls/panel",
+            &target,
+            Some(&transition),
+            1,
+            Revision(1),
+            1,
+            0.0,
+        );
+        let paused = renderer
+            .animation_control("pause", "controls/panel", None, 0.1)
+            .unwrap();
+        assert_eq!(paused["state"], "paused");
+        assert!(!renderer.has_active_animation(2.0));
+        let resumed = renderer
+            .animation_control("resume", "controls/panel", None, 2.0)
+            .unwrap();
+        assert_eq!(resumed["state"], "running");
+        let seek = renderer
+            .animation_control("seek", "controls/panel", Some(0.5), 2.1)
+            .unwrap();
+        assert_eq!(seek["progress"], 0.5);
+        assert!(renderer
+            .active
+            .get("controls/panel")
+            .is_some_and(|active| (transition_progress(active, 2.1) - 0.5).abs() < 0.001));
+        let cancelled = renderer
+            .animation_control("cancel", "controls/panel", None, 2.1)
+            .unwrap();
+        assert_eq!(cancelled["state"], "cancelled");
+        assert!(renderer.active.get("controls/panel").is_none());
+        assert!(matches!(renderer.animation_history.back(), Some(animation) if animation.status == UiAnimationStatus::Cancelled));
+
+        let target_zero = visual(0.0);
+        renderer.sample_with_history(
+            "controls/panel",
+            &target_zero,
+            Some(&transition),
+            1,
+            Revision(2),
+            2,
+            3.0,
+        );
+        let completed = renderer
+            .animation_control("seek", "controls/panel", Some(1.0), 3.0)
+            .unwrap();
+        assert_eq!(completed["state"], "completed");
+        assert!(renderer.active.get("controls/panel").is_none());
+        assert_eq!(renderer.current["controls/panel"].style.opacity, 0.0);
+    }
+
+    #[test]
+    fn spinner_accent_arc_uses_monotonic_clock_and_keeps_redraw_active() {
+        let (device, _queue) = test_device("neon3-ui-spinner-animation");
+        let mut spinner = node();
+        spinner.kind = UiNodeKind::Spinner;
+        spinner.enter_transition = None;
+        let fragment_id = UiFragmentId("spinner".into());
+        let fragments = HashMap::from([(
+            fragment_id.clone(),
+            UiFragment {
+                fragment_id,
+                revision: Revision(1),
+                root: spinner,
+                effects: Vec::new(),
+            },
+        )]);
+        let mut renderer = UiWgpuRenderer::new(&device, wgpu::TextureFormat::Rgba8Unorm);
+        renderer.prepare_interaction(&fragments, [160, 120], [160.0, 120.0], 0.0);
+        let visual = renderer.sampled[0].clone();
+        let parent = UiInstance::zeroed();
+        renderer.animation_clock_seconds = 0.0;
+        let first = renderer.decorate_chrome_instance(
+            &visual,
+            parent,
+            1,
+            renderer.component_chrome_instances(&visual, "spinner/root")[1],
+        );
+        renderer.animation_clock_seconds = 0.5;
+        let second = renderer.decorate_chrome_instance(
+            &visual,
+            parent,
+            1,
+            renderer.component_chrome_instances(&visual, "spinner/root")[1],
+        );
+        assert_ne!(first.rotation, second.rotation);
+        assert!(renderer.has_active_animation(0.5));
     }
 
     #[test]
@@ -19707,11 +21565,49 @@ mod tests {
                     ..UiTransitionState::default()
                 },
                 motion_key: None,
+                timeline: None,
             }),
             1.0,
         );
+        renderer.last_frame_snapshot = Some(VisualFrameSnapshot {
+            program_revision: Revision(1),
+            frame_sequence: 3,
+            animation_epoch: 1,
+            nodes: vec![SampledNodeVisual {
+                identity: AnimationIdentity {
+                    node_id: "animated".into(),
+                    generation: 1,
+                },
+                transition_id: Some(1),
+                visual: transition_source(
+                    &target,
+                    &UiTransition {
+                        delay_ms: 0,
+                        duration_ms: 10,
+                        easing: UiEasing::Linear,
+                        from: UiTransitionState {
+                            opacity: Some(0.0),
+                            ..UiTransitionState::default()
+                        },
+                        motion_key: None,
+                        timeline: None,
+                    },
+                ),
+                lifecycle: LifecycleState::Active,
+            }],
+        });
         assert!(renderer.has_active_animation(1.005));
-        assert!(!renderer.has_active_animation(1.020));
+        // Completion requests one final render so the exact target becomes
+        // observable before the renderer returns to its idle state.
+        assert!(renderer.has_active_animation(1.020));
+        let final_frame = renderer
+            .last_frame_snapshot
+            .as_ref()
+            .expect("completion keeps a final frame snapshot");
+        assert_eq!(final_frame.nodes[0].visual, target);
+        assert_eq!(final_frame.nodes[0].transition_id, None);
+        assert_eq!(final_frame.nodes[0].lifecycle, LifecycleState::Current);
+        assert!(!renderer.has_active_animation(1.040));
     }
 
     #[test]
@@ -19773,6 +21669,7 @@ mod tests {
                 ..UiTransitionState::default()
             },
             motion_key: Some("world-panel".into()),
+            timeline: None,
         };
         let mut current = HashMap::new();
         let mut active = HashMap::new();
@@ -19997,11 +21894,11 @@ mod tests {
 
     #[test]
     fn ui_instance_abi_matches_vertex_attributes() {
-        // The color/depth vertex buffer layout encodes offsets 0..=168 and the
-        // WGSL `VsIn` reads locations 0..=11 as Float32x4/Float32. Freeze the
+        // The color/depth vertex buffer layout encodes offsets 0..=228 and the
+        // WGSL `VsIn` reads locations 0..=15 as Float32x4/Float32. Freeze the
         // `#[repr(C)]` layout so a future field reorder cannot silently break
         // the shader bindings.
-        assert_eq!(std::mem::size_of::<UiInstance>(), 184);
+        assert_eq!(std::mem::size_of::<UiInstance>(), 236);
         assert_eq!(std::mem::align_of::<UiInstance>(), 4);
         #[rustfmt::skip]
         let offsets = [
@@ -20018,6 +21915,11 @@ mod tests {
             (136, 16), // from_params
             (152, 16), // animation
             (168, 16), // cut
+            (184, 4),  // clip_shape
+            (188, 16), // transform_from
+            (204, 16), // transform_to
+            (220, 8),  // rotation
+            (228, 8),  // pivot
         ];
         let mut cursor = 0usize;
         for (offset, size) in offsets {
@@ -20028,8 +21930,401 @@ mod tests {
         let instance = UiInstance::zeroed();
         assert_eq!(instance.animation, [0.0; 4]);
         assert_eq!(instance.cut, [0.0; 4]);
+        assert_eq!(instance.transform_from, [0.0; 4]);
+        assert_eq!(instance.transform_to, [0.0; 4]);
+        assert_eq!(instance.rotation, [0.0; 2]);
+        assert_eq!(instance.pivot, [0.0; 2]);
         assert_eq!(instance.depth, 0.0);
         assert_eq!(instance.paint_group_id, 0);
+    }
+
+    #[test]
+    fn canonical_target_transform_is_used_after_transition_completion() {
+        let _gpu_test = GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let (device, queue) = test_device("neon3-ui-target-transform");
+        let mut root = node();
+        root.bounds = UiBounds {
+            x: 4.0,
+            y: 4.0,
+            width: 20.0,
+            height: 20.0,
+        };
+        root.style = UiStyle {
+            background_color: [0.2, 0.8, 0.4, 1.0],
+            transform: UiTransform {
+                translation: [60.0, 0.0],
+                ..UiTransform::default()
+            },
+            ..UiStyle::default()
+        };
+        root.enter_transition = None;
+        let pixels = render_renderer_offscreen_for_test(
+            &mut UiWgpuRenderer::new(&device, wgpu::TextureFormat::Rgba8Unorm),
+            &device,
+            &queue,
+            wgpu::TextureFormat::Rgba8Unorm,
+            &HashMap::from([(
+                UiFragmentId("target-transform".into()),
+                UiFragment {
+                    fragment_id: UiFragmentId("target-transform".into()),
+                    revision: Revision(1),
+                    root,
+                    effects: Vec::new(),
+                },
+            )]),
+            [96, 32],
+            0.0,
+        );
+        let pixel_alpha = |x: usize, y: usize| pixels[(y * 96 + x) * 4 + 3];
+        let old_pixels = (4..24)
+            .flat_map(|x| (4..24).map(move |y| (x, y)))
+            .filter(|(x, y)| pixel_alpha(*x, *y) > 0)
+            .count();
+        let target_pixels = (64..84)
+            .flat_map(|x| (4..24).map(move |y| (x, y)))
+            .filter(|(x, y)| pixel_alpha(*x, *y) > 0)
+            .count();
+        assert!(target_pixels > 200, "target transform must move the panel pixels");
+        assert!(old_pixels < 4, "untransformed source bounds must remain empty");
+    }
+
+    #[test]
+    fn transformed_cpu_and_gpu_hit_tests_follow_the_same_inverse_transform() {
+        let _gpu_test = GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let (device, queue) = test_device("neon3-ui-transformed-hit");
+        let mut root = node();
+        root.enter_transition = None;
+        root.bounds = UiBounds {
+            x: 10.0,
+            y: 10.0,
+            width: 100.0,
+            height: 80.0,
+        };
+        root.style.transform = UiTransform {
+            translation: [50.0, 0.0],
+            ..UiTransform::default()
+        };
+        let mut button = node();
+        button.node_id = UiNodeId("button".into());
+        button.kind = UiNodeKind::Button;
+        button.enter_transition = None;
+        button.bounds = UiBounds {
+            x: 20.0,
+            y: 20.0,
+            width: 20.0,
+            height: 20.0,
+        };
+        root.children = vec![button];
+        let fragment_id = UiFragmentId("transformed-hit".into());
+        let fragments = HashMap::from([(
+            fragment_id.clone(),
+            UiFragment {
+                fragment_id,
+                revision: Revision(1),
+                root,
+                effects: Vec::new(),
+            },
+        )]);
+        let mut renderer = UiWgpuRenderer::new(&device, wgpu::TextureFormat::Rgba8Unorm);
+        let _ = render_renderer_offscreen_for_test(
+            &mut renderer,
+            &device,
+            &queue,
+            wgpu::TextureFormat::Rgba8Unorm,
+            &fragments,
+            [160, 120],
+            0.0,
+        );
+        renderer.set_pointer_position([80.0, 30.0]);
+        assert!(renderer.hit_binding_at_pointer().is_some());
+        renderer.set_pointer_position([30.0, 30.0]);
+        assert!(renderer.hit_binding_at_pointer().is_none());
+
+        let gpu_hits = render_hit_ids_with_renderer_for_test(
+            &mut renderer,
+            &device,
+            &queue,
+            &fragments,
+            [160, 120],
+        );
+        let target_pixel = gpu_hits[30 * 160 + 80];
+        let source_pixel = gpu_hits[30 * 160 + 30];
+        assert_ne!(target_pixel, 0, "GPU hit pass must follow transformed geometry");
+        assert_eq!(
+            source_pixel,
+            u32::MAX,
+            "GPU hit pass must not retain source geometry"
+        );
+    }
+
+    #[test]
+    fn text_and_image_layers_follow_a_transformed_panel_group() {
+        let _gpu_test = GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let (device, queue) = test_device("neon3-ui-transform-layers");
+        let image_asset = AssetRef {
+            project_id: "transform-layers".into(),
+            asset_id: 7,
+            revision: Revision(1),
+            kind: "image".into(),
+        };
+        let mut root = node();
+        root.enter_transition = None;
+        root.bounds = UiBounds {
+            x: 10.0,
+            y: 10.0,
+            width: 120.0,
+            height: 90.0,
+        };
+        root.style = UiStyle {
+            background_color: [0.0, 0.0, 0.0, 0.0],
+            border_color: [0.0, 0.0, 0.0, 0.0],
+            border_width: 0.0,
+            corner_radius: 0.0,
+            opacity: 1.0,
+            transform: UiTransform {
+                translation: [50.0, 0.0],
+                origin: [0.0, 0.0],
+                ..UiTransform::default()
+            },
+        };
+        let mut label = node();
+        label.node_id = UiNodeId("label".into());
+        label.kind = UiNodeKind::Label;
+        label.enter_transition = None;
+        label.bounds = UiBounds {
+            x: 20.0,
+            y: 20.0,
+            width: 50.0,
+            height: 20.0,
+        };
+        label.text = Some(TextRef::Literal {
+            value: "SYNC".into(),
+        });
+        label.style = UiStyle::default();
+        let mut image = node();
+        image.node_id = UiNodeId("image".into());
+        image.kind = UiNodeKind::Image;
+        image.enter_transition = None;
+        image.bounds = UiBounds {
+            x: 20.0,
+            y: 50.0,
+            width: 20.0,
+            height: 20.0,
+        };
+        image.image = Some(image_asset.clone());
+        image.style = UiStyle::default();
+        root.children = vec![label, image];
+        let fragment_id = UiFragmentId("transform-layers".into());
+        let fragments = HashMap::from([(
+            fragment_id.clone(),
+            UiFragment {
+                fragment_id,
+                revision: Revision(1),
+                root,
+                effects: Vec::new(),
+            },
+        )]);
+        let mut renderer = UiWgpuRenderer::new(&device, wgpu::TextureFormat::Rgba8Unorm);
+        renderer
+            .preload_image(
+                &device,
+                &queue,
+                &AssetBytes {
+                    asset: image_asset,
+                    media_type: "application/x-neon-rgba8".into(),
+                    width: Some(2),
+                    height: Some(2),
+                    bytes: [40, 220, 160, 255]
+                        .into_iter()
+                        .cycle()
+                        .take(16)
+                        .collect(),
+                },
+            )
+            .unwrap();
+        let pixels = render_renderer_offscreen_for_test(
+            &mut renderer,
+            &device,
+            &queue,
+            wgpu::TextureFormat::Rgba8Unorm,
+            &fragments,
+            [160, 120],
+            0.0,
+        );
+        let pixel = |x: usize, y: usize| &pixels[(y * 160 + x) * 4..(y * 160 + x) * 4 + 4];
+        assert_eq!(pixel(75, 55), &[40, 220, 160, 255]);
+        assert_eq!(pixel(25, 55)[3], 0, "image source position must be empty");
+        let translated_text_pixels = (70..110)
+            .flat_map(|x| (15..50).map(move |y| (x, y)))
+            .filter(|(x, y)| pixel(*x, *y)[3] > 0)
+            .count();
+        assert!(translated_text_pixels > 0, "text glyphs must follow the panel transform");
+    }
+
+    #[test]
+    fn exit_transition_retains_removed_node_until_its_deadline_and_resurrects() {
+        let (device, _queue) = test_device("neon3-ui-exit-lifecycle");
+        let mut renderer = UiWgpuRenderer::new(&device, wgpu::TextureFormat::Rgba8Unorm);
+        let transition = UiTransition {
+            delay_ms: 0,
+            duration_ms: 320,
+            easing: UiEasing::EaseIn,
+            from: UiTransitionState::default(),
+            motion_key: Some("exit-fade".into()),
+            timeline: None,
+        };
+        let mut old_root = node();
+        old_root.enter_transition = None;
+        let mut gone = node();
+        gone.node_id = UiNodeId("gone".into());
+        gone.enter_transition = None;
+        old_root.children = vec![gone];
+        let old_id = UiFragmentId("exit-test".into());
+        let old_fragments = HashMap::from([(
+            old_id.clone(),
+            UiFragment {
+                fragment_id: old_id.clone(),
+                revision: Revision(1),
+                root: old_root,
+                effects: vec![UiEffect::ExitTransition {
+                    node_id: UiNodeId("gone".into()),
+                    transition: transition.clone(),
+                }],
+            },
+        )]);
+        renderer.prepare_interaction(&old_fragments, [200, 100], [200.0, 100.0], 1.0);
+        let mut new_root = node();
+        new_root.enter_transition = None;
+        let new_fragments = HashMap::from([(
+            old_id.clone(),
+            UiFragment {
+                fragment_id: old_id,
+                revision: Revision(2),
+                root: new_root,
+                effects: vec![UiEffect::ExitTransition {
+                    node_id: UiNodeId("gone".into()),
+                    transition,
+                }],
+            },
+        )]);
+        renderer.prepare_interaction(&new_fragments, [200, 100], [200.0, 100.0], 1.1);
+        assert!(renderer
+            .active
+            .get("exit-test/gone")
+            .is_some_and(|active| active.reason == AnimationReason::Exit));
+        assert_eq!(renderer.exiting.len(), 1);
+        assert!(renderer
+            .last_frame_snapshot
+            .as_ref()
+            .is_some_and(|frame| frame
+                .nodes
+                .iter()
+                .any(|node| node.identity.node_id == "exit-test/gone")));
+
+        assert!(renderer.has_active_animation(1.2));
+        renderer.prepare_interaction(&new_fragments, [200, 100], [200.0, 100.0], 1.2);
+        assert!(renderer
+            .last_frame_snapshot
+            .as_ref()
+            .is_some_and(|frame| frame
+                .nodes
+                .iter()
+                .any(|node| node.identity.node_id == "exit-test/gone")));
+
+        let mut reappeared_root = node();
+        reappeared_root.enter_transition = None;
+        let mut reappeared = node();
+        reappeared.node_id = UiNodeId("gone".into());
+        reappeared.enter_transition = None;
+        let reappeared_fragments = HashMap::from([(
+            UiFragmentId("exit-test".into()),
+            UiFragment {
+                fragment_id: UiFragmentId("exit-test".into()),
+                revision: Revision(3),
+                root: {
+                    reappeared_root.children = vec![reappeared];
+                    reappeared_root
+                },
+                effects: vec![UiEffect::ExitTransition {
+                    node_id: UiNodeId("gone".into()),
+                    transition: UiTransition {
+                        delay_ms: 0,
+                        duration_ms: 320,
+                        easing: UiEasing::EaseIn,
+                        from: UiTransitionState::default(),
+                        motion_key: Some("exit-fade".into()),
+                        timeline: None,
+                    },
+                }],
+            },
+        )]);
+        renderer.animation_clock_seconds = 1.21;
+        renderer.update_viewport([200, 100], [200.0, 100.0]);
+        renderer.refresh_plan(&reappeared_fragments, [200.0, 100.0]);
+        let pre_sample_resurrection = renderer
+            .active
+            .get("exit-test/gone")
+            .expect("resurrection must install active before sampling");
+        assert!(
+            pre_sample_resurrection.started_at_seconds >= 1.20
+                && pre_sample_resurrection.transition.duration_ms == 320,
+            "unexpected resurrection track: started={}, duration={}",
+            pre_sample_resurrection.started_at_seconds,
+            pre_sample_resurrection.transition.duration_ms
+        );
+        renderer.compose_sampled_visuals(1.21);
+        let resurrected = renderer
+            .active
+            .get("exit-test/gone")
+            .expect("reappeared node must have a new active track");
+        assert_eq!(resurrected.reason, AnimationReason::Retarget);
+        assert_eq!(resurrected.identity.generation, 2);
+        assert!(resurrected.from.style.opacity < 1.0);
+        assert!(resurrected.from.style.opacity > 0.0);
+        assert!(renderer.exiting.is_empty());
+
+        assert!(renderer.has_active_animation(1.5));
+        renderer.prepare_interaction(&reappeared_fragments, [200, 100], [200.0, 100.0], 1.5);
+        assert!(renderer
+            .last_frame_snapshot
+            .as_ref()
+            .is_some_and(|frame| frame.nodes.iter().any(|node| {
+                node.identity.node_id == "exit-test/gone" && node.identity.generation == 2
+            })));
+        renderer.has_active_animation(1.9);
+        renderer.prepare_interaction(&reappeared_fragments, [200, 100], [200.0, 100.0], 1.9);
+        assert!(renderer.active.get("exit-test/gone").is_none());
+        assert!(renderer
+            .last_frame_snapshot
+            .as_ref()
+            .is_some_and(|frame| frame.nodes.iter().any(|node| {
+                node.identity.node_id == "exit-test/gone" && node.identity.generation == 2
+            })));
+
+        let mut removed_again = new_fragments
+            .get(&UiFragmentId("exit-test".into()))
+            .cloned()
+            .expect("initial hidden fragment exists");
+        removed_again.revision = Revision(4);
+        let removed_again_fragments = HashMap::from([(UiFragmentId("exit-test".into()), removed_again)]);
+        renderer.prepare_interaction(&removed_again_fragments, [200, 100], [200.0, 100.0], 2.0);
+        assert!(renderer
+            .active
+            .get("exit-test/gone")
+            .is_some_and(|active| active.reason == AnimationReason::Exit && active.identity.generation == 2));
+        renderer.has_active_animation(2.4);
+        renderer.prepare_interaction(&removed_again_fragments, [200, 100], [200.0, 100.0], 2.4);
+        assert_eq!(renderer.exiting.len(), 0);
+        assert!(!renderer
+            .last_frame_snapshot
+            .as_ref()
+            .is_some_and(|frame| frame.nodes.iter().any(|node| node.identity.node_id == "exit-test/gone")));
     }
 
     #[test]

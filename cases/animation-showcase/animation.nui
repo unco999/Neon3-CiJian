@@ -4,9 +4,21 @@
 # semantic intent；每个 presentation machine 在 UI runtime 内选择状态和
 # motion，WGPU runtime 只接收更新后的 visual target 并按统一时钟采样。
 # 覆盖：enter/transition、bounds、opacity、颜色、位置、border/radius、
-# delay、嵌套子树、多状态循环，以及快速 retarget 的真实交互入口。
+# numeric、translate/scale/rotate、linear/ease-in/ease-out/ease-in-out/spring、delay、keyframe/repeat/stagger、嵌套子树、多状态循环，
+# 以及快速 retarget 的真实交互入口。
 
 # === Motion 定义 ===
+input fill_progress f32:0..100 default 0
+input show_exit bool default true
+motion linear-enter duration 180 easing linear from opacity 0
+motion linear-fill duration 480 easing linear from numeric 0
+motion spring-expand duration 620 easing spring from bounds 820 540 100 36
+motion transform-enter duration 680 easing spring from transform 120 -24 0.72 0.72 -12 origin 0 0
+motion exit-fade duration 320 easing ease_in from opacity 1
+motion timeline-pulse duration 360 easing ease_in_out repeat 2 stagger 20 group sequence
+keyframe timeline-pulse 0 opacity 0
+keyframe timeline-pulse 180 opacity 0.5 easing bounce
+keyframe timeline-pulse 360 opacity 1 easing cubic_bezier
 motion expand duration 320 easing ease_out from bounds 420 40 120 72 opacity 0.55
 motion collapse duration 220 easing ease_in
 motion fade-in duration 420 easing ease_out delay 40 from opacity 0
@@ -90,12 +102,14 @@ state panel-f large
 on panel-f anim.f.next from small -> medium
 on panel-f anim.f.next from medium -> large
 on panel-f anim.f.next from large -> small
+on panel-f anim.f.large from small -> large
 on panel-f anim.f.small -> small
 on panel-f anim.f.medium -> medium
 on panel-f anim.f.large -> large
 transition panel-f small -> medium motion expand
 transition panel-f medium -> large motion expand
 transition panel-f large -> small motion collapse
+transition panel-f small -> large motion expand
 style panel-f.small.anim-panel-f x 820 y 40 w 120 h 120 fill #1D3557
 style panel-f.medium.anim-panel-f x 820 y 40 w 200 h 200 fill #457B9D
 style panel-f.large.anim-panel-f x 820 y 40 w 300 h 300 fill #A8DADC
@@ -107,8 +121,8 @@ on panel-g anim.g.toggle from quiet -> emphasized
 on panel-g anim.g.toggle from emphasized -> quiet
 transition panel-g quiet -> emphasized motion edge-glow
 transition panel-g emphasized -> quiet motion edge-glow
-style panel-g.quiet.anim-panel-g x 1040 y 400 w 140 h 92 fill #263238 line #405A64 border_width 1 corner_radius 4
-style panel-g.emphasized.anim-panel-g x 1040 y 400 w 140 h 92 fill #143D59 line #80ED99 border_width 10 corner_radius 32
+style panel-g.quiet.anim-panel-g x 1040 y 540 w 140 h 92 fill #263238 line #405A64 border_width 1 corner_radius 4
+style panel-g.emphasized.anim-panel-g x 1040 y 540 w 140 h 92 fill #143D59 line #80ED99 border_width 10 corner_radius 32
 
 # === 状态机 H：延迟入场/退出（delay + retarget） ===
 machine panel-h initial hidden
@@ -120,10 +134,52 @@ transition panel-h shown -> hidden motion fade-out
 style panel-h.hidden.anim-panel-h x 840 y 760 w 220 h 90 opacity 0.0
 style panel-h.shown.anim-panel-h x 840 y 760 w 260 h 110 opacity 1.0
 
-# === 主界面 ===
-surface anim-showcase overlay w 1200 h 900 fill #0D1117
+# === 状态机 I：数值控件动画（numeric_value + linear） ===
+machine panel-i initial empty
+state panel-i full
+on panel-i anim.i.fill from empty -> full
+on panel-i anim.i.empty from full -> empty
+transition panel-i empty -> full motion linear-fill
+transition panel-i full -> empty motion linear-fill
+style panel-i.empty.anim-panel-i x 820 y 360 w 190 h 100 fill #17324A
+style panel-i.full.anim-panel-i x 820 y 360 w 300 h 130 fill #245B4A
 
-  panel control-panel x 20 y 20 w 370 h 860 fill #161B22 radius 8 column pad 16 gap 10
+# === 状态机 J：弹簧回弹（spring easing） ===
+machine panel-j initial rest
+state panel-j bounced
+on panel-j anim.j.spring from rest -> bounced
+on panel-j anim.j.reset from bounced -> rest
+transition panel-j rest -> bounced motion spring-expand
+transition panel-j bounced -> rest motion spring-expand
+style panel-j.rest.anim-panel-j x 820 y 540 w 140 h 50 fill #3A315B line #BCA7FF border_width 1 corner_radius 10
+style panel-j.bounced.anim-panel-j x 820 y 540 w 200 h 90 fill #5C3D82 line #F0D8FF border_width 4 corner_radius 24
+
+# === 状态机 K：Transform track（translate + scale + rotate） ===
+machine panel-k initial rest
+state panel-k settled
+on panel-k anim.k.show from rest -> settled
+on panel-k anim.k.reset from settled -> rest
+transition panel-k rest -> settled motion transform-enter
+transition panel-k settled -> rest motion transform-enter
+style panel-k.rest.anim-panel-k x 640 y 380 w 160 h 100 fill #204B5B line #8CE8FF border_width 2 corner_radius 12 transform 0 0 1 1 0 origin 0 0
+style panel-k.settled.anim-panel-k x 640 y 380 w 190 h 120 fill #2B6E77 line #B8F4FF border_width 3 corner_radius 18 transform 32 8 1.12 1.12 9 origin 0 0
+
+# === 状态机 M：keyframe / repeat / sequence ===
+machine panel-m initial rest
+state panel-m peak
+on panel-m anim.m.play from rest -> peak
+on panel-m anim.m.reset from peak -> rest
+transition panel-m rest -> peak motion timeline-pulse
+transition panel-m peak -> rest motion timeline-pulse
+style panel-m.rest.anim-panel-m x 420 y 820 w 180 h 60
+style panel-m.peak.anim-panel-m x 420 y 820 w 260 h 90
+style panel-m.rest.m-core x 24 y 8 w 40 h 20
+style panel-m.peak.m-core x 24 y 8 w 80 h 28
+
+# === 主界面 ===
+surface anim-showcase overlay w 1200 h 1024 fill #0D1117
+
+  panel control-panel x 20 y 20 w 370 h 984 fill #161B22 radius 8 column pad 16 gap 10
     text title w 330 h 28 value "Neon3 Animation Showcase"
     text subtitle w 330 h 18 value "UI Runtime Statechart + WGPU Sampler"
 
@@ -168,6 +224,16 @@ surface anim-showcase overlay w 1200 h 900 fill #0D1117
       button btn-h-toggle w 150 h 32 fill #5E2A84 line #D0A2F7 radius 4 value "Toggle H" event anim.h.toggle
       button btn-h-again w 150 h 32 fill #263B4A line #5B7080 radius 4 value "Retarget" event anim.h.toggle
 
+    text section-i h 22 value "I  Numeric / Linear"
+    panel row-i row gap 8 h 36
+      button btn-i-fill w 150 h 32 fill #245B4A line #8AE6B8 radius 4 value "Fill I" event anim.i.fill
+      button btn-i-empty w 150 h 32 fill #263B4A line #5B7080 radius 4 value "Empty" event anim.i.empty
+
+    text section-j h 22 value "J  Spring"
+    panel row-j row gap 8 h 36
+      button btn-j-spring w 150 h 32 fill #5C3D82 line #F0D8FF radius 4 value "Spring J" event anim.j.spring
+      button btn-j-reset w 150 h 32 fill #263B4A line #5B7080 radius 4 value "Reset" event anim.j.reset
+
     text hint w 330 h 16 value "Buttons emit intents; no probe-side style if/else."
 
   # === 右侧动画展示区 ===
@@ -192,11 +258,35 @@ surface anim-showcase overlay w 1200 h 900 fill #0D1117
   panel anim-panel-f x 820 y 40 w 120 h 120 fill #1D3557 radius 8 transition expand
     text label-f h 20 value "F: Cycle"
 
-  panel anim-panel-g x 1040 y 400 w 140 h 92 fill #263238 line #405A64 border_width 1 radius 4 transition edge-glow
+  panel anim-panel-g x 1040 y 540 w 140 h 92 fill #263238 line #405A64 border_width 1 radius 4 transition edge-glow
     text label-g h 20 value "G: Edge"
 
   panel anim-panel-h x 840 y 760 w 220 h 90 fill #5E2A84 radius 8 opacity 0.0 transition delayed-reveal
     text label-h h 20 value "H: Delayed"
+
+  panel anim-panel-i x 820 y 360 w 190 h 100 fill #17324A radius 8 enter linear-enter
+    text label-i x 14 y 12 h 20 value "I: Numeric"
+    progress_bar anim-progress-i x 14 y 52 w 160 h 18 numeric $fill_progress value "Fill"
+
+  panel anim-panel-j x 820 y 540 w 140 h 50 fill #3A315B line #BCA7FF border_width 1 radius 10 enter spring-expand
+    text label-j x 14 y 14 h 20 value "J: Spring"
+
+  panel anim-panel-k x 640 y 380 w 160 h 100 fill #204B5B line #8CE8FF border_width 2 radius 12 enter transform-enter
+    panel k-core x 678 y 410 w 84 h 40 fill #8CE8FF line #D8FBFF border_width 1 radius 8
+
+  button btn-k-show x 640 y 500 w 100 h 32 fill #2B6E77 line #B8F4FF radius 4 value "Transform K" event anim.k.show
+  button btn-k-reset x 750 y 500 w 100 h 32 fill #263B4A line #5B7080 radius 4 value "Reset" event anim.k.reset
+
+  panel anim-panel-m x 420 y 820 w 180 h 36 fill #2D6A4F radius 8
+    text label-m x 14 y 14 h 20 value "M: Timeline"
+    panel m-core x 120 y 8 w 40 h 20 fill #8AE6B8 radius 4
+  button btn-m-play x 640 y 860 w 100 h 32 fill #2D6A4F line #8AE6B8 radius 4 value "Play M" event anim.m.play
+  button btn-m-reset x 750 y 860 w 100 h 32 fill #263B4A line #5B7080 radius 4 value "Reset" event anim.m.reset
+
+  panel anim-panel-l x 640 y 590 w 210 h 70 fill #754C2E line #F4C47A border_width 2 radius 12 visible $show_exit exit exit-fade
+    text label-l x 14 y 14 h 20 value "L: Exit / Unmount"
+  button btn-l-unmount x 640 y 670 w 100 h 32 fill #754C2E line #F4C47A radius 4 value "Unmount" event anim.exit.unmount
+  button btn-l-mount x 750 y 670 w 100 h 32 fill #263B4A line #5B7080 radius 4 value "Mount" event anim.exit.mount
 
   text tag-a x 420 y 165 w 350 h 16 value "A: bounds + retarget"
   text tag-b x 420 y 350 w 350 h 16 value "B: opacity + descendants"
@@ -204,5 +294,10 @@ surface anim-showcase overlay w 1200 h 900 fill #0D1117
   text tag-d x 420 y 630 w 350 h 16 value "D: position bounds"
   text tag-e x 420 y 785 w 350 h 16 value "E: parent + child tracks"
   text tag-f x 820 y 165 w 300 h 16 value "F: 3-state cycle"
-  text tag-g x 1040 y 505 w 220 h 16 value "G: delayed edge curve"
-  text tag-h x 840 y 875 w 350 h 16 value "H: delay + rapid retarget"
+  text tag-g x 1040 y 645 w 180 h 16 value "G: edge glow"
+  text tag-h x 900 y 900 w 250 h 16 value "H: delay + retarget"
+  text tag-i x 820 y 470 w 180 h 16 value "I: numeric + linear"
+  text tag-j x 820 y 610 w 180 h 16 value "J: spring rebound"
+  text tag-k x 640 y 480 w 180 h 16 value "K: transform track"
+  text tag-l x 640 y 715 w 250 h 16 value "L: exit retention"
+  text tag-m x 420 y 895 w 300 h 16 value "M: keyframes + repeat"
