@@ -688,8 +688,28 @@ impl EditorComponent {
                 true
             }
             "Tab" => {
-                let spaces = " ".repeat(self.declaration.tab_size as usize);
-                self.insert_text(&spaces, now);
+                if shift {
+                    // Shift+Tab: outdent the current line by one tab stop.
+                    let line = self.caret.line;
+                    let line_text = self.core.buffer().line(line).unwrap_or_default();
+                    let leading = line_text
+                        .chars()
+                        .take_while(|ch| *ch == ' ' || *ch == '\t')
+                        .count();
+                    if leading > 0 {
+                        let remove = leading.min(self.declaration.tab_size as usize);
+                        let old_col = self.caret.column;
+                        self.core
+                            .delete(Position::new(line, 0), Position::new(line, remove as u32));
+                        self.caret =
+                            Position::new(line, old_col.saturating_sub(remove as u32));
+                        self.mark_edit(now);
+                        self.revision += 1;
+                    }
+                } else {
+                    let spaces = " ".repeat(self.declaration.tab_size as usize);
+                    self.insert_text(&spaces, now);
+                }
                 true
             }
             "Backspace" => {
@@ -1377,6 +1397,46 @@ mod tests {
                 .any(|t| t.class == "Comment" && t.text == "// comment"),
             "row 5 should be Comment, got {:?}",
             classes(&pres.token_rows[5])
+        );
+    }
+
+    fn named_key(path: &str, name: &str, shift: bool) -> UiEditorInputEvent {
+        UiEditorInputEvent::Key {
+            path: path.into(),
+            kind: UiEditorKeyKind::Named(name.into()),
+            text: None,
+            shift,
+            ctrl: false,
+            viewport_height: 480.0,
+            viewport_width: 868.0,
+            gutter_width: 56.0,
+            row_height: 22.0,
+        }
+    }
+
+    #[test]
+    fn tab_inserts_and_shift_tab_outdents() {
+        register_providers();
+        // Start with an already-indented line.
+        let mut comp = EditorComponent::new(ts_declaration(), "    let x = 1;\n");
+        // Caret starts at (0,0); move it to end of line 0.
+        comp.handle_input(&named_key("source-view", "End", false), 0.0);
+        assert_eq!(comp.core.buffer().text(), "    let x = 1;\n");
+        // Tab inserts 4 spaces at caret.
+        comp.handle_input(&named_key("source-view", "Tab", false), 0.0);
+        assert_eq!(
+            comp.core.buffer().text(),
+            "    let x = 1;    \n",
+            "Tab should insert 4 spaces at caret, got {:?}",
+            comp.core.buffer().text()
+        );
+        // Shift+Tab removes one tab stop of leading whitespace.
+        comp.handle_input(&named_key("source-view", "Tab", true), 0.0);
+        assert_eq!(
+            comp.core.buffer().text(),
+            "let x = 1;    \n",
+            "Shift+Tab should outdent leading 4 spaces, got {:?}",
+            comp.core.buffer().text()
         );
     }
 }
