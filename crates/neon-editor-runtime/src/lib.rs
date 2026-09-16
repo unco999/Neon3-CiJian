@@ -7,8 +7,8 @@
 
 use std::collections::HashMap;
 
-use neon_editor_core::grammar::nui_flow_default;
-use neon_editor_core::{ChangeSet, EditOp, EditorCore, Position};
+use neon_editor::grammar::nui_flow_default;
+use neon_editor::{ChangeSet, EditOp, EditorCore, Position};
 use neon_observability::{
     CommandJournal, DebugSnapshot, EVENT_COMMAND_ACCEPTED, EVENT_COMMAND_RECEIVED,
     EVENT_COMMAND_REJECTED, EVENT_COMMAND_VALIDATED, TraceLevel,
@@ -118,7 +118,7 @@ pub struct EditorCompletionResult {
     pub document_id: String,
     pub document_revision: Revision,
     pub position: Position,
-    pub items: Vec<neon_editor_core::CompletionItem>,
+    pub items: Vec<neon_editor::CompletionItem>,
 }
 
 struct DocumentRecord {

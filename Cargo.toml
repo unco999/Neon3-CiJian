@@ -7,7 +7,6 @@ members = [
     "crates/neon-projectd",
     "crates/neon-eventd",
     "crates/neon-ui-schema",
-    "crates/neon-editor-core",
     "crates/neon-editor-runtime",
     "crates/neon-wgpu-runtime",
     "crates/neon-wgpu-ai",
@@ -15,6 +14,7 @@ members = [
     "crates/neon-ui-runtime",
     "crates/neon-ui",
     "crates/neon-cli",
+    "crates/neon3-runtime",
     "crates/neon-dev",
     "crates/neon-android-host",
 ]

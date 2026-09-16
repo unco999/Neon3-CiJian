@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 use std::thread;
 use std::time::Duration;
 
-use neon_editor_core::{ChangeSet, EditOp, Position};
+use neon_editor::{ChangeSet, EditOp, Position};
 use neon_editor_runtime::{
     EDITOR_DOCUMENT_CAPABILITY, EditorChangeApply, EditorChangeKind, EditorCompletionRequest,
     EditorDocumentOpen, EditorDocumentRef, EditorRuntime, SERVICE_NAME,

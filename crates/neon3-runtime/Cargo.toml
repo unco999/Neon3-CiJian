@@ -1,0 +1,18 @@
+[package]
+name = "neon3-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Single-binary Neon3 runtime host: eventd + ui-runtime + wgpu-runtime + editor-runtime in one process, one endpoint per service (same ports the split binaries used), so SDKs and scripts keep working unchanged."
+keywords = ["neon3", "runtime", "host"]
+
+[[bin]]
+name = "neon3-runtime"
+path = "src/main.rs"
+
+[dependencies]
+neon-eventd = { path = "../neon-eventd" }
+neon-ui-runtime = { path = "../neon-ui-runtime" }
+neon-wgpu-runtime = { path = "../neon-wgpu-runtime" }
+neon-editor-runtime = { path = "../neon-editor-runtime" }
+neon-ipc = { path = "../neon-ipc" }

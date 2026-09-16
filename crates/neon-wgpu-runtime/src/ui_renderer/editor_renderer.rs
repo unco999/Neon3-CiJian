@@ -14,8 +14,8 @@
 use std::collections::HashMap;
 
 use super::editor_theme::{EditorTheme, editor_theme_from};
-use neon_editor_core::grammar::nui_flow_default;
-use neon_editor_core::{
+use neon_editor::grammar::nui_flow_default;
+use neon_editor::{
     CompletionItem, CompletionKind, EditEventKind, EditorCore, Position, TokenClass,
 };
 use neon_ui_schema::{TextRef, UiCodeEditorDeclaration, UiEditorLanguage, UiNodeKind};
@@ -310,6 +310,8 @@ fn completion_kind_color(kind: CompletionKind, theme: &EditorTheme) -> [f32; 4] 
         CompletionKind::Input | CompletionKind::InputKind => {
             theme.token(TokenClass::InputRef, 1.0)
         }
+        // LSP-sourced values (TS/Rust/C++): neutral identifier color.
+        CompletionKind::Value => theme.token(TokenClass::Ident, 1.0),
     }
 }
 
@@ -320,6 +322,7 @@ fn kind_prefix(kind: CompletionKind) -> &'static str {
         CompletionKind::Attribute => "at",
         CompletionKind::Input => "in",
         CompletionKind::InputKind => "ik",
+        CompletionKind::Value => "vl",
     }
 }
 

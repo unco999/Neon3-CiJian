@@ -10,7 +10,7 @@
 //! materials (`token_shader`, `selection_shader`, whole-node `text_material`)
 //! are reserved for transient / emphasis effects.
 
-use neon_editor_core::TokenClass;
+use neon_editor::TokenClass;
 use neon_ui_schema::UiCodeEditorDeclaration;
 
 /// One token class's default One Dark color (RGB 0..1).
