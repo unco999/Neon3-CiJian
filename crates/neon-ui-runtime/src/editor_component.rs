@@ -207,6 +207,74 @@ impl EditorComponent {
         self.revision += 1;
     }
 
+    /// Map an opening bracket to its closing partner, if it should be
+    /// auto-closed on insertion.
+    fn pair_for(ch: char) -> Option<char> {
+        match ch {
+            '(' => Some(')'),
+            '[' => Some(']'),
+            '{' => Some('}'),
+            _ => None,
+        }
+    }
+
+    /// Insert text from keyboard/IME. Single characters go through the
+    /// bracket auto-pairing path; multi-char strings (IME commits,
+    /// paste) go straight through.
+    fn insert_character(&mut self, value: &str, now: f32) {
+        let mut chars = value.chars();
+        if let (Some(ch), None) = (chars.next(), chars.next()) {
+            self.insert_char_paired(ch, now);
+        } else {
+            self.insert_text(value, now);
+        }
+    }
+
+    /// Insert `ch` with bracket auto-pairing. When `ch` is an opening
+    /// bracket and no text is selected, the matching close bracket is
+    /// inserted immediately after and the caret lands between them. If the
+    /// character right after the caret is already the matching closer, we
+    /// just advance the caret past it instead of duplicating it. A closing
+    /// bracket that already exists right after the caret is likewise skipped.
+    fn insert_char_paired(&mut self, ch: char, now: f32) {
+        // With a selection, just wrap it (plain insert of the char).
+        if self.selection_anchor.is_some() {
+            self.insert_text(&ch.to_string(), now);
+            return;
+        }
+        // Character immediately after the caret on the same line.
+        let after = self
+            .core
+            .buffer()
+            .line(self.caret.line)
+            .and_then(|line| line.chars().nth(self.caret.column as usize));
+        if let Some(close) = Self::pair_for(ch) {
+            if after == Some(close) {
+                // Already closed: just step over the closer.
+                self.caret.column += 1;
+                self.revision += 1;
+                return;
+            }
+            // Insert "open+close", caret between them.
+            let pair: String = format!("{ch}{close}");
+            self.caret = self.core.insert(self.caret, &pair);
+            self.caret.column -= 1;
+            self.completion = None;
+            let events = self.core.take_edit_events();
+            self.take_edit_fx(events, now);
+            self.mark_edit(now);
+            self.revision += 1;
+            return;
+        }
+        // Typing a closer that already exists right after the caret: skip it.
+        if matches!(ch, ')' | ']' | '}') && after == Some(ch) {
+            self.caret.column += 1;
+            self.revision += 1;
+            return;
+        }
+        self.insert_text(&ch.to_string(), now);
+    }
+
     fn delete_backward(&mut self, now: f32) {
         if let Some(anchor) = self.selection_anchor {
             let (start, end) = ordered_selection(anchor, self.caret);
@@ -594,10 +662,10 @@ impl EditorComponent {
                     _ => return Vec::new(),
                 }
             } else if let Some(inserted) = text {
-                self.insert_text(inserted, now);
+                self.insert_character(inserted, now);
                 self.auto_complete();
             } else {
-                self.insert_text(value, now);
+                self.insert_character(value, now);
                 self.auto_complete();
             }
             self.scroll_caret_into_view(viewport_height, viewport_width, row_height, gutter_width);
@@ -1448,6 +1516,42 @@ mod tests {
             "Enter on a plain line should preserve indent, got {:?}",
             comp.core.buffer().text()
         );
+    }
+
+    #[test]
+    fn opening_bracket_auto_closes() {
+        register_providers();
+        let mut comp = EditorComponent::new(ts_declaration(), "");
+        comp.handle_input(&type_key("source-view", '('), 0.0);
+        assert_eq!(comp.core.buffer().text(), "()", "type ( -> (), got {:?}", comp.core.buffer().text());
+        // Caret should be between the parens.
+        assert_eq!(comp.caret.column, 1, "caret should be at col 1 between ()");
+    }
+
+    #[test]
+    fn closer_skips_when_already_present() {
+        register_providers();
+        let mut comp = EditorComponent::new(ts_declaration(), "()");
+        // Move caret between the parens (col 1) via ArrowRight.
+        comp.handle_input(&named_key("source-view", "ArrowRight", false), 0.0);
+        assert_eq!(comp.caret.column, 1);
+        // Typing ( when the next char is ) should step over it.
+        comp.handle_input(&type_key("source-view", '('), 0.0);
+        assert_eq!(comp.core.buffer().text(), "()", "buffer unchanged, got {:?}", comp.core.buffer().text());
+        assert_eq!(comp.caret.column, 2, "caret should be past the closer");
+    }
+
+    #[test]
+    fn closer_typing_skips_existing_closer() {
+        register_providers();
+        let mut comp = EditorComponent::new(ts_declaration(), "()");
+        // Move caret between parens.
+        comp.handle_input(&named_key("source-view", "ArrowRight", false), 0.0);
+        assert_eq!(comp.caret.column, 1);
+        // Type ) — should skip over the existing ).
+        comp.handle_input(&type_key("source-view", ')'), 0.0);
+        assert_eq!(comp.core.buffer().text(), "()", "buffer unchanged, got {:?}", comp.core.buffer().text());
+        assert_eq!(comp.caret.column, 2, "caret should skip past )");
     }
 
     #[test]
