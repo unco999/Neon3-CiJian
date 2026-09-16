@@ -560,7 +560,28 @@ impl super::UiWgpuRenderer {
                     // Transient edit fx: inserted glyphs in the fx column
                     // range ride the type-in package; a delete fx snapshots
                     // its ghost at the pre-delete estimate position.
-                    for fx in &state.edit_fx {
+                    // The mirror can be rebuilt by a co-drawn render pass
+                    // (behind-ui / world-lab) between presentations, which
+                    // would drop a just-published fx; re-read the external
+                    // presentations slot directly so transient effects never
+                    // vanish from the layout pass.
+                    let fx_owned;
+                    let fx_source = if !state.edit_fx.is_empty() {
+                        &state.edit_fx
+                    } else if let Some(slot) = &self.editor_external_presentations
+                        && let Ok(external) = slot.lock()
+                    {
+                        fx_owned = external
+                            .iter()
+                            .filter(|p| p.node_key == state.declaration.node_key)
+                            .flat_map(|p| p.edit_fx.iter().cloned())
+                            .collect::<Vec<_>>();
+                        &fx_owned
+                    } else {
+                        &state.edit_fx
+                    };
+
+                    for fx in fx_source {
                         let alive =
                             time_seconds - fx.started_seconds < fx.duration_ms as f32 / 1000.0;
                         if !alive {

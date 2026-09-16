@@ -32,8 +32,8 @@ use neon_ui_schema::{
 /// (see `nui_flow_code_editor_demo`). Type-in plays once on insert, the
 /// delete fragment plays once on delete; both are removed when their
 /// duration elapses.
-const FX_TYPE_IN_PACKAGE: &str = "code-editor-demo-register-type-in-v1";
-const FX_DELETE_PACKAGE: &str = "code-editor-demo-register-delete-fragment-v1";
+const FX_TYPE_IN_PACKAGE: &str = "text-type-in";
+const FX_DELETE_PACKAGE: &str = "text-delete-fragment";
 const FX_TYPE_IN_DURATION_MS: u32 = 420;
 const FX_DELETE_DURATION_MS: u32 = 620;
 
