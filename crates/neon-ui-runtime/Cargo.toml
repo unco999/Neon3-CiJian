@@ -18,3 +18,7 @@ neon-editor = { version = "0.1", path = "../neon-editor" }
 serde_json.workspace = true
 serde.workspace = true
 png = "0.18"
+
+
+[dev-dependencies]
+neon-languages = { version = "0.1.0", path = "../neon-languages" }

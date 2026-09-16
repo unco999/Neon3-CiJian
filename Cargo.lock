@@ -1115,6 +1115,7 @@ version = "0.2.13"
 dependencies = [
  "neon-editor",
  "neon-ipc",
+ "neon-languages",
  "neon-observability",
  "neon-protocol",
  "neon-ui-schema",

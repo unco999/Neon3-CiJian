@@ -43,7 +43,18 @@ impl LineIndex {
 }
 
 /// Parse `text` with `grammar` and return per-line token vectors.
-pub fn tokenize(buffer: &TextBuffer, grammar: &tree_sitter::Language) -> Vec<LineTokens> {
+///
+/// `kind` drives a lexer-level keyword fallback: tree-sitter classifies
+/// keywords that appear inside syntax-error regions as plain identifiers
+/// (e.g. `const` in `const t makeTrack`), which makes highlighting unstable
+/// while typing. The fallback rescans every identifier span and upgrades it
+/// to `Keyword` when its text is in the language's keyword table, matching
+/// the editor convention that keywords always highlight.
+pub fn tokenize(
+    buffer: &TextBuffer,
+    grammar: &tree_sitter::Language,
+    kind: LanguageKind,
+) -> Vec<LineTokens> {
     let text = buffer.text();
     let mut parser = Parser::new();
     let _ = parser.set_language(grammar);
@@ -74,6 +85,7 @@ pub fn tokenize(buffer: &TextBuffer, grammar: &tree_sitter::Language) -> Vec<Lin
         }
     }
 
+    apply_keyword_fallback(&mut per_line, &text, kind);
     per_line
         .into_iter()
         .map(|spans| LineTokens {
@@ -81,6 +93,34 @@ pub fn tokenize(buffer: &TextBuffer, grammar: &tree_sitter::Language) -> Vec<Lin
             state: Default::default(),
         })
         .collect()
+}
+
+/// Lexer-level keyword fallback: upgrade identifier spans whose text is a
+/// language keyword to `Keyword` (see [`tokenize`]).
+fn apply_keyword_fallback(per_line: &mut [Vec<Span>], text: &str, kind: LanguageKind) {
+    let keywords = neon_editor::languages::keywords::keywords_for(kind);
+    if keywords.is_empty() {
+        return;
+    }
+    let mut offset = 0usize;
+    for spans in per_line.iter_mut() {
+        let line_len = text[offset..]
+            .find('\n')
+            .map_or(text.len() - offset, |n| n);
+        let line_text = &text[offset..offset + line_len];
+        for span in spans.iter_mut() {
+            if span.class != TokenClass::Ident {
+                continue;
+            }
+            let start = (span.start as usize).min(line_text.len());
+            let end = (start + span.len as usize).min(line_text.len());
+            let word: String = line_text[start..end].chars().collect();
+            if keywords.contains(&word.as_str()) {
+                span.class = TokenClass::Keyword;
+            }
+        }
+        offset += line_len + 1;
+    }
 }
 
 /// Map a named CST node onto a [`TokenClass`] if the node is a leaf-ish
@@ -178,7 +218,7 @@ impl SyntaxProvider for RustSyntax {
     }
 
     fn tokenize(&self, buffer: &TextBuffer) -> Vec<LineTokens> {
-        tokenize(buffer, &tree_sitter_rust::LANGUAGE.into())
+        tokenize(buffer, &tree_sitter_rust::LANGUAGE.into(), LanguageKind::Rust)
     }
 }
 
@@ -190,7 +230,7 @@ impl SyntaxProvider for TypescriptSyntax {
     }
 
     fn tokenize(&self, buffer: &TextBuffer) -> Vec<LineTokens> {
-        tokenize(buffer, &tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
+        tokenize(buffer, &tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(), LanguageKind::Typescript)
     }
 }
 
@@ -202,12 +242,13 @@ impl SyntaxProvider for CppSyntax {
     }
 
     fn tokenize(&self, buffer: &TextBuffer) -> Vec<LineTokens> {
-        tokenize(buffer, &tree_sitter_cpp::LANGUAGE.into())
+        tokenize(buffer, &tree_sitter_cpp::LANGUAGE.into(), LanguageKind::Cpp)
     }
 }
 
 /// Register the built-in tree-sitter syntax providers on `registry`.
 pub fn register_builtins(registry: &mut LanguageRegistry) {
+
     registry.register_syntax(LanguageKind::Rust, Arc::new(RustSyntax));
     registry.register_syntax(LanguageKind::Typescript, Arc::new(TypescriptSyntax));
     registry.register_syntax(LanguageKind::Cpp, Arc::new(CppSyntax));
@@ -248,6 +289,81 @@ pub fn register_builtin_languages(registry: &mut LanguageRegistry) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::*;
+    use neon_editor::buffer::Position;
+    use neon_editor::registry::default_registry;
+
+    fn spans_at(lines: &[LineTokens], row: usize) -> Vec<(String, String)> {
+        lines[row]
+            .spans
+            .iter()
+            .map(|s| (s.class.name().to_string(), format!("{}+{}", s.start, s.len)))
+            .collect()
+    }
+
+    /// The exact text the user typed in the TS editor probe: const/let/class/
+    /// interface must classify as Keyword, variables as Ident, comments as
+    /// Comment — the "const and variable look the same" complaint.
+    #[test]
+    fn typescript_real_user_text_tokenizes() {
+        let mut registry = default_registry();
+        register_builtins(&mut registry);
+        let source = "interface Track\nconst t makeTrack\nlet x\nconst test = 1;\nconst test = 2;\nclass e{\n// comment\n";
+        let mut buffer = TextBuffer::default();
+        buffer.insert(Position::new(0, 0), source);
+        let provider = registry
+            .syntax(LanguageKind::Typescript)
+            .expect("typescript provider registered");
+        let lines = provider.tokenize(&buffer);
+
+        for (i, l) in lines.iter().enumerate() {
+            eprintln!(
+                "[ts] row {i}: {}",
+                l.spans
+                    .iter()
+                    .map(|s| format!("{}@{}+{}", s.class.name(), s.start, s.len))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+        }
+        let row0 = spans_at(&lines, 0); // interface Track
+        assert!(
+            row0.iter().any(|(c, r)| c == "Keyword" && r == "0+9"),
+            "interface should be Keyword 0+9, got {row0:?}"
+        );
+        assert!(
+            row0.iter().any(|(c, r)| c == "Ident" && r == "10+5"),
+            "Track should be Ident 10+5, got {row0:?}"
+        );
+
+        let row3 = spans_at(&lines, 3); // const test = 1;
+        assert!(
+            row3.iter().any(|(c, r)| c == "Keyword" && r == "0+5"),
+            "const should be Keyword 0+5, got {row3:?}"
+        );
+        assert!(
+            row3.iter().any(|(c, r)| c == "Ident" && r == "6+4"),
+            "test should be Ident 6+4, got {row3:?}"
+        );
+
+        let row5 = spans_at(&lines, 5); // class e{
+        assert!(
+            row5.iter().any(|(c, r)| c == "Keyword" && r == "0+5"),
+            "class should be Keyword 0+5, got {row5:?}"
+        );
+
+        let row6 = spans_at(&lines, 6); // // comment
+        assert!(
+            row6.iter().any(|(c, _)| c == "Comment"),
+            "comment line should have Comment, got {row6:?}"
+        );
+
+        let row2 = spans_at(&lines, 2); // let x
+        assert!(
+            row2.iter().any(|(c, r)| c == "Keyword" && r == "0+3"),
+            "let should be Keyword 0+3, got {row2:?}"
+        );
+    }
 
     #[test]
     fn rust_keywords_strings_comments() {

@@ -264,6 +264,62 @@ fn current_partial(prefix: &str) -> String {
         .to_string()
 }
 
+/// Static keyword completions for non-Flow languages (TS / Rust / C++).
+/// The cursor's trailing identifier is the filter prefix; LSP completions
+/// supersede these at the runtime layer when a server is connected.
+pub fn keyword_completions(
+    buffer: &TextBuffer,
+    kind: crate::languages::LanguageKind,
+    position: Position,
+) -> Vec<CompletionItem> {
+    let Some(line_text) = buffer.line(position.line) else {
+        return Vec::new();
+    };
+    let column = position.column.min(line_text.chars().count() as u32) as usize;
+    let prefix: String = line_text.chars().take(column).collect();
+    let partial = trailing_word(&prefix);
+    let partial_start = Position::new(
+        position.line,
+        column
+            .saturating_sub(partial.chars().count())
+            .try_into()
+            .unwrap_or(u32::MAX),
+    );
+    let partial_end = Position::new(position.line, column as u32);
+    let typed = partial.to_ascii_lowercase();
+    let mut candidates = Vec::new();
+    for keyword in crate::languages::keywords::keywords_for(kind) {
+        if typed.is_empty() || keyword.starts_with(&typed) {
+            candidates.push(CompletionItem {
+                item_id: format!("keyword:{keyword}"),
+                label: (*keyword).to_string(),
+                insert_text: (*keyword).to_string(),
+                replace_start: partial_start,
+                replace_end: partial_end,
+                kind: CompletionKind::Keyword,
+                detail: format!("{} keyword", kind.name()),
+                sort_text: (*keyword).to_string(),
+                source: CompletionSource::Grammar,
+                commit_characters: vec![' '],
+            });
+        }
+    }
+    candidates
+}
+
+/// The trailing identifier-ish token of `prefix` (letters, digits, `_`).
+fn trailing_word(prefix: &str) -> String {
+    let mut word = String::new();
+    for ch in prefix.chars().rev() {
+        if ch.is_alphanumeric() || ch == '_' {
+            word.insert(0, ch);
+        } else {
+            break;
+        }
+    }
+    word
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -343,6 +399,23 @@ surface workbench column w 400 h 300
         let items = completions(&buffer, &grammar, &symbols, Position::new(last, column));
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].label, "tab_size");
+    }
+
+    #[test]
+    fn typescript_keywords_filter_by_prefix() {
+        let mut buffer = TextBuffer::default();
+        buffer.insert(Position::new(0, 0), "const t = 1\n");
+        let items = keyword_completions(
+            &buffer,
+            crate::languages::LanguageKind::Typescript,
+            Position::new(0, 5),
+        );
+        assert!(items
+            .iter()
+            .any(|i| i.label == "const" && i.kind == CompletionKind::Keyword));
+        assert!(!items
+            .iter()
+            .any(|i| i.label == "let" && i.kind == CompletionKind::Keyword));
     }
 
     #[test]

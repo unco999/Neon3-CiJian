@@ -1258,3 +1258,126 @@ fn collect_node_literal_text(node: &UiNode, out: &mut HashMap<String, String>) {
         collect_node_literal_text(child, out);
     }
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use neon_ui_schema::{UiCodeEditorDeclaration, UiEditorInputEvent, UiEditorKeyKind, UiEditorLanguage, UiEditorWrap};
+
+    fn ts_declaration() -> UiCodeEditorDeclaration {
+        UiCodeEditorDeclaration {
+            node_key: "source-view".into(),
+            source_input_key: "document".into(),
+            language: UiEditorLanguage::Typescript,
+            line_numbers: true,
+            wrap: UiEditorWrap::None,
+            font_size: 17.0,
+            tab_size: 4,
+            read_only_input_key: None,
+            completion_input_key: None,
+            gutter_diagnostics: true,
+            token_materials: Default::default(),
+            syntax_colors: Default::default(),
+            ui_colors: Default::default(),
+            selection_material: None,
+        }
+    }
+
+    fn type_key(path: &str, ch: char) -> UiEditorInputEvent {
+        UiEditorInputEvent::Key {
+            path: path.into(),
+            kind: UiEditorKeyKind::Character(ch.to_string()),
+            text: Some(ch.to_string()),
+            shift: false,
+            ctrl: false,
+            viewport_height: 480.0,
+            viewport_width: 868.0,
+            gutter_width: 56.0,
+            row_height: 22.0,
+        }
+    }
+
+    /// Register the built-in tree-sitter providers, releasing the global
+    /// registry lock before constructing an EditorCore (creating a core while
+    /// holding the lock would deadlock on the non-reentrant global mutex).
+    fn register_providers() {
+        let mut registry = neon_editor::default_registry();
+        neon_languages::register_builtins(&mut registry);
+    }
+
+    fn classes(row: &[neon_ui_schema::UiEditorTokenSpan]) -> Vec<(String, String)> {
+        row.iter().map(|t| (t.class.clone(), t.text.clone())).collect()
+    }
+
+    #[test]
+    fn typescript_initial_presentation_has_keyword() {
+        register_providers();
+        let mut comp = EditorComponent::new(ts_declaration(), "interface Track\n");
+        let pres0 = comp.to_presentation(0.0);
+        assert_eq!(pres0.token_rows.len(), 2);
+        assert!(
+            pres0.token_rows[0]
+                .iter()
+                .any(|t| t.class == "Keyword" && t.text == "interface"),
+            "initial line should carry Keyword 'interface', got {:?}",
+            classes(&pres0.token_rows[0])
+        );
+    }
+
+    #[test]
+    fn typescript_presentation_carries_keyword_tokens_after_input() {
+        register_providers();
+        // User's exact real document: initial 4 lines + typed const lines.
+        let mut comp = EditorComponent::new(
+            ts_declaration(),
+            "interface Track\nconst t makeTrack\nlet x\n// comment\n",
+        );
+        for ch in "const test = 1;\nconst test = 2;\nclass e{".chars() {
+            comp.handle_input(&type_key("source-view", ch), 0.5);
+        }
+        let pres = comp.to_presentation(1.0);
+        eprintln!("[ui] source={:?}", pres.source);
+        eprintln!("[ui] source lines={}", pres.source.split('\n').count());
+        eprintln!(
+            "[ui] token_rows={}",
+            pres
+                .token_rows
+                .iter()
+                .enumerate()
+                .map(|(i, r)| format!(
+                    "r{i}:{}",
+                    r.iter()
+                        .map(|t| format!("{}@{}", t.class, t.text))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ))
+                .collect::<Vec<_>>()
+                .join(" | ")
+        );
+        assert!(pres.token_rows.len() >= 7, "rows = {}", pres.token_rows.len());
+        // Every keyword must classify as Keyword even on syntactically
+        // invalid lines (the lexer-level fallback guarantees this).
+        // Input lands at the caret (START), so the final buffer is:
+        //   const test = 1; / const test = 2; / class e{interface Track /
+        //   const t makeTrack / let x / // comment
+        // Every keyword must classify as Keyword (lexer fallback), including
+        // keywords inside syntax-error regions.
+        for (row, kw) in [(0, "const"), (1, "const"), (2, "class"), (3, "const"), (4, "let")] {
+            let row1 = &pres.token_rows[row];
+            assert!(
+                row1.iter().any(|t| t.class == "Keyword" && t.text == kw),
+                "row {row} should carry Keyword '{kw}', got {:?}",
+                classes(row1)
+            );
+        }
+        // The comment line stays a Comment.
+        assert!(
+            pres.token_rows[5]
+                .iter()
+                .any(|t| t.class == "Comment" && t.text == "// comment"),
+            "row 5 should be Comment, got {:?}",
+            classes(&pres.token_rows[5])
+        );
+    }
+}

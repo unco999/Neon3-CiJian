@@ -277,9 +277,10 @@ impl EditorCore {
                 &self.symbols,
                 position,
             ),
-            // Non-Flow languages resolve completions through the LSP client
-            // bridge at the runtime layer, not inside the kernel.
-            _ => Vec::new(),
+            // Non-Flow languages: built-in keyword tables give instant
+            // feedback; full semantic completions come from the LSP client
+            // bridge at the runtime layer (SDK editor.completion.request).
+            _ => completion::keyword_completions(&self.buffer, self.language.kind, position),
         }
     }
 

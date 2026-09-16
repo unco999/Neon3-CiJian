@@ -8,6 +8,8 @@
 use crate::buffer::TextBuffer;
 use crate::highlight::{LineTokens, TokenClass};
 
+pub mod keywords;
+
 /// Stable language identifiers understood by the kernel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum LanguageKind {
