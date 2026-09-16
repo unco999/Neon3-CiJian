@@ -1360,9 +1360,17 @@ fn source_hash(source: &str) -> String {
 }
 
 pub fn serve(endpoint: std::net::SocketAddr, epoch: u64) -> Result<(), neon_ipc::TransportError> {
-    let server = neon_ipc::RpcServer::bind(endpoint)?;
-    let mut runtime = EditorRuntime::new(epoch);
-    server.serve_until(|request| runtime.handle(request))
+    // BlockingRpcServer keeps one persistent, multiplexing connection per
+    // client (matching every SDK's long-lived NeonClient); the legacy
+    // RpcServer::serve_until serves one request per connection and closes the
+    // socket after the first response, which breaks the second RPC on a
+    // shared client.
+    let server = neon_ipc::BlockingRpcServer::bind(endpoint)?;
+    let runtime = std::sync::Arc::new(std::sync::Mutex::new(EditorRuntime::new(epoch)));
+    server.serve_until(
+        move |request| runtime.lock().expect("editor-runtime lock").handle(request).0,
+        |request| request.method == "service.shutdown",
+    )
 }
 
 #[cfg(test)]
