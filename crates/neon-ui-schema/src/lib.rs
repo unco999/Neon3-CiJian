@@ -3905,6 +3905,8 @@ pub struct UiCodeEditorPresentation {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UiEditorTokenSpan {
+    /// Absolute char column of the span start within its line.
+    pub start: u32,
     pub text: String,
     pub class: String,
 }

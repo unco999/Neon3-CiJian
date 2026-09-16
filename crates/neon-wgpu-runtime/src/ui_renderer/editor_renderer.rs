@@ -113,17 +113,14 @@ impl EditorRuntimeState {
         let lines: Vec<String> = presentation.source.split('\n').map(str::to_string).collect();
         let mut token_spans: Vec<Vec<SpanRef>> = Vec::with_capacity(presentation.token_rows.len());
         for row in &presentation.token_rows {
-            let mut spans = Vec::with_capacity(row.len());
-            let mut start = 0u32;
-            for span in row {
-                let len = span.text.chars().count() as u32;
-                spans.push(SpanRef {
-                    start,
-                    len,
+            let spans: Vec<SpanRef> = row
+                .iter()
+                .map(|span| SpanRef {
+                    start: span.start,
+                    len: span.text.chars().count() as u32,
                     class: span.class.clone(),
-                });
-                start += len;
-            }
+                })
+                .collect();
             token_spans.push(spans);
         }
         let selection_anchor = match (

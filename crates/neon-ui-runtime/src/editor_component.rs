@@ -1070,6 +1070,7 @@ impl EditorComponent {
                     }
                     let span_text: String = chars[start..start + len].iter().collect();
                     spans.push(UiEditorTokenSpan {
+                        start: span.start,
                         text: span_text,
                         class: span.class.name().to_string(),
                     });
