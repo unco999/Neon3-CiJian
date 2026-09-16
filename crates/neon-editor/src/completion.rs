@@ -267,6 +267,9 @@ fn current_partial(prefix: &str) -> String {
 /// Static keyword completions for non-Flow languages (TS / Rust / C++).
 /// The cursor's trailing identifier is the filter prefix; LSP completions
 /// supersede these at the runtime layer when a server is connected.
+///
+/// Keyword popups are suppressed when the cursor sits inside a string or a
+/// comment, mirroring the NUI Flow [`completions`] guard.
 pub fn keyword_completions(
     buffer: &TextBuffer,
     kind: crate::languages::LanguageKind,
@@ -277,6 +280,12 @@ pub fn keyword_completions(
     };
     let column = position.column.min(line_text.chars().count() as u32) as usize;
     let prefix: String = line_text.chars().take(column).collect();
+
+    // Inside a string or comment: no completion, matching the Flow path.
+    if inside_string_or_comment(&prefix) {
+        return Vec::new();
+    }
+
     let partial = trailing_word(&prefix);
     let partial_start = Position::new(
         position.line,
@@ -286,10 +295,12 @@ pub fn keyword_completions(
             .unwrap_or(u32::MAX),
     );
     let partial_end = Position::new(position.line, column as u32);
-    let typed = partial.to_ascii_lowercase();
+    let typed_lower = partial.to_ascii_lowercase();
     let mut candidates = Vec::new();
     for keyword in crate::languages::keywords::keywords_for(kind) {
-        if typed.is_empty() || keyword.starts_with(&typed) {
+        // Case-insensitive prefix match so Rust's `Self` (capital S) is found
+        // when the user types `se` or `Se`, not just the lowercase variant.
+        if typed_lower.is_empty() || keyword.to_ascii_lowercase().starts_with(&typed_lower) {
             candidates.push(CompletionItem {
                 item_id: format!("keyword:{keyword}"),
                 label: (*keyword).to_string(),
@@ -318,6 +329,46 @@ fn trailing_word(prefix: &str) -> String {
         }
     }
     word
+}
+
+/// Lightweight lexical scan: is the cursor at `prefix` inside a string or a
+/// line/block comment? Used to gate keyword popups off in non-code regions.
+///
+/// This is a line-level heuristic (it does not track block-comment state that
+/// opened on an earlier line), which is sufficient for completion-popup
+/// suppression — the common case is a same-line `// comment` or an unclosed
+/// string literal on the current line.
+fn inside_string_or_comment(prefix: &str) -> bool {
+    let mut in_string: Option<char> = None;
+    let mut in_block_comment = false;
+    let mut chars = prefix.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if let Some(quote) = in_string {
+            if ch == '\\' {
+                chars.next(); // skip escaped char
+            } else if ch == quote {
+                in_string = None;
+            }
+            continue;
+        }
+        if in_block_comment {
+            if ch == '*' && chars.peek() == Some(&'/') {
+                chars.next();
+                in_block_comment = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' | '\'' | '`' => in_string = Some(ch),
+            '/' if chars.peek() == Some(&'/') => return true,
+            '/' if chars.peek() == Some(&'*') => {
+                chars.next();
+                in_block_comment = true;
+            }
+            _ => {}
+        }
+    }
+    in_string.is_some() || in_block_comment
 }
 
 #[cfg(test)]
@@ -416,6 +467,69 @@ surface workbench column w 400 h 300
         assert!(!items
             .iter()
             .any(|i| i.label == "let" && i.kind == CompletionKind::Keyword));
+    }
+
+    #[test]
+    fn no_keyword_completion_inside_string() {
+        let mut buffer = TextBuffer::default();
+        // Cursor sits inside the "const" string literal.
+        buffer.insert(Position::new(0, 0), "let s = \"const\"\n");
+        let items = keyword_completions(
+            &buffer,
+            crate::languages::LanguageKind::Typescript,
+            Position::new(0, 11),
+        );
+        assert!(
+            items.is_empty(),
+            "no keyword popup inside a string literal, got {items:?}"
+        );
+    }
+
+    #[test]
+    fn no_keyword_completion_inside_line_comment() {
+        let mut buffer = TextBuffer::default();
+        // Cursor after `// const` on a comment line.
+        buffer.insert(Position::new(0, 0), "// const\n");
+        let items = keyword_completions(
+            &buffer,
+            crate::languages::LanguageKind::Rust,
+            Position::new(0, 8),
+        );
+        assert!(
+            items.is_empty(),
+            "no keyword popup inside a line comment, got {items:?}"
+        );
+    }
+
+    #[test]
+    fn no_keyword_completion_inside_block_comment() {
+        let mut buffer = TextBuffer::default();
+        buffer.insert(Position::new(0, 0), "/* const\n");
+        let items = keyword_completions(
+            &buffer,
+            crate::languages::LanguageKind::Rust,
+            Position::new(0, 8),
+        );
+        assert!(
+            items.is_empty(),
+            "no keyword popup inside an unclosed block comment, got {items:?}"
+        );
+    }
+
+    #[test]
+    fn rust_self_keyword_case_insensitive_match() {
+        let mut buffer = TextBuffer::default();
+        buffer.insert(Position::new(0, 0), "Se\n");
+        let items = keyword_completions(
+            &buffer,
+            crate::languages::LanguageKind::Rust,
+            Position::new(0, 2),
+        );
+        assert!(
+            items.iter().any(|i| i.label == "Self"),
+            "typing `Se` should suggest `Self`, got {:?}",
+            items.iter().map(|i| i.label.as_str()).collect::<Vec<_>>()
+        );
     }
 
     #[test]

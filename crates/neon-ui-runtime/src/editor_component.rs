@@ -20,7 +20,6 @@ use std::sync::{Arc, Mutex};
 
 use neon_editor::{
     CompletionItem, EditEvent, EditEventKind, EditorCore, Language, LanguageKind, Position,
-    grammar::nui_flow_default,
 };
 use neon_ui_schema::{
     TextRef, UiCodeEditorDeclaration, UiCodeEditorPresentation, UiEditorCompletionItem,
