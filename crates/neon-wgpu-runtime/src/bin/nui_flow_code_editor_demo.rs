@@ -210,12 +210,52 @@ fn main() {
 
     // 4. Window server: the only window + GPU owner, driven by the public
     //    neon3.rpc protocol. Fragments arrive over `wgpu.ui.submit_fragment`.
-    let window_result = neon_wgpu_runtime::WindowedRuntime::run_server(
+    //    The shared EditorBridge wires the renderer's input sink + the
+    //    presentations slot + the fragment observer, so the editor core stays
+    //    in the ui-runtime component while the renderer only draws snapshots.
+    let editor_bridge =
+        std::sync::Arc::new(neon_ui_runtime::editor_component::EditorBridge::new());
+    let input_sink: Box<
+        dyn FnMut(neon_ui_schema::UiEditorInputEvent, f32) -> Vec<neon_wgpu_runtime::EditorCommit>
+            + Send,
+    > = {
+        let bridge = editor_bridge.clone();
+        Box::new(move |event, now| {
+            bridge
+                .handle_input(&event, now)
+                .into_iter()
+                .map(|commit| neon_wgpu_runtime::EditorCommit {
+                    node_path: commit.node_path,
+                    event_action: commit.event_action,
+                    document: commit.document,
+                })
+                .collect()
+        })
+    };
+    let fragment_observer: Box<
+        dyn FnMut(
+                &std::collections::HashMap<
+                    neon_ui_schema::UiFragmentId,
+                    neon_ui_schema::UiFragment,
+                >,
+            ) + Send,
+    > = {
+        let bridge = editor_bridge.clone();
+        Box::new(move |fragments| bridge.sync_fragments(fragments))
+    };
+    let handle = neon_wgpu_runtime::EditorBridgeHandle {
+        input_sink: Some(input_sink),
+        external_presentations: Some(editor_bridge.presentations.clone()),
+        fragment_observer: Some(fragment_observer),
+    };
+    let window_result = neon_wgpu_runtime::WindowedRuntime::run_server_with_eventd_bridged(
         1,
         wgpu_endpoint,
         Some(host_endpoint),
         None,
+        None,
         false,
+        Some(handle),
     );
 
     let _ = submitter.join();

@@ -3855,7 +3855,7 @@ impl UiCodeEditorDeclaration {
 /// semantics) and consumed by the WGPU renderer as pure data: the renderer
 /// lays out glyphs and rects from this snapshot and never touches the editor
 /// kernel, buffer, or edit state.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UiCodeEditorPresentation {
     pub node_key: String,

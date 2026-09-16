@@ -99,6 +99,10 @@ pub(super) struct EditorRuntimeState {
     /// Revision of the presentation this mirror was built from (the
     /// ui-runtime bumps it on every semantic change).
     pub presentation_revision: u64,
+    /// Full rows region laid out by the renderer (x/y/width/height in the
+    /// same logical space as the node bounds). The lowered panel bounds may
+    /// not grow with content, so pointer hit-testing falls back to this.
+    pub content_rect: UiBounds,
 }
 
 impl EditorRuntimeState {
@@ -149,6 +153,12 @@ impl EditorRuntimeState {
             last_edit_seconds: presentation.last_edit_seconds,
             layout_dirty: true,
             presentation_revision: presentation.revision,
+            content_rect: UiBounds {
+                x: 0.0,
+                y: 0.0,
+                width: 0.0,
+                height: 0.0,
+            },
         }
     }
 }
@@ -403,6 +413,12 @@ impl super::UiWgpuRenderer {
             }
             let line_count = state.lines.len() as u32;
             let gutter_width = editor_gutter_width(declaration, line_count, state.font_scale);
+            state.content_rect = UiBounds {
+                x: visual.bounds.x,
+                y: visual.bounds.y - state.scroll_y,
+                width: visual.bounds.width,
+                height: (line_count as f32 * row_height).max(visual.bounds.height),
+            };
             let content_x = visual.bounds.x + gutter_width;
             let content_width = (visual.bounds.width - gutter_width).max(1.0);
             let clip = [
@@ -967,16 +983,17 @@ impl super::UiWgpuRenderer {
                     _ => {}
                 }
             }
-            for (node_key, presentation) in pres_map {
-                // Only accept presentations whose lowered node is still a
+            // The desired set comes from declarations (a lowered code_editor
+            // always carries the declaration; the presentation may ride the
+            // fragment or arrive via the external slot, filled below).
+            for (node_key, declaration) in declarations {
+                // Only accept declarations whose lowered node is still a
                 // Panel in this fragment (the renderer needs a draw target).
                 if kinds.get(&node_key) != Some(&UiNodeKind::Panel) {
                     continue;
                 }
                 let path = format!("{}/{}", fragment.fragment_id.0, node_key);
-                let Some(declaration) = declarations.get(&node_key).cloned() else {
-                    continue;
-                };
+                let presentation = pres_map.remove(&node_key).unwrap_or_default();
                 desired.insert(path, (declaration, presentation));
             }
         }
@@ -1087,7 +1104,12 @@ impl super::UiWgpuRenderer {
             if self.plan[index].instance_index.is_none() {
                 continue;
             }
-            if contains(visual.bounds, pointer) {
+            let in_panel = contains(visual.bounds, pointer);
+            let in_content = self
+                .editors
+                .get(path)
+                .is_some_and(|st| contains(st.content_rect, pointer));
+            if in_panel || in_content {
                 return Some(path.clone());
             }
         }
