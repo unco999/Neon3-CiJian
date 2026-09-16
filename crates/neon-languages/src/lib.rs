@@ -123,6 +123,43 @@ fn apply_keyword_fallback(per_line: &mut [Vec<Span>], text: &str, kind: Language
     }
 }
 
+/// Classify an identifier-like node by its own kind and parent context.
+///
+/// tree-sitter Rust/TS/C++ use the same `identifier` leaf for variables,
+/// function calls, macro names, and type references; the parent node tells
+/// us which visual bucket it belongs to.
+fn classify_identifier(node: Node<'_>) -> Option<TokenClass> {
+    let kind = node.kind();
+    let parent = node.parent();
+    let parent_kind = parent.as_ref().map(|p| p.kind()).unwrap_or("");
+
+    match kind {
+        // Type identifiers: struct/enum/trait/type names and function def names.
+        "type_identifier" => match parent_kind {
+            "function_item" | "function_signature_item" => Some(TokenClass::Function),
+            _ => Some(TokenClass::Type),
+        },
+        // Field / property names.
+        "field_identifier" | "shorthand_field_identifier" | "property_identifier"
+        | "shorthand_property_identifier_pattern" => Some(TokenClass::Property),
+        // Plain identifiers: look at the parent to decide Function/Type/Macro/Ident.
+        "identifier" => match parent_kind {
+            // `foo(...)` — function call.
+            "call_expression" | "function_call_expression" => Some(TokenClass::Function),
+            // `println!(...)` — macro.
+            "macro_invocation" => Some(TokenClass::Macro),
+            // `fn foo(...)` — function definition name.
+            "function_item" | "function_signature_item" => Some(TokenClass::Function),
+            // `String::from` — path segment (type or associated fn).
+            "scoped_identifier" => Some(TokenClass::Type),
+            // `Some(v) => ...` / `None => ...` in match arms.
+            "match_arm" | "match_pattern" | "tuple_struct_pattern" => Some(TokenClass::Type),
+            _ => Some(TokenClass::Ident),
+        },
+        _ => Some(TokenClass::Ident),
+    }
+}
+
 /// Map a named CST node onto a [`TokenClass`] if the node is a leaf-ish
 /// token (keyword / comment / string / number / identifier). Parent nodes are
 /// skipped so spans never overlap.
@@ -147,7 +184,9 @@ fn collect_node(
         "identifier" | "field_identifier" | "type_identifier" | "function_name"
         | "variable_name" | "property_identifier" | "shorthand_property_identifier"
         | "shorthand_property_identifier_pattern" | "constant" | "parameter"
-        | "assignment_identifier" => Some(TokenClass::Ident),
+        | "assignment_identifier" => classify_identifier(node),
+        "primitive_type" => Some(TokenClass::Type),
+        "lifetime" => Some(TokenClass::Lifetime),
         _ => {
             // Keywords are anonymous nodes: their `kind()` is the literal
             // text ("fn", "let", "if", ...). Named nodes that do not match
@@ -380,7 +419,7 @@ mod tests {
         assert!(line2.iter().any(|s| s.class == TokenClass::NumericLiteral)); // 42
         let line3 = &tokens[3].spans;
         assert!(line3.iter().any(|s| s.class == TokenClass::StringLiteral)); // "ok"
-        assert!(line3.iter().any(|s| s.class == TokenClass::Ident)); // println
+        assert!(line3.iter().any(|s| s.class == TokenClass::Macro)); // println
     }
 
     #[test]
@@ -391,7 +430,8 @@ mod tests {
         let tokens = TypescriptSyntax.tokenize(&buffer);
         assert_eq!(tokens.len(), 3); // trailing newline -> final empty line
         assert!(tokens[0].spans.iter().any(|s| s.class == TokenClass::Keyword));
-        assert!(tokens[0].spans.iter().any(|s| s.class == TokenClass::Ident));
+        assert!(tokens[0].spans.iter().any(|s| s.class == TokenClass::Type
+            || s.class == TokenClass::Ident)); // Foo type name
         assert!(tokens[1].spans.iter().any(|s| s.class == TokenClass::Keyword));
     }
 

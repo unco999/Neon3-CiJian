@@ -23,6 +23,16 @@ pub enum TokenClass {
     Intent,
     Comment,
     Ident,
+    /// Type name (e.g. `String`, `i32`, `Option`, `Vec`, `Some`).
+    Type,
+    /// Function name in a call or definition (e.g. `main`, `println`).
+    Function,
+    /// Macro invocation (e.g. `println!`).
+    Macro,
+    /// Field / property name.
+    Property,
+    /// Lifetime (e.g. `'a`).
+    Lifetime,
 }
 
 impl TokenClass {
@@ -42,6 +52,11 @@ impl TokenClass {
             TokenClass::Intent => "Intent",
             TokenClass::Comment => "Comment",
             TokenClass::Ident => "Ident",
+            TokenClass::Type => "Type",
+            TokenClass::Function => "Function",
+            TokenClass::Macro => "Macro",
+            TokenClass::Property => "Property",
+            TokenClass::Lifetime => "Lifetime",
         }
     }
 }

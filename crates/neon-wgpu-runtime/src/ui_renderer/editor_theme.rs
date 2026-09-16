@@ -25,6 +25,11 @@ const CLASS_STRING_LITERAL: &str = "StringLiteral";
 const CLASS_INTENT: &str = "Intent";
 const CLASS_COMMENT: &str = "Comment";
 const CLASS_IDENT: &str = "Ident";
+const CLASS_TYPE: &str = "Type";
+const CLASS_FUNCTION: &str = "Function";
+const CLASS_MACRO: &str = "Macro";
+const CLASS_PROPERTY: &str = "Property";
+const CLASS_LIFETIME: &str = "Lifetime";
 
 /// One token class's default One Dark color (RGB 0..1).
 fn one_dark_token(class: &str) -> [f32; 3] {
@@ -40,6 +45,11 @@ fn one_dark_token(class: &str) -> [f32; 3] {
         CLASS_INTENT => [0.78, 0.47, 0.87],         // #C678DD
         CLASS_COMMENT => [0.36, 0.39, 0.44],        // #5C6370
         CLASS_IDENT => [0.67, 0.70, 0.75],          // #ABB2BF
+        CLASS_TYPE => [0.90, 0.75, 0.48],           // #E5C07B (yellow)
+        CLASS_FUNCTION => [0.38, 0.69, 0.94],      // #61AFEF (blue)
+        CLASS_MACRO => [0.82, 0.60, 0.40],          // #D19A66 (orange)
+        CLASS_PROPERTY => [0.34, 0.71, 0.76],       // #56B6C2 (cyan)
+        CLASS_LIFETIME => [0.88, 0.42, 0.46],       // #E06C75 (red)
         _ => [0.67, 0.70, 0.75],
     }
 }
