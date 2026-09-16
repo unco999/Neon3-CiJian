@@ -1,0 +1,29 @@
+[package]
+name = "neon-editor"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Language-agnostic headless code editor kernel: text buffer, incremental highlight, symbols, change sets, tree-sitter grammars (TS/Rust/C++) and an LSP client bridge. Split out of Neon3."
+repository = "https://github.com/unco999/Neon3-CiJian"
+keywords = ["editor", "tree-sitter", "lsp", "highlight", "headless"]
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# 语言层：tree-sitter 语法高亮（TS / Rust / C++，CST -> LineTokens 转换）
+tree-sitter = { version = "0.25", optional = true }
+tree-sitter-rust = { version = "0.24", optional = true }
+tree-sitter-typescript = { version = "0.23", optional = true }
+tree-sitter-cpp = { version = "0.23", optional = true }
+
+# 语言服务层：LSP 协议类型 + 客户端桥（接 tsserver / rust-analyzer / clangd）
+lsp-types = { version = "0.97", optional = true }
+
+[profile.release]
+lto = true
+
+[features]
+default = ["tree-sitter", "lsp"]
+tree-sitter = ["dep:tree-sitter", "dep:tree-sitter-rust", "dep:tree-sitter-typescript", "dep:tree-sitter-cpp"]
+lsp = ["dep:lsp-types"]

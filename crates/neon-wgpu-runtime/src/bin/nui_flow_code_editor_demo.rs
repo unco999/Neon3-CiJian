@@ -593,7 +593,6 @@ fn serve_host_stub(endpoint: SocketAddr) -> Result<(), neon_ipc::TransportError>
                 Ok(event) => {
                     let action = match &event.intent {
                         UiIntent::Invoke { action, .. } => action.as_str(),
-                        _ => "",
                     };
                     let document = event
                         .text

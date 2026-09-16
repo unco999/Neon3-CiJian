@@ -7,7 +7,7 @@ description = "Headless revisioned document service for Neon3 code editors"
 repository.workspace = true
 
 [dependencies]
-neon-editor = { version = "0.1", path = "D:/neon-editor" }
+neon-editor = { version = "0.1", path = "../neon-editor" }
 neon-ipc = { version = "0.2.0", path = "../neon-ipc" }
 neon-observability = { version = "0.2.0", path = "../neon-observability" }
 neon-protocol = { version = "0.2.0", path = "../neon-protocol" }
