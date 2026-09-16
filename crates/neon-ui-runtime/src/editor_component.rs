@@ -684,7 +684,15 @@ impl EditorComponent {
                     .chars()
                     .take_while(|ch| *ch == ' ' || *ch == '\t')
                     .collect();
-                self.insert_text(&format!("\n{indent}"), now);
+                // Auto-indent one extra level after an opening bracket.
+                let before_caret: String = line_text.chars().take(self.caret.column as usize).collect();
+                let trimmed = before_caret.trim_end();
+                let extra: String = if trimmed.ends_with('{') || trimmed.ends_with('(') || trimmed.ends_with('[') {
+                    " ".repeat(self.declaration.tab_size as usize)
+                } else {
+                    String::new()
+                };
+                self.insert_text(&format!("\n{indent}{extra}"), now);
                 true
             }
             "Tab" => {
@@ -1412,6 +1420,34 @@ mod tests {
             gutter_width: 56.0,
             row_height: 22.0,
         }
+    }
+
+    #[test]
+    fn enter_after_opening_bracket_extra_indent() {
+        register_providers();
+        let mut comp = EditorComponent::new(ts_declaration(), "fn foo() {");
+        comp.handle_input(&named_key("source-view", "End", false), 0.0);
+        comp.handle_input(&named_key("source-view", "Enter", false), 0.0);
+        assert_eq!(
+            comp.core.buffer().text(),
+            "fn foo() {\n    ",
+            "Enter after {{ should add one extra indent level, got {:?}",
+            comp.core.buffer().text()
+        );
+    }
+
+    #[test]
+    fn enter_plain_line_keeps_same_indent() {
+        register_providers();
+        let mut comp = EditorComponent::new(ts_declaration(), "    let x = 1;");
+        comp.handle_input(&named_key("source-view", "End", false), 0.0);
+        comp.handle_input(&named_key("source-view", "Enter", false), 0.0);
+        assert_eq!(
+            comp.core.buffer().text(),
+            "    let x = 1;\n    ",
+            "Enter on a plain line should preserve indent, got {:?}",
+            comp.core.buffer().text()
+        );
     }
 
     #[test]
