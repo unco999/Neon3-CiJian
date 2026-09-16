@@ -5,8 +5,6 @@
 //! and, at the runtime layer, an LSP server for completions/diagnostics.
 //! This crate stays free of any Neon3 runtime dependency.
 
-pub mod tree_sitter;
-
 use crate::buffer::TextBuffer;
 use crate::highlight::{LineTokens, TokenClass};
 
@@ -74,23 +72,14 @@ impl Language {
         self.kind.name()
     }
 
-    /// Tree-sitter grammar for this language, when one is compiled in.
-    pub fn tree_sitter_language(&self) -> Option<::tree_sitter::Language> {
-        match self.kind {
-            LanguageKind::NuiFlow => None,
-            LanguageKind::Typescript => Some(
-                ::tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-            ),
-            LanguageKind::Rust => Some(::tree_sitter_rust::LANGUAGE.into()),
-            LanguageKind::Cpp => Some(::tree_sitter_cpp::LANGUAGE.into()),
-        }
-    }
-
     /// Tokenize the whole document into per-line token vectors.
     ///
     /// NUI Flow reuses the built-in table-driven tokenizer (see
-    /// [`crate::highlight`]); tree-sitter languages parse the document once
-    /// and map named CST nodes onto the kernel's [`TokenClass`] set.
+    /// [`crate::highlight`]). Other languages ask the process-wide
+    /// [`crate::registry::default_registry`] for their registered
+    /// [`crate::provider::SyntaxProvider`]; without a registered provider
+    /// the whole line degrades to a single identifier span so the document
+    /// stays editable and renderable.
     pub fn tokenize(&self, buffer: &TextBuffer) -> Vec<LineTokens> {
         match self.kind {
             LanguageKind::NuiFlow => {
@@ -105,8 +94,8 @@ impl Language {
                 }
                 tokens
             }
-            _ => match self.tree_sitter_language() {
-                Some(grammar) => tree_sitter::tokenize(buffer, &grammar),
+            _ => match crate::registry::default_registry().syntax(self.kind) {
+                Some(provider) => provider.tokenize(buffer),
                 None => {
                     let mut tokens = Vec::with_capacity(buffer.line_count() as usize);
                     for line in buffer.lines() {
@@ -171,28 +160,5 @@ mod tests {
             .spans
             .iter()
             .any(|s| s.class == TokenClass::NodeKind)); // text
-    }
-
-    #[cfg(feature = "tree-sitter")]
-    #[test]
-    fn tree_sitter_tokenize_rust() {
-        let buffer = TextBuffer::from_str(
-            "// hi\nfn main() { let x = 1; println!(\"ok\"); }\n",
-        );
-        let tokens = Language {
-            kind: LanguageKind::Rust,
-        }
-        .tokenize(&buffer);
-        assert_eq!(tokens.len(), 3); // trailing newline -> final empty line
-        assert!(tokens[0].spans.iter().any(|s| s.class == TokenClass::Comment));
-        assert!(tokens[1].spans.iter().any(|s| s.class == TokenClass::Keyword));
-        assert!(tokens[1]
-            .spans
-            .iter()
-            .any(|s| s.class == TokenClass::StringLiteral));
-        assert!(tokens[1]
-            .spans
-            .iter()
-            .any(|s| s.class == TokenClass::NumericLiteral));
     }
 }

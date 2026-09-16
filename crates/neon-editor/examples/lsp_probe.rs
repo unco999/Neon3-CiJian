@@ -12,6 +12,7 @@ fn main() {
     let mut lsp = match LspClient::connect(LspEndpoint::Stdio {
         command: "rust-analyzer".into(),
         args: Vec::new(),
+        env: std::collections::HashMap::new(),
     }) {
         Ok(lsp) => lsp,
         Err(error) => {

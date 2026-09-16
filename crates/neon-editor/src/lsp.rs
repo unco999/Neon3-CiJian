@@ -77,7 +77,12 @@ pub struct LspSymbol {
 pub enum LspEndpoint {
     /// Spawn a language server process and speak JSON-RPC over its stdin /
     /// stdout.
-    Stdio { command: String, args: Vec<String> },
+    Stdio {
+        command: String,
+        args: Vec<String>,
+        /// Extra environment variables for the server process.
+        env: std::collections::HashMap<String, String>,
+    },
     /// Connect to an already-running server over TCP (JSON-RPC framing).
     Tcp { address: String },
 }
@@ -136,9 +141,10 @@ impl LspClient {
             Box<dyn Read + Send>,
             Option<Child>,
         ) = match endpoint {
-            LspEndpoint::Stdio { command, args } => {
+            LspEndpoint::Stdio { command, args, env } => {
                 let mut child = Command::new(&command)
                     .args(&args)
+                    .envs(env)
                     .stdin(Stdio::piped())
                     .stdout(Stdio::piped())
                     .stderr(Stdio::null())

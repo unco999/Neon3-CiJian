@@ -1,0 +1,15 @@
+[package]
+name = "neon-languages"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Built-in syntax providers for the neon-editor kernel: tree-sitter grammars for TypeScript / Rust / C++ registered at runtime. Kept out of the kernel so language support stays pluggable."
+repository = "https://github.com/unco999/Neon3-CiJian"
+keywords = ["editor", "tree-sitter", "syntax", "provider"]
+
+[dependencies]
+neon-editor = { path = "../neon-editor" }
+tree-sitter = "0.25"
+tree-sitter-rust = "0.24"
+tree-sitter-typescript = "0.23"
+tree-sitter-cpp = "0.23"

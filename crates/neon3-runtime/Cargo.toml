@@ -16,4 +16,6 @@ neon-ui-runtime = { path = "../neon-ui-runtime" }
 neon-ui-schema = { path = "../neon-ui-schema" }
 neon-wgpu-runtime = { path = "../neon-wgpu-runtime" }
 neon-editor-runtime = { path = "../neon-editor-runtime" }
+neon-editor = { path = "../neon-editor" }
+neon-languages = { path = "../neon-languages" }
 neon-ipc = { path = "../neon-ipc" }

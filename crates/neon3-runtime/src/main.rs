@@ -51,6 +51,16 @@ fn main() {
         "[neon3-runtime] serve windowed={windowed} eventd={eventd_endpoint} ui={ui_endpoint} wgpu={wgpu_endpoint} editor={editor_endpoint}"
     );
 
+    // Register the built-in tree-sitter syntax providers and default LSP
+    // launch configs into the process-wide language registry. The editor
+    // kernel, the editor-runtime service and the NUI code_editor bridge all
+    // resolve language capabilities through this registry; nothing
+    // language-specific is compiled into the kernel itself.
+    {
+        let mut registry = neon_editor::default_registry();
+        neon_languages::register_builtin_languages(&mut registry);
+    }
+
     let eventd_task = {
         let endpoint = eventd_endpoint;
         std::thread::spawn(move || {

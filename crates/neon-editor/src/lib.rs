@@ -16,6 +16,8 @@ pub mod grammar;
 pub mod highlight;
 pub mod languages;
 pub mod lsp;
+pub mod provider;
+pub mod registry;
 pub mod symbols;
 
 pub use buffer::{Position, TextBuffer};
@@ -25,6 +27,10 @@ pub use grammar::FlowGrammar;
 use grammar::nui_flow_default;
 pub use highlight::{HighlightCache, LineTokens, Span, TokenClass};
 pub use languages::{Language, LanguageKind};
+pub use provider::{LspServerConfig, SyntaxProvider};
+pub use registry::{
+    default_registry, register_default_lsp, register_default_syntax, LanguageRegistry,
+};
 pub use lsp::{
     LspClient, LspDiagnostic, LspEndpoint, LspError, LspLocation, LspPosition, LspRange, LspSymbol,
 };

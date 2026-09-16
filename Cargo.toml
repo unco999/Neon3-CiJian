@@ -9,6 +9,7 @@ members = [
     "crates/neon-ui-schema",
     "crates/neon-editor-runtime",
     "crates/neon-editor",
+    "crates/neon-languages",
     "crates/neon-wgpu-runtime",
     "crates/neon-wgpu-ai",
     "crates/neon-gpu-ecs",
@@ -24,7 +25,7 @@ resolver = "2"
 [workspace.package]
 edition = "2024"
 license = "MIT OR Apache-2.0"
-version = "0.2.12"
+version = "0.2.13"
 repository = "https://github.com/unco999/Neon3-CiJian"
 homepage = "https://github.com/unco999/Neon3-CiJian"
 rust-version = "1.85"

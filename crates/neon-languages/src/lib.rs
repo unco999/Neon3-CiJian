@@ -1,11 +1,14 @@
 //! tree-sitter bridge: parse a document with a compiled grammar and convert
-//! the concrete syntax tree into the kernel's [`LineTokens`] representation,
-//! so the existing highlight/rendering pipeline is reused unchanged.
+//! the concrete syntax tree into the kernel's [`neon_editor::LineTokens`]
+//! representation, so the existing highlight/rendering pipeline is reused
+//! unchanged.
 
+use std::sync::Arc;
+
+use neon_editor::buffer::TextBuffer;
+use neon_editor::highlight::{LineTokens, Span, TokenClass};
+use neon_editor::{LanguageKind, LanguageRegistry, LspServerConfig, SyntaxProvider};
 use tree_sitter::{Node, Parser, Point};
-
-use crate::buffer::TextBuffer;
-use crate::highlight::{LineTokens, Span, TokenClass};
 
 /// Byte offset of the start of every line in the document.
 struct LineIndex {
@@ -163,6 +166,85 @@ fn push_span(per_line: &mut [Vec<Span>], line: usize, start: usize, len: usize, 
     }
 }
 
+// ---------------------------------------------------------------------------
+// Syntax providers
+// ---------------------------------------------------------------------------
+
+pub struct RustSyntax;
+
+impl SyntaxProvider for RustSyntax {
+    fn name(&self) -> &'static str {
+        "tree-sitter/rust"
+    }
+
+    fn tokenize(&self, buffer: &TextBuffer) -> Vec<LineTokens> {
+        tokenize(buffer, &tree_sitter_rust::LANGUAGE.into())
+    }
+}
+
+pub struct TypescriptSyntax;
+
+impl SyntaxProvider for TypescriptSyntax {
+    fn name(&self) -> &'static str {
+        "tree-sitter/typescript"
+    }
+
+    fn tokenize(&self, buffer: &TextBuffer) -> Vec<LineTokens> {
+        tokenize(buffer, &tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
+    }
+}
+
+pub struct CppSyntax;
+
+impl SyntaxProvider for CppSyntax {
+    fn name(&self) -> &'static str {
+        "tree-sitter/cpp"
+    }
+
+    fn tokenize(&self, buffer: &TextBuffer) -> Vec<LineTokens> {
+        tokenize(buffer, &tree_sitter_cpp::LANGUAGE.into())
+    }
+}
+
+/// Register the built-in tree-sitter syntax providers on `registry`.
+pub fn register_builtins(registry: &mut LanguageRegistry) {
+    registry.register_syntax(LanguageKind::Rust, Arc::new(RustSyntax));
+    registry.register_syntax(LanguageKind::Typescript, Arc::new(TypescriptSyntax));
+    registry.register_syntax(LanguageKind::Cpp, Arc::new(CppSyntax));
+}
+
+/// Standard language-server launch configs for the built-in languages.
+///
+/// Hosts can override these per language through
+/// `neon_editor::register_default_lsp` or the `editor.lsp.configure` RPC.
+pub fn default_lsp_configs() -> Vec<(LanguageKind, LspServerConfig)> {
+    vec![
+        (
+            LanguageKind::Rust,
+            LspServerConfig::stdio("rust-analyzer", Vec::new()),
+        ),
+        (
+            LanguageKind::Typescript,
+            LspServerConfig::stdio(
+                "typescript-language-server",
+                vec!["--stdio".into()],
+            ),
+        ),
+        (
+            LanguageKind::Cpp,
+            LspServerConfig::stdio("clangd", Vec::new()),
+        ),
+    ]
+}
+
+/// Register both syntax providers and default LSP configs on `registry`.
+pub fn register_builtin_languages(registry: &mut LanguageRegistry) {
+    register_builtins(registry);
+    for (kind, config) in default_lsp_configs() {
+        registry.register_lsp(kind, config);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -172,7 +254,7 @@ mod tests {
         let buffer = TextBuffer::from_str(
             "// header\nfn main() {\n  let x = 42;\n  println!(\"ok\");\n}\n",
         );
-        let tokens = tokenize(&buffer, &tree_sitter_rust::LANGUAGE.into());
+        let tokens = RustSyntax.tokenize(&buffer);
         assert_eq!(tokens.len(), 6); // trailing newline -> final empty line
         assert!(tokens[0].spans.iter().any(|s| s.class == TokenClass::Comment));
         let line1 = &tokens[1].spans;
@@ -190,10 +272,7 @@ mod tests {
         let buffer = TextBuffer::from_str(
             "interface Foo { bar: number }\nconst x: Foo = { bar: 1 };\n",
         );
-        let tokens = tokenize(
-            &buffer,
-            &tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-        );
+        let tokens = TypescriptSyntax.tokenize(&buffer);
         assert_eq!(tokens.len(), 3); // trailing newline -> final empty line
         assert!(tokens[0].spans.iter().any(|s| s.class == TokenClass::Keyword));
         assert!(tokens[0].spans.iter().any(|s| s.class == TokenClass::Ident));
@@ -205,9 +284,26 @@ mod tests {
         let buffer = TextBuffer::from_str(
             "#include <vector>\nint main() { return 0; }\n",
         );
-        let tokens = tokenize(&buffer, &tree_sitter_cpp::LANGUAGE.into());
+        let tokens = CppSyntax.tokenize(&buffer);
         assert_eq!(tokens.len(), 3); // trailing newline -> final empty line
         assert!(tokens[1].spans.iter().any(|s| s.class == TokenClass::Keyword));
         assert!(tokens[1].spans.iter().any(|s| s.class == TokenClass::NumericLiteral));
+    }
+
+    #[test]
+    fn builtins_registered_by_kind() {
+        let mut registry = LanguageRegistry::new();
+        register_builtin_languages(&mut registry);
+        assert!(registry.syntax(LanguageKind::Typescript).is_some());
+        assert!(registry.syntax(LanguageKind::Rust).is_some());
+        assert!(registry.syntax(LanguageKind::Cpp).is_some());
+        assert!(registry.syntax(LanguageKind::NuiFlow).is_none()); // built into kernel
+        assert!(registry.lsp(LanguageKind::Typescript).is_some());
+        assert_eq!(
+            registry
+                .lsp(LanguageKind::Rust)
+                .map(|c| c.command.as_str()),
+            Some("rust-analyzer")
+        );
     }
 }

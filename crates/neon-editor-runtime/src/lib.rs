@@ -147,6 +147,48 @@ pub struct EditorLspRef {
     pub document_revision: Revision,
 }
 
+/// Payload of `editor.lsp.configure`: (re)register the language-server
+/// launch config for one language. Fields merge over the current config;
+/// omitted fields keep their previous value.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EditorLspConfigure {
+    pub language: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub args: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env: Option<HashMap<String, String>>,
+}
+
+/// Language reference for `editor.language.capabilities`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EditorLanguageRef {
+    pub language: String,
+}
+
+/// Result of `editor.language.capabilities`: what the process can do for
+/// one language today.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct EditorLanguageCapabilitiesResult {
+    pub language: String,
+    /// NUI Flow always tokenizes with the built-in table; other languages
+    /// report whether a syntax provider is registered.
+    pub syntax_highlight: bool,
+    /// The active LSP server launch config, when one is available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lsp_server: Option<EditorLspConfigure>,
+}
+
+/// Result of `editor.lsp.configure`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EditorLspConfigureResult {
+    pub language: String,
+    pub state: String,
+}
+
 /// Result of `editor.lsp.diagnostics`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct EditorLspDiagnosticsResult {
@@ -361,6 +403,10 @@ impl EditorRuntime {
             "editor.lsp.references" => (self.lsp_references(request_id, request.params), true),
             "editor.lsp.symbols" => (self.lsp_symbols(request_id, request.params), true),
             "editor.lsp.signature_help" => (self.lsp_signature_help(request_id, request.params), true),
+            "editor.lsp.configure" => (self.lsp_configure(request_id, request.params), true),
+            "editor.language.capabilities" => {
+                (self.language_capabilities(request_id, request.params), true)
+            }
             "editor.document.close" => (self.close(request_id, request.params), true),
             "service.shutdown" => (
                 self.accept(request_id, json!({"state": "accepted"}), None),
@@ -861,6 +907,85 @@ impl EditorRuntime {
         self.lsp_position_request(request_id, params, LspKind::SignatureHelp)
     }
 
+    /// `editor.lsp.configure`: merge a language-server launch config for one
+    /// language into the process-wide default registry. Omitted fields keep
+    /// the current config (registered value, then the built-in defaults).
+    fn lsp_configure(&mut self, request_id: RequestId, params: Value) -> RpcResponse {
+        let configure: EditorLspConfigure = match serde_json::from_value(params) {
+            Ok(value) => value,
+            Err(error) => {
+                return self.reject(request_id, "editor_lsp_invalid", &error.to_string(), None);
+            }
+        };
+        let Some(kind) = language_from_name(&configure.language) else {
+            return self.reject(
+                request_id,
+                "editor_language_unsupported",
+                "supported languages: nui_flow, typescript, rust, cpp",
+                None,
+            );
+        };
+        let mut registry = neon_editor::default_registry();
+        let mut config = registry
+            .lsp(kind)
+            .cloned()
+            .unwrap_or_else(|| neon_editor::LspServerConfig::stdio("", Vec::new()));
+        if let Some(command) = configure.command {
+            config.command = command;
+        }
+        if let Some(args) = configure.args {
+            config.args = args;
+        }
+        if let Some(env) = configure.env {
+            config.env = env;
+        }
+        registry.register_lsp(kind, config);
+        self.accept(
+            request_id,
+            json!({
+                "language": kind.name(),
+                "state": "configured",
+            }),
+            None,
+        )
+    }
+
+    /// `editor.language.capabilities`: report what the process can do for
+    /// one language right now (syntax highlighting + active LSP config).
+    fn language_capabilities(&mut self, request_id: RequestId, params: Value) -> RpcResponse {
+        let reference: EditorLanguageRef = match serde_json::from_value(params) {
+            Ok(value) => value,
+            Err(error) => {
+                return self.reject(request_id, "editor_lsp_invalid", &error.to_string(), None);
+            }
+        };
+        let Some(kind) = language_from_name(&reference.language) else {
+            return self.reject(
+                request_id,
+                "editor_language_unsupported",
+                "supported languages: nui_flow, typescript, rust, cpp",
+                None,
+            );
+        };
+        let registry = neon_editor::default_registry();
+        let syntax_highlight = kind == LanguageKind::NuiFlow || registry.syntax(kind).is_some();
+        let lsp_server = registry.lsp(kind).map(|config| EditorLspConfigure {
+            language: kind.name().to_string(),
+            command: Some(config.command.clone()),
+            args: Some(config.args.clone()),
+            env: Some(config.env.clone()),
+        });
+        self.accept(
+            request_id,
+            json!(EditorLanguageCapabilitiesResult {
+                language: kind.name().to_string(),
+                syntax_highlight,
+                lsp_server,
+            }),
+            None,
+        )
+    }
+
     fn lsp_symbols(&mut self, request_id: RequestId, params: Value) -> RpcResponse {
         let reference: EditorLspRef = match serde_json::from_value(params) {
             Ok(value) => value,
@@ -1281,12 +1406,17 @@ fn lsp_uri_for(document_id: &str, kind: LanguageKind) -> String {
     format!("file:///neon3/{document_id}.{extension}")
 }
 
-/// Language-server command for a language. Each language can be overridden
-/// with `NEON3_LSP_RUST` / `NEON3_LSP_TYPESCRIPT` / `NEON3_LSP_CPP`; the
-/// defaults are the standard server binaries (`rust-analyzer`,
-/// `typescript-language-server --stdio`, `clangd`).
-fn lsp_command_for(kind: LanguageKind) -> Option<(String, Vec<String>)> {
-    let (env_key, command, args) = match kind {
+/// Language-server launch config for a language, resolved in priority order:
+///
+/// 1. a config registered on the process-wide default registry (via
+///    `editor.lsp.configure` or a host registering `neon_languages`);
+/// 2. the classic `NEON3_LSP_*` environment overrides;
+/// 3. the built-in defaults (`rust-analyzer`, `typescript-language-server
+///    --stdio`, `clangd`).
+///
+/// Returns `(command, args, env)`.
+fn lsp_command_for(kind: LanguageKind) -> Option<(String, Vec<String>, HashMap<String, String>)> {
+    let (env_key, fallback_command, fallback_args) = match kind {
         LanguageKind::NuiFlow => return None,
         LanguageKind::Rust => ("NEON3_LSP_RUST", "rust-analyzer", Vec::new()),
         LanguageKind::Typescript => (
@@ -1296,12 +1426,17 @@ fn lsp_command_for(kind: LanguageKind) -> Option<(String, Vec<String>)> {
         ),
         LanguageKind::Cpp => ("NEON3_LSP_CPP", "clangd", Vec::new()),
     };
+    let registered = neon_editor::default_registry().lsp(kind).cloned();
+    let (mut command, args, env) = match registered {
+        Some(config) => (config.command, config.args, config.env),
+        None => (fallback_command.into(), fallback_args, HashMap::new()),
+    };
     if let Ok(override_command) = std::env::var(env_key) {
         if !override_command.trim().is_empty() {
-            return Some((override_command, args));
+            command = override_command;
         }
     }
-    Some((command.into(), args))
+    Some((command, args, env))
 }
 
 /// Spawn the language server for a non-Flow document and open it. Returns
@@ -1313,12 +1448,13 @@ fn spawn_lsp(
     uri: &str,
     source: &str,
 ) -> (Option<LspClient>, Option<String>) {
-    let Some((command, args)) = lsp_command_for(kind) else {
+    let Some((command, args, env)) = lsp_command_for(kind) else {
         return (None, None);
     };
     let endpoint = LspEndpoint::Stdio {
         command: command.clone(),
         args,
+        env,
     };
     match LspClient::connect(endpoint) {
         Ok(mut lsp) => {
