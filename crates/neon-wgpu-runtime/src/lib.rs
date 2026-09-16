@@ -51,6 +51,26 @@ use neon_world_bridge::{
     WorldInformationSnapshot, WorldUiAnchor, WorldUiAnchorBatch,
 };
 use serde_json::{Value, json};
+
+/// Host bridge wiring for the code editor component. The host creates the
+/// shared ui-runtime `EditorBridge`, then hands these handles to the
+/// windowed runtime: the input sink routes renderer input into the editor
+/// component, the presentations slot is republished every frame, and the
+/// fragment observer keeps the component registry in sync with submitted
+/// fragments. See `neon3-runtime` main.rs.
+pub struct EditorBridgeHandle {
+    pub input_sink: Option<
+        Box<
+            dyn FnMut(neon_ui_schema::UiEditorInputEvent, f32)
+                -> Vec<ui_renderer::editor_renderer::EditorCommit>
+                + Send,
+        >,
+    >,
+    pub external_presentations:
+        Option<Arc<Mutex<Vec<neon_ui_schema::UiCodeEditorPresentation>>>>,
+    pub fragment_observer:
+        Option<Box<dyn FnMut(&HashMap<UiFragmentId, UiFragment>) + Send>>,
+}
 use winit::{
     application::ApplicationHandler,
     dpi::{LogicalPosition, LogicalSize, PhysicalSize},
@@ -241,6 +261,8 @@ use ui_renderer::{
     LocalPresentationCommit, PendingLocalPresentationKey, UiHitBinding, set_global_view_extras,
 };
 pub use ui_renderer::{UiDrawMode, UiWgpuRenderer};
+/// Re-exported for the host editor bridge (`EditorBridgeHandle.input_sink`).
+pub use ui_renderer::editor_renderer::EditorCommit;
 use world_ui_pipeline::{WorldUiCamera, WorldUiCameraState, WorldUiPipeline};
 
 pub const SERVICE_NAME: &str = "wgpu-runtime";
@@ -1586,6 +1608,9 @@ pub struct WindowedRuntime {
     lazy_surface: bool,
     /// Built-in component interaction state (checkbox toggle, slider value, etc.).
     component_states: ComponentStateStore,
+    /// Host-injected editor bridge handles (input sink, presentations slot,
+    /// fragment observer). `None` in standalone renderer mode.
+    editor_bridge: Option<EditorBridgeHandle>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1979,11 +2004,12 @@ impl WindowedRuntime {
             world_ui_lab_camera: Arc::new(Mutex::new(WorldUiLabCameraController::default())),
             lazy_surface: false,
             component_states: ComponentStateStore::new(),
+            editor_bridge: None,
         }
     }
 
     pub fn run(epoch: u64) -> Result<(), String> {
-        Self::run_with_server(epoch, None, None, None, None, true, false)
+        Self::run_with_server(epoch, None, None, None, None, true, false, None)
     }
 
     /// Generic Android host entry. It owns the Android surface and renderer
@@ -2112,6 +2138,30 @@ impl WindowedRuntime {
             eventd_endpoint,
             false,
             enable_world_ui_lab_camera,
+            None,
+        )
+    }
+
+    /// Like `run_server_with_eventd`, but wires the host's editor bridge
+    /// (input sink, presentations slot, fragment observer) into the renderer.
+    pub fn run_server_with_eventd_bridged(
+        epoch: u64,
+        endpoint: SocketAddr,
+        ui_endpoint: Option<SocketAddr>,
+        projectd_endpoint: Option<SocketAddr>,
+        eventd_endpoint: Option<SocketAddr>,
+        enable_world_ui_lab_camera: bool,
+        editor_bridge: Option<EditorBridgeHandle>,
+    ) -> Result<(), String> {
+        Self::run_with_server(
+            epoch,
+            Some(endpoint),
+            ui_endpoint,
+            projectd_endpoint,
+            eventd_endpoint,
+            false,
+            enable_world_ui_lab_camera,
+            editor_bridge,
         )
     }
 
@@ -2123,6 +2173,7 @@ impl WindowedRuntime {
         eventd_endpoint: Option<SocketAddr>,
         demo: bool,
         enable_world_ui_lab_camera: bool,
+        editor_bridge: Option<EditorBridgeHandle>,
     ) -> Result<(), String> {
         // Windows.UI.Composition on the desktop requires an STA thread with a
         // DispatcherQueue bound to the current thread BEFORE the winit event
@@ -2145,6 +2196,7 @@ impl WindowedRuntime {
             .lock()
             .expect("camera controller lock")
             .enabled = enable_world_ui_lab_camera;
+        runtime.editor_bridge = editor_bridge;
         if demo {
             runtime.fragments = runtime.demo_fragments();
             runtime.applied_composition_revision = Revision(1);
@@ -2225,7 +2277,7 @@ impl WindowedRuntime {
                 event_loop.owned_display_handle(),
             ))
         });
-        let gpu = WindowGpu::new(
+        let mut gpu = WindowGpu::new(
             &window,
             instance,
             self.world_ui_lab_camera.clone(),
@@ -2250,6 +2302,17 @@ impl WindowedRuntime {
             camera.window_focused = window.has_focus();
         }
         self.window = Some(window);
+        // Wire the host editor bridge into the unified renderer before the
+        // first frame: input events route into the ui-runtime editor
+        // component, and the presentations slot is republished each frame.
+        if let Some(bridge) = self.editor_bridge.as_mut() {
+            if let Some(sink) = bridge.input_sink.take() {
+                gpu.ui.set_editor_input_sink(sink);
+            }
+            if let Some(slot) = bridge.external_presentations.take() {
+                gpu.ui.set_editor_external_presentations(slot);
+            }
+        }
         self.gpu = Some(gpu);
         if let Some(endpoint) = self.projectd_endpoint {
             self.preload_fixture_image(endpoint)?;
@@ -3095,6 +3158,13 @@ impl WindowedRuntime {
         self.applied_composition_revision = composition_revision;
         self.fragments = fragments;
         self.redraw_pending = true;
+        if let Some(observer) = self
+            .editor_bridge
+            .as_mut()
+            .and_then(|bridge| bridge.fragment_observer.as_mut())
+        {
+            observer(&self.fragments);
+        }
         if let Ok(mut traces) = self.interaction_traces.lock() {
             traces.composition_applied(composition_revision);
         }
@@ -11235,6 +11305,11 @@ pub struct WgpuRuntime {
     /// Custom shader package registry (`wgpu.shader.register`). Control-plane
     /// only: entries are validated and WGSL-parsed before adoption.
     shader_registry: shader_registry::ShaderRegistry,
+    /// Host-injected fragment observer for the code-editor bridge
+    /// (keeps the ui-runtime editor component registry in sync on headless /
+    /// Android single-endpoint sessions).
+    editor_fragment_observer:
+        Option<Box<dyn FnMut(&HashMap<UiFragmentId, UiFragment>) + Send>>,
 }
 
 impl WgpuRuntime {
@@ -11268,7 +11343,16 @@ impl WgpuRuntime {
             ui_program_revision: None,
             ui_surface_id: None,
             shader_registry: shader_registry::ShaderRegistry::new(),
+            editor_fragment_observer: None,
         }
+    }
+
+    /// Attaches the host's code-editor fragment observer (headless sessions).
+    pub fn set_editor_fragment_observer(
+        &mut self,
+        observer: Option<Box<dyn FnMut(&HashMap<UiFragmentId, UiFragment>) + Send>>,
+    ) {
+        self.editor_fragment_observer = observer;
     }
 
     fn window_control(
@@ -12418,6 +12502,9 @@ impl WgpuRuntime {
         }
         self.fragments
             .insert(fragment.fragment_id.clone(), fragment);
+        if let Some(observer) = self.editor_fragment_observer.as_mut() {
+            observer(&self.fragments);
+        }
         self.graph_revision = Revision(self.graph_revision.0 + 1);
         self.hit_target_generation += 1;
         self.accept(request_id, diagnostics_value(self.diagnostics()))

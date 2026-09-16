@@ -2072,20 +2072,32 @@ pub struct UiWgpuRenderer {
     available_cameras: HashSet<(neon_world_bridge::CameraId, neon_world_bridge::CameraKind)>,
     last_stage_timings: UiDrawStageTimings,
     layout_counters: UiLayoutCounters,
-    /// Renderer-local code-editor mirrors (one per CodeEditorDeclaration).
-    /// The editor-core instances own buffer/highlight/completion/undo state;
-    /// the renderer only presents and forwards commit events to the host.
+    /// Renderer-local code-editor presentation mirrors (one per
+    /// CodeEditorDeclaration + CodeEditorPresentation pair). No editing state
+    /// lives here: the ui-runtime editor component owns the core and the
+    /// presentation; the renderer draws the snapshot and forwards input.
     editors: std::collections::HashMap<String, editor_renderer::EditorRuntimeState>,
-    /// Node path of the code editor that currently owns keyboard focus.
-    focused_editor: Option<String>,
     /// Whether a pointer selection drag is active inside the focused editor.
     editor_selection_drag: bool,
-    /// Renderer-local clipboard for editor cut/copy/paste (system clipboard
-    /// integration is a later slice).
-    editor_clipboard: String,
-    /// Queued editor commits (one per blur/save) forwarded to ui-runtime
-    /// through the UiHostInbound RPC after the draw loop.
+    /// Queued editor commits (one per blur/save) returned by the ui-runtime
+    /// through the input sink; drained by `take_editor_commits`.
     editor_pending_commits: Vec<editor_renderer::EditorCommit>,
+    /// Sink that forwards `UiEditorInputEvent`s to the ui-runtime editor
+    /// component (injected by the host; `None` in standalone renderer mode,
+    /// where editor interaction is disabled).
+    editor_input_sink: Option<
+        Box<
+            dyn FnMut(neon_ui_schema::UiEditorInputEvent, f32)
+                -> Vec<editor_renderer::EditorCommit>
+                + Send,
+        >,
+    >,
+    /// Shared slot where the host's ui-runtime editor component publishes
+    /// fresh presentations (after handling input). The renderer merges these
+    /// into `reconcile_editors` ahead of the fragment's own effect.
+    editor_external_presentations: Option<
+        std::sync::Arc<std::sync::Mutex<Vec<neon_ui_schema::UiCodeEditorPresentation>>>,
+    >,
 }
 
 impl UiWgpuRenderer {
@@ -3285,10 +3297,10 @@ impl UiWgpuRenderer {
             last_stage_timings: UiDrawStageTimings::default(),
             layout_counters: UiLayoutCounters::default(),
             editors: HashMap::new(),
-            focused_editor: None,
             editor_selection_drag: false,
-            editor_clipboard: String::new(),
             editor_pending_commits: Vec::new(),
+            editor_input_sink: None,
+            editor_external_presentations: None,
         }
     }
 
@@ -6006,14 +6018,13 @@ impl UiWgpuRenderer {
     /// Runs on every refresh (before the plan-reuse early return) and inside
     /// `has_active_animation`, so a static fragment still falls back to the
     /// default text pass once `duration_ms` elapses.
-    /// Whether any editor needs a layout pass this frame: pending edits that
-    /// have not been drained into fx yet, or transient fx still inside their
-    /// playback window. The plan-reuse early return must not skip layout while
-    /// either is true, or edit events would pile up in editor-core forever.
+    /// Whether any editor needs a layout pass this frame: a fresh
+    /// presentation (layout_dirty), or transient fx still inside their
+    /// playback window. The plan-reuse early return must not skip layout
+    /// while either is true.
     fn has_editor_activity(&self) -> bool {
         self.editors.values().any(|state| {
-            state.pending_edits
-                || state.layout_dirty
+            state.layout_dirty
                 || state
                     .edit_fx
                     .iter()

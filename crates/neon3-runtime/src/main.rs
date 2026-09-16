@@ -71,18 +71,61 @@ fn main() {
         })
     };
 
+    // Shared editor bridge: the ui-runtime component registry + presentations
+    // slot. Injected into the renderer (input sink + external presentations)
+    // and into the fragment path (observer), so the editor core stays fully
+    // outside the wgpu renderer while every feature keeps working.
+    let editor_bridge =
+        std::sync::Arc::new(neon_ui_runtime::editor_component::EditorBridge::new());
+
     if windowed {
         let wgpu = wgpu_endpoint;
         let ui = ui_endpoint;
         let eventd = eventd_endpoint;
+        let editor_bridge = editor_bridge.clone();
         let _ = std::thread::spawn(move || {
-            if let Err(error) = neon_wgpu_runtime::WindowedRuntime::run_server_with_eventd(
+            let input_sink: Box<
+                dyn FnMut(
+                        neon_ui_schema::UiEditorInputEvent,
+                        f32,
+                    ) -> Vec<neon_wgpu_runtime::EditorCommit>
+                    + Send,
+            > = {
+                let bridge = editor_bridge.clone();
+                Box::new(move |event, now| {
+                    bridge
+                        .handle_input(&event, now)
+                        .into_iter()
+                        .map(|commit| neon_wgpu_runtime::EditorCommit {
+                            node_path: commit.node_path,
+                            event_action: commit.event_action,
+                            document: commit.document,
+                        })
+                        .collect()
+                })
+            };
+            let fragment_observer: Box<
+                dyn FnMut(&std::collections::HashMap<
+                    neon_ui_schema::UiFragmentId,
+                    neon_ui_schema::UiFragment,
+                >) + Send,
+            > = {
+                let bridge = editor_bridge.clone();
+                Box::new(move |fragments| bridge.sync_fragments(fragments))
+            };
+            let handle = neon_wgpu_runtime::EditorBridgeHandle {
+                input_sink: Some(input_sink),
+                external_presentations: Some(editor_bridge.presentations.clone()),
+                fragment_observer: Some(fragment_observer),
+            };
+            if let Err(error) = neon_wgpu_runtime::WindowedRuntime::run_server_with_eventd_bridged(
                 1,
                 wgpu,
                 Some(ui),
                 None,
                 Some(eventd),
                 false,
+                Some(handle),
             ) {
                 eprintln!("[neon3-runtime] windowed wgpu failed: {error}");
                 std::process::exit(1);
@@ -90,14 +133,19 @@ fn main() {
         });
     } else {
         // Headless WGPU server on its own endpoint (mirrors the standalone
-        // `--headless-server` mode).
+        // `--headless-server` mode). The editor fragment observer keeps the
+        // component registry in sync even without a window.
         let wgpu = wgpu_endpoint;
+        let editor_bridge = editor_bridge.clone();
         let _ = std::thread::spawn(move || {
             let server = neon_ipc::BlockingRpcServer::bind(wgpu)
                 .expect("headless server must bind loopback");
-            let runtime = Arc::new(Mutex::new(
-                neon_wgpu_runtime::WgpuRuntime::headless(1),
-            ));
+            let mut runtime = neon_wgpu_runtime::WgpuRuntime::headless(1);
+            let bridge = editor_bridge.clone();
+            runtime.set_editor_fragment_observer(Some(Box::new(move |fragments| {
+                bridge.sync_fragments(fragments)
+            })));
+            let runtime = std::sync::Arc::new(std::sync::Mutex::new(runtime));
             let handler = move |request| {
                 let mut guard = runtime.lock().expect("runtime lock");
                 guard.handle(request)

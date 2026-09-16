@@ -71,6 +71,7 @@ pub use nui_flow::{
     NuiFlowError, apply_nui_ir_patch, bind_nui_flow_resources, compile_nui_flow_program,
     format_nui_flow, lower_nui_flow, lower_nui_flow_effects, parse_nui_flow, parse_nui_flow_patch,
 };
+pub mod editor_component;
 pub use nui_state_machine::{
     NuiFlowDragController, NuiFlowDragUpdate, NuiFlowDropResult, NuiFlowStateMachineRuntime,
     NuiFlowStateTransitionResult,

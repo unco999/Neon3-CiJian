@@ -19,7 +19,6 @@ neon-ui-schema = { version = "0.2.0", path = "../neon-ui-schema" }
 neon-world-bridge = { version = "0.2.0", path = "../neon-world-bridge" }
 neon-ipc = { version = "0.2.0", path = "../neon-ipc" }
 neon-ui-runtime = { version = "0.2.0", path = "../neon-ui-runtime" }
-neon-editor = { version = "0.1", path = "D:/neon-editor" }
 bytemuck.workspace = true
 pollster.workspace = true
 png = "0.18"
@@ -40,4 +39,3 @@ winit = { workspace = true, features = ["android-native-activity"] }
 [dev-dependencies]
 neon-projectd = { version = "0.2.0", path = "../neon-projectd" }
 neon-ui-runtime = { version = "0.2.0", path = "../neon-ui-runtime" }
-neon-editor = { version = "0.1", path = "D:/neon-editor" }

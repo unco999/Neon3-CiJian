@@ -1106,6 +1106,7 @@ dependencies = [
 name = "neon-ui-runtime"
 version = "0.2.10"
 dependencies = [
+ "neon-editor",
  "neon-ipc",
  "neon-observability",
  "neon-protocol",
@@ -1143,7 +1144,6 @@ version = "0.2.10"
 dependencies = [
  "bytemuck",
  "fontdue",
- "neon-editor",
  "neon-ipc",
  "neon-observability",
  "neon-projectd",
@@ -1179,6 +1179,7 @@ dependencies = [
  "neon-eventd",
  "neon-ipc",
  "neon-ui-runtime",
+ "neon-ui-schema",
  "neon-wgpu-runtime",
 ]
 

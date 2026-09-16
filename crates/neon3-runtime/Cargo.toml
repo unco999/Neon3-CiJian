@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 neon-eventd = { path = "../neon-eventd" }
 neon-ui-runtime = { path = "../neon-ui-runtime" }
+neon-ui-schema = { path = "../neon-ui-schema" }
 neon-wgpu-runtime = { path = "../neon-wgpu-runtime" }
 neon-editor-runtime = { path = "../neon-editor-runtime" }
 neon-ipc = { path = "../neon-ipc" }

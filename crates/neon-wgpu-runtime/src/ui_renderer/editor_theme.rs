@@ -10,31 +10,45 @@
 //! materials (`token_shader`, `selection_shader`, whole-node `text_material`)
 //! are reserved for transient / emphasis effects.
 
-use neon_editor::TokenClass;
 use neon_ui_schema::UiCodeEditorDeclaration;
 
+/// Stable token-class names produced by the editor-core highlighter
+/// (mirrors `neon_editor::TokenClass::name`).
+const CLASS_KEYWORD: &str = "Keyword";
+const CLASS_NODE_KIND: &str = "NodeKind";
+const CLASS_NODE_KEY: &str = "NodeKey";
+const CLASS_ATTRIBUTE: &str = "Attribute";
+const CLASS_INPUT_REF: &str = "InputRef";
+const CLASS_COLOR_LITERAL: &str = "ColorLiteral";
+const CLASS_NUMERIC_LITERAL: &str = "NumericLiteral";
+const CLASS_STRING_LITERAL: &str = "StringLiteral";
+const CLASS_INTENT: &str = "Intent";
+const CLASS_COMMENT: &str = "Comment";
+const CLASS_IDENT: &str = "Ident";
+
 /// One token class's default One Dark color (RGB 0..1).
-fn one_dark_token(class: TokenClass) -> [f32; 3] {
+fn one_dark_token(class: &str) -> [f32; 3] {
     match class {
-        TokenClass::Keyword => [0.78, 0.55, 0.91],      // #C678DD
-        TokenClass::NodeKind => [0.31, 0.76, 1.0],      // #4FC1FF
-        TokenClass::NodeKey => [0.90, 0.75, 0.48],      // #E5C07B
-        TokenClass::Attribute => [0.34, 0.71, 0.76],    // #56B6C2
-        TokenClass::InputRef => [0.38, 0.69, 0.94],     // #61AFEF
-        TokenClass::ColorLiteral => [0.82, 0.60, 0.40], // #D19A66
-        TokenClass::NumericLiteral => [0.82, 0.60, 0.40],
-        TokenClass::StringLiteral => [0.60, 0.76, 0.47], // #98C379
-        TokenClass::Intent => [0.78, 0.47, 0.87],       // #C678DD
-        TokenClass::Comment => [0.36, 0.39, 0.44],      // #5C6370
-        TokenClass::Ident => [0.67, 0.70, 0.75],        // #ABB2BF
+        CLASS_KEYWORD => [0.78, 0.55, 0.91],        // #C678DD
+        CLASS_NODE_KIND => [0.31, 0.76, 1.0],       // #4FC1FF
+        CLASS_NODE_KEY => [0.90, 0.75, 0.48],       // #E5C07B
+        CLASS_ATTRIBUTE => [0.34, 0.71, 0.76],      // #56B6C2
+        CLASS_INPUT_REF => [0.38, 0.69, 0.94],      // #61AFEF
+        CLASS_COLOR_LITERAL => [0.82, 0.60, 0.40],  // #D19A66
+        CLASS_NUMERIC_LITERAL => [0.82, 0.60, 0.40],
+        CLASS_STRING_LITERAL => [0.60, 0.76, 0.47], // #98C379
+        CLASS_INTENT => [0.78, 0.47, 0.87],         // #C678DD
+        CLASS_COMMENT => [0.36, 0.39, 0.44],        // #5C6370
+        CLASS_IDENT => [0.67, 0.70, 0.75],          // #ABB2BF
+        _ => [0.67, 0.70, 0.75],
     }
 }
 
 /// Complete visual theme for a code editor.
 ///
-/// Fields are RGBA 0..1. `syntax` holds per-class overrides keyed by
-/// [`TokenClass::name`]; classes absent from the map fall back to the built-in
-/// One Dark defaults via [`EditorTheme::token`].
+/// Fields are RGBA 0..1. `syntax` holds per-class overrides keyed by the
+/// stable token-class name (`TokenClass::name`); classes absent from the map
+/// fall back to the built-in One Dark defaults via [`EditorTheme::token`].
 #[derive(Clone, Debug)]
 pub struct EditorTheme {
     /// Ordinary code text (whitespace / unclassified glyphs).
@@ -53,7 +67,7 @@ pub struct EditorTheme {
     pub popup_background: [f32; 4],
     /// Completion popup selected-item highlight.
     pub popup_selection: [f32; 4],
-    /// Per-token-class color overrides (`TokenClass::name()` -> RGBA).
+    /// Per-token-class color overrides (class name -> RGBA).
     pub syntax: std::collections::BTreeMap<String, [f32; 4]>,
 }
 
@@ -111,8 +125,8 @@ impl EditorTheme {
 
     /// Color for a token class at a given opacity (override wins over the
     /// built-in One Dark default).
-    pub fn token(&self, class: TokenClass, opacity: f32) -> [f32; 4] {
-        if let Some(c) = self.syntax.get(class.name()) {
+    pub fn token(&self, class: &str, opacity: f32) -> [f32; 4] {
+        if let Some(c) = self.syntax.get(class) {
             return [c[0], c[1], c[2], c[3] * opacity];
         }
         let rgb = one_dark_token(class);
