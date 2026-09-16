@@ -7,15 +7,70 @@
 //! and conversion of `textDocument/completion` results into the kernel's
 //! [`CompletionItem`].
 
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Mutex};
 
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::buffer::Position;
 use crate::completion::{CompletionItem, CompletionKind, CompletionSource};
+
+/// A 1-based or 0-based line/character position inside an LSP range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LspPosition {
+    pub line: u32,
+    pub character: u32,
+}
+
+/// A zero-based LSP range (start inclusive, end exclusive).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LspRange {
+    pub start: LspPosition,
+    pub end: LspPosition,
+}
+
+/// A structured diagnostic pushed by `textDocument/publishDiagnostics`.
+/// Severity follows LSP: 1 = Error, 2 = Warning, 3 = Information, 4 = Hint.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LspDiagnostic {
+    pub range: LspRange,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub severity: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    pub message: String,
+}
+
+/// A location inside a document (`textDocument/definition`, `references`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LspLocation {
+    pub uri: String,
+    pub range: LspRange,
+}
+
+/// One entry of `textDocument/documentSymbol` (flat or nested).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LspSymbol {
+    pub name: String,
+    /// LSP SymbolKind integer (1 = File, 2 = Module, 3 = Namespace, 4 = Package,
+    /// 5 = Class, 6 = Method, 7 = Property, 8 = Field, 9 = Constructor,
+    /// 10 = Enum, 11 = Interface, 12 = Function, 13 = Variable, 14 = Constant,
+    /// 15 = String, 16 = Number, 17 = Boolean, 18 = Array, ...).
+    pub kind: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    pub range: LspRange,
+    pub selection_range: LspRange,
+    #[serde(default)]
+    pub children: Vec<LspSymbol>,
+}
 
 /// Where an LSP server lives.
 #[derive(Clone, Debug)]
@@ -66,6 +121,9 @@ pub struct LspClient {
     /// stdout reader thread end (kept alive for the client's lifetime).
     _reader_thread: std::thread::JoinHandle<()>,
     pending: Arc<Mutex<Pending>>,
+    /// Latest `textDocument/publishDiagnostics` per URI, written by the reader
+    /// thread and read by [`LspClient::diagnostics`].
+    diagnostics: Arc<Mutex<HashMap<String, Vec<LspDiagnostic>>>>,
     server_process: Option<Child>,
     initialized: bool,
 }
@@ -85,6 +143,17 @@ impl LspClient {
                     .stdout(Stdio::piped())
                     .stderr(Stdio::null())
                     .spawn()?;
+                // Fast-fail: some toolchains ship a launcher shim (e.g. the
+                // rustup `rust-analyzer` proxy) that exits immediately when
+                // the actual component is missing. Detecting that here keeps
+                // document open fast instead of blocking on an initialize
+                // timeout.
+                std::thread::sleep(std::time::Duration::from_millis(800));
+                if let Ok(Some(status)) = child.try_wait() {
+                    return Err(LspError::Protocol(format!(
+                        "language server exited immediately ({status})"
+                    )));
+                }
                 let stdin = child.stdin.take().expect("lsp child stdin");
                 let stdout = child.stdout.take().expect("lsp child stdout");
                 (Box::new(stdin), Box::new(stdout), Some(child))
@@ -98,10 +167,12 @@ impl LspClient {
 
         let pending = Arc::new(Mutex::new(Pending {
             next_id: 0,
-            responders: std::collections::HashMap::new(),
+            responders: HashMap::new(),
         }));
+        let diagnostics = Arc::new(Mutex::new(HashMap::<String, Vec<LspDiagnostic>>::new()));
 
         let pending_reader = Arc::clone(&pending);
+        let diagnostics_reader = Arc::clone(&diagnostics);
         let reader_thread = std::thread::spawn(move || {
             let mut reader = BufReader::new(reader);
             loop {
@@ -109,7 +180,7 @@ impl LspClient {
                 let Ok(value) = serde_json::from_str::<Value>(&line) else {
                     continue;
                 };
-                // Route responses by id; notifications are dropped.
+                // Route responses by id; notifications are handled here.
                 if let Some(id) = value.get("id") {
                     let responder = {
                         let mut guard = pending_reader.lock().unwrap();
@@ -117,6 +188,10 @@ impl LspClient {
                     };
                     if let Some(tx) = responder {
                         let _ = tx.send(Ok(value));
+                    }
+                } else if let Some(method) = value.get("method").and_then(Value::as_str) {
+                    if method == "textDocument/publishDiagnostics" {
+                        collect_diagnostics(&diagnostics_reader, &value);
                     }
                 }
             }
@@ -126,17 +201,19 @@ impl LspClient {
             writer: Some(Mutex::new(writer)),
             _reader_thread: reader_thread,
             pending,
+            diagnostics,
             server_process,
             initialized: false,
         };
 
-        client.request(
+        client.request_with_timeout(
             "initialize",
             json!({
                 "processId": std::process::id(),
                 "rootUri": null,
                 "capabilities": {},
             }),
+            std::time::Duration::from_secs(5),
         )?;
         client.notify(
             "initialized",
@@ -146,8 +223,18 @@ impl LspClient {
         Ok(client)
     }
 
-    /// Send a request and block for its response.
+    /// Send a request and block for its response (15s cap).
     fn request(&mut self, method: &str, params: Value) -> Result<Value, LspError> {
+        self.request_with_timeout(method, params, std::time::Duration::from_secs(15))
+    }
+
+    /// Send a request and block up to `timeout` for its response.
+    fn request_with_timeout(
+        &mut self,
+        method: &str,
+        params: Value,
+        timeout: std::time::Duration,
+    ) -> Result<Value, LspError> {
         if !self.initialized && method != "initialize" {
             return Err(LspError::Protocol("client not initialized".into()));
         }
@@ -167,7 +254,7 @@ impl LspClient {
             "method": method,
             "params": params,
         }))?;
-        match rx.recv() {
+        match rx.recv_timeout(timeout) {
             Ok(Ok(value)) => {
                 if let Some(error) = value.get("error") {
                     return Err(LspError::Protocol(error.to_string()));
@@ -175,7 +262,10 @@ impl LspClient {
                 Ok(value.get("result").cloned().unwrap_or(Value::Null))
             }
             Ok(Err(error)) => Err(error),
-            Err(_) => Err(LspError::ServerShutdown),
+            Err(_) => {
+                let _ = self.pending.lock().map(|mut guard| guard.responders.remove(&id.to_string()));
+                Err(LspError::Protocol("request timed out".into()))
+            }
         }
     }
 
@@ -255,6 +345,94 @@ impl LspClient {
             }),
         )
     }
+
+    /// Notify document close (textDocument/didClose).
+    pub fn close_document(&mut self, uri: &str) -> Result<(), LspError> {
+        self.notify(
+            "textDocument/didClose",
+            json!({ "textDocument": { "uri": uri } }),
+        )
+    }
+
+    /// Latest published diagnostics for `uri` (empty when none arrived).
+    pub fn diagnostics(&self, uri: &str) -> Vec<LspDiagnostic> {
+        self.diagnostics
+            .lock()
+            .map(|guard| guard.get(uri).cloned().unwrap_or_default())
+            .unwrap_or_default()
+    }
+
+    /// `textDocument/hover` — raw LSP result (markdown/plaintext contents).
+    pub fn request_hover(
+        &mut self,
+        uri: &str,
+        position: Position,
+    ) -> Result<Value, LspError> {
+        self.request(
+            "textDocument/hover",
+            json!({
+                "textDocument": { "uri": uri },
+                "position": lsp_position(position),
+            }),
+        )
+    }
+
+    /// `textDocument/definition` — resolved jump targets.
+    pub fn request_definition(
+        &mut self,
+        uri: &str,
+        position: Position,
+    ) -> Result<Vec<LspLocation>, LspError> {
+        let result = self.request(
+            "textDocument/definition",
+            json!({
+                "textDocument": { "uri": uri },
+                "position": lsp_position(position),
+            }),
+        )?;
+        Ok(parse_locations(result))
+    }
+
+    /// `textDocument/references` — all references of the symbol at `position`.
+    pub fn request_references(
+        &mut self,
+        uri: &str,
+        position: Position,
+    ) -> Result<Vec<LspLocation>, LspError> {
+        let result = self.request(
+            "textDocument/references",
+            json!({
+                "textDocument": { "uri": uri },
+                "position": lsp_position(position),
+                "context": { "includeDeclaration": true },
+            }),
+        )?;
+        Ok(parse_locations(result))
+    }
+
+    /// `textDocument/documentSymbol` — outline of the document.
+    pub fn request_symbols(&mut self, uri: &str) -> Result<Vec<LspSymbol>, LspError> {
+        let result = self.request(
+            "textDocument/documentSymbol",
+            json!({ "textDocument": { "uri": uri } }),
+        )?;
+        Ok(parse_symbols(result))
+    }
+
+    /// `textDocument/signatureHelp` — raw LSP result.
+    pub fn request_signature_help(
+        &mut self,
+        uri: &str,
+        position: Position,
+    ) -> Result<Value, LspError> {
+        self.request(
+            "textDocument/signatureHelp",
+            json!({
+                "textDocument": { "uri": uri },
+                "position": lsp_position(position),
+            }),
+        )
+    }
 }
 
 impl Drop for LspClient {
@@ -267,6 +445,126 @@ impl Drop for LspClient {
             let _ = child.kill();
         }
     }
+}
+
+/// Converts a kernel position to an LSP (0-based) position object.
+fn lsp_position(position: Position) -> Value {
+    json!({ "line": position.line, "character": position.column })
+}
+
+/// Parses a `textDocument/publishDiagnostics` notification and stores it in
+/// the shared slot, keyed by URI.
+fn collect_diagnostics(slot: &Arc<Mutex<HashMap<String, Vec<LspDiagnostic>>>>, value: &Value) {
+    let uri = value
+        .get("params")
+        .and_then(|params| params.get("uri"))
+        .and_then(Value::as_str);
+    let Some(uri) = uri else { return };
+    let Some(diagnostics) = value
+        .get("params")
+        .and_then(|params| params.get("diagnostics"))
+        .and_then(Value::as_array)
+    else {
+        return;
+    };
+    let parsed: Vec<LspDiagnostic> = diagnostics
+        .iter()
+        .filter_map(|entry| serde_json::from_value(entry.clone()).ok())
+        .collect();
+    if let Ok(mut guard) = slot.lock() {
+        guard.insert(uri.to_string(), parsed);
+    }
+}
+
+/// Normalizes a single location (Location | LocationLink) into our shape.
+fn parse_locations(result: Value) -> Vec<LspLocation> {
+    let entries = match result {
+        Value::Null => return Vec::new(),
+        Value::Array(items) => items,
+        Value::Object(map) => match map.get("uri") {
+            // Single Location object.
+            Some(_) => vec![Value::Object(map)],
+            None => return Vec::new(),
+        },
+        _ => return Vec::new(),
+    };
+    entries
+        .into_iter()
+        .filter_map(|entry| {
+            let target = match entry.get("targetUri") {
+                Some(Value::String(uri)) => {
+                    // LocationLink form.
+                    let range = entry.get("targetRange")?;
+                    Some((uri.clone(), range.clone()))
+                }
+                _ => {
+                    let uri = entry.get("uri")?.as_str()?.to_string();
+                    let range = entry.get("range")?.clone();
+                    Some((uri, range))
+                }
+            };
+            let (uri, range) = target?;
+            let range: LspRange = serde_json::from_value(range).ok()?;
+            Some(LspLocation { uri, range })
+        })
+        .collect()
+}
+
+/// Parses `textDocument/documentSymbol` (either `SymbolInformation[]` or a
+/// nested `DocumentSymbol[]` hierarchy).
+fn parse_symbols(result: Value) -> Vec<LspSymbol> {
+    let Value::Array(entries) = result else {
+        return Vec::new();
+    };
+    entries
+        .into_iter()
+        .filter_map(|entry| {
+            // DocumentSymbol form: has name + range + selectionRange.
+            if entry.get("selectionRange").is_some() {
+                let name = entry.get("name")?.as_str()?.to_string();
+                let kind = entry.get("kind").and_then(Value::as_u64).unwrap_or(0) as u32;
+                let detail = entry.get("detail").and_then(Value::as_str).map(String::from);
+                let range: LspRange = serde_json::from_value(entry.get("range")?.clone()).ok()?;
+                let selection_range: LspRange =
+                    serde_json::from_value(entry.get("selectionRange")?.clone()).ok()?;
+                let children = entry
+                    .get("children")
+                    .and_then(Value::as_array)
+                    .map(|children| {
+                        children
+                            .iter()
+                            .filter_map(|child| serde_json::from_value(child.clone()).ok())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                Some(LspSymbol {
+                    name,
+                    kind,
+                    detail,
+                    range,
+                    selection_range,
+                    children,
+                })
+            } else {
+                // SymbolInformation form: name + location.
+                let name = entry.get("name")?.as_str()?.to_string();
+                let kind = entry.get("kind").and_then(Value::as_u64).unwrap_or(0) as u32;
+                let detail = entry.get("containerName").and_then(Value::as_str).map(String::from);
+                let location = entry.get("location")?;
+                let _uri = location.get("uri")?.as_str()?.to_string();
+                let range: LspRange =
+                    serde_json::from_value(location.get("range")?.clone()).ok()?;
+                Some(LspSymbol {
+                    name,
+                    kind,
+                    detail,
+                    selection_range: range,
+                    range,
+                    children: Vec::new(),
+                })
+            }
+        })
+        .collect()
 }
 
 /// Reads one LSP message (Content-Length framed) from a buffered reader.
@@ -380,5 +678,93 @@ mod tests {
     fn empty_on_other_shapes() {
         assert!(parse_completion_result(Value::Null).is_empty());
         assert!(parse_completion_result(json!({"nope": 1})).is_empty());
+    }
+
+    #[test]
+    fn diagnostics_collect_and_parse() {
+        let slot = Arc::new(Mutex::new(HashMap::<String, Vec<LspDiagnostic>>::new()));
+        let notification = json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/publishDiagnostics",
+            "params": {
+                "uri": "file:///a.rs",
+                "diagnostics": [{
+                    "range": {"start": {"line": 0, "character": 4}, "end": {"line": 0, "character": 9}},
+                    "severity": 1,
+                    "code": "E0308",
+                    "source": "rustc",
+                    "message": "mismatched types"
+                }]
+            }
+        });
+        collect_diagnostics(&slot, &notification);
+        let guard = slot.lock().unwrap();
+        let diags = guard.get("file:///a.rs").expect("diagnostics stored");
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].severity, Some(1));
+        assert_eq!(diags[0].code.as_deref(), Some("E0308"));
+        assert_eq!(diags[0].range.start.line, 0);
+        assert_eq!(diags[0].range.end.character, 9);
+    }
+
+    #[test]
+    fn parse_locations_handles_single_and_links() {
+        let single = json!({
+            "uri": "file:///a.rs", "range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 4}}
+        });
+        let locs = parse_locations(single);
+        assert_eq!(locs.len(), 1);
+        assert_eq!(locs[0].uri, "file:///a.rs");
+        assert_eq!(locs[0].range.start.line, 1);
+
+        let links = json!([{
+            "targetUri": "file:///b.rs",
+            "targetRange": {"start": {"line": 2, "character": 0}, "end": {"line": 2, "character": 2}}
+        }]);
+        let locs = parse_locations(links);
+        assert_eq!(locs.len(), 1);
+        assert_eq!(locs[0].uri, "file:///b.rs");
+        assert_eq!(locs[0].range.end.character, 2);
+    }
+
+    #[test]
+    fn parse_symbols_nested_document_symbols() {
+        let result = json!([{
+            "name": "main",
+            "kind": 12,
+            "detail": "fn",
+            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 2, "character": 1}},
+            "selectionRange": {"start": {"line": 0, "character": 3}, "end": {"line": 0, "character": 7}},
+            "children": [{
+                "name": "x",
+                "kind": 13,
+                "range": {"start": {"line": 1, "character": 2}, "end": {"line": 1, "character": 8}},
+                "selectionRange": {"start": {"line": 1, "character": 2}, "end": {"line": 1, "character": 3}}
+            }]
+        }]);
+        let symbols = parse_symbols(result);
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].name, "main");
+        assert_eq!(symbols[0].kind, 12);
+        assert_eq!(symbols[0].children.len(), 1);
+        assert_eq!(symbols[0].children[0].name, "x");
+    }
+
+    #[test]
+    fn parse_symbols_flat_symbol_information() {
+        let result = json!([{
+            "name": "helper",
+            "kind": 12,
+            "containerName": "mod",
+            "location": {
+                "uri": "file:///a.rs",
+                "range": {"start": {"line": 4, "character": 0}, "end": {"line": 6, "character": 1}}
+            }
+        }]);
+        let symbols = parse_symbols(result);
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].name, "helper");
+        assert_eq!(symbols[0].detail.as_deref(), Some("mod"));
+        assert_eq!(symbols[0].selection_range.start.line, 4);
     }
 }

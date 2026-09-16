@@ -25,7 +25,9 @@ pub use grammar::FlowGrammar;
 use grammar::nui_flow_default;
 pub use highlight::{HighlightCache, LineTokens, Span, TokenClass};
 pub use languages::{Language, LanguageKind};
-pub use lsp::{LspClient, LspEndpoint, LspError};
+pub use lsp::{
+    LspClient, LspDiagnostic, LspEndpoint, LspError, LspLocation, LspPosition, LspRange, LspSymbol,
+};
 pub use symbols::{SymbolIndex, SymbolKind};
 
 /// Facade tying buffer, highlight cache, symbol index, and the edit session

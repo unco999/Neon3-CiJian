@@ -7,8 +7,11 @@
 
 use std::collections::HashMap;
 
-use neon_editor::grammar::nui_flow_default;
-use neon_editor::{ChangeSet, EditOp, EditorCore, Position};
+use neon_editor::languages::LanguageKind;
+use neon_editor::{
+    ChangeSet, EditOp, EditorCore, Language, LspClient, LspDiagnostic, LspEndpoint, LspLocation,
+    LspSymbol, Position,
+};
 use neon_observability::{
     CommandJournal, DebugSnapshot, EVENT_COMMAND_ACCEPTED, EVENT_COMMAND_RECEIVED,
     EVENT_COMMAND_REJECTED, EVENT_COMMAND_VALIDATED, TraceLevel,
@@ -24,6 +27,8 @@ pub const SERVICE_NAME: &str = "editor-runtime";
 pub const EDITOR_DOCUMENT_CAPABILITY: &str = "editor.document.v1";
 pub const EDITOR_CHANGESET_CAPABILITY: &str = "editor.changeset.v1";
 pub const EDITOR_COMPLETION_CAPABILITY: &str = "editor.completion.v1";
+pub const EDITOR_LANGUAGE_CAPABILITY: &str = "editor.language.v1";
+pub const EDITOR_LSP_CAPABILITY: &str = "editor.lsp.v1";
 pub const MAX_DOCUMENT_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_DOCUMENT_LINES: usize = 100_000;
 pub const MAX_CHANGESET_OPS: usize = 256;
@@ -121,18 +126,87 @@ pub struct EditorCompletionResult {
     pub items: Vec<neon_editor::CompletionItem>,
 }
 
+/// Position inside a document for LSP introspection requests.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EditorLspPosition {
+    pub document_id: String,
+    pub session_id: String,
+    pub epoch: u64,
+    pub document_revision: Revision,
+    pub position: Position,
+}
+
+/// Document reference for LSP requests that do not need a cursor position.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EditorLspRef {
+    pub document_id: String,
+    pub session_id: String,
+    pub epoch: u64,
+    pub document_revision: Revision,
+}
+
+/// Result of `editor.lsp.diagnostics`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct EditorLspDiagnosticsResult {
+    pub document_id: String,
+    pub document_revision: Revision,
+    pub diagnostics: Vec<LspDiagnostic>,
+    /// Present when the language server could not be started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_unavailable: Option<String>,
+}
+
+/// Result of `editor.lsp.definition` / `editor.lsp.references`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct EditorLspLocationsResult {
+    pub document_id: String,
+    pub document_revision: Revision,
+    pub locations: Vec<LspLocation>,
+}
+
+/// Result of `editor.lsp.symbols`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct EditorLspSymbolsResult {
+    pub document_id: String,
+    pub document_revision: Revision,
+    pub symbols: Vec<LspSymbol>,
+}
+
+/// Result of `editor.lsp.hover` / `editor.lsp.signature_help` — the raw LSP
+/// payload, plus the server availability state.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct EditorLspRawResult {
+    pub document_id: String,
+    pub document_revision: Revision,
+    pub result: Value,
+}
+
 struct DocumentRecord {
     session_id: String,
     language: String,
+    language_kind: LanguageKind,
     revision: Revision,
     committed_revision: Revision,
     dirty: bool,
     core: EditorCore,
+    /// Live LSP server for non-Flow documents (spawned on open when the
+    /// language server binary is available).
+    lsp: Option<LspClient>,
+    /// LSP document URI (`file:///neon3/{document_id}.{ext}`).
+    lsp_uri: String,
+    /// Set when the language server could not be started (missing binary).
+    lsp_unavailable: Option<String>,
 }
 
 impl DocumentRecord {
     fn snapshot(&self, document_id: &str, epoch: u64) -> EditorDocumentSnapshot {
         let source = self.core.buffer().text();
+        let diagnostics = match &self.lsp {
+            Some(lsp) => lsp.diagnostics(&self.lsp_uri),
+            None => Vec::new(),
+        };
         EditorDocumentSnapshot {
             document_id: document_id.into(),
             session_id: self.session_id.clone(),
@@ -145,7 +219,10 @@ impl DocumentRecord {
             byte_length: source.len() as u64,
             source_hash: source_hash(&source),
             source,
-            diagnostics: Vec::new(),
+            diagnostics: diagnostics
+                .into_iter()
+                .map(|diagnostic| serde_json::to_value(diagnostic).unwrap_or(Value::Null))
+                .collect(),
         }
     }
 }
@@ -189,6 +266,8 @@ impl EditorRuntime {
                 EDITOR_DOCUMENT_CAPABILITY.into(),
                 EDITOR_CHANGESET_CAPABILITY.into(),
                 EDITOR_COMPLETION_CAPABILITY.into(),
+                EDITOR_LANGUAGE_CAPABILITY.into(),
+                EDITOR_LSP_CAPABILITY.into(),
             ],
         }
     }
@@ -276,6 +355,12 @@ impl EditorRuntime {
                 true,
             ),
             "editor.completion.request" => (self.completion(request_id, request.params), true),
+            "editor.lsp.diagnostics" => (self.lsp_diagnostics(request_id, request.params), true),
+            "editor.lsp.hover" => (self.lsp_hover(request_id, request.params), true),
+            "editor.lsp.definition" => (self.lsp_definition(request_id, request.params), true),
+            "editor.lsp.references" => (self.lsp_references(request_id, request.params), true),
+            "editor.lsp.symbols" => (self.lsp_symbols(request_id, request.params), true),
+            "editor.lsp.signature_help" => (self.lsp_signature_help(request_id, request.params), true),
             "editor.document.close" => (self.close(request_id, request.params), true),
             "service.shutdown" => (
                 self.accept(request_id, json!({"state": "accepted"}), None),
@@ -312,14 +397,14 @@ impl EditorRuntime {
                 None,
             );
         }
-        if open.language != "nui_flow" {
+        let Some(language_kind) = language_from_name(&open.language) else {
             return self.reject(
                 request_id,
                 "editor_language_unsupported",
-                "only nui_flow is supported",
+                "supported languages: nui_flow, typescript, rust, cpp",
                 None,
             );
-        }
+        };
         if let Some(error) = validate_source(&open.source) {
             return self.reject(request_id, error.0, error.1, None);
         }
@@ -331,13 +416,23 @@ impl EditorRuntime {
                 Some(record.revision),
             );
         }
+        let language = Language { kind: language_kind };
+        let lsp_uri = lsp_uri_for(&open.document_id, language_kind);
+        let (lsp, lsp_unavailable) = match language_kind {
+            LanguageKind::NuiFlow => (None, None),
+            _ => spawn_lsp(language_kind, &lsp_uri, &open.source),
+        };
         let record = DocumentRecord {
             session_id: open.session_id,
             language: open.language,
+            language_kind,
             revision: Revision(1),
             committed_revision: Revision(1),
             dirty: false,
-            core: EditorCore::new(&open.source, nui_flow_default()),
+            core: EditorCore::from_language(&open.source, language),
+            lsp,
+            lsp_uri,
+            lsp_unavailable,
         };
         let snapshot = record.snapshot(&open.document_id, self.epoch);
         let revision = record.revision;
@@ -351,7 +446,7 @@ impl EditorRuntime {
             Some(open.document_id.clone()),
             None,
             Some(revision),
-            json!({"language": "nui_flow", "byte_length": snapshot.byte_length}),
+            json!({"language": language_kind.name(), "byte_length": snapshot.byte_length}),
         );
         self.accept(
             request_id,
@@ -426,12 +521,12 @@ impl EditorRuntime {
                 None,
             );
         }
-        let Some((current_revision, session_matches, language, current_source)) =
+        let Some((current_revision, session_matches, language_kind, current_source)) =
             self.documents.get(&change.document_id).map(|record| {
                 (
                     record.revision,
                     record.session_id == change.session_id,
-                    record.language.clone(),
+                    record.language_kind,
                     record.core.buffer().text(),
                 )
             })
@@ -459,14 +554,6 @@ impl EditorRuntime {
                 Some(current_revision),
             );
         }
-        if language != "nui_flow" {
-            return self.reject(
-                request_id,
-                "editor_language_unsupported",
-                "document language is unsupported",
-                Some(current_revision),
-            );
-        }
         if change.change_set.ops.is_empty() || change.change_set.ops.len() > MAX_CHANGESET_OPS {
             return self.reject(
                 request_id,
@@ -475,7 +562,8 @@ impl EditorRuntime {
                 Some(current_revision),
             );
         }
-        let mut candidate = EditorCore::new(&current_source, nui_flow_default());
+        let mut candidate =
+            EditorCore::from_language(&current_source, Language { kind: language_kind });
         for operation in &change.change_set.ops {
             match operation {
                 EditOp::Insert {
@@ -531,6 +619,17 @@ impl EditorRuntime {
         if matches!(change.kind, EditorChangeKind::Commit) {
             record.committed_revision = record.revision;
             record.dirty = false;
+        }
+        // Keep the language server in sync with the authoritative buffer.
+        if let Some(lsp) = &mut record.lsp {
+            let uri = record.lsp_uri.clone();
+            let text = record.core.buffer().text();
+            let version = record.revision.0 as i64;
+            if let Err(error) = lsp.change_document(&uri, version, &text) {
+                // LSP is best-effort: a dead server never fails the edit.
+                record.lsp = None;
+                record.lsp_unavailable = Some(format!("lsp server closed: {error}"));
+            }
         }
         let snapshot = record.snapshot(&change.document_id, self.epoch);
         let revision = record.revision;
@@ -593,12 +692,12 @@ impl EditorRuntime {
                 None,
             );
         }
-        let Some((revision, session_matches, items)) =
+        let Some((revision, session_matches, language_kind)) =
             self.documents.get(&completion.document_id).map(|record| {
                 (
                     record.revision,
                     record.session_id == completion.session_id,
-                    record.core.completions(completion.position),
+                    record.language_kind,
                 )
             })
         else {
@@ -625,6 +724,34 @@ impl EditorRuntime {
                 Some(revision),
             );
         }
+        let items = match language_kind {
+            LanguageKind::NuiFlow => self
+                .documents
+                .get(&completion.document_id)
+                .map(|record| record.core.completions(completion.position))
+                .unwrap_or_default(),
+            _ => {
+                let record = self
+                    .documents
+                    .get_mut(&completion.document_id)
+                    .expect("document was validated");
+                match &mut record.lsp {
+                    Some(lsp) => {
+                        let uri = record.lsp_uri.clone();
+                        match lsp.request_completion(&uri, completion.position) {
+                            Ok(items) => items,
+                            Err(error) => {
+                                record.lsp = None;
+                                record.lsp_unavailable =
+                                    Some(format!("lsp server closed: {error}"));
+                                Vec::new()
+                            }
+                        }
+                    }
+                    None => Vec::new(),
+                }
+            }
+        };
         self.accept(
             request_id,
             json!(EditorCompletionResult {
@@ -635,6 +762,329 @@ impl EditorRuntime {
             }),
             Some(revision),
         )
+    }
+
+    fn lsp_diagnostics(&mut self, request_id: RequestId, params: Value) -> RpcResponse {
+        let reference: EditorLspRef = match serde_json::from_value(params) {
+            Ok(value) => value,
+            Err(error) => {
+                return self.reject(request_id, "editor_lsp_invalid", &error.to_string(), None);
+            }
+        };
+        if reference.epoch != self.epoch {
+            return self.reject(
+                request_id,
+                "editor_epoch_stale",
+                "lsp request belongs to a previous editor epoch",
+                None,
+            );
+        }
+        let Some((revision, session_matches, unavailable)) = self
+            .documents
+            .get(&reference.document_id)
+            .map(|record| {
+                (
+                    record.revision,
+                    record.session_id == reference.session_id,
+                    record.lsp_unavailable.clone(),
+                )
+            })
+        else {
+            return self.reject(
+                request_id,
+                "editor_document_not_found",
+                "document is not open",
+                None,
+            );
+        };
+        if !session_matches {
+            return self.reject(
+                request_id,
+                "editor_session_mismatch",
+                "document session does not match",
+                Some(revision),
+            );
+        }
+        if reference.document_revision != revision {
+            return self.reject(
+                request_id,
+                "editor_lsp_stale",
+                "lsp request revision is stale",
+                Some(revision),
+            );
+        }
+        if let Some(reason) = unavailable {
+            return self.accept(
+                request_id,
+                json!(EditorLspDiagnosticsResult {
+                    document_id: reference.document_id,
+                    document_revision: revision,
+                    diagnostics: Vec::new(),
+                    server_unavailable: Some(reason),
+                }),
+                Some(revision),
+            );
+        }
+        let record = self
+            .documents
+            .get(&reference.document_id)
+            .expect("document was validated");
+        let diagnostics = match &record.lsp {
+            Some(lsp) => lsp.diagnostics(&record.lsp_uri),
+            None => Vec::new(),
+        };
+        self.accept(
+            request_id,
+            json!(EditorLspDiagnosticsResult {
+                document_id: reference.document_id,
+                document_revision: revision,
+                diagnostics,
+                server_unavailable: None,
+            }),
+            Some(revision),
+        )
+    }
+
+    fn lsp_hover(&mut self, request_id: RequestId, params: Value) -> RpcResponse {
+        self.lsp_position_request(request_id, params, LspKind::Hover)
+    }
+
+    fn lsp_definition(&mut self, request_id: RequestId, params: Value) -> RpcResponse {
+        self.lsp_position_request(request_id, params, LspKind::Definition)
+    }
+
+    fn lsp_references(&mut self, request_id: RequestId, params: Value) -> RpcResponse {
+        self.lsp_position_request(request_id, params, LspKind::References)
+    }
+
+    fn lsp_signature_help(&mut self, request_id: RequestId, params: Value) -> RpcResponse {
+        self.lsp_position_request(request_id, params, LspKind::SignatureHelp)
+    }
+
+    fn lsp_symbols(&mut self, request_id: RequestId, params: Value) -> RpcResponse {
+        let reference: EditorLspRef = match serde_json::from_value(params) {
+            Ok(value) => value,
+            Err(error) => {
+                return self.reject(request_id, "editor_lsp_invalid", &error.to_string(), None);
+            }
+        };
+        if reference.epoch != self.epoch {
+            return self.reject(
+                request_id,
+                "editor_epoch_stale",
+                "lsp request belongs to a previous editor epoch",
+                None,
+            );
+        }
+        let Some((revision, session_matches)) = self
+            .documents
+            .get(&reference.document_id)
+            .map(|record| {
+                (
+                    record.revision,
+                    record.session_id == reference.session_id,
+                )
+            })
+        else {
+            return self.reject(
+                request_id,
+                "editor_document_not_found",
+                "document is not open",
+                None,
+            );
+        };
+        if !session_matches {
+            return self.reject(
+                request_id,
+                "editor_session_mismatch",
+                "document session does not match",
+                Some(revision),
+            );
+        }
+        if reference.document_revision != revision {
+            return self.reject(
+                request_id,
+                "editor_lsp_stale",
+                "lsp request revision is stale",
+                Some(revision),
+            );
+        }
+        let record = self
+            .documents
+            .get_mut(&reference.document_id)
+            .expect("document was validated");
+        match &mut record.lsp {
+            Some(lsp) => {
+                let uri = record.lsp_uri.clone();
+                match lsp.request_symbols(&uri) {
+                    Ok(symbols) => self.accept(
+                        request_id,
+                        json!(EditorLspSymbolsResult {
+                            document_id: reference.document_id,
+                            document_revision: revision,
+                            symbols,
+                        }),
+                        Some(revision),
+                    ),
+                    Err(error) => {
+                        record.lsp = None;
+                        record.lsp_unavailable =
+                            Some(format!("lsp server closed: {error}"));
+                        self.accept(
+                            request_id,
+                            json!(EditorLspSymbolsResult {
+                                document_id: reference.document_id,
+                                document_revision: revision,
+                                symbols: Vec::new(),
+                            }),
+                            Some(revision),
+                        )
+                    }
+                }
+            }
+            None => self.accept(
+                request_id,
+                json!(EditorLspSymbolsResult {
+                    document_id: reference.document_id,
+                    document_revision: revision,
+                    symbols: Vec::new(),
+                }),
+                Some(revision),
+            ),
+        }
+    }
+
+    fn lsp_position_request(
+        &mut self,
+        request_id: RequestId,
+        params: Value,
+        kind: LspKind,
+    ) -> RpcResponse {
+        let request: EditorLspPosition = match serde_json::from_value(params) {
+            Ok(value) => value,
+            Err(error) => {
+                return self.reject(request_id, "editor_lsp_invalid", &error.to_string(), None);
+            }
+        };
+        if request.epoch != self.epoch {
+            return self.reject(
+                request_id,
+                "editor_epoch_stale",
+                "lsp request belongs to a previous editor epoch",
+                None,
+            );
+        }
+        let Some((revision, session_matches)) = self
+            .documents
+            .get(&request.document_id)
+            .map(|record| {
+                (
+                    record.revision,
+                    record.session_id == request.session_id,
+                )
+            })
+        else {
+            return self.reject(
+                request_id,
+                "editor_document_not_found",
+                "document is not open",
+                None,
+            );
+        };
+        if !session_matches {
+            return self.reject(
+                request_id,
+                "editor_session_mismatch",
+                "document session does not match",
+                Some(revision),
+            );
+        }
+        if request.document_revision != revision {
+            return self.reject(
+                request_id,
+                "editor_lsp_stale",
+                "lsp request revision is stale",
+                Some(revision),
+            );
+        }
+        let record = self
+            .documents
+            .get_mut(&request.document_id)
+            .expect("document was validated");
+        match &mut record.lsp {
+            Some(lsp) => {
+                let uri = record.lsp_uri.clone();
+                let outcome = match kind {
+                    LspKind::Hover => lsp
+                        .request_hover(&uri, request.position)
+                        .map(|result| json!(EditorLspRawResult {
+                            document_id: request.document_id.clone(),
+                            document_revision: revision,
+                            result,
+                        })),
+                    LspKind::SignatureHelp => lsp
+                        .request_signature_help(&uri, request.position)
+                        .map(|result| json!(EditorLspRawResult {
+                            document_id: request.document_id.clone(),
+                            document_revision: revision,
+                            result,
+                        })),
+                    LspKind::Definition => lsp
+                        .request_definition(&uri, request.position)
+                        .map(|locations| json!(EditorLspLocationsResult {
+                            document_id: request.document_id.clone(),
+                            document_revision: revision,
+                            locations,
+                        })),
+                    LspKind::References => lsp
+                        .request_references(&uri, request.position)
+                        .map(|locations| json!(EditorLspLocationsResult {
+                            document_id: request.document_id.clone(),
+                            document_revision: revision,
+                            locations,
+                        })),
+                };
+                match outcome {
+                    Ok(result) => self.accept(request_id, result, Some(revision)),
+                    Err(error) => {
+                        record.lsp = None;
+                        record.lsp_unavailable = Some(format!("lsp server closed: {error}"));
+                        let fallback = match kind {
+                            LspKind::Definition | LspKind::References => json!(
+                                EditorLspLocationsResult {
+                                    document_id: request.document_id,
+                                    document_revision: revision,
+                                    locations: Vec::new(),
+                                }
+                            ),
+                            _ => json!(EditorLspRawResult {
+                                document_id: request.document_id,
+                                document_revision: revision,
+                                result: Value::Null,
+                            }),
+                        };
+                        self.accept(request_id, fallback, Some(revision))
+                    }
+                }
+            }
+            None => {
+                let fallback = match kind {
+                    LspKind::Definition | LspKind::References => json!(
+                        EditorLspLocationsResult {
+                            document_id: request.document_id,
+                            document_revision: revision,
+                            locations: Vec::new(),
+                        }
+                    ),
+                    _ => json!(EditorLspRawResult {
+                        document_id: request.document_id,
+                        document_revision: revision,
+                        result: Value::Null,
+                    }),
+                };
+                self.accept(request_id, fallback, Some(revision))
+            }
+        }
     }
 
     fn commit(
@@ -738,7 +1188,11 @@ impl EditorRuntime {
             );
         }
         let revision = current.revision;
-        self.documents.remove(&reference.document_id);
+        if let Some(record) = self.documents.remove(&reference.document_id) {
+            if let Some(mut lsp) = record.lsp {
+                let _ = lsp.close_document(&record.lsp_uri);
+            }
+        }
         self.accept(
             request_id,
             json!({"state": "closed", "document_id": reference.document_id}),
@@ -793,6 +1247,93 @@ impl EditorRuntime {
                 object_id: None,
             }),
         }
+    }
+}
+
+/// Which LSP introspection a position-scoped request wants.
+#[derive(Clone, Copy)]
+enum LspKind {
+    Hover,
+    Definition,
+    References,
+    SignatureHelp,
+}
+
+/// Resolve the canonical language identifier the runtime accepts.
+fn language_from_name(name: &str) -> Option<LanguageKind> {
+    match name {
+        "nui_flow" => Some(LanguageKind::NuiFlow),
+        "typescript" => Some(LanguageKind::Typescript),
+        "rust" => Some(LanguageKind::Rust),
+        "cpp" => Some(LanguageKind::Cpp),
+        _ => None,
+    }
+}
+
+/// Stable LSP URI for a document, derived from its id and language.
+fn lsp_uri_for(document_id: &str, kind: LanguageKind) -> String {
+    let extension = match kind {
+        LanguageKind::NuiFlow => "nui",
+        LanguageKind::Typescript => "ts",
+        LanguageKind::Rust => "rs",
+        LanguageKind::Cpp => "cpp",
+    };
+    format!("file:///neon3/{document_id}.{extension}")
+}
+
+/// Language-server command for a language. Each language can be overridden
+/// with `NEON3_LSP_RUST` / `NEON3_LSP_TYPESCRIPT` / `NEON3_LSP_CPP`; the
+/// defaults are the standard server binaries (`rust-analyzer`,
+/// `typescript-language-server --stdio`, `clangd`).
+fn lsp_command_for(kind: LanguageKind) -> Option<(String, Vec<String>)> {
+    let (env_key, command, args) = match kind {
+        LanguageKind::NuiFlow => return None,
+        LanguageKind::Rust => ("NEON3_LSP_RUST", "rust-analyzer", Vec::new()),
+        LanguageKind::Typescript => (
+            "NEON3_LSP_TYPESCRIPT",
+            "typescript-language-server",
+            vec!["--stdio".into()],
+        ),
+        LanguageKind::Cpp => ("NEON3_LSP_CPP", "clangd", Vec::new()),
+    };
+    if let Ok(override_command) = std::env::var(env_key) {
+        if !override_command.trim().is_empty() {
+            return Some((override_command, args));
+        }
+    }
+    Some((command.into(), args))
+}
+
+/// Spawn the language server for a non-Flow document and open it. Returns
+/// `(client, unavailable_reason)`; a missing binary degrades to
+/// `(None, Some(reason))` so the document stays fully editable with
+/// tree-sitter highlighting.
+fn spawn_lsp(
+    kind: LanguageKind,
+    uri: &str,
+    source: &str,
+) -> (Option<LspClient>, Option<String>) {
+    let Some((command, args)) = lsp_command_for(kind) else {
+        return (None, None);
+    };
+    let endpoint = LspEndpoint::Stdio {
+        command: command.clone(),
+        args,
+    };
+    match LspClient::connect(endpoint) {
+        Ok(mut lsp) => {
+            let language_id = match kind {
+                LanguageKind::Rust => "rust",
+                LanguageKind::Typescript => "typescript",
+                LanguageKind::Cpp => "cpp",
+                LanguageKind::NuiFlow => "plaintext",
+            };
+            if let Err(error) = lsp.open_document(uri, language_id, source) {
+                return (None, Some(format!("lsp didOpen failed: {error}")));
+            }
+            (Some(lsp), None)
+        }
+        Err(error) => (None, Some(format!("{command} unavailable: {error}"))),
     }
 }
 
@@ -926,5 +1467,141 @@ mod tests {
             response.error.as_ref().map(|error| error.code.as_str()),
             Some("editor_revision_conflict")
         );
+    }
+
+    #[test]
+    fn rust_document_opens_edits_and_lsp_degrades() {
+        // Deterministic degradation: even if rust-analyzer is installed on
+        // this machine, force the spawn to fail so the test exercises the
+        // server_unavailable path instead of blocking on a real server.
+        unsafe { std::env::set_var("NEON3_LSP_RUST", "neon3-no-such-lsp-binary") };
+        let mut runtime = EditorRuntime::new(7);
+        let open = request(
+            "editor.document.open",
+            "open-rs",
+            json!(EditorDocumentOpen {
+                document_id: "doc-rs".into(),
+                session_id: "session".into(),
+                language: "rust".into(),
+                source: "// hi\nfn main() { let x = 1; }\n".into(),
+            }),
+            None,
+            "open-rs",
+        );
+        let (response, _) = runtime.handle(open);
+        assert_eq!(response.status, RpcStatus::Accepted);
+        let snapshot = &response.result.as_ref().unwrap()["snapshot"];
+        assert_eq!(snapshot["language"], "rust");
+        assert_eq!(snapshot["line_count"], 3);
+
+        // Edit the rust document: language gate must be open.
+        let apply = request(
+            "editor.document.change.apply",
+            "apply-rs",
+            json!(EditorChangeApply {
+                document_id: "doc-rs".into(),
+                session_id: "session".into(),
+                epoch: 7,
+                change_set: ChangeSet {
+                    base_revision: 1,
+                    ops: vec![EditOp::Insert {
+                        line: 1,
+                        column: 0,
+                        end: Position::new(1, 6),
+                        text: "pub ".into(),
+                    }],
+                },
+                kind: EditorChangeKind::Draft,
+                cursor: None,
+                selection: None,
+            }),
+            None,
+            "apply-rs",
+        );
+        let (response, _) = runtime.handle(apply);
+        assert_eq!(response.status, RpcStatus::Accepted);
+        let snapshot = &response.result.as_ref().unwrap()["snapshot"];
+        assert!(snapshot["source"]
+            .as_str()
+            .unwrap()
+            .contains("pub fn main()"));
+
+        // No LSP server installed in this environment: introspection must
+        // degrade to a structured server_unavailable, not fail the document.
+        let diagnostics = request(
+            "editor.lsp.diagnostics",
+            "diag-rs",
+            json!(EditorLspRef {
+                document_id: "doc-rs".into(),
+                session_id: "session".into(),
+                epoch: 7,
+                document_revision: Revision(2),
+            }),
+            None,
+            "diag-rs",
+        );
+        let (response, _) = runtime.handle(diagnostics);
+        assert_eq!(response.status, RpcStatus::Accepted);
+        let result = response.result.as_ref().unwrap();
+        assert!(result["server_unavailable"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("unavailable")));
+    }
+
+    #[test]
+    fn unknown_language_is_rejected() {
+        let mut runtime = EditorRuntime::new(7);
+        let open = request(
+            "editor.document.open",
+            "open-py",
+            json!(EditorDocumentOpen {
+                document_id: "doc-py".into(),
+                session_id: "session".into(),
+                language: "python".into(),
+                source: "print(1)".into(),
+            }),
+            None,
+            "open-py",
+        );
+        let (response, _) = runtime.handle(open);
+        assert_eq!(
+            response.error.as_ref().map(|error| error.code.as_str()),
+            Some("editor_language_unsupported")
+        );
+    }
+
+    #[test]
+    fn lsp_hover_on_unavailable_server_returns_null_without_error() {
+        let mut runtime = EditorRuntime::new(7);
+        let open = request(
+            "editor.document.open",
+            "open-ts",
+            json!(EditorDocumentOpen {
+                document_id: "doc-ts".into(),
+                session_id: "session".into(),
+                language: "typescript".into(),
+                source: "const x: number = 1;\n".into(),
+            }),
+            None,
+            "open-ts",
+        );
+        let (response, _) = runtime.handle(open);
+        assert_eq!(response.status, RpcStatus::Accepted);
+        let hover = request(
+            "editor.lsp.hover",
+            "hover-ts",
+            json!(EditorLspPosition {
+                document_id: "doc-ts".into(),
+                session_id: "session".into(),
+                epoch: 7,
+                document_revision: Revision(1),
+                position: Position::new(0, 6),
+            }),
+            None,
+            "hover-ts",
+        );
+        let (response, _) = runtime.handle(hover);
+        assert_eq!(response.status, RpcStatus::Accepted);
+        assert!(response.result.as_ref().unwrap()["result"].is_null());
     }
 }
