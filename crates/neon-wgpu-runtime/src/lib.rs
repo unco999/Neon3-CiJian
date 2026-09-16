@@ -10661,6 +10661,7 @@ fn spawn_window_server(
                     request.method.as_str(),
                     "wgpu.ui.submit_fragment"
                         | "wgpu.ui.remove_fragment"
+                        | "ui.flow.submit"
                         | "wgpu.world.info.configure"
                         | "wgpu.world.camera.submit_frame"
                         | "wgpu.world.ui.anchor.submit"

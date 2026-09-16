@@ -79,11 +79,13 @@ fn main() {
         std::sync::Arc::new(neon_ui_runtime::editor_component::EditorBridge::new());
 
     if windowed {
+        // winit 0.30 requires the event loop on the main thread; the windowed
+        // WGPU runtime therefore runs here in `main` instead of a spawned
+        // thread (eventd/editor keep running on their own threads).
         let wgpu = wgpu_endpoint;
         let ui = ui_endpoint;
         let eventd = eventd_endpoint;
-        let editor_bridge = editor_bridge.clone();
-        let _ = std::thread::spawn(move || {
+        {
             let input_sink: Box<
                 dyn FnMut(
                         neon_ui_schema::UiEditorInputEvent,
@@ -130,7 +132,8 @@ fn main() {
                 eprintln!("[neon3-runtime] windowed wgpu failed: {error}");
                 std::process::exit(1);
             }
-        });
+        }
+        return;
     } else {
         // Headless WGPU server on its own endpoint (mirrors the standalone
         // `--headless-server` mode). The editor fragment observer keeps the

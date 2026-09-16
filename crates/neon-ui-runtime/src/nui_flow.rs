@@ -4089,9 +4089,12 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
                 index += 1;
                 code_editor_language = match value {
                     "nui_flow" => neon_ui_schema::UiEditorLanguage::NuiFlow,
+                    "typescript" | "ts" => neon_ui_schema::UiEditorLanguage::Typescript,
+                    "rust" | "rs" => neon_ui_schema::UiEditorLanguage::Rust,
+                    "cpp" | "c++" | "cc" => neon_ui_schema::UiEditorLanguage::Cpp,
                     _ => return Err(error(
                         "nui_flow_invalid_code_editor",
-                        "code_editor language must be nui_flow",
+                        "code_editor language must be one of nui_flow/typescript/rust/cpp",
                         line,
                         1,
                     )),

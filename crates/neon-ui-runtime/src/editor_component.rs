@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use neon_editor::{
-    CompletionItem, EditEvent, EditEventKind, EditorCore, Position,
+    CompletionItem, EditEvent, EditEventKind, EditorCore, Language, LanguageKind, Position,
     grammar::nui_flow_default,
 };
 use neon_ui_schema::{
@@ -27,6 +27,23 @@ use neon_ui_schema::{
     UiEditorCompletionSnapshot, UiEditorEditFx, UiEditorInputEvent, UiEffect, UiFragment,
     UiFragmentId, UiEditorKeyKind, UiEditorTokenSpan, UiIntent, UiNode, UiNodeKind,
 };
+
+/// Map a NUI code_editor declaration language to the kernel Language.
+/// NuiFlow uses the built-in table-driven grammar; the rest use tree-sitter.
+fn core_language_for(declaration: &UiCodeEditorDeclaration) -> Language {
+    match declaration.language {
+        neon_ui_schema::UiEditorLanguage::NuiFlow => Language::nui_flow(),
+        neon_ui_schema::UiEditorLanguage::Typescript => Language {
+            kind: LanguageKind::Typescript,
+        },
+        neon_ui_schema::UiEditorLanguage::Rust => Language {
+            kind: LanguageKind::Rust,
+        },
+        neon_ui_schema::UiEditorLanguage::Cpp => Language {
+            kind: LanguageKind::Cpp,
+        },
+    }
+}
 
 /// Transient-fx packages agreed with the renderer's shader registry
 /// (see `nui_flow_code_editor_demo`). Type-in plays once on insert, the
@@ -99,7 +116,7 @@ pub struct EditorComponent {
 
 impl EditorComponent {
     pub fn new(declaration: UiCodeEditorDeclaration, source: &str) -> Self {
-        let core = EditorCore::new(source, nui_flow_default());
+        let core = EditorCore::from_language(source, core_language_for(&declaration));
         Self {
             declaration,
             core,
@@ -129,7 +146,7 @@ impl EditorComponent {
         }
         let rebuild = self.adopted_source != source || !self.focus;
         if rebuild {
-            self.core = EditorCore::new(source, nui_flow_default());
+            self.core = EditorCore::from_language(source, core_language_for(&self.declaration));
             self.adopted_source = source.to_string();
             self.caret = Position::START;
             self.selection_anchor = None;
@@ -1040,7 +1057,7 @@ impl EditorComponentRegistry {
                 state.declaration = declaration.clone();
                 state.event_action = event_action.clone();
                 if needs_rebuild {
-                    state.core = EditorCore::new(source, nui_flow_default());
+                    state.core = EditorCore::from_language(source, core_language_for(declaration));
                     state.adopted_source = source.clone();
                     state.caret = Position::START;
                     state.selection_anchor = None;

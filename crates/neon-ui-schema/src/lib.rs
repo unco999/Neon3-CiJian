@@ -3816,6 +3816,9 @@ pub struct UiCodeEditorDeclaration {
 #[serde(rename_all = "snake_case")]
 pub enum UiEditorLanguage {
     NuiFlow,
+    Typescript,
+    Rust,
+    Cpp,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
