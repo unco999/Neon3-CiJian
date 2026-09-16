@@ -8795,9 +8795,15 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                     } else {
                         delta
                     };
-                    // Code editors scroll themselves; other widgets use the
-                    // ordinary scroll path.
-                    gpu.ui.editor_scroll_at_pointer(delta) || gpu.ui.scroll_wheel_at_pointer(delta)
+                    if gpu.control_down {
+                        // Ctrl + wheel = lossless editor font zoom.
+                        gpu.ui.editor_zoom_at_pointer(delta[1])
+                    } else {
+                        // Code editors scroll themselves; other widgets use the
+                        // ordinary scroll path.
+                        gpu.ui.editor_scroll_at_pointer(delta)
+                            || gpu.ui.scroll_wheel_at_pointer(delta)
+                    }
                 });
                 if scrolled {
                     self.redraw_pending = true;

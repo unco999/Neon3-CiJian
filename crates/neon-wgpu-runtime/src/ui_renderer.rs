@@ -6011,6 +6011,7 @@ impl UiWgpuRenderer {
     fn has_editor_activity(&self) -> bool {
         self.editors.values().any(|state| {
             state.pending_edits
+                || state.layout_dirty
                 || state
                     .edit_fx
                     .iter()

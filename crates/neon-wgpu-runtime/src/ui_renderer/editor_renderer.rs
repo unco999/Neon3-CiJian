@@ -106,6 +106,14 @@ pub(super) struct EditorRuntimeState {
     /// Active transient edit effects (type-in / delete fragment). Bounded:
     /// every layout retires entries older than their duration.
     pub edit_fx: Vec<EditorEditFx>,
+    /// Runtime zoom factor for lossless font rescaling (Ctrl + wheel).
+    /// Base size comes from `declaration.font_size`; every layout metric is
+    /// multiplied by this so glyphs re-rasterize at the new size instead of
+    /// being stretched.
+    pub font_scale: f32,
+    /// Set by Ctrl+wheel zoom so the plan-reuse early return cannot skip the
+    /// layout pass; cleared at the end of each layout_editors run.
+    pub layout_dirty: bool,
 }
 
 impl EditorRuntimeState {
@@ -128,6 +136,8 @@ impl EditorRuntimeState {
             last_edit_seconds: 0.0,
             pending_edits: false,
             edit_fx: Vec::new(),
+            font_scale: 1.0,
+            layout_dirty: false,
         }
     }
 }
@@ -158,17 +168,18 @@ pub(super) struct EditorLayoutOutput {
 
 /// Raster/metrics pixel size for an editor: glyphs are rasterized 1:1 at the
 /// declared font size so small sizes render crisp (no fractional downscale).
-fn editor_px(declaration: &UiCodeEditorDeclaration) -> f32 {
-    declaration.font_size as f32
+fn editor_px(declaration: &UiCodeEditorDeclaration, font_scale: f32) -> f32 {
+    declaration.font_size as f32 * font_scale
 }
 
 /// Line metrics at the editor's declared size.
 fn editor_line_metrics(
     font: &ResidentFont,
     declaration: &UiCodeEditorDeclaration,
+    font_scale: f32,
 ) -> fontdue::LineMetrics {
     font.font
-        .horizontal_line_metrics(editor_px(declaration))
+        .horizontal_line_metrics(editor_px(declaration, font_scale))
         .unwrap_or(fontdue::LineMetrics {
             ascent: font.ascent,
             descent: font.ascent - font.line_height,
@@ -177,17 +188,69 @@ fn editor_line_metrics(
         })
 }
 
-fn editor_row_height(font: &ResidentFont, declaration: &UiCodeEditorDeclaration) -> f32 {
+fn editor_row_height(
+    font: &ResidentFont,
+    declaration: &UiCodeEditorDeclaration,
+    font_scale: f32,
+) -> f32 {
     // fontdue::Layout also rounds the line advance up (ceil), keeping every
     // row boundary on an integer pixel so baselines stay pixel-aligned.
-    editor_line_metrics(font, declaration).new_line_size.ceil()
+    editor_line_metrics(font, declaration, font_scale)
+        .new_line_size
+        .ceil()
 }
 
-fn editor_gutter_width(declaration: &UiCodeEditorDeclaration, line_count: u32) -> f32 {
+/// Type-ahead completion: after a character edit, if the caret sits right
+/// after an identifier character, ask editor-core for candidates (it already
+/// filters by the typed prefix and NUI context) and open or refresh the popup.
+/// A non-identifier context (space, punctuation, empty) dismisses it. This is
+/// component-internal Layer 1: no RPC, the popup render/navigation is shared
+/// with Ctrl+Space.
+fn auto_complete(state: &mut EditorRuntimeState) {
+    let line = state
+        .core
+        .buffer()
+        .line(state.caret.line)
+        .unwrap_or_default();
+    let before = line
+        .chars()
+        .take(state.caret.column as usize)
+        .collect::<String>();
+    let ident_typed = before
+        .chars()
+        .rev()
+        .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$')
+        .count()
+        > 0;
+    // NUI line-leading: the caret after leading whitespace is where node
+    // kinds / attributes complete, so a whitespace-only prefix also triggers
+    // (editor-core decides whether the context yields candidates).
+    let line_leading = !before.is_empty() && before.chars().all(|c| c.is_whitespace());
+    if !ident_typed && !line_leading {
+        state.completion = None;
+        return;
+    }
+    let items = state.core.completions(state.caret);
+    if items.is_empty() {
+        state.completion = None;
+        return;
+    }
+    let selected = state
+        .completion
+        .as_ref()
+        .map_or(0, |c| c.selected.min(items.len().saturating_sub(1)));
+    state.completion = Some(EditorCompletionState { items, selected });
+}
+
+fn editor_gutter_width(
+    declaration: &UiCodeEditorDeclaration,
+    line_count: u32,
+    font_scale: f32,
+) -> f32 {
     if !declaration.line_numbers {
         return 6.0;
     }
-    let px = editor_px(declaration);
+    let px = editor_px(declaration, font_scale);
     let digits = line_count.max(1).to_string().len() as f32;
     8.0 + digits * (px * 0.5) + 14.0
 }
@@ -232,7 +295,15 @@ fn column_from_x(font: &ResidentFont, line_text: &str, x: f32, px: f32) -> u32 {
     column
 }
 
-fn token_color(class: TokenClass, opacity: f32) -> [f32; 4] {
+fn token_color(
+    class: TokenClass,
+    opacity: f32,
+    syntax: &std::collections::BTreeMap<String, [f32; 4]>,
+) -> [f32; 4] {
+    // Theme override: declaration.syntax_colors (key = TokenClass::name()).
+    if let Some(c) = syntax.get(class.name()) {
+        return [c[0], c[1], c[2], c[3] * opacity];
+    }
     let rgb: [f32; 3] = match class {
         TokenClass::Keyword => [0.78, 0.55, 0.91],      // #C678DD
         TokenClass::NodeKind => [0.31, 0.76, 1.0],      // #4FC1FF
@@ -281,12 +352,17 @@ fn completion_selection_color() -> [f32; 4] {
     [0.20, 0.30, 0.44, 0.85]
 }
 
-fn completion_kind_color(kind: CompletionKind) -> [f32; 4] {
+fn completion_kind_color(
+    kind: CompletionKind,
+    syntax: &std::collections::BTreeMap<String, [f32; 4]>,
+) -> [f32; 4] {
     match kind {
-        CompletionKind::Keyword => token_color(TokenClass::Keyword, 1.0),
-        CompletionKind::NodeKind => token_color(TokenClass::NodeKind, 1.0),
-        CompletionKind::Attribute => token_color(TokenClass::Attribute, 1.0),
-        CompletionKind::Input | CompletionKind::InputKind => token_color(TokenClass::InputRef, 1.0),
+        CompletionKind::Keyword => token_color(TokenClass::Keyword, 1.0, syntax),
+        CompletionKind::NodeKind => token_color(TokenClass::NodeKind, 1.0, syntax),
+        CompletionKind::Attribute => token_color(TokenClass::Attribute, 1.0, syntax),
+        CompletionKind::Input | CompletionKind::InputKind => {
+            token_color(TokenClass::InputRef, 1.0, syntax)
+        }
     }
 }
 
@@ -330,8 +406,8 @@ fn scroll_caret_into_view(
     editor_bounds: UiBounds,
     gutter_width: f32,
 ) {
-    let raster_px = editor_px(&state.declaration);
-    let row_height = editor_row_height(font, &state.declaration);
+    let raster_px = editor_px(&state.declaration, state.font_scale);
+    let row_height = editor_row_height(font, &state.declaration, state.font_scale);
     let viewport_width = (editor_bounds.width - gutter_width).max(1.0);
     let line_text = state
         .core
@@ -460,13 +536,13 @@ impl super::UiWgpuRenderer {
                     duration_ms,
                 });
             }
-            let raster_px = editor_px(declaration);
-            let row_height = editor_row_height(font, declaration);
+            let raster_px = editor_px(declaration, state.font_scale);
+            let row_height = editor_row_height(font, declaration, state.font_scale);
             if row_height <= 0.0 || visual.bounds.width <= 0.0 || visual.bounds.height <= 0.0 {
                 continue;
             }
             let line_count = state.core.buffer().line_count();
-            let gutter_width = editor_gutter_width(declaration, line_count);
+            let gutter_width = editor_gutter_width(declaration, line_count, state.font_scale);
             let content_x = visual.bounds.x + gutter_width;
             let content_width = (visual.bounds.width - gutter_width).max(1.0);
             let clip = [
@@ -549,7 +625,7 @@ impl super::UiWgpuRenderer {
                 {
                     continue;
                 }
-                let baseline = (row_y + editor_line_metrics(font, declaration).ascent).floor();
+                let baseline = (row_y + editor_line_metrics(font, declaration, state.font_scale).ascent).floor();
 
                 // Line-number gutter.
                 if declaration.line_numbers {
@@ -594,7 +670,9 @@ impl super::UiWgpuRenderer {
                         .and_then(|tokens| tokens.class_at(column))
                         .map_or_else(
                             || default_text_color(opacity),
-                            |class| token_color(class, opacity),
+                            |class| {
+                                token_color(class, opacity, &state.declaration.syntax_colors)
+                            },
                         );
                     let Ok(glyph) = ensure_glyph(device, queue, font, ch, raster_px) else {
                         continue;
@@ -909,7 +987,7 @@ impl super::UiWgpuRenderer {
                         }
                         let mut ix = popup_x + COMPLETION_PAD;
                         let baseline =
-                            (item_y + editor_line_metrics(font, declaration).ascent).floor();
+                            (item_y + editor_line_metrics(font, declaration, state.font_scale).ascent).floor();
                         for ch in kind_prefix(item.kind).chars() {
                             let Ok(glyph) = ensure_glyph(device, queue, font, ch, raster_px) else {
                                 continue;
@@ -921,7 +999,7 @@ impl super::UiWgpuRenderer {
                                     glyph.width,
                                     glyph.height,
                                 ],
-                                color: completion_kind_color(item.kind),
+                                color: completion_kind_color(item.kind, &state.declaration.syntax_colors),
                                 clip: [
                                     popup_clip.x,
                                     popup_clip.y,
@@ -972,6 +1050,9 @@ impl super::UiWgpuRenderer {
                     }
                 }
             }
+        }
+        for state in editors.values_mut() {
+            state.layout_dirty = false;
         }
         output
     }
@@ -1082,9 +1163,9 @@ impl super::UiWgpuRenderer {
         let state = self.editors.get(path)?;
         let visual = &self.sampled[index];
         let font = self.resident_font.as_ref()?;
-        let raster_px = editor_px(&state.declaration);
-        let row_height = editor_row_height(font, &state.declaration);
-        let gutter = editor_gutter_width(&state.declaration, state.core.buffer().line_count());
+        let raster_px = editor_px(&state.declaration, state.font_scale);
+        let row_height = editor_row_height(font, &state.declaration, state.font_scale);
+        let gutter = editor_gutter_width(&state.declaration, state.core.buffer().line_count(), state.font_scale);
         let line_text = state
             .core
             .buffer()
@@ -1148,8 +1229,8 @@ impl super::UiWgpuRenderer {
             return true;
         };
         let visual = &self.sampled[index];
-        let row_height = editor_row_height(font, &state.declaration);
-        let gutter = editor_gutter_width(&state.declaration, state.core.buffer().line_count());
+        let row_height = editor_row_height(font, &state.declaration, state.font_scale);
+        let gutter = editor_gutter_width(&state.declaration, state.core.buffer().line_count(), state.font_scale);
         let line_count = state.core.buffer().line_count();
         let line = if row_height > 0.0 {
             ((pointer[1] - visual.bounds.y + state.scroll_y) / row_height)
@@ -1161,7 +1242,7 @@ impl super::UiWgpuRenderer {
         let line = line.min(line_count.saturating_sub(1));
         let line_text = state.core.buffer().line(line).unwrap_or_default();
         let x = pointer[0] - (visual.bounds.x + gutter - state.scroll_x);
-        let column = column_from_x(font, line_text, x, editor_px(&state.declaration));
+        let column = column_from_x(font, line_text, x, editor_px(&state.declaration, state.font_scale));
         state.caret = Position::new(line, column.min(line_text.chars().count() as u32));
         state.selection_anchor = Some(state.caret);
         true
@@ -1185,7 +1266,7 @@ impl super::UiWgpuRenderer {
         let Some(state) = self.editors.get_mut(&path) else {
             return;
         };
-        let row_height = editor_row_height(font, &state.declaration);
+        let row_height = editor_row_height(font, &state.declaration, state.font_scale);
         if row_height <= 0.0 {
             return;
         }
@@ -1200,10 +1281,10 @@ impl super::UiWgpuRenderer {
             .floor()
             .max(0.0) as u32;
         let line = line.min(line_count.saturating_sub(1));
-        let gutter = editor_gutter_width(&state.declaration, line_count);
+        let gutter = editor_gutter_width(&state.declaration, line_count, state.font_scale);
         let line_text = state.core.buffer().line(line).unwrap_or_default();
         let x = clamped[0] - (visual.bounds.x + gutter - state.scroll_x);
-        let column = column_from_x(font, line_text, x, editor_px(&state.declaration))
+        let column = column_from_x(font, line_text, x, editor_px(&state.declaration, state.font_scale))
             .min(line_text.chars().count() as u32);
         state.caret = Position::new(line, column);
     }
@@ -1231,9 +1312,9 @@ impl super::UiWgpuRenderer {
         let Some(state) = self.editors.get_mut(&path) else {
             return false;
         };
-        let raster_px = editor_px(&state.declaration);
-        let row_height = editor_row_height(font, &state.declaration);
-        let gutter = editor_gutter_width(&state.declaration, state.core.buffer().line_count());
+        let raster_px = editor_px(&state.declaration, state.font_scale);
+        let row_height = editor_row_height(font, &state.declaration, state.font_scale);
+        let gutter = editor_gutter_width(&state.declaration, state.core.buffer().line_count(), state.font_scale);
         state.scroll_y += delta[1];
         state.scroll_x += delta[0];
         let content_width = state
@@ -1251,6 +1332,31 @@ impl super::UiWgpuRenderer {
             (visual.bounds.width - gutter).max(1.0),
             visual.bounds.height,
         );
+        true
+    }
+
+    /// Ctrl + wheel over a code editor scales its font losslessly (glyphs
+    /// re-rasterize at the new size). Returns whether consumed.
+    pub(crate) fn editor_zoom_at_pointer(&mut self, wheel_y: f32) -> bool {
+        if wheel_y == 0.0 {
+            return false;
+        }
+        let Some(pointer) = self.pointer_position else {
+            return false;
+        };
+        let Some(path) = self.editor_at_pointer(pointer) else {
+            return false;
+        };
+        let Some(state) = self.editors.get_mut(&path) else {
+            return false;
+        };
+        let factor = if wheel_y > 0.0 { 1.12 } else { 1.0 / 1.12 };
+        let next = (state.font_scale * factor).clamp(0.5, 2.5);
+        if (next - state.font_scale).abs() < 0.001 {
+            return false;
+        }
+        state.font_scale = next;
+        state.layout_dirty = true;
         true
     }
 
@@ -1442,12 +1548,14 @@ impl super::UiWgpuRenderer {
                 }
             } else if let Some(text) = text {
                 insert_text(state, text, now);
+                auto_complete(state);
             } else {
                 insert_text(state, value, now);
+                auto_complete(state);
             }
             if consumed {
                 let gutter =
-                    editor_gutter_width(&state.declaration, state.core.buffer().line_count());
+                    editor_gutter_width(&state.declaration, state.core.buffer().line_count(), state.font_scale);
                 scroll_caret_into_view(state, font, editor_bounds, gutter);
             }
             return consumed;
@@ -1493,6 +1601,7 @@ impl super::UiWgpuRenderer {
                         let gutter = editor_gutter_width(
                             &state.declaration,
                             state.core.buffer().line_count(),
+                            state.font_scale,
                         );
                         scroll_caret_into_view(state, font, editor_bounds, gutter);
                         return true;
@@ -1511,6 +1620,13 @@ impl super::UiWgpuRenderer {
                 state.focus = false;
                 self.focused_editor = None;
                 self.editor_selection_drag = false;
+                true
+            }
+            NamedKey::Space => {
+                // winit reports a bare space as NamedKey::Space (only
+                // Ctrl+Space arrives as Character(" ")), so without this
+                // branch the key falls through unhandled and is lost.
+                insert_text(state, " ", now);
                 true
             }
             NamedKey::Enter => {
@@ -1553,6 +1669,7 @@ impl super::UiWgpuRenderer {
                 } else {
                     delete_backward(state, now);
                 }
+                auto_complete(state);
                 true
             }
             NamedKey::Delete => {
@@ -1578,6 +1695,7 @@ impl super::UiWgpuRenderer {
                 } else {
                     delete_forward(state, now);
                 }
+                auto_complete(state);
                 true
             }
             NamedKey::ArrowLeft => {
@@ -1711,14 +1829,14 @@ impl super::UiWgpuRenderer {
                 true
             }
             NamedKey::PageUp => {
-                let rows = (editor_height / editor_row_height(font, &state.declaration).max(1.0))
+                let rows = (editor_height / editor_row_height(font, &state.declaration, state.font_scale).max(1.0))
                     .floor() as u32;
                 let line = state.caret.line.saturating_sub(rows.max(1));
                 move_caret(state, Position::new(line, state.caret.column), shift);
                 true
             }
             NamedKey::PageDown => {
-                let rows = (editor_height / editor_row_height(font, &state.declaration).max(1.0))
+                let rows = (editor_height / editor_row_height(font, &state.declaration, state.font_scale).max(1.0))
                     .floor() as u32;
                 let line = state
                     .caret
@@ -1736,7 +1854,7 @@ impl super::UiWgpuRenderer {
         };
 
         if consumed {
-            let gutter = editor_gutter_width(&state.declaration, state.core.buffer().line_count());
+            let gutter = editor_gutter_width(&state.declaration, state.core.buffer().line_count(), state.font_scale);
             scroll_caret_into_view(state, font, editor_bounds, gutter);
         }
         consumed

@@ -257,7 +257,8 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
             && (content.starts_with("geometry ")
                 || content.starts_with("material ")
                 || content.starts_with("text_material ")
-                || content.starts_with("token_shader "))
+                || content.starts_with("token_shader ")
+                || content.starts_with("syntax "))
         {
             let parent = stack.last_mut().ok_or_else(|| {
                 error(
@@ -287,6 +288,21 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
                         )
                     })?;
                 editor.token_materials.insert(class, material);
+            } else if content.starts_with("syntax ") {
+                // Theme override: `syntax <class> <#RRGGBB[AA]>` tints one
+                // token class; static highlighting stays color-based.
+                let (class, color) = parse_syntax_color_line(content, line)?;
+                let editor = code_editors
+                    .get_mut(&parent.1.node.node_id.0)
+                    .ok_or_else(|| {
+                        error(
+                            "nui_flow_orphan_syntax",
+                            "syntax requires a code_editor parent",
+                            line,
+                            1,
+                        )
+                    })?;
+                editor.syntax_colors.insert(class, color);
             } else {
                 parent.1.text_material = Some(parse_text_material_line(content, line)?);
             }
@@ -4378,6 +4394,7 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
             completion_input_key: code_editor_completions,
             gutter_diagnostics: code_editor_gutter_diagnostics,
             token_materials: BTreeMap::new(),
+            syntax_colors: BTreeMap::new(),
         })
     } else {
         None
@@ -4971,6 +4988,89 @@ fn parse_text_material_line(text: &str, line: u32) -> FlowResult<UiTextMaterialR
         )
     })?;
     Ok(material)
+}
+
+/// Parses `syntax <class> <#RRGGBB[AA]>` — one token class theme override.
+fn parse_syntax_color_line(text: &str, line: u32) -> FlowResult<(String, [f32; 4])> {
+    let mut parts = text.split_whitespace();
+    if parts.next() != Some("syntax") {
+        return Err(error(
+            "nui_flow_invalid_syntax",
+            "syntax line must start with syntax",
+            line,
+            1,
+        ));
+    }
+    let class = parts
+        .next()
+        .ok_or_else(|| {
+            error(
+                "nui_flow_invalid_syntax",
+                "syntax requires a token class name",
+                line,
+                1,
+            )
+        })?
+        .to_string();
+    let hex = parts
+        .next()
+        .ok_or_else(|| {
+            error(
+                "nui_flow_invalid_syntax",
+                "syntax requires a #RRGGBB or #RRGGBBAA color",
+                line,
+                1,
+            )
+        })?;
+    if parts.next().is_some() {
+        return Err(error(
+            "nui_flow_invalid_syntax",
+            "syntax takes exactly a token class and a color",
+            line,
+            1,
+        ));
+    }
+    let color = parse_hex_color(hex, line)?;
+    Ok((class, color))
+}
+
+/// Parses a `#RRGGBB` / `#RRGGBBAA` color literal into RGBA 0..1.
+fn parse_hex_color(text: &str, line: u32) -> FlowResult<[f32; 4]> {
+    let hex = text.strip_prefix('#').ok_or_else(|| {
+        error(
+            "nui_flow_invalid_color",
+            "color must start with #",
+            line,
+            1,
+        )
+    })?;
+    if hex.len() != 6 && hex.len() != 8 {
+        return Err(error(
+            "nui_flow_invalid_color",
+            "color must be #RRGGBB or #RRGGBBAA",
+            line,
+            1,
+        ));
+    }
+    let val = u32::from_str_radix(hex, 16).map_err(|_| {
+        error(
+            "nui_flow_invalid_color",
+            "color contains non-hex digits",
+            line,
+            1,
+        )
+    })?;
+    let (r, g, b, a) = if hex.len() == 8 {
+        ((val >> 24) & 0xFF, (val >> 16) & 0xFF, (val >> 8) & 0xFF, val & 0xFF)
+    } else {
+        ((val >> 16) & 0xFF, (val >> 8) & 0xFF, val & 0xFF, 0xFF)
+    };
+    Ok([
+        r as f32 / 255.0,
+        g as f32 / 255.0,
+        b as f32 / 255.0,
+        a as f32 / 255.0,
+    ])
 }
 
 /// Parses `token_shader <class> <package> [overflow L T R B] [duration ms]`.

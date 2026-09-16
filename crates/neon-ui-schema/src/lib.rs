@@ -3788,6 +3788,12 @@ pub struct UiCodeEditorDeclaration {
     /// classes without an entry render as ordinary token-colored text.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub token_materials: std::collections::BTreeMap<String, UiTextMaterialRef>,
+    /// Per token-class color overrides for static syntax highlighting. Key is
+    /// the stable TokenClass name ("Keyword", "StringLiteral", ...). Static
+    /// highlighting is theme-colored by default; text materials are reserved
+    /// for transient / emphasis effects and are NOT needed for normal syntax.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub syntax_colors: std::collections::BTreeMap<String, [f32; 4]>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
