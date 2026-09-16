@@ -13,6 +13,7 @@
 
 use std::collections::HashMap;
 
+use super::editor_theme::{EditorTheme, editor_theme_from};
 use neon_editor_core::grammar::nui_flow_default;
 use neon_editor_core::{
     CompletionItem, CompletionKind, EditEventKind, EditorCore, Position, TokenClass,
@@ -295,73 +296,19 @@ fn column_from_x(font: &ResidentFont, line_text: &str, x: f32, px: f32) -> u32 {
     column
 }
 
-fn token_color(
-    class: TokenClass,
-    opacity: f32,
-    syntax: &std::collections::BTreeMap<String, [f32; 4]>,
-) -> [f32; 4] {
-    // Theme override: declaration.syntax_colors (key = TokenClass::name()).
-    if let Some(c) = syntax.get(class.name()) {
-        return [c[0], c[1], c[2], c[3] * opacity];
-    }
-    let rgb: [f32; 3] = match class {
-        TokenClass::Keyword => [0.78, 0.55, 0.91],      // #C678DD
-        TokenClass::NodeKind => [0.31, 0.76, 1.0],      // #4FC1FF
-        TokenClass::NodeKey => [0.90, 0.75, 0.48],      // #E5C07B
-        TokenClass::Attribute => [0.34, 0.71, 0.76],    // #56B6C2
-        TokenClass::InputRef => [0.38, 0.69, 0.94],     // #61AFEF
-        TokenClass::ColorLiteral => [0.82, 0.60, 0.40], // #D19A66
-        TokenClass::NumericLiteral => [0.82, 0.60, 0.40],
-        TokenClass::StringLiteral => [0.60, 0.76, 0.47], // #98C379
-        TokenClass::Intent => [0.78, 0.47, 0.87],        // #C678DD
-        TokenClass::Comment => [0.36, 0.39, 0.44],       // #5C6370
-        TokenClass::Ident => [0.67, 0.70, 0.75],         // #ABB2BF
-    };
-    [rgb[0], rgb[1], rgb[2], opacity]
+/// Rebuild a color with a multiplied alpha (theme colors carry their own
+/// alpha; glyph opacity from the visual style is folded in here).
+fn rgba(color: [f32; 4], a: f32) -> [f32; 4] {
+    [color[0], color[1], color[2], color[3] * a]
 }
 
-fn default_text_color(opacity: f32) -> [f32; 4] {
-    [0.75, 0.78, 0.84, opacity]
-}
-
-fn line_number_color(current_row: bool, opacity: f32) -> [f32; 4] {
-    if current_row {
-        [0.72, 0.76, 0.83, opacity]
-    } else {
-        [0.36, 0.39, 0.44, opacity * 0.9]
-    }
-}
-
-fn selection_color() -> [f32; 4] {
-    [0.15, 0.31, 0.47, 0.55]
-}
-
-fn current_line_color() -> [f32; 4] {
-    [1.0, 1.0, 1.0, 0.035]
-}
-
-fn caret_color() -> [f32; 4] {
-    [1.0, 1.0, 1.0, 1.0]
-}
-
-fn completion_background_color() -> [f32; 4] {
-    [0.118, 0.141, 0.188, 0.97]
-}
-
-fn completion_selection_color() -> [f32; 4] {
-    [0.20, 0.30, 0.44, 0.85]
-}
-
-fn completion_kind_color(
-    kind: CompletionKind,
-    syntax: &std::collections::BTreeMap<String, [f32; 4]>,
-) -> [f32; 4] {
+fn completion_kind_color(kind: CompletionKind, theme: &EditorTheme) -> [f32; 4] {
     match kind {
-        CompletionKind::Keyword => token_color(TokenClass::Keyword, 1.0, syntax),
-        CompletionKind::NodeKind => token_color(TokenClass::NodeKind, 1.0, syntax),
-        CompletionKind::Attribute => token_color(TokenClass::Attribute, 1.0, syntax),
+        CompletionKind::Keyword => theme.token(TokenClass::Keyword, 1.0),
+        CompletionKind::NodeKind => theme.token(TokenClass::NodeKind, 1.0),
+        CompletionKind::Attribute => theme.token(TokenClass::Attribute, 1.0),
         CompletionKind::Input | CompletionKind::InputKind => {
-            token_color(TokenClass::InputRef, 1.0, syntax)
+            theme.token(TokenClass::InputRef, 1.0)
         }
     }
 }
@@ -497,6 +444,7 @@ impl super::UiWgpuRenderer {
             }
             let state = editors.get_mut(path).expect("path from editors keys");
             let declaration = &state.declaration;
+            let theme = editor_theme_from(declaration);
             // Whole-editor text material: the code_editor node declares a
             // `text_material` clause like any text node, the effect lands in
             // node_text_materials under the full fragment/node path, and this
@@ -574,7 +522,7 @@ impl super::UiWgpuRenderer {
                             height: row_height,
                         },
                         visual.clip,
-                        current_line_color(),
+                        theme.current_line,
                     ));
                 }
             }
@@ -611,7 +559,7 @@ impl super::UiWgpuRenderer {
                             height: row_height,
                         },
                         visual.clip,
-                        selection_color(),
+                        theme.selection,
                     ));
                 }
             }
@@ -633,7 +581,11 @@ impl super::UiWgpuRenderer {
                     let number_width = line_full_advance(font, &number_text, raster_px);
                     let mut x = visual.bounds.x + (gutter_width - 10.0) - number_width;
                     let is_current = state.focus && row == state.caret.line;
-                    let color = line_number_color(is_current, opacity);
+                    let color = if is_current {
+                        rgba(theme.line_number_current, opacity)
+                    } else {
+                        rgba(theme.line_number, opacity * 0.9)
+                    };
                     for ch in number_text.chars() {
                         let Ok(glyph) = ensure_glyph(device, queue, font, ch, raster_px) else {
                             continue;
@@ -669,10 +621,8 @@ impl super::UiWgpuRenderer {
                     let color = highlight
                         .and_then(|tokens| tokens.class_at(column))
                         .map_or_else(
-                            || default_text_color(opacity),
-                            |class| {
-                                token_color(class, opacity, &state.declaration.syntax_colors)
-                            },
+                            || rgba(theme.text, opacity),
+                            |class| theme.token(class, opacity),
                         );
                     let Ok(glyph) = ensure_glyph(device, queue, font, ch, raster_px) else {
                         continue;
@@ -773,9 +723,33 @@ impl super::UiWgpuRenderer {
                     // dedicated entry. Glyph routing mirrors the text-node
                     // path: expand rect/clip by the material overflow so a
                     // glow can paint outside the glyph box.
-                    let class_material = highlight
-                        .and_then(|tokens| tokens.class_at(column))
-                        .and_then(|class| declaration.token_materials.get(class.name()));
+                    // Selected spans (if the editor declares `selection_shader`)
+                    // get the glow material in preference to the class shader;
+                    // without a selection material the class/fallback stands.
+                    let class_material = {
+                        let base = highlight
+                            .and_then(|tokens| tokens.class_at(column))
+                            .and_then(|class| declaration.token_materials.get(class.name()));
+                        let in_selection = match state.selection_anchor {
+                            Some(anchor) => {
+                                let (s, e) = ordered_selection(anchor, state.caret);
+                                row >= s.line
+                                    && row <= e.line
+                                    && column >= if row == s.line { s.column } else { 0 }
+                                    && column < if row == e.line { e.column } else { u32::MAX }
+                            }
+                            None => false,
+                        };
+                        if in_selection {
+                            state
+                                .declaration
+                                .selection_material
+                                .as_ref()
+                                .or(base)
+                        } else {
+                            base
+                        }
+                    };
                     if let Some(text_material) = class_material {
                         instance.rect[0] -= text_material.overflow[0];
                         instance.rect[1] -= text_material.overflow[1];
@@ -910,7 +884,7 @@ impl super::UiWgpuRenderer {
                             height: (row_height - 2.0).max(2.0),
                         },
                         visual.clip,
-                        caret_color(),
+                        theme.caret,
                     ));
                 }
             }
@@ -965,7 +939,7 @@ impl super::UiWgpuRenderer {
                     output.editor_popup_rects.push(overlay_instance(
                         popup_bounds,
                         popup_clip,
-                        completion_background_color(),
+                        theme.popup_background,
                     ));
                     let text_start_y = popup_y + COMPLETION_PAD * 0.5;
                     for (item_index, item) in completion.items.iter().enumerate() {
@@ -982,7 +956,7 @@ impl super::UiWgpuRenderer {
                                     height: item_height,
                                 },
                                 popup_clip,
-                                completion_selection_color(),
+                                theme.popup_selection,
                             ));
                         }
                         let mut ix = popup_x + COMPLETION_PAD;
@@ -999,7 +973,7 @@ impl super::UiWgpuRenderer {
                                     glyph.width,
                                     glyph.height,
                                 ],
-                                color: completion_kind_color(item.kind, &state.declaration.syntax_colors),
+                                color: completion_kind_color(item.kind, &theme),
                                 clip: [
                                     popup_clip.x,
                                     popup_clip.y,

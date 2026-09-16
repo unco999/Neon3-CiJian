@@ -3794,6 +3794,16 @@ pub struct UiCodeEditorDeclaration {
     /// for transient / emphasis effects and are NOT needed for normal syntax.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub syntax_colors: std::collections::BTreeMap<String, [f32; 4]>,
+    /// Chrome (non-syntax) color overrides keyed by UI_COLOR_KEYS name:
+    /// "text", "line_number", "line_number_current", "selection",
+    /// "current_line", "caret", "popup_background", "popup_selection".
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub ui_colors: std::collections::BTreeMap<String, [f32; 4]>,
+    /// Optional text material for glyphs inside the current selection
+    /// (selected-word glow). Transient by nature; falls back to the token
+    /// material / theme color when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection_material: Option<UiTextMaterialRef>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

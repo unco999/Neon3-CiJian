@@ -21,6 +21,8 @@ use neon_ui_schema::{
 use serde_json::{Value, json};
 
 pub(crate) mod editor_renderer;
+pub(crate) mod editor_theme;
+pub use editor_theme::{EditorTheme, UI_COLOR_KEYS, editor_theme_from};
 
 const SHADER: &str = r#"
 struct View { viewport: vec2<f32>, color_mode: u32, time_seconds: f32, extras: array<vec4<f32>, 10> }

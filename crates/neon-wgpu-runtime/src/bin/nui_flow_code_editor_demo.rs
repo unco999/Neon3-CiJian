@@ -274,6 +274,24 @@ fn text_material(input: TextMaterialInput) -> vec4<f32> {
 }
 "#;
 
+/// Selected-word glow: restrained cyan energy edge with a slow pulse. This is
+/// the third editor shader behavior (selection highlight) and it is transient
+/// by nature — the glow rides the current selection.
+const SELECTION_GLOW_SOURCE: &str = r#"
+fn text_material(input: TextMaterialInput) -> vec4<f32> {
+    let t = input.time_seconds;
+    let pulse = 0.5 + 0.5 * sin(t * 3.0);
+    let holo = vec3<f32>(0.45, 0.85, 1.0);
+    let base = input.base_color.rgb;
+    // Energy rim: glyph-edge ink picks up the cyan glow.
+    let edge = smoothstep(0.15, 0.6, input.edge_ink);
+    let core = smoothstep(0.05, 0.5, input.coverage);
+    let rgb = mix(base, holo, 0.22 + 0.22 * pulse) + holo * edge * (0.45 + 0.45 * pulse);
+    let alpha = clamp(core + edge * 0.5, 0.0, 1.0);
+    return vec4<f32>(rgb, alpha);
+}
+"#;
+
 fn register_text_shader_package(wgpu_endpoint: SocketAddr) {
     let packages = [
         (
@@ -310,6 +328,11 @@ fn register_text_shader_package(wgpu_endpoint: SocketAddr) {
             "text-delete-fragment",
             TEXT_DELETE_FRAGMENT_SOURCE,
             "code-editor-demo-register-delete-fragment-v1",
+        ),
+        (
+            "selection-glow",
+            SELECTION_GLOW_SOURCE,
+            "code-editor-demo-register-selection-glow-v1",
         ),
     ];
     let mut last_error = String::new();

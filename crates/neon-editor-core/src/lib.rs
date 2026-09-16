@@ -77,6 +77,7 @@ impl EditorCore {
         }
     }
 
+    /// The underlying editable text buffer.
     pub fn buffer(&self) -> &TextBuffer {
         &self.buffer
     }
@@ -106,6 +107,12 @@ impl EditorCore {
         self.symbols = SymbolIndex::build(&self.buffer, &self.grammar);
         self.session.set_revision(revision);
         self.host_text = source.to_string();
+    }
+
+    /// Clamp any position into the buffer's valid range (SDK convenience;
+    /// the render layer uses this after undo/redo and pointer moves).
+    pub fn clamp_position(&self, position: Position) -> Position {
+        self.buffer.clamp_position(position)
     }
 
     pub fn insert(&mut self, position: Position, text: &str) -> Position {
@@ -147,6 +154,7 @@ impl EditorCore {
         removed
     }
 
+    /// Undo the last session step, returns the new caret position.
     pub fn undo(&mut self) -> Option<u32> {
         let first = self.session.undo(&mut self.buffer)?;
         self.after_edit(first);

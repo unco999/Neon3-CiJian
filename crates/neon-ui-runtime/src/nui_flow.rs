@@ -258,7 +258,9 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
                 || content.starts_with("material ")
                 || content.starts_with("text_material ")
                 || content.starts_with("token_shader ")
-                || content.starts_with("syntax "))
+                || content.starts_with("syntax ")
+                || content.starts_with("ui_color ")
+                || content.starts_with("selection_shader "))
         {
             let parent = stack.last_mut().ok_or_else(|| {
                 error(
@@ -303,6 +305,38 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
                         )
                     })?;
                 editor.syntax_colors.insert(class, color);
+            } else if content.starts_with("ui_color ") {
+                // Chrome theme override: `ui_color <name> <#RRGGBB[AA]>`
+                // where name is one of UI_COLOR_KEYS.
+                let (name, color) = parse_ui_color_line(content, line)?;
+                let editor = code_editors
+                    .get_mut(&parent.1.node.node_id.0)
+                    .ok_or_else(|| {
+                        error(
+                            "nui_flow_orphan_ui_color",
+                            "ui_color requires a code_editor parent",
+                            line,
+                            1,
+                        )
+                    })?;
+                editor.ui_colors.insert(name, color);
+            } else if content.starts_with("selection_shader ") {
+                // Selected-word glow: same material syntax as text_material.
+                let material = parse_text_material_line(
+                    &format!("text_material{}", &content["selection_shader".len()..]),
+                    line,
+                )?;
+                let editor = code_editors
+                    .get_mut(&parent.1.node.node_id.0)
+                    .ok_or_else(|| {
+                        error(
+                            "nui_flow_orphan_selection_shader",
+                            "selection_shader requires a code_editor parent",
+                            line,
+                            1,
+                        )
+                    })?;
+                editor.selection_material = Some(material);
             } else {
                 parent.1.text_material = Some(parse_text_material_line(content, line)?);
             }
@@ -4395,6 +4429,8 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
             gutter_diagnostics: code_editor_gutter_diagnostics,
             token_materials: BTreeMap::new(),
             syntax_colors: BTreeMap::new(),
+            ui_colors: BTreeMap::new(),
+            selection_material: None,
         })
     } else {
         None
@@ -4988,6 +5024,50 @@ fn parse_text_material_line(text: &str, line: u32) -> FlowResult<UiTextMaterialR
         )
     })?;
     Ok(material)
+}
+
+/// Parses `ui_color <name> <#RRGGBB[AA]>` — one chrome theme override.
+fn parse_ui_color_line(text: &str, line: u32) -> FlowResult<(String, [f32; 4])> {
+    let mut parts = text.split_whitespace();
+    if parts.next() != Some("ui_color") {
+        return Err(error(
+            "nui_flow_invalid_ui_color",
+            "ui_color line must start with ui_color",
+            line,
+            1,
+        ));
+    }
+    let name = parts
+        .next()
+        .ok_or_else(|| {
+            error(
+                "nui_flow_invalid_ui_color",
+                "ui_color requires a chrome color name",
+                line,
+                1,
+            )
+        })?
+        .to_string();
+    let hex = parts
+        .next()
+        .ok_or_else(|| {
+            error(
+                "nui_flow_invalid_ui_color",
+                "ui_color requires a #RRGGBB or #RRGGBBAA color",
+                line,
+                1,
+            )
+        })?;
+    if parts.next().is_some() {
+        return Err(error(
+            "nui_flow_invalid_ui_color",
+            "ui_color takes exactly a name and a color",
+            line,
+            1,
+        ));
+    }
+    let color = parse_hex_color(hex, line)?;
+    Ok((name, color))
 }
 
 /// Parses `syntax <class> <#RRGGBB[AA]>` — one token class theme override.

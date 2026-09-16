@@ -29,3 +29,5 @@ surface root column w 960 h 680 fill #0B1216
     text oneshot_row value "一次性霓虹 One-shot —— 5 秒后回落默认文本" w 940 h 22
       text_material pulse-neon-text overflow 8 6 8 6 duration 5000
   code_editor source-view source $document language nui_flow line_numbers true wrap none font_size 17 tab_size 4 gutter_diagnostics true value "surface root column w 600 h 420 gap 8\n  panel header row gap 6 fill #102030\n    text title value \"Neon3 地形工作台\"\n    button open value \"打开\" event terrain.open\n    button run value \"运行\" event terrain.run\n  panel body column gap 4 fill #0C1820\n    text hint value \"输入即提示补全（如 p→panel），↑↓ 选择，Enter/Tab 接受，Esc 关闭；Ctrl+Z/Y 撤销重做，Ctrl+S 提交\"\n" event editor.commit
+    selection_shader selection-glow overflow 10 8 10 8
+    ui_color selection #1E4A67
