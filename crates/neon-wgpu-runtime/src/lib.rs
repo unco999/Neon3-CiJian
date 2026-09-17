@@ -11121,6 +11121,7 @@ fn handle_window_external_pointer(
         }
     };
     let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+    let _t = std::time::Instant::now();
     if proxy
         .send_event(WindowCommand::ExternalPointerEvent {
             event,
@@ -11136,7 +11137,7 @@ fn handle_window_external_pointer(
         );
     }
     match completed_rx.recv_timeout(Duration::from_secs(5)) {
-        Ok(Ok(result)) => runtime.accept(request.request_id, result),
+        Ok(Ok(result)) => { let dt = _t.elapsed(); if dt > std::time::Duration::from_millis(100) { eprintln!("[wgpu] pointer wait main: {:?}", dt); } runtime.accept(request.request_id, result) },
         Ok(Err(error)) => runtime.reject(request.request_id, &error, &error, None),
         Err(_) => runtime.reject(
             request.request_id,

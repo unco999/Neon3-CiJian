@@ -3327,7 +3327,7 @@ impl UiRuntime {
         // previous completion. A synchronous forward still preserves the
         // single ordered command lane and guarantees one click -> one
         // publication -> one fragment submission.
-        runtime.async_host_forward = false;
+        runtime.async_host_forward = true;
         let (host_completion_tx, host_completion_rx) = mpsc::channel();
         let mut active_host_forwards = 0_usize;
         let result = server.serve_until(|request| {
@@ -4088,6 +4088,7 @@ impl UiRuntime {
             return Ok(response);
         }
         // Sync path: host RPC + publication application synchronously.
+        let _t_hrpc = std::time::Instant::now();
         let host_response = match RpcClient::connect(host_endpoint)
             .and_then(|client| client.with_timeout(std::time::Duration::from_millis(200)))
             .and_then(|mut client| client.call(&forwarded))
@@ -4120,6 +4121,7 @@ impl UiRuntime {
             }
             Err(error) => return Err(error.into()),
         };
+        eprintln!("[host] host_rpc: {:?}", _t_hrpc.elapsed());
         self.complete_host_forward(wgpu_endpoint, prep, host_response, next_flow_state_machine)
     }
 
@@ -4134,6 +4136,7 @@ impl UiRuntime {
         host_response: RpcResponse,
         next_flow_state_machine: Option<NuiFlowStateMachineRuntime>,
     ) -> Result<RpcResponse, TransportError> {
+        let _t = std::time::Instant::now();
         let request_id = prep.request_id.clone();
         let idempotency_key = prep.idempotency_key.clone();
         let context = prep.context.clone();
@@ -4360,7 +4363,10 @@ impl UiRuntime {
             expected_revision: Some(fragment.revision),
             idempotency_key: Some(format!("ui-host-fragment:{idempotency_key}")),
         };
+        let _t_frag = std::time::Instant::now();
+        eprintln!("[host] before_frag: {:?}", _t.elapsed());
         let mut response = self.forward_fragment(wgpu_endpoint, submit)?;
+        eprintln!("[host] forward_fragment: {:?}", _t_frag.elapsed());
         if let Some(context) = &context {
             let stage = if response.status == RpcStatus::Accepted {
                 InteractionTraceStage::WgpuFragmentSubmissionAccepted

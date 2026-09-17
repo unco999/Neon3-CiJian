@@ -230,13 +230,18 @@ impl RpcServer {
         F: FnMut(RpcRequest) -> (RpcResponse, bool),
     {
         loop {
+            let t0 = std::time::Instant::now();
             let (mut stream, _) = self.listener.accept().map_err(map_io_error)?;
-            let request = match read_json_frame(&mut stream, self.max_frame_size) {
+            let request: RpcRequest = match read_json_frame(&mut stream, self.max_frame_size) {
                 Ok(request) => request,
                 Err(TransportError::ConnectionClosed) => continue,
                 Err(error) => return Err(error),
             };
+            let method = request.method.clone();
+            let t1 = std::time::Instant::now();
             let (response, keep_serving) = handler(request);
+            let t2 = std::time::Instant::now();
+            eprintln!("[srv] {}: read={:?} handle={:?}", method, t1 - t0, t2 - t1);
             match write_json_frame(&mut stream, &response, self.max_frame_size) {
                 Ok(()) => {}
                 Err(TransportError::ConnectionClosed) => continue,
