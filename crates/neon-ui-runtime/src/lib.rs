@@ -69,7 +69,8 @@ use host_adapter::UiHostAdapter;
 pub use host_adapter::UiHostAdapterConfig;
 pub use nui_flow::{
     NuiFlowError, apply_nui_ir_patch, bind_nui_flow_resources, compile_nui_flow_program,
-    format_nui_flow, lower_nui_flow, lower_nui_flow_effects, parse_nui_flow, parse_nui_flow_patch,
+    find_node_mut, format_nui_flow, lower_nui_flow, lower_nui_flow_effects, parse_nui_flow,
+    parse_nui_flow_patch,
 };
 pub mod editor_component;
 pub use nui_state_machine::{
@@ -3590,13 +3591,18 @@ impl UiRuntime {
         let ops_arr = request.params.get("operations")
             .and_then(Value::as_array)
             .ok_or_else(|| TransportError::Io(std::io::Error::other("operations array required")))?;
+        let ops_clone = ops_arr.clone();
         let mut operations = Vec::new();
         for op in ops_arr {
             let kind = op.get("kind").and_then(Value::as_str).unwrap_or("set");
             let path = op.get("path").and_then(Value::as_str).unwrap_or("");
+            let property = op.get("property").and_then(Value::as_str).unwrap_or("");
+            // source_file is handled separately (updates code_editors map), skip in IR patch
+            if kind == "set" && property == "source_file" {
+                continue;
+            }
             let (kind_enum, payload) = match kind {
                 "set" => {
-                    let property = op.get("property").and_then(Value::as_str).unwrap_or("");
                     let raw_value = op.get("value").and_then(Value::as_str).unwrap_or("");
                     let payload_value = if property == "value" {
                         format!("\"{}\"", raw_value.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n"))
@@ -3632,8 +3638,39 @@ impl UiRuntime {
             expected_revision: Revision(revision),
             operations,
         };
-        let new_ir = apply_nui_ir_patch(&current_doc.ir, &patch)
+        let mut new_ir = apply_nui_ir_patch(&current_doc.ir, &patch)
             .map_err(|e| TransportError::Io(std::io::Error::other(format!("patch apply: {e:?}"))))?;
+        // Apply source_file overrides from structured operations (set path property=source_file value="/abs/path").
+        for op in &ops_clone {
+            if op.get("kind").and_then(Value::as_str) == Some("set")
+                && op.get("property").and_then(Value::as_str) == Some("source_file")
+            {
+                if let (Some(node_key), Some(new_path)) = (
+                    op.get("path").and_then(Value::as_str),
+                    op.get("value").and_then(Value::as_str),
+                ) {
+                    if let Some(decl) = new_ir.code_editors.get_mut(node_key) {
+                        decl.source_file = Some(new_path.to_string());
+                    }
+                }
+            }
+        }
+        // If any code_editor has source_file set, read content from disk and
+        // update the node's text directly (no RPC transfer of file content).
+        let mut source_paths: Vec<(String, String)> = Vec::new();
+        for (node_key, decl) in &new_ir.code_editors {
+            if let Some(ref path) = decl.source_file {
+                match std::fs::read_to_string(path) {
+                    Ok(text) => source_paths.push((node_key.clone(), text)),
+                    Err(e) => eprintln!("[neon-ui-runtime] source_file read failed: {}: {}", path, e),
+                }
+            }
+        }
+        for (node_key, text) in &source_paths {
+            if let Some(node) = find_node_mut(&mut new_ir.root, node_key) {
+                node.text = Some(neon_ui_schema::TextRef::Literal { value: text.clone() });
+            }
+        }
         // Rebuild NuiFlowDocument with patched IR, preserving other fields.
         let mut new_doc = current_doc.clone();
         new_doc.ir = new_ir;

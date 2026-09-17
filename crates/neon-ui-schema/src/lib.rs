@@ -3777,6 +3777,11 @@ impl UiTransition {
 pub struct UiCodeEditorDeclaration {
     pub node_key: String,
     pub source_input_key: String,
+    /// Optional file path on disk. When set, the runtime reads file content
+    /// directly instead of routing through an input TextHandle. This avoids
+    /// transferring file contents over RPC for editor file switching.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_file: Option<String>,
     pub language: UiEditorLanguage,
     pub line_numbers: bool,
     pub wrap: UiEditorWrap,

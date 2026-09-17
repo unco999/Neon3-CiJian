@@ -3692,6 +3692,7 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
     let mut data_grid_columns = None;
     let mut data_grid_source = None;
     let mut code_editor_source = None;
+    let mut code_editor_source_file: Option<String> = None;
     let mut code_editor_language = neon_ui_schema::UiEditorLanguage::NuiFlow;
     let mut code_editor_line_numbers = true;
     let mut code_editor_wrap = neon_ui_schema::UiEditorWrap::None;
@@ -4082,6 +4083,13 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
                 }
                 code_editor_source = Some(key.into());
             }
+            "source_file" if component == "code_editor" => {
+                let value = *parts.get(index + 1).ok_or_else(|| {
+                    error("nui_flow_missing_value", "source_file requires a quoted path", line, 1)
+                })?;
+                index += 1;
+                code_editor_source_file = Some(quoted(value, line)?);
+            }
             "language" if component == "code_editor" => {
                 let value = *parts.get(index + 1).ok_or_else(|| {
                     error("nui_flow_missing_value", "language requires a value", line, 1)
@@ -4422,6 +4430,7 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
         Some(neon_ui_schema::UiCodeEditorDeclaration {
             node_key: node.node_id.0.clone(),
             source_input_key,
+            source_file: code_editor_source_file,
             language: code_editor_language,
             line_numbers: code_editor_line_numbers,
             wrap: code_editor_wrap,
@@ -6277,7 +6286,7 @@ fn format_data_grid_column(column: &UiDataGridColumn) -> String {
     }
 }
 
-fn find_node_mut<'a>(node: &'a mut UiNode, key: &str) -> Option<&'a mut UiNode> {
+pub fn find_node_mut<'a>(node: &'a mut UiNode, key: &str) -> Option<&'a mut UiNode> {
     if node.node_id.0 == key {
         return Some(node);
     }
