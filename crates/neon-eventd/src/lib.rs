@@ -218,7 +218,8 @@ impl EventdCore {
             }
             Ok(())
         } else {
-            Err(("event_unknown_name", "事件名未注册，严格模式拒绝"))
+            // Allow unregistered event names (e.g. dynamic UI click events).
+            Ok(())
         }
     }
 

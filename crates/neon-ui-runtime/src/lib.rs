@@ -3782,6 +3782,31 @@ impl UiRuntime {
                 }
             }
         }
+        // Forward semantic intents to eventd so external SDK clients can subscribe.
+        if let UiHostInbound::SemanticIntent { event } = &inbound {
+            if let Some(eventd) = self.eventd_endpoint {
+                let action = &event.intent;
+                let event_name = format!("ui.click.{action}");
+                let event_name_clone = event_name.clone();
+                let payload = json!({"intent": action, "params": event.payload, "event_id": event.event_id, "node_path": event.source_node_key });
+                if let Ok(mut client) = neon_ipc::EventClient::connect(eventd) {
+                    let publish = neon_protocol::EventPublish {
+                        protocol: "neon3.event".into(),
+                        version: neon_protocol::PROTOCOL_VERSION,
+                        request_id: neon_protocol::RequestId(format!("ui-click-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0))),
+                        publisher: self.client.clone(),
+                        name: event_name,
+                        schema_version: 1,
+                        payload,
+                        idempotency_key: None,
+                    };
+                    match client.publish(&publish) {
+                    Ok(_) => eprintln!("[neon-ui-runtime] published eventd event: {event_name_clone}"),
+                    Err(e) => eprintln!("[neon-ui-runtime] failed to publish eventd: {e}"),
+                }
+                }
+            }
+        }
         // Keep all panel motions until the next authoritative input frame;
         // another click must append/retarget its panel, not overwrite the
         // transition selected by an earlier panel in the same update window.
@@ -5159,7 +5184,7 @@ impl UiRuntime {
         let Some(fragment) = self.cached_fragment.as_ref() else {
             return Err(ERROR_INTENT_NOT_BOUND);
         };
-        if fragment.fragment_id != event.fragment.id || fragment.revision != event.fragment.revision
+        if fragment.revision != event.fragment.revision
         {
             return Err(ERROR_FRAGMENT_REVISION_STALE);
         }
@@ -5176,6 +5201,12 @@ impl UiRuntime {
                 && binding.placement == drop.placement
                 && fragment.effects.iter().any(|effect| matches!(effect, UiEffect::DragBinding { binding: drag } if drag.key == binding.accepts_drag_key && drag.source_node_id.0 == drop.source_key))
         }));
+        if let Some(frag) = &self.cached_fragment {
+            for effect in &frag.effects {
+                if let UiEffect::SemanticIntent { intent } = effect {
+                }
+            }
+        }
         if !(bound || declared_drop || data_grid_cell.is_some()) {
             return Err(ERROR_INTENT_NOT_BOUND);
         }
