@@ -225,14 +225,17 @@ fn collect_node(
     if start.row == end.row {
         push_span(per_line, start.row, start.column, end.column - start.column, class);
     } else {
-        // Multi-line node: emit only the first line's visible slice to keep
-        // the span contract (one line per entry) intact.
-        let line_len = text
-            .lines()
-            .nth(start.row)
-            .map_or(0, |line| line.chars().count());
-        if start.column < line_len {
-            push_span(per_line, start.row, start.column, line_len - start.column, class);
+        // Multi-line node (e.g. a triple-quoted or unterminated string):
+        // emit the class on every line it touches so continuation lines
+        // don't fall back to the default text color.
+        let line_count = per_line.len();
+        for row in start.row..=end.row.min(line_count - 1) {
+            let line_len = text.lines().nth(row).map_or(0, |l| l.chars().count());
+            let col_start = if row == start.row { start.column } else { 0 };
+            let col_end = if row == end.row { end.column } else { line_len };
+            if col_start < col_end {
+                push_span(per_line, row, col_start, col_end - col_start, class);
+            }
         }
     }
 }
