@@ -8751,6 +8751,37 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                             "release_without_semantic_binding".into()
                         };
                     }
+                    // Publish button click to eventd for external SDK subscription.
+                    if let Some(endpoint) = self.eventd_endpoint {
+                        let intent_opt = released.binding.intent.clone();
+                        if let Some(neon_ui_schema::UiIntent::Invoke { action, params }) = intent_opt {
+                            let params = params.clone();
+                            let node_path = released.binding.node_path.clone();
+                            let epoch = self.epoch;
+                            let seq = released.sequence;
+                            thread::spawn(move || {
+                                let publisher = ClientIdentity {
+                                    kind: ClientKind::WgpuRuntime,
+                                    instance_id: format!("window-{epoch}"),
+                                    pid: std::process::id(),
+                                    origin: "neon-wgpu-runtime".into(),
+                                };
+                                let publish = neon_protocol::EventPublish {
+                                    protocol: "neon3.event".into(),
+                                    version: PROTOCOL_VERSION,
+                                    request_id: RequestId(format!("ui-click-{epoch}-{seq}")),
+                                    publisher,
+                                    name: format!("ui.click.{action}"),
+                                    schema_version: 1,
+                                    payload: json!({ "action": action, "node_path": node_path, "params": params }),
+                                    idempotency_key: Some(format!("ui-click:{epoch}:{seq}")),
+                                };
+                                if let Err(e) = EventClient::connect(endpoint).and_then(|mut c| c.publish(&publish)) {
+                                    eprintln!("[neon-wgpu-runtime] click event publish failed: {e}");
+                                }
+                            });
+                        }
+                    }
                     let interaction_id = self
                         .gpu
                         .as_mut()
