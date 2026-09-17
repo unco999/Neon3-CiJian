@@ -103,13 +103,17 @@ fn main() {
         let _ui_task = {
             let ui = ui;
             let wgpu = wgpu;
-            let editor = editor;
+            // Dead domain endpoint: the forwarder falls back to empty publications
+            // when host RPC fails, which is correct for self-contained FLOW apps
+            // whose state machines run locally.  Pointing at editor-runtime would
+            // make it reject `ui.host.inbound` instead of failing the connect.
+            let dead_domain: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
             let eventd = eventd;
             std::thread::spawn(move || {
                 if let Err(error) = neon_ui_runtime::UiRuntime::serve_forwarder(
                     ui,
                     wgpu,
-                    editor,
+                    dead_domain,
                     Some(eventd),
                     1,
                 ) {
