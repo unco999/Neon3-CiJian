@@ -3659,6 +3659,19 @@ impl UiRuntime {
         };
         let program = compile_nui_flow_program(&new_doc, revision)
             .map_err(|e| TransportError::Io(std::io::Error::other(format!("compile: {e:?}"))))?;
+
+        // Sync code_editor source slots: after patch, the code_editor node's new
+        // literal text has a fresh TextHandle. Update the input_schema slots so
+        // that adapter.activate() picks up the new source content.
+        for editor in new_doc.ir.code_editors.values() {
+            if let Some(lit) = program.literal_texts.iter().find(|l| l.node_key == editor.node_key) {
+                let slot_key = &editor.source_input_key;
+                if let Some(slot) = new_doc.input_schema.slots.iter_mut().find(|s| &s.key == slot_key) {
+                    slot.default_value = neon_ui_schema::UiInputValue::TextHandle { value: lit.handle };
+                }
+            }
+        }
+
         let fragment_revision = self.cached_fragment.as_ref()
             .map_or(Revision(1), |c| Revision(c.revision.0 + 1));
         let mut fragment = UiFragment {
