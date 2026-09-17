@@ -94,7 +94,31 @@ fn main() {
         // thread (eventd/editor keep running on their own threads).
         let wgpu = wgpu_endpoint;
         let ui = ui_endpoint;
+        let editor = editor_endpoint;
         let eventd = eventd_endpoint;
+
+        // Start the UI runtime forwarder on the UI endpoint.  It compiles
+        // FLOW source, activates the host adapter, and runs the FLOW state
+        // machine locally.
+        let _ui_task = {
+            let ui = ui;
+            let wgpu = wgpu;
+            let editor = editor;
+            let eventd = eventd;
+            std::thread::spawn(move || {
+                if let Err(error) = neon_ui_runtime::UiRuntime::serve_forwarder(
+                    ui,
+                    wgpu,
+                    editor,
+                    Some(eventd),
+                    1,
+                ) {
+                    eprintln!("[neon3-runtime] ui-runtime failed: {error}");
+                    std::process::exit(1);
+                }
+            })
+        };
+
         {
             let input_sink: Box<
                 dyn FnMut(
