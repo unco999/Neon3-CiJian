@@ -43,3 +43,35 @@ pub fn keywords_for(kind: LanguageKind) -> &'static [&'static str] {
         ],
     }
 }
+
+/// Common built-in type names for one language. Shown after `:` or in type
+/// position alongside keyword completions, so `let x: ` pops up i32/String/...
+pub fn types_for(kind: LanguageKind) -> &'static [&'static str] {
+    match kind {
+        LanguageKind::Rust => &[
+            "i8", "i16", "i32", "i64", "i128", "isize",
+            "u8", "u16", "u32", "u64", "u128", "usize",
+            "f32", "f64", "bool", "char", "str",
+            "String", "Vec", "VecDeque", "LinkedList", "HashMap", "HashSet",
+            "BTreeMap", "BTreeSet", "BinaryHeap",
+            "Box", "Rc", "Arc", "Cell", "RefCell", "Mutex", "RwLock",
+            "Option", "Result", "Either",
+            "Duration", "Instant", "SystemTime",
+            "Path", "PathBuf", "File", "DirEntry",
+            "Cow", "Borrow", "Cow",
+        ],
+        LanguageKind::Typescript => &[
+            "string", "number", "boolean", "void", "undefined", "null", "any", "unknown",
+            "never", "object", "Array", "Map", "Set", "Promise", "Date", "RegExp",
+            "Record", "Partial", "Pick", "Omit", "Exclude", "Extract", "NonNull",
+            "Readonly", "ReadonlyArray", "Tuple",
+        ],
+        LanguageKind::Cpp => &[
+            "int", "char", "bool", "float", "double", "void", "long", "short",
+            "unsigned", "signed", "size_t", "string", "vector", "map", "set",
+            "pair", "tuple", "optional", "variant", "unique_ptr", "shared_ptr",
+            "weak_ptr", "auto", "const",
+        ],
+        LanguageKind::NuiFlow => &[],
+    }
+}

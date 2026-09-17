@@ -30,6 +30,9 @@ const CLASS_FUNCTION: &str = "Function";
 const CLASS_MACRO: &str = "Macro";
 const CLASS_PROPERTY: &str = "Property";
 const CLASS_LIFETIME: &str = "Lifetime";
+const CLASS_OPERATOR: &str = "Operator";
+const CLASS_ESCAPE: &str = "Escape";
+const CLASS_DOCUMENTATION: &str = "Documentation";
 
 /// One token class's default One Dark color (RGB 0..1).
 fn one_dark_token(class: &str) -> [f32; 3] {
@@ -50,6 +53,9 @@ fn one_dark_token(class: &str) -> [f32; 3] {
         CLASS_MACRO => [0.82, 0.60, 0.40],          // #D19A66 (orange)
         CLASS_PROPERTY => [0.34, 0.71, 0.76],       // #56B6C2 (cyan)
         CLASS_LIFETIME => [0.88, 0.42, 0.46],       // #E06C75 (red)
+        CLASS_OPERATOR => [0.77, 0.80, 0.84],       // #C8CCD4 (light gray-blue)
+        CLASS_ESCAPE => [0.85, 0.55, 0.70],         // #D98CB2 (pink)
+        CLASS_DOCUMENTATION => [0.55, 0.75, 0.55],  // #8CBF8C (muted green)
         _ => [0.67, 0.70, 0.75],
     }
 }

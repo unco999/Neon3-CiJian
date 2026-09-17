@@ -1,4 +1,4 @@
-//! Closed, line-oriented NUI Flow authoring notation.
+﻿//! Closed, line-oriented NUI Flow authoring notation.
 //!
 //! Flow is deliberately parsed into the canonical JSON IR. It has no evaluator,
 //! expressions, callbacks, or source of domain truth.
@@ -5435,6 +5435,11 @@ fn attach(
 }
 fn reject_forbidden(text: &str, line: u32) -> FlowResult<()> {
     let rich_text_data = text.starts_with("text ") && text.contains(" rich ");
+    // code_editor lines carry source-code text in value, which legitimately
+    // contains braces, equals, arrows, etc.
+    if text.trim_start().starts_with("code_editor ") {
+        return Ok(());
+    }
     let array_decl = text.starts_with("input ") && text.contains("array[");
     // Binding references like $scores[0] may contain brackets.
     let has_index_binding = text.split_whitespace().any(|token| token.starts_with('$') && token.contains('['));

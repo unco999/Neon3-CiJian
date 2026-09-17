@@ -172,7 +172,14 @@ fn collect_node(
     let kind = node.kind();
     let class = match kind {
         "comment" | "line_comment" | "block_comment" | "comment_block" => {
-            Some(TokenClass::Comment)
+            // Check if it's a doc comment (/// or //!) — override to Documentation.
+            let text = &text[node.start_byte()..node.end_byte()];
+            let trimmed = text.trim_start();
+            if trimmed.starts_with("///") || trimmed.starts_with("//!") {
+                Some(TokenClass::Documentation)
+            } else {
+                Some(TokenClass::Comment)
+            }
         }
         "string" | "string_literal" | "raw_string_literal" | "char_literal"
         | "template_string" | "concatenated_string" | "interpreted_string_literal"
@@ -187,6 +194,10 @@ fn collect_node(
         | "assignment_identifier" => classify_identifier(node),
         "primitive_type" => Some(TokenClass::Type),
         "lifetime" => Some(TokenClass::Lifetime),
+        // Escape sequences inside strings: \n, \t, \\, \", \x41, \u{...}
+        "escape_sequence" => Some(TokenClass::Escape),
+        // Rust attributes: #[derive(Debug)], #[cfg(test)]
+        "attribute_item" | "inner_attribute_item" | "attribute" => Some(TokenClass::Attribute),
         _ => {
             // Keywords are anonymous nodes: their `kind()` is the literal
             // text ("fn", "let", "if", ...). Named nodes that do not match
@@ -199,7 +210,8 @@ fn collect_node(
                 if is_word {
                     Some(TokenClass::Keyword)
                 } else {
-                    None
+                    // Operator / punctuation nodes: + - * / = == != < > & | ! etc.
+                    Some(TokenClass::Operator)
                 }
             } else {
                 None

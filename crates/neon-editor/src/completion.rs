@@ -13,6 +13,7 @@ pub enum CompletionKind {
     Attribute,
     Input,
     InputKind,
+    Type,
     /// Generic language value (LSP-sourced completions for TS/Rust/C++).
     Value,
 }
@@ -309,13 +310,107 @@ pub fn keyword_completions(
                 replace_end: partial_end,
                 kind: CompletionKind::Keyword,
                 detail: format!("{} keyword", kind.name()),
-                sort_text: (*keyword).to_string(),
+                sort_text: format!("1:{keyword}"),
                 source: CompletionSource::Grammar,
                 commit_characters: vec![' '],
             });
         }
     }
+    // Type names: shown alongside keywords so `let x: ` pops up i32/String/...
+    for type_name in crate::languages::keywords::types_for(kind) {
+        if typed_lower.is_empty() || type_name.to_ascii_lowercase().starts_with(&typed_lower) {
+            candidates.push(CompletionItem {
+                item_id: format!("type:{type_name}"),
+                label: (*type_name).to_string(),
+                insert_text: (*type_name).to_string(),
+                replace_start: partial_start,
+                replace_end: partial_end,
+                kind: CompletionKind::Type,
+                detail: format!("{} type", kind.name()),
+                sort_text: format!("2:{type_name}"),
+                source: CompletionSource::Grammar,
+                commit_characters: vec![' '],
+            });
+        }
+    }
+    // Local identifiers: scan the buffer for let bindings, fn names, and type
+    // definitions so the user gets in-document completion.
+    collect_local_identifiers(buffer, kind, partial_start, partial_end, typed_lower, &mut candidates);
     candidates
+}
+
+/// Scan the buffer for user-defined identifiers (let bindings, fn names,
+/// struct/enum/trait names) and add matching ones as completion candidates.
+fn collect_local_identifiers(
+    buffer: &TextBuffer,
+    kind: crate::languages::LanguageKind,
+    start: Position,
+    end: Position,
+    typed_lower: String,
+    candidates: &mut Vec<CompletionItem>,
+) {
+    let mut seen = std::collections::HashSet::new();
+    let mut add = |name: &str, kind_label: &str, completion_kind: CompletionKind| {
+        if name.len() < 2 { return; }
+        if !seen.insert(name.to_string()) { return; }
+        if !typed_lower.is_empty() && !name.to_ascii_lowercase().starts_with(&typed_lower) {
+            return;
+        }
+        candidates.push(CompletionItem {
+            item_id: format!("local:{name}"),
+            label: name.to_string(),
+            insert_text: name.to_string(),
+            replace_start: start,
+            replace_end: end,
+            kind: completion_kind,
+            detail: kind_label.into(),
+            sort_text: format!("3:{name}"),
+            source: CompletionSource::Grammar,
+            commit_characters: vec![' '],
+        });
+    };
+
+    for line_idx in 0..buffer.line_count() {
+        let Some(line) = buffer.line(line_idx) else { continue };
+        let trimmed = line.trim_start();
+        // `let name =` or `let mut name =`
+        if trimmed.starts_with("let ") {
+            let rest = trimmed.trim_start_matches("let ").trim_start_matches("mut ").trim_start();
+            if let Some(sp) = rest.find(|c: char| c == '=' || c == ':' || c == ';') {
+                let name = rest[..sp].trim();
+                if is_ident(name) {
+                    add(name, "local variable", CompletionKind::Value);
+                }
+            }
+        }
+        // `fn name(`
+        if trimmed.starts_with("fn ") {
+            let rest = &trimmed[3..];
+            if let Some(open) = rest.find('(') {
+                let name = rest[..open].trim();
+                if is_ident(name) {
+                    add(name, "function", CompletionKind::Value);
+                }
+            }
+        }
+        // `struct Name`, `enum Name`, `trait Name`, `type Name =`
+        for kw in ["struct ", "enum ", "trait ", "type ", "impl "] {
+            if trimmed.starts_with(kw) {
+                let rest = &trimmed[kw.len()..];
+                let end = rest.find(|c: char| c == '{' || c == '<' || c == '=' || c.is_whitespace()).unwrap_or(rest.len());
+                let name = rest[..end].trim();
+                if is_ident(name) {
+                    add(name, "type", CompletionKind::Type);
+                }
+            }
+        }
+    }
+}
+
+/// Is `s` a valid Rust-like identifier (alphanumeric + underscore, starts with letter)?
+fn is_ident(s: &str) -> bool {
+    !s.is_empty() && s.chars().next().map_or(false, |c| c.is_alphabetic() || c == '_')
+        && s.chars().all(|c| c.is_alphanumeric() || c == '_')
 }
 
 /// The trailing identifier-ish token of `prefix` (letters, digits, `_`).

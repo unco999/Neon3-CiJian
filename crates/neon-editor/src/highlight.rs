@@ -33,6 +33,12 @@ pub enum TokenClass {
     Property,
     /// Lifetime (e.g. `'a`).
     Lifetime,
+    /// Operator / punctuation (e.g. `+`, `==`, `->`, `=>`, `&`, `*`).
+    Operator,
+    /// Escape sequence inside a string (e.g. `\n`, `\t`, `\\`).
+    Escape,
+    /// Doc comment (e.g. `///`, `//!`).
+    Documentation,
 }
 
 impl TokenClass {
@@ -57,6 +63,9 @@ impl TokenClass {
             TokenClass::Macro => "Macro",
             TokenClass::Property => "Property",
             TokenClass::Lifetime => "Lifetime",
+            TokenClass::Operator => "Operator",
+            TokenClass::Escape => "Escape",
+            TokenClass::Documentation => "Documentation",
         }
     }
 }
