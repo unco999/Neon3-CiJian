@@ -1,4 +1,4 @@
-//! Headless UI declaration runtime. It must not create windows or GPU objects.
+﻿//! Headless UI declaration runtime. It must not create windows or GPU objects.
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
@@ -3365,6 +3365,16 @@ impl UiRuntime {
                     .unwrap_or_else(|error| {
                         runtime.rejected(request_id, "ui_flow_submit_failed", &error.to_string())
                     })
+            } else if request.method == "ui.flow.patch" {
+                eprintln!(
+                    "[neon-ui-runtime] received ui.flow.patch request={}",
+                    request.request_id.0
+                );
+                runtime
+                    .apply_flow_patch(wgpu_endpoint, request)
+                    .unwrap_or_else(|error| {
+                        runtime.rejected(request_id, "ui_flow_patch_failed", &error.to_string())
+                    })
             } else if request.method == "ui.host.inbound" {
                 runtime
                     .forward_host_request(domain_endpoint, wgpu_endpoint, request)
@@ -3558,6 +3568,84 @@ impl UiRuntime {
                 "surface_id": document.ir.surface_id,
                 "renderer": enriched.result,
             }));
+            return Ok(enriched);
+        }
+        Ok(response)
+    }
+
+    /// Apply an incremental patch to the current flow document.
+    pub fn apply_flow_patch(
+        &mut self,
+        wgpu_endpoint: SocketAddr,
+        request: RpcRequest,
+    ) -> Result<RpcResponse, TransportError> {
+        let patch_source = request.params
+            .get("patch").and_then(Value::as_str)
+            .ok_or_else(|| TransportError::Io(std::io::Error::other("patch source required")))?;
+        let current_doc = self.flow_document.as_ref()
+            .ok_or_else(|| TransportError::Io(std::io::Error::other("no active flow")))?;
+        let patch = parse_nui_flow_patch(patch_source)
+            .map_err(|e| TransportError::Io(std::io::Error::other(format!("patch parse: {e:?}"))))?;
+        let new_ir = apply_nui_ir_patch(&current_doc.ir, &patch)
+            .map_err(|e| TransportError::Io(std::io::Error::other(format!("patch apply: {e:?}"))))?;
+        // Rebuild NuiFlowDocument with patched IR, preserving other fields.
+        let mut new_doc = current_doc.clone();
+        new_doc.ir = new_ir;
+        let revision = UiProgramRevision {
+            program_id: new_doc.ir.surface_id.0.clone(),
+            revision: new_doc.ir.revision,
+            schema_version: neon_ui_schema::UI_PROGRAM_SCHEMA_VERSION,
+            capabilities: [
+                neon_ui_schema::UI_PROGRAM_CAPABILITY_NAME,
+                neon_ui_schema::UI_PROGRAM_TEXT_REGISTRY_CAPABILITY_NAME,
+                neon_ui_schema::UI_PROGRAM_BOUNDED_STRUCTURE_CAPABILITY_NAME,
+                neon_ui_schema::UI_PROGRAM_SEMANTIC_EVENT_CAPABILITY_NAME,
+                neon_ui_schema::UI_NINE_SLICE_CAPABILITY_NAME,
+                neon_ui_schema::UI_COMPONENT_SKIN_CAPABILITY_NAME,
+                neon_ui_schema::UI_CANVAS_POINTS_LINES_CAPABILITY_NAME,
+                neon_ui_schema::UI_TIMELINE_ANIMATION_CAPABILITY_NAME,
+                neon_ui_schema::UI_CODE_EDITOR_CAPABILITY_NAME,
+            ].into_iter().map(|n| UiProgramCapability {
+                name: n.into(), version: 1,
+                owner: UiProgramCapabilityOwner::SharedContract,
+                status: UiProgramCapabilityStatus::Supported,
+            }).collect(),
+        };
+        let program = compile_nui_flow_program(&new_doc, revision)
+            .map_err(|e| TransportError::Io(std::io::Error::other(format!("compile: {e:?}"))))?;
+        let fragment_revision = self.cached_fragment.as_ref()
+            .map_or(Revision(1), |c| Revision(c.revision.0 + 1));
+        let mut fragment = UiFragment {
+            fragment_id: UiFragmentId(new_doc.ir.surface_id.0.clone()),
+            revision: fragment_revision,
+            root: new_doc.ir.root.clone(),
+            effects: lower_nui_flow_effects(&new_doc),
+        };
+        let adapter = UiHostAdapter::activate(program.clone(), new_doc.input_schema.clone(), self.epoch)
+            .map_err(|e| TransportError::Io(std::io::Error::other(e.message)))?
+            .with_event_publisher(self.eventd_endpoint, self.client.clone());
+        let initial_inputs = adapter.snapshot().scalar_inputs;
+        refresh_fragment_from_program(&mut fragment, &program, &initial_inputs, &new_doc.input_schema);
+        self.host_adapter = Some(adapter);
+        let forwarded = RpcRequest {
+            protocol: "neon3.rpc".into(),
+            version: PROTOCOL_VERSION,
+            request_id: request.request_id.clone(),
+            client: self.client.clone(),
+            target: ServiceName("ui-runtime".into()),
+            method: "ui.fragment.submit".into(),
+            params: json!(UiCommand::SubmitFragment {
+                submission: UiFragmentSubmission::new(fragment)
+            }),
+            expected_revision: None,
+            idempotency_key: request.idempotency_key.clone(),
+        };
+        let response = self.forward_fragment(wgpu_endpoint, forwarded)?;
+        if response.status == RpcStatus::Accepted {
+            self.flow_state_machine = Some(NuiFlowStateMachineRuntime::new(&new_doc));
+            self.flow_document = Some(new_doc.clone());
+            let mut enriched = response;
+            enriched.result = Some(json!({"state": "patched", "program_revision": program.revision}));
             return Ok(enriched);
         }
         Ok(response)
