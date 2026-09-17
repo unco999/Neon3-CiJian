@@ -539,15 +539,16 @@ impl EditorComponent {
         let old_row = row_height;
         let new_row = old_row * (self.font_scale / old.max(f32::EPSILON)).max(f32::EPSILON);
         if new_row > 0.0 {
-            let anchor_y = self.scroll_y + viewport_height * 0.5;
-            self.scroll_y = (anchor_y / old_row.max(f32::EPSILON)) * new_row - viewport_height * 0.5;
+            // Anchor on the top-left so zoom keeps the current line pinned.
+            let anchor_y = self.scroll_y;
+            self.scroll_y = (anchor_y / old_row.max(f32::EPSILON)) * new_row;
         }
         let viewport_w = (viewport_width - gutter_width).max(1.0);
         let old_advance = self.declaration.font_size * old * MONO_ADVANCE_FACTOR;
         let new_advance = self.declaration.font_size * self.font_scale * MONO_ADVANCE_FACTOR;
         if new_advance > 0.0 && old_advance > 0.0 {
-            let anchor_x = self.scroll_x + viewport_w * 0.5;
-            self.scroll_x = (anchor_x / old_advance) * new_advance - viewport_w * 0.5;
+            let anchor_x = self.scroll_x;
+            self.scroll_x = (anchor_x / old_advance) * new_advance;
         }
         self.clamp_scroll_approx();
         self.revision += 1;
