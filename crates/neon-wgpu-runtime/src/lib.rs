@@ -1942,7 +1942,37 @@ impl WindowedRuntime {
                     control_value: released.control_value,
                     drag_drop: None,
                 };
-                self.redraw_pending = true;
+                // Publish button click to eventd for external SDK subscription.
+                if let Some(endpoint) = self.eventd_endpoint {
+                    if let neon_ui_schema::UiIntent::Invoke { ref action, ref params } = semantic_event.intent {
+                        let action = action.clone();
+                        let params = params.clone();
+                        let node_path = released.binding.node_path.clone();
+                        let epoch = self.epoch;
+                        let seq = released.sequence;
+                        thread::spawn(move || {
+                            let publisher = ClientIdentity {
+                                kind: ClientKind::WgpuRuntime,
+                                instance_id: format!("window-{epoch}"),
+                                pid: std::process::id(),
+                                origin: "neon-wgpu-runtime".into(),
+                            };
+                            let publish = neon_protocol::EventPublish {
+                                protocol: "neon3.event".into(),
+                                version: PROTOCOL_VERSION,
+                                request_id: RequestId(format!("ui-click-{epoch}-{seq}")),
+                                publisher,
+                                name: format!("ui.click.{action}"),
+                                schema_version: 1,
+                                payload: json!({ "action": action, "node_path": node_path, "params": params }),
+                                idempotency_key: Some(format!("ui-click:{epoch}:{seq}")),
+                            };
+                            if let Err(e) = EventClient::connect(endpoint).and_then(|mut c| c.publish(&publish)) {
+                                eprintln!("[neon-wgpu-runtime] click event publish failed: {e}");
+                            }
+                        });
+                    }
+                }
                 Ok(json!({"semantic_event": semantic_event}))
             }
             UiPointerEventType::Wheel => {
