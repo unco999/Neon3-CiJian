@@ -6323,10 +6323,17 @@ fn set_node(
         }
         "w" => node.bounds.width = number(value, span.line)?,
         "h" => node.bounds.height = number(value, span.line)?,
+        "fill" => {
+            let c = parse_hex_color(value, span.line)?;
+            node.style.background_color = c;
+        }
+        "opacity" => {
+            node.style.opacity = number(value, span.line)?;
+        }
         _ => {
             return Err(error_at(
                 "nui_flow_invalid_patch",
-                "set supports enabled, visible, value, w, and h",
+                "set supports enabled, visible, value, w, h, fill, opacity",
                 span,
             ));
         }

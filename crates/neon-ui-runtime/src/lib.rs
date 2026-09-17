@@ -3574,18 +3574,64 @@ impl UiRuntime {
     }
 
     /// Apply an incremental patch to the current flow document.
+    /// Accepts structured operations JSON: { revision: N, operations: [...] }
     pub fn apply_flow_patch(
         &mut self,
         wgpu_endpoint: SocketAddr,
         request: RpcRequest,
     ) -> Result<RpcResponse, TransportError> {
-        let patch_source = request.params
-            .get("patch").and_then(Value::as_str)
-            .ok_or_else(|| TransportError::Io(std::io::Error::other("patch source required")))?;
         let current_doc = self.flow_document.as_ref()
             .ok_or_else(|| TransportError::Io(std::io::Error::other("no active flow")))?;
-        let patch = parse_nui_flow_patch(patch_source)
-            .map_err(|e| TransportError::Io(std::io::Error::other(format!("patch parse: {e:?}"))))?;
+
+        // Build UiIrPatch from structured params (bypasses text patch restrictions).
+        let revision = request.params.get("revision")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| TransportError::Io(std::io::Error::other("revision required")))?;
+        let ops_arr = request.params.get("operations")
+            .and_then(Value::as_array)
+            .ok_or_else(|| TransportError::Io(std::io::Error::other("operations array required")))?;
+        let mut operations = Vec::new();
+        for op in ops_arr {
+            let kind = op.get("kind").and_then(Value::as_str).unwrap_or("set");
+            let path = op.get("path").and_then(Value::as_str).unwrap_or("");
+            let (kind_enum, payload) = match kind {
+                "set" => {
+                    let property = op.get("property").and_then(Value::as_str).unwrap_or("");
+                    let raw_value = op.get("value").and_then(Value::as_str).unwrap_or("");
+                    let payload_value = if property == "value" {
+                        format!("\"{}\"", raw_value.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n"))
+                    } else {
+                        raw_value.to_string()
+                    };
+                    (neon_ui_schema::UiIrPatchOperationKind::Set,
+                     Some(json!({"property": property, "value": payload_value})))
+                }
+                "insert" => {
+                    let k = op.get("kind_name").and_then(Value::as_str).unwrap_or("panel");
+                    let key = op.get("node_key").and_then(Value::as_str).unwrap_or("new");
+                    (neon_ui_schema::UiIrPatchOperationKind::Insert,
+                     Some(json!({"kind": k, "key": key})))
+                }
+                "remove" => (neon_ui_schema::UiIrPatchOperationKind::Remove, None),
+                "move" => {
+                    let parent = op.get("parent").and_then(Value::as_str).unwrap_or("root");
+                    (neon_ui_schema::UiIrPatchOperationKind::Move,
+                     Some(json!({"parent": parent})))
+                }
+                _ => return Err(TransportError::Io(std::io::Error::other(format!("unknown op kind: {kind}")))),
+            };
+            operations.push(neon_ui_schema::UiIrPatchOperation {
+                kind: kind_enum,
+                target_path: path.into(),
+                expected_revision: Revision(revision),
+                payload,
+                source_span: neon_ui_schema::NuiSourceSpan { line: 0, column: 0, end_line: 0, end_column: 0 },
+            });
+        }
+        let patch = neon_ui_schema::UiIrPatch {
+            expected_revision: Revision(revision),
+            operations,
+        };
         let new_ir = apply_nui_ir_patch(&current_doc.ir, &patch)
             .map_err(|e| TransportError::Io(std::io::Error::other(format!("patch apply: {e:?}"))))?;
         // Rebuild NuiFlowDocument with patched IR, preserving other fields.
