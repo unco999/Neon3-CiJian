@@ -2,6 +2,24 @@
 
 All notable changes to Neon3 are recorded in this file.
 
+## Unreleased
+
+### Fixed
+
+- **Formal editor visual reveal acknowledgements.** `editor.visual.reveal` now
+  validates the operation identity, distinct document identity, canonical
+  one-based-line/zero-based-column range, and optional document revision before
+  applying the reveal. Successful acknowledgements echo those fields and carry
+  the authoritative document and presentation revisions; unbound, stale, or
+  mismatched presentations are rejected with stable error codes.
+
+### Verification
+
+- `cargo test -p neon-wgpu-runtime editor_reveal --lib --quiet` passed (3 tests).
+- `cargo test -p neon-protocol --lib --quiet` passed (20 tests).
+- Full workspace `cargo build` passed; existing repository-wide formatting
+  drift is recorded in `PROGRESS.md` and was not rewritten.
+
 ## v0.2.10 — 2026-09-15
 
 ### Added

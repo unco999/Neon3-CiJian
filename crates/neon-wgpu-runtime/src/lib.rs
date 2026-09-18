@@ -24,9 +24,9 @@ use neon_protocol::{
     InteractionTraceFilters, InteractionTraceOutcome, InteractionTraceQuery,
     InteractionTraceRecord, InteractionTraceStage, PROTOCOL_VERSION, RenderBackend,
     RenderBackendNegotiation, RenderSurfaceKind, RenderSurfaceOpen, RenderSurfaceTargetKind,
-    RequestId, Revision, RpcError, RpcRequest, RpcResponse, RpcStatus, ServiceDescription,
-    ServiceHealth, ServiceName, UiFileDropPayload, UiImageSource, UiImageTextureRef,
-    UiImageTextureRegion, UiImageUploadRequest,
+    EditorRevealRange, EditorVisualRevealAck, RequestId, Revision, RpcError, RpcRequest,
+    RpcResponse, RpcStatus, ServiceDescription, ServiceHealth, ServiceName, UiFileDropPayload,
+    UiImageSource, UiImageTextureRef, UiImageTextureRegion, UiImageUploadRequest,
 };
 #[cfg(target_os = "android")]
 use neon_ui_runtime::demo_domain::{
@@ -10016,17 +10016,52 @@ fn handle_editor_visual_reveal(runtime: &mut WgpuRuntime, request: RpcRequest) -
         return runtime.reject(request.request_id, "editor_reveal_unavailable", "editor reveal sink is not connected", None);
     };
     let params = request.params;
-    let path = params.get("path").and_then(Value::as_str).unwrap_or("").to_string();
-    let line = params.get("line").and_then(Value::as_u64).unwrap_or(0) as u32;
-    let column = params.get("column").and_then(Value::as_u64).unwrap_or(0) as u32;
-    let end_line = params.get("end_line").and_then(Value::as_u64).map(|v| v as u32);
-    let end_column = params.get("end_column").and_then(Value::as_u64).map(|v| v as u32);
+    let path = match params.get("path").and_then(Value::as_str).filter(|v| !v.trim().is_empty()) {
+        Some(path) => path.to_owned(),
+        None => return runtime.reject(request.request_id, "editor_reveal_path_required", "editor reveal requires an editor node path", None),
+    };
+    let visual_operation_id = match params
+        .get("visual_operation_id")
+        .and_then(Value::as_str)
+        .filter(|v| !v.trim().is_empty())
+    {
+        Some(id) => id.to_owned(),
+        None => return runtime.reject(request.request_id, "editor_reveal_operation_required", "editor reveal requires visual_operation_id", None),
+    };
+    let document_id = match params
+        .get("document_id")
+        .and_then(Value::as_str)
+        .filter(|v| !v.trim().is_empty())
+    {
+        Some(id) => id.to_owned(),
+        None => return runtime.reject(request.request_id, "editor_reveal_document_required", "editor reveal requires document_id", None),
+    };
+    let range = match params.get("range").cloned().and_then(|value| serde_json::from_value::<EditorRevealRange>(value).ok()) {
+        Some(range) if range.is_normalized() => range,
+        _ => return runtime.reject(request.request_id, "editor_reveal_range_invalid", "editor reveal range must use one-based lines and be normalized", None),
+    };
+    let scalar_range_matches = params.get("line").and_then(Value::as_u64) == Some(range.start_line as u64)
+        && params.get("column").and_then(Value::as_u64) == Some(range.start_column as u64)
+        && params.get("end_line").and_then(Value::as_u64) == Some(range.end_line as u64)
+        && params.get("end_column").and_then(Value::as_u64) == Some(range.end_column as u64);
+    if !scalar_range_matches {
+        return runtime.reject(request.request_id, "editor_reveal_range_mismatch", "editor reveal scalar range does not match range", None);
+    }
+    let requested_document_revision = params.get("document_revision").and_then(Value::as_u64);
+    let line = range.start_line - 1;
+    let column = range.start_column;
+    let end_line = Some(range.end_line);
+    let end_column = Some(range.end_column);
     let event = json!({
         "path": path,
-        "line": line.saturating_sub(1),
+        "document_id": document_id.clone(),
+        "visual_operation_id": visual_operation_id.clone(),
+        "line": line,
         "column": column,
         "end_line": end_line.map(|v| v.saturating_sub(1)),
         "end_column": end_column,
+        "range": range.clone(),
+        "document_revision": requested_document_revision,
         "viewport_height": params.get("viewport_height").and_then(Value::as_f64).unwrap_or(720.0),
         "viewport_width": params.get("viewport_width").and_then(Value::as_f64).unwrap_or(1200.0),
         "row_height": params.get("row_height").and_then(Value::as_f64).unwrap_or(20.0),
@@ -10034,17 +10069,37 @@ fn handle_editor_visual_reveal(runtime: &mut WgpuRuntime, request: RpcRequest) -
     });
     let now = std::time::Instant::now().elapsed().as_secs_f32();
     match sink(event, now) {
-        Some(presentation) => runtime.accept(request.request_id, json!({
-            "state": "revealed",
-            "node_key": presentation.node_key,
-            "presentation_revision": presentation.revision,
-            "caret_line": presentation.caret_line + 1,
-            "caret_column": presentation.caret_column,
-            "selection_anchor_line": presentation.selection_anchor_line.map(|v| v + 1),
-            "selection_anchor_column": presentation.selection_anchor_column,
-            "scroll_x": presentation.scroll_x,
-            "scroll_y": presentation.scroll_y,
-        })),
+        Some(presentation) => {
+            let Some(document) = presentation.document.as_ref() else {
+                return runtime.reject(request.request_id, "editor_reveal_document_unbound", "editor reveal presentation has no authoritative document binding", None);
+            };
+            if document.document_id != document_id {
+                return runtime.reject(request.request_id, "editor_reveal_document_mismatch", "editor reveal presentation document does not match request", Some(Revision(document.revision)));
+            }
+            if document.revision == 0 || presentation.revision == 0 {
+                return runtime.reject(request.request_id, "editor_reveal_revision_invalid", "editor reveal requires positive document and presentation revisions", Some(Revision(document.revision)));
+            }
+            if requested_document_revision.is_some_and(|revision| revision != document.revision) {
+                return runtime.reject(request.request_id, "editor_reveal_revision_conflict", "editor reveal document revision is stale", Some(Revision(document.revision)));
+            }
+            let ack = EditorVisualRevealAck {
+                state: "revealed".into(),
+                visual_operation_id,
+                document_id,
+                document_revision: Revision(document.revision),
+                range,
+                presentation_revision: Revision(presentation.revision),
+            };
+            let mut result = serde_json::to_value(ack).expect("editor reveal ack is serializable");
+            result["node_key"] = Value::String(presentation.node_key);
+            result["caret_line"] = json!(presentation.caret_line + 1);
+            result["caret_column"] = json!(presentation.caret_column);
+            result["selection_anchor_line"] = json!(presentation.selection_anchor_line.map(|v| v + 1));
+            result["selection_anchor_column"] = json!(presentation.selection_anchor_column);
+            result["scroll_x"] = json!(presentation.scroll_x);
+            result["scroll_y"] = json!(presentation.scroll_y);
+            runtime.accept(request.request_id, result)
+        }
         None => runtime.reject(request.request_id, "editor_document_not_found", "editor node path is not active", None),
     }
 }
@@ -13410,6 +13465,95 @@ mod tests {
             expected_revision: None,
             idempotency_key: None,
         }
+    }
+
+    fn reveal_params() -> Value {
+        json!({
+            "path": "editor-source",
+            "visual_operation_id": "visual-17",
+            "document_id": "workspace/src/main.rs",
+            "document_revision": 4,
+            "range": {
+                "start_line": 3,
+                "start_column": 2,
+                "end_line": 4,
+                "end_column": 9
+            },
+            "line": 3,
+            "column": 2,
+            "end_line": 4,
+            "end_column": 9
+        })
+    }
+
+    fn reveal_presentation(document_id: &str, document_revision: u64, presentation_revision: u64) -> neon_ui_schema::UiCodeEditorPresentation {
+        neon_ui_schema::UiCodeEditorPresentation {
+            node_key: "editor-source".into(),
+            document: Some(neon_ui_schema::UiEditorDocumentBinding {
+                document_id: document_id.into(),
+                session_id: "neon-ide".into(),
+                epoch: 2,
+                revision: document_revision,
+                committed_revision: document_revision,
+                source_hash: "hash".into(),
+                dirty: false,
+            }),
+            revision: presentation_revision,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn editor_reveal_ack_echoes_operation_identity_range_and_authoritative_revisions() {
+        let mut runtime = WgpuRuntime::headless(2);
+        runtime.set_editor_reveal_sink(Some(Box::new(|_, _| {
+            Some(reveal_presentation("workspace/src/main.rs", 4, 11))
+        })));
+        let response = handle_editor_visual_reveal(&mut runtime, request("reveal", "editor.visual.reveal", reveal_params()));
+        assert_eq!(response.status, RpcStatus::Accepted);
+        let result = response.result.expect("reveal ack result");
+        assert_eq!(result["visual_operation_id"], "visual-17");
+        assert_eq!(result["document_id"], "workspace/src/main.rs");
+        assert_eq!(result["document_revision"], 4);
+        assert_eq!(result["presentation_revision"], 11);
+        assert_eq!(result["range"]["start_line"], 3);
+        assert_eq!(result["range"]["start_column"], 2);
+        assert_eq!(result["range"]["end_line"], 4);
+        assert_eq!(result["range"]["end_column"], 9);
+    }
+
+    #[test]
+    fn editor_reveal_rejects_missing_or_non_normalized_contract_fields() {
+        let mut runtime = WgpuRuntime::headless(2);
+        runtime.set_editor_reveal_sink(Some(Box::new(|_, _| {
+            Some(reveal_presentation("workspace/src/main.rs", 4, 11))
+        })));
+        let mut missing_operation = reveal_params();
+        missing_operation["visual_operation_id"] = Value::Null;
+        let response = handle_editor_visual_reveal(&mut runtime, request("missing-op", "editor.visual.reveal", missing_operation));
+        assert_eq!(response.error.unwrap().code, "editor_reveal_operation_required");
+
+        let mut invalid_range = reveal_params();
+        invalid_range["range"]["start_line"] = json!(0);
+        let response = handle_editor_visual_reveal(&mut runtime, request("bad-range", "editor.visual.reveal", invalid_range));
+        assert_eq!(response.error.unwrap().code, "editor_reveal_range_invalid");
+    }
+
+    #[test]
+    fn editor_reveal_rejects_stale_or_mismatched_authoritative_document() {
+        let mut stale_runtime = WgpuRuntime::headless(2);
+        stale_runtime.set_editor_reveal_sink(Some(Box::new(|_, _| {
+            Some(reveal_presentation("workspace/src/main.rs", 5, 11))
+        })));
+        let response = handle_editor_visual_reveal(&mut stale_runtime, request("stale", "editor.visual.reveal", reveal_params()));
+        assert_eq!(response.error.unwrap().code, "editor_reveal_revision_conflict");
+
+        let mut mismatch_runtime = WgpuRuntime::headless(2);
+        mismatch_runtime.set_editor_reveal_sink(Some(Box::new(|_, _| {
+            Some(reveal_presentation("workspace/src/other.rs", 4, 11))
+        })));
+        let response = handle_editor_visual_reveal(&mut mismatch_runtime, request("mismatch", "editor.visual.reveal", reveal_params()));
+        assert_eq!(response.error.unwrap().code, "editor_reveal_document_mismatch");
     }
 
     fn registered_camera_controller() -> WorldUiLabCameraController {

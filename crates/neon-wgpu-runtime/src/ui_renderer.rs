@@ -1134,6 +1134,16 @@ fn apply_text_transform_track(instances: &mut [UiTextInstance], track: UiTextTra
     }
 }
 
+fn apply_text_material_overflow(instance: &mut UiTextInstance, overflow: [f32; 4]) {
+    instance.rect[0] -= overflow[0];
+    instance.rect[1] -= overflow[1];
+    instance.rect[2] += overflow[0] + overflow[2];
+    instance.rect[3] += overflow[1] + overflow[3];
+    // `clip` is inherited from the parent subtree. It must not expand with
+    // the visual halo, otherwise text can escape its Panel.
+    instance.overflow = overflow;
+}
+
 fn apply_image_transform_track(instance: &mut UiImageInstance, track: UiTextTransformTrack) {
     instance.animation = track.animation;
     instance.transform_from = track.transform_from;
@@ -9538,25 +9548,14 @@ impl UiWgpuRenderer {
                             apply_text_transform_track(instances, transform_track);
                         }
                         if let Some(text_material) = node_text_material {
-                            // Text-material glyphs: expand every glyph quad and
-                            // its clip by the material overflow so a glow can
-                            // paint outside the glyph box, then route the
-                            // instances to the per-package material pass.
+                            // Text-material glyphs expand the glyph quad so a
+                            // glow can paint outside the glyph box. Keep the
+                            // inherited clip unchanged: it is the Panel
+                            // subtree boundary and must still contain the
+                            // material's halo.
                             let mut material_instances = instances.unwrap_or_default();
                             for instance in &mut material_instances {
-                                instance.rect[0] -= text_material.overflow[0];
-                                instance.rect[1] -= text_material.overflow[1];
-                                instance.rect[2] +=
-                                    text_material.overflow[0] + text_material.overflow[2];
-                                instance.rect[3] +=
-                                    text_material.overflow[1] + text_material.overflow[3];
-                                instance.clip[0] -= text_material.overflow[0];
-                                instance.clip[1] -= text_material.overflow[1];
-                                instance.clip[2] +=
-                                    text_material.overflow[0] + text_material.overflow[2];
-                                instance.clip[3] +=
-                                    text_material.overflow[1] + text_material.overflow[3];
-                                instance.overflow = text_material.overflow;
+                                apply_text_material_overflow(instance, text_material.overflow);
                             }
                             text_material_batches
                                 .push((text_material.package_id.clone(), material_instances));
@@ -16682,6 +16681,37 @@ mod tests {
     use std::sync::Mutex;
 
     static GPU_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn text_material_overflow_keeps_parent_panel_clip() {
+        let mut instance = UiTextInstance {
+            rect: [48.0, 12.0, 20.0, 16.0],
+            clip: [0.0, 0.0, 64.0, 32.0],
+            ..UiTextInstance::zeroed()
+        };
+        let original_clip = instance.clip;
+        let overflow = [4.0, 3.0, 5.0, 2.0];
+
+        apply_text_material_overflow(&mut instance, overflow);
+
+        let pass = instance.rect == [44.0, 9.0, 29.0, 21.0]
+            && instance.clip == original_clip
+            && instance.overflow == overflow;
+        println!(
+            "{}",
+            json!({
+                "probe": "panel-text-clip.v1",
+                "frame_sequence": 1,
+                "input": {"panel_clip": original_clip, "text_rect": [48.0, 12.0, 20.0, 16.0], "material_overflow": overflow},
+                "producer": {"expanded_text_rect": instance.rect, "clip": instance.clip},
+                "consumer": {"comparison": "expanded glyph rect is still tested against inherited panel clip"},
+                "diagnostic": {"missing_data": false, "stale_data": false, "coordinate_mismatch": false, "comparison_direction_error": false},
+                "result": if pass { "passed" } else { "failed" },
+                "pass": pass,
+            })
+        );
+        assert!(pass, "text material overflow must not expand the parent clip");
+    }
 
     #[test]
     fn splitter_semantic_value_is_normalized_and_clamped() {

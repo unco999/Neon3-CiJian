@@ -293,6 +293,40 @@ pub struct RpcResponse {
     pub error: Option<RpcError>,
 }
 
+/// Canonical source range used by the editor visual reveal contract.
+/// Lines are one-based and columns are zero-based on the wire.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EditorRevealRange {
+    pub start_line: u32,
+    pub start_column: u32,
+    pub end_line: u32,
+    pub end_column: u32,
+}
+
+impl EditorRevealRange {
+    pub fn is_normalized(&self) -> bool {
+        self.start_line > 0
+            && self.end_line > 0
+            && (self.start_line, self.start_column) <= (self.end_line, self.end_column)
+    }
+}
+
+/// Successful acknowledgement for `editor.visual.reveal`.
+///
+/// The fields that identify the visual operation and its target are echoed
+/// only after the editor bridge has applied the reveal to the bound document.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EditorVisualRevealAck {
+    pub state: String,
+    pub visual_operation_id: String,
+    pub document_id: String,
+    pub document_revision: Revision,
+    pub range: EditorRevealRange,
+    pub presentation_revision: Revision,
+}
+
 /// Engine-independent backend names used during an external host GPU session.
 /// The native resource transport is negotiated separately and never represented
 /// by a raw OS handle in this crate.
