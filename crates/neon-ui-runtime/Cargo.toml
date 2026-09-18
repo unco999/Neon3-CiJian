@@ -8,6 +8,10 @@ repository = "https://github.com/unco999/Neon3-CiJian"
 readme = "README.md"
 keywords = ["neon3", "ui", "declarative", "game-engine"]
 
+[[bin]]
+name = "ui_patch_contract_probe"
+path = "src/bin/ui_patch_contract_probe.rs"
+
 [dependencies]
 neon-protocol = { version = "0.2.0", path = "../neon-protocol" }
 neon-ipc = { version = "0.2.0", path = "../neon-ipc" }

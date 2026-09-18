@@ -1772,6 +1772,127 @@ pub fn apply_nui_ir_patch(document: &UiIrDocument, patch: &UiIrPatch) -> FlowRes
     Ok(result)
 }
 
+/// Applies the public structured patch contract to canonical IR. `SetInput`
+/// is intentionally validated by the host adapter and does not mutate the IR;
+/// topology/property operations remain bounded and revisioned here.
+pub fn apply_ui_patch(document: &UiIrDocument, patch: &neon_ui_schema::UiPatch) -> FlowResult<UiIrDocument> {
+    if document.surface_id.0 != patch.surface_id {
+        return Err(error(
+            "nui_flow_patch_surface_mismatch",
+            "patch surface_id does not match the active document",
+            1,
+            1,
+        ));
+    }
+    let mut operations = Vec::new();
+    let mut result = document.clone();
+    for operation in &patch.operations {
+        match operation {
+            neon_ui_schema::UiPatchOp::SetProperty {
+                node_path,
+                property,
+                value,
+            } => {
+                let encoded = if property == "value" {
+                    serde_json::to_string(value).map_err(|serialization_error| {
+                        error("nui_flow_invalid_patch", serialization_error.to_string(), 1, 1)
+                    })?
+                } else if let Some(string) = value.as_str() {
+                    string.to_owned()
+                } else {
+                    value.to_string()
+                };
+                operations.push(neon_ui_schema::UiIrPatchOperation {
+                    kind: neon_ui_schema::UiIrPatchOperationKind::Set,
+                    target_path: node_path.clone(),
+                    expected_revision: Revision(patch.base_revision),
+                    payload: Some(json!({"property": property, "value": encoded})),
+                    source_span: span(1, 1, "structured patch"),
+                });
+            }
+            neon_ui_schema::UiPatchOp::InsertNode {
+                parent_path,
+                index,
+                node,
+            } => {
+                operations.push(neon_ui_schema::UiIrPatchOperation {
+                    kind: neon_ui_schema::UiIrPatchOperationKind::Insert,
+                    target_path: parent_path.clone(),
+                    expected_revision: Revision(patch.base_revision),
+                    payload: Some(json!({"node": node, "index": index})),
+                    source_span: span(1, 1, "structured patch"),
+                });
+            }
+            neon_ui_schema::UiPatchOp::RemoveNode { node_path } => {
+                operations.push(neon_ui_schema::UiIrPatchOperation {
+                    kind: neon_ui_schema::UiIrPatchOperationKind::Remove,
+                    target_path: node_path.clone(),
+                    expected_revision: Revision(patch.base_revision),
+                    payload: None,
+                    source_span: span(1, 1, "structured patch"),
+                });
+            }
+            neon_ui_schema::UiPatchOp::ReplaceChildren {
+                parent_path,
+                children,
+            } => {
+                let parent = find_node_mut(&mut result.root, parent_path).ok_or_else(|| {
+                    error("nui_flow_unknown_patch_target", "replace parent does not exist", 1, 1)
+                })?;
+                parent.children = children.clone();
+            }
+            neon_ui_schema::UiPatchOp::MoveNode {
+                node_path,
+                parent_path,
+                index,
+            } => {
+                move_node(
+                    &mut result.root,
+                    node_path,
+                    Some(&json!({"parent": parent_path})),
+                    &span(1, 1, "structured patch"),
+                )?;
+                let node_key = node_path.rsplit('/').next().unwrap_or(node_path);
+                let parent = find_node_mut(&mut result.root, parent_path).ok_or_else(|| {
+                    error("nui_flow_unknown_patch_target", "move destination does not exist", 1, 1)
+                })?;
+                if let Some(position) = parent
+                    .children
+                    .iter()
+                    .position(|child| child.node_id.0 == node_key)
+                {
+                    let node = parent.children.remove(position);
+                    parent.children.insert((*index).min(parent.children.len()), node);
+                }
+            }
+            neon_ui_schema::UiPatchOp::StartTransition {
+                node_path,
+                transition,
+            } => {
+                let node = find_node_mut(&mut result.root, node_path).ok_or_else(|| {
+                    error("nui_flow_unknown_patch_target", "transition target does not exist", 1, 1)
+                })?;
+                node.enter_transition = Some(transition.clone());
+            }
+            neon_ui_schema::UiPatchOp::SetInput { .. } => {}
+        }
+    }
+    if !operations.is_empty() {
+        let ir_patch = neon_ui_schema::UiIrPatch {
+            expected_revision: Revision(patch.base_revision),
+            operations,
+        };
+        result = apply_nui_ir_patch(&result, &ir_patch)?;
+    } else {
+        if result.revision != Revision(patch.base_revision) {
+            return Err(error("nui_flow_stale_patch_revision", "patch revision does not match the document", 1, 1));
+        }
+        result.revision = Revision(result.revision.0 + 1);
+        result.validate().map_err(|_| error("nui_flow_invalid_patch", "patch result fails canonical IR validation", 1, 1))?;
+    }
+    Ok(result)
+}
+
 struct Header {
     surface_id: String,
     revision: u64,
@@ -6398,6 +6519,23 @@ fn insert_node(
             span,
         )
     })?;
+    if let Some(node_value) = payload.get("node") {
+        let node: UiNode = serde_json::from_value(node_value.clone()).map_err(|_| {
+            error_at("nui_flow_invalid_patch", "insert node payload is invalid", span)
+        })?;
+        if find_node_mut(root, &node.node_id.0).is_some() {
+            return Err(error_at("nui_flow_invalid_patch", "insert node key already exists", span));
+        }
+        let parent = find_node_mut(root, parent_key).ok_or_else(|| {
+            error_at("nui_flow_unknown_patch_target", "insert parent does not exist", span)
+        })?;
+        let index = payload
+            .get("index")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(parent.children.len() as u64) as usize;
+        parent.children.insert(index.min(parent.children.len()), node);
+        return Ok(());
+    }
     let kind = payload.get("kind").and_then(|v| v.as_str()).unwrap_or("");
     let key = payload.get("key").and_then(|v| v.as_str()).unwrap_or("");
     if !valid_key(key) || find_node_mut(root, key).is_some() {

@@ -2615,6 +2615,52 @@ pub struct UiIrPatch {
     pub operations: Vec<UiIrPatchOperation>,
 }
 
+/// Versioned workbench patch contract. This is the public state/presentation
+/// boundary for persistent IDE shells; renderer hit IDs and UI element IDs
+/// never appear here.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiPatch {
+    pub surface_id: String,
+    pub base_revision: u64,
+    pub operations: Vec<UiPatchOp>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+pub enum UiPatchOp {
+    SetProperty {
+        node_path: String,
+        property: String,
+        value: serde_json::Value,
+    },
+    InsertNode {
+        parent_path: String,
+        index: usize,
+        node: UiNode,
+    },
+    RemoveNode {
+        node_path: String,
+    },
+    ReplaceChildren {
+        parent_path: String,
+        children: Vec<UiNode>,
+    },
+    MoveNode {
+        node_path: String,
+        parent_path: String,
+        index: usize,
+    },
+    StartTransition {
+        node_path: String,
+        transition: UiTransition,
+    },
+    SetInput {
+        key: String,
+        value: UiInputValue,
+    },
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UiBoundProperty {

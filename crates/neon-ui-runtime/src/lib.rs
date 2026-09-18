@@ -71,7 +71,7 @@ pub use event_publisher::{EVENT_VARIABLE_CHANGED, FLOW_EVENT_PREFIX, UiVariableE
 use host_adapter::UiHostAdapter;
 pub use host_adapter::UiHostAdapterConfig;
 pub use nui_flow::{
-    NuiFlowError, apply_nui_ir_patch, bind_nui_flow_resources, compile_nui_flow_program,
+    NuiFlowError, apply_nui_ir_patch, apply_ui_patch, bind_nui_flow_resources, compile_nui_flow_program,
     find_node_mut, format_nui_flow, lower_nui_flow, lower_nui_flow_effects, parse_nui_flow,
     parse_nui_flow_patch,
 };
@@ -3830,8 +3830,47 @@ impl UiRuntime {
     pub fn apply_flow_patch(
         &mut self,
         wgpu_endpoint: SocketAddr,
-        request: RpcRequest,
+        mut request: RpcRequest,
     ) -> Result<RpcResponse, TransportError> {
+        // Accept the formal UiPatch envelope while retaining the legacy
+        // adapter below during the full-mount fallback phase.
+        if request.params.get("base_revision").is_some()
+            && request.params.get("revision").is_none()
+        {
+            if let Some(base_revision) = request.params.get("base_revision").cloned() {
+                request.params["revision"] = base_revision;
+            }
+            if let Some(operations) = request.params.get_mut("operations").and_then(Value::as_array_mut) {
+                for operation in operations {
+                    let op = operation.get("op").and_then(Value::as_str).unwrap_or("").to_owned();
+                    match op.as_str() {
+                        "set_property" => {
+                            operation["kind"] = Value::String("set".into());
+                            operation["path"] = operation.get("node_path").cloned().unwrap_or(Value::Null);
+                            operation["property"] = operation.get("property").cloned().unwrap_or(Value::Null);
+                        }
+                        "insert_node" => {
+                            operation["kind"] = Value::String("insert".into());
+                            operation["path"] = operation.get("parent_path").cloned().unwrap_or(Value::Null);
+                            operation["node"] = operation.get("node").cloned().unwrap_or(Value::Null);
+                            operation["index"] = operation.get("index").cloned().unwrap_or(json!(0));
+                        }
+                        "remove_node" => {
+                            operation["kind"] = Value::String("remove".into());
+                            operation["path"] = operation.get("node_path").cloned().unwrap_or(Value::Null);
+                        }
+                        "move_node" => {
+                            operation["kind"] = Value::String("move".into());
+                            operation["path"] = operation.get("node_path").cloned().unwrap_or(Value::Null);
+                            operation["parent"] = operation.get("parent_path").cloned().unwrap_or(Value::Null);
+                            operation["index"] = operation.get("index").cloned().unwrap_or(json!(0));
+                        }
+                        "replace_children" | "start_transition" | "set_input" => {}
+                        _ => {}
+                    }
+                }
+            }
+        }
         let current_doc = self.flow_document.as_ref()
             .ok_or_else(|| TransportError::Io(std::io::Error::other("no active flow")))?;
 
@@ -3854,9 +3893,11 @@ impl UiRuntime {
             }
             let (kind_enum, payload) = match kind {
                 "set" => {
-                    let raw_value = op.get("value").and_then(Value::as_str).unwrap_or("");
+                    let raw_value = op.get("value").map(|value| {
+                        value.as_str().map(str::to_owned).unwrap_or_else(|| value.to_string())
+                    }).unwrap_or_default();
                     let payload_value = if property == "value" {
-                        format!("\"{}\"", raw_value.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n"))
+                         if op.get("value").is_some_and(Value::is_string) { format!("\"{}\"", raw_value.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")) } else { raw_value.clone() }
                     } else {
                         raw_value.to_string()
                     };
@@ -3864,10 +3905,15 @@ impl UiRuntime {
                      Some(json!({"property": property, "value": payload_value})))
                 }
                 "insert" => {
+                    if let Some(node) = op.get("node") {
+                        (neon_ui_schema::UiIrPatchOperationKind::Insert,
+                         Some(json!({"node": node, "index": op.get("index").and_then(Value::as_u64).unwrap_or(0)})))
+                    } else {
                     let k = op.get("kind_name").and_then(Value::as_str).unwrap_or("panel");
                     let key = op.get("node_key").and_then(Value::as_str).unwrap_or("new");
                     (neon_ui_schema::UiIrPatchOperationKind::Insert,
                      Some(json!({"kind": k, "key": key})))
+                    }
                 }
                 "remove" => (neon_ui_schema::UiIrPatchOperationKind::Remove, None),
                 "move" => {
