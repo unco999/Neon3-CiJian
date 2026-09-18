@@ -30,7 +30,10 @@ use neon_ui_schema::{
     ERROR_UI_PROGRAM_TEXT_REGISTRY_CAPACITY_OVERFLOW,
     ERROR_UI_PROGRAM_TEXT_REGISTRY_GENERATION_MISMATCH,
     ERROR_UI_PROGRAM_TEXT_REGISTRY_STALE_REVISION, ERROR_UI_PROGRAM_TEXT_TOO_LONG,
-    ERROR_UI_PROGRAM_UNKNOWN_INPUT_KEY, ERROR_UI_PROGRAM_UNKNOWN_TEXT_HANDLE, NuiFlowDocument,
+    ERROR_NUI_FLOW_ACTIVATION, ERROR_NUI_FLOW_COMPILE, ERROR_NUI_FLOW_PARSE,
+    ERROR_NUI_FLOW_SOURCE_REQUIRED, ERROR_UI_PROGRAM_UNKNOWN_INPUT_KEY,
+    ERROR_UI_PROGRAM_UNKNOWN_TEXT_HANDLE, NuiFlowCompileReport, NuiFlowCompileStatus,
+    NuiFlowDiagnostic, NuiFlowDiagnosticStage, NuiFlowDocument,
     NuiFlowStateStyle, TextRef, UI_SURFACE_SCHEMA_VERSION, UiBinding, UiBoundProperty, UiBounds,
     UiBranchPredicate, UiBranchRecord, UiCommand, UiCpuFrameOutput, UiCpuNodeState,
     UiCpuRenderPrimitive, UiCpuSemanticTarget, UiCpuViewport, UiDataGridCellTarget,
@@ -1077,6 +1080,203 @@ impl UiInputStoreError {
 pub struct UiProgramCompileError {
     pub code: &'static str,
     pub message: String,
+}
+
+/// Structured compile failure for the public NUI Flow source API. This keeps
+/// parser and compiler failures consumable by SDKs without requiring callers to
+/// parse a debug string.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NuiFlowCompileError {
+    pub report: NuiFlowCompileReport,
+}
+
+/// Successful result of compiling one complete NUI Flow source document.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NuiFlowCompiledProgram {
+    pub document: NuiFlowDocument,
+    pub program: UiProgram,
+}
+
+/// Public, renderer-independent source compilation entry point. It performs
+/// parse and compile only; activation and WGPU submission remain separate
+/// protocol stages.
+pub fn compile_nui_flow_source(
+    source: &str,
+    revision: UiProgramRevision,
+) -> Result<NuiFlowCompiledProgram, NuiFlowCompileError> {
+    let document = parse_nui_flow(source).map_err(|error| NuiFlowCompileError {
+        report: flow_parse_report("nui-flow", &error),
+    })?;
+    let program = compile_nui_flow_program(&document, revision).map_err(|error| NuiFlowCompileError {
+        report: flow_compile_report(&document, &error),
+    })?;
+    Ok(NuiFlowCompiledProgram { document, program })
+}
+
+fn flow_parse_report(source_id: &str, error: &NuiFlowError) -> NuiFlowCompileReport {
+    NuiFlowCompileReport {
+        schema_version: neon_ui_schema::NUI_FLOW_DIAGNOSTIC_SCHEMA_VERSION,
+        status: NuiFlowCompileStatus::Invalid,
+        source_id: source_id.into(),
+        surface_id: None,
+        program_revision: None,
+        node_count: None,
+        binding_count: None,
+        event_count: None,
+        layout_hash: None,
+        diagnostics: error
+            .diagnostics
+            .iter()
+            .map(|diagnostic| NuiFlowDiagnostic {
+                stage: NuiFlowDiagnosticStage::Parse,
+                code: diagnostic.code.clone(),
+                severity: diagnostic.severity,
+                message: diagnostic.message.clone(),
+                span: Some(diagnostic.span.clone()),
+                suggestion: diagnostic.suggestion.clone(),
+                node_key: None,
+                input_key: None,
+            })
+            .collect(),
+    }
+}
+
+fn flow_compile_report(
+    document: &NuiFlowDocument,
+    error: &UiProgramCompileError,
+) -> NuiFlowCompileReport {
+    NuiFlowCompileReport {
+        schema_version: neon_ui_schema::NUI_FLOW_DIAGNOSTIC_SCHEMA_VERSION,
+        status: NuiFlowCompileStatus::Invalid,
+        source_id: "nui-flow".into(),
+        surface_id: Some(document.ir.surface_id.0.clone()),
+        program_revision: Some(document.ir.revision),
+        node_count: None,
+        binding_count: None,
+        event_count: None,
+        layout_hash: None,
+        diagnostics: vec![NuiFlowDiagnostic {
+            stage: NuiFlowDiagnosticStage::Compile,
+            code: error.code.into(),
+            severity: UiDiagnosticSeverity::Error,
+            message: error.message.clone(),
+            span: None,
+            suggestion: None,
+            node_key: None,
+            input_key: None,
+        }],
+    }
+}
+
+fn flow_valid_report(
+    document: &NuiFlowDocument,
+    program: &UiProgram,
+) -> NuiFlowCompileReport {
+    NuiFlowCompileReport {
+        schema_version: neon_ui_schema::NUI_FLOW_DIAGNOSTIC_SCHEMA_VERSION,
+        status: NuiFlowCompileStatus::Valid,
+        source_id: "nui-flow".into(),
+        surface_id: Some(document.ir.surface_id.0.clone()),
+        program_revision: Some(program.revision.revision),
+        node_count: Some(program.nodes.len() as u32),
+        binding_count: Some(program.binding_records.len() as u32),
+        event_count: Some(program.event_records.len() as u32),
+        layout_hash: Some(program.layout_hash.clone()),
+        diagnostics: Vec::new(),
+    }
+}
+
+fn flow_invalid_report(
+    stage: neon_ui_schema::NuiFlowDiagnosticStage,
+    code: &str,
+    message: &str,
+) -> NuiFlowCompileReport {
+    NuiFlowCompileReport {
+        schema_version: neon_ui_schema::NUI_FLOW_DIAGNOSTIC_SCHEMA_VERSION,
+        status: NuiFlowCompileStatus::Invalid,
+        source_id: "nui-flow".into(),
+        surface_id: None,
+        program_revision: None,
+        node_count: None,
+        binding_count: None,
+        event_count: None,
+        layout_hash: None,
+        diagnostics: vec![NuiFlowDiagnostic {
+            stage,
+            code: code.into(),
+            severity: UiDiagnosticSeverity::Error,
+            message: message.into(),
+            span: None,
+            suggestion: None,
+            node_key: None,
+            input_key: None,
+        }],
+    }
+}
+
+fn flow_runtime_report(
+    document: &NuiFlowDocument,
+    stage: neon_ui_schema::NuiFlowDiagnosticStage,
+    code: &str,
+    message: impl Into<String>,
+) -> NuiFlowCompileReport {
+    let mut report = flow_invalid_report(stage, code, &message.into());
+    report.surface_id = Some(document.ir.surface_id.0.clone());
+    report.program_revision = Some(document.ir.revision);
+    report
+}
+
+fn flow_program_revision(document: &NuiFlowDocument) -> UiProgramRevision {
+    let capabilities = [
+        neon_ui_schema::UI_PROGRAM_CAPABILITY_NAME,
+        neon_ui_schema::UI_PROGRAM_TEXT_REGISTRY_CAPABILITY_NAME,
+        neon_ui_schema::UI_PROGRAM_BOUNDED_STRUCTURE_CAPABILITY_NAME,
+        neon_ui_schema::UI_PROGRAM_SEMANTIC_EVENT_CAPABILITY_NAME,
+        neon_ui_schema::UI_NINE_SLICE_CAPABILITY_NAME,
+        neon_ui_schema::UI_COMPONENT_SKIN_CAPABILITY_NAME,
+        neon_ui_schema::UI_CANVAS_POINTS_LINES_CAPABILITY_NAME,
+        neon_ui_schema::UI_TIMELINE_ANIMATION_CAPABILITY_NAME,
+        neon_ui_schema::UI_CODE_EDITOR_CAPABILITY_NAME,
+    ]
+    .into_iter()
+    .map(|name| UiProgramCapability {
+        name: name.into(),
+        version: 1,
+        owner: UiProgramCapabilityOwner::SharedContract,
+        status: UiProgramCapabilityStatus::Supported,
+    })
+    .collect::<Vec<_>>();
+    UiProgramRevision {
+        program_id: document.ir.surface_id.0.clone(),
+        revision: Revision(document.ir.revision.0.max(1)),
+        schema_version: neon_ui_schema::UI_PROGRAM_SCHEMA_VERSION,
+        capabilities,
+    }
+}
+
+fn compile_flow_source_for_rpc(
+    source: &str,
+) -> Result<NuiFlowCompiledProgram, NuiFlowCompileReport> {
+    let document = parse_nui_flow(source)
+        .map_err(|error| flow_parse_report("nui-flow", &error))?;
+    let revision = flow_program_revision(&document);
+    let program = compile_nui_flow_program(&document, revision)
+        .map_err(|error| flow_compile_report(&document, &error))?;
+    Ok(NuiFlowCompiledProgram { document, program })
+}
+
+fn report_error_summary(report: &NuiFlowCompileReport) -> (String, String) {
+    let diagnostic = report
+        .diagnostics
+        .first()
+        .expect("invalid NUI Flow report must contain a diagnostic");
+    let code = match diagnostic.stage {
+        neon_ui_schema::NuiFlowDiagnosticStage::Parse => ERROR_NUI_FLOW_PARSE,
+        neon_ui_schema::NuiFlowDiagnosticStage::Compile => ERROR_NUI_FLOW_COMPILE,
+        neon_ui_schema::NuiFlowDiagnosticStage::Activation => ERROR_NUI_FLOW_ACTIVATION,
+        neon_ui_schema::NuiFlowDiagnosticStage::Submit => "nui_flow_submit",
+    };
+    (code.into(), diagnostic.message.clone())
 }
 
 /// Renderer-local presentation values are deliberately distinct from resolved
@@ -3040,6 +3240,7 @@ impl UiRuntime {
                 "ui.program.input.v1".into(),
                 "ui.input.repeat.v1".into(),
                 "ui.data_grid.window.v1".into(),
+                "ui.flow.compile.v1".into(),
                 "ui.host.pointer_event.v1".into(),
                 CAPABILITY_STATE_ANIMATION.into(),
                 CAPABILITY_NUMERIC_ANIMATION.into(),
@@ -3080,6 +3281,7 @@ impl UiRuntime {
             "debug.interaction.get" => return self.handle_interaction_get(request),
             "debug.interaction.query" => return self.handle_interaction_query(request),
             "ui.fragment.submit" => return self.handle_fragment_submit(request),
+            "ui.flow.compile" => return self.handle_flow_compile(request),
             "ui.surface.snapshot.get" => Some(self.surface_value()),
             "ui.ai.terrain.snapshot.get" => Some(self.ai_terrain.snapshot()),
             "ui.surface.event" => return self.handle_surface_event(request),
@@ -3113,6 +3315,7 @@ impl UiRuntime {
                     message: "method is not supported".into(),
                     current_revision: None,
                     object_id: None,
+                    details: None,
                 }),
             },
         }
@@ -3212,6 +3415,45 @@ impl UiRuntime {
 
     fn surface_value(&self) -> Value {
         json!(self.surface.snapshot())
+    }
+
+    /// Compiles NUI Flow without activating or submitting it to WGPU. Invalid
+    /// source is returned as a rejected RPC with the same typed report used by
+    /// `ui.flow.submit`.
+    fn handle_flow_compile(&mut self, request: RpcRequest) -> RpcResponse {
+        let Some(source) = request
+            .params
+            .get("source")
+            .and_then(Value::as_str)
+            .filter(|source| !source.trim().is_empty())
+        else {
+            return self.rejected_with_flow_report(
+                request.request_id,
+                ERROR_NUI_FLOW_SOURCE_REQUIRED,
+                "NUI Flow source is required",
+                flow_invalid_report(
+                    neon_ui_schema::NuiFlowDiagnosticStage::Parse,
+                    ERROR_NUI_FLOW_SOURCE_REQUIRED,
+                    "NUI Flow source is required",
+                ),
+            );
+        };
+
+        match compile_flow_source_for_rpc(source) {
+            Ok(compiled) => self.accepted(
+                request.request_id,
+                json!(flow_valid_report(&compiled.document, &compiled.program)),
+            ),
+            Err(report) => {
+                let (code, message) = report_error_summary(&report);
+                self.rejected_with_flow_report(
+                    request.request_id,
+                    &code,
+                    &message,
+                    report,
+                )
+            }
+        }
     }
 
     fn handle_debug_command(&mut self, request: RpcRequest) -> RpcResponse {
@@ -3461,17 +3703,37 @@ impl UiRuntime {
                 "endpoint": wgpu_endpoint.to_string()
             })
         );
-        let source = request
+        let Some(source) = request
             .params
             .get("source")
             .and_then(Value::as_str)
             .filter(|source| !source.trim().is_empty())
-            .ok_or_else(|| TransportError::Io(std::io::Error::other("NUI source is required")))?;
-        let document = parse_nui_flow(source).map_err(|error| {
-            TransportError::Io(std::io::Error::other(format!(
-                "NUI parse failed: {error:?}"
-            )))
-        })?;
+        else {
+            return Ok(self.rejected_with_flow_report(
+                request.request_id,
+                ERROR_NUI_FLOW_SOURCE_REQUIRED,
+                "NUI Flow source is required",
+                flow_invalid_report(
+                    neon_ui_schema::NuiFlowDiagnosticStage::Parse,
+                    ERROR_NUI_FLOW_SOURCE_REQUIRED,
+                    "NUI Flow source is required",
+                ),
+            ));
+        };
+        let compiled = match compile_flow_source_for_rpc(source) {
+            Ok(compiled) => compiled,
+            Err(report) => {
+                let (code, message) = report_error_summary(&report);
+                return Ok(self.rejected_with_flow_report(
+                    request.request_id,
+                    &code,
+                    &message,
+                    report,
+                ));
+            }
+        };
+        let document = compiled.document;
+        let program = compiled.program;
         eprintln!(
             "{}",
             json!({
@@ -3480,35 +3742,6 @@ impl UiRuntime {
                 "surface_id": document.ir.surface_id
             })
         );
-        let revision = UiProgramRevision {
-            program_id: document.ir.surface_id.0.clone(),
-            revision: Revision(1),
-            schema_version: neon_ui_schema::UI_PROGRAM_SCHEMA_VERSION,
-            capabilities: [
-                neon_ui_schema::UI_PROGRAM_CAPABILITY_NAME,
-                neon_ui_schema::UI_PROGRAM_TEXT_REGISTRY_CAPABILITY_NAME,
-                neon_ui_schema::UI_PROGRAM_BOUNDED_STRUCTURE_CAPABILITY_NAME,
-                neon_ui_schema::UI_PROGRAM_SEMANTIC_EVENT_CAPABILITY_NAME,
-                neon_ui_schema::UI_NINE_SLICE_CAPABILITY_NAME,
-                neon_ui_schema::UI_COMPONENT_SKIN_CAPABILITY_NAME,
-                neon_ui_schema::UI_CANVAS_POINTS_LINES_CAPABILITY_NAME,
-                neon_ui_schema::UI_TIMELINE_ANIMATION_CAPABILITY_NAME,
-                neon_ui_schema::UI_CODE_EDITOR_CAPABILITY_NAME,
-            ]
-            .into_iter()
-            .map(|name| UiProgramCapability {
-                name: name.into(),
-                version: 1,
-                owner: UiProgramCapabilityOwner::SharedContract,
-                status: UiProgramCapabilityStatus::Supported,
-            })
-            .collect(),
-        };
-        let program = compile_nui_flow_program(&document, revision).map_err(|error| {
-            TransportError::Io(std::io::Error::other(format!(
-                "NUI compile failed: {error:?}"
-            )))
-        })?;
         // Re-submitting the same flow advances the fragment revision so the
         // renderer accepts the replacement instead of treating it as stale.
         let fragment_revision = self
@@ -3521,10 +3754,28 @@ impl UiRuntime {
             root: document.ir.root.clone(),
             effects: lower_nui_flow_effects(&document),
         };
-        let adapter =
-            UiHostAdapter::activate(program.clone(), document.input_schema.clone(), self.epoch)
-                .map_err(|error| TransportError::Io(std::io::Error::other(error.message)))?
-                .with_event_publisher(self.eventd_endpoint, self.client.clone());
+        let adapter = match UiHostAdapter::activate(
+            program.clone(),
+            document.input_schema.clone(),
+            self.epoch,
+        ) {
+            Ok(adapter) => adapter.with_event_publisher(self.eventd_endpoint, self.client.clone()),
+            Err(error) => {
+                let message = error.message;
+                let report = flow_runtime_report(
+                    &document,
+                    neon_ui_schema::NuiFlowDiagnosticStage::Activation,
+                    ERROR_NUI_FLOW_ACTIVATION,
+                    message.to_owned(),
+                );
+                return Ok(self.rejected_with_flow_report(
+                    request.request_id,
+                    ERROR_NUI_FLOW_ACTIVATION,
+                    &message,
+                    report,
+                ));
+            }
+        };
         // Resolve branch visibility against schema defaults before the first
         // fragment reaches WGPU. Otherwise mutually exclusive branches all
         // render until the first input publication arrives.
@@ -5443,6 +5694,32 @@ impl UiRuntime {
                 message: message.into(),
                 current_revision: Some(self.debug_snapshot().revision),
                 object_id: None,
+                details: None,
+            }),
+        }
+    }
+
+    fn rejected_with_flow_report(
+        &mut self,
+        request_id: RequestId,
+        code: &str,
+        message: &str,
+        report: NuiFlowCompileReport,
+    ) -> RpcResponse {
+        self.record_receipt(&request_id, CommandState::Rejected, Some(code.into()));
+        let revision = self.debug_snapshot().revision;
+        RpcResponse {
+            request_id,
+            status: RpcStatus::Rejected,
+            revision: Some(revision),
+            result: None,
+            snapshot: None,
+            error: Some(RpcError {
+                code: code.into(),
+                message: message.into(),
+                current_revision: Some(revision),
+                object_id: None,
+                details: Some(json!(report)),
             }),
         }
     }
@@ -5467,6 +5744,7 @@ impl UiRuntime {
                 message: message.into(),
                 current_revision: Some(current_revision),
                 object_id: None,
+                details: None,
             }),
         }
     }
@@ -6657,6 +6935,7 @@ mod tests {
                     message: "renderer has a newer fragment".into(),
                     current_revision: Some(Revision(9)),
                     object_id: None,
+                    details: None,
                 }),
             })
         });
@@ -6735,6 +7014,7 @@ mod tests {
                     message: "fragment revision is stale".into(),
                     current_revision: Some(Revision(2)),
                     object_id: None,
+                    details: None,
                 }),
             })
         });
@@ -8096,6 +8376,7 @@ mod tests {
                     message: "rejected for rollback test".into(),
                     current_revision: Some(Revision(1)),
                     object_id: None,
+                    details: None,
                 }),
             })
         });

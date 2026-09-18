@@ -869,6 +869,7 @@ mod tests {
                         message: "stale".into(),
                         current_revision: Some(Revision(1)),
                         object_id: None,
+                        details: None,
                     }),
                 })
                 .unwrap();

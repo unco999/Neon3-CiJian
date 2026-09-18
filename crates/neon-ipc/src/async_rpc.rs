@@ -605,6 +605,7 @@ fn failed_response(request_id: RequestId, code: &str) -> RpcResponse {
             message: code.to_owned(),
             current_revision: None,
             object_id: None,
+            details: None,
         }),
     }
 }

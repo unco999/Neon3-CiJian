@@ -931,6 +931,7 @@ impl DemoDragDropDomain {
                     message: "accepted drag/drop did not produce a valid fragment".into(),
                     current_revision: self.revision,
                     object_id: None,
+                    details: None,
                 });
                 return response;
             };
@@ -1580,6 +1581,7 @@ fn rejected(
             message: message.into(),
             current_revision: revision,
             object_id: None,
+            details: None,
         }),
     }
 }

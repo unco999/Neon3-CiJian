@@ -675,6 +675,7 @@ impl Eventd {
                         message: message.into(),
                         current_revision: None,
                         object_id: None,
+                        details: None,
                     }),
                 }
             }

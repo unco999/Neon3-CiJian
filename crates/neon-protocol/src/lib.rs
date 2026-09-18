@@ -276,6 +276,10 @@ pub struct RpcError {
     pub message: String,
     pub current_revision: Option<Revision>,
     pub object_id: Option<String>,
+    /// Stable, method-specific error data. NUI Flow uses this for its typed
+    /// compile report; other methods may leave it absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<Value>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -826,6 +830,31 @@ mod tests {
         assert_eq!(response.status, RpcStatus::Rejected);
         assert_eq!(response.request_id.0, "request-001");
         assert_eq!(response.error.unwrap().current_revision, Some(Revision(43)));
+    }
+
+    #[test]
+    fn rpc_error_details_round_trip_for_method_specific_diagnostics() {
+        let response = RpcResponse {
+            request_id: RequestId("flow-001".into()),
+            status: RpcStatus::Rejected,
+            revision: Some(Revision(4)),
+            result: None,
+            snapshot: None,
+            error: Some(RpcError {
+                code: "nui_flow_parse".into(),
+                message: "NUI Flow source is invalid".into(),
+                current_revision: Some(Revision(4)),
+                object_id: None,
+                details: Some(serde_json::json!({
+                    "schema_version": 1,
+                    "status": "invalid",
+                    "diagnostics": [{"code": "nui_flow_unknown_component", "stage": "parse"}]
+                })),
+            }),
+        };
+        let encoded = serde_json::to_value(&response).unwrap();
+        assert_eq!(encoded["error"]["details"]["diagnostics"][0]["stage"], "parse");
+        assert_eq!(serde_json::from_value::<RpcResponse>(encoded).unwrap(), response);
     }
 
     #[test]

@@ -1370,6 +1370,7 @@ impl EditorRuntime {
                 message: message.into(),
                 current_revision: revision,
                 object_id: None,
+                details: None,
             }),
         }
     }

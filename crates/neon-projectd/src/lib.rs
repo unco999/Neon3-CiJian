@@ -231,6 +231,7 @@ impl Projectd {
                         message: message.into(),
                         current_revision: Some(self.revision),
                         object_id: None,
+                        details: None,
                     }),
                 }
             }

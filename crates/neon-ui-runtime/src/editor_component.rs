@@ -1373,6 +1373,7 @@ mod tests {
             tab_size: 4,
             read_only_input_key: None,
             completion_input_key: None,
+            source_file: None,
             gutter_diagnostics: true,
             token_materials: Default::default(),
             syntax_colors: Default::default(),

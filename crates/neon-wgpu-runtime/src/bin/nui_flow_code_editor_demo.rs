@@ -655,6 +655,7 @@ fn serve_host_stub(endpoint: SocketAddr) -> Result<(), neon_ipc::TransportError>
                         message: "host inbound payload is invalid".into(),
                         current_revision: None,
                         object_id: None,
+                        details: None,
                     }),
                 },
             },
@@ -669,6 +670,7 @@ fn serve_host_stub(endpoint: SocketAddr) -> Result<(), neon_ipc::TransportError>
                     message: "host stub supports only ui.host.inbound".into(),
                     current_revision: None,
                     object_id: None,
+                    details: None,
                 }),
             },
         };

@@ -73,6 +73,10 @@ pub const ERROR_NUI_FLOW_INVALID_PATCH: &str = "nui_flow_invalid_patch";
 pub const ERROR_NUI_FLOW_STALE_PATCH_REVISION: &str = "nui_flow_stale_patch_revision";
 pub const ERROR_NUI_FLOW_UNKNOWN_SHADER: &str = "nui_flow_unknown_shader";
 pub const ERROR_NUI_FLOW_INVALID_GEOMETRY: &str = "nui_flow_invalid_geometry";
+pub const ERROR_NUI_FLOW_SOURCE_REQUIRED: &str = "nui_flow_source_required";
+pub const ERROR_NUI_FLOW_COMPILE: &str = "nui_flow_compile";
+pub const ERROR_NUI_FLOW_ACTIVATION: &str = "nui_flow_activation";
+pub const NUI_FLOW_DIAGNOSTIC_SCHEMA_VERSION: u16 = 1;
 pub const ERROR_UI_SHADER_UNREGISTERED_PACKAGE: &str = "ui_shader_unregistered_package";
 pub const ERROR_UI_SHADER_SOURCE_TOO_LARGE: &str = "ui_shader_source_too_large";
 pub const ERROR_UI_SHADER_VALIDATION_FAILED: &str = "ui_shader_validation_failed";
@@ -2365,6 +2369,68 @@ pub struct NuiFlowParseDiagnostic {
     pub span: NuiSourceSpan,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub suggestion: Option<String>,
+}
+
+/// Phase that produced one public NUI Flow diagnostic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NuiFlowDiagnosticStage {
+    Parse,
+    Compile,
+    Activation,
+    Submit,
+}
+
+/// Stable cross-process diagnostic shape for NUI Flow authoring and compilation.
+/// The optional semantic keys are intentionally stable Flow keys, never renderer
+/// hit IDs or GPU handles.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NuiFlowDiagnostic {
+    pub stage: NuiFlowDiagnosticStage,
+    pub code: String,
+    pub severity: UiDiagnosticSeverity,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub span: Option<NuiSourceSpan>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suggestion: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_key: Option<String>,
+}
+
+/// Result returned by the public `ui.flow.compile` method and attached to
+/// rejected `ui.flow.submit` responses. It is safe for SDKs to deserialize and
+/// remains useful when a renderer is unavailable because compilation is a
+/// separate phase.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NuiFlowCompileReport {
+    pub schema_version: u16,
+    pub status: NuiFlowCompileStatus,
+    pub source_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub surface_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub program_revision: Option<Revision>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_count: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding_count: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_count: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layout_hash: Option<String>,
+    pub diagnostics: Vec<NuiFlowDiagnostic>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NuiFlowCompileStatus {
+    Valid,
+    Invalid,
 }
 
 /// Parsed Flow source and its deterministic lowering result. JSON IR remains

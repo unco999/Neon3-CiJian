@@ -13138,6 +13138,7 @@ impl WgpuRuntime {
                 message: message.into(),
                 current_revision,
                 object_id: None,
+                details: None,
             }),
         }
     }

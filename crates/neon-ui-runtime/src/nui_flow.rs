@@ -6565,6 +6565,34 @@ panel workspace row gap 8
 "#;
 
     #[test]
+    fn public_compile_api_returns_versioned_parse_diagnostics() {
+        let revision = UiProgramRevision {
+            program_id: "flow-diagnostics-test".into(),
+            revision: Revision(1),
+            schema_version: UI_PROGRAM_SCHEMA_VERSION,
+            capabilities: vec![neon_ui_schema::UiProgramCapability {
+                name: neon_ui_schema::UI_PROGRAM_CAPABILITY_NAME.into(),
+                version: 1,
+                owner: neon_ui_schema::UiProgramCapabilityOwner::SharedContract,
+                status: neon_ui_schema::UiProgramCapabilityStatus::Supported,
+            }],
+        };
+        let error = crate::compile_nui_flow_source(
+            "version 1\nsurface root\n  text title value unquoted text\n",
+            revision,
+        )
+        .expect_err("invalid Flow must return structured diagnostics");
+        assert_eq!(
+            error.report.status,
+            neon_ui_schema::NuiFlowCompileStatus::Invalid
+        );
+        assert_eq!(error.report.schema_version, 1);
+        assert_eq!(error.report.diagnostics[0].stage, neon_ui_schema::NuiFlowDiagnosticStage::Parse);
+        assert_eq!(error.report.diagnostics[0].code, "nui_flow_unquoted_text");
+        assert_eq!(error.report.diagnostics[0].span.as_ref().unwrap().line, 3);
+    }
+
+    #[test]
     fn trailing_comments_are_ignored() {
         let document = parse_nui_flow(
             "input show bool default true # declaration comment\nsurface root w 400 h 300 # surface comment\n  branch choices h 260 when $show # branch comment\n    text title value \"Title\" w 300 h 32 # node comment\n",
