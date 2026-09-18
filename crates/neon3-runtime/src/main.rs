@@ -16,8 +16,207 @@
 //! `--headless` (default) runs the headless WGPU server; `--window` opens the
 //! windowed runtime (window server manages the UI endpoint itself).
 
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
+use std::time::Duration;
+
+use neon_editor::ChangeSet;
+use neon_ui_runtime::editor_component::{
+    EditorDocumentFrame, EditorDocumentProvider,
+};
+use neon_ui_schema::UiEditorDocumentBinding;
+use neon_protocol::{
+    ClientIdentity, ClientKind, ProtocolVersion, RequestId, RpcRequest, RpcStatus,
+    ServiceName,
+};
+
+enum EditorDocumentRequest {
+    Snapshot {
+        binding: UiEditorDocumentBinding,
+        initial_source: String,
+    },
+    Change {
+        binding: UiEditorDocumentBinding,
+        change_set: ChangeSet,
+    },
+}
+
+struct EditorRuntimeDocumentProvider {
+    requests: mpsc::Sender<EditorDocumentRequest>,
+    snapshots: Arc<Mutex<HashMap<String, EditorDocumentFrame>>>,
+    pending: Arc<Mutex<HashSet<String>>>,
+}
+
+impl EditorRuntimeDocumentProvider {
+    fn start(endpoint: SocketAddr) -> Arc<Self> {
+        let (requests, receiver) = mpsc::channel();
+        let snapshots = Arc::new(Mutex::new(HashMap::new()));
+        let pending = Arc::new(Mutex::new(HashSet::new()));
+        let cache = snapshots.clone();
+        let pending_worker = pending.clone();
+        std::thread::spawn(move || {
+            let mut sequence = 0_u64;
+            while let Ok(request) = receiver.recv() {
+                sequence = sequence.saturating_add(1);
+                let (method, params, document_id, fallback_source) = match request {
+                    EditorDocumentRequest::Snapshot {
+                        binding,
+                        initial_source,
+                    } => {
+                        let mut binding = binding;
+                        if binding.epoch == 0 {
+                            binding.epoch = 1;
+                        }
+                        let document_id = binding.document_id.clone();
+                        (
+                            "editor.document.snapshot.get",
+                            serde_json::json!({
+                                "document_id": binding.document_id,
+                                "session_id": binding.session_id,
+                                "epoch": binding.epoch,
+                            }),
+                            document_id,
+                            Some(initial_source),
+                        )
+                    }
+                    EditorDocumentRequest::Change { binding, change_set } => {
+                        let mut binding = binding;
+                        if binding.epoch == 0 {
+                            binding.epoch = 1;
+                        }
+                        let document_id = binding.document_id.clone();
+                        (
+                            "editor.document.change.apply",
+                            serde_json::json!({
+                                "document_id": binding.document_id,
+                                "session_id": binding.session_id,
+                                "epoch": binding.epoch,
+                                "change_set": change_set,
+                                "kind": "commit",
+                            }),
+                            document_id,
+                            None,
+                        )
+                    }
+                };
+                let request = RpcRequest {
+                    protocol: "neon3.rpc".into(),
+                    version: ProtocolVersion { major: 1, minor: 0 },
+                    request_id: RequestId(format!("editor-bridge-{sequence}")),
+                    client: ClientIdentity {
+                        kind: ClientKind::UiRuntime,
+                        instance_id: "neon3-runtime-editor-bridge".into(),
+                        pid: std::process::id(),
+                        origin: "neon3-runtime".into(),
+                    },
+                    target: ServiceName("editor-runtime".into()),
+                    method: method.into(),
+                    params,
+                    expected_revision: None,
+                    idempotency_key: Some(format!("editor-bridge-{sequence}")),
+                };
+                let mut response = neon_ipc::RpcClient::connect(endpoint)
+                    .and_then(|client| client.with_timeout(Duration::from_secs(3)))
+                    .and_then(|mut client| client.call(&request));
+                if response
+                    .as_ref()
+                    .is_ok_and(|response| response.status != RpcStatus::Accepted)
+                    && method == "editor.document.snapshot.get"
+                {
+                    if let Some(initial_source) = fallback_source {
+                        let open_request = RpcRequest {
+                            request_id: RequestId(format!("editor-bridge-open-{sequence}")),
+                            method: "editor.document.open".into(),
+                            params: serde_json::json!({
+                                "document_id": request.params.get("document_id"),
+                                "session_id": request.params.get("session_id"),
+                                "language": "nui_flow",
+                                "source": initial_source,
+                            }),
+                            idempotency_key: Some(format!("editor-bridge-open-{sequence}")),
+                            ..request.clone()
+                        };
+                        response = neon_ipc::RpcClient::connect(endpoint)
+                            .and_then(|client| client.with_timeout(Duration::from_secs(3)))
+                            .and_then(|mut client| client.call(&open_request));
+                    }
+                }
+                if let Ok(response) = response
+                    && response.status == RpcStatus::Accepted
+                {
+                    let snapshot = response
+                        .result
+                        .as_ref()
+                        .and_then(|result| result.get("snapshot"))
+                        .and_then(|snapshot| {
+                            serde_json::from_value::<neon_editor_runtime::EditorDocumentSnapshot>(
+                                snapshot.clone(),
+                            )
+                            .ok()
+                        });
+                    if let Some(snapshot) = snapshot {
+                        if let Ok(mut cache) = cache.lock() {
+                            cache.insert(
+                                document_id.clone(),
+                                EditorDocumentFrame {
+                                    binding: UiEditorDocumentBinding {
+                                        document_id: snapshot.document_id.clone(),
+                                        session_id: snapshot.session_id.clone(),
+                                        epoch: snapshot.epoch,
+                                        revision: snapshot.revision.0,
+                                        committed_revision: snapshot.committed_revision.0,
+                                        source_hash: snapshot.source_hash.clone(),
+                                        dirty: snapshot.dirty,
+                                    },
+                                    source: snapshot.source,
+                                },
+                            );
+                        }
+                    }
+                }
+                if let Ok(mut pending) = pending_worker.lock() {
+                    pending.remove(&document_id);
+                }
+            }
+        });
+        Arc::new(Self {
+            requests,
+            snapshots,
+            pending,
+        })
+    }
+}
+
+impl EditorDocumentProvider for EditorRuntimeDocumentProvider {
+    fn request_snapshot(&self, binding: &UiEditorDocumentBinding, initial_source: &str) {
+        let Ok(mut pending) = self.pending.lock() else { return };
+        if !pending.insert(binding.document_id.clone()) {
+            return;
+        }
+        if self
+            .requests
+            .send(EditorDocumentRequest::Snapshot {
+                binding: binding.clone(),
+                initial_source: initial_source.to_owned(),
+            })
+            .is_err()
+        {
+            pending.remove(&binding.document_id);
+        }
+    }
+
+    fn take_snapshot(&self, document_id: &str) -> Option<EditorDocumentFrame> {
+        self.snapshots.lock().ok()?.get(document_id).cloned()
+    }
+
+    fn submit_change(&self, binding: &UiEditorDocumentBinding, change_set: ChangeSet) {
+        let _ = self.requests.send(EditorDocumentRequest::Change {
+            binding: binding.clone(),
+            change_set,
+        });
+    }
+}
 
 fn parse_addr(args: &[String], flag: &str, default: &str) -> SocketAddr {
     args.iter()
@@ -99,8 +298,11 @@ fn main() {
     // slot. Injected into the renderer (input sink + external presentations)
     // and into the fragment path (observer), so the editor core stays fully
     // outside the wgpu renderer while every feature keeps working.
-    let editor_bridge =
-        std::sync::Arc::new(neon_ui_runtime::editor_component::EditorBridge::new());
+    let document_provider = EditorRuntimeDocumentProvider::start(editor_endpoint);
+    let editor_bridge = std::sync::Arc::new(
+        neon_ui_runtime::editor_component::EditorBridge::new()
+            .with_document_provider(document_provider),
+    );
 
     if windowed {
         // winit 0.30 requires the event loop on the main thread; the windowed
@@ -190,6 +392,10 @@ fn main() {
                 reveal_sink: Some(reveal_sink),
                 external_presentations: Some(editor_bridge.presentations.clone()),
                 fragment_observer: Some(fragment_observer),
+                presentation_refresh: Some(Box::new({
+                    let bridge = editor_bridge.clone();
+                    move || bridge.refresh_provider_snapshots()
+                })),
             };
             if let Err(error) = neon_wgpu_runtime::WindowedRuntime::run_server_with_eventd_bridged(
                 1,
@@ -218,6 +424,11 @@ fn main() {
             let bridge = editor_bridge.clone();
             runtime.set_editor_fragment_observer(Some(Box::new(move |fragments| {
                 bridge.sync_fragments(fragments)
+            })));
+            runtime.set_editor_external_presentations(editor_bridge.presentations.clone());
+            let bridge = editor_bridge.clone();
+            runtime.set_editor_presentation_refresh(Some(Box::new(move || {
+                bridge.refresh_provider_snapshots()
             })));
             let runtime = std::sync::Arc::new(std::sync::Mutex::new(runtime));
             let handler = move |request| {

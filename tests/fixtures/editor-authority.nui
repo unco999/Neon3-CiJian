@@ -1,0 +1,5 @@
+version 1
+surface surface.editor-authority revision 1
+input document text default text:empty
+surface root column w 800 h 500
+  code_editor source-view source $document source_file "D:/Neon3/tests/fixtures/editor-authority.nui" language nui_flow line_numbers true wrap none font_size 14 tab_size 2

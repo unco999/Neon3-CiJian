@@ -1188,6 +1188,7 @@ dependencies = [
  "neon-eventd",
  "neon-ipc",
  "neon-languages",
+ "neon-protocol",
  "neon-ui-runtime",
  "neon-ui-schema",
  "neon-wgpu-runtime",

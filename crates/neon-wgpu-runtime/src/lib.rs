@@ -71,6 +71,7 @@ pub struct EditorBridgeHandle {
         Option<Arc<Mutex<Vec<neon_ui_schema::UiCodeEditorPresentation>>>>,
     pub fragment_observer:
         Option<Box<dyn FnMut(&HashMap<UiFragmentId, UiFragment>) + Send>>,
+    pub presentation_refresh: Option<Box<dyn FnMut() + Send>>,
 }
 use winit::{
     application::ApplicationHandler,
@@ -2077,6 +2078,7 @@ impl WindowedRuntime {
             runtime.interaction_traces.clone(),
             runtime.world_ui_lab_camera.clone(),
             None,
+            None,
         );
         runtime.applied_composition_revision = Revision(0);
         runtime.redraw_pending = true;
@@ -2237,7 +2239,9 @@ impl WindowedRuntime {
         }
         if let Some(endpoint) = endpoint {
             let interaction_traces = runtime.interaction_traces.clone();
-            let reveal_sink = runtime.editor_bridge.as_mut().and_then(|bridge| bridge.reveal_sink.take());
+            let (reveal_sink, fragment_observer) = runtime.editor_bridge.as_mut().map(|bridge| {
+                (bridge.reveal_sink.take(), bridge.fragment_observer.take())
+            }).unwrap_or((None, None));
             spawn_window_server(
                 epoch,
                 endpoint,
@@ -2245,6 +2249,7 @@ impl WindowedRuntime {
                 interaction_traces,
                 runtime.world_ui_lab_camera.clone(),
                 reveal_sink,
+                fragment_observer,
             );
         }
         event_loop
@@ -2372,6 +2377,9 @@ impl WindowedRuntime {
             }
             if let Some(slot) = bridge.external_presentations.take() {
                 gpu.ui.set_editor_external_presentations(slot);
+            }
+            if let Some(refresh) = bridge.presentation_refresh.take() {
+                gpu.ui.set_editor_presentation_refresh(refresh);
             }
         }
         self.gpu = Some(gpu);
@@ -10812,6 +10820,7 @@ fn spawn_window_server(
     interaction_traces: Arc<Mutex<InteractionTraceStore>>,
     world_ui_lab_camera: Arc<Mutex<WorldUiLabCameraController>>,
     reveal_sink: Option<Box<dyn FnMut(Value, f32) -> Option<neon_ui_schema::UiCodeEditorPresentation> + Send>>,
+    fragment_observer: Option<Box<dyn FnMut(&HashMap<UiFragmentId, UiFragment>) + Send>>,
 ) {
     thread::spawn(move || {
         let server = match neon_ipc::BlockingRpcServer::bind(endpoint) {
@@ -10828,6 +10837,7 @@ fn spawn_window_server(
             world_ui_lab_camera,
         )));
         runtime.lock().expect("runtime lock").editor_reveal_sink = reveal_sink;
+        runtime.lock().expect("runtime lock").editor_fragment_observer = fragment_observer;
         let handler_proxy = proxy.clone();
         if let Err(error) = server.serve_until(
             move |request| {
@@ -11493,6 +11503,9 @@ pub struct WgpuRuntime {
         Option<Box<dyn FnMut(&HashMap<UiFragmentId, UiFragment>) + Send>>,
     editor_reveal_sink:
         Option<Box<dyn FnMut(Value, f32) -> Option<neon_ui_schema::UiCodeEditorPresentation> + Send>>,
+    editor_external_presentations:
+        Option<Arc<Mutex<Vec<neon_ui_schema::UiCodeEditorPresentation>>>>,
+    editor_presentation_refresh: Option<Box<dyn FnMut() + Send>>,
 }
 
 impl WgpuRuntime {
@@ -11528,6 +11541,8 @@ impl WgpuRuntime {
             shader_registry: shader_registry::ShaderRegistry::new(),
             editor_fragment_observer: None,
             editor_reveal_sink: None,
+            editor_external_presentations: None,
+            editor_presentation_refresh: None,
         }
     }
 
@@ -11537,6 +11552,20 @@ impl WgpuRuntime {
         observer: Option<Box<dyn FnMut(&HashMap<UiFragmentId, UiFragment>) + Send>>,
     ) {
         self.editor_fragment_observer = observer;
+    }
+
+    /// Attaches the host-owned presentation cache for headless composition.
+    /// The renderer consumes snapshots only; editor state remains in the
+    /// injected UI/editor bridge.
+    pub fn set_editor_external_presentations(
+        &mut self,
+        presentations: Arc<Mutex<Vec<neon_ui_schema::UiCodeEditorPresentation>>>,
+    ) {
+        self.editor_external_presentations = Some(presentations);
+    }
+
+    pub fn set_editor_presentation_refresh(&mut self, refresh: Option<Box<dyn FnMut() + Send>>) {
+        self.editor_presentation_refresh = refresh;
     }
 
     pub fn set_editor_reveal_sink(
@@ -12381,6 +12410,7 @@ impl WgpuRuntime {
                 )),
             ),
             "wgpu.ui.fragment.snapshot" => self.fragment_snapshot(request_id, request.params),
+            "wgpu.ui.editor.presentation.snapshot" => self.editor_presentation_snapshot(request_id),
             "wgpu.render.target.capture" => self.target_capture(request_id, request.params),
             "wgpu.render.target.assert" => self.target_assert(request_id, request.params),
             "wgpu.ui.animation.cancel"
@@ -12972,6 +13002,25 @@ impl WgpuRuntime {
                     "sequence": self.graph_revision,
                     "fragment_revision": fragment.revision,
                     "fragment": fragment,
+            }),
+        )
+    }
+
+    fn editor_presentation_snapshot(&mut self, request_id: RequestId) -> RpcResponse {
+        if let Some(refresh) = self.editor_presentation_refresh.as_mut() {
+            refresh();
+        }
+        let presentations = self
+            .editor_external_presentations
+            .as_ref()
+            .and_then(|slot| slot.lock().ok().map(|presentations| presentations.clone()))
+            .unwrap_or_default();
+        self.accept(
+            request_id,
+            json!({
+                "epoch": self.epoch,
+                "sequence": self.graph_revision,
+                "presentations": presentations,
             }),
         )
     }

@@ -2119,6 +2119,7 @@ pub struct UiWgpuRenderer {
     editor_external_presentations: Option<
         std::sync::Arc<std::sync::Mutex<Vec<neon_ui_schema::UiCodeEditorPresentation>>>,
     >,
+    editor_presentation_refresh: Option<Box<dyn FnMut() + Send>>,
 }
 
 impl UiWgpuRenderer {
@@ -3326,6 +3327,7 @@ impl UiWgpuRenderer {
             editor_pending_commits: Vec::new(),
             editor_input_sink: None,
             editor_external_presentations: None,
+            editor_presentation_refresh: None,
         }
     }
 

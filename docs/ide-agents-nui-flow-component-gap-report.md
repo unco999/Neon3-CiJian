@@ -405,3 +405,7 @@ single grammar source
 - **Executable probe**：新增 [`component_interaction_probe.rs`](../crates/neon-wgpu-runtime/src/bin/component_interaction_probe.rs)，真实经过 headless external GPU、surface open、fragment submit、pointer Down/Up 和 semantic event。
 
 本轮仍没有把以下能力伪装成完成：正式 `code_editor` document frame、revisioned TreeFrame、Splitter semantic commit、Toast queue/TTL、完整 Popup keyboard focus。这些仍是下一批独立 contract 工作。
+
+当前主推进已开始补正式 CodeEditor document frame：schema 已有 `UiEditorDocumentBinding`，presentation/commit 已携带文档身份和 ChangeSet，EditorBridge 已支持非阻塞 provider/cache，`neon3-runtime` 已有后台 editor-runtime RPC provider；cache miss 时会在 worker 中执行 `document.open`。端到端 document open/apply/conflict/reveal 验收仍未完成，因此 CodeEditor 当前状态更新为“authority bridge in progress”，不是 complete。
+
+新增 `code_editor_authority.v1` 端到端 probe 后，首次 open/snapshot/presentation 子链路已通过：真实 `neon3-runtime` 提交 Flow 后，WGPU presentation 观察到 `document_id`、`epoch`、`revision=1`、`source_hash` 和 source，与 editor-runtime snapshot 配对一致。ChangeSet apply、revision conflict、reveal 仍需下一阶段 probe。

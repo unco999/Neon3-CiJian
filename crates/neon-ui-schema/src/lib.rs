@@ -3843,6 +3843,11 @@ impl UiTransition {
 pub struct UiCodeEditorDeclaration {
     pub node_key: String,
     pub source_input_key: String,
+    /// Runtime-resolved document identity. Flow may leave this unset; the
+    /// editor host fills it from the editor-runtime binding before publishing
+    /// a presentation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub document: Option<UiEditorDocumentBinding>,
     /// Optional file path on disk. When set, the runtime reads file content
     /// directly instead of routing through an input TextHandle. This avoids
     /// transferring file contents over RPC for editor file switching.
@@ -3881,6 +3886,20 @@ pub struct UiCodeEditorDeclaration {
     /// material / theme color when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selection_material: Option<UiTextMaterialRef>,
+}
+
+/// Stable document identity shared by editor-runtime, ui-runtime and the
+/// renderer. File paths are intentionally absent from this transport frame.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiEditorDocumentBinding {
+    pub document_id: String,
+    pub session_id: String,
+    pub epoch: u64,
+    pub revision: u64,
+    pub committed_revision: u64,
+    pub source_hash: String,
+    pub dirty: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -3933,6 +3952,8 @@ impl UiCodeEditorDeclaration {
 #[serde(deny_unknown_fields)]
 pub struct UiCodeEditorPresentation {
     pub node_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub document: Option<UiEditorDocumentBinding>,
     /// Monotonic snapshot revision. The renderer may skip re-layout when the
     /// revision is unchanged across fragments.
     pub revision: u64,

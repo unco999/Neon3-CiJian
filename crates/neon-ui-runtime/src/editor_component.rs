@@ -19,12 +19,14 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use neon_editor::{
-    CompletionItem, EditEvent, EditEventKind, EditorCore, Language, LanguageKind, Position,
+    ChangeSet, CompletionItem, EditEvent, EditEventKind, EditorCore, Language, LanguageKind,
+    Position,
 };
 use neon_ui_schema::{
     TextRef, UiCodeEditorDeclaration, UiCodeEditorPresentation, UiEditorCompletionItem,
-    UiEditorCompletionSnapshot, UiEditorEditFx, UiEditorInputEvent, UiEffect, UiFragment,
-    UiFragmentId, UiEditorKeyKind, UiEditorTokenSpan, UiIntent, UiNode, UiNodeKind,
+    UiEditorCompletionSnapshot, UiEditorDocumentBinding, UiEditorEditFx, UiEditorInputEvent,
+    UiEffect, UiFragment, UiFragmentId, UiEditorKeyKind, UiEditorTokenSpan, UiIntent, UiNode,
+    UiNodeKind,
 };
 
 /// Map a NUI code_editor declaration language to the kernel Language.
@@ -90,6 +92,25 @@ pub struct EditorCommit {
     pub node_path: String,
     pub event_action: Option<String>,
     pub document: String,
+    pub change_set: Option<ChangeSet>,
+    pub binding: Option<UiEditorDocumentBinding>,
+}
+
+/// Snapshot returned by the authoritative editor-runtime. The UI runtime
+/// keeps this bounded frame for presentation; it does not own persistence.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EditorDocumentFrame {
+    pub binding: UiEditorDocumentBinding,
+    pub source: String,
+}
+
+/// Non-blocking document boundary used by EditorBridge. Implementations must
+/// queue RPC work instead of performing network I/O from fragment/render
+/// callbacks. `take_snapshot` returns only frames already received.
+pub trait EditorDocumentProvider: Send + Sync {
+    fn request_snapshot(&self, binding: &UiEditorDocumentBinding, initial_source: &str);
+    fn take_snapshot(&self, document_id: &str) -> Option<EditorDocumentFrame>;
+    fn submit_change(&self, binding: &UiEditorDocumentBinding, change_set: ChangeSet);
 }
 
 /// The `code_editor` component: editing core + view state + semantics.
@@ -135,6 +156,19 @@ impl EditorComponent {
             revision: 0,
             clipboard: String::new(),
         }
+    }
+
+    /// Adopts an authoritative document frame. Local undo/pending state is
+    /// discarded because the host revision is now the source of truth.
+    pub fn adopt_document_frame(&mut self, frame: &EditorDocumentFrame) {
+        self.core
+            .adopt_document(&frame.source, frame.binding.revision);
+        self.declaration.document = Some(frame.binding.clone());
+        self.adopted_source = frame.source.clone();
+        self.pending_edits = false;
+        self.completion = None;
+        self.preedit.clear();
+        self.revision = frame.binding.revision;
     }
 
     /// Rebuilds the core when the declaration language or the external
@@ -358,11 +392,14 @@ impl EditorComponent {
         self.completion = None;
         self.preedit.clear();
         let document = self.core.buffer().text();
+        let change_set = self.core.take_change_set();
         self.core.commit();
         Some(EditorCommit {
             node_path: self.declaration.node_key.clone(),
             event_action: self.event_action.clone(),
             document,
+            change_set,
+            binding: self.declaration.document.clone(),
         })
     }
 
@@ -1082,6 +1119,11 @@ impl EditorComponent {
     /// defensively). `now` drives fx lifetime.
     pub fn to_presentation(&mut self, now: f32) -> UiCodeEditorPresentation {
         self.revision += 1;
+        let presentation_revision = self
+            .declaration
+            .document
+            .as_ref()
+            .map_or(self.revision, |document| document.revision);
         self.edit_fx
             .retain(|fx| now - fx.started_seconds < fx.duration_ms as f32 / 1000.0);
         let line_count = self.core.buffer().line_count();
@@ -1121,7 +1163,8 @@ impl EditorComponent {
         });
         UiCodeEditorPresentation {
             node_key: self.declaration.node_key.clone(),
-            revision: self.revision,
+            document: self.declaration.document.clone(),
+            revision: presentation_revision,
             source: self.core.buffer().text(),
             token_rows,
             caret_line: self.caret.line,
@@ -1173,16 +1216,44 @@ impl EditorComponentRegistry {
         &mut self,
         desired: &HashMap<String, (UiCodeEditorDeclaration, Option<String>, String)>,
     ) {
+        self.reconcile_with_provider(desired, None);
+    }
+
+    pub fn reconcile_with_provider(
+        &mut self,
+        desired: &HashMap<String, (UiCodeEditorDeclaration, Option<String>, String)>,
+        provider: Option<&dyn EditorDocumentProvider>,
+    ) {
         self.editors
             .retain(|path, _| desired.contains_key(path));
         for (path, (declaration, event_action, source)) in desired {
+            let mut declaration = declaration.clone();
+            let mut source = source.clone();
+            if let Some(binding) = declaration.document.as_ref() {
+                if let Some(provider) = provider {
+                    if let Some(frame) = provider.take_snapshot(&binding.document_id) {
+                        source = frame.source.clone();
+                        declaration.document = Some(frame.binding.clone());
+                    } else {
+                        provider.request_snapshot(binding, &source);
+                    }
+                }
+            }
             if let Some(state) = self.editors.get_mut(path) {
                 let needs_rebuild = state.declaration.language != declaration.language
-                    || (state.adopted_source != *source && !state.focus);
+                    || (state.adopted_source != source && !state.focus);
+                if state.declaration.document != declaration.document {
+                    if let Some(binding) = declaration.document.as_ref()
+                        && let Some(provider) = provider
+                        && let Some(frame) = provider.take_snapshot(&binding.document_id)
+                    {
+                        state.adopt_document_frame(&frame);
+                    }
+                }
                 state.declaration = declaration.clone();
                 state.event_action = event_action.clone();
                 if needs_rebuild {
-                    state.core = EditorCore::from_language(source, core_language_for(declaration));
+                    state.core = EditorCore::from_language(&source, core_language_for(&declaration));
                     state.adopted_source = source.clone();
                     state.caret = Position::START;
                     state.selection_anchor = None;
@@ -1193,7 +1264,13 @@ impl EditorComponentRegistry {
                     state.revision += 1;
                 }
             } else {
-                let mut state = EditorComponent::new(declaration.clone(), source);
+                let mut state = EditorComponent::new(declaration.clone(), &source);
+                if let Some(binding) = declaration.document.as_ref()
+                    && let Some(provider) = provider
+                    && let Some(frame) = provider.take_snapshot(&binding.document_id)
+                {
+                    state.adopt_document_frame(&frame);
+                }
                 state.event_action = event_action.clone();
                 self.editors.insert(path.clone(), state);
             }
@@ -1235,7 +1312,16 @@ impl EditorComponentRegistry {
         row_height: f32,
         gutter_width: f32,
     ) -> bool {
-        let Some(state) = self.editors.get_mut(path) else { return false };
+        let resolved_path = if self.editors.contains_key(path) {
+            Some(path.to_string())
+        } else {
+            self.editors
+                .keys()
+                .find(|candidate| candidate.ends_with(path) || path.ends_with(candidate.as_str()))
+                .cloned()
+        };
+        let Some(resolved_path) = resolved_path else { return false };
+        let Some(state) = self.editors.get_mut(&resolved_path) else { return false };
         state.reveal(
             line,
             column,
@@ -1319,6 +1405,7 @@ pub struct EditorBridge {
     /// The renderer reads this slot each frame (Arc so the host can hand the
     /// same slot to the renderer without a copy).
     pub presentations: Arc<Mutex<Vec<UiCodeEditorPresentation>>>,
+    document_provider: Option<Arc<dyn EditorDocumentProvider>>,
 }
 
 impl EditorBridge {
@@ -1326,7 +1413,17 @@ impl EditorBridge {
         Self {
             registry: Mutex::new(EditorComponentRegistry::new()),
             presentations: Arc::new(Mutex::new(Vec::new())),
+            document_provider: None,
         }
+    }
+
+    pub fn with_document_provider(mut self, provider: Arc<dyn EditorDocumentProvider>) -> Self {
+        self.document_provider = Some(provider);
+        self
+    }
+
+    pub fn set_document_provider(&mut self, provider: Option<Arc<dyn EditorDocumentProvider>>) {
+        self.document_provider = provider;
     }
 
     /// Rescans submitted fragments for `code_editor` declarations, reconciles
@@ -1358,15 +1455,34 @@ impl EditorBridge {
                     continue;
                 }
                 let path = format!("{}/{}", fragment.fragment_id.0, node_key);
-                let source = sources.get(node_key).cloned().unwrap_or_default();
+                let mut source = sources.get(node_key).cloned().unwrap_or_default();
+                let mut declaration = declaration.clone();
+                if source.is_empty()
+                    && let Some(source_file) = declaration.source_file.as_deref()
+                    && let Ok(file_source) = std::fs::read_to_string(source_file)
+                {
+                    source = file_source;
+                }
+                if declaration.document.is_none() {
+                    if let Some(source_file) = declaration.source_file.as_deref() {
+                        // Compatibility bootstrap only. The host should
+                        // replace this path-derived binding with a
+                        // workspace-relative document ID and real epoch.
+                        declaration.document = Some(UiEditorDocumentBinding {
+                            document_id: source_file.to_owned(),
+                            session_id: "neon-ide".into(),
+                            ..UiEditorDocumentBinding::default()
+                        });
+                    }
+                }
                 desired.insert(
                     path,
-                    (declaration.clone(), events.get(node_key).cloned(), source),
+                    (declaration, events.get(node_key).cloned(), source),
                 );
             }
         }
         let mut registry = self.registry.lock().expect("editor bridge registry lock");
-        registry.reconcile(&desired);
+        registry.reconcile_with_provider(&desired, self.document_provider.as_deref());
         *self.presentations.lock().expect("editor bridge presentations lock") =
             registry.to_presentations(0.0);
     }
@@ -1380,9 +1496,38 @@ impl EditorBridge {
     ) -> Vec<EditorCommit> {
         let mut registry = self.registry.lock().expect("editor bridge registry lock");
         let commits = registry.handle_input(event, now);
+        if let Some(provider) = self.document_provider.as_ref() {
+            for commit in &commits {
+                if let (Some(binding), Some(change_set)) = (&commit.binding, &commit.change_set) {
+                    provider.submit_change(binding, change_set.clone());
+                }
+            }
+        }
         *self.presentations.lock().expect("editor bridge presentations lock") =
             registry.to_presentations(now);
         commits
+    }
+
+    /// Pulls completed provider frames into local editor components without
+    /// performing network I/O. Hosts call this from their frame/diagnostic
+    /// tick after the provider worker has had time to complete.
+    pub fn refresh_provider_snapshots(&self) {
+        let Some(provider) = self.document_provider.as_deref() else {
+            return;
+        };
+        let mut registry = self.registry.lock().expect("editor bridge registry lock");
+        for state in registry.editors.values_mut() {
+            let Some(binding) = state.declaration.document.as_ref() else {
+                continue;
+            };
+            if let Some(frame) = provider.take_snapshot(&binding.document_id)
+                && frame.binding.revision != binding.revision
+            {
+                state.adopt_document_frame(&frame);
+            }
+        }
+        *self.presentations.lock().expect("editor bridge presentations lock") =
+            registry.to_presentations(0.0);
     }
 
     /// Host-directed editor reveal. The returned presentation is the
@@ -1455,6 +1600,7 @@ mod tests {
         UiCodeEditorDeclaration {
             node_key: "source-view".into(),
             source_input_key: "document".into(),
+            document: None,
             language: UiEditorLanguage::Typescript,
             line_numbers: true,
             wrap: UiEditorWrap::None,

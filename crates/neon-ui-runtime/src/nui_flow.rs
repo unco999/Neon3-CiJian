@@ -4430,6 +4430,7 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
         Some(neon_ui_schema::UiCodeEditorDeclaration {
             node_key: node.node_id.0.clone(),
             source_input_key,
+            document: None,
             source_file: code_editor_source_file,
             language: code_editor_language,
             line_numbers: code_editor_line_numbers,

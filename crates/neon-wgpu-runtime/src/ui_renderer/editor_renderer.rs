@@ -1018,6 +1018,9 @@ impl super::UiWgpuRenderer {
         // Merge externally-published presentations (the host's ui-runtime
         // editor component publishes fresh snapshots after handling input;
         // they key by node_key like the fragment effects do).
+        if let Some(refresh) = self.editor_presentation_refresh.as_mut() {
+            refresh();
+        }
         if let Some(slot) = &self.editor_external_presentations
             && let Ok(external) = slot.lock()
         {
@@ -1068,6 +1071,10 @@ impl super::UiWgpuRenderer {
         slot: std::sync::Arc<std::sync::Mutex<Vec<neon_ui_schema::UiCodeEditorPresentation>>>,
     ) {
         self.editor_external_presentations = Some(slot);
+    }
+
+    pub(crate) fn set_editor_presentation_refresh(&mut self, refresh: Box<dyn FnMut() + Send>) {
+        self.editor_presentation_refresh = Some(refresh);
     }
 
     /// Whether any code editor currently owns keyboard focus.

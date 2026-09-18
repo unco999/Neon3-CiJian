@@ -274,6 +274,7 @@ fn main() {
         reveal_sink: None,
         external_presentations: Some(editor_bridge.presentations.clone()),
         fragment_observer: Some(fragment_observer),
+        presentation_refresh: None,
     };
     let window_result = neon_wgpu_runtime::WindowedRuntime::run_server_with_eventd_bridged(
         1,
