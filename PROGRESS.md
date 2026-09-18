@@ -48,15 +48,16 @@ normalized `range`, `document_revision`, and `presentation_revision`.
 
 ## Next steps
 
-1. Run the final `git diff --check` and inspect the staged diff.
-2. Run `git add -A`, commit with the contract root
-   cause and verification in the message, and push `origin/master`.
-3. Run the IDE reveal probe against a live runtime as the cross-repository
+1. Run the IDE reveal probe against a live runtime as the cross-repository
    end-to-end acceptance check; the IDE remains intentionally unmodified.
+2. Keep the generic SDK/IDE response parsing aligned with this public result
+   schema when those repositories next receive their planned updates.
 
 ## Final verification update
 
 The full workspace `cargo build` passed on 2026-09-18. The targeted reveal and
-protocol tests listed above also passed. The remaining next step is the live
+protocol tests listed above also passed. `git diff --check` passed. Commit
+`ff6ba88` (`Complete editor reveal acknowledgement contract`) was created and
+pushed to `origin/master` on 2026-09-18. The remaining next step is the live
 cross-repository IDE probe; it requires the runtime services to be running and
 does not justify changing the IDE or SDK in this kernel task.
