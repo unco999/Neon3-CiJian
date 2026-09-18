@@ -1,4 +1,4 @@
-﻿//! GPU-independent UI declaration schema types.
+//! GPU-independent UI declaration schema types.
 //! This crate must not create GPU or window objects.
 
 use neon_protocol::{AssetRef, Revision};
@@ -113,15 +113,31 @@ pub enum UiInputKind {
     Vec2,
     Vec4,
     Color,
-    Enum { variants: Vec<String> },
+    Enum {
+        variants: Vec<String>,
+    },
     TextHandle,
     AssetHandle,
-    I32Range { minimum: i32, maximum: i32 },
-    U32Range { minimum: u32, maximum: u32 },
-    F32Range { minimum: f32, maximum: f32 },
+    I32Range {
+        minimum: i32,
+        maximum: i32,
+    },
+    U32Range {
+        minimum: u32,
+        maximum: u32,
+    },
+    F32Range {
+        minimum: f32,
+        maximum: f32,
+    },
     CanvasData,
-    Struct { fields: std::collections::BTreeMap<String, UiInputKind> },
-    Array { element_kind: Box<UiInputKind>, length: usize },
+    Struct {
+        fields: std::collections::BTreeMap<String, UiInputKind>,
+    },
+    Array {
+        element_kind: Box<UiInputKind>,
+        length: usize,
+    },
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -134,19 +150,47 @@ pub enum UiInputUpdateClass {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum UiInputValue {
-    Bool { value: bool },
-    I32 { value: i32 },
-    U32 { value: u32 },
-    F32 { value: f32 },
-    Vec2 { value: [f32; 2] },
-    Vec4 { value: [f32; 4] },
-    Color { value: [f32; 4] },
-    Enum { value: String },
-    TextHandle { value: UiTextHandle },
-    AssetHandle { id: u64, generation: u32 },
-    CanvasData { value: UiCanvasData },
-    Struct { fields: std::collections::BTreeMap<String, UiInputValue> },
-    Array { elements: Vec<UiInputValue>, element_kind: Box<UiInputKind> },
+    Bool {
+        value: bool,
+    },
+    I32 {
+        value: i32,
+    },
+    U32 {
+        value: u32,
+    },
+    F32 {
+        value: f32,
+    },
+    Vec2 {
+        value: [f32; 2],
+    },
+    Vec4 {
+        value: [f32; 4],
+    },
+    Color {
+        value: [f32; 4],
+    },
+    Enum {
+        value: String,
+    },
+    TextHandle {
+        value: UiTextHandle,
+    },
+    AssetHandle {
+        id: u64,
+        generation: u32,
+    },
+    CanvasData {
+        value: UiCanvasData,
+    },
+    Struct {
+        fields: std::collections::BTreeMap<String, UiInputValue>,
+    },
+    Array {
+        elements: Vec<UiInputValue>,
+        element_kind: Box<UiInputKind>,
+    },
 }
 
 /// Bounded, persisted drawing data for a single declarative Canvas node.
@@ -257,7 +301,12 @@ impl Default for UiInputSlot {
             default_value: UiInputValue::Bool { value: false },
             update_class: UiInputUpdateClass::ReliableExternal,
             semantic_label: String::new(),
-            packing: UiInputPacking { alignment: 4, lanes: 1, offset: 0, representation: UiGpuScalarRepresentation::U32 },
+            packing: UiInputPacking {
+                alignment: 4,
+                lanes: 1,
+                offset: 0,
+                representation: UiGpuScalarRepresentation::U32,
+            },
             derived_expression: None,
         }
     }
@@ -360,7 +409,10 @@ impl UiInputKind {
     pub fn gpu_slot_count(&self) -> usize {
         match self {
             Self::Struct { fields } => fields.values().map(|kind| kind.gpu_slot_count()).sum(),
-            Self::Array { element_kind, length } => element_kind.gpu_slot_count() * length,
+            Self::Array {
+                element_kind,
+                length,
+            } => element_kind.gpu_slot_count() * length,
             _ => 1,
         }
     }
@@ -394,7 +446,14 @@ impl UiInputKind {
                     && *value <= *maximum
             }
             (Self::CanvasData, UiInputValue::CanvasData { value }) => value.validate(),
-            (Self::Struct { fields: kind_fields }, UiInputValue::Struct { fields: value_fields }) => {
+            (
+                Self::Struct {
+                    fields: kind_fields,
+                },
+                UiInputValue::Struct {
+                    fields: value_fields,
+                },
+            ) => {
                 kind_fields.len() == value_fields.len()
                     && kind_fields.iter().all(|(key, kind)| {
                         value_fields
@@ -403,8 +462,15 @@ impl UiInputKind {
                             .unwrap_or(false)
                     })
             }
-            (Self::Array { element_kind, length }, UiInputValue::Array { elements, .. }) => {
-                elements.len() == *length && elements.iter().all(|element| element_kind.accepts(element))
+            (
+                Self::Array {
+                    element_kind,
+                    length,
+                },
+                UiInputValue::Array { elements, .. },
+            ) => {
+                elements.len() == *length
+                    && elements.iter().all(|element| element_kind.accepts(element))
             }
             _ => false,
         }
@@ -892,9 +958,17 @@ pub enum UiSkinSlotKind {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum UiSkinPresentation {
-    Solid { color: [f32; 4] },
-    Image { resource_key: String, fit: UiImageFit },
-    NineSlice { resource_key: String, layout: UiNineSlice },
+    Solid {
+        color: [f32; 4],
+    },
+    Image {
+        resource_key: String,
+        fit: UiImageFit,
+    },
+    NineSlice {
+        resource_key: String,
+        layout: UiNineSlice,
+    },
     Default,
 }
 
@@ -909,7 +983,36 @@ pub struct UiSkinSlot {
 impl UiControlSkin {
     pub fn validate(&self) -> Result<(), UiSchemaError> {
         if self.key.trim().is_empty()
-            || !matches!(self.component_kind, UiNodeKind::Button | UiNodeKind::Slider | UiNodeKind::Scrollbar | UiNodeKind::ProgressBar | UiNodeKind::Checkbox | UiNodeKind::RadioButton | UiNodeKind::TextInput | UiNodeKind::Tooltip | UiNodeKind::Panel | UiNodeKind::Dialog | UiNodeKind::ContextMenu | UiNodeKind::Splitter | UiNodeKind::Combo | UiNodeKind::Dropdown | UiNodeKind::Tabs | UiNodeKind::Selectable | UiNodeKind::ListBox | UiNodeKind::DragValue | UiNodeKind::Modal | UiNodeKind::TreeView | UiNodeKind::Switch | UiNodeKind::Toast | UiNodeKind::MenuBar | UiNodeKind::Accordion | UiNodeKind::Spinner | UiNodeKind::Divider | UiNodeKind::Popup)
+            || !matches!(
+                self.component_kind,
+                UiNodeKind::Button
+                    | UiNodeKind::Slider
+                    | UiNodeKind::Scrollbar
+                    | UiNodeKind::ProgressBar
+                    | UiNodeKind::Checkbox
+                    | UiNodeKind::RadioButton
+                    | UiNodeKind::TextInput
+                    | UiNodeKind::Tooltip
+                    | UiNodeKind::Panel
+                    | UiNodeKind::Dialog
+                    | UiNodeKind::ContextMenu
+                    | UiNodeKind::Splitter
+                    | UiNodeKind::Combo
+                    | UiNodeKind::Dropdown
+                    | UiNodeKind::Tabs
+                    | UiNodeKind::Selectable
+                    | UiNodeKind::ListBox
+                    | UiNodeKind::DragValue
+                    | UiNodeKind::Modal
+                    | UiNodeKind::TreeView
+                    | UiNodeKind::Switch
+                    | UiNodeKind::Toast
+                    | UiNodeKind::MenuBar
+                    | UiNodeKind::Accordion
+                    | UiNodeKind::Spinner
+                    | UiNodeKind::Divider
+                    | UiNodeKind::Popup
+            )
         {
             return Err(UiSchemaError::InvalidControlSkin);
         }
@@ -920,19 +1023,21 @@ impl UiControlSkin {
             }
             match &slot.presentation {
                 UiSkinPresentation::Solid { color }
-                    if color.iter().all(|value| value.is_finite() && (0.0..=1.0).contains(value)) => {}
+                    if color
+                        .iter()
+                        .all(|value| value.is_finite() && (0.0..=1.0).contains(value)) => {}
                 UiSkinPresentation::Image { resource_key, .. }
                     if !resource_key.trim().is_empty() => {}
-                UiSkinPresentation::NineSlice { resource_key, layout }
-                    if !resource_key.trim().is_empty() && layout.validate() => {}
+                UiSkinPresentation::NineSlice {
+                    resource_key,
+                    layout,
+                } if !resource_key.trim().is_empty() && layout.validate() => {}
                 UiSkinPresentation::Default => {}
                 _ => return Err(UiSchemaError::InvalidControlSkin),
             }
         }
         let required: &[(UiSkinSlotKind, UiVisualState)] = match self.component_kind {
-            UiNodeKind::Button => &[
-                (UiSkinSlotKind::Body, UiVisualState::Normal),
-            ],
+            UiNodeKind::Button => &[(UiSkinSlotKind::Body, UiVisualState::Normal)],
             UiNodeKind::Slider => &[
                 (UiSkinSlotKind::Track, UiVisualState::Normal),
                 (UiSkinSlotKind::Fill, UiVisualState::Active),
@@ -946,23 +1051,29 @@ impl UiControlSkin {
                 (UiSkinSlotKind::Track, UiVisualState::Normal),
                 (UiSkinSlotKind::Fill, UiVisualState::Active),
             ],
-            UiNodeKind::Checkbox | UiNodeKind::RadioButton => &[
-                (UiSkinSlotKind::Body, UiVisualState::Normal),
-            ],
-            UiNodeKind::TextInput => &[
-                (UiSkinSlotKind::Body, UiVisualState::Normal),
-            ],
-            UiNodeKind::Tooltip | UiNodeKind::Panel => &[
-                (UiSkinSlotKind::Body, UiVisualState::Normal),
-            ],
-            UiNodeKind::Dialog | UiNodeKind::ContextMenu | UiNodeKind::Splitter
-                | UiNodeKind::Combo | UiNodeKind::Dropdown | UiNodeKind::Tabs
-                | UiNodeKind::Selectable | UiNodeKind::ListBox
-                | UiNodeKind::Modal | UiNodeKind::TreeView
-                | UiNodeKind::Toast | UiNodeKind::MenuBar | UiNodeKind::Accordion
-                | UiNodeKind::Spinner | UiNodeKind::Divider | UiNodeKind::Popup => &[
-                (UiSkinSlotKind::Body, UiVisualState::Normal),
-            ],
+            UiNodeKind::Checkbox | UiNodeKind::RadioButton => {
+                &[(UiSkinSlotKind::Body, UiVisualState::Normal)]
+            }
+            UiNodeKind::TextInput => &[(UiSkinSlotKind::Body, UiVisualState::Normal)],
+            UiNodeKind::Tooltip | UiNodeKind::Panel => {
+                &[(UiSkinSlotKind::Body, UiVisualState::Normal)]
+            }
+            UiNodeKind::Dialog
+            | UiNodeKind::ContextMenu
+            | UiNodeKind::Splitter
+            | UiNodeKind::Combo
+            | UiNodeKind::Dropdown
+            | UiNodeKind::Tabs
+            | UiNodeKind::Selectable
+            | UiNodeKind::ListBox
+            | UiNodeKind::Modal
+            | UiNodeKind::TreeView
+            | UiNodeKind::Toast
+            | UiNodeKind::MenuBar
+            | UiNodeKind::Accordion
+            | UiNodeKind::Spinner
+            | UiNodeKind::Divider
+            | UiNodeKind::Popup => &[(UiSkinSlotKind::Body, UiVisualState::Normal)],
             UiNodeKind::Switch => &[
                 (UiSkinSlotKind::Track, UiVisualState::Normal),
                 (UiSkinSlotKind::Thumb, UiVisualState::Normal),
@@ -974,7 +1085,10 @@ impl UiControlSkin {
             _ => &[],
         };
         if required.iter().any(|(kind, state)| {
-            !self.slots.iter().any(|slot| slot.slot_kind == *kind && slot.state == *state)
+            !self
+                .slots
+                .iter()
+                .any(|slot| slot.slot_kind == *kind && slot.state == *state)
         }) {
             return Err(UiSchemaError::InvalidControlSkin);
         }
@@ -984,8 +1098,10 @@ impl UiControlSkin {
     pub fn validate_for_image(&self, resource_key: &str, width: u32, height: u32) -> bool {
         self.validate().is_ok()
             && self.slots.iter().all(|slot| match &slot.presentation {
-                UiSkinPresentation::NineSlice { resource_key: key, layout }
-                    if key == resource_key => layout.validate_for_image(width, height),
+                UiSkinPresentation::NineSlice {
+                    resource_key: key,
+                    layout,
+                } if key == resource_key => layout.validate_for_image(width, height),
                 _ => true,
             })
     }
@@ -1083,7 +1199,12 @@ impl UiTreeNode {
 
     /// Maximum depth of this subtree. A leaf has depth 1.
     pub fn max_depth(&self) -> usize {
-        1 + self.children.iter().map(|c| c.max_depth()).max().unwrap_or(0)
+        1 + self
+            .children
+            .iter()
+            .map(|c| c.max_depth())
+            .max()
+            .unwrap_or(0)
     }
 
     /// Find a node by id in this subtree.
@@ -1253,7 +1374,9 @@ pub enum UiImageFit {
 }
 
 impl UiImageFit {
-    fn is_stretch(value: &Self) -> bool { *value == Self::Stretch }
+    fn is_stretch(value: &Self) -> bool {
+        *value == Self::Stretch
+    }
 }
 
 /// Visual corner geometry for a panel or interaction region. Values are logical
@@ -1282,7 +1405,11 @@ impl UiGeometry {
     }
 
     pub fn validate(&self) -> Result<(), UiSchemaError> {
-        if self.cut.iter().any(|value| !value.is_finite() || *value < 0.0 || *value > Self::MAX_CUT) {
+        if self
+            .cut
+            .iter()
+            .any(|value| !value.is_finite() || *value < 0.0 || *value > Self::MAX_CUT)
+        {
             return Err(UiSchemaError::InvalidGeometry);
         }
         Ok(())
@@ -1516,7 +1643,10 @@ impl UiTextMaterialRef {
         {
             return Err(UiSchemaError::InvalidGeometry);
         }
-        if self.duration_ms.is_some_and(|ms| ms == 0 || ms > Self::MAX_DURATION_MS) {
+        if self
+            .duration_ms
+            .is_some_and(|ms| ms == 0 || ms > Self::MAX_DURATION_MS)
+        {
             return Err(UiSchemaError::InvalidShaderParameter);
         }
         for (key, value) in &self.parameters {
@@ -3684,9 +3814,7 @@ impl UiFragment {
                 {
                     return Err(UiSchemaError::InvalidProgramEvent);
                 }
-                UiEffect::CodeEditorDeclaration { node_key, .. }
-                    if !nodes.contains(node_key) =>
-                {
+                UiEffect::CodeEditorDeclaration { node_key, .. } if !nodes.contains(node_key) => {
                     return Err(UiSchemaError::InvalidProgramEvent);
                 }
                 UiEffect::TextMaterial { node_id, material }
@@ -3860,8 +3988,16 @@ impl UiStyle {
             && self.border_width.is_finite()
             && self.corner_radius.is_finite()
             && self.opacity.is_finite()
-            && self.transform.scale.iter().all(|value| value.is_finite() && *value >= 0.0)
-            && self.transform.translation.iter().all(|value| value.is_finite())
+            && self
+                .transform
+                .scale
+                .iter()
+                .all(|value| value.is_finite() && *value >= 0.0)
+            && self
+                .transform
+                .translation
+                .iter()
+                .all(|value| value.is_finite())
             && self.transform.rotation_degrees.is_finite()
             && self.transform.origin.iter().all(|value| value.is_finite())
             && self.border_width >= 0.0
@@ -4178,10 +4314,9 @@ impl UiCodeEditorPresentation {
             && self.font_scale.is_finite()
             && self.font_scale > 0.0
             && self.last_edit_seconds.is_finite()
-            && self
-                .completion
-                .as_ref()
-                .is_none_or(|snapshot| snapshot.selected as usize <= snapshot.items.len().max(1) - 1)
+            && self.completion.as_ref().is_none_or(|snapshot| {
+                snapshot.selected as usize <= snapshot.items.len().max(1) - 1
+            })
     }
 }
 
@@ -4199,13 +4334,13 @@ impl UiAnimationTimeline {
                 .keyframes
                 .first()
                 .is_some_and(|keyframe| keyframe.offset_ms == 0 && keyframe.state.is_valid())
+            && self.keyframes.last().is_some_and(|keyframe| {
+                keyframe.offset_ms == duration_ms && keyframe.state.is_valid()
+            })
             && self
                 .keyframes
-                .last()
-                .is_some_and(|keyframe| {
-                    keyframe.offset_ms == duration_ms && keyframe.state.is_valid()
-                })
-            && self.keyframes.iter().all(|keyframe| keyframe.state.is_valid())
+                .iter()
+                .all(|keyframe| keyframe.state.is_valid())
             && match self.repeat {
                 UiAnimationRepeat::Once | UiAnimationRepeat::Infinite => true,
                 UiAnimationRepeat::Count(count) => (1..=64).contains(&count),
@@ -4328,7 +4463,10 @@ impl UiEffect {
                     Ok(())
                 }
             }
-            Self::ContextMenuBinding { node_id, context_menu_id } => {
+            Self::ContextMenuBinding {
+                node_id,
+                context_menu_id,
+            } => {
                 if node_id.0.trim().is_empty() || context_menu_id.trim().is_empty() {
                     Err(UiSchemaError::InvalidProgramEvent)
                 } else {
@@ -4377,7 +4515,10 @@ impl UiEffect {
                     Ok(())
                 }
             }
-            Self::ExitTransition { node_id, transition } => {
+            Self::ExitTransition {
+                node_id,
+                transition,
+            } => {
                 if node_id.0.trim().is_empty() || !transition.is_valid() {
                     Err(UiSchemaError::InvalidProgramEvent)
                 } else {
@@ -4410,7 +4551,10 @@ impl UiEffect {
                     Ok(())
                 }
             }
-            Self::CodeEditorDeclaration { node_key, declaration } => {
+            Self::CodeEditorDeclaration {
+                node_key,
+                declaration,
+            } => {
                 if node_key.trim().is_empty() || !declaration.validate() {
                     Err(UiSchemaError::InvalidProgramEvent)
                 } else {
@@ -4444,13 +4588,18 @@ impl TextRef {
         match self {
             Self::Key { key, .. } => !key.trim().is_empty(),
             Self::Literal { value } => !value.is_empty(),
-            Self::Rich { spans } => !spans.is_empty()
-                && spans.iter().all(|span| {
-                    !span.value.is_empty()
-                        && span.color.iter().all(|value| value.is_finite() && (0.0..=1.0).contains(value))
-                        && span.scale.is_finite()
-                        && (0.5..=2.0).contains(&span.scale)
-                }),
+            Self::Rich { spans } => {
+                !spans.is_empty()
+                    && spans.iter().all(|span| {
+                        !span.value.is_empty()
+                            && span
+                                .color
+                                .iter()
+                                .all(|value| value.is_finite() && (0.0..=1.0).contains(value))
+                            && span.scale.is_finite()
+                            && (0.5..=2.0).contains(&span.scale)
+                    })
+            }
         }
     }
 }
@@ -4511,7 +4660,8 @@ mod tests {
             package_id: "pulse-glass".into(),
             version: 1,
             source_digest: "sha256:0123456789abcdef0123456789abcdef".into(),
-            source_bytes: b"@fragment fn material() -> @location(0) vec4<f32> { return vec4(1.0); }".to_vec(),
+            source_bytes:
+                b"@fragment fn material() -> @location(0) vec4<f32> { return vec4(1.0); }".to_vec(),
             entry_point: "material".into(),
             fallback: "standard_ui".into(),
             parameters: vec![UiShaderParameter {
@@ -4523,10 +4673,7 @@ mod tests {
         };
         package.validate().unwrap();
         let dup = UiShaderPackage {
-            parameters: vec![
-                package.parameters[0].clone(),
-                package.parameters[0].clone(),
-            ],
+            parameters: vec![package.parameters[0].clone(), package.parameters[0].clone()],
             ..package.clone()
         };
         assert_eq!(dup.validate(), Err(UiSchemaError::InvalidShaderParameter));
@@ -4534,7 +4681,10 @@ mod tests {
             source_bytes: vec![0u8; UiShaderPackage::MAX_SOURCE_BYTES + 1],
             ..package.clone()
         };
-        assert_eq!(over_budget.validate(), Err(UiSchemaError::InvalidShaderBudget));
+        assert_eq!(
+            over_budget.validate(),
+            Err(UiSchemaError::InvalidShaderBudget)
+        );
     }
 
     #[test]
@@ -4564,7 +4714,8 @@ mod tests {
     }
 
     #[test]
-    fn style_state_and_animation_property_contract_round_trip() {        let patch = UiStylePatch {
+    fn style_state_and_animation_property_contract_round_trip() {
+        let patch = UiStylePatch {
             background_color: Some([0.1, 0.2, 0.3, 1.0]),
             text_color: Some([1.0, 1.0, 1.0, 1.0]),
             opacity: Some(0.8),
@@ -4614,7 +4765,10 @@ mod tests {
         assert!(skin.validate().is_ok());
         assert!(skin.validate_for_image("idle", 8, 8));
         assert!(!skin.validate_for_image("idle", 3, 8));
-        let invalid = UiControlSkin { slots: Vec::new(), ..skin };
+        let invalid = UiControlSkin {
+            slots: Vec::new(),
+            ..skin
+        };
         assert_eq!(invalid.validate(), Err(UiSchemaError::InvalidControlSkin));
     }
 
@@ -4624,28 +4778,68 @@ mod tests {
             key: "volume".into(),
             component_kind: UiNodeKind::Slider,
             slots: vec![
-                UiSkinSlot { slot_kind: UiSkinSlotKind::Track, state: UiVisualState::Normal, presentation: UiSkinPresentation::Default },
-                UiSkinSlot { slot_kind: UiSkinSlotKind::Fill, state: UiVisualState::Active, presentation: UiSkinPresentation::Default },
-                UiSkinSlot { slot_kind: UiSkinSlotKind::Thumb, state: UiVisualState::Normal, presentation: UiSkinPresentation::Default },
+                UiSkinSlot {
+                    slot_kind: UiSkinSlotKind::Track,
+                    state: UiVisualState::Normal,
+                    presentation: UiSkinPresentation::Default,
+                },
+                UiSkinSlot {
+                    slot_kind: UiSkinSlotKind::Fill,
+                    state: UiVisualState::Active,
+                    presentation: UiSkinPresentation::Default,
+                },
+                UiSkinSlot {
+                    slot_kind: UiSkinSlotKind::Thumb,
+                    state: UiVisualState::Normal,
+                    presentation: UiSkinPresentation::Default,
+                },
             ],
         };
         assert!(skin.validate().is_ok());
-        assert_eq!(UiControlSkin { slots: skin.slots[..2].to_vec(), ..skin.clone() }.validate(), Err(UiSchemaError::InvalidControlSkin));
-        assert_eq!(UiControlSkin { component_kind: UiNodeKind::Button, ..skin }.validate(), Err(UiSchemaError::InvalidControlSkin));
+        assert_eq!(
+            UiControlSkin {
+                slots: skin.slots[..2].to_vec(),
+                ..skin.clone()
+            }
+            .validate(),
+            Err(UiSchemaError::InvalidControlSkin)
+        );
+        assert_eq!(
+            UiControlSkin {
+                component_kind: UiNodeKind::Button,
+                ..skin
+            }
+            .validate(),
+            Err(UiSchemaError::InvalidControlSkin)
+        );
     }
 
     #[test]
     fn fragment_accepts_slider_skin_reference_only_for_matching_control_kind() {
-        let mut root: UiNode = serde_json::from_str::<UiFragment>(STATIC_FRAGMENT).unwrap().root;
+        let mut root: UiNode = serde_json::from_str::<UiFragment>(STATIC_FRAGMENT)
+            .unwrap()
+            .root;
         root.node_id = UiNodeId("volume".into());
         root.kind = UiNodeKind::Slider;
         let skin = UiControlSkin {
             key: "volume".into(),
             component_kind: UiNodeKind::Slider,
             slots: vec![
-                UiSkinSlot { slot_kind: UiSkinSlotKind::Track, state: UiVisualState::Normal, presentation: UiSkinPresentation::Default },
-                UiSkinSlot { slot_kind: UiSkinSlotKind::Fill, state: UiVisualState::Active, presentation: UiSkinPresentation::Default },
-                UiSkinSlot { slot_kind: UiSkinSlotKind::Thumb, state: UiVisualState::Normal, presentation: UiSkinPresentation::Default },
+                UiSkinSlot {
+                    slot_kind: UiSkinSlotKind::Track,
+                    state: UiVisualState::Normal,
+                    presentation: UiSkinPresentation::Default,
+                },
+                UiSkinSlot {
+                    slot_kind: UiSkinSlotKind::Fill,
+                    state: UiVisualState::Active,
+                    presentation: UiSkinPresentation::Default,
+                },
+                UiSkinSlot {
+                    slot_kind: UiSkinSlotKind::Thumb,
+                    state: UiVisualState::Normal,
+                    presentation: UiSkinPresentation::Default,
+                },
             ],
         };
         let fragment = UiFragment {
@@ -4654,13 +4848,19 @@ mod tests {
             root,
             effects: vec![
                 UiEffect::ControlSkin { skin },
-                UiEffect::SkinReference { node_id: UiNodeId("volume".into()), skin_key: "volume".into() },
+                UiEffect::SkinReference {
+                    node_id: UiNodeId("volume".into()),
+                    skin_key: "volume".into(),
+                },
             ],
         };
         assert!(fragment.validate().is_ok());
         let mut wrong_kind = fragment.clone();
         wrong_kind.root.kind = UiNodeKind::Button;
-        assert_eq!(wrong_kind.validate(), Err(UiSchemaError::InvalidControlSkin));
+        assert_eq!(
+            wrong_kind.validate(),
+            Err(UiSchemaError::InvalidControlSkin)
+        );
     }
 
     #[test]
@@ -5514,7 +5714,12 @@ impl UiIrDocument {
             if !skin_keys.insert(&skin.key)
                 || skin.slots.iter().any(|slot| match &slot.presentation {
                     UiSkinPresentation::Image { resource_key, .. }
-                    | UiSkinPresentation::NineSlice { resource_key, .. } => !self.resources.iter().any(|resource| resource.key == *resource_key && resource.kind == UiProgramResourceKind::Image),
+                    | UiSkinPresentation::NineSlice { resource_key, .. } => {
+                        !self.resources.iter().any(|resource| {
+                            resource.key == *resource_key
+                                && resource.kind == UiProgramResourceKind::Image
+                        })
+                    }
                     _ => false,
                 })
             {
@@ -5538,9 +5743,7 @@ impl UiIrDocument {
             .collect::<std::collections::HashSet<_>>();
         let mut geometry_material_valid = true;
         for (node_key, geometry) in &self.geometry_records {
-            if geometry.validate().is_err()
-                || find_ir_node(&self.root, node_key).is_none()
-            {
+            if geometry.validate().is_err() || find_ir_node(&self.root, node_key).is_none() {
                 geometry_material_valid = false;
             }
         }

@@ -249,24 +249,16 @@ pub fn classify(
 ) -> TokenClass {
     for rule in &grammar.classify_rules {
         let class = match rule {
-            ClassifyRule::StartsWith(prefix, class) => {
-                token.starts_with(prefix).then_some(*class)
-            }
-            ClassifyRule::Numeric => {
-                is_numeric_token(token).then_some(TokenClass::NumericLiteral)
-            }
+            ClassifyRule::StartsWith(prefix, class) => token.starts_with(prefix).then_some(*class),
+            ClassifyRule::Numeric => is_numeric_token(token).then_some(TokenClass::NumericLiteral),
             ClassifyRule::Intent => is_intent_token(token).then_some(TokenClass::Intent),
             ClassifyRule::HexColor => {
                 let rest = token.chars().skip(1).collect::<Vec<char>>();
                 (token.starts_with('#') && starts_color_literal(&rest))
                     .then_some(TokenClass::ColorLiteral)
             }
-            ClassifyRule::Keyword => {
-                grammar.is_keyword(token).then_some(TokenClass::Keyword)
-            }
-            ClassifyRule::NodeKind => {
-                grammar.is_node_kind(token).then_some(TokenClass::NodeKind)
-            }
+            ClassifyRule::Keyword => grammar.is_keyword(token).then_some(TokenClass::Keyword),
+            ClassifyRule::NodeKind => grammar.is_node_kind(token).then_some(TokenClass::NodeKind),
             // The token directly after a node kind is the node's semantic key.
             ClassifyRule::NodeKeyAfterNodeKind => {
                 (previous_class == Some(TokenClass::NodeKind)).then_some(TokenClass::NodeKey)

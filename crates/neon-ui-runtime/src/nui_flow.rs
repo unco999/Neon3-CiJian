@@ -1,4 +1,4 @@
-﻿//! Closed, line-oriented NUI Flow authoring notation.
+//! Closed, line-oriented NUI Flow authoring notation.
 //!
 //! Flow is deliberately parsed into the canonical JSON IR. It has no evaluator,
 //! expressions, callbacks, or source of domain truth.
@@ -10,17 +10,18 @@ use neon_ui_schema::{
     NuiFlowDocument, NuiFlowDragAxis, NuiFlowDragDeclaration, NuiFlowDropDeclaration,
     NuiFlowMotion, NuiFlowParseDiagnostic, NuiFlowState, NuiFlowStateMachine, NuiFlowStateStyle,
     NuiFlowStateTransition, NuiFlowStateTrigger, NuiFlowWorldPanelDeclaration, NuiSourceSpan,
-    RenderSurfaceRef, TextRef, UiAlignItems, UiBoundProperty, UiBounds, UiBranchDeclaration,
-    UiBranchLayoutParticipation, UiBranchPredicate, UiCameraVisibilityBinding, UiClipPolicy, UiClipShape,
-    UiDataGridColumn, UiDataGridDeclaration, UiDataGridPresentation, UiDiagnosticSeverity,
-    UiDragAxis, UiDragBinding, UiDragBoundary, UiDropBinding, UiDropPlacement, UiEasing, UiEffect,
-    UiGridInputSlot, UiGeometry, UiInputKind, UiInputPacking, UiInputSchema, UiInputSlot, UiInputUpdateClass,
-    UiInputValue, UiIntent, UiIrBinding, UiIrDocument, UiIrPatch, UiIrPatchOperation,
-    UiIrPatchOperationKind, UiJustifyContent, UiLayout, UiLayoutMode, UiMaterialRef, UiNineSlice, UiNineSliceMode,
-    UiCompositionLayer, UiNode, UiNodeId, UiNodeKind, UiProgram, UiProgramEventDeclaration, UiProgramRevision,
-    UiResourceBudget, UiRichTextSpan, UiShaderPackage, UiTextMaterialRef,
-    UiSourceSpan, UiStyle, UiSurfaceId, UiTemplateDeclaration, UiTransform, UiTransition, UiTransitionState,
-    UiAnimationGroup, UiAnimationKeyframe, UiAnimationRepeat, UiAnimationTimeline,
+    RenderSurfaceRef, TextRef, UiAlignItems, UiAnimationGroup, UiAnimationKeyframe,
+    UiAnimationRepeat, UiAnimationTimeline, UiBoundProperty, UiBounds, UiBranchDeclaration,
+    UiBranchLayoutParticipation, UiBranchPredicate, UiCameraVisibilityBinding, UiClipPolicy,
+    UiClipShape, UiCompositionLayer, UiDataGridColumn, UiDataGridDeclaration,
+    UiDataGridPresentation, UiDiagnosticSeverity, UiDragAxis, UiDragBinding, UiDragBoundary,
+    UiDropBinding, UiDropPlacement, UiEasing, UiEffect, UiGeometry, UiGridInputSlot, UiInputKind,
+    UiInputPacking, UiInputSchema, UiInputSlot, UiInputUpdateClass, UiInputValue, UiIntent,
+    UiIrBinding, UiIrDocument, UiIrPatch, UiIrPatchOperation, UiIrPatchOperationKind,
+    UiJustifyContent, UiLayout, UiLayoutMode, UiMaterialRef, UiNineSlice, UiNineSliceMode, UiNode,
+    UiNodeId, UiNodeKind, UiProgram, UiProgramEventDeclaration, UiProgramRevision,
+    UiResourceBudget, UiRichTextSpan, UiShaderPackage, UiSourceSpan, UiStyle, UiSurfaceId,
+    UiTemplateDeclaration, UiTextMaterialRef, UiTransform, UiTransition, UiTransitionState,
 };
 use neon_world_bridge::{CameraId, CameraKind, WorldAnchorId};
 use serde_json::json;
@@ -46,7 +47,8 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
     let mut branches = Vec::new();
     let mut templates = Vec::new();
     let mut data_grids = Vec::new();
-    let mut code_editors: BTreeMap<String, neon_ui_schema::UiCodeEditorDeclaration> = BTreeMap::new();
+    let mut code_editors: BTreeMap<String, neon_ui_schema::UiCodeEditorDeclaration> =
+        BTreeMap::new();
     let mut state_machines = Vec::new();
     let mut motions = Vec::new();
     let mut pending_keyframes: Vec<(String, UiAnimationKeyframe)> = Vec::new();
@@ -66,7 +68,12 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
     let mut skins = Vec::new();
     let mut shader_packages = Vec::new();
     let mut current_skin: Option<neon_ui_schema::UiControlSkin> = None;
-    let mut pending_struct: Option<(String, u32, BTreeMap<String, neon_ui_schema::UiInputKind>, BTreeMap<String, neon_ui_schema::UiInputValue>)> = None;
+    let mut pending_struct: Option<(
+        String,
+        u32,
+        BTreeMap<String, neon_ui_schema::UiInputKind>,
+        BTreeMap<String, neon_ui_schema::UiInputValue>,
+    )> = None;
     let mut node_motion_refs = BTreeMap::<String, NodeMotionRefs>::new();
 
     for (index, raw) in source.lines().enumerate() {
@@ -98,17 +105,43 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
         }
         let content = without_comment.trim();
         // Struct input block: collect indented field lines until closing brace.
-        if let Some((struct_key, _struct_line, mut kind_fields, mut value_fields)) = pending_struct.take() {
+        if let Some((struct_key, _struct_line, mut kind_fields, mut value_fields)) =
+            pending_struct.take()
+        {
             if content == "}" {
-                let kind = neon_ui_schema::UiInputKind::Struct { fields: kind_fields };
-                let default_value = neon_ui_schema::UiInputValue::Struct { fields: value_fields };
+                let kind = neon_ui_schema::UiInputKind::Struct {
+                    fields: kind_fields,
+                };
+                let default_value = neon_ui_schema::UiInputValue::Struct {
+                    fields: value_fields,
+                };
                 let (alignment, lanes, representation) = kind.packing();
-                input_slots.push(neon_ui_schema::UiInputSlot { key: struct_key.clone(), kind, default_value, update_class: neon_ui_schema::UiInputUpdateClass::ReliableExternal, semantic_label: struct_key.replace('_', " "), packing: neon_ui_schema::UiInputPacking { alignment, lanes, offset: 0, representation }, derived_expression: None });
+                input_slots.push(neon_ui_schema::UiInputSlot {
+                    key: struct_key.clone(),
+                    kind,
+                    default_value,
+                    update_class: neon_ui_schema::UiInputUpdateClass::ReliableExternal,
+                    semantic_label: struct_key.replace('_', " "),
+                    packing: neon_ui_schema::UiInputPacking {
+                        alignment,
+                        lanes,
+                        offset: 0,
+                        representation,
+                    },
+                    derived_expression: None,
+                });
                 seen_inputs.insert(struct_key);
                 continue;
             }
             let (field_name, field_kind, field_value) = parse_struct_field(content, line)?;
-            if kind_fields.contains_key(&field_name) { return Err(error("nui_flow_duplicate_struct_field", "duplicate field", line, 1)); }
+            if kind_fields.contains_key(&field_name) {
+                return Err(error(
+                    "nui_flow_duplicate_struct_field",
+                    "duplicate field",
+                    line,
+                    1,
+                ));
+            }
             kind_fields.insert(field_name.clone(), field_kind);
             value_fields.insert(field_name, field_value);
             pending_struct = Some((struct_key, _struct_line, kind_fields, value_fields));
@@ -116,7 +149,14 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
         }
         if indent == 0 {
             if let Some(key) = parse_struct_header(content) {
-                if !seen_inputs.insert(key.clone()) { return Err(error("ui_program_duplicate_input_key", "duplicate", line, 1)); }
+                if !seen_inputs.insert(key.clone()) {
+                    return Err(error(
+                        "ui_program_duplicate_input_key",
+                        "duplicate",
+                        line,
+                        1,
+                    ));
+                }
                 pending_struct = Some((key, line, BTreeMap::new(), BTreeMap::new()));
                 continue;
             }
@@ -131,13 +171,23 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
         }
         if indent == 2 && content.starts_with("slot ") {
             let skin = current_skin.as_mut().ok_or_else(|| {
-                error("nui_flow_invalid_skin", "skin slots require a preceding skin declaration", line, 1)
+                error(
+                    "nui_flow_invalid_skin",
+                    "skin slots require a preceding skin declaration",
+                    line,
+                    1,
+                )
             })?;
             skin.slots.push(parse_skin_slot(content, line)?);
             continue;
         }
         if current_skin.is_some() && indent != 0 {
-            return Err(error("nui_flow_invalid_skin", "skin slots must use exactly two spaces of indentation", line, 1));
+            return Err(error(
+                "nui_flow_invalid_skin",
+                "skin slots must use exactly two spaces of indentation",
+                line,
+                1,
+            ));
         }
         if current_skin.is_some() && indent == 0 {
             skins.push(current_skin.take().expect("skin is present"));
@@ -346,13 +396,16 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
         node_motion_refs.insert(
             node.node.node_id.0.clone(),
             NodeMotionRefs {
-            enter: node.enter_motion.take(),
-            transition: node.transition_motion.take(),
-            exit: node.exit_motion.take(),
+                enter: node.enter_motion.take(),
+                transition: node.transition_motion.take(),
+                exit: node.exit_motion.take(),
             },
         );
         if let Some(resource_key) = node.image_resource.take() {
-            if !matches!(node.node.kind, UiNodeKind::Image | UiNodeKind::Panel | UiNodeKind::Tooltip) {
+            if !matches!(
+                node.node.kind,
+                UiNodeKind::Image | UiNodeKind::Panel | UiNodeKind::Tooltip
+            ) {
                 return Err(error(
                     "nui_flow_invalid_resource",
                     "only image or panel nodes may reference image resources",
@@ -644,15 +697,16 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
         }
     }
     for editor in code_editors.values() {
-        let source_kind = resolve_binding_kind(&schema, &editor.source_input_key).ok_or_else(|| {
-            error_at(
-                "ui_program_unknown_binding_target",
-                "code_editor source references an input that is not declared",
-                source_map
-                    .get(&editor.node_key)
-                    .expect("code editor node has a source span"),
-            )
-        })?;
+        let source_kind =
+            resolve_binding_kind(&schema, &editor.source_input_key).ok_or_else(|| {
+                error_at(
+                    "ui_program_unknown_binding_target",
+                    "code_editor source references an input that is not declared",
+                    source_map
+                        .get(&editor.node_key)
+                        .expect("code editor node has a source span"),
+                )
+            })?;
         if !matches!(source_kind, UiInputKind::TextHandle) {
             return Err(error_at(
                 "ui_program_input_type_mismatch",
@@ -674,7 +728,10 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
             }
         }
         if let Some(key) = &editor.completion_input_key {
-            if !matches!(resolve_binding_kind(&schema, key), Some(UiInputKind::TextHandle)) {
+            if !matches!(
+                resolve_binding_kind(&schema, key),
+                Some(UiInputKind::TextHandle)
+            ) {
                 return Err(error_at(
                     "ui_program_input_type_mismatch",
                     "code_editor completions must use a text handle input",
@@ -757,20 +814,36 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
     }
     let mut skin_keys = HashSet::new();
     for skin in &skins {
-        skin.validate().map_err(|_| error("nui_flow_invalid_skin", "control skin is invalid", 1, 1))?;
+        skin.validate()
+            .map_err(|_| error("nui_flow_invalid_skin", "control skin is invalid", 1, 1))?;
         if !skin_keys.insert(skin.key.clone()) {
-            return Err(error("nui_flow_duplicate_skin", "skin keys must be unique", 1, 1));
+            return Err(error(
+                "nui_flow_duplicate_skin",
+                "skin keys must be unique",
+                1,
+                1,
+            ));
         }
         for slot in &skin.slots {
             let resource_key = match &slot.presentation {
                 neon_ui_schema::UiSkinPresentation::Image { resource_key, .. }
-                | neon_ui_schema::UiSkinPresentation::NineSlice { resource_key, .. } => Some(resource_key),
+                | neon_ui_schema::UiSkinPresentation::NineSlice { resource_key, .. } => {
+                    Some(resource_key)
+                }
                 _ => None,
             };
             if let Some(resource_key) = resource_key
-                && !resources.iter().any(|resource| resource.key == *resource_key && resource.kind == neon_ui_schema::UiProgramResourceKind::Image)
+                && !resources.iter().any(|resource| {
+                    resource.key == *resource_key
+                        && resource.kind == neon_ui_schema::UiProgramResourceKind::Image
+                })
             {
-                return Err(error("nui_flow_unknown_resource", "skin image resource is not declared", 1, 1));
+                return Err(error(
+                    "nui_flow_unknown_resource",
+                    "skin image resource is not declared",
+                    1,
+                    1,
+                ));
             }
         }
     }
@@ -779,7 +852,12 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
             || !skin_keys.contains(skin_key)
             || !matches!((find_node(&root.node, node_key), skins.iter().find(|skin| skin.key == *skin_key)), (Some(node), Some(skin)) if node.kind == skin.component_kind)
         {
-            return Err(error("nui_flow_invalid_skin", "skin reference must target a declared skin of matching component kind", 1, 1));
+            return Err(error(
+                "nui_flow_invalid_skin",
+                "skin reference must target a declared skin of matching component kind",
+                1,
+                1,
+            ));
         }
     }
     apply_boolean_binding_defaults(&mut root.node, &bindings, &schema);
@@ -919,12 +997,7 @@ pub fn parse_nui_flow(source: &str) -> FlowResult<NuiFlowDocument> {
                 neon_ui_schema::UiSchemaError::InvalidProgramBudget => "Flow lowering produced an invalid UI IR document: resource budget is invalid".to_string(),
                 other => format!("Flow lowering produced an invalid UI IR document: {other:?}"),
             };
-            return Err(error(
-                "nui_flow_invalid_ir",
-                message,
-                1,
-                1,
-            ));
+            return Err(error("nui_flow_invalid_ir", message, 1, 1));
         }
     }
     Ok(NuiFlowDocument {
@@ -1007,7 +1080,9 @@ pub fn bind_nui_flow_resources(
         for slot in &mut skin.slots {
             let resource_key = match &slot.presentation {
                 neon_ui_schema::UiSkinPresentation::Image { resource_key, .. }
-                | neon_ui_schema::UiSkinPresentation::NineSlice { resource_key, .. } => resource_key,
+                | neon_ui_schema::UiSkinPresentation::NineSlice { resource_key, .. } => {
+                    resource_key
+                }
                 _ => continue,
             };
             let resource = document
@@ -1015,12 +1090,31 @@ pub fn bind_nui_flow_resources(
                 .resources
                 .iter_mut()
                 .find(|resource| resource.key == *resource_key)
-                .ok_or_else(|| error("nui_flow_unknown_resource", "skin references an undeclared resource", 1, 1))?;
+                .ok_or_else(|| {
+                    error(
+                        "nui_flow_unknown_resource",
+                        "skin references an undeclared resource",
+                        1,
+                        1,
+                    )
+                })?;
             let asset = snapshot.get(resource_key).ok_or_else(|| {
-                error("nui_flow_unresolved_resource", "skin resource binding is missing from the external snapshot", 1, 1)
+                error(
+                    "nui_flow_unresolved_resource",
+                    "skin resource binding is missing from the external snapshot",
+                    1,
+                    1,
+                )
             })?;
-            if resource.kind != neon_ui_schema::UiProgramResourceKind::Image || asset.kind != "image" {
-                return Err(error("nui_flow_invalid_resource", "skin resource must bind an image AssetRef", 1, 1));
+            if resource.kind != neon_ui_schema::UiProgramResourceKind::Image
+                || asset.kind != "image"
+            {
+                return Err(error(
+                    "nui_flow_invalid_resource",
+                    "skin resource must bind an image AssetRef",
+                    1,
+                    1,
+                ));
             }
             resource.asset_ref = Some(asset.clone());
         }
@@ -1124,33 +1218,62 @@ pub fn lower_nui_flow_effects(document: &NuiFlowDocument) -> Vec<UiEffect> {
                 material: material.clone(),
             }),
     );
-    effects.extend(document.ir.composition_layer_records.iter().map(|(node_key, layer)| {
-        UiEffect::CompositionLayer {
-            node_id: UiNodeId(node_key.clone()),
-            layer: *layer,
-        }
-    }));
-    effects.extend(document.ir.exit_transition_records.iter().map(|(node_key, transition)| {
-        UiEffect::ExitTransition {
-            node_id: UiNodeId(node_key.clone()),
-            transition: transition.clone(),
-        }
-    }));
-    effects.extend(document.ir.context_menu_records.iter().map(|(node_id, menu_id)| UiEffect::ContextMenuBinding {
-        node_id: UiNodeId(node_id.clone()),
-        context_menu_id: menu_id.clone(),
-    }));
-    effects.extend(document.ir.skins.iter().cloned().map(|skin| UiEffect::ControlSkin { skin }));
-    effects.extend(document.ir.skin_references.iter().map(|(node_id, skin_key)| UiEffect::SkinReference {
-        node_id: UiNodeId(node_id.clone()),
-        skin_key: skin_key.clone(),
-    }));
+    effects.extend(
+        document
+            .ir
+            .composition_layer_records
+            .iter()
+            .map(|(node_key, layer)| UiEffect::CompositionLayer {
+                node_id: UiNodeId(node_key.clone()),
+                layer: *layer,
+            }),
+    );
+    effects.extend(
+        document
+            .ir
+            .exit_transition_records
+            .iter()
+            .map(|(node_key, transition)| UiEffect::ExitTransition {
+                node_id: UiNodeId(node_key.clone()),
+                transition: transition.clone(),
+            }),
+    );
+    effects.extend(
+        document
+            .ir
+            .context_menu_records
+            .iter()
+            .map(|(node_id, menu_id)| UiEffect::ContextMenuBinding {
+                node_id: UiNodeId(node_id.clone()),
+                context_menu_id: menu_id.clone(),
+            }),
+    );
+    effects.extend(
+        document
+            .ir
+            .skins
+            .iter()
+            .cloned()
+            .map(|skin| UiEffect::ControlSkin { skin }),
+    );
+    effects.extend(
+        document
+            .ir
+            .skin_references
+            .iter()
+            .map(|(node_id, skin_key)| UiEffect::SkinReference {
+                node_id: UiNodeId(node_id.clone()),
+                skin_key: skin_key.clone(),
+            }),
+    );
     for skin in &document.ir.skins {
         let mut resource_keys = HashSet::new();
         for slot in &skin.slots {
             let Some(resource_key) = (match &slot.presentation {
                 neon_ui_schema::UiSkinPresentation::Image { resource_key, .. }
-                | neon_ui_schema::UiSkinPresentation::NineSlice { resource_key, .. } => Some(resource_key),
+                | neon_ui_schema::UiSkinPresentation::NineSlice { resource_key, .. } => {
+                    Some(resource_key)
+                }
                 _ => None,
             }) else {
                 continue;
@@ -1414,12 +1537,7 @@ pub fn format_nui_flow(source: &str) -> FlowResult<String> {
                         .unwrap_or_default();
                     lines.push(format!(
                         "on {} {}{}{} -> {}{}",
-                        machine.key,
-                        name,
-                        from,
-                        predicate,
-                        transition.target_state,
-                        emit
+                        machine.key, name, from, predicate, transition.target_state, emit
                     ));
                 }
             }
@@ -1446,9 +1564,18 @@ pub fn format_nui_flow(source: &str) -> FlowResult<String> {
         ));
     }
     for skin in &parsed.ir.skins {
-        lines.push(format!("skin {} {}", skin.key, format_skin_component(&skin.component_kind)));
+        lines.push(format!(
+            "skin {} {}",
+            skin.key,
+            format_skin_component(&skin.component_kind)
+        ));
         for slot in &skin.slots {
-            lines.push(format!("  slot {} {} {}", format_skin_slot_kind(slot.slot_kind), format_skin_state(slot.state), format_skin_presentation(&slot.presentation)));
+            lines.push(format!(
+                "  slot {} {} {}",
+                format_skin_slot_kind(slot.slot_kind),
+                format_skin_state(slot.state),
+                format_skin_presentation(&slot.presentation)
+            ));
         }
     }
     format_node(
@@ -1493,7 +1620,13 @@ fn format_predicate(predicate: &UiBranchPredicate) -> String {
 }
 
 fn format_skin_state(state: neon_ui_schema::UiVisualState) -> &'static str {
-    match state { neon_ui_schema::UiVisualState::Normal => "idle", neon_ui_schema::UiVisualState::Hover => "hover", neon_ui_schema::UiVisualState::Pressed => "pressed", neon_ui_schema::UiVisualState::Active => "active", _ => "idle" }
+    match state {
+        neon_ui_schema::UiVisualState::Normal => "idle",
+        neon_ui_schema::UiVisualState::Hover => "hover",
+        neon_ui_schema::UiVisualState::Pressed => "pressed",
+        neon_ui_schema::UiVisualState::Active => "active",
+        _ => "idle",
+    }
 }
 
 fn format_skin_component(kind: &neon_ui_schema::UiNodeKind) -> &'static str {
@@ -1530,16 +1663,44 @@ fn format_skin_component(kind: &neon_ui_schema::UiNodeKind) -> &'static str {
 }
 
 fn format_skin_slot_kind(kind: neon_ui_schema::UiSkinSlotKind) -> &'static str {
-    match kind { neon_ui_schema::UiSkinSlotKind::Body => "body", neon_ui_schema::UiSkinSlotKind::Label => "label", neon_ui_schema::UiSkinSlotKind::FocusRing => "focus_ring", neon_ui_schema::UiSkinSlotKind::Track => "track", neon_ui_schema::UiSkinSlotKind::Fill => "fill", neon_ui_schema::UiSkinSlotKind::Thumb => "thumb" }
+    match kind {
+        neon_ui_schema::UiSkinSlotKind::Body => "body",
+        neon_ui_schema::UiSkinSlotKind::Label => "label",
+        neon_ui_schema::UiSkinSlotKind::FocusRing => "focus_ring",
+        neon_ui_schema::UiSkinSlotKind::Track => "track",
+        neon_ui_schema::UiSkinSlotKind::Fill => "fill",
+        neon_ui_schema::UiSkinSlotKind::Thumb => "thumb",
+    }
 }
 
 fn format_skin_presentation(presentation: &neon_ui_schema::UiSkinPresentation) -> String {
     match presentation {
         neon_ui_schema::UiSkinPresentation::Image { resource_key, fit } => {
-            let fit = match fit { neon_ui_schema::UiImageFit::Stretch => "stretch", neon_ui_schema::UiImageFit::Cover => "cover", neon_ui_schema::UiImageFit::Contain => "contain" };
-            if fit == "stretch" { format!("resource {resource_key}") } else { format!("resource {resource_key} fit {fit}") }
+            let fit = match fit {
+                neon_ui_schema::UiImageFit::Stretch => "stretch",
+                neon_ui_schema::UiImageFit::Cover => "cover",
+                neon_ui_schema::UiImageFit::Contain => "contain",
+            };
+            if fit == "stretch" {
+                format!("resource {resource_key}")
+            } else {
+                format!("resource {resource_key} fit {fit}")
+            }
         }
-        neon_ui_schema::UiSkinPresentation::NineSlice { resource_key, layout } => format!("resource {resource_key} nine_slice {} {} {} {} border {} {} {} {}", layout.source_insets_px[0], layout.source_insets_px[1], layout.source_insets_px[2], layout.source_insets_px[3], layout.target_insets[0], layout.target_insets[1], layout.target_insets[2], layout.target_insets[3]),
+        neon_ui_schema::UiSkinPresentation::NineSlice {
+            resource_key,
+            layout,
+        } => format!(
+            "resource {resource_key} nine_slice {} {} {} {} border {} {} {} {}",
+            layout.source_insets_px[0],
+            layout.source_insets_px[1],
+            layout.source_insets_px[2],
+            layout.source_insets_px[3],
+            layout.target_insets[0],
+            layout.target_insets[1],
+            layout.target_insets[2],
+            layout.target_insets[3]
+        ),
         _ => "resource missing".into(),
     }
 }
@@ -1775,7 +1936,10 @@ pub fn apply_nui_ir_patch(document: &UiIrDocument, patch: &UiIrPatch) -> FlowRes
 /// Applies the public structured patch contract to canonical IR. `SetInput`
 /// is intentionally validated by the host adapter and does not mutate the IR;
 /// topology/property operations remain bounded and revisioned here.
-pub fn apply_ui_patch(document: &UiIrDocument, patch: &neon_ui_schema::UiPatch) -> FlowResult<UiIrDocument> {
+pub fn apply_ui_patch(
+    document: &UiIrDocument,
+    patch: &neon_ui_schema::UiPatch,
+) -> FlowResult<UiIrDocument> {
     if document.surface_id.0 != patch.surface_id {
         return Err(error(
             "nui_flow_patch_surface_mismatch",
@@ -1795,7 +1959,12 @@ pub fn apply_ui_patch(document: &UiIrDocument, patch: &neon_ui_schema::UiPatch) 
             } => {
                 let encoded = if property == "value" {
                     serde_json::to_string(value).map_err(|serialization_error| {
-                        error("nui_flow_invalid_patch", serialization_error.to_string(), 1, 1)
+                        error(
+                            "nui_flow_invalid_patch",
+                            serialization_error.to_string(),
+                            1,
+                            1,
+                        )
                     })?
                 } else if let Some(string) = value.as_str() {
                     string.to_owned()
@@ -1837,7 +2006,12 @@ pub fn apply_ui_patch(document: &UiIrDocument, patch: &neon_ui_schema::UiPatch) 
                 children,
             } => {
                 let parent = find_node_mut(&mut result.root, parent_path).ok_or_else(|| {
-                    error("nui_flow_unknown_patch_target", "replace parent does not exist", 1, 1)
+                    error(
+                        "nui_flow_unknown_patch_target",
+                        "replace parent does not exist",
+                        1,
+                        1,
+                    )
                 })?;
                 parent.children = children.clone();
             }
@@ -1854,7 +2028,12 @@ pub fn apply_ui_patch(document: &UiIrDocument, patch: &neon_ui_schema::UiPatch) 
                 )?;
                 let node_key = node_path.rsplit('/').next().unwrap_or(node_path);
                 let parent = find_node_mut(&mut result.root, parent_path).ok_or_else(|| {
-                    error("nui_flow_unknown_patch_target", "move destination does not exist", 1, 1)
+                    error(
+                        "nui_flow_unknown_patch_target",
+                        "move destination does not exist",
+                        1,
+                        1,
+                    )
                 })?;
                 if let Some(position) = parent
                     .children
@@ -1862,7 +2041,9 @@ pub fn apply_ui_patch(document: &UiIrDocument, patch: &neon_ui_schema::UiPatch) 
                     .position(|child| child.node_id.0 == node_key)
                 {
                     let node = parent.children.remove(position);
-                    parent.children.insert((*index).min(parent.children.len()), node);
+                    parent
+                        .children
+                        .insert((*index).min(parent.children.len()), node);
                 }
             }
             neon_ui_schema::UiPatchOp::StartTransition {
@@ -1870,7 +2051,12 @@ pub fn apply_ui_patch(document: &UiIrDocument, patch: &neon_ui_schema::UiPatch) 
                 transition,
             } => {
                 let node = find_node_mut(&mut result.root, node_path).ok_or_else(|| {
-                    error("nui_flow_unknown_patch_target", "transition target does not exist", 1, 1)
+                    error(
+                        "nui_flow_unknown_patch_target",
+                        "transition target does not exist",
+                        1,
+                        1,
+                    )
                 })?;
                 node.enter_transition = Some(transition.clone());
             }
@@ -1885,10 +2071,22 @@ pub fn apply_ui_patch(document: &UiIrDocument, patch: &neon_ui_schema::UiPatch) 
         result = apply_nui_ir_patch(&result, &ir_patch)?;
     } else {
         if result.revision != Revision(patch.base_revision) {
-            return Err(error("nui_flow_stale_patch_revision", "patch revision does not match the document", 1, 1));
+            return Err(error(
+                "nui_flow_stale_patch_revision",
+                "patch revision does not match the document",
+                1,
+                1,
+            ));
         }
         result.revision = Revision(result.revision.0 + 1);
-        result.validate().map_err(|_| error("nui_flow_invalid_patch", "patch result fails canonical IR validation", 1, 1))?;
+        result.validate().map_err(|_| {
+            error(
+                "nui_flow_invalid_patch",
+                "patch result fails canonical IR validation",
+                1,
+                1,
+            )
+        })?;
     }
     Ok(result)
 }
@@ -2009,7 +2207,10 @@ struct NodeMotionRefs {
 
 fn append_keyframe_state(line: &mut String, state: UiTransitionState) {
     if let Some(bounds) = state.bounds {
-        line.push_str(&format!(" bounds {} {} {} {}", bounds.x, bounds.y, bounds.width, bounds.height));
+        line.push_str(&format!(
+            " bounds {} {} {} {}",
+            bounds.x, bounds.y, bounds.width, bounds.height
+        ));
     }
     if let Some(transform) = state.transform {
         line.push_str(&format!(
@@ -2073,14 +2274,17 @@ fn apply_node_motion_refs(
         }
         let key = reference.enter.as_ref().or(reference.transition.as_ref());
         if let Some(key) = key {
-            let motion = motions.iter().find(|motion| motion.key == *key).ok_or_else(|| {
-                error(
-                    "nui_flow_unknown_motion",
-                    "node references an undeclared motion",
-                    1,
-                    1,
-                )
-            })?;
+            let motion = motions
+                .iter()
+                .find(|motion| motion.key == *key)
+                .ok_or_else(|| {
+                    error(
+                        "nui_flow_unknown_motion",
+                        "node references an undeclared motion",
+                        1,
+                        1,
+                    )
+                })?;
             node.enter_transition = Some(motion.transition.clone());
         }
     }
@@ -2093,7 +2297,12 @@ fn apply_node_motion_refs(
 fn parse_skin_header(text: &str, line: u32) -> FlowResult<neon_ui_schema::UiControlSkin> {
     let parts = text.split_whitespace().collect::<Vec<_>>();
     if parts.len() != 3 || parts[0] != "skin" || !valid_key(parts[1]) {
-        return Err(error("nui_flow_invalid_skin", "skin syntax is: skin <key> <component_kind>", line, 1));
+        return Err(error(
+            "nui_flow_invalid_skin",
+            "skin syntax is: skin <key> <component_kind>",
+            line,
+            1,
+        ));
     }
     let component_kind = match parts[2] {
         "button" => neon_ui_schema::UiNodeKind::Button,
@@ -2123,7 +2332,14 @@ fn parse_skin_header(text: &str, line: u32) -> FlowResult<neon_ui_schema::UiCont
         "spinner" => neon_ui_schema::UiNodeKind::Spinner,
         "divider" => neon_ui_schema::UiNodeKind::Divider,
         "popup" => neon_ui_schema::UiNodeKind::Popup,
-        _ => return Err(error("nui_flow_invalid_skin", "skin component kind must be one of: button, slider, scrollbar, progress_bar, checkbox, radio_button, input, tooltip, panel, dialog, context_menu, splitter, combo, dropdown, tabs, selectable, list_box, drag_value, modal, tree_view, switch, toast, menu_bar, accordion, spinner, divider, popup", line, 1)),
+        _ => {
+            return Err(error(
+                "nui_flow_invalid_skin",
+                "skin component kind must be one of: button, slider, scrollbar, progress_bar, checkbox, radio_button, input, tooltip, panel, dialog, context_menu, splitter, combo, dropdown, tabs, selectable, list_box, drag_value, modal, tree_view, switch, toast, menu_bar, accordion, spinner, divider, popup",
+                line,
+                1,
+            ));
+        }
     };
     Ok(neon_ui_schema::UiControlSkin {
         key: parts[1].into(),
@@ -2134,40 +2350,116 @@ fn parse_skin_header(text: &str, line: u32) -> FlowResult<neon_ui_schema::UiCont
 
 fn parse_skin_slot(text: &str, line: u32) -> FlowResult<neon_ui_schema::UiSkinSlot> {
     let parts = text.split_whitespace().collect::<Vec<_>>();
-    if parts.len() < 5 || parts[0] != "slot" || !matches!(parts[1], "body" | "track" | "fill" | "thumb" | "label" | "focus_ring") {
-        return Err(error("nui_flow_invalid_skin", "skin slots require a supported slot kind and resource", line, 1));
+    if parts.len() < 5
+        || parts[0] != "slot"
+        || !matches!(
+            parts[1],
+            "body" | "track" | "fill" | "thumb" | "label" | "focus_ring"
+        )
+    {
+        return Err(error(
+            "nui_flow_invalid_skin",
+            "skin slots require a supported slot kind and resource",
+            line,
+            1,
+        ));
     }
-    let slot_kind = match parts[1] { "body" => neon_ui_schema::UiSkinSlotKind::Body, "track" => neon_ui_schema::UiSkinSlotKind::Track, "fill" => neon_ui_schema::UiSkinSlotKind::Fill, "thumb" => neon_ui_schema::UiSkinSlotKind::Thumb, "label" => neon_ui_schema::UiSkinSlotKind::Label, "focus_ring" => neon_ui_schema::UiSkinSlotKind::FocusRing, _ => unreachable!() };
+    let slot_kind = match parts[1] {
+        "body" => neon_ui_schema::UiSkinSlotKind::Body,
+        "track" => neon_ui_schema::UiSkinSlotKind::Track,
+        "fill" => neon_ui_schema::UiSkinSlotKind::Fill,
+        "thumb" => neon_ui_schema::UiSkinSlotKind::Thumb,
+        "label" => neon_ui_schema::UiSkinSlotKind::Label,
+        "focus_ring" => neon_ui_schema::UiSkinSlotKind::FocusRing,
+        _ => unreachable!(),
+    };
     let state = match parts[2] {
         "idle" => neon_ui_schema::UiVisualState::Normal,
         "hover" => neon_ui_schema::UiVisualState::Hover,
         "pressed" => neon_ui_schema::UiVisualState::Pressed,
         "active" => neon_ui_schema::UiVisualState::Active,
-        _ => return Err(error("nui_flow_invalid_skin", "skin state must be idle, hover, pressed, or active", line, 1)),
+        _ => {
+            return Err(error(
+                "nui_flow_invalid_skin",
+                "skin state must be idle, hover, pressed, or active",
+                line,
+                1,
+            ));
+        }
     };
     if parts[3] != "resource" || !valid_key(parts[4]) {
-        return Err(error("nui_flow_invalid_skin", "skin body requires a resource key", line, 1));
+        return Err(error(
+            "nui_flow_invalid_skin",
+            "skin body requires a resource key",
+            line,
+            1,
+        ));
     }
     let presentation = if parts.len() == 5 {
-        neon_ui_schema::UiSkinPresentation::Image { resource_key: parts[4].into(), fit: neon_ui_schema::UiImageFit::Stretch }
+        neon_ui_schema::UiSkinPresentation::Image {
+            resource_key: parts[4].into(),
+            fit: neon_ui_schema::UiImageFit::Stretch,
+        }
     } else if parts.len() == 7 && parts[5] == "fit" {
-        let fit = match parts[6] { "stretch" => neon_ui_schema::UiImageFit::Stretch, "cover" => neon_ui_schema::UiImageFit::Cover, "contain" => neon_ui_schema::UiImageFit::Contain, _ => return Err(error("nui_flow_invalid_skin", "skin fit must be stretch, cover, or contain", line, 1)) };
-        neon_ui_schema::UiSkinPresentation::Image { resource_key: parts[4].into(), fit }
+        let fit = match parts[6] {
+            "stretch" => neon_ui_schema::UiImageFit::Stretch,
+            "cover" => neon_ui_schema::UiImageFit::Cover,
+            "contain" => neon_ui_schema::UiImageFit::Contain,
+            _ => {
+                return Err(error(
+                    "nui_flow_invalid_skin",
+                    "skin fit must be stretch, cover, or contain",
+                    line,
+                    1,
+                ));
+            }
+        };
+        neon_ui_schema::UiSkinPresentation::Image {
+            resource_key: parts[4].into(),
+            fit,
+        }
     } else if parts.get(5) == Some(&"nine_slice") {
         let source = parse_u32_quad(&parts, 6, line, "source insets")?;
         if parts.get(10) != Some(&"border") {
-            return Err(error("nui_flow_invalid_nine_slice", "skin nine_slice requires border insets", line, 1));
+            return Err(error(
+                "nui_flow_invalid_nine_slice",
+                "skin nine_slice requires border insets",
+                line,
+                1,
+            ));
         }
         let target = parse_f32_quad(&parts, 11, line, "target insets")?;
-        let layout = neon_ui_schema::UiNineSlice { source_insets_px: source, target_insets: target, mode: neon_ui_schema::UiNineSliceMode::Stretch, fill_center: true };
+        let layout = neon_ui_schema::UiNineSlice {
+            source_insets_px: source,
+            target_insets: target,
+            mode: neon_ui_schema::UiNineSliceMode::Stretch,
+            fill_center: true,
+        };
         if !layout.validate() || parts.len() != 15 {
-            return Err(error("nui_flow_invalid_nine_slice", "skin nine_slice syntax is resource <key> nine_slice l t r b border l t r b", line, 1));
+            return Err(error(
+                "nui_flow_invalid_nine_slice",
+                "skin nine_slice syntax is resource <key> nine_slice l t r b border l t r b",
+                line,
+                1,
+            ));
         }
-        neon_ui_schema::UiSkinPresentation::NineSlice { resource_key: parts[4].into(), layout }
+        neon_ui_schema::UiSkinPresentation::NineSlice {
+            resource_key: parts[4].into(),
+            layout,
+        }
     } else {
-        return Err(error("nui_flow_invalid_skin", "unsupported skin presentation", line, 1));
+        return Err(error(
+            "nui_flow_invalid_skin",
+            "unsupported skin presentation",
+            line,
+            1,
+        ));
     };
-    Ok(neon_ui_schema::UiSkinSlot { slot_kind, state, presentation })
+    Ok(neon_ui_schema::UiSkinSlot {
+        slot_kind,
+        state,
+        presentation,
+    })
 }
 
 fn parse_resource_declaration(
@@ -2234,14 +2526,24 @@ fn parse_shader_declaration(
         match parts[index] {
             "version" => {
                 let raw = parts.get(index + 1).ok_or_else(|| {
-                    error("nui_flow_invalid_shader", "shader version requires a value", line, 1)
+                    error(
+                        "nui_flow_invalid_shader",
+                        "shader version requires a value",
+                        line,
+                        1,
+                    )
                 })?;
                 version = parse_u64(raw, line, "shader version")? as u32;
                 index += 2;
             }
             "fallback" => {
                 let raw = parts.get(index + 1).ok_or_else(|| {
-                    error("nui_flow_invalid_shader", "shader fallback requires a key", line, 1)
+                    error(
+                        "nui_flow_invalid_shader",
+                        "shader fallback requires a key",
+                        line,
+                        1,
+                    )
                 })?;
                 if !valid_key(raw) {
                     return Err(error(
@@ -2351,9 +2653,15 @@ fn parse_keyframe_declaration(
             1,
         ));
     }
-    let offset_ms = u32::try_from(parse_u64(&words[2], line, "keyframe offset")?).map_err(|_| {
-        error("nui_flow_invalid_keyframe", "keyframe offset exceeds the supported range", line, 1)
-    })?;
+    let offset_ms =
+        u32::try_from(parse_u64(&words[2], line, "keyframe offset")?).map_err(|_| {
+            error(
+                "nui_flow_invalid_keyframe",
+                "keyframe offset exceeds the supported range",
+                line,
+                1,
+            )
+        })?;
     let mut state = UiTransitionState::default();
     let mut easing = None;
     let mut index = 3;
@@ -2361,37 +2669,118 @@ fn parse_keyframe_declaration(
         match words[index].as_str() {
             "easing" => {
                 let value = words.get(index + 1).ok_or_else(|| {
-                    error("nui_flow_invalid_keyframe", "keyframe easing requires a value", line, 1)
+                    error(
+                        "nui_flow_invalid_keyframe",
+                        "keyframe easing requires a value",
+                        line,
+                        1,
+                    )
                 })?;
                 easing = Some(parse_flow_easing(value, line)?);
                 index += 2;
             }
             "opacity" => {
-                state.opacity = Some(number(words.get(index + 1).ok_or_else(|| error("nui_flow_invalid_keyframe", "keyframe opacity requires a value", line, 1))?, line)?.clamp(0.0, 1.0));
+                state.opacity = Some(
+                    number(
+                        words.get(index + 1).ok_or_else(|| {
+                            error(
+                                "nui_flow_invalid_keyframe",
+                                "keyframe opacity requires a value",
+                                line,
+                                1,
+                            )
+                        })?,
+                        line,
+                    )?
+                    .clamp(0.0, 1.0),
+                );
                 index += 2;
             }
             "fill" | "background" => {
-                state.background_color = Some(color(words.get(index + 1).ok_or_else(|| error("nui_flow_invalid_keyframe", "keyframe fill requires a color", line, 1))?, line)?);
+                state.background_color = Some(color(
+                    words.get(index + 1).ok_or_else(|| {
+                        error(
+                            "nui_flow_invalid_keyframe",
+                            "keyframe fill requires a color",
+                            line,
+                            1,
+                        )
+                    })?,
+                    line,
+                )?);
                 index += 2;
             }
             "line" | "border" => {
-                state.border_color = Some(color(words.get(index + 1).ok_or_else(|| error("nui_flow_invalid_keyframe", "keyframe border requires a color", line, 1))?, line)?);
+                state.border_color = Some(color(
+                    words.get(index + 1).ok_or_else(|| {
+                        error(
+                            "nui_flow_invalid_keyframe",
+                            "keyframe border requires a color",
+                            line,
+                            1,
+                        )
+                    })?,
+                    line,
+                )?);
                 index += 2;
             }
             "border_width" => {
-                state.border_width = Some(number(words.get(index + 1).ok_or_else(|| error("nui_flow_invalid_keyframe", "keyframe border_width requires a value", line, 1))?, line)?.max(0.0));
+                state.border_width = Some(
+                    number(
+                        words.get(index + 1).ok_or_else(|| {
+                            error(
+                                "nui_flow_invalid_keyframe",
+                                "keyframe border_width requires a value",
+                                line,
+                                1,
+                            )
+                        })?,
+                        line,
+                    )?
+                    .max(0.0),
+                );
                 index += 2;
             }
             "corner_radius" | "radius" => {
-                state.corner_radius = Some(number(words.get(index + 1).ok_or_else(|| error("nui_flow_invalid_keyframe", "keyframe corner_radius requires a value", line, 1))?, line)?.max(0.0));
+                state.corner_radius = Some(
+                    number(
+                        words.get(index + 1).ok_or_else(|| {
+                            error(
+                                "nui_flow_invalid_keyframe",
+                                "keyframe corner_radius requires a value",
+                                line,
+                                1,
+                            )
+                        })?,
+                        line,
+                    )?
+                    .max(0.0),
+                );
                 index += 2;
             }
             "numeric" => {
-                state.numeric_value = Some(number(words.get(index + 1).ok_or_else(|| error("nui_flow_invalid_keyframe", "keyframe numeric requires a value", line, 1))?, line)?);
+                state.numeric_value = Some(number(
+                    words.get(index + 1).ok_or_else(|| {
+                        error(
+                            "nui_flow_invalid_keyframe",
+                            "keyframe numeric requires a value",
+                            line,
+                            1,
+                        )
+                    })?,
+                    line,
+                )?);
                 index += 2;
             }
             "bounds" => {
-                let values = words.get(index + 1..index + 5).ok_or_else(|| error("nui_flow_invalid_keyframe", "keyframe bounds requires x y width height", line, 1))?;
+                let values = words.get(index + 1..index + 5).ok_or_else(|| {
+                    error(
+                        "nui_flow_invalid_keyframe",
+                        "keyframe bounds requires x y width height",
+                        line,
+                        1,
+                    )
+                })?;
                 state.bounds = Some(UiBounds {
                     x: number(&values[0], line)?,
                     y: number(&values[1], line)?,
@@ -2401,11 +2790,23 @@ fn parse_keyframe_declaration(
                 index += 5;
             }
             "transform" => {
-                let values = words.get(index + 1..index + 6).ok_or_else(|| error("nui_flow_invalid_keyframe", "keyframe transform requires tx ty sx sy rotate_deg", line, 1))?;
+                let values = words.get(index + 1..index + 6).ok_or_else(|| {
+                    error(
+                        "nui_flow_invalid_keyframe",
+                        "keyframe transform requires tx ty sx sy rotate_deg",
+                        line,
+                        1,
+                    )
+                })?;
                 let scale_x = number(&values[2], line)?;
                 let scale_y = number(&values[3], line)?;
                 if scale_x < 0.0 || scale_y < 0.0 {
-                    return Err(error("nui_flow_invalid_keyframe", "keyframe transform scale must be non-negative", line, 1));
+                    return Err(error(
+                        "nui_flow_invalid_keyframe",
+                        "keyframe transform scale must be non-negative",
+                        line,
+                        1,
+                    ));
                 }
                 state.transform = Some(UiTransform {
                     translation: [number(&values[0], line)?, number(&values[1], line)?],
@@ -2416,16 +2817,35 @@ fn parse_keyframe_declaration(
                 index += 6;
             }
             "origin" => {
-                let values = words.get(index + 1..index + 3).ok_or_else(|| error("nui_flow_invalid_keyframe", "keyframe origin requires normalized x y", line, 1))?;
+                let values = words.get(index + 1..index + 3).ok_or_else(|| {
+                    error(
+                        "nui_flow_invalid_keyframe",
+                        "keyframe origin requires normalized x y",
+                        line,
+                        1,
+                    )
+                })?;
                 let transform = state.transform.get_or_insert_with(UiTransform::default);
                 transform.origin = [number(&values[0], line)?, number(&values[1], line)?];
                 index += 3;
             }
-            _ => return Err(error("nui_flow_invalid_keyframe", "unknown keyframe property", line, 1)),
+            _ => {
+                return Err(error(
+                    "nui_flow_invalid_keyframe",
+                    "unknown keyframe property",
+                    line,
+                    1,
+                ));
+            }
         }
     }
     if !state.is_valid() {
-        return Err(error("nui_flow_invalid_keyframe", "keyframe state contains an invalid value", line, 1));
+        return Err(error(
+            "nui_flow_invalid_keyframe",
+            "keyframe state contains an invalid value",
+            line,
+            1,
+        ));
     }
     Ok(Some((
         words[1].clone(),
@@ -2446,7 +2866,12 @@ fn parse_flow_easing(value: &str, line: u32) -> FlowResult<UiEasing> {
         "spring" => Ok(UiEasing::Spring),
         "bounce" => Ok(UiEasing::Bounce),
         "cubic_bezier" => Ok(UiEasing::CubicBezier),
-        _ => Err(error("nui_flow_invalid_easing", "animation easing is not supported", line, 1)),
+        _ => Err(error(
+            "nui_flow_invalid_easing",
+            "animation easing is not supported",
+            line,
+            1,
+        )),
     }
 }
 
@@ -2506,25 +2931,50 @@ fn parse_motion_declaration(text: &str, line: u32) -> FlowResult<Option<NuiFlowM
         match words[index].as_str() {
             "delay" => {
                 let value = words.get(index + 1).ok_or_else(|| {
-                    error("nui_flow_invalid_motion", "delay requires milliseconds", line, 1)
+                    error(
+                        "nui_flow_invalid_motion",
+                        "delay requires milliseconds",
+                        line,
+                        1,
+                    )
                 })?;
                 delay_ms = u32::try_from(parse_u64(value, line, "delay")?).map_err(|_| {
-                    error("nui_flow_invalid_motion", "motion delay exceeds the supported range", line, 1)
+                    error(
+                        "nui_flow_invalid_motion",
+                        "motion delay exceeds the supported range",
+                        line,
+                        1,
+                    )
                 })?;
                 index += 2;
             }
             "repeat" => {
                 let value = words.get(index + 1).ok_or_else(|| {
-                    error("nui_flow_invalid_motion", "repeat requires a count or infinite", line, 1)
+                    error(
+                        "nui_flow_invalid_motion",
+                        "repeat requires a count or infinite",
+                        line,
+                        1,
+                    )
                 })?;
                 timeline.repeat = if value == "infinite" {
                     UiAnimationRepeat::Infinite
                 } else {
                     let count = u32::try_from(parse_u64(value, line, "repeat")?).map_err(|_| {
-                        error("nui_flow_invalid_motion", "repeat count exceeds the supported range", line, 1)
+                        error(
+                            "nui_flow_invalid_motion",
+                            "repeat count exceeds the supported range",
+                            line,
+                            1,
+                        )
                     })?;
                     if !(1..=64).contains(&count) {
-                        return Err(error("nui_flow_invalid_motion", "repeat count must be in 1..=64", line, 1));
+                        return Err(error(
+                            "nui_flow_invalid_motion",
+                            "repeat count must be in 1..=64",
+                            line,
+                            1,
+                        ));
                     }
                     UiAnimationRepeat::Count(count)
                 };
@@ -2533,11 +2983,22 @@ fn parse_motion_declaration(text: &str, line: u32) -> FlowResult<Option<NuiFlowM
             }
             "stagger" => {
                 let value = words.get(index + 1).ok_or_else(|| {
-                    error("nui_flow_invalid_motion", "stagger requires milliseconds", line, 1)
+                    error(
+                        "nui_flow_invalid_motion",
+                        "stagger requires milliseconds",
+                        line,
+                        1,
+                    )
                 })?;
-                timeline.stagger_ms = u32::try_from(parse_u64(value, line, "stagger")?).map_err(|_| {
-                    error("nui_flow_invalid_motion", "stagger exceeds the supported range", line, 1)
-                })?;
+                timeline.stagger_ms =
+                    u32::try_from(parse_u64(value, line, "stagger")?).map_err(|_| {
+                        error(
+                            "nui_flow_invalid_motion",
+                            "stagger exceeds the supported range",
+                            line,
+                            1,
+                        )
+                    })?;
                 timeline_declared = true;
                 index += 2;
             }
@@ -2545,7 +3006,14 @@ fn parse_motion_declaration(text: &str, line: u32) -> FlowResult<Option<NuiFlowM
                 timeline.group = match words.get(index + 1).map(String::as_str) {
                     Some("sequence") => UiAnimationGroup::Sequence,
                     Some("parallel") => UiAnimationGroup::Parallel,
-                    _ => return Err(error("nui_flow_invalid_motion", "group must be sequence or parallel", line, 1)),
+                    _ => {
+                        return Err(error(
+                            "nui_flow_invalid_motion",
+                            "group must be sequence or parallel",
+                            line,
+                            1,
+                        ));
+                    }
                 };
                 timeline_declared = true;
                 index += 2;
@@ -2553,38 +3021,85 @@ fn parse_motion_declaration(text: &str, line: u32) -> FlowResult<Option<NuiFlowM
             "from" => {
                 index += 1;
                 if index >= words.len() {
-                    return Err(error("nui_flow_invalid_motion", "from requires at least one property", line, 1));
+                    return Err(error(
+                        "nui_flow_invalid_motion",
+                        "from requires at least one property",
+                        line,
+                        1,
+                    ));
                 }
                 while index < words.len() && !is_motion_tail_clause(&words[index]) {
                     let property = words[index].as_str();
                     match property {
                         "opacity" => {
-                            let value = words.get(index + 1).ok_or_else(|| error("nui_flow_invalid_motion", "from opacity requires a value", line, 1))?;
+                            let value = words.get(index + 1).ok_or_else(|| {
+                                error(
+                                    "nui_flow_invalid_motion",
+                                    "from opacity requires a value",
+                                    line,
+                                    1,
+                                )
+                            })?;
                             from.opacity = Some(number(value, line)?.clamp(0.0, 1.0));
                             index += 2;
                         }
                         "fill" | "background" => {
-                            let value = words.get(index + 1).ok_or_else(|| error("nui_flow_invalid_motion", "from fill requires a color", line, 1))?;
+                            let value = words.get(index + 1).ok_or_else(|| {
+                                error(
+                                    "nui_flow_invalid_motion",
+                                    "from fill requires a color",
+                                    line,
+                                    1,
+                                )
+                            })?;
                             from.background_color = Some(color(value, line)?);
                             index += 2;
                         }
                         "line" | "border" => {
-                            let value = words.get(index + 1).ok_or_else(|| error("nui_flow_invalid_motion", "from border requires a color", line, 1))?;
+                            let value = words.get(index + 1).ok_or_else(|| {
+                                error(
+                                    "nui_flow_invalid_motion",
+                                    "from border requires a color",
+                                    line,
+                                    1,
+                                )
+                            })?;
                             from.border_color = Some(color(value, line)?);
                             index += 2;
                         }
                         "border_width" => {
-                            let value = words.get(index + 1).ok_or_else(|| error("nui_flow_invalid_motion", "from border_width requires a value", line, 1))?;
+                            let value = words.get(index + 1).ok_or_else(|| {
+                                error(
+                                    "nui_flow_invalid_motion",
+                                    "from border_width requires a value",
+                                    line,
+                                    1,
+                                )
+                            })?;
                             from.border_width = Some(number(value, line)?.max(0.0));
                             index += 2;
                         }
                         "corner_radius" | "radius" => {
-                            let value = words.get(index + 1).ok_or_else(|| error("nui_flow_invalid_motion", "from corner_radius requires a value", line, 1))?;
+                            let value = words.get(index + 1).ok_or_else(|| {
+                                error(
+                                    "nui_flow_invalid_motion",
+                                    "from corner_radius requires a value",
+                                    line,
+                                    1,
+                                )
+                            })?;
                             from.corner_radius = Some(number(value, line)?.max(0.0));
                             index += 2;
                         }
                         "bounds" => {
-                            let values = words.get(index + 1..index + 5).ok_or_else(|| error("nui_flow_invalid_motion", "from bounds requires x y width height", line, 1))?;
+                            let values = words.get(index + 1..index + 5).ok_or_else(|| {
+                                error(
+                                    "nui_flow_invalid_motion",
+                                    "from bounds requires x y width height",
+                                    line,
+                                    1,
+                                )
+                            })?;
                             from.bounds = Some(UiBounds {
                                 x: number(&values[0], line)?,
                                 y: number(&values[1], line)?,
@@ -2620,11 +3135,19 @@ fn parse_motion_declaration(text: &str, line: u32) -> FlowResult<Option<NuiFlowM
                                 )
                             })?;
                             let transform = from.transform.get_or_insert_with(UiTransform::default);
-                            transform.origin = [number(&values[0], line)?, number(&values[1], line)?];
+                            transform.origin =
+                                [number(&values[0], line)?, number(&values[1], line)?];
                             index += 3;
                         }
                         "numeric" => {
-                            let value = words.get(index + 1).ok_or_else(|| error("nui_flow_invalid_motion", "from numeric requires a value", line, 1))?;
+                            let value = words.get(index + 1).ok_or_else(|| {
+                                error(
+                                    "nui_flow_invalid_motion",
+                                    "from numeric requires a value",
+                                    line,
+                                    1,
+                                )
+                            })?;
                             from.numeric_value = Some(number(value, line)?);
                             index += 2;
                         }
@@ -2845,9 +3368,7 @@ fn parse_state_machine_declaration(
                         let values = words
                             .get(i + 1..i + 3)
                             .ok_or_else(|| invalid("origin requires normalized x y"))?;
-                        let transform = style
-                            .transform
-                            .get_or_insert_with(UiTransform::default);
+                        let transform = style.transform.get_or_insert_with(UiTransform::default);
                         transform.origin = [number(values[0], line)?, number(values[1], line)?];
                         i += 3;
                     }
@@ -2906,9 +3427,10 @@ fn parse_state_machine_declaration(
             let mut cursor = 3;
             let mut from_state = "*".to_owned();
             if words.get(cursor) == Some(&"from") {
-                let state = words.get(cursor + 1).copied().ok_or_else(|| {
-                    invalid("on from requires a declared source state")
-                })?;
+                let state = words
+                    .get(cursor + 1)
+                    .copied()
+                    .ok_or_else(|| invalid("on from requires a declared source state"))?;
                 if !valid_key(state) {
                     return Err(invalid("on from requires a valid source state"));
                 }
@@ -2917,9 +3439,10 @@ fn parse_state_machine_declaration(
             }
             let mut predicate = None;
             if words.get(cursor) == Some(&"when") {
-                let predicate_text = words.get(cursor + 1).copied().ok_or_else(|| {
-                    invalid("on when requires a predicate")
-                })?;
+                let predicate_text = words
+                    .get(cursor + 1)
+                    .copied()
+                    .ok_or_else(|| invalid("on when requires a predicate"))?;
                 predicate = Some(parse_branch_predicate(predicate_text, line)?);
                 cursor += 2;
             }
@@ -3255,17 +3778,36 @@ fn parse_struct_header(content: &str) -> Option<String> {
 fn parse_struct_field(
     content: &str,
     line: u32,
-) -> FlowResult<(String, neon_ui_schema::UiInputKind, neon_ui_schema::UiInputValue)> {
+) -> FlowResult<(
+    String,
+    neon_ui_schema::UiInputKind,
+    neon_ui_schema::UiInputValue,
+)> {
     let parts: Vec<&str> = content.split_whitespace().collect();
     if parts.is_empty() {
-        return Err(error("nui_flow_invalid_struct_field", "empty struct field", line, 1));
+        return Err(error(
+            "nui_flow_invalid_struct_field",
+            "empty struct field",
+            line,
+            1,
+        ));
     }
     let field_name = parts[0].to_string();
     if !valid_key(&field_name) {
-        return Err(error("nui_flow_invalid_struct_field", "invalid field name", line, 1));
+        return Err(error(
+            "nui_flow_invalid_struct_field",
+            "invalid field name",
+            line,
+            1,
+        ));
     }
     if parts.len() < 2 {
-        return Err(error("nui_flow_invalid_struct_field", "field requires a kind", line, 1));
+        return Err(error(
+            "nui_flow_invalid_struct_field",
+            "field requires a kind",
+            line,
+            1,
+        ));
     }
     let kind = parse_field_kind(parts[1], line)?;
     // Parse optional default value
@@ -3274,7 +3816,12 @@ fn parse_struct_field(
     } else if parts.len() == 2 {
         default_for_kind(&kind)
     } else {
-        return Err(error("nui_flow_invalid_struct_field", "field syntax: <name> <kind> [default <value>]", line, 1));
+        return Err(error(
+            "nui_flow_invalid_struct_field",
+            "field syntax: <name> <kind> [default <value>]",
+            line,
+            1,
+        ));
     };
     Ok((field_name, kind, default_value))
 }
@@ -3292,13 +3839,27 @@ fn parse_field_kind(kind_str: &str, line: u32) -> FlowResult<neon_ui_schema::UiI
         "asset_handle" => Ok(UiInputKind::AssetHandle),
         "text" => Ok(UiInputKind::TextHandle),
         s if s.starts_with("enum:") => {
-            let variants = s[5..].split('|').filter(|v| !v.is_empty()).map(str::to_owned).collect::<Vec<_>>();
+            let variants = s[5..]
+                .split('|')
+                .filter(|v| !v.is_empty())
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
             if variants.is_empty() || variants.iter().any(|v| !valid_key(v)) {
-                return Err(error("nui_flow_invalid_struct_field", "enum uses enum:one|two", line, 1));
+                return Err(error(
+                    "nui_flow_invalid_struct_field",
+                    "enum uses enum:one|two",
+                    line,
+                    1,
+                ));
             }
             Ok(UiInputKind::Enum { variants })
         }
-        _ => Err(error("nui_flow_unknown_field_kind", "struct field supports bool, i32, u32, f32, vec2, vec4, color, text, enum", line, 1)),
+        _ => Err(error(
+            "nui_flow_unknown_field_kind",
+            "struct field supports bool, i32, u32, f32, vec2, vec4, color, text, enum",
+            line,
+            1,
+        )),
     }
 }
 
@@ -3306,22 +3867,46 @@ fn default_for_kind(kind: &neon_ui_schema::UiInputKind) -> neon_ui_schema::UiInp
     use neon_ui_schema::UiInputValue;
     match kind {
         neon_ui_schema::UiInputKind::Bool => UiInputValue::Bool { value: false },
-        neon_ui_schema::UiInputKind::I32 | neon_ui_schema::UiInputKind::I32Range { .. } => UiInputValue::I32 { value: 0 },
-        neon_ui_schema::UiInputKind::U32 | neon_ui_schema::UiInputKind::U32Range { .. } => UiInputValue::U32 { value: 0 },
-        neon_ui_schema::UiInputKind::F32 | neon_ui_schema::UiInputKind::F32Range { .. } => UiInputValue::F32 { value: 0.0 },
+        neon_ui_schema::UiInputKind::I32 | neon_ui_schema::UiInputKind::I32Range { .. } => {
+            UiInputValue::I32 { value: 0 }
+        }
+        neon_ui_schema::UiInputKind::U32 | neon_ui_schema::UiInputKind::U32Range { .. } => {
+            UiInputValue::U32 { value: 0 }
+        }
+        neon_ui_schema::UiInputKind::F32 | neon_ui_schema::UiInputKind::F32Range { .. } => {
+            UiInputValue::F32 { value: 0.0 }
+        }
         neon_ui_schema::UiInputKind::Vec2 => UiInputValue::Vec2 { value: [0.0, 0.0] },
-        neon_ui_schema::UiInputKind::Vec4 => UiInputValue::Vec4 { value: [0.0, 0.0, 0.0, 0.0] },
-        neon_ui_schema::UiInputKind::Color => UiInputValue::Color { value: [0.0, 0.0, 0.0, 1.0] },
-        neon_ui_schema::UiInputKind::TextHandle | neon_ui_schema::UiInputKind::AssetHandle => UiInputValue::TextHandle {
-            value: neon_ui_schema::UiTextHandle { id: 0, generation: 0 },
+        neon_ui_schema::UiInputKind::Vec4 => UiInputValue::Vec4 {
+            value: [0.0, 0.0, 0.0, 0.0],
         },
+        neon_ui_schema::UiInputKind::Color => UiInputValue::Color {
+            value: [0.0, 0.0, 0.0, 1.0],
+        },
+        neon_ui_schema::UiInputKind::TextHandle | neon_ui_schema::UiInputKind::AssetHandle => {
+            UiInputValue::TextHandle {
+                value: neon_ui_schema::UiTextHandle {
+                    id: 0,
+                    generation: 0,
+                },
+            }
+        }
         neon_ui_schema::UiInputKind::Enum { variants } => UiInputValue::Enum {
             value: variants.first().cloned().unwrap_or_default(),
         },
-        neon_ui_schema::UiInputKind::CanvasData => UiInputValue::CanvasData { value: Default::default() },
-        neon_ui_schema::UiInputKind::Struct { .. } => UiInputValue::Struct { fields: Default::default() },
-        neon_ui_schema::UiInputKind::Array { element_kind, length } => UiInputValue::Array {
-            elements: (0..*length).map(|_| default_for_kind(element_kind)).collect(),
+        neon_ui_schema::UiInputKind::CanvasData => UiInputValue::CanvasData {
+            value: Default::default(),
+        },
+        neon_ui_schema::UiInputKind::Struct { .. } => UiInputValue::Struct {
+            fields: Default::default(),
+        },
+        neon_ui_schema::UiInputKind::Array {
+            element_kind,
+            length,
+        } => UiInputValue::Array {
+            elements: (0..*length)
+                .map(|_| default_for_kind(element_kind))
+                .collect(),
             element_kind: element_kind.clone(),
         },
     }
@@ -3337,44 +3922,114 @@ fn parse_field_default(
         (UiInputKind::Bool, "true") => Ok(UiInputValue::Bool { value: true }),
         (UiInputKind::Bool, "false") => Ok(UiInputValue::Bool { value: false }),
         (UiInputKind::I32 | UiInputKind::I32Range { .. }, v) => Ok(UiInputValue::I32 {
-            value: v.parse().map_err(|_| error("nui_flow_invalid_literal", "invalid i32 default", line, 1))?,
+            value: v
+                .parse()
+                .map_err(|_| error("nui_flow_invalid_literal", "invalid i32 default", line, 1))?,
         }),
         (UiInputKind::U32 | UiInputKind::U32Range { .. }, v) => Ok(UiInputValue::U32 {
-            value: v.parse().map_err(|_| error("nui_flow_invalid_literal", "invalid u32 default", line, 1))?,
+            value: v
+                .parse()
+                .map_err(|_| error("nui_flow_invalid_literal", "invalid u32 default", line, 1))?,
         }),
         (UiInputKind::F32 | UiInputKind::F32Range { .. }, v) => Ok(UiInputValue::F32 {
-            value: v.parse::<f32>().ok().filter(|x| x.is_finite())
-                .ok_or_else(|| error("nui_flow_invalid_literal", "invalid finite f32 default", line, 1))?,
+            value: v
+                .parse::<f32>()
+                .ok()
+                .filter(|x| x.is_finite())
+                .ok_or_else(|| {
+                    error(
+                        "nui_flow_invalid_literal",
+                        "invalid finite f32 default",
+                        line,
+                        1,
+                    )
+                })?,
         }),
         (UiInputKind::Vec2, v) => {
-            let nums: Vec<f32> = v.split(',').map(|s| s.trim().parse::<f32>())
-                .collect::<Result<_, _>>().map_err(|_| error("nui_flow_invalid_literal", "vec2 default uses x,y", line, 1))?;
-            if nums.len() != 2 { return Err(error("nui_flow_invalid_literal", "vec2 needs 2 numbers", line, 1)); }
-            Ok(UiInputValue::Vec2 { value: [nums[0], nums[1]] })
+            let nums: Vec<f32> = v
+                .split(',')
+                .map(|s| s.trim().parse::<f32>())
+                .collect::<Result<_, _>>()
+                .map_err(|_| error("nui_flow_invalid_literal", "vec2 default uses x,y", line, 1))?;
+            if nums.len() != 2 {
+                return Err(error(
+                    "nui_flow_invalid_literal",
+                    "vec2 needs 2 numbers",
+                    line,
+                    1,
+                ));
+            }
+            Ok(UiInputValue::Vec2 {
+                value: [nums[0], nums[1]],
+            })
         }
         (UiInputKind::Vec4, v) => {
-            let nums: Vec<f32> = v.split(',').map(|s| s.trim().parse::<f32>())
-                .collect::<Result<_, _>>().map_err(|_| error("nui_flow_invalid_literal", "vec4 default uses x,y,z,w", line, 1))?;
-            if nums.len() != 4 { return Err(error("nui_flow_invalid_literal", "vec4 needs 4 numbers", line, 1)); }
-            Ok(UiInputValue::Vec4 { value: [nums[0], nums[1], nums[2], nums[3]] })
+            let nums: Vec<f32> = v
+                .split(',')
+                .map(|s| s.trim().parse::<f32>())
+                .collect::<Result<_, _>>()
+                .map_err(|_| {
+                    error(
+                        "nui_flow_invalid_literal",
+                        "vec4 default uses x,y,z,w",
+                        line,
+                        1,
+                    )
+                })?;
+            if nums.len() != 4 {
+                return Err(error(
+                    "nui_flow_invalid_literal",
+                    "vec4 needs 4 numbers",
+                    line,
+                    1,
+                ));
+            }
+            Ok(UiInputValue::Vec4 {
+                value: [nums[0], nums[1], nums[2], nums[3]],
+            })
         }
         (UiInputKind::Color, v) => {
-            let nums: Vec<f32> = v.split(',').map(|s| s.trim().parse::<f32>())
-                .collect::<Result<_, _>>().map_err(|_| error("nui_flow_invalid_literal", "color default uses r,g,b,a", line, 1))?;
+            let nums: Vec<f32> = v
+                .split(',')
+                .map(|s| s.trim().parse::<f32>())
+                .collect::<Result<_, _>>()
+                .map_err(|_| {
+                    error(
+                        "nui_flow_invalid_literal",
+                        "color default uses r,g,b,a",
+                        line,
+                        1,
+                    )
+                })?;
             if nums.len() != 4 || nums.iter().any(|x| !(0.0..=1.0).contains(x)) {
-                return Err(error("nui_flow_invalid_literal", "color needs 4 numbers in 0..1", line, 1));
+                return Err(error(
+                    "nui_flow_invalid_literal",
+                    "color needs 4 numbers in 0..1",
+                    line,
+                    1,
+                ));
             }
-            Ok(UiInputValue::Color { value: [nums[0], nums[1], nums[2], nums[3]] })
+            Ok(UiInputValue::Color {
+                value: [nums[0], nums[1], nums[2], nums[3]],
+            })
         }
         (UiInputKind::TextHandle, "text:empty") => Ok(UiInputValue::TextHandle {
-            value: neon_ui_schema::UiTextHandle { id: 0, generation: 0 },
+            value: neon_ui_schema::UiTextHandle {
+                id: 0,
+                generation: 0,
+            },
         }),
         (UiInputKind::AssetHandle, "asset:empty") => Ok(UiInputValue::AssetHandle {
             id: 0,
             generation: 0,
         }),
         (UiInputKind::Enum { .. }, v) => Ok(UiInputValue::Enum { value: v.into() }),
-        _ => Err(error("nui_flow_invalid_literal", "field default does not match its type", line, 1)),
+        _ => Err(error(
+            "nui_flow_invalid_literal",
+            "field default does not match its type",
+            line,
+            1,
+        )),
     }
 }
 
@@ -3395,21 +4050,41 @@ fn parse_input(text: &str, line: u32) -> FlowResult<Option<(ParsedInput, bool)>>
     if parts.len() >= 6 && parts[3] == "=" {
         let key = parts[1];
         if parts[2] != "bool" {
-            return Err(error("nui_flow_invalid_input", "derived inputs must be bool", line, 1));
+            return Err(error(
+                "nui_flow_invalid_input",
+                "derived inputs must be bool",
+                line,
+                1,
+            ));
         }
         // Reassemble expression from parts[4..]
         let expr = parts[4..].join(" ");
         // Validate expression format: $left op right
         let expr_parts = expr.split_whitespace().collect::<Vec<_>>();
         if expr_parts.len() != 3 {
-            return Err(error("nui_flow_invalid_input", "expression must be: $left op right", line, 1));
+            return Err(error(
+                "nui_flow_invalid_input",
+                "expression must be: $left op right",
+                line,
+                1,
+            ));
         }
         if !expr_parts[0].starts_with('$') {
-            return Err(error("nui_flow_invalid_input", "left operand must be $variable", line, 1));
+            return Err(error(
+                "nui_flow_invalid_input",
+                "left operand must be $variable",
+                line,
+                1,
+            ));
         }
         let op = expr_parts[1];
         if !matches!(op, "==" | "!=" | ">" | "<" | ">=" | "<=") {
-            return Err(error("nui_flow_invalid_input", "unsupported operator", line, 1));
+            return Err(error(
+                "nui_flow_invalid_input",
+                "unsupported operator",
+                line,
+                1,
+            ));
         }
         let kind = UiInputKind::Bool;
         let (alignment, lanes, representation) = kind.packing();
@@ -3420,7 +4095,12 @@ fn parse_input(text: &str, line: u32) -> FlowResult<Option<(ParsedInput, bool)>>
                 default_value: UiInputValue::Bool { value: false },
                 update_class: UiInputUpdateClass::ReliableExternal,
                 semantic_label: key.replace('_', " "),
-                packing: UiInputPacking { alignment, lanes, offset: 0, representation },
+                packing: UiInputPacking {
+                    alignment,
+                    lanes,
+                    offset: 0,
+                    representation,
+                },
                 derived_expression: Some(expr),
             }),
             false,
@@ -3428,17 +4108,32 @@ fn parse_input(text: &str, line: u32) -> FlowResult<Option<(ParsedInput, bool)>>
     }
     // Array input: input <key> array[<N>] <element_kind>
     if parts.len() >= 4 && parts[2].starts_with("array[") && parts[2].ends_with("]") {
-        let length_str = &parts[2][6..parts[2].len()-1];
+        let length_str = &parts[2][6..parts[2].len() - 1];
         let length: usize = length_str.parse().map_err(|_| {
-            error("nui_flow_invalid_input", "array length must be a positive integer", line, 1)
+            error(
+                "nui_flow_invalid_input",
+                "array length must be a positive integer",
+                line,
+                1,
+            )
         })?;
         if length == 0 {
-            return Err(error("nui_flow_invalid_input", "array length must be > 0", line, 1));
+            return Err(error(
+                "nui_flow_invalid_input",
+                "array length must be > 0",
+                line,
+                1,
+            ));
         }
         let element_kind = parse_field_kind(parts[3], line)?;
-        let kind = UiInputKind::Array { element_kind: Box::new(element_kind.clone()), length };
+        let kind = UiInputKind::Array {
+            element_kind: Box::new(element_kind.clone()),
+            length,
+        };
         let default_value = UiInputValue::Array {
-            elements: (0..length).map(|_| default_for_kind(&element_kind)).collect(),
+            elements: (0..length)
+                .map(|_| default_for_kind(&element_kind))
+                .collect(),
             element_kind: Box::new(element_kind),
         };
         let (alignment, lanes, representation) = kind.packing();
@@ -3449,7 +4144,12 @@ fn parse_input(text: &str, line: u32) -> FlowResult<Option<(ParsedInput, bool)>>
                 default_value,
                 update_class: UiInputUpdateClass::ReliableExternal,
                 semantic_label: parts[1].into(),
-                packing: UiInputPacking { alignment, lanes, offset: 0, representation },
+                packing: UiInputPacking {
+                    alignment,
+                    lanes,
+                    offset: 0,
+                    representation,
+                },
                 derived_expression: None,
             }),
             false,
@@ -3628,31 +4328,70 @@ fn parse_input(text: &str, line: u32) -> FlowResult<Option<(ParsedInput, bool)>>
                 .collect::<Result<_, _>>()
                 .map_err(|_| error("nui_flow_invalid_literal", "vec2 default uses x,y", line, 1))?;
             if nums.len() != 2 || nums.iter().any(|v| !v.is_finite()) {
-                return Err(error("nui_flow_invalid_literal", "vec2 default needs 2 finite numbers", line, 1));
+                return Err(error(
+                    "nui_flow_invalid_literal",
+                    "vec2 default needs 2 finite numbers",
+                    line,
+                    1,
+                ));
             }
-            UiInputValue::Vec2 { value: [nums[0], nums[1]] }
+            UiInputValue::Vec2 {
+                value: [nums[0], nums[1]],
+            }
         }
         (UiInputKind::Vec4, value) => {
             let nums: Vec<f32> = value
                 .split(',')
                 .map(|s| s.trim().parse::<f32>())
                 .collect::<Result<_, _>>()
-                .map_err(|_| error("nui_flow_invalid_literal", "vec4 default uses x,y,z,w", line, 1))?;
+                .map_err(|_| {
+                    error(
+                        "nui_flow_invalid_literal",
+                        "vec4 default uses x,y,z,w",
+                        line,
+                        1,
+                    )
+                })?;
             if nums.len() != 4 || nums.iter().any(|v| !v.is_finite()) {
-                return Err(error("nui_flow_invalid_literal", "vec4 default needs 4 finite numbers", line, 1));
+                return Err(error(
+                    "nui_flow_invalid_literal",
+                    "vec4 default needs 4 finite numbers",
+                    line,
+                    1,
+                ));
             }
-            UiInputValue::Vec4 { value: [nums[0], nums[1], nums[2], nums[3]] }
+            UiInputValue::Vec4 {
+                value: [nums[0], nums[1], nums[2], nums[3]],
+            }
         }
         (UiInputKind::Color, value) => {
             let nums: Vec<f32> = value
                 .split(',')
                 .map(|s| s.trim().parse::<f32>())
                 .collect::<Result<_, _>>()
-                .map_err(|_| error("nui_flow_invalid_literal", "color default uses r,g,b,a", line, 1))?;
-            if nums.len() != 4 || nums.iter().any(|v| !v.is_finite() || !(0.0..=1.0).contains(v)) {
-                return Err(error("nui_flow_invalid_literal", "color default needs 4 numbers in 0..1", line, 1));
+                .map_err(|_| {
+                    error(
+                        "nui_flow_invalid_literal",
+                        "color default uses r,g,b,a",
+                        line,
+                        1,
+                    )
+                })?;
+            if nums.len() != 4
+                || nums
+                    .iter()
+                    .any(|v| !v.is_finite() || !(0.0..=1.0).contains(v))
+            {
+                return Err(error(
+                    "nui_flow_invalid_literal",
+                    "color default needs 4 numbers in 0..1",
+                    line,
+                    1,
+                ));
             }
-            UiInputValue::Color { value: [nums[0], nums[1], nums[2], nums[3]] }
+            UiInputValue::Color {
+                value: [nums[0], nums[1], nums[2], nums[3]],
+            }
         }
         _ => {
             return Err(error(
@@ -3854,9 +4593,10 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
             "scrollable" => node.layout.as_mut().unwrap().clip = UiClipPolicy::Scroll,
             "x" | "y" | "w" | "h" | "minw" | "maxw" | "grow" | "shrink" | "basis" | "gap"
             | "pad" | "fill" | "line" | "ink" | "opacity" | "radius" | "border_width" | "value"
-            | "checked" | "selected" | "state" | "numeric" | "scroll" | "scroll_offset" | "enabled" | "visible"
-             | "event" | "token" | "align" | "clip" | "clip_shape" | "fit" | "justify" | "data" | "rich" | "skin" | "context_menu" | "enter" | "transition"
-             | "composition_layer" | "layer" | "exit" => {
+            | "checked" | "selected" | "state" | "numeric" | "scroll" | "scroll_offset"
+            | "enabled" | "visible" | "event" | "token" | "align" | "clip" | "clip_shape"
+            | "fit" | "justify" | "data" | "rich" | "skin" | "context_menu" | "enter"
+            | "transition" | "composition_layer" | "layer" | "exit" => {
                 let value = *parts.get(index + 1).ok_or_else(|| {
                     error(
                         "nui_flow_missing_value",
@@ -3866,7 +4606,7 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
                     )
                 })?;
                 index += 1;
-                 if token == "enter" || token == "transition" || token == "exit" {
+                if token == "enter" || token == "transition" || token == "exit" {
                     if !valid_key(value) {
                         return Err(error(
                             "nui_flow_invalid_motion",
@@ -3875,7 +4615,7 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
                             1,
                         ));
                     }
-                     let slot = if token == "enter" {
+                    let slot = if token == "enter" {
                         &mut enter_motion
                     } else if token == "transition" {
                         &mut transition_motion
@@ -3900,7 +4640,14 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
                         ));
                     }
                     let spans = serde_json::from_str::<Vec<UiRichTextSpan>>(&quoted(value, line)?)
-                        .map_err(|_| error("nui_flow_invalid_rich_text", "rich requires a JSON span array", line, 1))?;
+                        .map_err(|_| {
+                            error(
+                                "nui_flow_invalid_rich_text",
+                                "rich requires a JSON span array",
+                                line,
+                                1,
+                            )
+                        })?;
                     node.text = Some(TextRef::Rich { spans });
                 } else if token == "data" {
                     if component != "canvas" {
@@ -3930,28 +4677,81 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
                     bindings.push((UiBoundProperty::CanvasData, key.into()));
                 } else if matches!(token, "composition_layer" | "layer") {
                     composition_layer = match (token, value) {
-                        ("composition_layer", "behind_glass") | ("layer", "behind_glass") => UiCompositionLayer::BehindGlass,
-                        ("composition_layer", "overlay") | ("layer", "top") => UiCompositionLayer::Top,
-                        _ => return Err(error(
-                            "nui_flow_invalid_composition_layer",
-                            "composition layer must be behind_glass, overlay, or top",
-                            line,
-                            1,
-                        )),
+                        ("composition_layer", "behind_glass") | ("layer", "behind_glass") => {
+                            UiCompositionLayer::BehindGlass
+                        }
+                        ("composition_layer", "overlay") | ("layer", "top") => {
+                            UiCompositionLayer::Top
+                        }
+                        _ => {
+                            return Err(error(
+                                "nui_flow_invalid_composition_layer",
+                                "composition layer must be behind_glass, overlay, or top",
+                                line,
+                                1,
+                            ));
+                        }
                     };
                 } else {
                     if token == "skin" {
-                        if !matches!(component, "button" | "slider" | "scrollbar" | "progress_bar" | "checkbox" | "radio_button" | "input" | "tooltip" | "panel" | "dialog" | "context_menu" | "splitter" | "combo" | "dropdown" | "tabs" | "selectable" | "list_box" | "drag_value" | "modal" | "tree_view" | "switch" | "toast" | "menu_bar" | "accordion" | "spinner" | "divider" | "popup") || !valid_key(value) {
-                            return Err(error("nui_flow_invalid_skin", "skin reference is valid only for skinnable components and requires a stable key", line, 1));
+                        if !matches!(
+                            component,
+                            "button"
+                                | "slider"
+                                | "scrollbar"
+                                | "progress_bar"
+                                | "checkbox"
+                                | "radio_button"
+                                | "input"
+                                | "tooltip"
+                                | "panel"
+                                | "dialog"
+                                | "context_menu"
+                                | "splitter"
+                                | "combo"
+                                | "dropdown"
+                                | "tabs"
+                                | "selectable"
+                                | "list_box"
+                                | "drag_value"
+                                | "modal"
+                                | "tree_view"
+                                | "switch"
+                                | "toast"
+                                | "menu_bar"
+                                | "accordion"
+                                | "spinner"
+                                | "divider"
+                                | "popup"
+                        ) || !valid_key(value)
+                        {
+                            return Err(error(
+                                "nui_flow_invalid_skin",
+                                "skin reference is valid only for skinnable components and requires a stable key",
+                                line,
+                                1,
+                            ));
                         }
                         skin_key = Some(value.into());
                     } else if token == "context_menu" {
                         if !valid_key(value) {
-                            return Err(error("nui_flow_invalid_context_menu", "context_menu requires a valid node key", line, 1));
+                            return Err(error(
+                                "nui_flow_invalid_context_menu",
+                                "context_menu requires a valid node key",
+                                line,
+                                1,
+                            ));
                         }
                         context_menu = Some(value.into());
                     } else {
-                        parse_attribute(&mut node, &mut bindings, &mut intents, token, value, line)?;
+                        parse_attribute(
+                            &mut node,
+                            &mut bindings,
+                            &mut intents,
+                            token,
+                            value,
+                            line,
+                        )?;
                     }
                 }
             }
@@ -4206,14 +5006,24 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
             }
             "source_file" if component == "code_editor" => {
                 let value = *parts.get(index + 1).ok_or_else(|| {
-                    error("nui_flow_missing_value", "source_file requires a quoted path", line, 1)
+                    error(
+                        "nui_flow_missing_value",
+                        "source_file requires a quoted path",
+                        line,
+                        1,
+                    )
                 })?;
                 index += 1;
                 code_editor_source_file = Some(quoted(value, line)?);
             }
             "language" if component == "code_editor" => {
                 let value = *parts.get(index + 1).ok_or_else(|| {
-                    error("nui_flow_missing_value", "language requires a value", line, 1)
+                    error(
+                        "nui_flow_missing_value",
+                        "language requires a value",
+                        line,
+                        1,
+                    )
                 })?;
                 index += 1;
                 code_editor_language = match value {
@@ -4221,17 +5031,24 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
                     "typescript" | "ts" => neon_ui_schema::UiEditorLanguage::Typescript,
                     "rust" | "rs" => neon_ui_schema::UiEditorLanguage::Rust,
                     "cpp" | "c++" | "cc" => neon_ui_schema::UiEditorLanguage::Cpp,
-                    _ => return Err(error(
-                        "nui_flow_invalid_code_editor",
-                        "code_editor language must be one of nui_flow/typescript/rust/cpp",
-                        line,
-                        1,
-                    )),
+                    _ => {
+                        return Err(error(
+                            "nui_flow_invalid_code_editor",
+                            "code_editor language must be one of nui_flow/typescript/rust/cpp",
+                            line,
+                            1,
+                        ));
+                    }
                 };
             }
             "line_numbers" if component == "code_editor" => {
                 let value = *parts.get(index + 1).ok_or_else(|| {
-                    error("nui_flow_missing_value", "line_numbers requires a bool", line, 1)
+                    error(
+                        "nui_flow_missing_value",
+                        "line_numbers requires a bool",
+                        line,
+                        1,
+                    )
                 })?;
                 index += 1;
                 code_editor_line_numbers = boolean(value, line)?;
@@ -4243,17 +5060,24 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
                 index += 1;
                 code_editor_wrap = match value {
                     "none" => neon_ui_schema::UiEditorWrap::None,
-                    _ => return Err(error(
-                        "nui_flow_invalid_code_editor",
-                        "code_editor wrap must be none in V1",
-                        line,
-                        1,
-                    )),
+                    _ => {
+                        return Err(error(
+                            "nui_flow_invalid_code_editor",
+                            "code_editor wrap must be none in V1",
+                            line,
+                            1,
+                        ));
+                    }
                 };
             }
             "font_size" if component == "code_editor" => {
                 let value = *parts.get(index + 1).ok_or_else(|| {
-                    error("nui_flow_missing_value", "font_size requires a number", line, 1)
+                    error(
+                        "nui_flow_missing_value",
+                        "font_size requires a number",
+                        line,
+                        1,
+                    )
                 })?;
                 index += 1;
                 code_editor_font_size = number(value, line)?;
@@ -4268,11 +5092,23 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
             }
             "tab_size" if component == "code_editor" => {
                 let value = *parts.get(index + 1).ok_or_else(|| {
-                    error("nui_flow_missing_value", "tab_size requires an integer", line, 1)
+                    error(
+                        "nui_flow_missing_value",
+                        "tab_size requires an integer",
+                        line,
+                        1,
+                    )
                 })?;
                 index += 1;
-                code_editor_tab_size = u8::try_from(parse_u64(value, line, "tab_size")?)
-                    .map_err(|_| error("nui_flow_invalid_code_editor", "tab_size is too large", line, 1))?;
+                code_editor_tab_size =
+                    u8::try_from(parse_u64(value, line, "tab_size")?).map_err(|_| {
+                        error(
+                            "nui_flow_invalid_code_editor",
+                            "tab_size is too large",
+                            line,
+                            1,
+                        )
+                    })?;
                 if !(1..=8).contains(&code_editor_tab_size) {
                     return Err(error(
                         "nui_flow_invalid_code_editor",
@@ -4284,27 +5120,52 @@ fn parse_node(text: &str, line: u32) -> FlowResult<NodeBuild> {
             }
             "read_only" if component == "code_editor" => {
                 let value = *parts.get(index + 1).ok_or_else(|| {
-                    error("nui_flow_missing_value", "read_only requires $bool", line, 1)
+                    error(
+                        "nui_flow_missing_value",
+                        "read_only requires $bool",
+                        line,
+                        1,
+                    )
                 })?;
                 index += 1;
                 let Some(key) = value.strip_prefix('$') else {
-                    return Err(error("nui_flow_invalid_code_editor", "read_only must use $bool", line, 1));
+                    return Err(error(
+                        "nui_flow_invalid_code_editor",
+                        "read_only must use $bool",
+                        line,
+                        1,
+                    ));
                 };
                 code_editor_read_only = Some(key.into());
             }
             "completions" if component == "code_editor" => {
                 let value = *parts.get(index + 1).ok_or_else(|| {
-                    error("nui_flow_missing_value", "completions requires $input", line, 1)
+                    error(
+                        "nui_flow_missing_value",
+                        "completions requires $input",
+                        line,
+                        1,
+                    )
                 })?;
                 index += 1;
                 let Some(key) = value.strip_prefix('$') else {
-                    return Err(error("nui_flow_invalid_code_editor", "completions must use $input", line, 1));
+                    return Err(error(
+                        "nui_flow_invalid_code_editor",
+                        "completions must use $input",
+                        line,
+                        1,
+                    ));
                 };
                 code_editor_completions = Some(key.into());
             }
             "gutter_diagnostics" if component == "code_editor" => {
                 let value = *parts.get(index + 1).ok_or_else(|| {
-                    error("nui_flow_missing_value", "gutter_diagnostics requires a bool", line, 1)
+                    error(
+                        "nui_flow_missing_value",
+                        "gutter_diagnostics requires a bool",
+                        line,
+                        1,
+                    )
                 })?;
                 index += 1;
                 code_editor_gutter_diagnostics = boolean(value, line)?;
@@ -5007,14 +5868,18 @@ fn parse_material_line(text: &str, line: u32) -> FlowResult<UiMaterialRef> {
                     ));
                 }
                 if let Ok(value) = raw.parse::<f64>() {
-                    material.parameters.insert(key.into(), serde_json::json!(value));
+                    material
+                        .parameters
+                        .insert(key.into(), serde_json::json!(value));
                 } else if raw.starts_with('#') {
                     let [r, g, b, a] = color(raw, line)?;
                     material
                         .parameters
                         .insert(key.into(), serde_json::json!([r, g, b, a]));
                 } else {
-                    material.parameters.insert(key.into(), serde_json::json!(raw));
+                    material
+                        .parameters
+                        .insert(key.into(), serde_json::json!(raw));
                 }
             }
             _ => {
@@ -5109,14 +5974,18 @@ fn parse_text_material_line(text: &str, line: u32) -> FlowResult<UiTextMaterialR
                     ));
                 }
                 if let Ok(value) = raw.parse::<f64>() {
-                    material.parameters.insert(key.into(), serde_json::json!(value));
+                    material
+                        .parameters
+                        .insert(key.into(), serde_json::json!(value));
                 } else if raw.starts_with('#') {
                     let [r, g, b, a] = color(raw, line)?;
                     material
                         .parameters
                         .insert(key.into(), serde_json::json!([r, g, b, a]));
                 } else {
-                    material.parameters.insert(key.into(), serde_json::json!(raw));
+                    material
+                        .parameters
+                        .insert(key.into(), serde_json::json!(raw));
                 }
             }
             "duration" => {
@@ -5182,16 +6051,14 @@ fn parse_ui_color_line(text: &str, line: u32) -> FlowResult<(String, [f32; 4])> 
             )
         })?
         .to_string();
-    let hex = parts
-        .next()
-        .ok_or_else(|| {
-            error(
-                "nui_flow_invalid_ui_color",
-                "ui_color requires a #RRGGBB or #RRGGBBAA color",
-                line,
-                1,
-            )
-        })?;
+    let hex = parts.next().ok_or_else(|| {
+        error(
+            "nui_flow_invalid_ui_color",
+            "ui_color requires a #RRGGBB or #RRGGBBAA color",
+            line,
+            1,
+        )
+    })?;
     if parts.next().is_some() {
         return Err(error(
             "nui_flow_invalid_ui_color",
@@ -5226,16 +6093,14 @@ fn parse_syntax_color_line(text: &str, line: u32) -> FlowResult<(String, [f32; 4
             )
         })?
         .to_string();
-    let hex = parts
-        .next()
-        .ok_or_else(|| {
-            error(
-                "nui_flow_invalid_syntax",
-                "syntax requires a #RRGGBB or #RRGGBBAA color",
-                line,
-                1,
-            )
-        })?;
+    let hex = parts.next().ok_or_else(|| {
+        error(
+            "nui_flow_invalid_syntax",
+            "syntax requires a #RRGGBB or #RRGGBBAA color",
+            line,
+            1,
+        )
+    })?;
     if parts.next().is_some() {
         return Err(error(
             "nui_flow_invalid_syntax",
@@ -5250,14 +6115,9 @@ fn parse_syntax_color_line(text: &str, line: u32) -> FlowResult<(String, [f32; 4
 
 /// Parses a `#RRGGBB` / `#RRGGBBAA` color literal into RGBA 0..1.
 fn parse_hex_color(text: &str, line: u32) -> FlowResult<[f32; 4]> {
-    let hex = text.strip_prefix('#').ok_or_else(|| {
-        error(
-            "nui_flow_invalid_color",
-            "color must start with #",
-            line,
-            1,
-        )
-    })?;
+    let hex = text
+        .strip_prefix('#')
+        .ok_or_else(|| error("nui_flow_invalid_color", "color must start with #", line, 1))?;
     if hex.len() != 6 && hex.len() != 8 {
         return Err(error(
             "nui_flow_invalid_color",
@@ -5275,7 +6135,12 @@ fn parse_hex_color(text: &str, line: u32) -> FlowResult<[f32; 4]> {
         )
     })?;
     let (r, g, b, a) = if hex.len() == 8 {
-        ((val >> 24) & 0xFF, (val >> 16) & 0xFF, (val >> 8) & 0xFF, val & 0xFF)
+        (
+            (val >> 24) & 0xFF,
+            (val >> 16) & 0xFF,
+            (val >> 8) & 0xFF,
+            val & 0xFF,
+        )
     } else {
         ((val >> 16) & 0xFF, (val >> 8) & 0xFF, val & 0xFF, 0xFF)
     };
@@ -5427,13 +6292,25 @@ fn parse_attribute(
         }
         "fit" => {
             if node.kind != UiNodeKind::Image {
-                return Err(error("nui_flow_invalid_image_fit", "fit is valid only for image nodes", line, 1));
+                return Err(error(
+                    "nui_flow_invalid_image_fit",
+                    "fit is valid only for image nodes",
+                    line,
+                    1,
+                ));
             }
             layout.image_fit = match value {
                 "stretch" => neon_ui_schema::UiImageFit::Stretch,
                 "cover" => neon_ui_schema::UiImageFit::Cover,
                 "contain" => neon_ui_schema::UiImageFit::Contain,
-                _ => return Err(error("nui_flow_invalid_image_fit", "fit must be stretch, cover, or contain", line, 1)),
+                _ => {
+                    return Err(error(
+                        "nui_flow_invalid_image_fit",
+                        "fit must be stretch, cover, or contain",
+                        line,
+                        1,
+                    ));
+                }
             };
         }
         "justify" => layout.justify_content = justify(value, line)?,
@@ -5493,9 +6370,21 @@ fn parse_attribute(
                     .split(',')
                     .map(|s| s.trim().parse::<f32>())
                     .collect::<Result<_, _>>()
-                    .map_err(|_| error("nui_flow_invalid_literal", "scroll_offset literal uses x,y", line, 1))?;
+                    .map_err(|_| {
+                        error(
+                            "nui_flow_invalid_literal",
+                            "scroll_offset literal uses x,y",
+                            line,
+                            1,
+                        )
+                    })?;
                 if nums.len() != 2 || nums.iter().any(|v| !v.is_finite()) {
-                    return Err(error("nui_flow_invalid_literal", "scroll_offset needs 2 finite numbers", line, 1));
+                    return Err(error(
+                        "nui_flow_invalid_literal",
+                        "scroll_offset needs 2 finite numbers",
+                        line,
+                        1,
+                    ));
                 }
                 layout.scroll_offset = [nums[0], nums[1]];
             }
@@ -5573,7 +6462,9 @@ fn reject_forbidden(text: &str, line: u32) -> FlowResult<()> {
     }
     let array_decl = text.starts_with("input ") && text.contains("array[");
     // Binding references like $scores[0] may contain brackets.
-    let has_index_binding = text.split_whitespace().any(|token| token.starts_with('$') && token.contains('['));
+    let has_index_binding = text
+        .split_whitespace()
+        .any(|token| token.starts_with('$') && token.contains('['));
     // Derived input declarations use `=`: input x bool = $a > 0.5
     let derived_decl = text.starts_with("input ") && text.contains(" = ");
     if (text
@@ -5826,7 +6717,12 @@ fn resolve_binding_kind(
     let mut segments = input_key.split('.');
     let first = segments.next()?;
     let (top_key, top_index) = parse_path_segment_kind(first);
-    let mut current = schema.slots.iter().find(|slot| slot.key == top_key)?.kind.clone();
+    let mut current = schema
+        .slots
+        .iter()
+        .find(|slot| slot.key == top_key)?
+        .kind
+        .clone();
     if top_index.is_some() {
         match current {
             neon_ui_schema::UiInputKind::Array { element_kind, .. } => {
@@ -6045,57 +6941,66 @@ fn format_node(
         "code_editor"
     } else {
         match &node.kind {
-        UiNodeKind::Panel => "panel",
-        UiNodeKind::Label => "text",
-        UiNodeKind::Button => "button",
-        UiNodeKind::TextInput => "input",
-        UiNodeKind::Checkbox => "checkbox",
-        UiNodeKind::RadioButton => "radio_button",
-        UiNodeKind::Slider => "slider",
-        UiNodeKind::DragValue => "drag_value",
-        UiNodeKind::Combo => "combo",
-        UiNodeKind::Dropdown => "dropdown",
-        UiNodeKind::Tabs => "tabs",
-        UiNodeKind::Tooltip => "tooltip",
-        UiNodeKind::Modal => "modal",
-        UiNodeKind::Dialog => "dialog",
-        UiNodeKind::Selectable => "selectable",
-        UiNodeKind::ListBox => "list_box",
-        UiNodeKind::Scrollbar => "scrollbar",
-        UiNodeKind::ProgressBar => "progress_bar",
-        UiNodeKind::Splitter => "splitter",
-        UiNodeKind::ContextMenu => "context_menu",
-        UiNodeKind::TreeView => "tree_view",
-        UiNodeKind::DataGrid => "data_grid",
-        UiNodeKind::Image => "image",
-        UiNodeKind::RenderSurface => "render",
-        UiNodeKind::Canvas => "canvas",
-        UiNodeKind::Switch => "switch",
-        UiNodeKind::Toast => "toast",
-        UiNodeKind::MenuBar => "menu_bar",
-        UiNodeKind::Accordion => "accordion",
-        UiNodeKind::Spinner => "spinner",
-        UiNodeKind::Divider => "divider",
+            UiNodeKind::Panel => "panel",
+            UiNodeKind::Label => "text",
+            UiNodeKind::Button => "button",
+            UiNodeKind::TextInput => "input",
+            UiNodeKind::Checkbox => "checkbox",
+            UiNodeKind::RadioButton => "radio_button",
+            UiNodeKind::Slider => "slider",
+            UiNodeKind::DragValue => "drag_value",
+            UiNodeKind::Combo => "combo",
+            UiNodeKind::Dropdown => "dropdown",
+            UiNodeKind::Tabs => "tabs",
+            UiNodeKind::Tooltip => "tooltip",
+            UiNodeKind::Modal => "modal",
+            UiNodeKind::Dialog => "dialog",
+            UiNodeKind::Selectable => "selectable",
+            UiNodeKind::ListBox => "list_box",
+            UiNodeKind::Scrollbar => "scrollbar",
+            UiNodeKind::ProgressBar => "progress_bar",
+            UiNodeKind::Splitter => "splitter",
+            UiNodeKind::ContextMenu => "context_menu",
+            UiNodeKind::TreeView => "tree_view",
+            UiNodeKind::DataGrid => "data_grid",
+            UiNodeKind::Image => "image",
+            UiNodeKind::RenderSurface => "render",
+            UiNodeKind::Canvas => "canvas",
+            UiNodeKind::Switch => "switch",
+            UiNodeKind::Toast => "toast",
+            UiNodeKind::MenuBar => "menu_bar",
+            UiNodeKind::Accordion => "accordion",
+            UiNodeKind::Spinner => "spinner",
+            UiNodeKind::Divider => "divider",
             UiNodeKind::Popup => "popup",
         }
     };
     let mut line = format!("{}{} {}", " ".repeat(indent), kind, node.node_id.0);
     if let Some(editor) = code_editors.get(&node.node_id.0) {
-        line.push_str(&format!(" source ${} language nui_flow", editor.source_input_key));
+        line.push_str(&format!(
+            " source ${} language nui_flow",
+            editor.source_input_key
+        ));
         if editor.line_numbers {
             line.push_str(" line_numbers true");
         } else {
             line.push_str(" line_numbers false");
         }
         line.push_str(" wrap none");
-        line.push_str(&format!(" font_size {} tab_size {}", editor.font_size, editor.tab_size));
+        line.push_str(&format!(
+            " font_size {} tab_size {}",
+            editor.font_size, editor.tab_size
+        ));
         if let Some(key) = &editor.read_only_input_key {
             line.push_str(&format!(" read_only ${key}"));
         }
         if let Some(key) = &editor.completion_input_key {
             line.push_str(&format!(" completions ${key}"));
         }
-        line.push_str(&format!(" gutter_diagnostics {}", editor.gutter_diagnostics));
+        line.push_str(&format!(
+            " gutter_diagnostics {}",
+            editor.gutter_diagnostics
+        ));
     }
     if let Some(skin) = skin_references.get(&node.node_id.0) {
         line.push_str(&format!(" skin {skin}"));
@@ -6180,11 +7085,21 @@ fn format_node(
         let has_scroll_offset_binding = bindings
             .iter()
             .any(|b| b.node_key == node.node_id.0 && b.property == UiBoundProperty::ScrollOffset);
-        if (layout.scroll_offset[0] != 0.0 || layout.scroll_offset[1] != 0.0) && !has_scroll_offset_binding {
-            line.push_str(&format!(" scroll_offset {},{}", layout.scroll_offset[0], layout.scroll_offset[1]));
+        if (layout.scroll_offset[0] != 0.0 || layout.scroll_offset[1] != 0.0)
+            && !has_scroll_offset_binding
+        {
+            line.push_str(&format!(
+                " scroll_offset {},{}",
+                layout.scroll_offset[0], layout.scroll_offset[1]
+            ));
         }
-        if node.kind == UiNodeKind::Image && layout.image_fit != neon_ui_schema::UiImageFit::Stretch {
-            let fit = match layout.image_fit { neon_ui_schema::UiImageFit::Stretch => "stretch", neon_ui_schema::UiImageFit::Cover => "cover", neon_ui_schema::UiImageFit::Contain => "contain" };
+        if node.kind == UiNodeKind::Image && layout.image_fit != neon_ui_schema::UiImageFit::Stretch
+        {
+            let fit = match layout.image_fit {
+                neon_ui_schema::UiImageFit::Stretch => "stretch",
+                neon_ui_schema::UiImageFit::Cover => "cover",
+                neon_ui_schema::UiImageFit::Contain => "contain",
+            };
             line.push_str(&format!(" fit {fit}"));
         }
     }
@@ -6247,7 +7162,11 @@ fn format_node(
         ));
     }
     if let Some(material) = material_records.get(&node.node_id.0) {
-        let mut material_text = format!("{}material {}", " ".repeat(child_indent), material.package_id);
+        let mut material_text = format!(
+            "{}material {}",
+            " ".repeat(child_indent),
+            material.package_id
+        );
         if material.overflow != [0.0; 4] {
             material_text.push_str(&format!(
                 " overflow {} {} {} {}",
@@ -6278,8 +7197,11 @@ fn format_node(
         lines.push(material_text);
     }
     if let Some(material) = text_material_records.get(&node.node_id.0) {
-        let mut material_text =
-            format!("{}text_material {}", " ".repeat(child_indent), material.package_id);
+        let mut material_text = format!(
+            "{}text_material {}",
+            " ".repeat(child_indent),
+            material.package_id
+        );
         if material.overflow != [0.0; 4] {
             material_text.push_str(&format!(
                 " overflow {} {} {} {}",
@@ -6521,19 +7443,33 @@ fn insert_node(
     })?;
     if let Some(node_value) = payload.get("node") {
         let node: UiNode = serde_json::from_value(node_value.clone()).map_err(|_| {
-            error_at("nui_flow_invalid_patch", "insert node payload is invalid", span)
+            error_at(
+                "nui_flow_invalid_patch",
+                "insert node payload is invalid",
+                span,
+            )
         })?;
         if find_node_mut(root, &node.node_id.0).is_some() {
-            return Err(error_at("nui_flow_invalid_patch", "insert node key already exists", span));
+            return Err(error_at(
+                "nui_flow_invalid_patch",
+                "insert node key already exists",
+                span,
+            ));
         }
         let parent = find_node_mut(root, parent_key).ok_or_else(|| {
-            error_at("nui_flow_unknown_patch_target", "insert parent does not exist", span)
+            error_at(
+                "nui_flow_unknown_patch_target",
+                "insert parent does not exist",
+                span,
+            )
         })?;
         let index = payload
             .get("index")
             .and_then(|value| value.as_u64())
             .unwrap_or(parent.children.len() as u64) as usize;
-        parent.children.insert(index.min(parent.children.len()), node);
+        parent
+            .children
+            .insert(index.min(parent.children.len()), node);
         return Ok(());
     }
     let kind = payload.get("kind").and_then(|v| v.as_str()).unwrap_or("");
@@ -6726,7 +7662,10 @@ panel workspace row gap 8
             neon_ui_schema::NuiFlowCompileStatus::Invalid
         );
         assert_eq!(error.report.schema_version, 1);
-        assert_eq!(error.report.diagnostics[0].stage, neon_ui_schema::NuiFlowDiagnosticStage::Parse);
+        assert_eq!(
+            error.report.diagnostics[0].stage,
+            neon_ui_schema::NuiFlowDiagnosticStage::Parse
+        );
         assert_eq!(error.report.diagnostics[0].code, "nui_flow_unquoted_text");
         assert_eq!(error.report.diagnostics[0].span.as_ref().unwrap().line, 3);
     }
@@ -6946,16 +7885,20 @@ panel workspace row gap 8
             "surface root\n  button gamma-up value \"+\" event settings.gamma.commit\n",
         )
         .unwrap();
-        assert!(error
-            .ir
-            .events
-            .iter()
-            .any(|event| event.node_key == "gamma-up"));
-        assert!(!error
-            .ir
-            .events
-            .iter()
-            .any(|event| event.node_key == "gamma"));
+        assert!(
+            error
+                .ir
+                .events
+                .iter()
+                .any(|event| event.node_key == "gamma-up")
+        );
+        assert!(
+            !error
+                .ir
+                .events
+                .iter()
+                .any(|event| event.node_key == "gamma")
+        );
     }
 
     #[test]
@@ -7150,9 +8093,27 @@ panel workspace row gap 8
             "resource cover image\nsurface root\n  image artwork resource cover fit cover\n  image logo resource cover fit contain\n",
         )
         .unwrap();
-        assert_eq!(find_node(&document.ir.root, "artwork").unwrap().layout.unwrap().image_fit, neon_ui_schema::UiImageFit::Cover);
-        assert_eq!(find_node(&document.ir.root, "logo").unwrap().layout.unwrap().image_fit, neon_ui_schema::UiImageFit::Contain);
-        assert!(format_nui_flow(&document.source).unwrap().contains("fit cover"));
+        assert_eq!(
+            find_node(&document.ir.root, "artwork")
+                .unwrap()
+                .layout
+                .unwrap()
+                .image_fit,
+            neon_ui_schema::UiImageFit::Cover
+        );
+        assert_eq!(
+            find_node(&document.ir.root, "logo")
+                .unwrap()
+                .layout
+                .unwrap()
+                .image_fit,
+            neon_ui_schema::UiImageFit::Contain
+        );
+        assert!(
+            format_nui_flow(&document.source)
+                .unwrap()
+                .contains("fit cover")
+        );
         let error = parse_nui_flow("surface root\n  panel card fit cover\n").unwrap_err();
         assert_eq!(error.diagnostics[0].code, "nui_flow_invalid_image_fit");
     }
@@ -7207,9 +8168,16 @@ panel workspace row gap 8
         assert_eq!(document.ir.skins.len(), 1);
         assert_eq!(document.ir.skin_references["play"], "pulse");
         let effects = lower_nui_flow_effects(&document);
-        assert!(effects.iter().any(|effect| matches!(effect, UiEffect::ControlSkin { skin } if skin.key == "pulse")));
+        assert!(
+            effects.iter().any(
+                |effect| matches!(effect, UiEffect::ControlSkin { skin } if skin.key == "pulse")
+            )
+        );
         assert!(effects.iter().any(|effect| matches!(effect, UiEffect::SkinReference { node_id, skin_key } if node_id.0 == "play" && skin_key == "pulse")));
-        assert_eq!(format_nui_flow(source).unwrap(), format_nui_flow(&format_nui_flow(source).unwrap()).unwrap());
+        assert_eq!(
+            format_nui_flow(source).unwrap(),
+            format_nui_flow(&format_nui_flow(source).unwrap()).unwrap()
+        );
     }
 
     #[test]
@@ -7758,23 +8726,27 @@ panel workspace row gap 8
         assert!(document.motions.iter().any(|motion| {
             motion.key == "transform-enter"
                 && motion.transition.from.transform.is_some_and(|transform| {
-                        transform.translation == [120.0, -24.0]
-                            && transform.scale == [0.72, 0.72]
-                            && transform.rotation_degrees == -12.0
-                            && transform.origin == [0.0, 0.0]
+                    transform.translation == [120.0, -24.0]
+                        && transform.scale == [0.72, 0.72]
+                        && transform.rotation_degrees == -12.0
+                        && transform.origin == [0.0, 0.0]
                 })
         }));
-        assert!(document
-            .input_schema
-            .slots
-            .iter()
-            .any(|slot| slot.key == "fill_progress"));
-        assert!(document
-            .motions
-            .iter()
-            .any(|motion| motion.key == "delayed-reveal"
-                && motion.transition.delay_ms == 90
-                && motion.transition.from.opacity == Some(0.0)));
+        assert!(
+            document
+                .input_schema
+                .slots
+                .iter()
+                .any(|slot| slot.key == "fill_progress")
+        );
+        assert!(
+            document
+                .motions
+                .iter()
+                .any(|motion| motion.key == "delayed-reveal"
+                    && motion.transition.delay_ms == 90
+                    && motion.transition.from.opacity == Some(0.0))
+        );
         let panel_a = document
             .state_machines
             .iter()
@@ -7910,10 +8882,13 @@ panel workspace row gap 8
                 .and_then(|transition| transition.motion_key.as_deref()),
             Some("transform-enter")
         );
-        assert!(document.ir.events.iter().any(|event| {
-            event.node_key == "btn-a-toggle" && event.intent == "anim.a.toggle"
-        }));
-        let formatted = format_nui_flow(&source).expect("showcase formatter must accept the catalog");
+        assert!(
+            document.ir.events.iter().any(|event| {
+                event.node_key == "btn-a-toggle" && event.intent == "anim.a.toggle"
+            })
+        );
+        let formatted =
+            format_nui_flow(&source).expect("showcase formatter must accept the catalog");
         assert!(formatted.contains("delay 90 from bounds 840 760 80 40 opacity 0"));
         assert!(formatted.contains("transform 32 8 1.12 1.12 9 origin 0 0"));
         assert!(formatted.contains("on panel-a anim.a.toggle from compact -> expanded"));
@@ -8069,7 +9044,10 @@ panel workspace row gap 8
         assert_eq!(material.package_id, "pulse-glass");
         assert_eq!(material.overflow, [24.0, 8.0, 24.0, 16.0]);
         assert_eq!(
-            material.parameters.get("rim_strength").and_then(|v| v.as_f64()),
+            material
+                .parameters
+                .get("rim_strength")
+                .and_then(|v| v.as_f64()),
             Some(0.22)
         );
         assert!(lower_nui_flow_effects(&document).iter().any(|effect| {
@@ -8113,26 +9091,33 @@ panel workspace row gap 8
             "shader pulse-neon-text version 1 fallback standard_text\nsurface root w 400 h 300\n  text title x 10 y 20\n    text_material pulse-neon-text overflow 8 6 8 6 parameter strength 1.25 duration 2000\n",
         )
         .expect("format must succeed");
-        assert!(formatted.contains("text_material pulse-neon-text"), "{formatted}");
+        assert!(
+            formatted.contains("text_material pulse-neon-text"),
+            "{formatted}"
+        );
         assert!(formatted.contains("duration 2000"), "{formatted}");
         // duration out of range is rejected
         let rejected = parse_nui_flow(
             "shader pulse-neon-text version 1 fallback standard_text\nsurface root w 400 h 300\n  text title x 10 y 20\n    text_material pulse-neon-text duration 999999\n",
         )
         .unwrap_err();
-        assert_eq!(rejected.diagnostics[0].code, "nui_flow_invalid_text_material");
+        assert_eq!(
+            rejected.diagnostics[0].code,
+            "nui_flow_invalid_text_material"
+        );
     }
 
     fn geometry_and_material_reject_invalid_declarations() {
-        let geometry_error = parse_nui_flow(
-            "surface root\n  panel hero w 100 h 50\n    geometry skew 10\n",
-        )
-        .unwrap_err();
-        assert_eq!(geometry_error.diagnostics[0].code, "nui_flow_invalid_geometry");
-        let missing_material_key = parse_nui_flow(
-            "surface root\n  panel hero w 100 h 50\n    material pulse-glass\n",
-        )
-        .unwrap_err();
+        let geometry_error =
+            parse_nui_flow("surface root\n  panel hero w 100 h 50\n    geometry skew 10\n")
+                .unwrap_err();
+        assert_eq!(
+            geometry_error.diagnostics[0].code,
+            "nui_flow_invalid_geometry"
+        );
+        let missing_material_key =
+            parse_nui_flow("surface root\n  panel hero w 100 h 50\n    material pulse-glass\n")
+                .unwrap_err();
         assert_eq!(
             missing_material_key.diagnostics[0].code,
             "nui_flow_unknown_shader"
@@ -8141,10 +9126,9 @@ panel workspace row gap 8
 
     #[test]
     fn vec2_input_parses_default_value() {
-        let document = parse_nui_flow(
-            "surface root w 100 h 100\ninput offset vec2 default 10.5,-20.0\n",
-        )
-        .expect("vec2 input must parse");
+        let document =
+            parse_nui_flow("surface root w 100 h 100\ninput offset vec2 default 10.5,-20.0\n")
+                .expect("vec2 input must parse");
         let slot = document
             .input_schema
             .slots
@@ -8162,10 +9146,9 @@ panel workspace row gap 8
 
     #[test]
     fn vec4_input_parses_default_value() {
-        let document = parse_nui_flow(
-            "surface root w 100 h 100\ninput quat vec4 default 0.0,0.0,0.0,1.0\n",
-        )
-        .expect("vec4 input must parse");
+        let document =
+            parse_nui_flow("surface root w 100 h 100\ninput quat vec4 default 0.0,0.0,0.0,1.0\n")
+                .expect("vec4 input must parse");
         let slot = document
             .input_schema
             .slots
@@ -8183,10 +9166,9 @@ panel workspace row gap 8
 
     #[test]
     fn color_input_parses_default_value() {
-        let document = parse_nui_flow(
-            "surface root w 100 h 100\ninput tint color default 1.0,0.5,0.0,0.8\n",
-        )
-        .expect("color input must parse");
+        let document =
+            parse_nui_flow("surface root w 100 h 100\ninput tint color default 1.0,0.5,0.0,0.8\n")
+                .expect("color input must parse");
         let slot = document
             .input_schema
             .slots
@@ -8204,19 +9186,17 @@ panel workspace row gap 8
 
     #[test]
     fn vec2_input_rejects_wrong_component_count() {
-        let error = parse_nui_flow(
-            "surface root w 100 h 100\ninput bad vec2 default 1.0,2.0,3.0\n",
-        )
-        .unwrap_err();
+        let error =
+            parse_nui_flow("surface root w 100 h 100\ninput bad vec2 default 1.0,2.0,3.0\n")
+                .unwrap_err();
         assert_eq!(error.diagnostics[0].code, "nui_flow_invalid_literal");
     }
 
     #[test]
     fn color_input_rejects_out_of_range() {
-        let error = parse_nui_flow(
-            "surface root w 100 h 100\ninput bad color default 1.5,0.0,0.0,1.0\n",
-        )
-        .unwrap_err();
+        let error =
+            parse_nui_flow("surface root w 100 h 100\ninput bad color default 1.5,0.0,0.0,1.0\n")
+                .unwrap_err();
         assert_eq!(error.diagnostics[0].code, "nui_flow_invalid_literal");
     }
 
@@ -8235,16 +9215,31 @@ panel workspace row gap 8
         match &slot.kind {
             neon_ui_schema::UiInputKind::Struct { fields } => {
                 assert_eq!(fields.len(), 3);
-                assert!(matches!(fields.get("hp"), Some(neon_ui_schema::UiInputKind::F32)));
-                assert!(matches!(fields.get("level"), Some(neon_ui_schema::UiInputKind::U32)));
-                assert!(matches!(fields.get("name"), Some(neon_ui_schema::UiInputKind::TextHandle)));
+                assert!(matches!(
+                    fields.get("hp"),
+                    Some(neon_ui_schema::UiInputKind::F32)
+                ));
+                assert!(matches!(
+                    fields.get("level"),
+                    Some(neon_ui_schema::UiInputKind::U32)
+                ));
+                assert!(matches!(
+                    fields.get("name"),
+                    Some(neon_ui_schema::UiInputKind::TextHandle)
+                ));
             }
             _ => panic!("expected Struct kind"),
         }
         match &slot.default_value {
             neon_ui_schema::UiInputValue::Struct { fields } => {
-                assert_eq!(fields.get("hp"), Some(&neon_ui_schema::UiInputValue::F32 { value: 0.8 }));
-                assert_eq!(fields.get("level"), Some(&neon_ui_schema::UiInputValue::U32 { value: 5 }));
+                assert_eq!(
+                    fields.get("hp"),
+                    Some(&neon_ui_schema::UiInputValue::F32 { value: 0.8 })
+                );
+                assert_eq!(
+                    fields.get("level"),
+                    Some(&neon_ui_schema::UiInputValue::U32 { value: 5 })
+                );
             }
             _ => panic!("expected Struct value"),
         }
@@ -8256,11 +9251,22 @@ panel workspace row gap 8
             "surface root w 100 h 100\ninput cfg struct {\n  enabled bool\n  ratio f32\n}\n",
         )
         .expect("struct with implicit defaults must parse");
-        let slot = document.input_schema.slots.iter().find(|s| s.key == "cfg").unwrap();
+        let slot = document
+            .input_schema
+            .slots
+            .iter()
+            .find(|s| s.key == "cfg")
+            .unwrap();
         match &slot.default_value {
             neon_ui_schema::UiInputValue::Struct { fields } => {
-                assert_eq!(fields.get("enabled"), Some(&neon_ui_schema::UiInputValue::Bool { value: false }));
-                assert_eq!(fields.get("ratio"), Some(&neon_ui_schema::UiInputValue::F32 { value: 0.0 }));
+                assert_eq!(
+                    fields.get("enabled"),
+                    Some(&neon_ui_schema::UiInputValue::Bool { value: false })
+                );
+                assert_eq!(
+                    fields.get("ratio"),
+                    Some(&neon_ui_schema::UiInputValue::F32 { value: 0.0 })
+                );
             }
             _ => panic!("expected Struct value"),
         }
@@ -8268,10 +9274,9 @@ panel workspace row gap 8
 
     #[test]
     fn struct_input_rejects_duplicate_fields() {
-        let error = parse_nui_flow(
-            "surface root w 100 h 100\ninput s struct {\n  x f32\n  x f32\n}\n",
-        )
-        .unwrap_err();
+        let error =
+            parse_nui_flow("surface root w 100 h 100\ninput s struct {\n  x f32\n  x f32\n}\n")
+                .unwrap_err();
         assert_eq!(error.diagnostics[0].code, "nui_flow_duplicate_struct_field");
     }
 
@@ -8283,11 +9288,21 @@ panel workspace row gap 8
         .expect("struct field binding must parse");
         let bindings = &document.ir.bindings;
         assert_eq!(bindings.len(), 2);
-        assert!(bindings.iter().any(|b| b.input_key == "player.hp" && b.property == UiBoundProperty::NumericValue));
-        assert!(bindings.iter().any(|b| b.input_key == "player.name" && b.property == UiBoundProperty::TextValue));
-        let hp_kind = resolve_binding_kind(&document.input_schema, "player.hp").expect("hp kind must resolve");
+        assert!(
+            bindings
+                .iter()
+                .any(|b| b.input_key == "player.hp" && b.property == UiBoundProperty::NumericValue)
+        );
+        assert!(
+            bindings
+                .iter()
+                .any(|b| b.input_key == "player.name" && b.property == UiBoundProperty::TextValue)
+        );
+        let hp_kind = resolve_binding_kind(&document.input_schema, "player.hp")
+            .expect("hp kind must resolve");
         assert!(matches!(hp_kind, neon_ui_schema::UiInputKind::F32));
-        let name_kind = resolve_binding_kind(&document.input_schema, "player.name").expect("name kind must resolve");
+        let name_kind = resolve_binding_kind(&document.input_schema, "player.name")
+            .expect("name kind must resolve");
         assert!(matches!(name_kind, neon_ui_schema::UiInputKind::TextHandle));
     }
 
@@ -8297,7 +9312,10 @@ panel workspace row gap 8
             "input player struct {\n  hp f32\n}\nsurface root w 100 h 100\n  text label value $player.nonexistent w 50 h 20\n",
         )
         .unwrap_err();
-        assert_eq!(error.diagnostics[0].code, "ui_program_unknown_binding_target");
+        assert_eq!(
+            error.diagnostics[0].code,
+            "ui_program_unknown_binding_target"
+        );
     }
 
     #[test]
@@ -8311,10 +9329,8 @@ panel workspace row gap 8
 
     #[test]
     fn array_input_parses_scalar_element_type() {
-        let document = parse_nui_flow(
-            "surface root w 100 h 100\ninput scores array[5] f32\n",
-        )
-        .expect("array input must parse");
+        let document = parse_nui_flow("surface root w 100 h 100\ninput scores array[5] f32\n")
+            .expect("array input must parse");
         let slot = document
             .input_schema
             .slots
@@ -8322,16 +9338,26 @@ panel workspace row gap 8
             .find(|s| s.key == "scores")
             .expect("scores slot must exist");
         match &slot.kind {
-            neon_ui_schema::UiInputKind::Array { element_kind, length } => {
+            neon_ui_schema::UiInputKind::Array {
+                element_kind,
+                length,
+            } => {
                 assert_eq!(*length, 5);
-                assert!(matches!(element_kind.as_ref(), neon_ui_schema::UiInputKind::F32));
+                assert!(matches!(
+                    element_kind.as_ref(),
+                    neon_ui_schema::UiInputKind::F32
+                ));
             }
             _ => panic!("expected Array kind"),
         }
         match &slot.default_value {
             neon_ui_schema::UiInputValue::Array { elements, .. } => {
                 assert_eq!(elements.len(), 5);
-                assert!(elements.iter().all(|e| matches!(e, neon_ui_schema::UiInputValue::F32 { value: 0.0 })));
+                assert!(
+                    elements
+                        .iter()
+                        .all(|e| matches!(e, neon_ui_schema::UiInputValue::F32 { value: 0.0 }))
+                );
             }
             _ => panic!("expected Array value"),
         }
@@ -8339,24 +9365,29 @@ panel workspace row gap 8
 
     #[test]
     fn array_input_rejects_zero_length() {
-        let error = parse_nui_flow(
-            "surface root w 100 h 100\ninput bad array[0] f32\n",
-        )
-        .unwrap_err();
+        let error =
+            parse_nui_flow("surface root w 100 h 100\ninput bad array[0] f32\n").unwrap_err();
         assert_eq!(error.diagnostics[0].code, "nui_flow_invalid_input");
     }
 
     #[test]
     fn array_of_u32_parses_and_defaults_to_zero() {
-        let document = parse_nui_flow(
-            "surface root w 100 h 100\ninput counts array[3] u32\n",
-        )
-        .expect("array of u32 must parse");
-        let slot = document.input_schema.slots.iter().find(|s| s.key == "counts").unwrap();
+        let document = parse_nui_flow("surface root w 100 h 100\ninput counts array[3] u32\n")
+            .expect("array of u32 must parse");
+        let slot = document
+            .input_schema
+            .slots
+            .iter()
+            .find(|s| s.key == "counts")
+            .unwrap();
         match &slot.default_value {
             neon_ui_schema::UiInputValue::Array { elements, .. } => {
                 assert_eq!(elements.len(), 3);
-                assert!(elements.iter().all(|e| matches!(e, neon_ui_schema::UiInputValue::U32 { value: 0 })));
+                assert!(
+                    elements
+                        .iter()
+                        .all(|e| matches!(e, neon_ui_schema::UiInputValue::U32 { value: 0 }))
+                );
             }
             _ => panic!("expected Array value"),
         }
@@ -8369,8 +9400,13 @@ panel workspace row gap 8
         )
         .expect("array index binding must parse");
         let bindings = &document.ir.bindings;
-        assert!(bindings.iter().any(|b| b.input_key == "scores[1]" && b.property == UiBoundProperty::NumericValue));
-        let kind = resolve_binding_kind(&document.input_schema, "scores[1]").expect("kind must resolve");
+        assert!(
+            bindings
+                .iter()
+                .any(|b| b.input_key == "scores[1]" && b.property == UiBoundProperty::NumericValue)
+        );
+        let kind =
+            resolve_binding_kind(&document.input_schema, "scores[1]").expect("kind must resolve");
         assert!(matches!(kind, neon_ui_schema::UiInputKind::F32));
     }
 
@@ -8392,7 +9428,10 @@ panel workspace row gap 8
             "surface root w 100 h 100\ninput hp f32 default 1.0\n  slider s numeric $hp[0] w 50 h 20\n",
         )
         .unwrap_err();
-        assert_eq!(error.diagnostics[0].code, "ui_program_unknown_binding_target");
+        assert_eq!(
+            error.diagnostics[0].code,
+            "ui_program_unknown_binding_target"
+        );
     }
 
     #[test]
@@ -8401,7 +9440,12 @@ panel workspace row gap 8
             "surface root w 100 h 100\ninput hp f32 default 0.8\ninput low_hp bool = $hp < 0.3\n  panel p visible $low_hp w 50 h 50\n",
         )
         .expect("derived expression must parse");
-        let slot = document.input_schema.slots.iter().find(|s| s.key == "low_hp").expect("low_hp slot");
+        let slot = document
+            .input_schema
+            .slots
+            .iter()
+            .find(|s| s.key == "low_hp")
+            .expect("low_hp slot");
         assert_eq!(slot.derived_expression.as_deref(), Some("$hp < 0.3"));
         assert!(matches!(slot.kind, neon_ui_schema::UiInputKind::Bool));
     }
@@ -8424,24 +9468,41 @@ panel workspace row gap 8
         assert_eq!(error.diagnostics[0].code, "nui_flow_invalid_input");
     }
 
-
     #[test]
     fn grid_pulse_case_parses_all_array_bindings_and_derived() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../cases/grid-pulse/grid-pulse.nui");
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../cases/grid-pulse/grid-pulse.nui"
+        );
         let source = std::fs::read_to_string(path).expect("grid-pulse.nui must exist");
         let document = parse_nui_flow(&source).expect("grid-pulse case must parse");
         // 1 array input + 36 derived bool inputs = 37 inputs
         assert_eq!(document.input_schema.slots.len(), 37);
-        let grid = document.input_schema.slots.iter().find(|s| s.key == "grid").unwrap();
+        let grid = document
+            .input_schema
+            .slots
+            .iter()
+            .find(|s| s.key == "grid")
+            .unwrap();
         match &grid.kind {
             neon_ui_schema::UiInputKind::Array { length, .. } => assert_eq!(*length, 36),
             _ => panic!("grid must be Array"),
         }
         // 36 derived expressions
-        let derived_count = document.input_schema.slots.iter().filter(|s| s.derived_expression.is_some()).count();
+        let derived_count = document
+            .input_schema
+            .slots
+            .iter()
+            .filter(|s| s.derived_expression.is_some())
+            .count();
         assert_eq!(derived_count, 36);
         // 36 cell visible bindings
-        let visible_bindings = document.ir.bindings.iter().filter(|b| b.property == neon_ui_schema::UiBoundProperty::Visible).count();
+        let visible_bindings = document
+            .ir
+            .bindings
+            .iter()
+            .filter(|b| b.property == neon_ui_schema::UiBoundProperty::Visible)
+            .count();
         assert_eq!(visible_bindings, 36, "expected 36 cell visible bindings");
     }
 
@@ -8451,7 +9512,12 @@ panel workspace row gap 8
             "surface root w 100 h 100\n  panel box x 0 y 0 w 50 h 50 opacity $alpha\ninput alpha f32 default 0.5\n",
         )
         .expect("opacity binding should parse");
-        let binding = document.ir.bindings.iter().find(|b| b.property == neon_ui_schema::UiBoundProperty::Opacity).unwrap();
+        let binding = document
+            .ir
+            .bindings
+            .iter()
+            .find(|b| b.property == neon_ui_schema::UiBoundProperty::Opacity)
+            .unwrap();
         assert_eq!(binding.input_key, "alpha");
         assert_eq!(binding.node_key, "box");
     }
@@ -8462,7 +9528,12 @@ panel workspace row gap 8
             "surface root w 100 h 100\n  image icon x 0 y 0 w 32 h 32 resource $tex\ninput tex asset_handle default asset:empty\n",
         )
         .expect("image resource binding should parse");
-        let binding = document.ir.bindings.iter().find(|b| b.property == neon_ui_schema::UiBoundProperty::ImageAsset).unwrap();
+        let binding = document
+            .ir
+            .bindings
+            .iter()
+            .find(|b| b.property == neon_ui_schema::UiBoundProperty::ImageAsset)
+            .unwrap();
         assert_eq!(binding.input_key, "tex");
         assert_eq!(binding.node_key, "icon");
     }
@@ -8474,7 +9545,12 @@ panel workspace row gap 8
             "surface root w 100 h 100\n  panel area x 0 y 0 w 80 h 80 scroll_offset $offset\ninput offset vec2 default 0,0\n",
         )
         .expect("scroll_offset binding with vec2 should parse");
-        let binding = document.ir.bindings.iter().find(|b| b.property == neon_ui_schema::UiBoundProperty::ScrollOffset).unwrap();
+        let binding = document
+            .ir
+            .bindings
+            .iter()
+            .find(|b| b.property == neon_ui_schema::UiBoundProperty::ScrollOffset)
+            .unwrap();
         assert_eq!(binding.input_key, "offset");
 
         // Invalid: f32 input (scroll_offset requires vec2)
@@ -8482,7 +9558,11 @@ panel workspace row gap 8
             "surface root w 100 h 100\n  panel area x 0 y 0 w 80 h 80 scroll_offset $offset\ninput offset f32 default 0\n",
         )
         .unwrap_err();
-        assert!(err.diagnostics.iter().any(|d| d.code == "ui_program_input_type_mismatch"));
+        assert!(
+            err.diagnostics
+                .iter()
+                .any(|d| d.code == "ui_program_input_type_mismatch")
+        );
     }
 
     #[test]
@@ -8490,24 +9570,51 @@ panel workspace row gap 8
         let source = "surface root w 100 h 100\n  panel box x 0 y 0 w 50 h 50 opacity $alpha\n  image icon x 60 y 0 w 32 h 32 resource $tex\ninput alpha f32 default 0.5\ninput tex asset_handle default asset:empty\n";
         let serialized = format_nui_flow(source).expect("should format");
         // opacity and resource bindings should appear in serialized output
-        assert!(serialized.contains("opacity $alpha"), "serialized should contain opacity binding");
-        assert!(serialized.contains("resource $tex"), "serialized should contain resource binding");
+        assert!(
+            serialized.contains("opacity $alpha"),
+            "serialized should contain opacity binding"
+        );
+        assert!(
+            serialized.contains("resource $tex"),
+            "serialized should contain resource binding"
+        );
     }
 
     #[test]
     fn scrollable_panel_and_scroll_offset_literal() {
         let source = "surface root w 200 h 200\n  panel scroller x 0 y 0 w 100 h 100 scrollable scroll_offset 10,20\n    text item1 x 0 y 0 w 80 h 20 value \"Item 1\"\n    text item2 x 0 y 30 w 80 h 20 value \"Item 2\"\n";
         let document = parse_nui_flow(source).expect("scrollable panel should parse");
-        let panel = document.ir.root.children.iter().find(|n| n.node_id.0 == "scroller").unwrap();
-        assert_eq!(panel.layout.unwrap().clip, neon_ui_schema::UiClipPolicy::Scroll);
+        let panel = document
+            .ir
+            .root
+            .children
+            .iter()
+            .find(|n| n.node_id.0 == "scroller")
+            .unwrap();
+        assert_eq!(
+            panel.layout.unwrap().clip,
+            neon_ui_schema::UiClipPolicy::Scroll
+        );
         assert_eq!(panel.layout.unwrap().scroll_offset, [10.0, 20.0]);
 
         // Serialize round-trip
         let serialized = format_nui_flow(source).expect("should format");
-        assert!(serialized.contains("clip scroll"), "serialized should contain clip scroll");
-        assert!(serialized.contains("scroll_offset 10,20"), "serialized should contain scroll_offset literal");
+        assert!(
+            serialized.contains("clip scroll"),
+            "serialized should contain clip scroll"
+        );
+        assert!(
+            serialized.contains("scroll_offset 10,20"),
+            "serialized should contain scroll_offset literal"
+        );
         let reparsed = parse_nui_flow(&serialized).expect("reparsed should succeed");
-        let panel2 = reparsed.ir.root.children.iter().find(|n| n.node_id.0 == "scroller").unwrap();
+        let panel2 = reparsed
+            .ir
+            .root
+            .children
+            .iter()
+            .find(|n| n.node_id.0 == "scroller")
+            .unwrap();
         assert_eq!(panel2.layout.unwrap().scroll_offset, [10.0, 20.0]);
     }
 
@@ -8515,9 +9622,30 @@ panel workspace row gap 8
     fn new_component_kinds_parse_and_round_trip() {
         let source = "surface root w 800 h 600\n  splitter hsplit x 200 y 0 w 4 h 600\n  context_menu menu x 400 y 300 w 160 h 120\n    text item1 x 8 y 8 w 144 h 24 value \"Copy\"\n    text item2 x 8 y 36 w 144 h 24 value \"Paste\"\n    text item3 x 8 y 64 w 144 h 24 value \"Delete\"\n  tree_view tree x 20 y 20 w 300 h 400\n    text tree-root x 8 y 8 w 284 h 24 value \"project/\"\n    text tree-child1 x 24 y 36 w 268 h 24 value \"crates/\"\n    text tree-child2 x 40 y 64 w 252 h 24 value \"neon-ui-schema\"\n";
         let document = parse_nui_flow(source).expect("new components should parse");
-        assert!(document.ir.root.children.iter().any(|n| n.node_id.0 == "hsplit" && n.kind == UiNodeKind::Splitter));
-        assert!(document.ir.root.children.iter().any(|n| n.node_id.0 == "menu" && n.kind == UiNodeKind::ContextMenu));
-        assert!(document.ir.root.children.iter().any(|n| n.node_id.0 == "tree" && n.kind == UiNodeKind::TreeView));
+        assert!(
+            document
+                .ir
+                .root
+                .children
+                .iter()
+                .any(|n| n.node_id.0 == "hsplit" && n.kind == UiNodeKind::Splitter)
+        );
+        assert!(
+            document
+                .ir
+                .root
+                .children
+                .iter()
+                .any(|n| n.node_id.0 == "menu" && n.kind == UiNodeKind::ContextMenu)
+        );
+        assert!(
+            document
+                .ir
+                .root
+                .children
+                .iter()
+                .any(|n| n.node_id.0 == "tree" && n.kind == UiNodeKind::TreeView)
+        );
         let formatted = format_nui_flow(source).unwrap();
         assert!(formatted.contains("splitter hsplit"));
         assert!(formatted.contains("context_menu menu"));
@@ -8559,16 +9687,22 @@ panel workspace row gap 8
     fn timeline_motion_rejects_non_monotonic_or_out_of_range_keyframes() {
         let source = "version 1\nmotion pulse duration 300 easing linear\nkeyframe pulse 200 opacity 0\nkeyframe pulse 100 opacity 1\nsurface root w 10 h 10\n";
         let error = parse_nui_flow(source).expect_err("non-monotonic keyframes must be rejected");
-        assert!(error
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.code == "nui_flow_invalid_timeline"), "diagnostics: {:?}", error.diagnostics);
+        assert!(
+            error
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "nui_flow_invalid_timeline"),
+            "diagnostics: {:?}",
+            error.diagnostics
+        );
 
         let source = "version 1\nmotion pulse duration 300 easing linear\nkeyframe pulse 0 opacity 0\nkeyframe pulse 301 opacity 1\nsurface root w 10 h 10\n";
         let error = parse_nui_flow(source).expect_err("out-of-range keyframes must be rejected");
-        assert!(error
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.code == "nui_flow_invalid_timeline"));
+        assert!(
+            error
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "nui_flow_invalid_timeline")
+        );
     }
 }

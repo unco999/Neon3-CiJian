@@ -14,15 +14,15 @@
 use std::collections::HashMap;
 
 use neon_ui_schema::{
-    UiCodeEditorDeclaration, UiCodeEditorPresentation, UiEditorCompletionItem,
-    UiEditorEditFx, UiEditorInputEvent, UiEditorKeyKind, UiNodeKind,
+    UiCodeEditorDeclaration, UiCodeEditorPresentation, UiEditorCompletionItem, UiEditorEditFx,
+    UiEditorInputEvent, UiEditorKeyKind, UiNodeKind,
 };
 use winit::keyboard::{Key, NamedKey};
 
 use super::editor_theme::{EditorTheme, editor_theme_from};
 use super::{
-    ResidentFont, UiBounds, UiFragment, UiTextInstance, color_pass_depth, contains,
-    ensure_glyph, overlay_instance,
+    ResidentFont, UiBounds, UiFragment, UiTextInstance, color_pass_depth, contains, ensure_glyph,
+    overlay_instance,
 };
 
 /// How many completion items the popup shows before scrolling internally.
@@ -110,7 +110,11 @@ impl EditorRuntimeState {
         declaration: UiCodeEditorDeclaration,
         presentation: UiCodeEditorPresentation,
     ) -> Self {
-        let lines: Vec<String> = presentation.source.split('\n').map(str::to_string).collect();
+        let lines: Vec<String> = presentation
+            .source
+            .split('\n')
+            .map(str::to_string)
+            .collect();
         let mut token_spans: Vec<Vec<SpanRef>> = Vec::with_capacity(presentation.token_rows.len());
         for row in &presentation.token_rows {
             let spans: Vec<SpanRef> = row
@@ -302,7 +306,10 @@ fn kind_prefix(kind: &str) -> &'static str {
 }
 
 /// Ordered selection endpoints from `anchor` + `caret`.
-fn ordered_selection(anchor: EditorPosition, caret: EditorPosition) -> (EditorPosition, EditorPosition) {
+fn ordered_selection(
+    anchor: EditorPosition,
+    caret: EditorPosition,
+) -> (EditorPosition, EditorPosition) {
     if anchor <= caret {
         (anchor, caret)
     } else {
@@ -435,8 +442,7 @@ impl super::UiWgpuRenderer {
 
             // 1) Current-line highlight (focused editors only).
             if state.focus {
-                let row_y =
-                    visual.bounds.y + state.caret.line as f32 * row_height - state.scroll_y;
+                let row_y = visual.bounds.y + state.caret.line as f32 * row_height - state.scroll_y;
                 if row_y + row_height >= visual.bounds.y
                     && row_y <= visual.bounds.y + visual.bounds.height
                 {
@@ -471,9 +477,8 @@ impl super::UiWgpuRenderer {
                     {
                         continue;
                     }
-                    let x_from =
-                        content_x + line_prefix_advance(font, line_text, from, raster_px)
-                            - state.scroll_x;
+                    let x_from = content_x + line_prefix_advance(font, line_text, from, raster_px)
+                        - state.scroll_x;
                     let x_to = content_x + line_prefix_advance(font, line_text, to, raster_px)
                         - state.scroll_x;
                     let rect_x = x_from.min(x_to);
@@ -500,9 +505,9 @@ impl super::UiWgpuRenderer {
                 {
                     continue;
                 }
-                let baseline =
-                    (row_y + editor_line_metrics(font, declaration, state.font_scale).ascent)
-                        .floor();
+                let baseline = (row_y
+                    + editor_line_metrics(font, declaration, state.font_scale).ascent)
+                    .floor();
 
                 // Line-number gutter.
                 if declaration.line_numbers {
@@ -546,11 +551,10 @@ impl super::UiWgpuRenderer {
                 let mut column = 0u32;
                 let mut x = content_x - state.scroll_x;
                 for ch in line_text.chars() {
-                    let color = class_at(state, row, column)
-                        .map_or_else(
-                            || rgba(theme.text, opacity),
-                            |class| theme.token(class, opacity),
-                        );
+                    let color = class_at(state, row, column).map_or_else(
+                        || rgba(theme.text, opacity),
+                        |class| theme.token(class, opacity),
+                    );
                     let Ok(glyph) = ensure_glyph(device, queue, font, ch, raster_px) else {
                         continue;
                     };
@@ -692,11 +696,7 @@ impl super::UiWgpuRenderer {
                             None => false,
                         };
                         if in_selection {
-                            state
-                                .declaration
-                                .selection_material
-                                .as_ref()
-                                .or(base)
+                            state.declaration.selection_material.as_ref().or(base)
                         } else {
                             base
                         }
@@ -704,40 +704,30 @@ impl super::UiWgpuRenderer {
                     if let Some(text_material) = class_material {
                         instance.rect[0] -= text_material.overflow[0];
                         instance.rect[1] -= text_material.overflow[1];
-                        instance.rect[2] +=
-                            text_material.overflow[0] + text_material.overflow[2];
-                        instance.rect[3] +=
-                            text_material.overflow[1] + text_material.overflow[3];
+                        instance.rect[2] += text_material.overflow[0] + text_material.overflow[2];
+                        instance.rect[3] += text_material.overflow[1] + text_material.overflow[3];
                         instance.clip[0] -= text_material.overflow[0];
                         instance.clip[1] -= text_material.overflow[1];
-                        instance.clip[2] +=
-                            text_material.overflow[0] + text_material.overflow[2];
-                        instance.clip[3] +=
-                            text_material.overflow[1] + text_material.overflow[3];
+                        instance.clip[2] += text_material.overflow[0] + text_material.overflow[2];
+                        instance.clip[3] += text_material.overflow[1] + text_material.overflow[3];
                         instance.overflow = text_material.overflow;
                         match token_material_batches
                             .iter_mut()
                             .find(|(package, _)| *package == text_material.package_id)
                         {
                             Some((_, instances)) => instances.push(instance),
-                            None => token_material_batches.push((
-                                text_material.package_id.clone(),
-                                vec![instance],
-                            )),
+                            None => token_material_batches
+                                .push((text_material.package_id.clone(), vec![instance])),
                         }
                     } else if let Some(text_material) = &editor_material {
                         instance.rect[0] -= text_material.overflow[0];
                         instance.rect[1] -= text_material.overflow[1];
-                        instance.rect[2] +=
-                            text_material.overflow[0] + text_material.overflow[2];
-                        instance.rect[3] +=
-                            text_material.overflow[1] + text_material.overflow[3];
+                        instance.rect[2] += text_material.overflow[0] + text_material.overflow[2];
+                        instance.rect[3] += text_material.overflow[1] + text_material.overflow[3];
                         instance.clip[0] -= text_material.overflow[0];
                         instance.clip[1] -= text_material.overflow[1];
-                        instance.clip[2] +=
-                            text_material.overflow[0] + text_material.overflow[2];
-                        instance.clip[3] +=
-                            text_material.overflow[1] + text_material.overflow[3];
+                        instance.clip[2] += text_material.overflow[0] + text_material.overflow[2];
+                        instance.clip[3] += text_material.overflow[1] + text_material.overflow[3];
                         instance.overflow = text_material.overflow;
                         editor_material_instances.push(instance);
                     } else {
@@ -785,19 +775,16 @@ impl super::UiWgpuRenderer {
             // the whole-node material (line numbers are intentionally
             // excluded above; only token-colored code glyphs route to
             // shaders).
-            output
-                .editor_text_materials
-                .extend(fx_batches.into_iter());
+            output.editor_text_materials.extend(fx_batches.into_iter());
             output
                 .editor_text_materials
                 .append(&mut token_material_batches);
             if !editor_material_instances.is_empty()
                 && let Some(text_material) = &editor_material
             {
-                output.editor_text_materials.push((
-                    text_material.package_id.clone(),
-                    editor_material_instances,
-                ));
+                output
+                    .editor_text_materials
+                    .push((text_material.package_id.clone(), editor_material_instances));
             }
 
             // 4) Caret (focused editors; blink unless recently edited or a
@@ -900,8 +887,7 @@ impl super::UiWgpuRenderer {
                             + editor_line_metrics(font, declaration, state.font_scale).ascent)
                             .floor();
                         for ch in kind_prefix(&item.kind).chars() {
-                            let Ok(glyph) = ensure_glyph(device, queue, font, ch, raster_px)
-                            else {
+                            let Ok(glyph) = ensure_glyph(device, queue, font, ch, raster_px) else {
                                 continue;
                             };
                             output.editor_popup_texts.push(UiTextInstance {
@@ -931,8 +917,7 @@ impl super::UiWgpuRenderer {
                         }
                         ix += 6.0;
                         for ch in item.label.chars() {
-                            let Ok(glyph) = ensure_glyph(device, queue, font, ch, raster_px)
-                            else {
+                            let Ok(glyph) = ensure_glyph(device, queue, font, ch, raster_px) else {
                                 continue;
                             };
                             output.editor_popup_texts.push(UiTextInstance {
@@ -995,7 +980,10 @@ impl super::UiWgpuRenderer {
                             pres_map.insert(key.clone(), presentation.clone());
                         }
                     }
-                    neon_ui_schema::UiEffect::CodeEditorDeclaration { node_key, declaration } => {
+                    neon_ui_schema::UiEffect::CodeEditorDeclaration {
+                        node_key,
+                        declaration,
+                    } => {
                         declarations.insert(node_key.clone(), declaration.clone());
                     }
                     _ => {}
@@ -1056,11 +1044,7 @@ impl super::UiWgpuRenderer {
     /// Attaches the ui-runtime input sink (host bridge).
     pub(crate) fn set_editor_input_sink(
         &mut self,
-        sink: Box<
-            dyn FnMut(neon_ui_schema::UiEditorInputEvent, f32)
-                -> Vec<EditorCommit>
-                + Send,
-        >,
+        sink: Box<dyn FnMut(neon_ui_schema::UiEditorInputEvent, f32) -> Vec<EditorCommit> + Send>,
     ) {
         self.editor_input_sink = Some(sink);
     }
@@ -1099,8 +1083,11 @@ impl super::UiWgpuRenderer {
         let font = self.resident_font.as_ref()?;
         let raster_px = editor_px(&state.declaration, state.font_scale);
         let row_height = editor_row_height(font, &state.declaration, state.font_scale);
-        let gutter =
-            editor_gutter_width(&state.declaration, state.lines.len() as u32, state.font_scale);
+        let gutter = editor_gutter_width(
+            &state.declaration,
+            state.lines.len() as u32,
+            state.font_scale,
+        );
         let line_text = line_of(state, state.caret.line);
         let x = visual.bounds.x
             + gutter
@@ -1153,8 +1140,11 @@ impl super::UiWgpuRenderer {
         let state = self.editors.get(path)?;
         let visual = &self.sampled[index];
         let row_height = editor_row_height(font, &state.declaration, state.font_scale);
-        let gutter =
-            editor_gutter_width(&state.declaration, state.lines.len() as u32, state.font_scale);
+        let gutter = editor_gutter_width(
+            &state.declaration,
+            state.lines.len() as u32,
+            state.font_scale,
+        );
         let line_count = state.lines.len() as u32;
         let line = if row_height > 0.0 {
             ((pointer[1] - visual.bounds.y + state.scroll_y) / row_height)
@@ -1166,23 +1156,27 @@ impl super::UiWgpuRenderer {
         let line = line.min(line_count.saturating_sub(1));
         let line_text = line_of(state, line);
         let x = pointer[0] - (visual.bounds.x + gutter - state.scroll_x);
-        let column = column_from_x(font, line_text, x, editor_px(&state.declaration, state.font_scale));
+        let column = column_from_x(
+            font,
+            line_text,
+            x,
+            editor_px(&state.declaration, state.font_scale),
+        );
         Some((line, column.min(line_text.chars().count() as u32)))
     }
 
     /// Renderer metrics for a mirrored editor (font-derived), attached to
     /// forwarded key/zoom events so the ui-runtime can scroll without fonts.
-    fn editor_metrics(
-        &self,
-        path: &str,
-        index: usize,
-    ) -> Option<(f32, f32, f32, f32)> {
+    fn editor_metrics(&self, path: &str, index: usize) -> Option<(f32, f32, f32, f32)> {
         let font = self.resident_font.as_ref()?;
         let state = self.editors.get(path)?;
         let visual = &self.sampled[index];
         let row_height = editor_row_height(font, &state.declaration, state.font_scale);
-        let gutter =
-            editor_gutter_width(&state.declaration, state.lines.len() as u32, state.font_scale);
+        let gutter = editor_gutter_width(
+            &state.declaration,
+            state.lines.len() as u32,
+            state.font_scale,
+        );
         Some((
             visual.bounds.height,
             visual.bounds.width,

@@ -7,12 +7,12 @@
 //! (the compaction index), so the instance buffer stays dense and its count
 //! equals the query count in `framePrepBuffer`.
 
+use crate::EcsError;
 use crate::generator::bind_layout;
 use crate::ir::{
     AtomicOpCode, BinaryOpCode, BuiltinFunc, CompareOp, ComponentDef, ComponentType, EcsIr, Instr,
     ResourceDef, SystemDef, UnaryOpCode,
 };
-use crate::EcsError;
 
 /// Everything needed to emit one entry point.
 pub(super) struct EmitCtx<'a> {
@@ -38,7 +38,9 @@ pub(super) fn infer_local_types(
     for (pc, instr) in system.instructions.iter().enumerate() {
         let at = format!("instruction {pc}");
         match instr {
-            Instr::Load { dest, component_id, .. } => {
+            Instr::Load {
+                dest, component_id, ..
+            } => {
                 let comp = component(ir, *component_id, name, &at)?;
                 assign_local(&mut types, *dest, comp.ty.wgsl_local_type(), name, &at)?;
             }
@@ -151,7 +153,7 @@ fn binary_result(
                 _ => {
                     return Err(EcsError::WgslInvalid(format!(
                         "system '{name}': {at} Mul mixes {lhs_ty} and {rhs_ty}"
-                    )))
+                    )));
                 }
             };
             Ok(promoted)
@@ -260,7 +262,10 @@ pub(super) fn emit_system(system: &SystemDef, ctx: &EmitCtx<'_>) -> Result<Strin
     out.push_str(&format!(
         "@compute @workgroup_size(64)\nfn system_{name}(@builtin(global_invocation_id) ecs_gid : vec3u) {{\n"
     ));
-    out.push_str(&format!("    let ecs_cmd = framePrepBuffer[{}u];\n", ctx.slot));
+    out.push_str(&format!(
+        "    let ecs_cmd = framePrepBuffer[{}u];\n",
+        ctx.slot
+    ));
     out.push_str("    let ecs_index = ecs_gid.x;\n");
     out.push_str("    if (ecs_index >= ecs_cmd.count) { return; }\n");
     out.push_str("    let ecs_entity = compactedEntityIds[ecs_cmd.start + ecs_index];\n");
@@ -338,7 +343,11 @@ fn emit_state_machine(
     let mut starts: Vec<usize> = vec![0];
     for (i, instr) in instrs.iter().enumerate() {
         match instr {
-            Instr::If { true_block, false_block, .. } => {
+            Instr::If {
+                true_block,
+                false_block,
+                ..
+            } => {
                 for t in [*true_block as usize, *false_block as usize] {
                     if t < n && !starts.contains(&t) {
                         starts.push(t);
@@ -363,12 +372,20 @@ fn emit_state_machine(
     // instruction of the block range.
     let mut blocks: Vec<Block> = Vec::new();
     for (k, first) in starts.iter().enumerate() {
-        let last_excl = if k + 1 < starts.len() { starts[k + 1] } else { n };
+        let last_excl = if k + 1 < starts.len() {
+            starts[k + 1]
+        } else {
+            n
+        };
         let last_i = last_excl - 1;
         let term = match &instrs[last_i] {
             Instr::Return => Term::Return,
             Instr::Jump { target } => Term::Jump(*target),
-            Instr::If { cond, true_block, false_block } => Term::If {
+            Instr::If {
+                cond,
+                true_block,
+                false_block,
+            } => Term::If {
                 cond: *cond,
                 t: *true_block,
                 f: *false_block,
@@ -382,7 +399,11 @@ fn emit_state_machine(
                 }
             }
         };
-        blocks.push(Block { first: *first, last_excl, term });
+        blocks.push(Block {
+            first: *first,
+            last_excl,
+            term,
+        });
     }
 
     // Map a branch target instruction index to its case number.
@@ -467,7 +488,9 @@ fn indent(text: &str, extra: usize) -> String {
 fn emit_instr(instr: &Instr, ctx: &EmitCtx<'_>) -> Result<String, EcsError> {
     let mut out = String::new();
     match instr {
-        Instr::Load { dest, component_id, .. } => {
+        Instr::Load {
+            dest, component_id, ..
+        } => {
             let comp = ctx.ir.components.get(*component_id as usize).unwrap();
             if comp.ty == ComponentType::Bool {
                 // Bool payload is stored as u32 0/1 in the plain data array;
@@ -480,9 +503,7 @@ fn emit_instr(instr: &Instr, ctx: &EmitCtx<'_>) -> Result<String, EcsError> {
                     "    v{dest} = atomicLoad(&ecs_c{component_id}[ecs_entity]);\n"
                 ));
             } else {
-                out.push_str(&format!(
-                    "    v{dest} = ecs_c{component_id}[ecs_entity];\n"
-                ));
+                out.push_str(&format!("    v{dest} = ecs_c{component_id}[ecs_entity];\n"));
             }
         }
         Instr::Const { dest, ty, bytes } => {
@@ -515,7 +536,12 @@ fn emit_instr(instr: &Instr, ctx: &EmitCtx<'_>) -> Result<String, EcsError> {
             };
             out.push_str(&format!("    v{dest} = {op}v{src};\n"));
         }
-        Instr::Compare { dest, lhs, rhs, cond } => {
+        Instr::Compare {
+            dest,
+            lhs,
+            rhs,
+            cond,
+        } => {
             let op = match cond {
                 CompareOp::Equal => "==",
                 CompareOp::NotEqual => "!=",
@@ -537,9 +563,7 @@ fn emit_instr(instr: &Instr, ctx: &EmitCtx<'_>) -> Result<String, EcsError> {
                     "    atomicStore(&ecs_c{component_id}[ecs_entity], v{src});\n"
                 ));
             } else {
-                out.push_str(&format!(
-                    "    ecs_c{component_id}[ecs_entity] = v{src};\n"
-                ));
+                out.push_str(&format!("    ecs_c{component_id}[ecs_entity] = v{src};\n"));
             }
             // Bump the version: every Store marks the component changed since
             // the last baseline snapshot.
@@ -603,7 +627,11 @@ fn emit_instr(instr: &Instr, ctx: &EmitCtx<'_>) -> Result<String, EcsError> {
                 out.push_str(&format!("    v{dest} = {call};\n"));
             }
         }
-        Instr::AtomicOp { component_id, op, value } => {
+        Instr::AtomicOp {
+            component_id,
+            op,
+            value,
+        } => {
             let fn_name = match op {
                 AtomicOpCode::Add => "atomicAdd",
                 AtomicOpCode::Sub => "atomicSub",
@@ -611,7 +639,11 @@ fn emit_instr(instr: &Instr, ctx: &EmitCtx<'_>) -> Result<String, EcsError> {
                 AtomicOpCode::CompareExchange => {
                     return Err(EcsError::WgslInvalid(format!(
                         "AtomicOp CompareExchange needs two value operands and is not supported in v1 (system '{}')",
-                        ctx.ir.systems.get(ctx.system_id as usize).map(|s| s.name.as_str()).unwrap_or("?")
+                        ctx.ir
+                            .systems
+                            .get(ctx.system_id as usize)
+                            .map(|s| s.name.as_str())
+                            .unwrap_or("?")
                     )));
                 }
             };
@@ -667,7 +699,7 @@ pub(super) fn const_literal(ty: ComponentType, bytes: &[u8]) -> Result<String, E
         ComponentType::Mat4F => {
             return Err(EcsError::WgslInvalid(
                 "Const of mat4x4f is not supported".into(),
-            ))
+            ));
         }
     })
 }

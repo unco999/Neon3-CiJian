@@ -22,14 +22,11 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
 use neon_editor::ChangeSet;
-use neon_ui_runtime::editor_component::{
-    EditorDocumentFrame, EditorDocumentProvider,
-};
-use neon_ui_schema::UiEditorDocumentBinding;
 use neon_protocol::{
-    ClientIdentity, ClientKind, ProtocolVersion, RequestId, RpcRequest, RpcStatus,
-    ServiceName,
+    ClientIdentity, ClientKind, ProtocolVersion, RequestId, RpcRequest, RpcStatus, ServiceName,
 };
+use neon_ui_runtime::editor_component::{EditorDocumentFrame, EditorDocumentProvider};
+use neon_ui_schema::UiEditorDocumentBinding;
 
 enum EditorDocumentRequest {
     Snapshot {
@@ -80,7 +77,10 @@ impl EditorRuntimeDocumentProvider {
                             Some(initial_source),
                         )
                     }
-                    EditorDocumentRequest::Change { binding, change_set } => {
+                    EditorDocumentRequest::Change {
+                        binding,
+                        change_set,
+                    } => {
                         let mut binding = binding;
                         if binding.epoch == 0 {
                             binding.epoch = 1;
@@ -190,7 +190,9 @@ impl EditorRuntimeDocumentProvider {
 
 impl EditorDocumentProvider for EditorRuntimeDocumentProvider {
     fn request_snapshot(&self, binding: &UiEditorDocumentBinding, initial_source: &str) {
-        let Ok(mut pending) = self.pending.lock() else { return };
+        let Ok(mut pending) = self.pending.lock() else {
+            return;
+        };
         if !pending.insert(binding.document_id.clone()) {
             return;
         }
@@ -222,11 +224,7 @@ fn parse_addr(args: &[String], flag: &str, default: &str) -> SocketAddr {
     args.iter()
         .position(|argument| argument == flag)
         .and_then(|index| args.get(index + 1))
-        .map(|endpoint| {
-            endpoint
-                .parse()
-                .expect("endpoint must be a socket address")
-        })
+        .map(|endpoint| endpoint.parse().expect("endpoint must be a socket address"))
         .unwrap_or_else(|| default.parse().expect("default endpoint is valid"))
 }
 
@@ -361,15 +359,23 @@ fn main() {
                 })
             };
             let fragment_observer: Box<
-                dyn FnMut(&std::collections::HashMap<
-                    neon_ui_schema::UiFragmentId,
-                    neon_ui_schema::UiFragment,
-                >) + Send,
+                dyn FnMut(
+                        &std::collections::HashMap<
+                            neon_ui_schema::UiFragmentId,
+                            neon_ui_schema::UiFragment,
+                        >,
+                    ) + Send,
             > = {
                 let bridge = editor_bridge.clone();
                 Box::new(move |fragments| bridge.sync_fragments(fragments))
             };
-            let reveal_sink: Box<dyn FnMut(serde_json::Value, f32) -> Option<neon_ui_schema::UiCodeEditorPresentation> + Send> = {
+            let reveal_sink: Box<
+                dyn FnMut(
+                        serde_json::Value,
+                        f32,
+                    ) -> Option<neon_ui_schema::UiCodeEditorPresentation>
+                    + Send,
+            > = {
                 let bridge = editor_bridge.clone();
                 Box::new(move |params, now| {
                     let path = params.get("path")?.as_str()?.to_string();
@@ -377,12 +383,30 @@ fn main() {
                         &path,
                         params.get("line")?.as_u64()? as u32,
                         params.get("column")?.as_u64()? as u32,
-                        params.get("end_line").and_then(|v| v.as_u64()).map(|v| v as u32),
-                        params.get("end_column").and_then(|v| v.as_u64()).map(|v| v as u32),
-                        params.get("viewport_height").and_then(|v| v.as_f64()).unwrap_or(720.0) as f32,
-                        params.get("viewport_width").and_then(|v| v.as_f64()).unwrap_or(1200.0) as f32,
-                        params.get("row_height").and_then(|v| v.as_f64()).unwrap_or(20.0) as f32,
-                        params.get("gutter_width").and_then(|v| v.as_f64()).unwrap_or(56.0) as f32,
+                        params
+                            .get("end_line")
+                            .and_then(|v| v.as_u64())
+                            .map(|v| v as u32),
+                        params
+                            .get("end_column")
+                            .and_then(|v| v.as_u64())
+                            .map(|v| v as u32),
+                        params
+                            .get("viewport_height")
+                            .and_then(|v| v.as_f64())
+                            .unwrap_or(720.0) as f32,
+                        params
+                            .get("viewport_width")
+                            .and_then(|v| v.as_f64())
+                            .unwrap_or(1200.0) as f32,
+                        params
+                            .get("row_height")
+                            .and_then(|v| v.as_f64())
+                            .unwrap_or(20.0) as f32,
+                        params
+                            .get("gutter_width")
+                            .and_then(|v| v.as_f64())
+                            .unwrap_or(56.0) as f32,
                         now,
                     )
                 })
@@ -448,13 +472,9 @@ fn main() {
         let editor = editor_endpoint;
         let eventd = eventd_endpoint;
         let _ = std::thread::spawn(move || {
-            if let Err(error) = neon_ui_runtime::UiRuntime::serve_forwarder(
-                ui,
-                wgpu,
-                editor,
-                Some(eventd),
-                1,
-            ) {
+            if let Err(error) =
+                neon_ui_runtime::UiRuntime::serve_forwarder(ui, wgpu, editor, Some(eventd), 1)
+            {
                 eprintln!("[neon3-runtime] ui-runtime failed: {error}");
                 std::process::exit(1);
             }

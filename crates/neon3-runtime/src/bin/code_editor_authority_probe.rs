@@ -56,7 +56,14 @@ fn call(
     Ok(response.result.unwrap_or(Value::Null))
 }
 
-fn emit(sequence: u64, method: &str, producer: Value, consumer: Value, pass: bool, error: Option<String>) {
+fn emit(
+    sequence: u64,
+    method: &str,
+    producer: Value,
+    consumer: Value,
+    pass: bool,
+    error: Option<String>,
+) {
     println!(
         "{}",
         json!({
@@ -85,11 +92,31 @@ fn main() {
     let mut failed = false;
 
     let health = call(editor, "editor-runtime", "service.health", 1, json!({}));
-    emit(1, "editor.service.health", json!({}), health.clone().unwrap_or(Value::Null), health.is_ok(), health.clone().err());
+    emit(
+        1,
+        "editor.service.health",
+        json!({}),
+        health.clone().unwrap_or(Value::Null),
+        health.is_ok(),
+        health.clone().err(),
+    );
     failed |= health.is_err();
 
-    let submitted = call(ui, "ui-runtime", "ui.flow.submit", 2, json!({"source": FLOW}));
-    emit(2, "ui.flow.submit", json!({"source_bytes": FLOW.len()}), submitted.clone().unwrap_or(Value::Null), submitted.is_ok(), submitted.clone().err());
+    let submitted = call(
+        ui,
+        "ui-runtime",
+        "ui.flow.submit",
+        2,
+        json!({"source": FLOW}),
+    );
+    emit(
+        2,
+        "ui.flow.submit",
+        json!({"source_bytes": FLOW.len()}),
+        submitted.clone().unwrap_or(Value::Null),
+        submitted.is_ok(),
+        submitted.clone().err(),
+    );
     failed |= submitted.is_err();
 
     let mut observed = None;
@@ -140,7 +167,8 @@ fn main() {
         json!({"document_id": DOCUMENT_ID, "expected": "CodeEditorPresentation.document"}),
         observed.clone().unwrap_or(Value::Null),
         presentation_pass,
-        (!presentation_pass).then(|| "document presentation was not observed within 3 seconds".into()),
+        (!presentation_pass)
+            .then(|| "document presentation was not observed within 3 seconds".into()),
     );
     failed |= !presentation_pass;
 

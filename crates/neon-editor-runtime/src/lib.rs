@@ -402,7 +402,9 @@ impl EditorRuntime {
             "editor.lsp.definition" => (self.lsp_definition(request_id, request.params), true),
             "editor.lsp.references" => (self.lsp_references(request_id, request.params), true),
             "editor.lsp.symbols" => (self.lsp_symbols(request_id, request.params), true),
-            "editor.lsp.signature_help" => (self.lsp_signature_help(request_id, request.params), true),
+            "editor.lsp.signature_help" => {
+                (self.lsp_signature_help(request_id, request.params), true)
+            }
             "editor.lsp.configure" => (self.lsp_configure(request_id, request.params), true),
             "editor.language.capabilities" => {
                 (self.language_capabilities(request_id, request.params), true)
@@ -462,7 +464,9 @@ impl EditorRuntime {
                 Some(record.revision),
             );
         }
-        let language = Language { kind: language_kind };
+        let language = Language {
+            kind: language_kind,
+        };
         let lsp_uri = lsp_uri_for(&open.document_id, language_kind);
         let (lsp, lsp_unavailable) = match language_kind {
             LanguageKind::NuiFlow => (None, None),
@@ -608,8 +612,12 @@ impl EditorRuntime {
                 Some(current_revision),
             );
         }
-        let mut candidate =
-            EditorCore::from_language(&current_source, Language { kind: language_kind });
+        let mut candidate = EditorCore::from_language(
+            &current_source,
+            Language {
+                kind: language_kind,
+            },
+        );
         for operation in &change.change_set.ops {
             match operation {
                 EditOp::Insert {
@@ -825,10 +833,8 @@ impl EditorRuntime {
                 None,
             );
         }
-        let Some((revision, session_matches, unavailable)) = self
-            .documents
-            .get(&reference.document_id)
-            .map(|record| {
+        let Some((revision, session_matches, unavailable)) =
+            self.documents.get(&reference.document_id).map(|record| {
                 (
                     record.revision,
                     record.session_id == reference.session_id,
@@ -1004,12 +1010,7 @@ impl EditorRuntime {
         let Some((revision, session_matches)) = self
             .documents
             .get(&reference.document_id)
-            .map(|record| {
-                (
-                    record.revision,
-                    record.session_id == reference.session_id,
-                )
-            })
+            .map(|record| (record.revision, record.session_id == reference.session_id))
         else {
             return self.reject(
                 request_id,
@@ -1053,8 +1054,7 @@ impl EditorRuntime {
                     ),
                     Err(error) => {
                         record.lsp = None;
-                        record.lsp_unavailable =
-                            Some(format!("lsp server closed: {error}"));
+                        record.lsp_unavailable = Some(format!("lsp server closed: {error}"));
                         self.accept(
                             request_id,
                             json!(EditorLspSymbolsResult {
@@ -1102,12 +1102,7 @@ impl EditorRuntime {
         let Some((revision, session_matches)) = self
             .documents
             .get(&request.document_id)
-            .map(|record| {
-                (
-                    record.revision,
-                    record.session_id == request.session_id,
-                )
-            })
+            .map(|record| (record.revision, record.session_id == request.session_id))
         else {
             return self.reject(
                 request_id,
@@ -1140,34 +1135,42 @@ impl EditorRuntime {
             Some(lsp) => {
                 let uri = record.lsp_uri.clone();
                 let outcome = match kind {
-                    LspKind::Hover => lsp
-                        .request_hover(&uri, request.position)
-                        .map(|result| json!(EditorLspRawResult {
+                    LspKind::Hover => lsp.request_hover(&uri, request.position).map(|result| {
+                        json!(EditorLspRawResult {
                             document_id: request.document_id.clone(),
                             document_revision: revision,
                             result,
-                        })),
+                        })
+                    }),
                     LspKind::SignatureHelp => lsp
                         .request_signature_help(&uri, request.position)
-                        .map(|result| json!(EditorLspRawResult {
-                            document_id: request.document_id.clone(),
-                            document_revision: revision,
-                            result,
-                        })),
-                    LspKind::Definition => lsp
-                        .request_definition(&uri, request.position)
-                        .map(|locations| json!(EditorLspLocationsResult {
-                            document_id: request.document_id.clone(),
-                            document_revision: revision,
-                            locations,
-                        })),
-                    LspKind::References => lsp
-                        .request_references(&uri, request.position)
-                        .map(|locations| json!(EditorLspLocationsResult {
-                            document_id: request.document_id.clone(),
-                            document_revision: revision,
-                            locations,
-                        })),
+                        .map(|result| {
+                            json!(EditorLspRawResult {
+                                document_id: request.document_id.clone(),
+                                document_revision: revision,
+                                result,
+                            })
+                        }),
+                    LspKind::Definition => {
+                        lsp.request_definition(&uri, request.position)
+                            .map(|locations| {
+                                json!(EditorLspLocationsResult {
+                                    document_id: request.document_id.clone(),
+                                    document_revision: revision,
+                                    locations,
+                                })
+                            })
+                    }
+                    LspKind::References => {
+                        lsp.request_references(&uri, request.position)
+                            .map(|locations| {
+                                json!(EditorLspLocationsResult {
+                                    document_id: request.document_id.clone(),
+                                    document_revision: revision,
+                                    locations,
+                                })
+                            })
+                    }
                 };
                 match outcome {
                     Ok(result) => self.accept(request_id, result, Some(revision)),
@@ -1175,13 +1178,13 @@ impl EditorRuntime {
                         record.lsp = None;
                         record.lsp_unavailable = Some(format!("lsp server closed: {error}"));
                         let fallback = match kind {
-                            LspKind::Definition | LspKind::References => json!(
-                                EditorLspLocationsResult {
+                            LspKind::Definition | LspKind::References => {
+                                json!(EditorLspLocationsResult {
                                     document_id: request.document_id,
                                     document_revision: revision,
                                     locations: Vec::new(),
-                                }
-                            ),
+                                })
+                            }
                             _ => json!(EditorLspRawResult {
                                 document_id: request.document_id,
                                 document_revision: revision,
@@ -1194,13 +1197,11 @@ impl EditorRuntime {
             }
             None => {
                 let fallback = match kind {
-                    LspKind::Definition | LspKind::References => json!(
-                        EditorLspLocationsResult {
-                            document_id: request.document_id,
-                            document_revision: revision,
-                            locations: Vec::new(),
-                        }
-                    ),
+                    LspKind::Definition | LspKind::References => json!(EditorLspLocationsResult {
+                        document_id: request.document_id,
+                        document_revision: revision,
+                        locations: Vec::new(),
+                    }),
                     _ => json!(EditorLspRawResult {
                         document_id: request.document_id,
                         document_revision: revision,
@@ -1444,11 +1445,7 @@ fn lsp_command_for(kind: LanguageKind) -> Option<(String, Vec<String>, HashMap<S
 /// `(client, unavailable_reason)`; a missing binary degrades to
 /// `(None, Some(reason))` so the document stays fully editable with
 /// tree-sitter highlighting.
-fn spawn_lsp(
-    kind: LanguageKind,
-    uri: &str,
-    source: &str,
-) -> (Option<LspClient>, Option<String>) {
+fn spawn_lsp(kind: LanguageKind, uri: &str, source: &str) -> (Option<LspClient>, Option<String>) {
     let Some((command, args, env)) = lsp_command_for(kind) else {
         return (None, None);
     };
@@ -1505,7 +1502,13 @@ pub fn serve(endpoint: std::net::SocketAddr, epoch: u64) -> Result<(), neon_ipc:
     let server = neon_ipc::BlockingRpcServer::bind(endpoint)?;
     let runtime = std::sync::Arc::new(std::sync::Mutex::new(EditorRuntime::new(epoch)));
     server.serve_until(
-        move |request| runtime.lock().expect("editor-runtime lock").handle(request).0,
+        move |request| {
+            runtime
+                .lock()
+                .expect("editor-runtime lock")
+                .handle(request)
+                .0
+        },
         |request| request.method == "service.shutdown",
     )
 }
@@ -1666,10 +1669,12 @@ mod tests {
         let (response, _) = runtime.handle(apply);
         assert_eq!(response.status, RpcStatus::Accepted);
         let snapshot = &response.result.as_ref().unwrap()["snapshot"];
-        assert!(snapshot["source"]
-            .as_str()
-            .unwrap()
-            .contains("pub fn main()"));
+        assert!(
+            snapshot["source"]
+                .as_str()
+                .unwrap()
+                .contains("pub fn main()")
+        );
 
         // No LSP server installed in this environment: introspection must
         // degrade to a structured server_unavailable, not fail the document.
@@ -1688,9 +1693,11 @@ mod tests {
         let (response, _) = runtime.handle(diagnostics);
         assert_eq!(response.status, RpcStatus::Accepted);
         let result = response.result.as_ref().unwrap();
-        assert!(result["server_unavailable"]
-            .as_str()
-            .is_some_and(|reason| reason.contains("unavailable")));
+        assert!(
+            result["server_unavailable"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("unavailable"))
+        );
     }
 
     #[test]

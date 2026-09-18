@@ -8,14 +8,14 @@
 
 use std::{sync::Arc, time::Duration};
 
-use winit::{
-    application::ApplicationHandler,
-    event_loop::{ActiveEventLoop, EventLoop},
-    event::WindowEvent,
-    window::{Window, WindowId},
-};
 #[cfg(windows)]
 use winit::platform::windows::WindowAttributesExtWindows;
+use winit::{
+    application::ApplicationHandler,
+    event::WindowEvent,
+    event_loop::{ActiveEventLoop, EventLoop},
+    window::{Window, WindowId},
+};
 
 struct GpuState {
     surface: wgpu::Surface<'static>,
@@ -47,16 +47,15 @@ fn create_gpu(window: &Arc<Window>) -> Result<GpuState, String> {
         apply_limit_buckets: false,
     }))
     .map_err(|error| format!("request adapter: {error:?}"))?;
-    let (device, queue) =
-        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("neon3-transparent-window-probe"),
-            required_features: wgpu::Features::empty(),
-            required_limits: wgpu::Limits::default(),
-            experimental_features: wgpu::ExperimentalFeatures::default(),
-            memory_hints: wgpu::MemoryHints::Performance,
-            trace: wgpu::Trace::Off,
-        }))
-        .map_err(|error| format!("request device: {error:?}"))?;
+    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        label: Some("neon3-transparent-window-probe"),
+        required_features: wgpu::Features::empty(),
+        required_limits: wgpu::Limits::default(),
+        experimental_features: wgpu::ExperimentalFeatures::default(),
+        memory_hints: wgpu::MemoryHints::Performance,
+        trace: wgpu::Trace::Off,
+    }))
+    .map_err(|error| format!("request device: {error:?}"))?;
     let caps = surface.get_capabilities(&adapter);
     let format = caps
         .formats
@@ -70,7 +69,12 @@ fn create_gpu(window: &Arc<Window>) -> Result<GpuState, String> {
         .iter()
         .copied()
         .find(|mode| *mode == wgpu::CompositeAlphaMode::PreMultiplied)
-        .or_else(|| caps.alpha_modes.iter().copied().find(|mode| *mode == wgpu::CompositeAlphaMode::PostMultiplied))
+        .or_else(|| {
+            caps.alpha_modes
+                .iter()
+                .copied()
+                .find(|mode| *mode == wgpu::CompositeAlphaMode::PostMultiplied)
+        })
         .or_else(|| caps.alpha_modes.first().copied())
         .ok_or_else(|| "no alpha mode".to_owned())?;
     let size = window.inner_size();
@@ -149,9 +153,7 @@ fn draw(gpu: &GpuState) -> Result<(), String> {
         other => return Err(format!("acquire: {other:?}")),
     };
     let view = frame.texture.create_view(&Default::default());
-    let mut encoder = gpu
-        .device
-        .create_command_encoder(&Default::default());
+    let mut encoder = gpu.device.create_command_encoder(&Default::default());
     let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
         label: Some("probe-pass"),
         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -222,22 +224,22 @@ impl ApplicationHandler for App {
         }
         self.window = Some(window);
         self.deadline = Some(std::time::Instant::now() + Duration::from_secs(20));
-        event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(self.deadline.unwrap()));
+        event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
+            self.deadline.unwrap(),
+        ));
     }
 
-    fn window_event(
-        &mut self,
-        event_loop: &ActiveEventLoop,
-        _id: WindowId,
-        event: WindowEvent,
-    ) {
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         if matches!(event, WindowEvent::CloseRequested) {
             event_loop.exit();
         }
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        if self.deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+        if self
+            .deadline
+            .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+        {
             event_loop.exit();
         }
     }
@@ -250,6 +252,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         gpu: None,
         deadline: None,
     })?;
-    println!("{}", serde_json::json!({"probe": "transparent-window", "stage": "result", "pass": true}));
+    println!(
+        "{}",
+        serde_json::json!({"probe": "transparent-window", "stage": "result", "pass": true})
+    );
     Ok(())
 }

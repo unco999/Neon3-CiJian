@@ -481,9 +481,7 @@ pub fn component_gallery_program(
 /// Deterministic first window for the component gallery. The renderer may use
 /// this frame for its initial composition; later windows still come through
 /// `ui.host.inbound` and the normal DataGrid window request protocol.
-pub fn component_gallery_initial_grid_frame(
-    program: &UiProgram,
-) -> Option<UiDataGridFrame> {
+pub fn component_gallery_initial_grid_frame(program: &UiProgram) -> Option<UiDataGridFrame> {
     let record = program
         .data_grid_records
         .iter()
@@ -493,14 +491,12 @@ pub fn component_gallery_initial_grid_frame(
         .iter()
         .map(|column| column.key.as_str())
         .collect::<Vec<_>>();
-    Some(
-        DemoDragDropDomain::new().virtual_list_window_frame(
-            0,
-            record.max_window_rows,
-            program.revision.clone(),
-            &columns,
-        ),
-    )
+    Some(DemoDragDropDomain::new().virtual_list_window_frame(
+        0,
+        record.max_window_rows,
+        program.revision.clone(),
+        &columns,
+    ))
 }
 
 /// Applies a domain-produced display snapshot to declared status labels. Status
@@ -605,10 +601,7 @@ pub fn apply_visible_status_to_fragment(
 /// Applies an accepted host publication to an already mounted presentation.
 /// This is used by embedded hosts as well as the desktop UI runtime; acceptance
 /// alone must never leave the renderer displaying the old controlled value.
-pub fn apply_publication_to_fragment(
-    fragment: &mut UiFragment,
-    publication: &UiHostPublication,
-) {
+pub fn apply_publication_to_fragment(fragment: &mut UiFragment, publication: &UiHostPublication) {
     let mut changed = std::collections::BTreeMap::new();
     for change in &publication.scalar_frame.changes {
         changed.insert(change.key.as_str(), &change.value);
@@ -639,11 +632,19 @@ pub fn apply_publication_to_fragment(
             )),
             ("slider_value", UiInputValue::F32 { value }) => Some((
                 "exposure-slider",
-                UiControlPresentation::Numeric { value: *value, min: 0.0, max: 1.0 },
+                UiControlPresentation::Numeric {
+                    value: *value,
+                    min: 0.0,
+                    max: 1.0,
+                },
             )),
             ("drag_value", UiInputValue::I32 { value }) => Some((
                 "count-drag",
-                UiControlPresentation::Numeric { value: *value as f32, min: 0.0, max: 24.0 },
+                UiControlPresentation::Numeric {
+                    value: *value as f32,
+                    min: 0.0,
+                    max: 24.0,
+                },
             )),
             _ => None,
         };
@@ -659,7 +660,9 @@ pub fn apply_publication_to_fragment(
     }
     for grid in &publication.grid_inputs {
         let existing = fragment.effects.iter().find_map(|effect| {
-            let UiEffect::DataGridFrame { declaration, .. } = effect else { return None };
+            let UiEffect::DataGridFrame { declaration, .. } = effect else {
+                return None;
+            };
             (declaration.source_key == grid.source_key).then_some(declaration.clone())
         });
         fragment.effects.retain(|effect| {

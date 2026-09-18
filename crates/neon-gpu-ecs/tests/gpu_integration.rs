@@ -5,9 +5,9 @@
 //! `compactedEntityIds` and `indirectArgs` against the pure CPU reference
 //! implementation in `runtime::init`.
 
+use neon_gpu_ecs::GpuEcsCtx;
 use neon_gpu_ecs::ir::*;
 use neon_gpu_ecs::runtime::init;
-use neon_gpu_ecs::GpuEcsCtx;
 
 const MAX_ENTITIES: u32 = 16;
 
@@ -45,34 +45,57 @@ fn sorting_world() -> EcsIr {
             default_value: (1.0f32 / 60.0).to_le_bytes().to_vec(),
         }],
         initial_entities: vec![
-            EntityPrototype { component_ids: vec![0, 1], count: 6, initial_values: None },
-            EntityPrototype { component_ids: vec![0, 1, 2], count: 4, initial_values: None },
+            EntityPrototype {
+                component_ids: vec![0, 1],
+                count: 6,
+                initial_values: None,
+            },
+            EntityPrototype {
+                component_ids: vec![0, 1, 2],
+                count: 4,
+                initial_values: None,
+            },
         ],
         queries: vec![
             QueryDef {
                 id: 0,
                 with: vec![
-                    ComponentAccess { component_id: 0, access_type: AccessType::Read },
-                    ComponentAccess { component_id: 1, access_type: AccessType::Read },
+                    ComponentAccess {
+                        component_id: 0,
+                        access_type: AccessType::Read,
+                    },
+                    ComponentAccess {
+                        component_id: 1,
+                        access_type: AccessType::Read,
+                    },
                 ],
                 without: vec![],
                 filters: vec![],
             },
             QueryDef {
                 id: 1,
-                with: vec![ComponentAccess { component_id: 0, access_type: AccessType::Read }],
+                with: vec![ComponentAccess {
+                    component_id: 0,
+                    access_type: AccessType::Read,
+                }],
                 without: vec![2],
                 filters: vec![],
             },
             QueryDef {
                 id: 2,
-                with: vec![ComponentAccess { component_id: 2, access_type: AccessType::Read }],
+                with: vec![ComponentAccess {
+                    component_id: 2,
+                    access_type: AccessType::Read,
+                }],
                 without: vec![],
                 filters: vec![],
             },
             QueryDef {
                 id: 3,
-                with: vec![ComponentAccess { component_id: 0, access_type: AccessType::Read }],
+                with: vec![ComponentAccess {
+                    component_id: 0,
+                    access_type: AccessType::Read,
+                }],
                 without: vec![],
                 filters: vec![QueryFilter::RenderData],
             },
@@ -87,7 +110,11 @@ fn sorting_world() -> EcsIr {
             instructions: vec![Instr::Return],
         }],
         schedule: ScheduleDef {
-            stages: vec![Stage { id: 0, name: "Logic".into(), system_ids: vec![0] }],
+            stages: vec![Stage {
+                id: 0,
+                name: "Logic".into(),
+                system_ids: vec![0],
+            }],
         },
     }
 }
@@ -135,7 +162,10 @@ fn cpu_reference(ir: &EcsIr) -> (Vec<neon_gpu_ecs::generator::QueryRange>, Vec<V
     for q in 0..ir.queries.len() {
         let matched = init::initial_query_match(ir, q);
         let count = matched.len() as u32;
-        ranges.push(neon_gpu_ecs::generator::QueryRange { start: total, count });
+        ranges.push(neon_gpu_ecs::generator::QueryRange {
+            start: total,
+            count,
+        });
         lists.push(matched);
         total += count;
     }
@@ -170,7 +200,11 @@ fn sorting_matches_cpu_reference() {
     let args = ctx.read_indirect_args();
     for (q, range) in ranges.iter().enumerate() {
         let want_x = range.count.div_ceil(64);
-        assert_eq!(args[q], [want_x, 1, 1], "indirect args mismatch for query {q}");
+        assert_eq!(
+            args[q],
+            [want_x, 1, 1],
+            "indirect args mismatch for query {q}"
+        );
     }
 }
 
@@ -186,7 +220,11 @@ fn second_sort_is_stable_after_counter_reset() {
     ctx.seed_initial();
     ctx.run_sort();
     ctx.run_sort();
-    assert_eq!(ctx.read_frame_prep(), expected_ranges, "second sort must match");
+    assert_eq!(
+        ctx.read_frame_prep(),
+        expected_ranges,
+        "second sort must match"
+    );
 }
 
 #[test]
@@ -198,7 +236,10 @@ fn insufficient_storage_buffer_limit_is_rejected() {
     match result {
         Err(neon_gpu_ecs::EcsError::Limits(message)) => {
             assert!(message.contains("17"), "{message}");
-            assert!(message.contains("max_storage_buffers_per_shader_stage"), "{message}");
+            assert!(
+                message.contains("max_storage_buffers_per_shader_stage"),
+                "{message}"
+            );
         }
         Err(other) => panic!("expected Limits, got {other:?}"),
         Ok(_) => panic!("8-slot device must reject a 17-binding world"),

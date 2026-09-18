@@ -73,6 +73,9 @@ impl ComponentType {
 
     /// True for `U32`/`I32`/`Bool` (integer-class values; atomics require non-`Bool`).
     pub fn is_integer(self) -> bool {
-        matches!(self, ComponentType::U32 | ComponentType::I32 | ComponentType::Bool)
+        matches!(
+            self,
+            ComponentType::U32 | ComponentType::I32 | ComponentType::Bool
+        )
     }
 }

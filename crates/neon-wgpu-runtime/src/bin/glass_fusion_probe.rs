@@ -70,9 +70,14 @@ fn texture(device: &wgpu::Device, label: &str, usage: wgpu::TextureUsages) -> wg
     })
 }
 
-fn readback(device: &wgpu::Device, queue: &wgpu::Queue, source: &wgpu::Texture) -> Result<Vec<u8>, String> {
+fn readback(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    source: &wgpu::Texture,
+) -> Result<Vec<u8>, String> {
     let row_bytes = WIDTH * 4;
-    let padded = row_bytes.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+    let padded =
+        row_bytes.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
     let buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("glass-fusion-probe-readback"),
         size: u64::from(padded) * u64::from(HEIGHT),
@@ -83,23 +88,46 @@ fn readback(device: &wgpu::Device, queue: &wgpu::Queue, source: &wgpu::Texture) 
         label: Some("glass-fusion-probe-readback-encoder"),
     });
     encoder.copy_texture_to_buffer(
-        wgpu::TexelCopyTextureInfo { texture: source, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+        wgpu::TexelCopyTextureInfo {
+            texture: source,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
         wgpu::TexelCopyBufferInfo {
             buffer: &buffer,
-            layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(padded), rows_per_image: Some(HEIGHT) },
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(padded),
+                rows_per_image: Some(HEIGHT),
+            },
         },
-        wgpu::Extent3d { width: WIDTH, height: HEIGHT, depth_or_array_layers: 1 },
+        wgpu::Extent3d {
+            width: WIDTH,
+            height: HEIGHT,
+            depth_or_array_layers: 1,
+        },
     );
     queue.submit(Some(encoder.finish()));
     let (tx, rx) = std::sync::mpsc::channel();
-    buffer.slice(..).map_async(wgpu::MapMode::Read, move |result| { let _ = tx.send(result); });
+    buffer
+        .slice(..)
+        .map_async(wgpu::MapMode::Read, move |result| {
+            let _ = tx.send(result);
+        });
     device
-        .poll(wgpu::PollType::Wait { submission_index: None, timeout: Some(std::time::Duration::from_secs(10)) })
+        .poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: Some(std::time::Duration::from_secs(10)),
+        })
         .map_err(|error| format!("probe readback poll: {error}"))?;
     rx.recv_timeout(std::time::Duration::from_secs(5))
         .map_err(|_| "probe readback timeout".to_owned())?
         .map_err(|error| format!("probe readback map: {error}"))?;
-    let mapped = buffer.slice(..).get_mapped_range().map_err(|error| format!("probe readback range: {error}"))?;
+    let mapped = buffer
+        .slice(..)
+        .get_mapped_range()
+        .map_err(|error| format!("probe readback range: {error}"))?;
     let mut result = Vec::with_capacity((WIDTH * HEIGHT * 4) as usize);
     for row in mapped.chunks_exact(padded as usize) {
         result.extend_from_slice(&row[..row_bytes as usize]);
@@ -159,11 +187,52 @@ fn composite(
     let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("glass-fusion-probe-layout"),
         entries: &[
-            wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Texture { multisampled: false, view_dimension: wgpu::TextureViewDimension::D2, sample_type: wgpu::TextureSampleType::Float { filterable: true } }, count: None },
-            wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Texture { multisampled: false, view_dimension: wgpu::TextureViewDimension::D2, sample_type: wgpu::TextureSampleType::Float { filterable: true } }, count: None },
-            wgpu::BindGroupLayoutEntry { binding: 2, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Texture { multisampled: false, view_dimension: wgpu::TextureViewDimension::D2, sample_type: wgpu::TextureSampleType::Float { filterable: true } }, count: None },
-            wgpu::BindGroupLayoutEntry { binding: 3, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None },
-            wgpu::BindGroupLayoutEntry { binding: 4, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    multisampled: false,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    multisampled: false,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    multisampled: false,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 3,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 4,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
         ],
     });
     let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -187,11 +256,26 @@ fn composite(
         label: Some("glass-fusion-probe-bind-group"),
         layout: &layout,
         entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(backdrop_view) },
-            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(behind_view) },
-            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(content_view) },
-            wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&sampler) },
-            wgpu::BindGroupEntry { binding: 4, resource: tint_uniform.as_entire_binding() },
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(backdrop_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(behind_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::TextureView(content_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::Sampler(&sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: tint_uniform.as_entire_binding(),
+            },
         ],
     });
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -265,19 +349,43 @@ fn box_blur(tex: texture_2d<f32>, sampler_ref: sampler, uv: vec2<f32>, px: vec2<
     let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("glass-fusion-probe-pipeline"),
         layout: Some(&pipeline_layout),
-        vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs"), buffers: &[], compilation_options: Default::default() },
-        fragment: Some(wgpu::FragmentState { module: &shader, entry_point: Some("fs"), targets: &[Some(wgpu::ColorTargetState { format: FORMAT, blend: None, write_mask: wgpu::ColorWrites::ALL })], compilation_options: Default::default() }),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs"),
+            buffers: &[],
+            compilation_options: Default::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs"),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: FORMAT,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: Default::default(),
+        }),
         primitive: wgpu::PrimitiveState::default(),
         depth_stencil: None,
         multisample: wgpu::MultisampleState::default(),
         multiview_mask: None,
         cache: None,
     });
-    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("glass-fusion-probe-composite") });
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("glass-fusion-probe-composite"),
+    });
     {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("glass-fusion-probe-composite-pass"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: output_view, depth_slice: None, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store } })],
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: output_view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
             depth_stencil_attachment: None,
             timestamp_writes: None,
             occlusion_query_set: None,
@@ -297,11 +405,17 @@ fn flat_pipeline(device: &wgpu::Device, color: wgpu::Color) -> wgpu::RenderPipel
         bind_group_layouts: &[],
         immediate_size: 0,
     });
-    let color = [color.r as f32, color.g as f32, color.b as f32, color.a as f32];
+    let color = [
+        color.r as f32,
+        color.g as f32,
+        color.b as f32,
+        color.a as f32,
+    ];
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("glass-fusion-probe-flat-shader"),
-        source: wgpu::ShaderSource::Wgsl(format!(
-            r#"
+        source: wgpu::ShaderSource::Wgsl(
+            format!(
+                r#"
 const C: vec4<f32> = vec4<f32>({c0}, {c1}, {c2}, {c3});
 @vertex fn vs(@builtin(vertex_index) index: u32) -> @builtin(position) vec4<f32> {{
     var p = array<vec2<f32>, 3>(vec2<f32>(-1.0,-1.0), vec2<f32>(3.0,-1.0), vec2<f32>(-1.0,3.0));
@@ -309,14 +423,33 @@ const C: vec4<f32> = vec4<f32>({c0}, {c1}, {c2}, {c3});
 }}
 @fragment fn fs() -> @location(0) vec4<f32> {{ return C; }}
 "#,
-            c0 = color[0], c1 = color[1], c2 = color[2], c3 = color[3]
-        ).into()),
+                c0 = color[0],
+                c1 = color[1],
+                c2 = color[2],
+                c3 = color[3]
+            )
+            .into(),
+        ),
     });
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("glass-fusion-probe-flat-pipeline"),
         layout: Some(&layout),
-        vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs"), buffers: &[], compilation_options: Default::default() },
-        fragment: Some(wgpu::FragmentState { module: &shader, entry_point: Some("fs"), targets: &[Some(wgpu::ColorTargetState { format: FORMAT, blend: None, write_mask: wgpu::ColorWrites::ALL })], compilation_options: Default::default() }),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs"),
+            buffers: &[],
+            compilation_options: Default::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs"),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: FORMAT,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: Default::default(),
+        }),
         primitive: wgpu::PrimitiveState::default(),
         depth_stencil: None,
         multisample: wgpu::MultisampleState::default(),
@@ -325,12 +458,27 @@ const C: vec4<f32> = vec4<f32>({c0}, {c1}, {c2}, {c3});
     })
 }
 
-fn paint(device: &wgpu::Device, queue: &wgpu::Queue, view: &wgpu::TextureView, pipeline: &wgpu::RenderPipeline) {
-    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("glass-fusion-probe-paint") });
+fn paint(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    view: &wgpu::TextureView,
+    pipeline: &wgpu::RenderPipeline,
+) {
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("glass-fusion-probe-paint"),
+    });
     {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("glass-fusion-probe-paint-pass"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment { view, depth_slice: None, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store } })],
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
             depth_stencil_attachment: None,
             timestamp_writes: None,
             occlusion_query_set: None,
@@ -344,7 +492,12 @@ fn paint(device: &wgpu::Device, queue: &wgpu::Queue, view: &wgpu::TextureView, p
 
 fn pixel(bytes: &[u8], x: u32, y: u32) -> [u8; 4] {
     let offset = ((y * WIDTH + x) * 4) as usize;
-    [bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3]]
+    [
+        bytes[offset],
+        bytes[offset + 1],
+        bytes[offset + 2],
+        bytes[offset + 3],
+    ]
 }
 
 struct Metrics {
@@ -357,11 +510,17 @@ struct Metrics {
 
 fn main() -> Result<(), String> {
     let mut input = String::new();
-    io::stdin().read_to_string(&mut input).map_err(|error| format!("probe JSONL input: {error}"))?;
+    io::stdin()
+        .read_to_string(&mut input)
+        .map_err(|error| format!("probe JSONL input: {error}"))?;
     let _frames: Vec<serde_json::Value> = if input.trim().is_empty() {
         Vec::new()
     } else {
-        input.lines().filter(|l| !l.trim().is_empty()).map(|l| serde_json::from_str(l).map_err(|e| format!("input line: {e}"))).collect::<Result<_, _>>()?
+        input
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).map_err(|e| format!("input line: {e}")))
+            .collect::<Result<_, _>>()?
     };
 
     let _ = &_frames; // probe accepts optional JSONL frame input for parity with sibling probes
@@ -401,31 +560,74 @@ fn main() -> Result<(), String> {
     let (tint, tint_opacity) = glass_tint();
 
     // Textures (producer = what wgpu draws, consumer = final composite).
-    let content = texture(&device, "glass-probe-content", wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC);
-    let behind = texture(&device, "glass-probe-behind", wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC);
-    let consumer = texture(&device, "glass-probe-consumer", wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC);
+    let content = texture(
+        &device,
+        "glass-probe-content",
+        wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_SRC,
+    );
+    let behind = texture(
+        &device,
+        "glass-probe-behind",
+        wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_SRC,
+    );
+    let consumer = texture(
+        &device,
+        "glass-probe-consumer",
+        wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+    );
     let content_view = content.create_view(&Default::default());
     let behind_view = behind.create_view(&Default::default());
 
     // Render the wgpu UI content surface exactly like the runtime does
     // (UiDrawMode::Screen over a TRANSPARENT clear).
     {
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("glass-probe-content-pass") });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("glass-probe-content-pass"),
+        });
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("glass-probe-content-pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &content_view, depth_slice: None, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store } })],
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &content_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            renderer.draw(&device, &queue, &mut pass, &fragments, [WIDTH, HEIGHT], [WIDTH as f32, HEIGHT as f32], 0.0, UiDrawMode::Screen);
+            renderer.draw(
+                &device,
+                &queue,
+                &mut pass,
+                &fragments,
+                [WIDTH, HEIGHT],
+                [WIDTH as f32, HEIGHT as f32],
+                0.0,
+                UiDrawMode::Screen,
+            );
         }
         // Behind-glass surface stays empty (TRANSPARENT clear) - mirrors this app.
         let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("glass-probe-behind-clear"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &behind_view, depth_slice: None, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store } })],
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &behind_view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
             depth_stencil_attachment: None,
             timestamp_writes: None,
             occlusion_query_set: None,
@@ -433,7 +635,12 @@ fn main() -> Result<(), String> {
         });
         drop(pass);
         queue.submit(Some(encoder.finish()));
-        device.poll(wgpu::PollType::Wait { submission_index: None, timeout: Some(std::time::Duration::from_secs(10)) }).map_err(|error| format!("probe poll: {error}"))?;
+        device
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: Some(std::time::Duration::from_secs(10)),
+            })
+            .map_err(|error| format!("probe poll: {error}"))?;
     }
     let content_px = readback(&device, &queue, &content)?;
     // Producer-side facts.
@@ -447,19 +654,43 @@ fn main() -> Result<(), String> {
 
     // Two backdrops: a bright (near-white) desktop and a dark desktop.
     let backdrops = [
-        ("bright", wgpu::Color { r: 0.95, g: 0.95, b: 0.98, a: 1.0 }),
-        ("dark", wgpu::Color { r: 0.05, g: 0.05, b: 0.08, a: 1.0 }),
+        (
+            "bright",
+            wgpu::Color {
+                r: 0.95,
+                g: 0.95,
+                b: 0.98,
+                a: 1.0,
+            },
+        ),
+        (
+            "dark",
+            wgpu::Color {
+                r: 0.05,
+                g: 0.05,
+                b: 0.08,
+                a: 1.0,
+            },
+        ),
     ];
 
     let mut records = Vec::new();
     let mut failed = false;
     for (name, bcolor) in backdrops {
-        let backdrop = texture(&device, &format!("glass-probe-backdrop-{name}"), wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC);
+        let backdrop = texture(
+            &device,
+            &format!("glass-probe-backdrop-{name}"),
+            wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
+        );
         let backdrop_view = backdrop.create_view(&Default::default());
         let pipeline = flat_pipeline(&device, bcolor);
         paint(&device, &queue, &backdrop_view, &pipeline);
 
-        let _ = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("glass-probe-composite") });
+        let _ = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("glass-probe-composite"),
+        });
         let consumer_view = consumer.create_view(&Default::default());
         composite(
             &device,
@@ -471,7 +702,12 @@ fn main() -> Result<(), String> {
             tint,
             tint_opacity,
         )?;
-        device.poll(wgpu::PollType::Wait { submission_index: None, timeout: Some(std::time::Duration::from_secs(10)) }).map_err(|error| format!("probe poll: {error}"))?;
+        device
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: Some(std::time::Duration::from_secs(10)),
+            })
+            .map_err(|error| format!("probe poll: {error}"))?;
         let final_px = readback(&device, &queue, &consumer)?;
 
         let metrics = Metrics {

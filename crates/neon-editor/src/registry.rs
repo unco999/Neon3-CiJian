@@ -67,7 +67,9 @@ static DEFAULT_REGISTRY: OnceLock<Mutex<LanguageRegistry>> = OnceLock::new();
 /// startup (the `neon3-runtime` binary registers `neon-languages` built-ins).
 pub fn default_registry() -> MutexGuard<'static, LanguageRegistry> {
     let mutex = DEFAULT_REGISTRY.get_or_init(|| Mutex::new(LanguageRegistry::new()));
-    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Register a syntax provider on the process-wide default registry.

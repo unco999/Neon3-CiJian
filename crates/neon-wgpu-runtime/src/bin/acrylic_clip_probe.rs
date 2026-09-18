@@ -9,10 +9,9 @@
 use std::time::{Duration, Instant};
 
 use neon_wgpu_runtime::acrylic_backdrop::AcrylicHost;
-use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
+use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
 use windows::Win32::System::WinRT::{
-    CreateDispatcherQueueController, DispatcherQueueOptions, DQTAT_COM_STA,
-    DQTYPE_THREAD_CURRENT,
+    CreateDispatcherQueueController, DQTAT_COM_STA, DQTYPE_THREAD_CURRENT, DispatcherQueueOptions,
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -139,15 +138,18 @@ impl ApplicationHandler for Probe {
                 return;
             }
         };
-        let hwnd = match window.window_handle().map_err(|error| error.to_string()).and_then(|handle| {
-            let raw = handle.as_raw();
-            match raw {
-                RawWindowHandle::Win32(handle) => Ok(windows::Win32::Foundation::HWND(
-                    handle.hwnd.get() as *mut _,
-                )),
-                _ => Err("expected Win32 HWND".to_owned()),
-            }
-        }) {
+        let hwnd = match window
+            .window_handle()
+            .map_err(|error| error.to_string())
+            .and_then(|handle| {
+                let raw = handle.as_raw();
+                match raw {
+                    RawWindowHandle::Win32(handle) => {
+                        Ok(windows::Win32::Foundation::HWND(handle.hwnd.get() as *mut _))
+                    }
+                    _ => Err("expected Win32 HWND".to_owned()),
+                }
+            }) {
             Ok(hwnd) => hwnd,
             Err(error) => {
                 println!(
@@ -162,16 +164,10 @@ impl ApplicationHandler for Probe {
         let host: Result<AcrylicHost, String> = AcrylicHost::new(hwnd, 640, 480)
             .map_err(|error| error.to_string())
             .and_then(|host| {
-            host.set_backdrop_shell_bounds(
-                BOUNDS[0],
-                BOUNDS[1],
-                BOUNDS[2],
-                BOUNDS[3],
-                CUT,
-            )
-            .map(|_| host)
-            .map_err(|error| error.to_string())
-        });
+                host.set_backdrop_shell_bounds(BOUNDS[0], BOUNDS[1], BOUNDS[2], BOUNDS[3], CUT)
+                    .map(|_| host)
+                    .map_err(|error| error.to_string())
+            });
         self.emit(event_loop, host);
     }
 
@@ -216,5 +212,7 @@ fn main() -> Result<(), String> {
         timeout,
         emitted: false,
     };
-    event_loop.run_app(&mut probe).map_err(|error| error.to_string())
+    event_loop
+        .run_app(&mut probe)
+        .map_err(|error| error.to_string())
 }

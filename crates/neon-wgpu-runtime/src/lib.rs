@@ -20,11 +20,11 @@ use neon_observability::{
 };
 use neon_protocol::{
     AiTerrainGenerateCommand, AiTerrainGenerationResult, AssetBytes, AssetRef, ClientIdentity,
-    ClientKind, HealthStatus, InteractionId, InteractionSemanticTarget, InteractionTraceError,
-    InteractionTraceFilters, InteractionTraceOutcome, InteractionTraceQuery,
-    InteractionTraceRecord, InteractionTraceStage, PROTOCOL_VERSION, RenderBackend,
-    RenderBackendNegotiation, RenderSurfaceKind, RenderSurfaceOpen, RenderSurfaceTargetKind,
-    EditorRevealRange, EditorVisualRevealAck, RequestId, Revision, RpcError, RpcRequest,
+    ClientKind, EditorRevealRange, EditorVisualRevealAck, HealthStatus, InteractionId,
+    InteractionSemanticTarget, InteractionTraceError, InteractionTraceFilters,
+    InteractionTraceOutcome, InteractionTraceQuery, InteractionTraceRecord, InteractionTraceStage,
+    PROTOCOL_VERSION, RenderBackend, RenderBackendNegotiation, RenderSurfaceKind,
+    RenderSurfaceOpen, RenderSurfaceTargetKind, RequestId, Revision, RpcError, RpcRequest,
     RpcResponse, RpcStatus, ServiceDescription, ServiceHealth, ServiceName, UiFileDropPayload,
     UiImageSource, UiImageTextureRef, UiImageTextureRegion, UiImageUploadRequest,
 };
@@ -61,16 +61,18 @@ use serde_json::{Value, json};
 pub struct EditorBridgeHandle {
     pub input_sink: Option<
         Box<
-            dyn FnMut(neon_ui_schema::UiEditorInputEvent, f32)
-                -> Vec<ui_renderer::editor_renderer::EditorCommit>
+            dyn FnMut(
+                    neon_ui_schema::UiEditorInputEvent,
+                    f32,
+                ) -> Vec<ui_renderer::editor_renderer::EditorCommit>
                 + Send,
         >,
     >,
-    pub reveal_sink: Option<Box<dyn FnMut(Value, f32) -> Option<neon_ui_schema::UiCodeEditorPresentation> + Send>>,
-    pub external_presentations:
-        Option<Arc<Mutex<Vec<neon_ui_schema::UiCodeEditorPresentation>>>>,
-    pub fragment_observer:
-        Option<Box<dyn FnMut(&HashMap<UiFragmentId, UiFragment>) + Send>>,
+    pub reveal_sink: Option<
+        Box<dyn FnMut(Value, f32) -> Option<neon_ui_schema::UiCodeEditorPresentation> + Send>,
+    >,
+    pub external_presentations: Option<Arc<Mutex<Vec<neon_ui_schema::UiCodeEditorPresentation>>>>,
+    pub fragment_observer: Option<Box<dyn FnMut(&HashMap<UiFragmentId, UiFragment>) + Send>>,
     pub presentation_refresh: Option<Box<dyn FnMut() + Send>>,
 }
 use winit::{
@@ -259,12 +261,12 @@ mod ui_renderer;
 mod world_ui_pipeline;
 use gpu_preview::HeightmapPreviewConverter;
 pub use ui_program_gpu::GpuUiProgramBackend;
+/// Re-exported for the host editor bridge (`EditorBridgeHandle.input_sink`).
+pub use ui_renderer::editor_renderer::EditorCommit;
 use ui_renderer::{
     LocalPresentationCommit, PendingLocalPresentationKey, UiHitBinding, set_global_view_extras,
 };
 pub use ui_renderer::{UiDrawMode, UiWgpuRenderer};
-/// Re-exported for the host editor bridge (`EditorBridgeHandle.input_sink`).
-pub use ui_renderer::editor_renderer::EditorCommit;
 use world_ui_pipeline::{WorldUiCamera, WorldUiCameraState, WorldUiPipeline};
 
 pub const SERVICE_NAME: &str = "wgpu-runtime";
@@ -1995,7 +1997,9 @@ impl WindowedRuntime {
                 gpu.pending_control_value = None;
                 gpu.input.cancel();
                 self.redraw_pending |= splitter_cancelled;
-                Ok(json!({"state": if splitter_cancelled { "splitter_cancelled" } else { "cancelled" }}))
+                Ok(
+                    json!({"state": if splitter_cancelled { "splitter_cancelled" } else { "cancelled" }}),
+                )
             }
         }
     }
@@ -2239,9 +2243,11 @@ impl WindowedRuntime {
         }
         if let Some(endpoint) = endpoint {
             let interaction_traces = runtime.interaction_traces.clone();
-            let (reveal_sink, fragment_observer) = runtime.editor_bridge.as_mut().map(|bridge| {
-                (bridge.reveal_sink.take(), bridge.fragment_observer.take())
-            }).unwrap_or((None, None));
+            let (reveal_sink, fragment_observer) = runtime
+                .editor_bridge
+                .as_mut()
+                .map(|bridge| (bridge.reveal_sink.take(), bridge.fragment_observer.take()))
+                .unwrap_or((None, None));
             spawn_window_server(
                 epoch,
                 endpoint,
@@ -2272,16 +2278,18 @@ impl WindowedRuntime {
                 std::env::var("NEON_WINDOW_CHROME").as_deref(),
                 Ok("borderless")
             ))
-            .with_fullscreen(if matches!(
-                std::env::var("NEON_WINDOW_FULLSCREEN").as_deref(),
-                Ok("borderless") | Ok("1") | Ok("true")
-            ) {
-                // Official winit borderless fullscreen: the surface fills the
-                // whole monitor and the OS never restores/shrinks it on drag.
-                Some(winit::window::Fullscreen::Borderless(None))
-            } else {
-                None
-            })
+            .with_fullscreen(
+                if matches!(
+                    std::env::var("NEON_WINDOW_FULLSCREEN").as_deref(),
+                    Ok("borderless") | Ok("1") | Ok("true")
+                ) {
+                    // Official winit borderless fullscreen: the surface fills the
+                    // whole monitor and the OS never restores/shrinks it on drag.
+                    Some(winit::window::Fullscreen::Borderless(None))
+                } else {
+                    None
+                },
+            )
             .with_maximized(
                 if matches!(
                     std::env::var("NEON_WINDOW_FULLSCREEN").as_deref(),
@@ -2290,10 +2298,12 @@ impl WindowedRuntime {
                     false
                 } else {
                     std::env::var("NEON_WINDOW_MAXIMIZED")
-                        .map(|value| !matches!(
-                            value.trim().to_ascii_lowercase().as_str(),
-                            "0" | "false" | "off"
-                        ))
+                        .map(|value| {
+                            !matches!(
+                                value.trim().to_ascii_lowercase().as_str(),
+                                "0" | "false" | "off"
+                            )
+                        })
                         .unwrap_or(true)
                 },
             );
@@ -2905,10 +2915,9 @@ impl WindowedRuntime {
                         .shell_window_fit
                         .observe([bounds.width, bounds.height], [logical[0], logical[1]])
                     {
-                        if let Some(accepted) = window.request_inner_size(winit::dpi::LogicalSize::new(
-                            f64::from(fit_w),
-                            f64::from(fit_h),
-                        )) {
+                        if let Some(accepted) = window.request_inner_size(
+                            winit::dpi::LogicalSize::new(f64::from(fit_w), f64::from(fit_h)),
+                        ) {
                             pending_window_resize = Some(accepted);
                         } else {
                             // The window manager did not apply the request; stop
@@ -8821,10 +8830,9 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                     );
                 }
                 if let Some(Ok(released)) = binding {
-                    let popup_item_release = self
-                        .gpu
-                        .as_ref()
-                        .is_some_and(|gpu| gpu.ui.active_popup_contains(&released.binding.node_path));
+                    let popup_item_release = self.gpu.as_ref().is_some_and(|gpu| {
+                        gpu.ui.active_popup_contains(&released.binding.node_path)
+                    });
                     if popup_item_release {
                         if let Some(gpu) = self.gpu.as_mut() {
                             gpu.ui.close_active_popup();
@@ -10013,12 +10021,28 @@ fn handle_window_debug_snapshot(
 
 fn handle_editor_visual_reveal(runtime: &mut WgpuRuntime, request: RpcRequest) -> RpcResponse {
     let Some(sink) = runtime.editor_reveal_sink.as_mut() else {
-        return runtime.reject(request.request_id, "editor_reveal_unavailable", "editor reveal sink is not connected", None);
+        return runtime.reject(
+            request.request_id,
+            "editor_reveal_unavailable",
+            "editor reveal sink is not connected",
+            None,
+        );
     };
     let params = request.params;
-    let path = match params.get("path").and_then(Value::as_str).filter(|v| !v.trim().is_empty()) {
+    let path = match params
+        .get("path")
+        .and_then(Value::as_str)
+        .filter(|v| !v.trim().is_empty())
+    {
         Some(path) => path.to_owned(),
-        None => return runtime.reject(request.request_id, "editor_reveal_path_required", "editor reveal requires an editor node path", None),
+        None => {
+            return runtime.reject(
+                request.request_id,
+                "editor_reveal_path_required",
+                "editor reveal requires an editor node path",
+                None,
+            );
+        }
     };
     let visual_operation_id = match params
         .get("visual_operation_id")
@@ -10026,7 +10050,14 @@ fn handle_editor_visual_reveal(runtime: &mut WgpuRuntime, request: RpcRequest) -
         .filter(|v| !v.trim().is_empty())
     {
         Some(id) => id.to_owned(),
-        None => return runtime.reject(request.request_id, "editor_reveal_operation_required", "editor reveal requires visual_operation_id", None),
+        None => {
+            return runtime.reject(
+                request.request_id,
+                "editor_reveal_operation_required",
+                "editor reveal requires visual_operation_id",
+                None,
+            );
+        }
     };
     let document_id = match params
         .get("document_id")
@@ -10034,18 +10065,42 @@ fn handle_editor_visual_reveal(runtime: &mut WgpuRuntime, request: RpcRequest) -
         .filter(|v| !v.trim().is_empty())
     {
         Some(id) => id.to_owned(),
-        None => return runtime.reject(request.request_id, "editor_reveal_document_required", "editor reveal requires document_id", None),
+        None => {
+            return runtime.reject(
+                request.request_id,
+                "editor_reveal_document_required",
+                "editor reveal requires document_id",
+                None,
+            );
+        }
     };
-    let range = match params.get("range").cloned().and_then(|value| serde_json::from_value::<EditorRevealRange>(value).ok()) {
+    let range = match params
+        .get("range")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<EditorRevealRange>(value).ok())
+    {
         Some(range) if range.is_normalized() => range,
-        _ => return runtime.reject(request.request_id, "editor_reveal_range_invalid", "editor reveal range must use one-based lines and be normalized", None),
+        _ => {
+            return runtime.reject(
+                request.request_id,
+                "editor_reveal_range_invalid",
+                "editor reveal range must use one-based lines and be normalized",
+                None,
+            );
+        }
     };
-    let scalar_range_matches = params.get("line").and_then(Value::as_u64) == Some(range.start_line as u64)
+    let scalar_range_matches = params.get("line").and_then(Value::as_u64)
+        == Some(range.start_line as u64)
         && params.get("column").and_then(Value::as_u64) == Some(range.start_column as u64)
         && params.get("end_line").and_then(Value::as_u64) == Some(range.end_line as u64)
         && params.get("end_column").and_then(Value::as_u64) == Some(range.end_column as u64);
     if !scalar_range_matches {
-        return runtime.reject(request.request_id, "editor_reveal_range_mismatch", "editor reveal scalar range does not match range", None);
+        return runtime.reject(
+            request.request_id,
+            "editor_reveal_range_mismatch",
+            "editor reveal scalar range does not match range",
+            None,
+        );
     }
     let requested_document_revision = params.get("document_revision").and_then(Value::as_u64);
     let line = range.start_line - 1;
@@ -10071,16 +10126,36 @@ fn handle_editor_visual_reveal(runtime: &mut WgpuRuntime, request: RpcRequest) -
     match sink(event, now) {
         Some(presentation) => {
             let Some(document) = presentation.document.as_ref() else {
-                return runtime.reject(request.request_id, "editor_reveal_document_unbound", "editor reveal presentation has no authoritative document binding", None);
+                return runtime.reject(
+                    request.request_id,
+                    "editor_reveal_document_unbound",
+                    "editor reveal presentation has no authoritative document binding",
+                    None,
+                );
             };
             if document.document_id != document_id {
-                return runtime.reject(request.request_id, "editor_reveal_document_mismatch", "editor reveal presentation document does not match request", Some(Revision(document.revision)));
+                return runtime.reject(
+                    request.request_id,
+                    "editor_reveal_document_mismatch",
+                    "editor reveal presentation document does not match request",
+                    Some(Revision(document.revision)),
+                );
             }
             if document.revision == 0 || presentation.revision == 0 {
-                return runtime.reject(request.request_id, "editor_reveal_revision_invalid", "editor reveal requires positive document and presentation revisions", Some(Revision(document.revision)));
+                return runtime.reject(
+                    request.request_id,
+                    "editor_reveal_revision_invalid",
+                    "editor reveal requires positive document and presentation revisions",
+                    Some(Revision(document.revision)),
+                );
             }
             if requested_document_revision.is_some_and(|revision| revision != document.revision) {
-                return runtime.reject(request.request_id, "editor_reveal_revision_conflict", "editor reveal document revision is stale", Some(Revision(document.revision)));
+                return runtime.reject(
+                    request.request_id,
+                    "editor_reveal_revision_conflict",
+                    "editor reveal document revision is stale",
+                    Some(Revision(document.revision)),
+                );
             }
             let ack = EditorVisualRevealAck {
                 state: "revealed".into(),
@@ -10094,13 +10169,19 @@ fn handle_editor_visual_reveal(runtime: &mut WgpuRuntime, request: RpcRequest) -
             result["node_key"] = Value::String(presentation.node_key);
             result["caret_line"] = json!(presentation.caret_line + 1);
             result["caret_column"] = json!(presentation.caret_column);
-            result["selection_anchor_line"] = json!(presentation.selection_anchor_line.map(|v| v + 1));
+            result["selection_anchor_line"] =
+                json!(presentation.selection_anchor_line.map(|v| v + 1));
             result["selection_anchor_column"] = json!(presentation.selection_anchor_column);
             result["scroll_x"] = json!(presentation.scroll_x);
             result["scroll_y"] = json!(presentation.scroll_y);
             runtime.accept(request.request_id, result)
         }
-        None => runtime.reject(request.request_id, "editor_document_not_found", "editor node path is not active", None),
+        None => runtime.reject(
+            request.request_id,
+            "editor_document_not_found",
+            "editor node path is not active",
+            None,
+        ),
     }
 }
 
@@ -10874,7 +10955,9 @@ fn spawn_window_server(
     proxy: EventLoopProxy<WindowCommand>,
     interaction_traces: Arc<Mutex<InteractionTraceStore>>,
     world_ui_lab_camera: Arc<Mutex<WorldUiLabCameraController>>,
-    reveal_sink: Option<Box<dyn FnMut(Value, f32) -> Option<neon_ui_schema::UiCodeEditorPresentation> + Send>>,
+    reveal_sink: Option<
+        Box<dyn FnMut(Value, f32) -> Option<neon_ui_schema::UiCodeEditorPresentation> + Send>,
+    >,
     fragment_observer: Option<Box<dyn FnMut(&HashMap<UiFragmentId, UiFragment>) + Send>>,
 ) {
     thread::spawn(move || {
@@ -10892,7 +10975,10 @@ fn spawn_window_server(
             world_ui_lab_camera,
         )));
         runtime.lock().expect("runtime lock").editor_reveal_sink = reveal_sink;
-        runtime.lock().expect("runtime lock").editor_fragment_observer = fragment_observer;
+        runtime
+            .lock()
+            .expect("runtime lock")
+            .editor_fragment_observer = fragment_observer;
         let handler_proxy = proxy.clone();
         if let Err(error) = server.serve_until(
             move |request| {
@@ -11320,7 +11406,13 @@ fn handle_window_external_pointer(
         );
     }
     match completed_rx.recv_timeout(Duration::from_secs(5)) {
-        Ok(Ok(result)) => { let dt = _t.elapsed(); if dt > std::time::Duration::from_millis(100) { eprintln!("[wgpu] pointer wait main: {:?}", dt); } runtime.accept(request.request_id, result) },
+        Ok(Ok(result)) => {
+            let dt = _t.elapsed();
+            if dt > std::time::Duration::from_millis(100) {
+                eprintln!("[wgpu] pointer wait main: {:?}", dt);
+            }
+            runtime.accept(request.request_id, result)
+        }
         Ok(Err(error)) => runtime.reject(request.request_id, &error, &error, None),
         Err(_) => runtime.reject(
             request.request_id,
@@ -11554,10 +11646,10 @@ pub struct WgpuRuntime {
     /// Host-injected fragment observer for the code-editor bridge
     /// (keeps the ui-runtime editor component registry in sync on headless /
     /// Android single-endpoint sessions).
-    editor_fragment_observer:
-        Option<Box<dyn FnMut(&HashMap<UiFragmentId, UiFragment>) + Send>>,
-    editor_reveal_sink:
-        Option<Box<dyn FnMut(Value, f32) -> Option<neon_ui_schema::UiCodeEditorPresentation> + Send>>,
+    editor_fragment_observer: Option<Box<dyn FnMut(&HashMap<UiFragmentId, UiFragment>) + Send>>,
+    editor_reveal_sink: Option<
+        Box<dyn FnMut(Value, f32) -> Option<neon_ui_schema::UiCodeEditorPresentation> + Send>,
+    >,
     editor_external_presentations:
         Option<Arc<Mutex<Vec<neon_ui_schema::UiCodeEditorPresentation>>>>,
     editor_presentation_refresh: Option<Box<dyn FnMut() + Send>>,
@@ -11625,7 +11717,9 @@ impl WgpuRuntime {
 
     pub fn set_editor_reveal_sink(
         &mut self,
-        sink: Option<Box<dyn FnMut(Value, f32) -> Option<neon_ui_schema::UiCodeEditorPresentation> + Send>>,
+        sink: Option<
+            Box<dyn FnMut(Value, f32) -> Option<neon_ui_schema::UiCodeEditorPresentation> + Send>,
+        >,
     ) {
         self.editor_reveal_sink = sink;
     }
@@ -13486,7 +13580,11 @@ mod tests {
         })
     }
 
-    fn reveal_presentation(document_id: &str, document_revision: u64, presentation_revision: u64) -> neon_ui_schema::UiCodeEditorPresentation {
+    fn reveal_presentation(
+        document_id: &str,
+        document_revision: u64,
+        presentation_revision: u64,
+    ) -> neon_ui_schema::UiCodeEditorPresentation {
         neon_ui_schema::UiCodeEditorPresentation {
             node_key: "editor-source".into(),
             document: Some(neon_ui_schema::UiEditorDocumentBinding {
@@ -13509,7 +13607,10 @@ mod tests {
         runtime.set_editor_reveal_sink(Some(Box::new(|_, _| {
             Some(reveal_presentation("workspace/src/main.rs", 4, 11))
         })));
-        let response = handle_editor_visual_reveal(&mut runtime, request("reveal", "editor.visual.reveal", reveal_params()));
+        let response = handle_editor_visual_reveal(
+            &mut runtime,
+            request("reveal", "editor.visual.reveal", reveal_params()),
+        );
         assert_eq!(response.status, RpcStatus::Accepted);
         let result = response.result.expect("reveal ack result");
         assert_eq!(result["visual_operation_id"], "visual-17");
@@ -13530,12 +13631,21 @@ mod tests {
         })));
         let mut missing_operation = reveal_params();
         missing_operation["visual_operation_id"] = Value::Null;
-        let response = handle_editor_visual_reveal(&mut runtime, request("missing-op", "editor.visual.reveal", missing_operation));
-        assert_eq!(response.error.unwrap().code, "editor_reveal_operation_required");
+        let response = handle_editor_visual_reveal(
+            &mut runtime,
+            request("missing-op", "editor.visual.reveal", missing_operation),
+        );
+        assert_eq!(
+            response.error.unwrap().code,
+            "editor_reveal_operation_required"
+        );
 
         let mut invalid_range = reveal_params();
         invalid_range["range"]["start_line"] = json!(0);
-        let response = handle_editor_visual_reveal(&mut runtime, request("bad-range", "editor.visual.reveal", invalid_range));
+        let response = handle_editor_visual_reveal(
+            &mut runtime,
+            request("bad-range", "editor.visual.reveal", invalid_range),
+        );
         assert_eq!(response.error.unwrap().code, "editor_reveal_range_invalid");
     }
 
@@ -13545,15 +13655,27 @@ mod tests {
         stale_runtime.set_editor_reveal_sink(Some(Box::new(|_, _| {
             Some(reveal_presentation("workspace/src/main.rs", 5, 11))
         })));
-        let response = handle_editor_visual_reveal(&mut stale_runtime, request("stale", "editor.visual.reveal", reveal_params()));
-        assert_eq!(response.error.unwrap().code, "editor_reveal_revision_conflict");
+        let response = handle_editor_visual_reveal(
+            &mut stale_runtime,
+            request("stale", "editor.visual.reveal", reveal_params()),
+        );
+        assert_eq!(
+            response.error.unwrap().code,
+            "editor_reveal_revision_conflict"
+        );
 
         let mut mismatch_runtime = WgpuRuntime::headless(2);
         mismatch_runtime.set_editor_reveal_sink(Some(Box::new(|_, _| {
             Some(reveal_presentation("workspace/src/other.rs", 4, 11))
         })));
-        let response = handle_editor_visual_reveal(&mut mismatch_runtime, request("mismatch", "editor.visual.reveal", reveal_params()));
-        assert_eq!(response.error.unwrap().code, "editor_reveal_document_mismatch");
+        let response = handle_editor_visual_reveal(
+            &mut mismatch_runtime,
+            request("mismatch", "editor.visual.reveal", reveal_params()),
+        );
+        assert_eq!(
+            response.error.unwrap().code,
+            "editor_reveal_document_mismatch"
+        );
     }
 
     fn registered_camera_controller() -> WorldUiLabCameraController {

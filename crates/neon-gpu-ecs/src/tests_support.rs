@@ -30,8 +30,14 @@ pub fn physics_world() -> EcsIr {
         queries: vec![QueryDef {
             id: 0,
             with: vec![
-                ComponentAccess { component_id: 0, access_type: AccessType::ReadWrite },
-                ComponentAccess { component_id: 1, access_type: AccessType::ReadWrite },
+                ComponentAccess {
+                    component_id: 0,
+                    access_type: AccessType::ReadWrite,
+                },
+                ComponentAccess {
+                    component_id: 1,
+                    access_type: AccessType::ReadWrite,
+                },
             ],
             without: vec![],
             filters: vec![],
@@ -40,21 +46,55 @@ pub fn physics_world() -> EcsIr {
             id: 0,
             name: "physics_update".into(),
             query_id: 0,
-            resource_refs: vec![ResourceRef { resource_id: 0, access_type: AccessType::Read }],
+            resource_refs: vec![ResourceRef {
+                resource_id: 0,
+                access_type: AccessType::Read,
+            }],
             local_var_count: 3,
             instructions: vec![
-                Instr::Load { dest: 0, component_id: 0, access: AccessType::ReadWrite },
-                Instr::Load { dest: 1, component_id: 1, access: AccessType::ReadWrite },
-                Instr::LoadResource { dest: 2, resource_id: 0 },
-                Instr::BinaryOp { dest: 1, lhs: 1, rhs: 2, op: BinaryOpCode::Mul },
-                Instr::BinaryOp { dest: 0, lhs: 0, rhs: 1, op: BinaryOpCode::Add },
-                Instr::Store { src: 0, component_id: 0 },
-                Instr::Store { src: 1, component_id: 1 },
+                Instr::Load {
+                    dest: 0,
+                    component_id: 0,
+                    access: AccessType::ReadWrite,
+                },
+                Instr::Load {
+                    dest: 1,
+                    component_id: 1,
+                    access: AccessType::ReadWrite,
+                },
+                Instr::LoadResource {
+                    dest: 2,
+                    resource_id: 0,
+                },
+                Instr::BinaryOp {
+                    dest: 1,
+                    lhs: 1,
+                    rhs: 2,
+                    op: BinaryOpCode::Mul,
+                },
+                Instr::BinaryOp {
+                    dest: 0,
+                    lhs: 0,
+                    rhs: 1,
+                    op: BinaryOpCode::Add,
+                },
+                Instr::Store {
+                    src: 0,
+                    component_id: 0,
+                },
+                Instr::Store {
+                    src: 1,
+                    component_id: 1,
+                },
                 Instr::Return,
             ],
         }],
         schedule: ScheduleDef {
-            stages: vec![Stage { id: 0, name: "Logic".into(), system_ids: vec![0] }],
+            stages: vec![Stage {
+                id: 0,
+                name: "Logic".into(),
+                system_ids: vec![0],
+            }],
         },
     }
 }

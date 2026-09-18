@@ -21,8 +21,8 @@ use neon_protocol::{
     ServiceName,
 };
 use neon_ui_schema::{
-        UiBounds, UiCanvasData, UiCanvasLine, UiClipShape, UiCommand, UiFragment, UiFragmentId,
-    UiFragmentSubmission, UiNode, UiNodeId, UiNodeKind, UiRichTextSpan, UiStyle, TextRef,
+    TextRef, UiBounds, UiCanvasData, UiCanvasLine, UiClipShape, UiCommand, UiFragment,
+    UiFragmentId, UiFragmentSubmission, UiNode, UiNodeId, UiNodeKind, UiRichTextSpan, UiStyle,
 };
 use serde_json::json;
 
@@ -75,7 +75,12 @@ fn label_node(id: &str, x: f32, y: f32, w: f32, h: f32, text: TextRef) -> UiNode
     UiNode {
         node_id: UiNodeId(id.into()),
         kind: UiNodeKind::Label,
-        bounds: UiBounds { x, y, width: w, height: h },
+        bounds: UiBounds {
+            x,
+            y,
+            width: w,
+            height: h,
+        },
         layout: None,
         visible: true,
         enabled: true,
@@ -136,20 +141,74 @@ fn test_fragment() -> UiFragment {
         let top = y + (h - block).max(0.0) * 0.5;
         top + ascent
     };
-    lines.push(hline("s1-baseline", 30.0, baseline1(52.0, 120.0, 3.0), 250.0, guide_red));
-    lines.push(hline("s2-baseline", 310.0, baseline1(52.0, 120.0, 3.0), 250.0, guide_red));
-    lines.push(hline("s3-baseline", 590.0, baseline1(52.0, 120.0, 3.0), 280.0, guide_red));
+    lines.push(hline(
+        "s1-baseline",
+        30.0,
+        baseline1(52.0, 120.0, 3.0),
+        250.0,
+        guide_red,
+    ));
+    lines.push(hline(
+        "s2-baseline",
+        310.0,
+        baseline1(52.0, 120.0, 3.0),
+        250.0,
+        guide_red,
+    ));
+    lines.push(hline(
+        "s3-baseline",
+        590.0,
+        baseline1(52.0, 120.0, 3.0),
+        280.0,
+        guide_red,
+    ));
     // Rich text: max_scale=2.0, line_height=19.344*2=38.688, baseline = top + ascent*2
     {
         let block = line_h * 2.0;
         let top = 228.0 + (60.0 - block).max(0.0) * 0.5;
-        lines.push(hline("s4-baseline", 30.0, top + ascent * 2.0, 840.0, guide_red));
+        lines.push(hline(
+            "s4-baseline",
+            30.0,
+            top + ascent * 2.0,
+            840.0,
+            guide_red,
+        ));
     }
-    lines.push(hline("s5-baseline1", 30.0, baseline1(350.0, 24.0, 1.0), 200.0, guide_red));
-    lines.push(hline("s5-baseline2", 250.0, baseline1(350.0, 24.0, 1.0), 200.0, guide_red));
-    lines.push(hline("s5-baseline3", 470.0, baseline1(350.0, 24.0, 1.0), 200.0, guide_red));
-    lines.push(hline("s6-baseline", 30.0, baseline1(428.0, 80.0, 2.0), 150.0, guide_red));
-    lines.push(hline("s7-baseline", 200.0, baseline1(428.0, 80.0, 4.0), 300.0, guide_red));
+    lines.push(hline(
+        "s5-baseline1",
+        30.0,
+        baseline1(350.0, 24.0, 1.0),
+        200.0,
+        guide_red,
+    ));
+    lines.push(hline(
+        "s5-baseline2",
+        250.0,
+        baseline1(350.0, 24.0, 1.0),
+        200.0,
+        guide_red,
+    ));
+    lines.push(hline(
+        "s5-baseline3",
+        470.0,
+        baseline1(350.0, 24.0, 1.0),
+        200.0,
+        guide_red,
+    ));
+    lines.push(hline(
+        "s6-baseline",
+        30.0,
+        baseline1(428.0, 80.0, 2.0),
+        150.0,
+        guide_red,
+    ));
+    lines.push(hline(
+        "s7-baseline",
+        200.0,
+        baseline1(428.0, 80.0, 4.0),
+        300.0,
+        guide_red,
+    ));
 
     // Section titles (drawn as canvas lines won't show text; use Label nodes)
     let mut children: Vec<UiNode> = vec![
@@ -254,7 +313,12 @@ fn test_fragment() -> UiFragment {
     children.push(UiNode {
         node_id: UiNodeId("guides".into()),
         kind: UiNodeKind::Canvas,
-        bounds: UiBounds { x: 0.0, y: 0.0, width: 900.0, height: 700.0 },
+        bounds: UiBounds {
+            x: 0.0,
+            y: 0.0,
+            width: 900.0,
+            height: 700.0,
+        },
         layout: None,
         visible: true,
         enabled: false,
@@ -276,7 +340,12 @@ fn test_fragment() -> UiFragment {
         root: UiNode {
             node_id: UiNodeId("root".into()),
             kind: UiNodeKind::Panel,
-            bounds: UiBounds { x: 0.0, y: 0.0, width: 900.0, height: 700.0 },
+            bounds: UiBounds {
+                x: 0.0,
+                y: 0.0,
+                width: 900.0,
+                height: 700.0,
+            },
             layout: None,
             visible: true,
             enabled: true,

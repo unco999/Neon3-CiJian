@@ -25,9 +25,9 @@ use neon_ui_schema::{
     UI_PROGRAM_BOUNDED_STRUCTURE_CAPABILITY_NAME, UI_PROGRAM_CAPABILITY_NAME,
     UI_PROGRAM_SCHEMA_VERSION, UI_PROGRAM_SEMANTIC_EVENT_CAPABILITY_NAME,
     UI_PROGRAM_TEXT_REGISTRY_CAPABILITY_NAME, UiBounds, UiCommand, UiCpuViewport, UiFragment,
-    UiFragmentId, UiFragmentSubmission, UiIntent, UiProgramCapability, UiProgramCapabilityOwner,
-    UiProgramCapabilityStatus, UiProgramResource, UiProgramResourceKind, UiProgramRevision,
-    UiSemanticEvent, UiNode, UiNodeKind,
+    UiFragmentId, UiFragmentSubmission, UiIntent, UiNode, UiNodeKind, UiProgramCapability,
+    UiProgramCapabilityOwner, UiProgramCapabilityStatus, UiProgramResource, UiProgramResourceKind,
+    UiProgramRevision, UiSemanticEvent,
 };
 use serde_json::json;
 
@@ -213,8 +213,7 @@ fn main() {
     //    The shared EditorBridge wires the renderer's input sink + the
     //    presentations slot + the fragment observer, so the editor core stays
     //    in the ui-runtime component while the renderer only draws snapshots.
-    let editor_bridge =
-        std::sync::Arc::new(neon_ui_runtime::editor_component::EditorBridge::new());
+    let editor_bridge = std::sync::Arc::new(neon_ui_runtime::editor_component::EditorBridge::new());
 
     // Optional headless self-check: `NEON_DEMO_AUTO_INPUT=1` injects one
     // character 8s after boot straight into the shared EditorBridge, so the
@@ -260,10 +259,7 @@ fn main() {
     };
     let fragment_observer: Box<
         dyn FnMut(
-                &std::collections::HashMap<
-                    neon_ui_schema::UiFragmentId,
-                    neon_ui_schema::UiFragment,
-                >,
+                &std::collections::HashMap<neon_ui_schema::UiFragmentId, neon_ui_schema::UiFragment>,
             ) + Send,
     > = {
         let bridge = editor_bridge.clone();
@@ -570,7 +566,10 @@ fn declare_preview_fallbacks(node: &mut UiNode, resources: &mut Vec<UiProgramRes
     }
 }
 
-fn apply_evaluated_visibility(node: &mut UiNode, visibility: &std::collections::BTreeMap<String, bool>) {
+fn apply_evaluated_visibility(
+    node: &mut UiNode,
+    visibility: &std::collections::BTreeMap<String, bool>,
+) {
     node.visible &= visibility.get(&node.node_id.0).copied().unwrap_or(false);
     for child in &mut node.children {
         apply_evaluated_visibility(child, visibility);

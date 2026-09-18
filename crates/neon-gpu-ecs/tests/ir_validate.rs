@@ -1,8 +1,8 @@
 //! M1 acceptance tests: IR serialization roundtrip, type/byte validation and
 //! rejection of invalid references. Pure CPU, no GPU required.
 
-use neon_gpu_ecs::ir::*;
 use neon_gpu_ecs::EcsError;
+use neon_gpu_ecs::ir::*;
 
 fn comp(id: u32, name: &str, ty: ComponentType) -> ComponentDef {
     ComponentDef {
@@ -38,8 +38,14 @@ fn base_ir() -> EcsIr {
         queries: vec![QueryDef {
             id: 0,
             with: vec![
-                ComponentAccess { component_id: 0, access_type: AccessType::ReadWrite },
-                ComponentAccess { component_id: 1, access_type: AccessType::ReadWrite },
+                ComponentAccess {
+                    component_id: 0,
+                    access_type: AccessType::ReadWrite,
+                },
+                ComponentAccess {
+                    component_id: 1,
+                    access_type: AccessType::ReadWrite,
+                },
             ],
             without: vec![],
             filters: vec![],
@@ -48,21 +54,55 @@ fn base_ir() -> EcsIr {
             id: 0,
             name: "physics_update".to_string(),
             query_id: 0,
-            resource_refs: vec![ResourceRef { resource_id: 0, access_type: AccessType::Read }],
+            resource_refs: vec![ResourceRef {
+                resource_id: 0,
+                access_type: AccessType::Read,
+            }],
             local_var_count: 3,
             instructions: vec![
-                Instr::Load { dest: 0, component_id: 0, access: AccessType::ReadWrite },
-                Instr::Load { dest: 1, component_id: 1, access: AccessType::ReadWrite },
-                Instr::LoadResource { dest: 2, resource_id: 0 },
-                Instr::BinaryOp { dest: 1, lhs: 1, rhs: 2, op: BinaryOpCode::Mul },
-                Instr::BinaryOp { dest: 0, lhs: 0, rhs: 1, op: BinaryOpCode::Add },
-                Instr::Store { src: 0, component_id: 0 },
-                Instr::Store { src: 1, component_id: 1 },
+                Instr::Load {
+                    dest: 0,
+                    component_id: 0,
+                    access: AccessType::ReadWrite,
+                },
+                Instr::Load {
+                    dest: 1,
+                    component_id: 1,
+                    access: AccessType::ReadWrite,
+                },
+                Instr::LoadResource {
+                    dest: 2,
+                    resource_id: 0,
+                },
+                Instr::BinaryOp {
+                    dest: 1,
+                    lhs: 1,
+                    rhs: 2,
+                    op: BinaryOpCode::Mul,
+                },
+                Instr::BinaryOp {
+                    dest: 0,
+                    lhs: 0,
+                    rhs: 1,
+                    op: BinaryOpCode::Add,
+                },
+                Instr::Store {
+                    src: 0,
+                    component_id: 0,
+                },
+                Instr::Store {
+                    src: 1,
+                    component_id: 1,
+                },
                 Instr::Return,
             ],
         }],
         schedule: ScheduleDef {
-            stages: vec![Stage { id: 0, name: "Logic".to_string(), system_ids: vec![0] }],
+            stages: vec![Stage {
+                id: 0,
+                name: "Logic".to_string(),
+                system_ids: vec![0],
+            }],
         },
     }
 }
@@ -101,7 +141,10 @@ fn component_default_value_byte_count_must_match_type() {
     let mut ir = base_ir();
     ir.components[2].default_value = vec![1, 2, 3]; // F32 needs 4 bytes
     let err = ir.validate().unwrap_err();
-    assert!(problems(&err).contains("default_value is 3 bytes, expected 4"), "{err}");
+    assert!(
+        problems(&err).contains("default_value is 3 bytes, expected 4"),
+        "{err}"
+    );
 }
 
 #[test]
@@ -115,7 +158,10 @@ fn component_id_must_match_index() {
 #[test]
 fn query_referencing_unknown_component_is_rejected() {
     let mut ir = base_ir();
-    ir.queries[0].with.push(ComponentAccess { component_id: 42, access_type: AccessType::Read });
+    ir.queries[0].with.push(ComponentAccess {
+        component_id: 42,
+        access_type: AccessType::Read,
+    });
     let err = ir.validate().unwrap_err();
     assert!(problems(&err).contains("unknown component 42"), "{err}");
 }
@@ -155,15 +201,25 @@ fn unscheduled_system_is_rejected() {
         resource_refs: vec![],
         local_var_count: 1,
         instructions: vec![
-            Instr::Load { dest: 0, component_id: 2, access: AccessType::Read },
+            Instr::Load {
+                dest: 0,
+                component_id: 2,
+                access: AccessType::Read,
+            },
             Instr::Return,
         ],
     });
     // The orphan system must also be covered by the query for this test to
     // isolate the scheduling rule.
-    ir.queries[0].with.push(ComponentAccess { component_id: 2, access_type: AccessType::Read });
+    ir.queries[0].with.push(ComponentAccess {
+        component_id: 2,
+        access_type: AccessType::Read,
+    });
     let err = ir.validate().unwrap_err();
-    assert!(problems(&err).contains("not referenced by any stage"), "{err}");
+    assert!(
+        problems(&err).contains("not referenced by any stage"),
+        "{err}"
+    );
 }
 
 #[test]
@@ -178,8 +234,15 @@ fn same_stage_write_conflict_is_rejected() {
         resource_refs: vec![],
         local_var_count: 1,
         instructions: vec![
-            Instr::Load { dest: 0, component_id: 1, access: AccessType::ReadWrite },
-            Instr::Store { src: 0, component_id: 1 },
+            Instr::Load {
+                dest: 0,
+                component_id: 1,
+                access: AccessType::ReadWrite,
+            },
+            Instr::Store {
+                src: 0,
+                component_id: 1,
+            },
             Instr::Return,
         ],
     });
@@ -191,8 +254,11 @@ fn same_stage_write_conflict_is_rejected() {
 #[test]
 fn local_slot_out_of_range_is_rejected() {
     let mut ir = base_ir();
-    ir.systems[0].instructions[0] =
-        Instr::Load { dest: 9, component_id: 0, access: AccessType::ReadWrite };
+    ir.systems[0].instructions[0] = Instr::Load {
+        dest: 9,
+        component_id: 0,
+        access: AccessType::ReadWrite,
+    };
     let err = ir.validate().unwrap_err();
     assert!(problems(&err).contains("local v9 out of range"), "{err}");
 }
@@ -216,11 +282,18 @@ fn load_resource_must_be_declared_in_resource_refs() {
         default_value: vec![0u8; 64],
     });
     // Use resource 1 in the body but forget to declare it in resource_refs.
-    ir.systems[0]
-        .instructions
-        .insert(3, Instr::LoadResource { dest: 2, resource_id: 1 });
+    ir.systems[0].instructions.insert(
+        3,
+        Instr::LoadResource {
+            dest: 2,
+            resource_id: 1,
+        },
+    );
     let err = ir.validate().unwrap_err();
-    assert!(problems(&err).contains("not declared in resource_refs"), "{err}");
+    assert!(
+        problems(&err).contains("not declared in resource_refs"),
+        "{err}"
+    );
 }
 
 #[test]
@@ -254,7 +327,10 @@ fn duplicate_binding_slot_is_rejected() {
         default_value: vec![0u8; 64],
     });
     let err = ir.validate().unwrap_err();
-    assert!(problems(&err).contains("duplicates binding_slot 0"), "{err}");
+    assert!(
+        problems(&err).contains("duplicates binding_slot 0"),
+        "{err}"
+    );
 }
 
 #[test]
@@ -262,5 +338,8 @@ fn component_names_must_be_wgsl_idents() {
     let mut ir = base_ir();
     ir.components[0].name = "my transform".to_string();
     let err = ir.validate().unwrap_err();
-    assert!(problems(&err).contains("not a valid WGSL identifier"), "{err}");
+    assert!(
+        problems(&err).contains("not a valid WGSL identifier"),
+        "{err}"
+    );
 }

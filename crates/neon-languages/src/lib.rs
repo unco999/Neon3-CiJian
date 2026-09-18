@@ -104,9 +104,7 @@ fn apply_keyword_fallback(per_line: &mut [Vec<Span>], text: &str, kind: Language
     }
     let mut offset = 0usize;
     for spans in per_line.iter_mut() {
-        let line_len = text[offset..]
-            .find('\n')
-            .map_or(text.len() - offset, |n| n);
+        let line_len = text[offset..].find('\n').map_or(text.len() - offset, |n| n);
         let line_text = &text[offset..offset + line_len];
         for span in spans.iter_mut() {
             if span.class != TokenClass::Ident {
@@ -140,7 +138,9 @@ fn classify_identifier(node: Node<'_>) -> Option<TokenClass> {
             _ => Some(TokenClass::Type),
         },
         // Field / property names.
-        "field_identifier" | "shorthand_field_identifier" | "property_identifier"
+        "field_identifier"
+        | "shorthand_field_identifier"
+        | "property_identifier"
         | "shorthand_property_identifier_pattern" => Some(TokenClass::Property),
         // Plain identifiers: look at the parent to decide Function/Type/Macro/Ident.
         "identifier" => match parent_kind {
@@ -163,12 +163,7 @@ fn classify_identifier(node: Node<'_>) -> Option<TokenClass> {
 /// Map a named CST node onto a [`TokenClass`] if the node is a leaf-ish
 /// token (keyword / comment / string / number / identifier). Parent nodes are
 /// skipped so spans never overlap.
-fn collect_node(
-    per_line: &mut [Vec<Span>],
-    text: &str,
-    index: &LineIndex,
-    node: Node<'_>,
-) {
+fn collect_node(per_line: &mut [Vec<Span>], text: &str, index: &LineIndex, node: Node<'_>) {
     let kind = node.kind();
     let class = match kind {
         "comment" | "line_comment" | "block_comment" | "comment_block" => {
@@ -181,16 +176,36 @@ fn collect_node(
                 Some(TokenClass::Comment)
             }
         }
-        "string" | "string_literal" | "raw_string_literal" | "char_literal"
-        | "template_string" | "concatenated_string" | "interpreted_string_literal"
-        | "regex_pattern" | "regex" => Some(TokenClass::StringLiteral),
-        "integer_literal" | "float_literal" | "number" | "number_literal"
-        | "numeric_literal" | "decimal_integer_literal" | "hex_integer_literal"
-        | "octal_integer_literal" | "binary_integer_literal" | "decimal_float_literal"
+        "string"
+        | "string_literal"
+        | "raw_string_literal"
+        | "char_literal"
+        | "template_string"
+        | "concatenated_string"
+        | "interpreted_string_literal"
+        | "regex_pattern"
+        | "regex" => Some(TokenClass::StringLiteral),
+        "integer_literal"
+        | "float_literal"
+        | "number"
+        | "number_literal"
+        | "numeric_literal"
+        | "decimal_integer_literal"
+        | "hex_integer_literal"
+        | "octal_integer_literal"
+        | "binary_integer_literal"
+        | "decimal_float_literal"
         | "boolean" => Some(TokenClass::NumericLiteral),
-        "identifier" | "field_identifier" | "type_identifier" | "function_name"
-        | "variable_name" | "property_identifier" | "shorthand_property_identifier"
-        | "shorthand_property_identifier_pattern" | "constant" | "parameter"
+        "identifier"
+        | "field_identifier"
+        | "type_identifier"
+        | "function_name"
+        | "variable_name"
+        | "property_identifier"
+        | "shorthand_property_identifier"
+        | "shorthand_property_identifier_pattern"
+        | "constant"
+        | "parameter"
         | "assignment_identifier" => classify_identifier(node),
         "primitive_type" => Some(TokenClass::Type),
         "lifetime" => Some(TokenClass::Lifetime),
@@ -223,7 +238,13 @@ fn collect_node(
     let start = index.point(text, node.start_byte());
     let end = index.point(text, node.end_byte());
     if start.row == end.row {
-        push_span(per_line, start.row, start.column, end.column - start.column, class);
+        push_span(
+            per_line,
+            start.row,
+            start.column,
+            end.column - start.column,
+            class,
+        );
     } else {
         // Multi-line node (e.g. a triple-quoted or unterminated string):
         // emit the class on every line it touches so continuation lines
@@ -272,7 +293,11 @@ impl SyntaxProvider for RustSyntax {
     }
 
     fn tokenize(&self, buffer: &TextBuffer) -> Vec<LineTokens> {
-        tokenize(buffer, &tree_sitter_rust::LANGUAGE.into(), LanguageKind::Rust)
+        tokenize(
+            buffer,
+            &tree_sitter_rust::LANGUAGE.into(),
+            LanguageKind::Rust,
+        )
     }
 }
 
@@ -284,7 +309,11 @@ impl SyntaxProvider for TypescriptSyntax {
     }
 
     fn tokenize(&self, buffer: &TextBuffer) -> Vec<LineTokens> {
-        tokenize(buffer, &tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(), LanguageKind::Typescript)
+        tokenize(
+            buffer,
+            &tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            LanguageKind::Typescript,
+        )
     }
 }
 
@@ -302,7 +331,6 @@ impl SyntaxProvider for CppSyntax {
 
 /// Register the built-in tree-sitter syntax providers on `registry`.
 pub fn register_builtins(registry: &mut LanguageRegistry) {
-
     registry.register_syntax(LanguageKind::Rust, Arc::new(RustSyntax));
     registry.register_syntax(LanguageKind::Typescript, Arc::new(TypescriptSyntax));
     registry.register_syntax(LanguageKind::Cpp, Arc::new(CppSyntax));
@@ -320,10 +348,7 @@ pub fn default_lsp_configs() -> Vec<(LanguageKind, LspServerConfig)> {
         ),
         (
             LanguageKind::Typescript,
-            LspServerConfig::stdio(
-                "typescript-language-server",
-                vec!["--stdio".into()],
-            ),
+            LspServerConfig::stdio("typescript-language-server", vec!["--stdio".into()]),
         ),
         (
             LanguageKind::Cpp,
@@ -421,12 +446,16 @@ mod tests {
 
     #[test]
     fn rust_keywords_strings_comments() {
-        let buffer = TextBuffer::from_str(
-            "// header\nfn main() {\n  let x = 42;\n  println!(\"ok\");\n}\n",
-        );
+        let buffer =
+            TextBuffer::from_str("// header\nfn main() {\n  let x = 42;\n  println!(\"ok\");\n}\n");
         let tokens = RustSyntax.tokenize(&buffer);
         assert_eq!(tokens.len(), 6); // trailing newline -> final empty line
-        assert!(tokens[0].spans.iter().any(|s| s.class == TokenClass::Comment));
+        assert!(
+            tokens[0]
+                .spans
+                .iter()
+                .any(|s| s.class == TokenClass::Comment)
+        );
         let line1 = &tokens[1].spans;
         assert!(line1.iter().any(|s| s.class == TokenClass::Keyword)); // fn
         let line2 = &tokens[2].spans;
@@ -439,26 +468,47 @@ mod tests {
 
     #[test]
     fn typescript_tokenizes() {
-        let buffer = TextBuffer::from_str(
-            "interface Foo { bar: number }\nconst x: Foo = { bar: 1 };\n",
-        );
+        let buffer =
+            TextBuffer::from_str("interface Foo { bar: number }\nconst x: Foo = { bar: 1 };\n");
         let tokens = TypescriptSyntax.tokenize(&buffer);
         assert_eq!(tokens.len(), 3); // trailing newline -> final empty line
-        assert!(tokens[0].spans.iter().any(|s| s.class == TokenClass::Keyword));
-        assert!(tokens[0].spans.iter().any(|s| s.class == TokenClass::Type
-            || s.class == TokenClass::Ident)); // Foo type name
-        assert!(tokens[1].spans.iter().any(|s| s.class == TokenClass::Keyword));
+        assert!(
+            tokens[0]
+                .spans
+                .iter()
+                .any(|s| s.class == TokenClass::Keyword)
+        );
+        assert!(
+            tokens[0]
+                .spans
+                .iter()
+                .any(|s| s.class == TokenClass::Type || s.class == TokenClass::Ident)
+        ); // Foo type name
+        assert!(
+            tokens[1]
+                .spans
+                .iter()
+                .any(|s| s.class == TokenClass::Keyword)
+        );
     }
 
     #[test]
     fn cpp_tokenizes() {
-        let buffer = TextBuffer::from_str(
-            "#include <vector>\nint main() { return 0; }\n",
-        );
+        let buffer = TextBuffer::from_str("#include <vector>\nint main() { return 0; }\n");
         let tokens = CppSyntax.tokenize(&buffer);
         assert_eq!(tokens.len(), 3); // trailing newline -> final empty line
-        assert!(tokens[1].spans.iter().any(|s| s.class == TokenClass::Keyword));
-        assert!(tokens[1].spans.iter().any(|s| s.class == TokenClass::NumericLiteral));
+        assert!(
+            tokens[1]
+                .spans
+                .iter()
+                .any(|s| s.class == TokenClass::Keyword)
+        );
+        assert!(
+            tokens[1]
+                .spans
+                .iter()
+                .any(|s| s.class == TokenClass::NumericLiteral)
+        );
     }
 
     #[test]
@@ -471,9 +521,7 @@ mod tests {
         assert!(registry.syntax(LanguageKind::NuiFlow).is_none()); // built into kernel
         assert!(registry.lsp(LanguageKind::Typescript).is_some());
         assert_eq!(
-            registry
-                .lsp(LanguageKind::Rust)
-                .map(|c| c.command.as_str()),
+            registry.lsp(LanguageKind::Rust).map(|c| c.command.as_str()),
             Some("rust-analyzer")
         );
     }

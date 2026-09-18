@@ -2118,17 +2118,15 @@ pub struct UiWgpuRenderer {
     /// where editor interaction is disabled).
     editor_input_sink: Option<
         Box<
-            dyn FnMut(neon_ui_schema::UiEditorInputEvent, f32)
-                -> Vec<editor_renderer::EditorCommit>
+            dyn FnMut(neon_ui_schema::UiEditorInputEvent, f32) -> Vec<editor_renderer::EditorCommit>
                 + Send,
         >,
     >,
     /// Shared slot where the host's ui-runtime editor component publishes
     /// fresh presentations (after handling input). The renderer merges these
     /// into `reconcile_editors` ahead of the fragment's own effect.
-    editor_external_presentations: Option<
-        std::sync::Arc<std::sync::Mutex<Vec<neon_ui_schema::UiCodeEditorPresentation>>>,
-    >,
+    editor_external_presentations:
+        Option<std::sync::Arc<std::sync::Mutex<Vec<neon_ui_schema::UiCodeEditorPresentation>>>>,
     editor_presentation_refresh: Option<Box<dyn FnMut() + Send>>,
 }
 
@@ -2308,12 +2306,10 @@ impl UiWgpuRenderer {
             } else {
                 "let uv = input.uv;"
             };
-            let source =
-                format!("{TEXT_MATERIAL_SHADER_PREFIX}\n{source}\n{}",
-                    TEXT_MATERIAL_SHADER_SUFFIX.replace(
-                        "// @@TEXT_MATERIAL_SAMPLE_UV@@",
-                        sample_line,
-                    ));
+            let source = format!(
+                "{TEXT_MATERIAL_SHADER_PREFIX}\n{source}\n{}",
+                TEXT_MATERIAL_SHADER_SUFFIX.replace("// @@TEXT_MATERIAL_SAMPLE_UV@@", sample_line,)
+            );
             let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some(&format!("neon3-ui-text-material-{}", package.package_id)),
                 source: wgpu::ShaderSource::Wgsl(source.into()),
@@ -4675,12 +4671,10 @@ impl UiWgpuRenderer {
                 Some(UiControlPresentation::Toggle { selected }) => Some(*selected),
                 _ => None,
             })
-            .or_else(|| self.is_treeview_child(node_path).then(|| {
-                self.builtin_toggles
-                    .get(node_path)
-                    .copied()
-                    .unwrap_or(true)
-            }))?;
+            .or_else(|| {
+                self.is_treeview_child(node_path)
+                    .then(|| self.builtin_toggles.get(node_path).copied().unwrap_or(true))
+            })?;
         let new_selected = !selected;
         let value = UiSemanticPayloadValue::Bool {
             value: new_selected,
@@ -4715,31 +4709,34 @@ impl UiWgpuRenderer {
         let Some(pointer) = self.pointer_position else {
             return false;
         };
-        let Some((menu_bar_id, popup_id)) = self
-            .plan
-            .iter()
-            .enumerate()
-            .rev()
-            .find_map(|(index, node)| {
-                let parent_id = node.parent_id.as_deref()?;
-                let parent = self.plan.iter().find(|candidate| candidate.id == parent_id)?;
-                if parent.target.kind != UiNodeKind::MenuBar
-                    || node.target.kind == UiNodeKind::Popup
-                    || !contains(self.visual_at(index).bounds, pointer)
-                    || !contains(self.visual_at(index).clip, pointer)
-                {
-                    return None;
-                }
-                let popup = self
-                    .plan
-                    .iter()
-                    .find(|candidate| {
-                        candidate.parent_id.as_deref() == Some(parent_id)
-                            && candidate.target.kind == UiNodeKind::Popup
-                    })
-                    .map(|candidate| candidate.id.clone())?;
-                Some((parent_id.to_owned(), popup))
-            })
+        let Some((menu_bar_id, popup_id)) =
+            self.plan
+                .iter()
+                .enumerate()
+                .rev()
+                .find_map(|(index, node)| {
+                    let parent_id = node.parent_id.as_deref()?;
+                    let parent = self
+                        .plan
+                        .iter()
+                        .find(|candidate| candidate.id == parent_id)?;
+                    if parent.target.kind != UiNodeKind::MenuBar
+                        || node.target.kind == UiNodeKind::Popup
+                        || !contains(self.visual_at(index).bounds, pointer)
+                        || !contains(self.visual_at(index).clip, pointer)
+                    {
+                        return None;
+                    }
+                    let popup = self
+                        .plan
+                        .iter()
+                        .find(|candidate| {
+                            candidate.parent_id.as_deref() == Some(parent_id)
+                                && candidate.target.kind == UiNodeKind::Popup
+                        })
+                        .map(|candidate| candidate.id.clone())?;
+                    Some((parent_id.to_owned(), popup))
+                })
         else {
             return false;
         };
@@ -4830,7 +4827,10 @@ impl UiWgpuRenderer {
             .rev()
             .find_map(|(index, node)| {
                 let parent_id = node.parent_id.as_deref()?;
-                let parent = self.plan.iter().find(|candidate| candidate.id == parent_id)?;
+                let parent = self
+                    .plan
+                    .iter()
+                    .find(|candidate| candidate.id == parent_id)?;
                 if parent.target.kind != UiNodeKind::Accordion
                     || !contains(self.visual_at(index).bounds, pointer)
                     || !contains(self.visual_at(index).clip, pointer)
@@ -6252,13 +6252,10 @@ impl UiWgpuRenderer {
     fn has_editor_activity(&self) -> bool {
         self.editors.values().any(|state| {
             state.layout_dirty
-                || state
-                    .edit_fx
-                    .iter()
-                    .any(|fx| {
-                        fx.started_seconds + fx.duration_ms as f32 / 1000.0
-                            > self.animation_clock_seconds
-                    })
+                || state.edit_fx.iter().any(|fx| {
+                    fx.started_seconds + fx.duration_ms as f32 / 1000.0
+                        > self.animation_clock_seconds
+                })
         })
     }
 
@@ -6311,8 +6308,7 @@ impl UiWgpuRenderer {
         let mut active_edit_fx = false;
         for state in self.editors.values_mut() {
             state.edit_fx.retain(|fx| {
-                let alive =
-                    time_seconds - fx.started_seconds < fx.duration_ms as f32 / 1000.0;
+                let alive = time_seconds - fx.started_seconds < fx.duration_ms as f32 / 1000.0;
                 active_edit_fx |= alive;
                 alive
             });
@@ -10636,8 +10632,7 @@ impl UiWgpuRenderer {
         let hidden_popup_ids: HashSet<String> = nodes
             .iter()
             .filter(|(id, _, target, _)| {
-                matches!(target.kind, UiNodeKind::Popup)
-                    && !is_active_popup(id)
+                matches!(target.kind, UiNodeKind::Popup) && !is_active_popup(id)
             })
             .map(|(id, _, _, _)| id.clone())
             .collect();
@@ -15652,8 +15647,7 @@ fn flatten_node(
     // ContextMenu and Popup nodes are always included in the flattened list;
     // their actual visibility is controlled by the active popup filters that
     // run after flattening. Other invisible nodes are skipped here.
-    if (!node.visible
-        && !matches!(node.kind, UiNodeKind::ContextMenu | UiNodeKind::Popup))
+    if (!node.visible && !matches!(node.kind, UiNodeKind::ContextMenu | UiNodeKind::Popup))
         || hidden_world_nodes.contains(node.node_id.0.as_str())
     {
         return;
@@ -16710,7 +16704,10 @@ mod tests {
                 "pass": pass,
             })
         );
-        assert!(pass, "text material overflow must not expand the parent clip");
+        assert!(
+            pass,
+            "text material overflow must not expand the parent clip"
+        );
     }
 
     #[test]

@@ -1,9 +1,9 @@
 //! M7 acceptance tests: RenderData systems write the shared instance buffer;
 //! the rendered instance count equals the RenderData query's compacted count.
 
+use neon_gpu_ecs::GpuEcsCtx;
 use neon_gpu_ecs::generator::bind_layout;
 use neon_gpu_ecs::ir::*;
-use neon_gpu_ecs::GpuEcsCtx;
 
 const MAX_ENTITIES: u32 = 16;
 
@@ -60,7 +60,10 @@ fn read_f32s(bytes: &[u8]) -> Vec<f32> {
 fn render_data_world() -> EcsIr {
     EcsIr {
         version: 1,
-        components: vec![comp(0, "Transform", ComponentType::Vec3F), comp(1, "Health", ComponentType::F32)],
+        components: vec![
+            comp(0, "Transform", ComponentType::Vec3F),
+            comp(1, "Health", ComponentType::F32),
+        ],
         resources: vec![],
         initial_entities: vec![EntityPrototype {
             component_ids: vec![0, 1],
@@ -70,8 +73,14 @@ fn render_data_world() -> EcsIr {
         queries: vec![QueryDef {
             id: 0,
             with: vec![
-                ComponentAccess { component_id: 0, access_type: AccessType::Read },
-                ComponentAccess { component_id: 1, access_type: AccessType::Read },
+                ComponentAccess {
+                    component_id: 0,
+                    access_type: AccessType::Read,
+                },
+                ComponentAccess {
+                    component_id: 1,
+                    access_type: AccessType::Read,
+                },
             ],
             without: vec![],
             filters: vec![QueryFilter::RenderData],
@@ -84,36 +93,66 @@ fn render_data_world() -> EcsIr {
             local_var_count: 6,
             instructions: vec![
                 // v0 = pos
-                Instr::Load { dest: 0, component_id: 0, access: AccessType::Read },
+                Instr::Load {
+                    dest: 0,
+                    component_id: 0,
+                    access: AccessType::Read,
+                },
                 // v1 = vec4(pos, 1.0)
-                Instr::Const { dest: 1, ty: ComponentType::F32, bytes: 1.0f32.to_le_bytes().to_vec() },
-                Instr::CallBuiltin { dest: 2, func: BuiltinFunc::Length, args: vec![0] }, // v2 = |pos| (scalar use)
+                Instr::Const {
+                    dest: 1,
+                    ty: ComponentType::F32,
+                    bytes: 1.0f32.to_le_bytes().to_vec(),
+                },
+                Instr::CallBuiltin {
+                    dest: 2,
+                    func: BuiltinFunc::Length,
+                    args: vec![0],
+                }, // v2 = |pos| (scalar use)
                 // Build transform vector via three Const + arithmetic is awkward;
                 // instead reuse pos through a vec4 by packing manually:
-                Instr::Const { dest: 3, ty: ComponentType::Vec4F, bytes: {
-                    let mut v = Vec::new();
-                    v.extend_from_slice(&0f32.to_le_bytes());
-                    v.extend_from_slice(&0f32.to_le_bytes());
-                    v.extend_from_slice(&0f32.to_le_bytes());
-                    v.extend_from_slice(&1f32.to_le_bytes());
-                    v
-                } },
-                Instr::StoreRender { src: 3, field: RenderField::Transform },
+                Instr::Const {
+                    dest: 3,
+                    ty: ComponentType::Vec4F,
+                    bytes: {
+                        let mut v = Vec::new();
+                        v.extend_from_slice(&0f32.to_le_bytes());
+                        v.extend_from_slice(&0f32.to_le_bytes());
+                        v.extend_from_slice(&0f32.to_le_bytes());
+                        v.extend_from_slice(&1f32.to_le_bytes());
+                        v
+                    },
+                },
+                Instr::StoreRender {
+                    src: 3,
+                    field: RenderField::Transform,
+                },
                 // color = green
-                Instr::Const { dest: 4, ty: ComponentType::Vec4F, bytes: {
-                    let mut v = Vec::new();
-                    v.extend_from_slice(&0f32.to_le_bytes());
-                    v.extend_from_slice(&1f32.to_le_bytes());
-                    v.extend_from_slice(&0f32.to_le_bytes());
-                    v.extend_from_slice(&1f32.to_le_bytes());
-                    v
-                } },
-                Instr::StoreRender { src: 4, field: RenderField::Color },
+                Instr::Const {
+                    dest: 4,
+                    ty: ComponentType::Vec4F,
+                    bytes: {
+                        let mut v = Vec::new();
+                        v.extend_from_slice(&0f32.to_le_bytes());
+                        v.extend_from_slice(&1f32.to_le_bytes());
+                        v.extend_from_slice(&0f32.to_le_bytes());
+                        v.extend_from_slice(&1f32.to_le_bytes());
+                        v
+                    },
+                },
+                Instr::StoreRender {
+                    src: 4,
+                    field: RenderField::Color,
+                },
                 Instr::Return,
             ],
         }],
         schedule: ScheduleDef {
-            stages: vec![Stage { id: 0, name: "RenderData".into(), system_ids: vec![0] }],
+            stages: vec![Stage {
+                id: 0,
+                name: "RenderData".into(),
+                system_ids: vec![0],
+            }],
         },
     }
 }
@@ -167,8 +206,14 @@ fn health_change_reflected_in_render_data() {
     ir.queries.push(QueryDef {
         id: 1,
         with: vec![
-            ComponentAccess { component_id: 0, access_type: AccessType::Read },
-            ComponentAccess { component_id: 1, access_type: AccessType::Write },
+            ComponentAccess {
+                component_id: 0,
+                access_type: AccessType::Read,
+            },
+            ComponentAccess {
+                component_id: 1,
+                access_type: AccessType::Write,
+            },
         ],
         without: vec![],
         filters: vec![],
@@ -180,16 +225,26 @@ fn health_change_reflected_in_render_data() {
         resource_refs: vec![],
         local_var_count: 2,
         instructions: vec![
-            Instr::Const { dest: 0, ty: ComponentType::F32, bytes: 42.0f32.to_le_bytes().to_vec() },
-            Instr::Store { src: 0, component_id: 1 },
+            Instr::Const {
+                dest: 0,
+                ty: ComponentType::F32,
+                bytes: 42.0f32.to_le_bytes().to_vec(),
+            },
+            Instr::Store {
+                src: 0,
+                component_id: 1,
+            },
             Instr::Return,
         ],
     });
-    ir.schedule.stages.insert(0, Stage {
-        id: 0,
-        name: "Heal".into(),
-        system_ids: vec![1],
-    });
+    ir.schedule.stages.insert(
+        0,
+        Stage {
+            id: 0,
+            name: "Heal".into(),
+            system_ids: vec![1],
+        },
+    );
     // Re-number the stage ids to stay consistent with validation.
     for (i, stage) in ir.schedule.stages.iter_mut().enumerate() {
         stage.id = i as u32;
@@ -201,9 +256,8 @@ fn health_change_reflected_in_render_data() {
     ctx.run_frame();
 
     // Health must now read back 42 for all entities.
-    let health = read_f32s(&ctx.read_buffer_blocking(
-        &ctx.component_buffers[1].0,
-        MAX_ENTITIES as usize * 4,
-    ));
+    let health = read_f32s(
+        &ctx.read_buffer_blocking(&ctx.component_buffers[1].0, MAX_ENTITIES as usize * 4),
+    );
     assert_eq!(&health[..3], &[42.0, 42.0, 42.0]);
 }

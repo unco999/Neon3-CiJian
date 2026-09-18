@@ -37,19 +37,19 @@ const CLASS_DOCUMENTATION: &str = "Documentation";
 /// One token class's default One Dark color (RGB 0..1).
 fn one_dark_token(class: &str) -> [f32; 3] {
     match class {
-        CLASS_KEYWORD => [0.78, 0.55, 0.91],        // #C678DD
-        CLASS_NODE_KIND => [0.31, 0.76, 1.0],       // #4FC1FF
-        CLASS_NODE_KEY => [0.90, 0.75, 0.48],       // #E5C07B
-        CLASS_ATTRIBUTE => [0.34, 0.71, 0.76],      // #56B6C2
-        CLASS_INPUT_REF => [0.38, 0.69, 0.94],      // #61AFEF
-        CLASS_COLOR_LITERAL => [0.82, 0.60, 0.40],  // #D19A66
+        CLASS_KEYWORD => [0.78, 0.55, 0.91],       // #C678DD
+        CLASS_NODE_KIND => [0.31, 0.76, 1.0],      // #4FC1FF
+        CLASS_NODE_KEY => [0.90, 0.75, 0.48],      // #E5C07B
+        CLASS_ATTRIBUTE => [0.34, 0.71, 0.76],     // #56B6C2
+        CLASS_INPUT_REF => [0.38, 0.69, 0.94],     // #61AFEF
+        CLASS_COLOR_LITERAL => [0.82, 0.60, 0.40], // #D19A66
         CLASS_NUMERIC_LITERAL => [0.82, 0.60, 0.40],
         CLASS_STRING_LITERAL => [0.60, 0.76, 0.47], // #98C379
         CLASS_INTENT => [0.78, 0.47, 0.87],         // #C678DD
         CLASS_COMMENT => [0.36, 0.39, 0.44],        // #5C6370
         CLASS_IDENT => [0.67, 0.70, 0.75],          // #ABB2BF
         CLASS_TYPE => [0.90, 0.75, 0.48],           // #E5C07B (yellow)
-        CLASS_FUNCTION => [0.38, 0.69, 0.94],      // #61AFEF (blue)
+        CLASS_FUNCTION => [0.38, 0.69, 0.94],       // #61AFEF (blue)
         CLASS_MACRO => [0.82, 0.60, 0.40],          // #D19A66 (orange)
         CLASS_PROPERTY => [0.34, 0.71, 0.76],       // #56B6C2 (cyan)
         CLASS_LIFETIME => [0.88, 0.42, 0.46],       // #E06C75 (red)

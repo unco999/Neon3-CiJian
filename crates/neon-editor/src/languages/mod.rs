@@ -89,8 +89,7 @@ impl Language {
                 let mut tokens = Vec::with_capacity(buffer.line_count() as usize);
                 let mut state = Default::default();
                 for line in buffer.lines() {
-                    let line_tokens =
-                        crate::highlight::tokenize_line(line, state, &grammar);
+                    let line_tokens = crate::highlight::tokenize_line(line, state, &grammar);
                     state = line_tokens.state;
                     tokens.push(line_tokens);
                 }
@@ -154,13 +153,17 @@ mod tests {
         );
         let tokens = Language::nui_flow().tokenize(&buffer);
         assert_eq!(tokens.len(), 4); // trailing newline -> final empty line
-        assert!(tokens[1]
-            .spans
-            .iter()
-            .any(|s| s.class == TokenClass::Keyword)); // surface
-        assert!(tokens[2]
-            .spans
-            .iter()
-            .any(|s| s.class == TokenClass::NodeKind)); // text
+        assert!(
+            tokens[1]
+                .spans
+                .iter()
+                .any(|s| s.class == TokenClass::Keyword)
+        ); // surface
+        assert!(
+            tokens[2]
+                .spans
+                .iter()
+                .any(|s| s.class == TokenClass::NodeKind)
+        ); // text
     }
 }

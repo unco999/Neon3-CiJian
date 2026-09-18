@@ -1,4 +1,4 @@
-use neon_android_host::{capabilities, HostConfig, HostDiagnostics, HostLifecycle};
+use neon_android_host::{HostConfig, HostDiagnostics, HostLifecycle, capabilities};
 use serde_json::json;
 
 fn main() {

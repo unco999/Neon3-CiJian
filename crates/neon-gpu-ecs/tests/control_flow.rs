@@ -2,10 +2,10 @@
 //! counter state machine. Every pattern gets a text snapshot assertion and a
 //! headless `create_shader_module` compilation check.
 
+use neon_gpu_ecs::EcsError;
 use neon_gpu_ecs::generator::generate_wgsl;
 use neon_gpu_ecs::ir::*;
 use neon_gpu_ecs::tests_support::physics_world;
-use neon_gpu_ecs::EcsError;
 
 /// Base IR with a single Health-only read/write query and no systems yet.
 fn control_world() -> EcsIr {
@@ -13,7 +13,10 @@ fn control_world() -> EcsIr {
     // Add a query/system pair focused on Health (F32).
     ir.queries.push(QueryDef {
         id: 1,
-        with: vec![ComponentAccess { component_id: 2, access_type: AccessType::ReadWrite }],
+        with: vec![ComponentAccess {
+            component_id: 2,
+            access_type: AccessType::ReadWrite,
+        }],
         without: vec![],
         filters: vec![],
     });
@@ -57,21 +60,57 @@ fn generate(ir: &EcsIr) -> String {
 fn simple_if_else_lowers_to_state_machine() {
     let mut ir = control_world();
     // if (health > 50) { health = 100 } else { health = 0 }
-    add_system(&mut ir, "heal", 3, vec![
-        Instr::Load { dest: 0, component_id: 2, access: AccessType::ReadWrite },
-        Instr::Const { dest: 1, ty: ComponentType::F32, bytes: f32_bytes(50.0) },
-        Instr::Compare { dest: 2, lhs: 0, rhs: 1, cond: CompareOp::Greater },
-        Instr::If { cond: 2, true_block: 4, false_block: 7 },
-        // then: store 100
-        Instr::Const { dest: 0, ty: ComponentType::F32, bytes: f32_bytes(100.0) },
-        Instr::Store { src: 0, component_id: 2 },
-        Instr::Jump { target: 9 },
-        // else: store 0
-        Instr::Const { dest: 0, ty: ComponentType::F32, bytes: f32_bytes(0.0) },
-        Instr::Store { src: 0, component_id: 2 },
-        // implicit final return
-        Instr::Return,
-    ]);
+    add_system(
+        &mut ir,
+        "heal",
+        3,
+        vec![
+            Instr::Load {
+                dest: 0,
+                component_id: 2,
+                access: AccessType::ReadWrite,
+            },
+            Instr::Const {
+                dest: 1,
+                ty: ComponentType::F32,
+                bytes: f32_bytes(50.0),
+            },
+            Instr::Compare {
+                dest: 2,
+                lhs: 0,
+                rhs: 1,
+                cond: CompareOp::Greater,
+            },
+            Instr::If {
+                cond: 2,
+                true_block: 4,
+                false_block: 7,
+            },
+            // then: store 100
+            Instr::Const {
+                dest: 0,
+                ty: ComponentType::F32,
+                bytes: f32_bytes(100.0),
+            },
+            Instr::Store {
+                src: 0,
+                component_id: 2,
+            },
+            Instr::Jump { target: 9 },
+            // else: store 0
+            Instr::Const {
+                dest: 0,
+                ty: ComponentType::F32,
+                bytes: f32_bytes(0.0),
+            },
+            Instr::Store {
+                src: 0,
+                component_id: 2,
+            },
+            // implicit final return
+            Instr::Return,
+        ],
+    );
     let wgsl = generate(&ir);
     assert!(wgsl.contains("var ecs_pc : u32 = 0u;"));
     assert!(wgsl.contains("loop {"));
@@ -87,25 +126,72 @@ fn simple_if_else_lowers_to_state_machine() {
 fn counter_loop_lowers_to_state_machine() {
     let mut ir = control_world();
     // i = 0; loop { if (i < 3) { health += 1; i += 1; jump back } else return }
-    add_system(&mut ir, "tick_three", 5, vec![
-        // 0: i = 0
-        Instr::Const { dest: 0, ty: ComponentType::U32, bytes: 0u32.to_le_bytes().to_vec() },
-        // 1: loop head
-        Instr::Const { dest: 1, ty: ComponentType::U32, bytes: 3u32.to_le_bytes().to_vec() },
-        Instr::Compare { dest: 2, lhs: 0, rhs: 1, cond: CompareOp::Less },
-        Instr::If { cond: 2, true_block: 4, false_block: 11 },
-        // 4: body
-        Instr::Load { dest: 3, component_id: 2, access: AccessType::ReadWrite },
-        Instr::Const { dest: 4, ty: ComponentType::F32, bytes: f32_bytes(1.0) },
-        Instr::BinaryOp { dest: 3, lhs: 3, rhs: 4, op: BinaryOpCode::Add },
-        Instr::Store { src: 3, component_id: 2 },
-        Instr::Const { dest: 1, ty: ComponentType::U32, bytes: 1u32.to_le_bytes().to_vec() },
-        // 9: i += 1 -> jump back to loop head
-        Instr::BinaryOp { dest: 0, lhs: 0, rhs: 1, op: BinaryOpCode::Add },
-        Instr::Jump { target: 1 },
-        // 11: exit
-        Instr::Return,
-    ]);
+    add_system(
+        &mut ir,
+        "tick_three",
+        5,
+        vec![
+            // 0: i = 0
+            Instr::Const {
+                dest: 0,
+                ty: ComponentType::U32,
+                bytes: 0u32.to_le_bytes().to_vec(),
+            },
+            // 1: loop head
+            Instr::Const {
+                dest: 1,
+                ty: ComponentType::U32,
+                bytes: 3u32.to_le_bytes().to_vec(),
+            },
+            Instr::Compare {
+                dest: 2,
+                lhs: 0,
+                rhs: 1,
+                cond: CompareOp::Less,
+            },
+            Instr::If {
+                cond: 2,
+                true_block: 4,
+                false_block: 11,
+            },
+            // 4: body
+            Instr::Load {
+                dest: 3,
+                component_id: 2,
+                access: AccessType::ReadWrite,
+            },
+            Instr::Const {
+                dest: 4,
+                ty: ComponentType::F32,
+                bytes: f32_bytes(1.0),
+            },
+            Instr::BinaryOp {
+                dest: 3,
+                lhs: 3,
+                rhs: 4,
+                op: BinaryOpCode::Add,
+            },
+            Instr::Store {
+                src: 3,
+                component_id: 2,
+            },
+            Instr::Const {
+                dest: 1,
+                ty: ComponentType::U32,
+                bytes: 1u32.to_le_bytes().to_vec(),
+            },
+            // 9: i += 1 -> jump back to loop head
+            Instr::BinaryOp {
+                dest: 0,
+                lhs: 0,
+                rhs: 1,
+                op: BinaryOpCode::Add,
+            },
+            Instr::Jump { target: 1 },
+            // 11: exit
+            Instr::Return,
+        ],
+    );
     let wgsl = generate(&ir);
     // The back edge lands as `ecs_pc = <case>; break;` inside the loop.
     assert!(wgsl.matches("ecs_pc =").count() >= 3);
@@ -118,21 +204,66 @@ fn counter_loop_lowers_to_state_machine() {
 fn branch_to_fallthrough_block_falls_into_next_case() {
     let mut ir = control_world();
     // if (health > 0) { } else { health = 1 }; health = health + 1
-    add_system(&mut ir, "join_flow", 3, vec![
-        Instr::Load { dest: 0, component_id: 2, access: AccessType::ReadWrite },
-        Instr::Const { dest: 1, ty: ComponentType::F32, bytes: f32_bytes(0.0) },
-        Instr::Compare { dest: 2, lhs: 0, rhs: 1, cond: CompareOp::Greater },
-        Instr::If { cond: 2, true_block: 6, false_block: 4 },
-        // 4: else branch
-        Instr::Const { dest: 0, ty: ComponentType::F32, bytes: f32_bytes(1.0) },
-        Instr::Store { src: 0, component_id: 2 },
-        // 6: join block WITHOUT terminator -> falls through to block 7
-        Instr::Load { dest: 0, component_id: 2, access: AccessType::ReadWrite },
-        Instr::Const { dest: 1, ty: ComponentType::F32, bytes: f32_bytes(1.0) },
-        Instr::BinaryOp { dest: 0, lhs: 0, rhs: 1, op: BinaryOpCode::Add },
-        Instr::Store { src: 0, component_id: 2 },
-        Instr::Return,
-    ]);
+    add_system(
+        &mut ir,
+        "join_flow",
+        3,
+        vec![
+            Instr::Load {
+                dest: 0,
+                component_id: 2,
+                access: AccessType::ReadWrite,
+            },
+            Instr::Const {
+                dest: 1,
+                ty: ComponentType::F32,
+                bytes: f32_bytes(0.0),
+            },
+            Instr::Compare {
+                dest: 2,
+                lhs: 0,
+                rhs: 1,
+                cond: CompareOp::Greater,
+            },
+            Instr::If {
+                cond: 2,
+                true_block: 6,
+                false_block: 4,
+            },
+            // 4: else branch
+            Instr::Const {
+                dest: 0,
+                ty: ComponentType::F32,
+                bytes: f32_bytes(1.0),
+            },
+            Instr::Store {
+                src: 0,
+                component_id: 2,
+            },
+            // 6: join block WITHOUT terminator -> falls through to block 7
+            Instr::Load {
+                dest: 0,
+                component_id: 2,
+                access: AccessType::ReadWrite,
+            },
+            Instr::Const {
+                dest: 1,
+                ty: ComponentType::F32,
+                bytes: f32_bytes(1.0),
+            },
+            Instr::BinaryOp {
+                dest: 0,
+                lhs: 0,
+                rhs: 1,
+                op: BinaryOpCode::Add,
+            },
+            Instr::Store {
+                src: 0,
+                component_id: 2,
+            },
+            Instr::Return,
+        ],
+    );
     let wgsl = generate(&ir);
     // The join block emits `ecs_pc = <next case>u; break;`.
     assert!(wgsl.matches("case ").count() >= 3);
@@ -144,25 +275,74 @@ fn branch_to_fallthrough_block_falls_into_next_case() {
 fn nested_if_lowers_to_state_machine() {
     let mut ir = control_world();
     // if (health > 50) { if (health > 80) { health = 200 } else { health = 100 } }
-    add_system(&mut ir, "nested", 4, vec![
-        Instr::Load { dest: 0, component_id: 2, access: AccessType::ReadWrite },
-        Instr::Const { dest: 1, ty: ComponentType::F32, bytes: f32_bytes(50.0) },
-        Instr::Compare { dest: 2, lhs: 0, rhs: 1, cond: CompareOp::Greater },
-        Instr::If { cond: 2, true_block: 4, false_block: 12 },
-        // outer then
-        Instr::Const { dest: 1, ty: ComponentType::F32, bytes: f32_bytes(80.0) },
-        Instr::Compare { dest: 2, lhs: 0, rhs: 1, cond: CompareOp::Greater },
-        Instr::If { cond: 2, true_block: 7, false_block: 10 },
-        // inner then: 200
-        Instr::Const { dest: 0, ty: ComponentType::F32, bytes: f32_bytes(200.0) },
-        Instr::Store { src: 0, component_id: 2 },
-        Instr::Jump { target: 12 },
-        // inner else: 100
-        Instr::Const { dest: 0, ty: ComponentType::F32, bytes: f32_bytes(100.0) },
-        Instr::Store { src: 0, component_id: 2 },
-        // 12: join -> implicit return (falls off the end)
-        Instr::Return,
-    ]);
+    add_system(
+        &mut ir,
+        "nested",
+        4,
+        vec![
+            Instr::Load {
+                dest: 0,
+                component_id: 2,
+                access: AccessType::ReadWrite,
+            },
+            Instr::Const {
+                dest: 1,
+                ty: ComponentType::F32,
+                bytes: f32_bytes(50.0),
+            },
+            Instr::Compare {
+                dest: 2,
+                lhs: 0,
+                rhs: 1,
+                cond: CompareOp::Greater,
+            },
+            Instr::If {
+                cond: 2,
+                true_block: 4,
+                false_block: 12,
+            },
+            // outer then
+            Instr::Const {
+                dest: 1,
+                ty: ComponentType::F32,
+                bytes: f32_bytes(80.0),
+            },
+            Instr::Compare {
+                dest: 2,
+                lhs: 0,
+                rhs: 1,
+                cond: CompareOp::Greater,
+            },
+            Instr::If {
+                cond: 2,
+                true_block: 7,
+                false_block: 10,
+            },
+            // inner then: 200
+            Instr::Const {
+                dest: 0,
+                ty: ComponentType::F32,
+                bytes: f32_bytes(200.0),
+            },
+            Instr::Store {
+                src: 0,
+                component_id: 2,
+            },
+            Instr::Jump { target: 12 },
+            // inner else: 100
+            Instr::Const {
+                dest: 0,
+                ty: ComponentType::F32,
+                bytes: f32_bytes(100.0),
+            },
+            Instr::Store {
+                src: 0,
+                component_id: 2,
+            },
+            // 12: join -> implicit return (falls off the end)
+            Instr::Return,
+        ],
+    );
     let wgsl = generate(&ir);
     assert!(wgsl.matches("if (v2) {").count() == 2);
 }
@@ -181,11 +361,24 @@ fn straight_line_body_keeps_flat_form() {
 #[test]
 fn branch_target_out_of_range_is_rejected_by_validation() {
     let mut ir = control_world();
-    add_system(&mut ir, "bad_target", 2, vec![
-        Instr::Const { dest: 0, ty: ComponentType::U32, bytes: 0u32.to_le_bytes().to_vec() },
-        Instr::If { cond: 0, true_block: 5, false_block: 1 },
-        Instr::Return,
-    ]);
+    add_system(
+        &mut ir,
+        "bad_target",
+        2,
+        vec![
+            Instr::Const {
+                dest: 0,
+                ty: ComponentType::U32,
+                bytes: 0u32.to_le_bytes().to_vec(),
+            },
+            Instr::If {
+                cond: 0,
+                true_block: 5,
+                false_block: 1,
+            },
+            Instr::Return,
+        ],
+    );
     // IR validation rejects out-of-range targets before generation.
     match generate_wgsl(&ir) {
         Err(EcsError::IrInvalid(message)) => {
@@ -201,16 +394,40 @@ fn branch_target_out_of_range_is_rejected_by_validation() {
 fn same_writer_in_different_stages_is_allowed() {
     let mut ir = control_world();
     // Two systems both write Health, but in separate stages -> allowed.
-    add_system(&mut ir, "writer_a", 1, vec![
-        Instr::Load { dest: 0, component_id: 2, access: AccessType::ReadWrite },
-        Instr::Store { src: 0, component_id: 2 },
-        Instr::Return,
-    ]);
-    add_system(&mut ir, "writer_b", 1, vec![
-        Instr::Load { dest: 0, component_id: 2, access: AccessType::ReadWrite },
-        Instr::Store { src: 0, component_id: 2 },
-        Instr::Return,
-    ]);
+    add_system(
+        &mut ir,
+        "writer_a",
+        1,
+        vec![
+            Instr::Load {
+                dest: 0,
+                component_id: 2,
+                access: AccessType::ReadWrite,
+            },
+            Instr::Store {
+                src: 0,
+                component_id: 2,
+            },
+            Instr::Return,
+        ],
+    );
+    add_system(
+        &mut ir,
+        "writer_b",
+        1,
+        vec![
+            Instr::Load {
+                dest: 0,
+                component_id: 2,
+                access: AccessType::ReadWrite,
+            },
+            Instr::Store {
+                src: 0,
+                component_id: 2,
+            },
+            Instr::Return,
+        ],
+    );
     generate_wgsl(&ir).expect("different stages must not conflict");
 }
 
@@ -258,77 +475,254 @@ fn compiled_world(build: impl Fn(&mut EcsIr)) {
 #[test]
 fn if_else_pattern_compiles_on_headless_device() {
     compiled_world(|ir| {
-        add_system(ir, "heal", 3, vec![
-            Instr::Load { dest: 0, component_id: 2, access: AccessType::ReadWrite },
-            Instr::Const { dest: 1, ty: ComponentType::F32, bytes: f32_bytes(50.0) },
-            Instr::Compare { dest: 2, lhs: 0, rhs: 1, cond: CompareOp::Greater },
-            Instr::If { cond: 2, true_block: 4, false_block: 7 },
-            Instr::Const { dest: 0, ty: ComponentType::F32, bytes: f32_bytes(100.0) },
-            Instr::Store { src: 0, component_id: 2 },
-            Instr::Jump { target: 9 },
-            Instr::Const { dest: 0, ty: ComponentType::F32, bytes: f32_bytes(0.0) },
-            Instr::Store { src: 0, component_id: 2 },
-            Instr::Return,
-        ]);
+        add_system(
+            ir,
+            "heal",
+            3,
+            vec![
+                Instr::Load {
+                    dest: 0,
+                    component_id: 2,
+                    access: AccessType::ReadWrite,
+                },
+                Instr::Const {
+                    dest: 1,
+                    ty: ComponentType::F32,
+                    bytes: f32_bytes(50.0),
+                },
+                Instr::Compare {
+                    dest: 2,
+                    lhs: 0,
+                    rhs: 1,
+                    cond: CompareOp::Greater,
+                },
+                Instr::If {
+                    cond: 2,
+                    true_block: 4,
+                    false_block: 7,
+                },
+                Instr::Const {
+                    dest: 0,
+                    ty: ComponentType::F32,
+                    bytes: f32_bytes(100.0),
+                },
+                Instr::Store {
+                    src: 0,
+                    component_id: 2,
+                },
+                Instr::Jump { target: 9 },
+                Instr::Const {
+                    dest: 0,
+                    ty: ComponentType::F32,
+                    bytes: f32_bytes(0.0),
+                },
+                Instr::Store {
+                    src: 0,
+                    component_id: 2,
+                },
+                Instr::Return,
+            ],
+        );
     });
 }
 
 #[test]
 fn counter_loop_pattern_compiles_on_headless_device() {
     compiled_world(|ir| {
-        add_system(ir, "tick_three", 5, vec![
-            Instr::Const { dest: 0, ty: ComponentType::U32, bytes: 0u32.to_le_bytes().to_vec() },
-            Instr::Const { dest: 1, ty: ComponentType::U32, bytes: 3u32.to_le_bytes().to_vec() },
-            Instr::Compare { dest: 2, lhs: 0, rhs: 1, cond: CompareOp::Less },
-            Instr::If { cond: 2, true_block: 4, false_block: 11 },
-            Instr::Load { dest: 3, component_id: 2, access: AccessType::ReadWrite },
-            Instr::Const { dest: 4, ty: ComponentType::F32, bytes: f32_bytes(1.0) },
-            Instr::BinaryOp { dest: 3, lhs: 3, rhs: 4, op: BinaryOpCode::Add },
-            Instr::Store { src: 3, component_id: 2 },
-            Instr::Const { dest: 1, ty: ComponentType::U32, bytes: 1u32.to_le_bytes().to_vec() },
-            Instr::BinaryOp { dest: 0, lhs: 0, rhs: 1, op: BinaryOpCode::Add },
-            Instr::Jump { target: 1 },
-            Instr::Return,
-        ]);
+        add_system(
+            ir,
+            "tick_three",
+            5,
+            vec![
+                Instr::Const {
+                    dest: 0,
+                    ty: ComponentType::U32,
+                    bytes: 0u32.to_le_bytes().to_vec(),
+                },
+                Instr::Const {
+                    dest: 1,
+                    ty: ComponentType::U32,
+                    bytes: 3u32.to_le_bytes().to_vec(),
+                },
+                Instr::Compare {
+                    dest: 2,
+                    lhs: 0,
+                    rhs: 1,
+                    cond: CompareOp::Less,
+                },
+                Instr::If {
+                    cond: 2,
+                    true_block: 4,
+                    false_block: 11,
+                },
+                Instr::Load {
+                    dest: 3,
+                    component_id: 2,
+                    access: AccessType::ReadWrite,
+                },
+                Instr::Const {
+                    dest: 4,
+                    ty: ComponentType::F32,
+                    bytes: f32_bytes(1.0),
+                },
+                Instr::BinaryOp {
+                    dest: 3,
+                    lhs: 3,
+                    rhs: 4,
+                    op: BinaryOpCode::Add,
+                },
+                Instr::Store {
+                    src: 3,
+                    component_id: 2,
+                },
+                Instr::Const {
+                    dest: 1,
+                    ty: ComponentType::U32,
+                    bytes: 1u32.to_le_bytes().to_vec(),
+                },
+                Instr::BinaryOp {
+                    dest: 0,
+                    lhs: 0,
+                    rhs: 1,
+                    op: BinaryOpCode::Add,
+                },
+                Instr::Jump { target: 1 },
+                Instr::Return,
+            ],
+        );
     });
 }
 
 #[test]
 fn fallthrough_pattern_compiles_on_headless_device() {
     compiled_world(|ir| {
-        add_system(ir, "join_flow", 3, vec![
-            Instr::Load { dest: 0, component_id: 2, access: AccessType::ReadWrite },
-            Instr::Const { dest: 1, ty: ComponentType::F32, bytes: f32_bytes(0.0) },
-            Instr::Compare { dest: 2, lhs: 0, rhs: 1, cond: CompareOp::Greater },
-            Instr::If { cond: 2, true_block: 6, false_block: 4 },
-            Instr::Const { dest: 0, ty: ComponentType::F32, bytes: f32_bytes(1.0) },
-            Instr::Store { src: 0, component_id: 2 },
-            Instr::Load { dest: 0, component_id: 2, access: AccessType::ReadWrite },
-            Instr::Const { dest: 1, ty: ComponentType::F32, bytes: f32_bytes(1.0) },
-            Instr::BinaryOp { dest: 0, lhs: 0, rhs: 1, op: BinaryOpCode::Add },
-            Instr::Store { src: 0, component_id: 2 },
-            Instr::Return,
-        ]);
+        add_system(
+            ir,
+            "join_flow",
+            3,
+            vec![
+                Instr::Load {
+                    dest: 0,
+                    component_id: 2,
+                    access: AccessType::ReadWrite,
+                },
+                Instr::Const {
+                    dest: 1,
+                    ty: ComponentType::F32,
+                    bytes: f32_bytes(0.0),
+                },
+                Instr::Compare {
+                    dest: 2,
+                    lhs: 0,
+                    rhs: 1,
+                    cond: CompareOp::Greater,
+                },
+                Instr::If {
+                    cond: 2,
+                    true_block: 6,
+                    false_block: 4,
+                },
+                Instr::Const {
+                    dest: 0,
+                    ty: ComponentType::F32,
+                    bytes: f32_bytes(1.0),
+                },
+                Instr::Store {
+                    src: 0,
+                    component_id: 2,
+                },
+                Instr::Load {
+                    dest: 0,
+                    component_id: 2,
+                    access: AccessType::ReadWrite,
+                },
+                Instr::Const {
+                    dest: 1,
+                    ty: ComponentType::F32,
+                    bytes: f32_bytes(1.0),
+                },
+                Instr::BinaryOp {
+                    dest: 0,
+                    lhs: 0,
+                    rhs: 1,
+                    op: BinaryOpCode::Add,
+                },
+                Instr::Store {
+                    src: 0,
+                    component_id: 2,
+                },
+                Instr::Return,
+            ],
+        );
     });
 }
 
 #[test]
 fn nested_if_pattern_compiles_on_headless_device() {
     compiled_world(|ir| {
-        add_system(ir, "nested", 4, vec![
-            Instr::Load { dest: 0, component_id: 2, access: AccessType::ReadWrite },
-            Instr::Const { dest: 1, ty: ComponentType::F32, bytes: f32_bytes(50.0) },
-            Instr::Compare { dest: 2, lhs: 0, rhs: 1, cond: CompareOp::Greater },
-            Instr::If { cond: 2, true_block: 4, false_block: 12 },
-            Instr::Const { dest: 1, ty: ComponentType::F32, bytes: f32_bytes(80.0) },
-            Instr::Compare { dest: 2, lhs: 0, rhs: 1, cond: CompareOp::Greater },
-            Instr::If { cond: 2, true_block: 7, false_block: 10 },
-            Instr::Const { dest: 0, ty: ComponentType::F32, bytes: f32_bytes(200.0) },
-            Instr::Store { src: 0, component_id: 2 },
-            Instr::Jump { target: 12 },
-            Instr::Const { dest: 0, ty: ComponentType::F32, bytes: f32_bytes(100.0) },
-            Instr::Store { src: 0, component_id: 2 },
-            Instr::Return,
-        ]);
+        add_system(
+            ir,
+            "nested",
+            4,
+            vec![
+                Instr::Load {
+                    dest: 0,
+                    component_id: 2,
+                    access: AccessType::ReadWrite,
+                },
+                Instr::Const {
+                    dest: 1,
+                    ty: ComponentType::F32,
+                    bytes: f32_bytes(50.0),
+                },
+                Instr::Compare {
+                    dest: 2,
+                    lhs: 0,
+                    rhs: 1,
+                    cond: CompareOp::Greater,
+                },
+                Instr::If {
+                    cond: 2,
+                    true_block: 4,
+                    false_block: 12,
+                },
+                Instr::Const {
+                    dest: 1,
+                    ty: ComponentType::F32,
+                    bytes: f32_bytes(80.0),
+                },
+                Instr::Compare {
+                    dest: 2,
+                    lhs: 0,
+                    rhs: 1,
+                    cond: CompareOp::Greater,
+                },
+                Instr::If {
+                    cond: 2,
+                    true_block: 7,
+                    false_block: 10,
+                },
+                Instr::Const {
+                    dest: 0,
+                    ty: ComponentType::F32,
+                    bytes: f32_bytes(200.0),
+                },
+                Instr::Store {
+                    src: 0,
+                    component_id: 2,
+                },
+                Instr::Jump { target: 12 },
+                Instr::Const {
+                    dest: 0,
+                    ty: ComponentType::F32,
+                    bytes: f32_bytes(100.0),
+                },
+                Instr::Store {
+                    src: 0,
+                    component_id: 2,
+                },
+                Instr::Return,
+            ],
+        );
     });
 }

@@ -1,10 +1,10 @@
 //! M5 acceptance tests: `run_frame` execution chain, resource upload, and
 //! Changed/Added change filtering, headless.
 
+use neon_gpu_ecs::GpuEcsCtx;
 use neon_gpu_ecs::generator::bind_layout;
 use neon_gpu_ecs::ir::*;
 use neon_gpu_ecs::tests_support::physics_world;
-use neon_gpu_ecs::GpuEcsCtx;
 
 const MAX_ENTITIES: u32 = 16;
 
@@ -81,7 +81,11 @@ fn physics_integration_matches_cpu_reference() {
         ctx.run_frame();
         let positions = read_vec3_f32s(&ctx.read_component_data(0));
         for (e, pos) in positions.iter().enumerate().take(10) {
-            assert_eq!(pos, &[frame as f32, 0.0, 0.0], "entity {e} after frame {frame}");
+            assert_eq!(
+                pos,
+                &[frame as f32, 0.0, 0.0],
+                "entity {e} after frame {frame}"
+            );
         }
     }
     // Velocities stay (1,0,0).
@@ -126,7 +130,10 @@ fn comp(id: u32, name: &str, ty: ComponentType) -> ComponentDef {
 fn heater_detector_world() -> EcsIr {
     EcsIr {
         version: 1,
-        components: vec![comp(0, "Health", ComponentType::F32), comp(1, "Marker", ComponentType::F32)],
+        components: vec![
+            comp(0, "Health", ComponentType::F32),
+            comp(1, "Marker", ComponentType::F32),
+        ],
         resources: vec![],
         initial_entities: vec![EntityPrototype {
             component_ids: vec![0, 1],
@@ -136,15 +143,24 @@ fn heater_detector_world() -> EcsIr {
         queries: vec![
             QueryDef {
                 id: 0,
-                with: vec![ComponentAccess { component_id: 0, access_type: AccessType::ReadWrite }],
+                with: vec![ComponentAccess {
+                    component_id: 0,
+                    access_type: AccessType::ReadWrite,
+                }],
                 without: vec![],
                 filters: vec![],
             },
             QueryDef {
                 id: 1,
                 with: vec![
-                    ComponentAccess { component_id: 0, access_type: AccessType::Read },
-                    ComponentAccess { component_id: 1, access_type: AccessType::ReadWrite },
+                    ComponentAccess {
+                        component_id: 0,
+                        access_type: AccessType::Read,
+                    },
+                    ComponentAccess {
+                        component_id: 1,
+                        access_type: AccessType::ReadWrite,
+                    },
                 ],
                 without: vec![],
                 filters: vec![QueryFilter::Changed(0)],
@@ -158,13 +174,42 @@ fn heater_detector_world() -> EcsIr {
                 resource_refs: vec![],
                 local_var_count: 3,
                 instructions: vec![
-                    Instr::Load { dest: 0, component_id: 0, access: AccessType::ReadWrite },
-                    Instr::Const { dest: 1, ty: ComponentType::F32, bytes: 3.0f32.to_le_bytes().to_vec() },
-                    Instr::Compare { dest: 2, lhs: 0, rhs: 1, cond: CompareOp::Less },
-                    Instr::If { cond: 2, true_block: 4, false_block: 7 },
-                    Instr::Const { dest: 1, ty: ComponentType::F32, bytes: 1.0f32.to_le_bytes().to_vec() },
-                    Instr::BinaryOp { dest: 0, lhs: 0, rhs: 1, op: BinaryOpCode::Add },
-                    Instr::Store { src: 0, component_id: 0 },
+                    Instr::Load {
+                        dest: 0,
+                        component_id: 0,
+                        access: AccessType::ReadWrite,
+                    },
+                    Instr::Const {
+                        dest: 1,
+                        ty: ComponentType::F32,
+                        bytes: 3.0f32.to_le_bytes().to_vec(),
+                    },
+                    Instr::Compare {
+                        dest: 2,
+                        lhs: 0,
+                        rhs: 1,
+                        cond: CompareOp::Less,
+                    },
+                    Instr::If {
+                        cond: 2,
+                        true_block: 4,
+                        false_block: 7,
+                    },
+                    Instr::Const {
+                        dest: 1,
+                        ty: ComponentType::F32,
+                        bytes: 1.0f32.to_le_bytes().to_vec(),
+                    },
+                    Instr::BinaryOp {
+                        dest: 0,
+                        lhs: 0,
+                        rhs: 1,
+                        op: BinaryOpCode::Add,
+                    },
+                    Instr::Store {
+                        src: 0,
+                        component_id: 0,
+                    },
                     Instr::Return,
                 ],
             },
@@ -175,18 +220,42 @@ fn heater_detector_world() -> EcsIr {
                 resource_refs: vec![],
                 local_var_count: 2,
                 instructions: vec![
-                    Instr::Load { dest: 0, component_id: 1, access: AccessType::ReadWrite },
-                    Instr::Const { dest: 1, ty: ComponentType::F32, bytes: 1.0f32.to_le_bytes().to_vec() },
-                    Instr::BinaryOp { dest: 0, lhs: 0, rhs: 1, op: BinaryOpCode::Add },
-                    Instr::Store { src: 0, component_id: 1 },
+                    Instr::Load {
+                        dest: 0,
+                        component_id: 1,
+                        access: AccessType::ReadWrite,
+                    },
+                    Instr::Const {
+                        dest: 1,
+                        ty: ComponentType::F32,
+                        bytes: 1.0f32.to_le_bytes().to_vec(),
+                    },
+                    Instr::BinaryOp {
+                        dest: 0,
+                        lhs: 0,
+                        rhs: 1,
+                        op: BinaryOpCode::Add,
+                    },
+                    Instr::Store {
+                        src: 0,
+                        component_id: 1,
+                    },
                     Instr::Return,
                 ],
             },
         ],
         schedule: ScheduleDef {
             stages: vec![
-                Stage { id: 0, name: "Heat".into(), system_ids: vec![0] },
-                Stage { id: 1, name: "Detect".into(), system_ids: vec![1] },
+                Stage {
+                    id: 0,
+                    name: "Heat".into(),
+                    system_ids: vec![0],
+                },
+                Stage {
+                    id: 1,
+                    name: "Detect".into(),
+                    system_ids: vec![1],
+                },
             ],
         },
     }
@@ -267,8 +336,10 @@ fn added_filter_matches_zero_baseline_only() {
         }
         out
     };
-    ctx.queue.write_buffer(&ctx.component_buffers[0].1, 0, &to_bytes(&current));
-    ctx.queue.write_buffer(&ctx.component_buffers[0].2, 0, &to_bytes(&baseline));
+    ctx.queue
+        .write_buffer(&ctx.component_buffers[0].1, 0, &to_bytes(&current));
+    ctx.queue
+        .write_buffer(&ctx.component_buffers[0].2, 0, &to_bytes(&baseline));
 
     // Run sorting only and check the Added query (query 1) matches exactly
     // entity 2: its baseline version is zero and current is non-zero.
@@ -292,7 +363,11 @@ fn zero_count_dispatch_is_a_noop() {
     ctx.seed_initial();
     ctx.run_frame();
     let args = ctx.read_indirect_args();
-    assert_eq!(args[1], [0, 1, 1], "empty query must dispatch zero workgroups");
+    assert_eq!(
+        args[1],
+        [0, 1, 1],
+        "empty query must dispatch zero workgroups"
+    );
 }
 
 // ------------------------------------------- version bump bookkeeping --------

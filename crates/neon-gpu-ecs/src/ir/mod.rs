@@ -16,11 +16,10 @@ pub mod types;
 pub use component::ComponentDef;
 pub use entity::EntityPrototype;
 pub use query::{AccessType, ComponentAccess, QueryDef, QueryFilter};
-pub use resource::{ResourceDef, ResourceRef, RESERVED_RENDER_BINDING};
+pub use resource::{RESERVED_RENDER_BINDING, ResourceDef, ResourceRef};
 pub use schedule::{ScheduleDef, Stage};
 pub use system::{
-    AtomicOpCode, BinaryOpCode, BuiltinFunc, CompareOp, Instr, RenderField, SystemDef,
-    UnaryOpCode,
+    AtomicOpCode, BinaryOpCode, BuiltinFunc, CompareOp, Instr, RenderField, SystemDef, UnaryOpCode,
 };
 pub use types::ComponentType;
 
@@ -53,7 +52,10 @@ impl EcsIr {
         let mut problems: Vec<String> = Vec::new();
 
         if self.version != 1 {
-            problems.push(format!("unsupported ir version {} (expected 1)", self.version));
+            problems.push(format!(
+                "unsupported ir version {} (expected 1)",
+                self.version
+            ));
         }
 
         // --- components ---
@@ -100,7 +102,10 @@ impl EcsIr {
                 ));
             }
             if res.name.is_empty() || !is_wgsl_ident(&res.name) {
-                problems.push(format!("resource id {index} has an invalid name '{}'", res.name));
+                problems.push(format!(
+                    "resource id {index} has an invalid name '{}'",
+                    res.name
+                ));
             }
             if !res_names.insert(res.name.clone()) {
                 problems.push(format!("duplicate resource name '{}'", res.name));
@@ -138,7 +143,10 @@ impl EcsIr {
         let mut render_queries = 0u32;
         for (index, query) in self.queries.iter().enumerate() {
             if query.id as usize != index {
-                problems.push(format!("query id {} does not match its index {index}", query.id));
+                problems.push(format!(
+                    "query id {} does not match its index {index}",
+                    query.id
+                ));
             }
             if query.with.is_empty() {
                 problems.push(format!("query {index} requires at least one component"));
@@ -163,7 +171,9 @@ impl EcsIr {
             }
             for cid in &query.without {
                 if *cid as usize >= n_comp {
-                    problems.push(format!("query {index} without-clause references unknown component {cid}"));
+                    problems.push(format!(
+                        "query {index} without-clause references unknown component {cid}"
+                    ));
                 } else if seen.contains(cid) {
                     problems.push(format!(
                         "query {index} lists component {cid} in both with and without"
@@ -202,13 +212,19 @@ impl EcsIr {
                 ));
             }
             if system.name.is_empty() || !is_wgsl_ident(&system.name) {
-                problems.push(format!("system id {index} has an invalid name '{}'", system.name));
+                problems.push(format!(
+                    "system id {index} has an invalid name '{}'",
+                    system.name
+                ));
             }
             if !sys_names.insert(system.name.clone()) {
                 problems.push(format!("duplicate system name '{}'", system.name));
             }
             if system.query_id as usize >= n_query {
-                problems.push(format!("system '{}' references unknown query {}", system.name, system.query_id));
+                problems.push(format!(
+                    "system '{}' references unknown query {}",
+                    system.name, system.query_id
+                ));
             }
             for r in &system.resource_refs {
                 if r.resource_id as usize >= n_res {
@@ -244,7 +260,10 @@ impl EcsIr {
         let mut covered = HashSet::new();
         for (index, stage) in self.schedule.stages.iter().enumerate() {
             if stage.id as usize != index {
-                problems.push(format!("stage id {} does not match its index {index}", stage.id));
+                problems.push(format!(
+                    "stage id {} does not match its index {index}",
+                    stage.id
+                ));
             }
             for sid in &stage.system_ids {
                 if *sid as usize >= n_sys {
@@ -283,7 +302,9 @@ impl EcsIr {
             let mut seen = HashSet::new();
             for cid in &proto.component_ids {
                 if *cid as usize >= n_comp {
-                    problems.push(format!("prototype {index} references unknown component {cid}"));
+                    problems.push(format!(
+                        "prototype {index} references unknown component {cid}"
+                    ));
                 }
                 if !seen.insert(*cid) {
                     problems.push(format!("prototype {index} lists component {cid} twice"));
@@ -339,19 +360,17 @@ fn validate_system_body(
     let n_instr = system.instructions.len();
 
     // Resource references used by LoadResource must be declared.
-    let declared_resources: HashSet<u32> = system
-        .resource_refs
-        .iter()
-        .map(|r| r.resource_id)
-        .collect();
+    let declared_resources: HashSet<u32> =
+        system.resource_refs.iter().map(|r| r.resource_id).collect();
 
     // Components touched must be present in the query's `with` list.
-    let query_components: HashSet<u32> =
-        query_with.iter().map(|a| a.component_id).collect();
+    let query_components: HashSet<u32> = query_with.iter().map(|a| a.component_id).collect();
 
     for (pc, instr) in system.instructions.iter().enumerate() {
         match instr {
-            Instr::Load { dest, component_id, .. } => {
+            Instr::Load {
+                dest, component_id, ..
+            } => {
                 check_local(&mut problems, &tag(), *dest, n_locals, pc);
                 check_component(&mut problems, &tag(), *component_id, n_comp, pc);
                 if (*component_id as usize) < n_comp && !query_components.contains(component_id) {
@@ -364,7 +383,10 @@ fn validate_system_body(
             Instr::Const { dest, ty, bytes } => {
                 check_local(&mut problems, &tag(), *dest, n_locals, pc);
                 if matches!(ty, ComponentType::Mat4F) {
-                    problems.push(format!("{} [{pc}]: Const of mat4x4f is not supported", tag()));
+                    problems.push(format!(
+                        "{} [{pc}]: Const of mat4x4f is not supported",
+                        tag()
+                    ));
                 }
                 if bytes.len() != ty.byte_size() {
                     problems.push(format!(
@@ -422,10 +444,28 @@ fn validate_system_body(
                 check_local(&mut problems, &tag(), *lhs, n_locals, pc);
                 check_local(&mut problems, &tag(), *rhs, n_locals, pc);
             }
-            Instr::If { cond, true_block, false_block } => {
+            Instr::If {
+                cond,
+                true_block,
+                false_block,
+            } => {
                 check_local(&mut problems, &tag(), *cond, n_locals, pc);
-                check_target(&mut problems, &tag(), *true_block, n_instr, pc, "If.true_block");
-                check_target(&mut problems, &tag(), *false_block, n_instr, pc, "If.false_block");
+                check_target(
+                    &mut problems,
+                    &tag(),
+                    *true_block,
+                    n_instr,
+                    pc,
+                    "If.true_block",
+                );
+                check_target(
+                    &mut problems,
+                    &tag(),
+                    *false_block,
+                    n_instr,
+                    pc,
+                    "If.false_block",
+                );
             }
             Instr::Jump { target } => {
                 check_target(&mut problems, &tag(), *target, n_instr, pc, "Jump.target");
@@ -446,7 +486,11 @@ fn validate_system_body(
                     ));
                 }
             }
-            Instr::AtomicOp { component_id, value, .. } => {
+            Instr::AtomicOp {
+                component_id,
+                value,
+                ..
+            } => {
                 check_local(&mut problems, &tag(), *value, n_locals, pc);
                 check_component(&mut problems, &tag(), *component_id, n_comp, pc);
                 let atomic_on_bool = components
@@ -466,7 +510,9 @@ fn validate_system_body(
 
 fn check_local(problems: &mut Vec<String>, tag: &str, slot: u32, n_locals: u32, pc: usize) {
     if slot >= n_locals {
-        problems.push(format!("{tag} [{pc}]: local v{slot} out of range (local_var_count = {n_locals})"));
+        problems.push(format!(
+            "{tag} [{pc}]: local v{slot} out of range (local_var_count = {n_locals})"
+        ));
     }
 }
 
@@ -476,9 +522,18 @@ fn check_component(problems: &mut Vec<String>, tag: &str, cid: u32, n_comp: usiz
     }
 }
 
-fn check_target(problems: &mut Vec<String>, tag: &str, target: u32, n_instr: usize, pc: usize, what: &str) {
+fn check_target(
+    problems: &mut Vec<String>,
+    tag: &str,
+    target: u32,
+    n_instr: usize,
+    pc: usize,
+    what: &str,
+) {
     if target as usize >= n_instr {
-        problems.push(format!("{tag} [{pc}]: {what} {target} out of range (len {n_instr})"));
+        problems.push(format!(
+            "{tag} [{pc}]: {what} {target} out of range (len {n_instr})"
+        ));
     }
 }
 

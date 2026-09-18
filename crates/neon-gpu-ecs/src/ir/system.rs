@@ -67,9 +67,17 @@ impl SystemDef {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Instr {
     /// Load a component into a local: `v_dest = comp[entity]`.
-    Load { dest: u32, component_id: u32, access: AccessType },
+    Load {
+        dest: u32,
+        component_id: u32,
+        access: AccessType,
+    },
     /// Load an immediate constant: `v_dest = <typed literal>`.
-    Const { dest: u32, ty: super::types::ComponentType, bytes: Vec<u8> },
+    Const {
+        dest: u32,
+        ty: super::types::ComponentType,
+        bytes: Vec<u8>,
+    },
     /// Load the current entity's own ID: `v_dest = ecs_entity`.
     LoadEntityId { dest: u32 },
     /// Store a local back: `comp[entity] = v_src`.
@@ -77,13 +85,31 @@ pub enum Instr {
     /// Load a fixed resource: `v_dest = res`.
     LoadResource { dest: u32, resource_id: u32 },
     /// `v_dest = v_lhs op v_rhs`.
-    BinaryOp { dest: u32, lhs: u32, rhs: u32, op: BinaryOpCode },
+    BinaryOp {
+        dest: u32,
+        lhs: u32,
+        rhs: u32,
+        op: BinaryOpCode,
+    },
     /// `v_dest = op v_src`.
-    UnaryOp { dest: u32, src: u32, op: UnaryOpCode },
+    UnaryOp {
+        dest: u32,
+        src: u32,
+        op: UnaryOpCode,
+    },
     /// `v_dest = (v_lhs cond v_rhs)`; result slot is `Bool`.
-    Compare { dest: u32, lhs: u32, rhs: u32, cond: CompareOp },
+    Compare {
+        dest: u32,
+        lhs: u32,
+        rhs: u32,
+        cond: CompareOp,
+    },
     /// Conditional branch over the flat instruction list.
-    If { cond: u32, true_block: u32, false_block: u32 },
+    If {
+        cond: u32,
+        true_block: u32,
+        false_block: u32,
+    },
     /// Unconditional branch over the flat instruction list.
     Jump { target: u32 },
     /// End this entity's thread.
@@ -91,9 +117,17 @@ pub enum Instr {
     /// Built-in call; result goes to `v_dest` unless the function is a
     /// structural-change call (`SpawnEntity` etc.), whose result is discarded
     /// or stored in an `U32` local.
-    CallBuiltin { dest: u32, func: BuiltinFunc, args: Vec<u32> },
+    CallBuiltin {
+        dest: u32,
+        func: BuiltinFunc,
+        args: Vec<u32>,
+    },
     /// Atomic RMW on a component slot: `atomicAdd(&comp[entity], v_value)`.
-    AtomicOp { component_id: u32, op: AtomicOpCode, value: u32 },
+    AtomicOp {
+        component_id: u32,
+        op: AtomicOpCode,
+        value: u32,
+    },
     /// Write a `vec4f` local into the RenderData instance buffer of the
     /// current entity slot: `renderInstances[idx].field = v_src`.
     StoreRender { src: u32, field: RenderField },

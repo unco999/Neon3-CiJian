@@ -11,37 +11,37 @@
 
 use std::time::Duration;
 
-use windows::core::{implement, Interface, PCWSTR};
 use windows::Foundation::{IPropertyValue, PropertyValue};
 use windows::Graphics::Effects::{
-    IGraphicsEffect, IGraphicsEffectSource, IGraphicsEffectSource_Impl, IGraphicsEffect_Impl,
+    IGraphicsEffect, IGraphicsEffect_Impl, IGraphicsEffectSource, IGraphicsEffectSource_Impl,
 };
 use windows::UI::Composition::Desktop::DesktopWindowTarget;
 use windows::UI::Composition::{
-    Compositor, CompositionBackdropBrush, CompositionEffectBrush, CompositionEffectSourceParameter,
+    CompositionBackdropBrush, CompositionEffectBrush, CompositionEffectSourceParameter, Compositor,
     ContainerVisual, SpriteVisual,
 };
-use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
-use windows::Win32::System::WinRT::{
-    CreateDispatcherQueueController, DispatcherQueueOptions, DQTAT_COM_STA, DQTYPE_THREAD_CURRENT,
-};
+use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
 use windows::Win32::System::WinRT::Composition::ICompositorDesktopInterop;
 use windows::Win32::System::WinRT::Graphics::Direct2D::{
     GRAPHICS_EFFECT_PROPERTY_MAPPING, GRAPHICS_EFFECT_PROPERTY_MAPPING_DIRECT,
     IGraphicsEffectD2D1Interop, IGraphicsEffectD2D1Interop_Impl,
 };
+use windows::Win32::System::WinRT::{
+    CreateDispatcherQueueController, DQTAT_COM_STA, DQTYPE_THREAD_CURRENT, DispatcherQueueOptions,
+};
+use windows::core::{Interface, PCWSTR, implement};
 use windows_numerics::Vector2;
 
+#[cfg(windows)]
+use winit::platform::windows::WindowAttributesExtWindows;
+#[cfg(windows)]
+use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::{
     application::ApplicationHandler,
     event::WindowEvent,
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
     window::{Window, WindowId},
 };
-#[cfg(windows)]
-use winit::platform::windows::WindowAttributesExtWindows;
-#[cfg(windows)]
-use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 // ---------------------------------------------------------------------------
 // Hand-rolled GaussianBlurEffect : needs neither Win2D nor any extra runtime.
@@ -95,7 +95,10 @@ impl IGraphicsEffectD2D1Interop_Impl for GaussianBlurEffect_Impl {
         mapping: *mut GRAPHICS_EFFECT_PROPERTY_MAPPING,
     ) -> windows::core::Result<()> {
         let prop = unsafe { name.as_wide() };
-        let prop_str: String = prop.iter().map(|&c| char::from_u32(c as u32).unwrap_or('?')).collect();
+        let prop_str: String = prop
+            .iter()
+            .map(|&c| char::from_u32(c as u32).unwrap_or('?'))
+            .collect();
         eprintln!("[effect] GetNamedPropertyMapping -> {prop_str}");
         if prop == widestring("BlurAmount") {
             unsafe {
@@ -193,7 +196,9 @@ fn build_backdrop_chain(window: &Window) -> Result<BackdropChain, String> {
     );
 
     // 2. DesktopWindowTarget via CompositorInterop
-    let interop: ICompositorDesktopInterop = compositor.cast().map_err(|e| format!("cast ICompositorDesktopInterop: {e:?}"))?;
+    let interop: ICompositorDesktopInterop = compositor
+        .cast()
+        .map_err(|e| format!("cast ICompositorDesktopInterop: {e:?}"))?;
     let target = unsafe { interop.CreateDesktopWindowTarget(hwnd, false) }
         .map_err(|e| format!("CreateDesktopWindowTarget: {e:?}"))?;
     println!(
@@ -207,10 +212,11 @@ fn build_backdrop_chain(window: &Window) -> Result<BackdropChain, String> {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(16.0);
-    let source_param: IGraphicsEffectSource = CompositionEffectSourceParameter::Create(&windows::core::HSTRING::from("backdrop"))
-        .map_err(|e| format!("Create source parameter: {e:?}"))?
-        .cast()
-        .map_err(|e| format!("cast source parameter: {e:?}"))?;
+    let source_param: IGraphicsEffectSource =
+        CompositionEffectSourceParameter::Create(&windows::core::HSTRING::from("backdrop"))
+            .map_err(|e| format!("Create source parameter: {e:?}"))?
+            .cast()
+            .map_err(|e| format!("cast source parameter: {e:?}"))?;
     let effect = GaussianBlurEffect {
         name: std::cell::RefCell::new(windows::core::HSTRING::from("GaussianBlurEffect")),
         blur_amount,
@@ -245,7 +251,9 @@ fn build_backdrop_chain(window: &Window) -> Result<BackdropChain, String> {
             "{}",
             serde_json::json!({"probe":"composition-backdrop","stage":"factory","pass":true})
         );
-        let brush = factory.CreateBrush().map_err(|e| format!("factory.CreateBrush: {e:?}"))?;
+        let brush = factory
+            .CreateBrush()
+            .map_err(|e| format!("factory.CreateBrush: {e:?}"))?;
         let load_status = factory.LoadStatus().map(|s| s.0).unwrap_or(-1);
         println!(
             "{}",
@@ -275,7 +283,10 @@ fn build_backdrop_chain(window: &Window) -> Result<BackdropChain, String> {
         .SetBrush(&effect_brush)
         .map_err(|e| format!("sprite.SetBrush: {e:?}"))?;
     sprite
-        .SetSize(Vector2::new(size.width.max(1) as f32, size.height.max(1) as f32))
+        .SetSize(Vector2::new(
+            size.width.max(1) as f32,
+            size.height.max(1) as f32,
+        ))
         .map_err(|e| format!("sprite.SetSize: {e:?}"))?;
 
     // 7. Root container + SetRoot on the desktop target
@@ -286,7 +297,9 @@ fn build_backdrop_chain(window: &Window) -> Result<BackdropChain, String> {
         .map_err(|e| format!("root.Children: {e:?}"))?
         .InsertAtTop(&sprite)
         .map_err(|e| format!("InsertAtTop: {e:?}"))?;
-    target.SetRoot(&root).map_err(|e| format!("target.SetRoot: {e:?}"))?;
+    target
+        .SetRoot(&root)
+        .map_err(|e| format!("target.SetRoot: {e:?}"))?;
     println!(
         "{}",
         serde_json::json!({"probe":"composition-backdrop","stage":"root","size":[size.width,size.height],"pass":true})
@@ -321,7 +334,10 @@ fn build_bare_backdrop_chain(
         .SetBrush(&backdrop_brush)
         .map_err(|e| format!("bootstrap sprite.SetBrush: {e:?}"))?;
     sprite
-        .SetSize(Vector2::new(size.width.max(1) as f32, size.height.max(1) as f32))
+        .SetSize(Vector2::new(
+            size.width.max(1) as f32,
+            size.height.max(1) as f32,
+        ))
         .map_err(|e| format!("bootstrap sprite.SetSize: {e:?}"))?;
     let root = compositor
         .CreateContainerVisual()
@@ -363,11 +379,10 @@ fn capture_window_png(
     out_path: &std::path::Path,
 ) -> Result<(), String> {
     use windows::Win32::Foundation::RECT;
-use windows::Win32::Graphics::Gdi::{
-    BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC,
-    GetDIBits, ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
-    SRCCOPY,
-};
+    use windows::Win32::Graphics::Gdi::{
+        BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC,
+        DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, GetDIBits, ReleaseDC, SRCCOPY, SelectObject,
+    };
     use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
 
     let mut rect = RECT::default();
@@ -388,9 +403,7 @@ use windows::Win32::Graphics::Gdi::{
         unsafe { ReleaseDC(None, screen_dc) };
         return Err("CreateCompatibleBitmap failed".into());
     }
-    let _old = unsafe {
-        SelectObject(mem_dc, windows::Win32::Graphics::Gdi::HGDIOBJ(bitmap.0))
-    };
+    let _old = unsafe { SelectObject(mem_dc, windows::Win32::Graphics::Gdi::HGDIOBJ(bitmap.0)) };
     unsafe {
         BitBlt(
             mem_dc,
@@ -450,7 +463,9 @@ use windows::Win32::Graphics::Gdi::{
     let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), width as u32, height as u32);
     encoder.set_color(png::ColorType::Rgba);
     encoder.set_depth(png::BitDepth::Eight);
-    let mut writer = encoder.write_header().map_err(|e| format!("png header: {e}"))?;
+    let mut writer = encoder
+        .write_header()
+        .map_err(|e| format!("png header: {e}"))?;
     writer
         .write_image_data(&rgba)
         .map_err(|e| format!("png write: {e}"))?;
@@ -543,7 +558,10 @@ impl ApplicationHandler for App {
                 self.captures_done += 1;
             }
         }
-        if self.deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+        if self
+            .deadline
+            .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+        {
             event_loop.exit();
         }
     }

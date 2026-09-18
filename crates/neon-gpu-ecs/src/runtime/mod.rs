@@ -7,9 +7,9 @@
 
 pub mod init;
 
+use crate::EcsError;
 use crate::generator::{self, bind_layout};
 use crate::ir::EcsIr;
-use crate::EcsError;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 
@@ -163,7 +163,9 @@ impl GpuEcsCtx {
         // ---- buffers -------------------------------------------------------
         let n_queries = ir.queries.len() as u64;
         let me = max_entities as u64;
-        let storage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST;
+        let storage = wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_SRC
+            | wgpu::BufferUsages::COPY_DST;
 
         let entity_active = create_buffer(&device, "ecs entityActive", me * 4, storage);
         let query_counts = create_buffer(&device, "ecs queryCounts", n_queries * 4, storage);
@@ -178,12 +180,7 @@ impl GpuEcsCtx {
             storage,
         );
         // `array<vec3u>` has a 16-byte stride (vec3 alignment).
-        let indirect_args = create_buffer(
-            &device,
-            "ecs indirectArgs",
-            n_queries * 16,
-            storage,
-        );
+        let indirect_args = create_buffer(&device, "ecs indirectArgs", n_queries * 16, storage);
         // Dedicated indirect-dispatch source. Indirect dispatch and a STORAGE
         // binding of the same buffer cannot share one compute dispatch's usage
         // scope, so the scan result is copied here and systems dispatch from it.
@@ -198,8 +195,18 @@ impl GpuEcsCtx {
         // copies + map_async), replayed on the CPU and its count reset.
         let cmd_usage = storage;
         let cmd_buffers = [
-            create_buffer(&device, "ecs commandBuffer A", command_capacity as u64 * 16, cmd_usage),
-            create_buffer(&device, "ecs commandBuffer B", command_capacity as u64 * 16, cmd_usage),
+            create_buffer(
+                &device,
+                "ecs commandBuffer A",
+                command_capacity as u64 * 16,
+                cmd_usage,
+            ),
+            create_buffer(
+                &device,
+                "ecs commandBuffer B",
+                command_capacity as u64 * 16,
+                cmd_usage,
+            ),
         ];
         let cmd_counts = [
             create_buffer(&device, "ecs commandCount A", 4, cmd_usage),
@@ -209,11 +216,26 @@ impl GpuEcsCtx {
         let mut component_buffers = Vec::new();
         for comp in &ir.components {
             let stride = comp.ty.wgsl_array_stride() as u64;
-            let data = create_buffer(&device, &format!("ecs c_{}", comp.name), me * stride, storage);
+            let data = create_buffer(
+                &device,
+                &format!("ecs c_{}", comp.name),
+                me * stride,
+                storage,
+            );
             // Version buffers are rewritten by structural replay (write_buffer).
             let version_usage = storage;
-            let version = create_buffer(&device, &format!("ecs cv_{}", comp.name), me * 4, version_usage);
-            let baseline = create_buffer(&device, &format!("ecs cb_{}", comp.name), me * 4, version_usage);
+            let version = create_buffer(
+                &device,
+                &format!("ecs cv_{}", comp.name),
+                me * 4,
+                version_usage,
+            );
+            let baseline = create_buffer(
+                &device,
+                &format!("ecs cb_{}", comp.name),
+                me * 4,
+                version_usage,
+            );
             component_buffers.push((data, version, baseline));
         }
 
@@ -242,14 +264,38 @@ impl GpuEcsCtx {
         for ring in 0..2usize {
             let mut group0_bindings: Vec<wgpu::BindGroupEntry> =
                 Vec::with_capacity(8 + ir.components.len() * 3);
-            group0_bindings.push(wgpu::BindGroupEntry { binding: bind_layout::ENTITY_ACTIVE_BINDING, resource: entity_active.as_entire_binding() });
-            group0_bindings.push(wgpu::BindGroupEntry { binding: bind_layout::QUERY_COUNTS_BINDING, resource: query_counts.as_entire_binding() });
-            group0_bindings.push(wgpu::BindGroupEntry { binding: bind_layout::QUERY_CURSORS_BINDING, resource: query_cursors.as_entire_binding() });
-            group0_bindings.push(wgpu::BindGroupEntry { binding: bind_layout::FRAME_PREP_BINDING, resource: frame_prep.as_entire_binding() });
-            group0_bindings.push(wgpu::BindGroupEntry { binding: bind_layout::COMPACTED_IDS_BINDING, resource: compacted_ids.as_entire_binding() });
-            group0_bindings.push(wgpu::BindGroupEntry { binding: bind_layout::INDIRECT_ARGS_BINDING, resource: indirect_args.as_entire_binding() });
-            group0_bindings.push(wgpu::BindGroupEntry { binding: bind_layout::COMMAND_BUFFER_BINDING, resource: cmd_buffers[ring].as_entire_binding() });
-            group0_bindings.push(wgpu::BindGroupEntry { binding: bind_layout::COMMAND_COUNT_BINDING, resource: cmd_counts[ring].as_entire_binding() });
+            group0_bindings.push(wgpu::BindGroupEntry {
+                binding: bind_layout::ENTITY_ACTIVE_BINDING,
+                resource: entity_active.as_entire_binding(),
+            });
+            group0_bindings.push(wgpu::BindGroupEntry {
+                binding: bind_layout::QUERY_COUNTS_BINDING,
+                resource: query_counts.as_entire_binding(),
+            });
+            group0_bindings.push(wgpu::BindGroupEntry {
+                binding: bind_layout::QUERY_CURSORS_BINDING,
+                resource: query_cursors.as_entire_binding(),
+            });
+            group0_bindings.push(wgpu::BindGroupEntry {
+                binding: bind_layout::FRAME_PREP_BINDING,
+                resource: frame_prep.as_entire_binding(),
+            });
+            group0_bindings.push(wgpu::BindGroupEntry {
+                binding: bind_layout::COMPACTED_IDS_BINDING,
+                resource: compacted_ids.as_entire_binding(),
+            });
+            group0_bindings.push(wgpu::BindGroupEntry {
+                binding: bind_layout::INDIRECT_ARGS_BINDING,
+                resource: indirect_args.as_entire_binding(),
+            });
+            group0_bindings.push(wgpu::BindGroupEntry {
+                binding: bind_layout::COMMAND_BUFFER_BINDING,
+                resource: cmd_buffers[ring].as_entire_binding(),
+            });
+            group0_bindings.push(wgpu::BindGroupEntry {
+                binding: bind_layout::COMMAND_COUNT_BINDING,
+                resource: cmd_counts[ring].as_entire_binding(),
+            });
             for (id, (data, version, baseline)) in component_buffers.iter().enumerate() {
                 group0_bindings.push(wgpu::BindGroupEntry {
                     binding: bind_layout::component_data_binding(id as u32),
@@ -324,8 +370,11 @@ impl GpuEcsCtx {
     /// Upload the initial prototype population, version seeds (baseline ==
     /// current) and resource defaults. Call once before the first frame.
     pub fn seed_initial(&self) {
-        self.queue
-            .write_buffer(&self.entity_active, 0, &init::initial_entity_active(&self.ir, self.max_entities));
+        self.queue.write_buffer(
+            &self.entity_active,
+            0,
+            &init::initial_entity_active(&self.ir, self.max_entities),
+        );
         for (id, (data, version, baseline)) in self.component_buffers.iter().enumerate() {
             let bytes = init::initial_component_bytes(&self.ir, id as u32, self.max_entities);
             self.queue.write_buffer(data, 0, &bytes);
@@ -377,9 +426,11 @@ impl GpuEcsCtx {
     /// Dispatches are ordered within one compute pass, so the implicit
     /// barriers between them hold.
     pub fn run_sort(&self) {
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("ecs sort"),
-        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("ecs sort"),
+            });
         self.record_sort_pass(&mut encoder);
         self.queue.submit(std::iter::once(encoder.finish()));
     }
@@ -407,9 +458,11 @@ impl GpuEcsCtx {
     /// Submit an empty batch so pending `write_buffer` staging data is
     /// flushed to the buffers before the next real submission reads them.
     pub fn flush(&self) {
-        let encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("ecs flush"),
-        });
+        let encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("ecs flush"),
+            });
         self.queue.submit(std::iter::once(encoder.finish()));
     }
 
@@ -434,9 +487,11 @@ impl GpuEcsCtx {
             self.replay_commands(replay_ring);
         }
 
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("ecs frame"),
-        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("ecs frame"),
+            });
         self.record_sort_pass(&mut encoder);
 
         // Baseline snapshot: copy current version numbers to baselines.
@@ -449,7 +504,13 @@ impl GpuEcsCtx {
         // the indirect dispatch never shares a usage scope with a STORAGE
         // binding of the same buffer.
         let n_queries = self.ir.queries.len() as u64;
-        encoder.copy_buffer_to_buffer(&self.indirect_args, 0, &self.indirect_exec, 0, n_queries * 16);
+        encoder.copy_buffer_to_buffer(
+            &self.indirect_args,
+            0,
+            &self.indirect_exec,
+            0,
+            n_queries * 16,
+        );
 
         // Systems, stage by stage.
         let ring = self.cmd_phase.get();
@@ -546,12 +607,18 @@ impl GpuEcsCtx {
                 slot as u64 * stride,
                 value,
             );
-            self.queue
-                .write_buffer(&self.component_buffers[*cid as usize].1, slot as u64 * 4, &1u32.to_le_bytes());
+            self.queue.write_buffer(
+                &self.component_buffers[*cid as usize].1,
+                slot as u64 * 4,
+                &1u32.to_le_bytes(),
+            );
             // Baseline starts equal so the fresh entity is not flagged
             // Changed until a system actually writes it.
-            self.queue
-                .write_buffer(&self.component_buffers[*cid as usize].2, slot as u64 * 4, &1u32.to_le_bytes());
+            self.queue.write_buffer(
+                &self.component_buffers[*cid as usize].2,
+                slot as u64 * 4,
+                &1u32.to_le_bytes(),
+            );
         }
 
         self.active_entities.borrow_mut()[slot as usize] = true;
@@ -594,10 +661,16 @@ impl GpuEcsCtx {
             );
         }
         let word = if present { 1u32 } else { 0u32 };
-        self.queue
-            .write_buffer(&self.component_buffers[component_id as usize].1, entity as u64 * 4, &word.to_le_bytes());
-        self.queue
-            .write_buffer(&self.component_buffers[component_id as usize].2, entity as u64 * 4, &word.to_le_bytes());
+        self.queue.write_buffer(
+            &self.component_buffers[component_id as usize].1,
+            entity as u64 * 4,
+            &word.to_le_bytes(),
+        );
+        self.queue.write_buffer(
+            &self.component_buffers[component_id as usize].2,
+            entity as u64 * 4,
+            &word.to_le_bytes(),
+        );
     }
 
     /// Blocking readback of a buffer's full contents into a fresh Vec.
@@ -608,9 +681,11 @@ impl GpuEcsCtx {
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("ecs readback"),
-        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("ecs readback"),
+            });
         encoder.copy_buffer_to_buffer(buffer, 0, &staging, 0, size as u64);
         self.queue.submit(std::iter::once(encoder.finish()));
 
@@ -641,7 +716,9 @@ impl GpuEcsCtx {
 
     /// Read back a component's full data buffer (with WGSL stride padding).
     pub fn read_component_data(&self, component_id: u32) -> Vec<u8> {
-        let stride = self.ir.components[component_id as usize].ty.wgsl_array_stride();
+        let stride = self.ir.components[component_id as usize]
+            .ty
+            .wgsl_array_stride();
         self.read_buffer_blocking(
             &self.component_buffers[component_id as usize].0,
             self.max_entities as usize * stride,
@@ -714,7 +791,12 @@ impl GpuEcsCtx {
     }
 }
 
-fn create_buffer(device: &wgpu::Device, label: &str, size: u64, usage: wgpu::BufferUsages) -> wgpu::Buffer {
+fn create_buffer(
+    device: &wgpu::Device,
+    label: &str,
+    size: u64,
+    usage: wgpu::BufferUsages,
+) -> wgpu::Buffer {
     device.create_buffer(&wgpu::BufferDescriptor {
         label: Some(label),
         size: size.max(4), // WebGPU forbids zero-sized buffers

@@ -1,8 +1,8 @@
 //! M6 acceptance tests: structural changes (Spawn/Delete) through the GPU
 //! command ring, ping-pong readback and CPU replay, headless.
 
-use neon_gpu_ecs::ir::*;
 use neon_gpu_ecs::GpuEcsCtx;
+use neon_gpu_ecs::ir::*;
 
 const MAX_ENTITIES: u32 = 16;
 
@@ -60,22 +60,39 @@ fn read_u32s(bytes: &[u8]) -> Vec<u32> {
 fn spawn_world() -> EcsIr {
     EcsIr {
         version: 1,
-        components: vec![comp(0, "Health", ComponentType::F32), comp(1, "Seed", ComponentType::U32)],
+        components: vec![
+            comp(0, "Health", ComponentType::F32),
+            comp(1, "Seed", ComponentType::U32),
+        ],
         resources: vec![],
         initial_entities: vec![
-            EntityPrototype { component_ids: vec![0, 1], count: 2, initial_values: None },
-            EntityPrototype { component_ids: vec![0], count: 1, initial_values: None },
+            EntityPrototype {
+                component_ids: vec![0, 1],
+                count: 2,
+                initial_values: None,
+            },
+            EntityPrototype {
+                component_ids: vec![0],
+                count: 1,
+                initial_values: None,
+            },
         ],
         queries: vec![
             QueryDef {
                 id: 0,
-                with: vec![ComponentAccess { component_id: 1, access_type: AccessType::Read }],
+                with: vec![ComponentAccess {
+                    component_id: 1,
+                    access_type: AccessType::Read,
+                }],
                 without: vec![],
                 filters: vec![],
             },
             QueryDef {
                 id: 1,
-                with: vec![ComponentAccess { component_id: 0, access_type: AccessType::Read }],
+                with: vec![ComponentAccess {
+                    component_id: 0,
+                    access_type: AccessType::Read,
+                }],
                 without: vec![],
                 filters: vec![],
             },
@@ -87,13 +104,25 @@ fn spawn_world() -> EcsIr {
             resource_refs: vec![],
             local_var_count: 2,
             instructions: vec![
-                Instr::Const { dest: 0, ty: ComponentType::U32, bytes: 1u32.to_le_bytes().to_vec() },
-                Instr::CallBuiltin { dest: 1, func: BuiltinFunc::SpawnEntity, args: vec![0] },
+                Instr::Const {
+                    dest: 0,
+                    ty: ComponentType::U32,
+                    bytes: 1u32.to_le_bytes().to_vec(),
+                },
+                Instr::CallBuiltin {
+                    dest: 1,
+                    func: BuiltinFunc::SpawnEntity,
+                    args: vec![0],
+                },
                 Instr::Return,
             ],
         }],
         schedule: ScheduleDef {
-            stages: vec![Stage { id: 0, name: "Spawn".into(), system_ids: vec![0] }],
+            stages: vec![Stage {
+                id: 0,
+                name: "Spawn".into(),
+                system_ids: vec![0],
+            }],
         },
     }
 }
@@ -105,19 +134,22 @@ fn spawn_commands_activate_entities_on_replay() {
     ctx.seed_initial();
 
     // Seeding activates entities 0,1 (proto 0) and 2 (proto 1).
-    let active = read_u32s(&ctx.read_buffer_blocking(&ctx.entity_active, MAX_ENTITIES as usize * 4));
+    let active =
+        read_u32s(&ctx.read_buffer_blocking(&ctx.entity_active, MAX_ENTITIES as usize * 4));
     assert_eq!(&active[..5], &[1, 1, 1, 0, 0]);
 
     // Frame 1: spawner runs on the 2 Seed entities and appends 2 spawn
     // commands to ring 0. No replay yet (first frame).
     ctx.run_frame();
-    let active = read_u32s(&ctx.read_buffer_blocking(&ctx.entity_active, MAX_ENTITIES as usize * 4));
+    let active =
+        read_u32s(&ctx.read_buffer_blocking(&ctx.entity_active, MAX_ENTITIES as usize * 4));
     assert_eq!(&active[..5], &[1, 1, 1, 0, 0]);
 
     // Frame 2 start replays ring 0: two new entities take slots 3 and 4
     // (lowest free slots), activate, and get Health at version 1.
     ctx.run_frame();
-    let active = read_u32s(&ctx.read_buffer_blocking(&ctx.entity_active, MAX_ENTITIES as usize * 4));
+    let active =
+        read_u32s(&ctx.read_buffer_blocking(&ctx.entity_active, MAX_ENTITIES as usize * 4));
     assert_eq!(&active[..6], &[1, 1, 1, 1, 1, 0]);
 
     let health_versions = ctx.read_component_versions(0);
@@ -128,7 +160,10 @@ fn spawn_commands_activate_entities_on_replay() {
 
     // Sorting now matches 5 entities for the Health query.
     let prep = ctx.read_frame_prep();
-    assert_eq!(prep[1].count, 5, "Health query must see the spawned entities");
+    assert_eq!(
+        prep[1].count, 5,
+        "Health query must see the spawned entities"
+    );
 }
 
 #[test]
@@ -145,10 +180,14 @@ fn rings_ping_pong_across_frames() {
     ctx.run_frame(); // replay ring 0 -> slots 3,4; entities 0,1 write 2 more (ring 1)
     ctx.run_frame(); // replay ring 1 -> slots 5,6
 
-    let active = read_u32s(&ctx.read_buffer_blocking(&ctx.entity_active, MAX_ENTITIES as usize * 4));
+    let active =
+        read_u32s(&ctx.read_buffer_blocking(&ctx.entity_active, MAX_ENTITIES as usize * 4));
     assert_eq!(&active[..8], &[1, 1, 1, 1, 1, 1, 1, 0]);
     let prep = ctx.read_frame_prep();
-    assert_eq!(prep[1].count, 7, "Health query must see all 7 active entities");
+    assert_eq!(
+        prep[1].count, 7,
+        "Health query must see all 7 active entities"
+    );
 }
 
 #[test]
@@ -162,9 +201,13 @@ fn ring_replay_does_not_double_apply() {
     ctx.run_frame();
     ctx.run_frame();
     ctx.run_frame(); // replay ring 0 again: seeds wrote 2 more during frame 3
-    let active = read_u32s(&ctx.read_buffer_blocking(&ctx.entity_active, MAX_ENTITIES as usize * 4));
+    let active =
+        read_u32s(&ctx.read_buffer_blocking(&ctx.entity_active, MAX_ENTITIES as usize * 4));
     let total: u32 = active[..8].iter().sum();
-    assert_eq!(total, 8, "each ring replay applies its commands exactly once");
+    assert_eq!(
+        total, 8,
+        "each ring replay applies its commands exactly once"
+    );
 }
 
 // ------------------------------------------------------------- delete -------
@@ -182,7 +225,10 @@ fn delete_world() -> EcsIr {
         }],
         queries: vec![QueryDef {
             id: 0,
-            with: vec![ComponentAccess { component_id: 0, access_type: AccessType::Read }],
+            with: vec![ComponentAccess {
+                component_id: 0,
+                access_type: AccessType::Read,
+            }],
             without: vec![],
             filters: vec![],
         }],
@@ -194,12 +240,20 @@ fn delete_world() -> EcsIr {
             local_var_count: 2,
             instructions: vec![
                 Instr::LoadEntityId { dest: 0 },
-                Instr::CallBuiltin { dest: 1, func: BuiltinFunc::DeleteEntity, args: vec![0] },
+                Instr::CallBuiltin {
+                    dest: 1,
+                    func: BuiltinFunc::DeleteEntity,
+                    args: vec![0],
+                },
                 Instr::Return,
             ],
         }],
         schedule: ScheduleDef {
-            stages: vec![Stage { id: 0, name: "Die".into(), system_ids: vec![0] }],
+            stages: vec![Stage {
+                id: 0,
+                name: "Die".into(),
+                system_ids: vec![0],
+            }],
         },
     }
 }
@@ -214,7 +268,8 @@ fn delete_commands_deactivate_entities_and_free_slots() {
     ctx.run_frame();
     // Frame 2 start replays: all 4 deactivated, versions zeroed.
     ctx.run_frame();
-    let active = read_u32s(&ctx.read_buffer_blocking(&ctx.entity_active, MAX_ENTITIES as usize * 4));
+    let active =
+        read_u32s(&ctx.read_buffer_blocking(&ctx.entity_active, MAX_ENTITIES as usize * 4));
     assert_eq!(&active[..5], &[0, 0, 0, 0, 0]);
     let life_versions = ctx.read_component_versions(0);
     assert_eq!(&life_versions[..4], &[0, 0, 0, 0]);

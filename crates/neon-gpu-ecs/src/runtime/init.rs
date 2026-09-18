@@ -58,7 +58,10 @@ pub fn initial_query_match(ir: &EcsIr, query_index: usize) -> Vec<u32> {
 /// entity, zero padded to `max_entities`.
 pub fn initial_entity_active(ir: &EcsIr, max_entities: u32) -> Vec<u8> {
     let total = prototype_entity_total(ir);
-    assert!(total <= max_entities, "max_entities too small for prototypes");
+    assert!(
+        total <= max_entities,
+        "max_entities too small for prototypes"
+    );
     let mut bytes = vec![0u8; max_entities as usize * 4];
     for e in 0..total {
         bytes[e as usize * 4..e as usize * 4 + 4].copy_from_slice(&1u32.to_le_bytes());
@@ -74,10 +77,7 @@ pub fn initial_component_bytes(ir: &EcsIr, component_id: u32, max_entities: u32)
     let stride = comp.ty.wgsl_array_stride();
     let mut bytes = vec![0u8; max_entities as usize * stride];
     for (proto, range) in ir.initial_entities.iter().zip(prototype_entity_ranges(ir)) {
-        let pos = proto
-            .component_ids
-            .iter()
-            .position(|c| *c == component_id);
+        let pos = proto.component_ids.iter().position(|c| *c == component_id);
         let Some(pos) = pos else { continue };
         for entity in range.clone() {
             let value = match &proto.initial_values {
@@ -119,13 +119,24 @@ mod tests {
         let mut ir = physics_world();
         // Prototype A: 4 entities with Transform+Velocity.
         ir.initial_entities = vec![
-            EntityPrototype { component_ids: vec![0, 1], count: 4, initial_values: None },
-            EntityPrototype { component_ids: vec![0, 1, 2], count: 4, initial_values: None },
+            EntityPrototype {
+                component_ids: vec![0, 1],
+                count: 4,
+                initial_values: None,
+            },
+            EntityPrototype {
+                component_ids: vec![0, 1, 2],
+                count: 4,
+                initial_values: None,
+            },
         ];
         // Query 1: Transform but WITHOUT Health -> only population A.
         ir.queries.push(QueryDef {
             id: 1,
-            with: vec![ComponentAccess { component_id: 0, access_type: AccessType::Read }],
+            with: vec![ComponentAccess {
+                component_id: 0,
+                access_type: AccessType::Read,
+            }],
             without: vec![2],
             filters: vec![],
         });

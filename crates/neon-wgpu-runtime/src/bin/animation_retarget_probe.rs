@@ -22,7 +22,7 @@ use neon_ui_schema::{
     UiBounds, UiClipShape, UiCommand, UiFragment, UiFragmentId, UiFragmentSubmission, UiNode,
     UiNodeId, UiNodeKind, UiStyle, UiTransition, UiTransitionState,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 const ENDPOINT: &str = "127.0.0.1:39261";
 const NODE_KEY: &str = "retarget-panel";
@@ -190,11 +190,7 @@ fn health_until(deadline: Instant, child: &mut Child) -> Result<(), String> {
         match call("service.health", sequence, json!({})) {
             Ok(_) => return Ok(()),
             Err(error) if Instant::now() < deadline => {
-                if child
-                    .try_wait()
-                    .map_err(|wait| wait.to_string())?
-                    .is_some()
-                {
+                if child.try_wait().map_err(|wait| wait.to_string())?.is_some() {
                     return Err(format!("runtime exited before health: {error}"));
                 }
                 sequence += 1;
@@ -239,7 +235,10 @@ fn close_enough(left: Option<f64>, right: Option<f64>) -> bool {
 }
 
 fn emit(record: Value) {
-    println!("{}", serde_json::to_string(&record).expect("probe record serializes"));
+    println!(
+        "{}",
+        serde_json::to_string(&record).expect("probe record serializes")
+    );
 }
 
 fn fail(probe_start: Instant, sequence: u64, input: Value, error: String) -> ! {
@@ -313,9 +312,7 @@ fn main() {
                 thread::sleep(Duration::from_millis(8));
             }
             let Some((current, transition_id)) = observed else {
-                return Err(format!(
-                    "no new transition observed for update {sequence}"
-                ));
+                return Err(format!("no new transition observed for update {sequence}"));
             };
             let transition = active_transition(&current).expect("observed transition exists");
             let window = window_snapshot(&current);
@@ -350,7 +347,10 @@ fn main() {
                 && sampled_x.is_some()
                 && generation == Some(1)
                 && frame_paired
-                && child.try_wait().map_err(|error| error.to_string())?.is_none();
+                && child
+                    .try_wait()
+                    .map_err(|error| error.to_string())?
+                    .is_none();
             emit(json!({
                 "probe": "animation-retarget.v1",
                 "sequence": sequence + 1,
@@ -413,9 +413,9 @@ fn main() {
                 .and_then(|frame| frame.get("nodes"))
                 .and_then(Value::as_array)
                 .and_then(|nodes| {
-                    nodes.iter().find(|node| {
-                        node.get("node_id").and_then(Value::as_str) == Some(NODE_PATH)
-                    })
+                    nodes
+                        .iter()
+                        .find(|node| node.get("node_id").and_then(Value::as_str) == Some(NODE_PATH))
                 });
             let final_x = frame_node.and_then(|node| number(node, "visual.bounds.x"));
             final_observation = json!({
@@ -451,6 +451,11 @@ fn main() {
     let _ = child.kill();
     let _ = child.wait();
     if let Err(error) = result {
-        fail(probe_start, UPDATE_COUNT + 3, json!({"endpoint": ENDPOINT}), error);
+        fail(
+            probe_start,
+            UPDATE_COUNT + 3,
+            json!({"endpoint": ENDPOINT}),
+            error,
+        );
     }
 }

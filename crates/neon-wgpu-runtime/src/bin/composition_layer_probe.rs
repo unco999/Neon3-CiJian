@@ -39,10 +39,14 @@ fn texture(device: &wgpu::Device, label: &str, usage: wgpu::TextureUsages) -> wg
     })
 }
 
-fn readback(device: &wgpu::Device, queue: &wgpu::Queue, source: &wgpu::Texture) -> Result<Vec<u8>, String> {
+fn readback(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    source: &wgpu::Texture,
+) -> Result<Vec<u8>, String> {
     let row_bytes = WIDTH * 4;
-    let padded = row_bytes.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
-        * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+    let padded =
+        row_bytes.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
     let buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("composition-layer-probe-readback"),
         size: u64::from(padded) * u64::from(HEIGHT),
@@ -75,11 +79,16 @@ fn readback(device: &wgpu::Device, queue: &wgpu::Queue, source: &wgpu::Texture) 
     );
     queue.submit(Some(encoder.finish()));
     let (tx, rx) = std::sync::mpsc::channel();
-    buffer.slice(..).map_async(wgpu::MapMode::Read, move |result| {
-        let _ = tx.send(result);
-    });
+    buffer
+        .slice(..)
+        .map_async(wgpu::MapMode::Read, move |result| {
+            let _ = tx.send(result);
+        });
     device
-        .poll(wgpu::PollType::Wait { submission_index: None, timeout: Some(std::time::Duration::from_secs(10)) })
+        .poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: Some(std::time::Duration::from_secs(10)),
+        })
         .map_err(|error| format!("probe readback poll: {error}"))?;
     rx.recv_timeout(std::time::Duration::from_secs(5))
         .map_err(|_| "probe readback timeout".to_owned())?
@@ -99,7 +108,12 @@ fn readback(device: &wgpu::Device, queue: &wgpu::Queue, source: &wgpu::Texture) 
 
 fn pixel(bytes: &[u8], x: u32, y: u32) -> [u8; 4] {
     let offset = ((y * WIDTH + x) * 4) as usize;
-    [bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3]]
+    [
+        bytes[offset],
+        bytes[offset + 1],
+        bytes[offset + 2],
+        bytes[offset + 3],
+    ]
 }
 
 fn distance(left: [u8; 4], right: [u8; 4]) -> u32 {
@@ -205,10 +219,22 @@ fn composite_pipeline(
         label: Some("composition-layer-probe-composite-bind-group"),
         layout: &layout,
         entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(backdrop) },
-            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(behind) },
-            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(normal) },
-            wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&sampler) },
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(backdrop),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(behind),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::TextureView(normal),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::Sampler(&sampler),
+            },
         ],
     });
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -284,12 +310,21 @@ fn main() -> Result<(), String> {
     let mut frames = input
         .lines()
         .filter(|line| !line.trim().is_empty())
-        .map(|line| serde_json::from_str::<FrameInput>(line).map_err(|error| format!("probe input line: {error}")))
+        .map(|line| {
+            serde_json::from_str::<FrameInput>(line)
+                .map_err(|error| format!("probe input line: {error}"))
+        })
         .collect::<Result<Vec<_>, _>>()?;
     if frames.is_empty() {
         frames = vec![
-            FrameInput { frame_sequence: 1, time_seconds: 1.0 },
-            FrameInput { frame_sequence: 2, time_seconds: 2.0 },
+            FrameInput {
+                frame_sequence: 1,
+                time_seconds: 1.0,
+            },
+            FrameInput {
+                frame_sequence: 2,
+                time_seconds: 2.0,
+            },
         ];
     }
 
@@ -328,15 +363,38 @@ fn main() -> Result<(), String> {
     behind_renderer.sync_material_packages(&device, &packages);
     normal_renderer.sync_material_packages(&device, &packages);
     eprintln!("probe: renderers ready");
-    let backdrop = texture(&device, "composition-layer-probe-backdrop", wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC);
-    let behind = texture(&device, "composition-layer-probe-behind-surface-g1", wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC);
-    let normal = texture(&device, "composition-layer-probe-normal-surface-g1", wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC);
-    let consumer = texture(&device, "composition-layer-probe-consumer-final", wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC);
+    let backdrop = texture(
+        &device,
+        "composition-layer-probe-backdrop",
+        wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_SRC,
+    );
+    let behind = texture(
+        &device,
+        "composition-layer-probe-behind-surface-g1",
+        wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_SRC,
+    );
+    let normal = texture(
+        &device,
+        "composition-layer-probe-normal-surface-g1",
+        wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_SRC,
+    );
+    let consumer = texture(
+        &device,
+        "composition-layer-probe-consumer-final",
+        wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+    );
     let backdrop_view = backdrop.create_view(&Default::default());
     let behind_view = behind.create_view(&Default::default());
     let normal_view = normal.create_view(&Default::default());
     let consumer_view = consumer.create_view(&Default::default());
-    let (pipeline, bind_group) = composite_pipeline(&device, &backdrop_view, &behind_view, &normal_view);
+    let (pipeline, bind_group) =
+        composite_pipeline(&device, &backdrop_view, &behind_view, &normal_view);
     let backdrop_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("composition-layer-probe-backdrop-layout"),
         entries: &[wgpu::BindGroupLayoutEntry {
@@ -380,22 +438,59 @@ fn main() -> Result<(), String> {
     });
     let backdrop_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("composition-layer-probe-backdrop-pipeline"),
-         layout: Some(&device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[Some(&backdrop_layout)], immediate_size: 0 })),
-        vertex: wgpu::VertexState { module: &backdrop_shader, entry_point: Some("vs"), buffers: &[], compilation_options: Default::default() },
-        fragment: Some(wgpu::FragmentState { module: &backdrop_shader, entry_point: Some("fs"), targets: &[Some(wgpu::ColorTargetState { format: FORMAT, blend: None, write_mask: wgpu::ColorWrites::ALL })], compilation_options: Default::default() }),
-        primitive: wgpu::PrimitiveState::default(), depth_stencil: None, multisample: wgpu::MultisampleState::default(), multiview_mask: None, cache: None,
+        layout: Some(
+            &device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: None,
+                bind_group_layouts: &[Some(&backdrop_layout)],
+                immediate_size: 0,
+            }),
+        ),
+        vertex: wgpu::VertexState {
+            module: &backdrop_shader,
+            entry_point: Some("vs"),
+            buffers: &[],
+            compilation_options: Default::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &backdrop_shader,
+            entry_point: Some("fs"),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: FORMAT,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: Default::default(),
+        }),
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
     });
 
     let mut previous_pixels: Option<([u8; 4], [u8; 4])> = None;
     let mut failed = false;
     for frame in frames {
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("composition-layer-probe-frame") });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("composition-layer-probe-frame"),
+        });
         queue.write_buffer(&backdrop_time, 0, bytemuck::bytes_of(&frame.time_seconds));
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("composition-layer-probe-backdrop-pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &backdrop_view, depth_slice: None, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store } })],
-                depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None, multiview_mask: None,
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &backdrop_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
             });
             pass.set_pipeline(&backdrop_pipeline);
             pass.set_bind_group(0, &backdrop_bind_group, &[]);
@@ -404,31 +499,87 @@ fn main() -> Result<(), String> {
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("composition-layer-probe-behind-pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &behind_view, depth_slice: None, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store } })],
-                depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None, multiview_mask: None,
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &behind_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
             });
-            behind_renderer.draw(&device, &queue, &mut pass, &fragments, [WIDTH, HEIGHT], [WIDTH as f32, HEIGHT as f32], frame.time_seconds, UiDrawMode::BehindGlass);
+            behind_renderer.draw(
+                &device,
+                &queue,
+                &mut pass,
+                &fragments,
+                [WIDTH, HEIGHT],
+                [WIDTH as f32, HEIGHT as f32],
+                frame.time_seconds,
+                UiDrawMode::BehindGlass,
+            );
         }
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("composition-layer-probe-normal-pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &normal_view, depth_slice: None, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store } })],
-                depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None, multiview_mask: None,
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &normal_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
             });
-            normal_renderer.draw(&device, &queue, &mut pass, &fragments, [WIDTH, HEIGHT], [WIDTH as f32, HEIGHT as f32], frame.time_seconds, UiDrawMode::Screen);
+            normal_renderer.draw(
+                &device,
+                &queue,
+                &mut pass,
+                &fragments,
+                [WIDTH, HEIGHT],
+                [WIDTH as f32, HEIGHT as f32],
+                frame.time_seconds,
+                UiDrawMode::Screen,
+            );
         }
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("composition-layer-probe-consumer-pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &consumer_view, depth_slice: None, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store } })],
-                depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None, multiview_mask: None,
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &consumer_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
             });
             pass.set_pipeline(&pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
             pass.draw(0..3, 0..1);
         }
         queue.submit(Some(encoder.finish()));
-        device.poll(wgpu::PollType::Wait { submission_index: None, timeout: Some(std::time::Duration::from_secs(10)) }).map_err(|error| format!("probe frame poll: {error}"))?;
+        device
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: Some(std::time::Duration::from_secs(10)),
+            })
+            .map_err(|error| format!("probe frame poll: {error}"))?;
         eprintln!("probe: frame {} poll complete", frame.frame_sequence);
         eprintln!("probe: reading back producer");
         let producer = readback(&device, &queue, &behind)?;
@@ -437,7 +588,8 @@ fn main() -> Result<(), String> {
         let consumer_pixel = pixel(&final_pixels, 48, 48);
         let top_pixel = pixel(&final_pixels, 200, 48);
         let changed = distance(producer_pixel, consumer_pixel) > 8;
-        let top_present = top_pixel[1] > top_pixel[0] && top_pixel[1] > top_pixel[2] && top_pixel[3] > 180;
+        let top_present =
+            top_pixel[1] > top_pixel[0] && top_pixel[1] > top_pixel[2] && top_pixel[3] > 180;
         let missing = producer_pixel[3] < 32 || consumer_pixel[3] < 32;
         let stale = previous_pixels.is_some_and(|(previous_producer, previous_consumer)| {
             frame.frame_sequence > 1
@@ -445,7 +597,11 @@ fn main() -> Result<(), String> {
                 && previous_consumer == consumer_pixel
         });
         let coords = top_present && consumer_pixel[0] > top_pixel[0];
-        let direction = if changed { "blurred_consumer_differs_from_producer" } else { "missing_or_unblurred" };
+        let direction = if changed {
+            "blurred_consumer_differs_from_producer"
+        } else {
+            "missing_or_unblurred"
+        };
         let record = serde_json::json!({
             "probe": "composition-layer",
             "frame_sequence": frame.frame_sequence,
@@ -463,5 +619,9 @@ fn main() -> Result<(), String> {
         failed |= missing || stale || !changed || !coords;
         previous_pixels = Some((producer_pixel, consumer_pixel));
     }
-    if failed { Err("composition layer probe failed pixel assertions".into()) } else { Ok(()) }
+    if failed {
+        Err("composition layer probe failed pixel assertions".into())
+    } else {
+        Ok(())
+    }
 }

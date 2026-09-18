@@ -20,12 +20,13 @@ pub mod wgsl_types;
 pub use bind_layout::{QueryRange, RenderInstance, StructuralCommand};
 pub use validation::{check_limits, check_schedule_conflicts, required_group0_bindings};
 
-use crate::ir::{ComponentType, EcsIr};
 use crate::EcsError;
+use crate::ir::{ComponentType, EcsIr};
 use system_emit::EmitCtx;
 
 /// Entry point names reserved for the sorting pass.
-const RESERVED_ENTRY_POINTS: [&str; 3] = ["system_prep_count", "system_prep_scan", "system_prep_fill"];
+const RESERVED_ENTRY_POINTS: [&str; 3] =
+    ["system_prep_count", "system_prep_scan", "system_prep_fill"];
 
 /// Generate the complete WGSL module for a validated world.
 pub fn generate_wgsl(ir: &EcsIr) -> Result<String, EcsError> {
@@ -72,9 +73,7 @@ fn emit_structs(out: &mut String) {
     out.push_str(
         "struct StructuralCommand {\n    kind : u32,\n    a : u32,\n    b : u32,\n    reserved : u32,\n}\n\n",
     );
-    out.push_str(
-        "struct RenderInstance {\n    transform : vec4f,\n    color : vec4f,\n}\n\n",
-    );
+    out.push_str("struct RenderInstance {\n    transform : vec4f,\n    color : vec4f,\n}\n\n");
 }
 
 fn emit_bindings(out: &mut String, ir: &EcsIr) {

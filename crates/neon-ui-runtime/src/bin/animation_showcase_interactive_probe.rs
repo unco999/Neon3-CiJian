@@ -19,16 +19,13 @@ use neon_protocol::{
     ClientIdentity, ClientKind, ProtocolVersion, RequestId, Revision, RpcRequest, RpcResponse,
     RpcStatus, ServiceName,
 };
-use neon_ui_runtime::{
-    UiRuntime, compile_nui_flow_program, parse_nui_flow,
-};
+use neon_ui_runtime::{UiRuntime, compile_nui_flow_program, parse_nui_flow};
 use neon_ui_schema::{
-    UI_CANVAS_POINTS_LINES_CAPABILITY_NAME,
-    UI_COMPONENT_SKIN_CAPABILITY_NAME, UI_NINE_SLICE_CAPABILITY_NAME,
-    UI_PROGRAM_BOUNDED_STRUCTURE_CAPABILITY_NAME, UI_PROGRAM_CAPABILITY_NAME,
-    UI_PROGRAM_SEMANTIC_EVENT_CAPABILITY_NAME, UI_PROGRAM_SCHEMA_VERSION,
-    UI_PROGRAM_TEXT_REGISTRY_CAPABILITY_NAME, UI_TIMELINE_ANIMATION_CAPABILITY_NAME,
-    UiHostInbound, UiHostPublication, UiInputChange,
+    UI_CANVAS_POINTS_LINES_CAPABILITY_NAME, UI_COMPONENT_SKIN_CAPABILITY_NAME,
+    UI_NINE_SLICE_CAPABILITY_NAME, UI_PROGRAM_BOUNDED_STRUCTURE_CAPABILITY_NAME,
+    UI_PROGRAM_CAPABILITY_NAME, UI_PROGRAM_SCHEMA_VERSION,
+    UI_PROGRAM_SEMANTIC_EVENT_CAPABILITY_NAME, UI_PROGRAM_TEXT_REGISTRY_CAPABILITY_NAME,
+    UI_TIMELINE_ANIMATION_CAPABILITY_NAME, UiHostInbound, UiHostPublication, UiInputChange,
     UiInputFrame, UiInputSchema, UiInputValue, UiProgram, UiProgramCapability,
     UiProgramCapabilityOwner, UiProgramCapabilityStatus, UiProgramRevision,
 };
@@ -165,7 +162,10 @@ impl Step {
 }
 
 fn emit(record: Value) {
-    println!("{}", serde_json::to_string(&record).expect("probe record serializes"));
+    println!(
+        "{}",
+        serde_json::to_string(&record).expect("probe record serializes")
+    );
 }
 
 fn identity() -> ClientIdentity {
@@ -225,10 +225,7 @@ fn call_result_with_timeout(
         .call(&request(target, method, sequence, params))
         .map_err(|error| error.to_string())?;
     if response.status != RpcStatus::Accepted {
-        return Err(format!(
-            "{target}.{method} rejected: {:?}",
-            response.error
-        ));
+        return Err(format!("{target}.{method} rejected: {:?}", response.error));
     }
     Ok(response.result.unwrap_or(Value::Null))
 }
@@ -386,11 +383,7 @@ fn wait_for_endpoint(endpoint: SocketAddr, target: &str, child: &mut Child) -> R
         match call_result(endpoint, target, "service.health", sequence, json!({})) {
             Ok(_) => return Ok(()),
             Err(error) if Instant::now() < deadline => {
-                if child
-                    .try_wait()
-                    .map_err(|wait| wait.to_string())?
-                    .is_some()
-                {
+                if child.try_wait().map_err(|wait| wait.to_string())?.is_some() {
                     return Err(format!("runtime exited during startup: {error}"));
                 }
                 sequence += 1;
@@ -450,10 +443,7 @@ fn last_transition<'a>(snapshot: &'a Value, machine: &str) -> Option<&'a Value> 
 }
 
 fn state<'a>(snapshot: &'a Value, machine: &str) -> Option<&'a str> {
-    snapshot
-        .get("states")?
-        .get(machine)?
-        .as_str()
+    snapshot.get("states")?.get(machine)?.as_str()
 }
 
 fn transition_id(snapshot: &Value, node_path: &str) -> u64 {
@@ -500,22 +490,13 @@ fn run_animation_controls(child: &mut Child, sequence: u64) -> Result<(), String
                 )
         });
     let resume = animation_control("wgpu.ui.animation.resume", sequence + 3, node_path, None)?;
-    let seek_half = animation_control(
-        "wgpu.ui.animation.seek",
-        sequence + 4,
-        node_path,
-        Some(0.5),
-    )?;
+    let seek_half =
+        animation_control("wgpu.ui.animation.seek", sequence + 4, node_path, Some(0.5))?;
     let seek_snapshot = wgpu_snapshot(sequence + 5)?;
     let seek_progress = active_transition(&seek_snapshot, node_path)
         .and_then(|transition| transition.get("progress"))
         .and_then(Value::as_f64);
-    let complete = animation_control(
-        "wgpu.ui.animation.seek",
-        sequence + 6,
-        node_path,
-        Some(1.0),
-    )?;
+    let complete = animation_control("wgpu.ui.animation.seek", sequence + 6, node_path, Some(1.0))?;
     let completed_snapshot = wgpu_snapshot(sequence + 7)?;
     let cleaned = active_transition(&completed_snapshot, node_path).is_none();
     let process_alive = child
@@ -525,9 +506,10 @@ fn run_animation_controls(child: &mut Child, sequence: u64) -> Result<(), String
     let pass = pause.get("state").and_then(Value::as_str) == Some("paused")
         && frozen
         && resume.get("state").and_then(Value::as_str) == Some("running")
-        && seek_half.get("progress").and_then(Value::as_f64).is_some_and(|value| {
-            (value - 0.5).abs() <= 0.001
-        })
+        && seek_half
+            .get("progress")
+            .and_then(Value::as_f64)
+            .is_some_and(|value| (value - 0.5).abs() <= 0.001)
         && seek_progress.is_some_and(|value| (value - 0.5).abs() <= 0.12)
         && complete.get("state").and_then(Value::as_str) == Some("completed")
         && cleaned
@@ -599,7 +581,9 @@ fn observe_timeline_cubic_segment(child: &mut Child, sequence: u64) -> Result<()
     if pass {
         Ok(())
     } else {
-        Err(format!("cubic-bezier segment was not observed: {transition:?}"))
+        Err(format!(
+            "cubic-bezier segment was not observed: {transition:?}"
+        ))
     }
 }
 
@@ -671,7 +655,10 @@ fn wait_for_renderer_idle(child: &mut Child, sequence: u64) -> Result<Value, Str
         .unwrap_or_default();
     Err(format!(
         "initial animations did not settle: count={}, transitions={active_summary:?}, history={history_summary:?}",
-        active.get("count").and_then(Value::as_u64).unwrap_or(u64::MAX),
+        active
+            .get("count")
+            .and_then(Value::as_u64)
+            .unwrap_or(u64::MAX),
     ))
 }
 
@@ -856,7 +843,11 @@ fn wait_for_step(
             transition_id(&wgpu, path) > previous_numeric_transition_id
                 && active_transition(&wgpu, path).is_some()
         });
-        if state_matches && render_seen && numeric_render_seen && (!step.expect_timeline || timeline_seen) {
+        if state_matches
+            && render_seen
+            && numeric_render_seen
+            && (!step.expect_timeline || timeline_seen)
+        {
             break;
         }
         thread::sleep(Duration::from_millis(12));
@@ -870,9 +861,10 @@ fn wait_for_step(
             if let Some(transition) = active_transition(&snapshot, &panel_path) {
                 let sampled_width = number_at(transition, "sampled.bounds.width");
                 let target_width = number_at(transition, "target.bounds.width");
-                if sampled_width.zip(target_width).is_some_and(|(sampled, target)| {
-                    sampled > target + 0.01
-                }) {
+                if sampled_width
+                    .zip(target_width)
+                    .is_some_and(|(sampled, target)| sampled > target + 0.01)
+                {
                     spring_overshoot = true;
                     break;
                 }
@@ -906,8 +898,9 @@ fn wait_for_step(
     };
     let selected = last_transition(&ui, step.machine);
     let active = active_transition(&wgpu, &panel_path);
-    let timeline_child_transition = active_transition(&observed_timeline_child, &timeline_child_path)
-        .or_else(|| active_transition(&wgpu, &timeline_child_path));
+    let timeline_child_transition =
+        active_transition(&observed_timeline_child, &timeline_child_path)
+            .or_else(|| active_transition(&wgpu, &timeline_child_path));
     let observed_active = active_transition(&observed_wgpu, &panel_path);
     let renderer_transition = active.or(observed_active);
     let numeric_active = numeric_path
@@ -954,12 +947,10 @@ fn wait_for_step(
     } else {
         true
     };
-    let numeric_target = numeric_active.and_then(|transition| {
-        number_at(transition, "target.numeric_value.value")
-    });
-    let numeric_sampled = numeric_active.and_then(|transition| {
-        number_at(transition, "sampled.numeric_value.value")
-    });
+    let numeric_target =
+        numeric_active.and_then(|transition| number_at(transition, "target.numeric_value.value"));
+    let numeric_sampled =
+        numeric_active.and_then(|transition| number_at(transition, "sampled.numeric_value.value"));
     let numeric_matches = match step.expected_numeric {
         Some(expected) => {
             numeric_active.is_some()
@@ -1109,7 +1100,11 @@ fn wait_for_exit_unmount(
     let mut active = None;
     let mut observed_active = None;
     while Instant::now() < deadline {
-        if child.try_wait().map_err(|error| error.to_string())?.is_some() {
+        if child
+            .try_wait()
+            .map_err(|error| error.to_string())?
+            .is_some()
+        {
             return Err("WGPU process exited during exit/unmount".into());
         }
         active_snapshot = wgpu_snapshot(sequence + 1).unwrap_or(Value::Null);
@@ -1145,12 +1140,13 @@ fn wait_for_exit_unmount(
         .get("window")
         .and_then(|window| window.get("active_transitions"))
         .and_then(|active| active.get("last_exit_reconciliation"))
-        .filter(|diagnostic| diagnostic.get("result").and_then(Value::as_str) == Some("exit_started"))
+        .filter(|diagnostic| {
+            diagnostic.get("result").and_then(Value::as_str) == Some("exit_started")
+        })
         .cloned();
-    let exit_evidence = evidence_active
-        .cloned()
-        .or(final_exit_diagnostic);
-    let (observed_producer_frame, observed_consumer_frame) = frame_pair(evidence_snapshot, node_path);
+    let exit_evidence = evidence_active.cloned().or(final_exit_diagnostic);
+    let (observed_producer_frame, observed_consumer_frame) =
+        frame_pair(evidence_snapshot, node_path);
     let producer_frame = observed_producer_frame.or_else(|| {
         exit_evidence
             .as_ref()
@@ -1192,7 +1188,9 @@ fn wait_for_exit_unmount(
     if pass {
         Ok(())
     } else {
-        Err(format!("exit/unmount failed: exit_track={exit_track}, frame={producer_frame:?}->{consumer_frame:?}, removed={removed}, observed={evidence_active:?}, snapshot={final_snapshot}"))
+        Err(format!(
+            "exit/unmount failed: exit_track={exit_track}, frame={producer_frame:?}->{consumer_frame:?}, removed={removed}, observed={evidence_active:?}, snapshot={final_snapshot}"
+        ))
     }
 }
 
@@ -1239,7 +1237,13 @@ fn wait_for_exit_mount(
         "result": if pass { "passed" } else { "failed" },
         "pass_result": pass,
     }));
-    if pass { Ok(()) } else { Err(format!("exit/mount failed: mounted={mounted}, snapshot={snapshot}")) }
+    if pass {
+        Ok(())
+    } else {
+        Err(format!(
+            "exit/mount failed: mounted={mounted}, snapshot={snapshot}"
+        ))
+    }
 }
 
 fn main() {
@@ -1274,23 +1278,20 @@ fn main() {
         }
     };
     let (host_events_tx, host_events_rx) = mpsc::channel();
-    let (host_endpoint, host_thread) = match start_host(
-        host_events_tx,
-        program,
-        document.input_schema.clone(),
-    ) {
-        Ok(value) => value,
-        Err(error) => {
-            emit(json!({
-                "probe": "animation-showcase.interactive.v1",
-                "sequence": 0,
-                "result": "failed",
-                "pass_result": false,
-                "error": error,
-            }));
-            std::process::exit(1);
-        }
-    };
+    let (host_endpoint, host_thread) =
+        match start_host(host_events_tx, program, document.input_schema.clone()) {
+            Ok(value) => value,
+            Err(error) => {
+                emit(json!({
+                    "probe": "animation-showcase.interactive.v1",
+                    "sequence": 0,
+                    "result": "failed",
+                    "pass_result": false,
+                    "error": error,
+                }));
+                std::process::exit(1);
+            }
+        };
 
     let ui_endpoint: SocketAddr = UI_ENDPOINT.parse().expect("fixed UI endpoint");
     let wgpu_endpoint: SocketAddr = WGPU_ENDPOINT.parse().expect("fixed WGPU endpoint");
@@ -1308,7 +1309,10 @@ fn main() {
                 "pass_result": false,
                 "error": error,
             }));
-            let _ = call(host_endpoint, request("ui-host", "service.shutdown", 90_000, json!({})));
+            let _ = call(
+                host_endpoint,
+                request("ui-host", "service.shutdown", 90_000, json!({})),
+            );
             let _ = host_thread.join();
             let _ = ui_thread.join();
             std::process::exit(1);
@@ -1349,14 +1353,19 @@ fn main() {
                 "result": "waiting_for_manual_input",
                 "pass_result": true,
             }));
-            println!("Animation showcase window is ready. Click the buttons to test it manually; it will stay open for up to 10 minutes.");
+            println!(
+                "Animation showcase window is ready. Click the buttons to test it manually; it will stay open for up to 10 minutes."
+            );
             thread::sleep(Duration::from_secs(600));
             return Ok(());
         }
         let startup_deadline = Instant::now() + STARTUP_TIMEOUT;
         while Instant::now() < startup_deadline {
             if let Ok(snapshot) = wgpu_snapshot(2)
-                && window_snapshot(&snapshot).get("state").and_then(Value::as_str) != Some("uninitialized")
+                && window_snapshot(&snapshot)
+                    .get("state")
+                    .and_then(Value::as_str)
+                    != Some("uninitialized")
             {
                 break;
             }
@@ -1401,40 +1410,278 @@ fn main() {
         }));
 
         let steps = [
-            Step::visual("btn-a-toggle", "panel-a", "expanded", "anim-panel-a", "expand", "ease_out"),
-            Step::visual("btn-a-collapse", "panel-a", "compact", "anim-panel-a", "collapse", "ease_in"),
-            Step::visual("btn-a-toggle", "panel-a", "expanded", "anim-panel-a", "expand", "ease_out"),
-            Step::visual("btn-a-toggle", "panel-a", "compact", "anim-panel-a", "collapse", "ease_in"),
-            Step::visual("btn-b-toggle", "panel-b", "hidden", "anim-panel-b", "fade-out", "ease_in"),
-            Step::visual("btn-b-show", "panel-b", "visible", "anim-panel-b", "fade-in", "ease_out"),
-            Step::visual("btn-b-toggle", "panel-b", "hidden", "anim-panel-b", "fade-out", "ease_in"),
-            Step::visual("btn-b-toggle", "panel-b", "visible", "anim-panel-b", "fade-in", "ease_out"),
-            Step::visual("btn-c-warn", "panel-c", "warning", "anim-panel-c", "color-shift", "ease_in_out"),
-            Step::visual("btn-c-error", "panel-c", "error", "anim-panel-c", "color-shift", "ease_in_out"),
-            Step::visual("btn-c-normal", "panel-c", "normal", "anim-panel-c", "color-shift", "ease_in_out"),
-            Step::visual("btn-d-toggle", "panel-d", "right", "anim-panel-d", "slide", "ease_in_out"),
-            Step::visual("btn-d-left", "panel-d", "left", "anim-panel-d", "slide", "ease_in_out"),
-            Step::visual("btn-e-toggle", "panel-e", "expanded", "anim-panel-e", "expand", "ease_out"),
-            Step::visual("btn-e-collapse", "panel-e", "collapsed", "anim-panel-e", "collapse", "ease_in"),
-            Step::visual("btn-e-toggle", "panel-e", "expanded", "anim-panel-e", "expand", "ease_out"),
-            Step::visual("btn-e-toggle", "panel-e", "collapsed", "anim-panel-e", "collapse", "ease_in"),
-            Step::visual("btn-f-next", "panel-f", "medium", "anim-panel-f", "expand", "ease_out"),
-            Step::visual("btn-f-next", "panel-f", "large", "anim-panel-f", "expand", "ease_out"),
-            Step::visual("btn-f-next", "panel-f", "small", "anim-panel-f", "collapse", "ease_in"),
-            Step::visual("btn-f-large", "panel-f", "large", "anim-panel-f", "expand", "ease_out"),
-            Step::visual("btn-f-next", "panel-f", "small", "anim-panel-f", "collapse", "ease_in"),
-            Step::visual("btn-g-toggle", "panel-g", "emphasized", "anim-panel-g", "edge-glow", "ease_out"),
-            Step::visual("btn-g-quiet", "panel-g", "quiet", "anim-panel-g", "edge-glow", "ease_out"),
-            Step::visual("btn-g-toggle", "panel-g", "emphasized", "anim-panel-g", "edge-glow", "ease_out"),
-            Step::visual("btn-g-quiet", "panel-g", "quiet", "anim-panel-g", "edge-glow", "ease_out"),
-            Step::visual("btn-h-toggle", "panel-h", "shown", "anim-panel-h", "delayed-reveal", "ease_out"),
-            Step::visual("btn-h-again", "panel-h", "hidden", "anim-panel-h", "fade-out", "ease_in"),
-            Step::numeric("btn-i-fill", "panel-i", "full", "anim-panel-i", "linear-fill", 100.0),
-            Step::numeric("btn-i-empty", "panel-i", "empty", "anim-panel-i", "linear-fill", 0.0),
-            Step::visual("btn-j-spring", "panel-j", "bounced", "anim-panel-j", "spring-expand", "spring"),
-            Step::visual("btn-j-reset", "panel-j", "rest", "anim-panel-j", "spring-expand", "spring"),
-            Step::transform("btn-k-show", "panel-k", "settled", "anim-panel-k", true, false),
-            Step::transform("btn-k-reset", "panel-k", "rest", "anim-panel-k", false, true),
+            Step::visual(
+                "btn-a-toggle",
+                "panel-a",
+                "expanded",
+                "anim-panel-a",
+                "expand",
+                "ease_out",
+            ),
+            Step::visual(
+                "btn-a-collapse",
+                "panel-a",
+                "compact",
+                "anim-panel-a",
+                "collapse",
+                "ease_in",
+            ),
+            Step::visual(
+                "btn-a-toggle",
+                "panel-a",
+                "expanded",
+                "anim-panel-a",
+                "expand",
+                "ease_out",
+            ),
+            Step::visual(
+                "btn-a-toggle",
+                "panel-a",
+                "compact",
+                "anim-panel-a",
+                "collapse",
+                "ease_in",
+            ),
+            Step::visual(
+                "btn-b-toggle",
+                "panel-b",
+                "hidden",
+                "anim-panel-b",
+                "fade-out",
+                "ease_in",
+            ),
+            Step::visual(
+                "btn-b-show",
+                "panel-b",
+                "visible",
+                "anim-panel-b",
+                "fade-in",
+                "ease_out",
+            ),
+            Step::visual(
+                "btn-b-toggle",
+                "panel-b",
+                "hidden",
+                "anim-panel-b",
+                "fade-out",
+                "ease_in",
+            ),
+            Step::visual(
+                "btn-b-toggle",
+                "panel-b",
+                "visible",
+                "anim-panel-b",
+                "fade-in",
+                "ease_out",
+            ),
+            Step::visual(
+                "btn-c-warn",
+                "panel-c",
+                "warning",
+                "anim-panel-c",
+                "color-shift",
+                "ease_in_out",
+            ),
+            Step::visual(
+                "btn-c-error",
+                "panel-c",
+                "error",
+                "anim-panel-c",
+                "color-shift",
+                "ease_in_out",
+            ),
+            Step::visual(
+                "btn-c-normal",
+                "panel-c",
+                "normal",
+                "anim-panel-c",
+                "color-shift",
+                "ease_in_out",
+            ),
+            Step::visual(
+                "btn-d-toggle",
+                "panel-d",
+                "right",
+                "anim-panel-d",
+                "slide",
+                "ease_in_out",
+            ),
+            Step::visual(
+                "btn-d-left",
+                "panel-d",
+                "left",
+                "anim-panel-d",
+                "slide",
+                "ease_in_out",
+            ),
+            Step::visual(
+                "btn-e-toggle",
+                "panel-e",
+                "expanded",
+                "anim-panel-e",
+                "expand",
+                "ease_out",
+            ),
+            Step::visual(
+                "btn-e-collapse",
+                "panel-e",
+                "collapsed",
+                "anim-panel-e",
+                "collapse",
+                "ease_in",
+            ),
+            Step::visual(
+                "btn-e-toggle",
+                "panel-e",
+                "expanded",
+                "anim-panel-e",
+                "expand",
+                "ease_out",
+            ),
+            Step::visual(
+                "btn-e-toggle",
+                "panel-e",
+                "collapsed",
+                "anim-panel-e",
+                "collapse",
+                "ease_in",
+            ),
+            Step::visual(
+                "btn-f-next",
+                "panel-f",
+                "medium",
+                "anim-panel-f",
+                "expand",
+                "ease_out",
+            ),
+            Step::visual(
+                "btn-f-next",
+                "panel-f",
+                "large",
+                "anim-panel-f",
+                "expand",
+                "ease_out",
+            ),
+            Step::visual(
+                "btn-f-next",
+                "panel-f",
+                "small",
+                "anim-panel-f",
+                "collapse",
+                "ease_in",
+            ),
+            Step::visual(
+                "btn-f-large",
+                "panel-f",
+                "large",
+                "anim-panel-f",
+                "expand",
+                "ease_out",
+            ),
+            Step::visual(
+                "btn-f-next",
+                "panel-f",
+                "small",
+                "anim-panel-f",
+                "collapse",
+                "ease_in",
+            ),
+            Step::visual(
+                "btn-g-toggle",
+                "panel-g",
+                "emphasized",
+                "anim-panel-g",
+                "edge-glow",
+                "ease_out",
+            ),
+            Step::visual(
+                "btn-g-quiet",
+                "panel-g",
+                "quiet",
+                "anim-panel-g",
+                "edge-glow",
+                "ease_out",
+            ),
+            Step::visual(
+                "btn-g-toggle",
+                "panel-g",
+                "emphasized",
+                "anim-panel-g",
+                "edge-glow",
+                "ease_out",
+            ),
+            Step::visual(
+                "btn-g-quiet",
+                "panel-g",
+                "quiet",
+                "anim-panel-g",
+                "edge-glow",
+                "ease_out",
+            ),
+            Step::visual(
+                "btn-h-toggle",
+                "panel-h",
+                "shown",
+                "anim-panel-h",
+                "delayed-reveal",
+                "ease_out",
+            ),
+            Step::visual(
+                "btn-h-again",
+                "panel-h",
+                "hidden",
+                "anim-panel-h",
+                "fade-out",
+                "ease_in",
+            ),
+            Step::numeric(
+                "btn-i-fill",
+                "panel-i",
+                "full",
+                "anim-panel-i",
+                "linear-fill",
+                100.0,
+            ),
+            Step::numeric(
+                "btn-i-empty",
+                "panel-i",
+                "empty",
+                "anim-panel-i",
+                "linear-fill",
+                0.0,
+            ),
+            Step::visual(
+                "btn-j-spring",
+                "panel-j",
+                "bounced",
+                "anim-panel-j",
+                "spring-expand",
+                "spring",
+            ),
+            Step::visual(
+                "btn-j-reset",
+                "panel-j",
+                "rest",
+                "anim-panel-j",
+                "spring-expand",
+                "spring",
+            ),
+            Step::transform(
+                "btn-k-show",
+                "panel-k",
+                "settled",
+                "anim-panel-k",
+                true,
+                false,
+            ),
+            Step::transform(
+                "btn-k-reset",
+                "panel-k",
+                "rest",
+                "anim-panel-k",
+                false,
+                true,
+            ),
             Step::timeline("btn-m-play", "panel-m", "peak", "anim-panel-m"),
             Step::timeline("btn-m-reset", "panel-m", "rest", "anim-panel-m"),
         ];
@@ -1535,29 +1782,23 @@ fn main() {
                     })
                 })
                 .and_then(|node| number_at(node, "visual.numeric_value.value"));
-            final_k_identity = frame_visual(
-                &final_wgpu,
-                "surface.anim-showcase/anim-panel-k",
-            )
-            .is_some_and(|visual| {
-                number_at(visual, "transform.translation.0")
-                    .is_some_and(|value| value.abs() <= 0.01)
-                    && number_at(visual, "transform.translation.1")
+            final_k_identity = frame_visual(&final_wgpu, "surface.anim-showcase/anim-panel-k")
+                .is_some_and(|visual| {
+                    number_at(visual, "transform.translation.0")
                         .is_some_and(|value| value.abs() <= 0.01)
-                    && number_at(visual, "transform.scale.0")
-                        .is_some_and(|value| (value - 1.0).abs() <= 0.01)
-                    && number_at(visual, "transform.scale.1")
-                        .is_some_and(|value| (value - 1.0).abs() <= 0.01)
-                    && number_at(visual, "transform.rotation_degrees")
-                        .is_some_and(|value| value.abs() <= 0.01)
-            });
-            final_l_mounted = frame_visual(
-                &final_wgpu,
-                "surface.anim-showcase/anim-panel-l",
-            )
-            .and_then(|visual| visual.get("opacity"))
-            .and_then(Value::as_f64)
-            .is_some_and(|opacity| opacity > 0.99);
+                        && number_at(visual, "transform.translation.1")
+                            .is_some_and(|value| value.abs() <= 0.01)
+                        && number_at(visual, "transform.scale.0")
+                            .is_some_and(|value| (value - 1.0).abs() <= 0.01)
+                        && number_at(visual, "transform.scale.1")
+                            .is_some_and(|value| (value - 1.0).abs() <= 0.01)
+                        && number_at(visual, "transform.rotation_degrees")
+                            .is_some_and(|value| value.abs() <= 0.01)
+                });
+            final_l_mounted = frame_visual(&final_wgpu, "surface.anim-showcase/anim-panel-l")
+                .and_then(|visual| visual.get("opacity"))
+                .and_then(Value::as_f64)
+                .is_some_and(|opacity| opacity > 0.99);
             if active == 0
                 && state(&final_ui, "panel-a") == Some("compact")
                 && state(&final_ui, "panel-b") == Some("visible")
@@ -1580,7 +1821,13 @@ fn main() {
             }
             thread::sleep(Duration::from_millis(20));
         }
-        let health = call_result(wgpu_endpoint, "wgpu-runtime", "service.health", 50_000, json!({}))?;
+        let health = call_result(
+            wgpu_endpoint,
+            "wgpu-runtime",
+            "service.health",
+            50_000,
+            json!({}),
+        )?;
         let final_pass = final_active_count == 0
             && final_h_opacity.is_some_and(|opacity| opacity <= 0.0001)
             && close_enough(final_i_value, Some(0.0))
@@ -1613,7 +1860,9 @@ fn main() {
         if final_pass {
             Ok(())
         } else {
-            Err(format!("final state did not settle: active={final_active_count}, h_opacity={final_h_opacity:?}, i_value={final_i_value:?}, ui={final_ui}, wgpu={final_wgpu}"))
+            Err(format!(
+                "final state did not settle: active={final_active_count}, h_opacity={final_h_opacity:?}, i_value={final_i_value:?}, ui={final_ui}, wgpu={final_wgpu}"
+            ))
         }
     })();
 
@@ -1630,7 +1879,9 @@ fn main() {
         request("ui-host", "service.shutdown", 90_003, json!({})),
     );
     let _ = child.wait();
-    let ui_result = ui_thread.join().unwrap_or_else(|_| Err("UI thread panicked".into()));
+    let ui_result = ui_thread
+        .join()
+        .unwrap_or_else(|_| Err("UI thread panicked".into()));
     let host_result = host_thread
         .join()
         .unwrap_or_else(|_| Err("host thread panicked".into()));

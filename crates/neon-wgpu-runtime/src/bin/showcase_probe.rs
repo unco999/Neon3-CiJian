@@ -17,11 +17,11 @@ use neon_protocol::{
     ClientIdentity, ClientKind, ProtocolVersion, RequestId, Revision, RpcRequest, RpcResponse,
     RpcStatus, ServiceName, UiImageSource, UiImageUploadRequest,
 };
-use neon_ui_schema::{
-    UiCommand, UiControlPresentation, UiEffect, UiFragment, UiFragmentId, UiFragmentSubmission,
-    UiNode, UiNodeId, UiSemanticEvent, TextRef,
-};
 use neon_ui_runtime::nui_flow::{lower_nui_flow, lower_nui_flow_effects, parse_nui_flow};
+use neon_ui_schema::{
+    TextRef, UiCommand, UiControlPresentation, UiEffect, UiFragment, UiFragmentId,
+    UiFragmentSubmission, UiNode, UiNodeId, UiSemanticEvent,
+};
 use serde_json::json;
 
 const ENDPOINT: &str = "127.0.0.1:39254";
@@ -189,7 +189,12 @@ fn rounded_image(fill: (u8, u8, u8, u8)) -> Vec<u8> {
 }
 
 /// Upload a generated image to the runtime so skins can reference it. Retries on timeout.
-fn upload_image(endpoint: SocketAddr, seq: u64, image_id: &str, bytes: Vec<u8>) -> Result<(), String> {
+fn upload_image(
+    endpoint: SocketAddr,
+    seq: u64,
+    image_id: &str,
+    bytes: Vec<u8>,
+) -> Result<(), String> {
     let upload = UiImageUploadRequest {
         source: UiImageSource {
             image_id: image_id.into(),
@@ -201,7 +206,12 @@ fn upload_image(endpoint: SocketAddr, seq: u64, image_id: &str, bytes: Vec<u8>) 
     };
     let mut last_err = String::new();
     for attempt in 0..5 {
-        match call(endpoint, "wgpu.ui.image.upload", seq, serde_json::to_value(&upload).unwrap()) {
+        match call(
+            endpoint,
+            "wgpu.ui.image.upload",
+            seq,
+            serde_json::to_value(&upload).unwrap(),
+        ) {
             Ok(_) => return Ok(()),
             Err(e) => {
                 last_err = e;
@@ -211,82 +221,344 @@ fn upload_image(endpoint: SocketAddr, seq: u64, image_id: &str, bytes: Vec<u8>) 
             }
         }
     }
-    Err(format!("upload {image_id} failed after 5 attempts: {last_err}"))
+    Err(format!(
+        "upload {image_id} failed after 5 attempts: {last_err}"
+    ))
 }
 
 /// Upload all showcase skin images. Called once before fragment submission.
 fn upload_showcase_images(endpoint: SocketAddr) -> Result<(), String> {
     let mut seq = 1000u64;
     // Panel backgrounds
-    upload_image(endpoint, seq, "panel-bg", solid_image(40, 50, 70, 230))?; seq += 1;
-    upload_image(endpoint, seq, "panel-dark", solid_image(28, 28, 34, 240))?; seq += 1;
-    upload_image(endpoint, seq, "panel-warm", solid_image(58, 42, 30, 235))?; seq += 1;
-    upload_image(endpoint, seq, "panel-accent", solid_image(24, 58, 54, 235))?; seq += 1;
+    upload_image(endpoint, seq, "panel-bg", solid_image(40, 50, 70, 230))?;
+    seq += 1;
+    upload_image(endpoint, seq, "panel-dark", solid_image(28, 28, 34, 240))?;
+    seq += 1;
+    upload_image(endpoint, seq, "panel-warm", solid_image(58, 42, 30, 235))?;
+    seq += 1;
+    upload_image(endpoint, seq, "panel-accent", solid_image(24, 58, 54, 235))?;
+    seq += 1;
     // Button idle / hover
-    upload_image(endpoint, seq, "btn-idle", solid_image(50, 90, 160, 255))?; seq += 1;
-    upload_image(endpoint, seq, "btn-hover", solid_image(70, 120, 200, 255))?; seq += 1;
-    upload_image(endpoint, seq, "btn-idle-dark", solid_image(60, 60, 72, 255))?; seq += 1;
-    upload_image(endpoint, seq, "btn-hover-dark", solid_image(85, 85, 100, 255))?; seq += 1;
-    upload_image(endpoint, seq, "btn-idle-warm", solid_image(160, 100, 50, 255))?; seq += 1;
-    upload_image(endpoint, seq, "btn-hover-warm", solid_image(200, 130, 70, 255))?; seq += 1;
+    upload_image(endpoint, seq, "btn-idle", solid_image(50, 90, 160, 255))?;
+    seq += 1;
+    upload_image(endpoint, seq, "btn-hover", solid_image(70, 120, 200, 255))?;
+    seq += 1;
+    upload_image(endpoint, seq, "btn-idle-dark", solid_image(60, 60, 72, 255))?;
+    seq += 1;
+    upload_image(
+        endpoint,
+        seq,
+        "btn-hover-dark",
+        solid_image(85, 85, 100, 255),
+    )?;
+    seq += 1;
+    upload_image(
+        endpoint,
+        seq,
+        "btn-idle-warm",
+        solid_image(160, 100, 50, 255),
+    )?;
+    seq += 1;
+    upload_image(
+        endpoint,
+        seq,
+        "btn-hover-warm",
+        solid_image(200, 130, 70, 255),
+    )?;
+    seq += 1;
     // Slider / progress / input / tooltip / scrollbar
-    upload_image(endpoint, seq, "track-bg", solid_image(40, 44, 52, 255))?; seq += 1;
-    upload_image(endpoint, seq, "fill-bg", solid_image(80, 140, 220, 255))?; seq += 1;
-    upload_image(endpoint, seq, "thumb-bg", solid_image(180, 200, 230, 255))?; seq += 1;
-    upload_image(endpoint, seq, "input-bg", solid_image(30, 34, 42, 255))?; seq += 1;
-    upload_image(endpoint, seq, "check-icon", solid_image(120, 200, 255, 255))?; seq += 1;
-    upload_image(endpoint, seq, "radio-dot", solid_image(120, 200, 255, 255))?; seq += 1;
-    upload_image(endpoint, seq, "tooltip-bg", solid_image(50, 48, 40, 245))?; seq += 1;
-    upload_image(endpoint, seq, "scrollbar-track", solid_image(30, 32, 38, 200))?; seq += 1;
-    upload_image(endpoint, seq, "scrollbar-thumb", solid_image(100, 108, 120, 220))?; seq += 1;
-    upload_image(endpoint, seq, "progress-track", solid_image(40, 44, 52, 255))?; seq += 1;
-    upload_image(endpoint, seq, "progress-fill", solid_image(80, 180, 120, 255))?; seq += 1;
+    upload_image(endpoint, seq, "track-bg", solid_image(40, 44, 52, 255))?;
+    seq += 1;
+    upload_image(endpoint, seq, "fill-bg", solid_image(80, 140, 220, 255))?;
+    seq += 1;
+    upload_image(endpoint, seq, "thumb-bg", solid_image(180, 200, 230, 255))?;
+    seq += 1;
+    upload_image(endpoint, seq, "input-bg", solid_image(30, 34, 42, 255))?;
+    seq += 1;
+    upload_image(endpoint, seq, "check-icon", solid_image(120, 200, 255, 255))?;
+    seq += 1;
+    upload_image(endpoint, seq, "radio-dot", solid_image(120, 200, 255, 255))?;
+    seq += 1;
+    upload_image(endpoint, seq, "tooltip-bg", solid_image(50, 48, 40, 245))?;
+    seq += 1;
+    upload_image(
+        endpoint,
+        seq,
+        "scrollbar-track",
+        solid_image(30, 32, 38, 200),
+    )?;
+    seq += 1;
+    upload_image(
+        endpoint,
+        seq,
+        "scrollbar-thumb",
+        solid_image(100, 108, 120, 220),
+    )?;
+    seq += 1;
+    upload_image(
+        endpoint,
+        seq,
+        "progress-track",
+        solid_image(40, 44, 52, 255),
+    )?;
+    seq += 1;
+    upload_image(
+        endpoint,
+        seq,
+        "progress-fill",
+        solid_image(80, 180, 120, 255),
+    )?;
+    seq += 1;
     // Slider variants
-    upload_image(endpoint, seq, "slider-fat-track", border_image((180, 100, 30, 255), (100, 60, 20, 255)))?; seq += 1;
-    upload_image(endpoint, seq, "slider-fat-fill", solid_image(240, 180, 40, 255))?; seq += 1;
-    upload_image(endpoint, seq, "slider-fat-thumb", border_image((255, 255, 255, 255), (220, 220, 230, 255)))?; seq += 1;
-    upload_image(endpoint, seq, "slider-min-track", solid_image(60, 60, 68, 255))?; seq += 1;
-    upload_image(endpoint, seq, "slider-min-fill", solid_image(80, 200, 140, 255))?; seq += 1;
-    upload_image(endpoint, seq, "slider-min-thumb", solid_image(200, 255, 220, 255))?; seq += 1;
+    upload_image(
+        endpoint,
+        seq,
+        "slider-fat-track",
+        border_image((180, 100, 30, 255), (100, 60, 20, 255)),
+    )?;
+    seq += 1;
+    upload_image(
+        endpoint,
+        seq,
+        "slider-fat-fill",
+        solid_image(240, 180, 40, 255),
+    )?;
+    seq += 1;
+    upload_image(
+        endpoint,
+        seq,
+        "slider-fat-thumb",
+        border_image((255, 255, 255, 255), (220, 220, 230, 255)),
+    )?;
+    seq += 1;
+    upload_image(
+        endpoint,
+        seq,
+        "slider-min-track",
+        solid_image(60, 60, 68, 255),
+    )?;
+    seq += 1;
+    upload_image(
+        endpoint,
+        seq,
+        "slider-min-fill",
+        solid_image(80, 200, 140, 255),
+    )?;
+    seq += 1;
+    upload_image(
+        endpoint,
+        seq,
+        "slider-min-thumb",
+        solid_image(200, 255, 220, 255),
+    )?;
+    seq += 1;
     // Checkbox variants
-    upload_image(endpoint, seq, "check-dark-body", border_image((80, 80, 90, 255), (20, 20, 26, 255)))?; seq += 1;
-    upload_image(endpoint, seq, "check-dark-icon", solid_image(240, 240, 250, 255))?; seq += 1;
-    upload_image(endpoint, seq, "check-warm-body", border_image((140, 90, 40, 255), (50, 35, 20, 255)))?; seq += 1;
-    upload_image(endpoint, seq, "check-warm-icon", solid_image(255, 200, 80, 255))?; seq += 1;
+    upload_image(
+        endpoint,
+        seq,
+        "check-dark-body",
+        border_image((80, 80, 90, 255), (20, 20, 26, 255)),
+    )?;
+    seq += 1;
+    upload_image(
+        endpoint,
+        seq,
+        "check-dark-icon",
+        solid_image(240, 240, 250, 255),
+    )?;
+    seq += 1;
+    upload_image(
+        endpoint,
+        seq,
+        "check-warm-body",
+        border_image((140, 90, 40, 255), (50, 35, 20, 255)),
+    )?;
+    seq += 1;
+    upload_image(
+        endpoint,
+        seq,
+        "check-warm-icon",
+        solid_image(255, 200, 80, 255),
+    )?;
+    seq += 1;
     // Progress variants
-    upload_image(endpoint, seq, "progress-blue-fill", solid_image(60, 120, 220, 255))?; seq += 1;
-    upload_image(endpoint, seq, "progress-warm-fill", solid_image(220, 130, 50, 255))?; seq += 1;
+    upload_image(
+        endpoint,
+        seq,
+        "progress-blue-fill",
+        solid_image(60, 120, 220, 255),
+    )?;
+    seq += 1;
+    upload_image(
+        endpoint,
+        seq,
+        "progress-warm-fill",
+        solid_image(220, 130, 50, 255),
+    )?;
+    seq += 1;
     // Input variants
-    upload_image(endpoint, seq, "input-dark-bg", border_image((70, 70, 80, 255), (15, 15, 20, 255)))?; seq += 1;
-    upload_image(endpoint, seq, "input-warm-bg", border_image((120, 80, 40, 255), (40, 28, 18, 255)))?; seq += 1;
+    upload_image(
+        endpoint,
+        seq,
+        "input-dark-bg",
+        border_image((70, 70, 80, 255), (15, 15, 20, 255)),
+    )?;
+    seq += 1;
+    upload_image(
+        endpoint,
+        seq,
+        "input-warm-bg",
+        border_image((120, 80, 40, 255), (40, 28, 18, 255)),
+    )?;
+    seq += 1;
     // Circle checkbox style
-    upload_image(endpoint, seq, "check-circle-ring", ring_image((100, 160, 255, 255)))?; seq += 1;
-    upload_image(endpoint, seq, "check-circle-dot", circle_image(100, 200, 255, 255))?; seq += 1;
+    upload_image(
+        endpoint,
+        seq,
+        "check-circle-ring",
+        ring_image((100, 160, 255, 255)),
+    )?;
+    seq += 1;
+    upload_image(
+        endpoint,
+        seq,
+        "check-circle-dot",
+        circle_image(100, 200, 255, 255),
+    )?;
+    seq += 1;
     // Card checkbox style (thick border)
-    upload_image(endpoint, seq, "check-card-body", border_image((180, 80, 200, 255), (40, 20, 50, 255)))?; seq += 1;
-    upload_image(endpoint, seq, "check-card-icon", solid_image(220, 140, 255, 255))?; seq += 1;
+    upload_image(
+        endpoint,
+        seq,
+        "check-card-body",
+        border_image((180, 80, 200, 255), (40, 20, 50, 255)),
+    )?;
+    seq += 1;
+    upload_image(
+        endpoint,
+        seq,
+        "check-card-icon",
+        solid_image(220, 140, 255, 255),
+    )?;
+    seq += 1;
     // Striped progress
-    upload_image(endpoint, seq, "progress-striped-fill", striped_image((100, 200, 140, 255), (60, 140, 90, 255)))?; seq += 1;
+    upload_image(
+        endpoint,
+        seq,
+        "progress-striped-fill",
+        striped_image((100, 200, 140, 255), (60, 140, 90, 255)),
+    )?;
+    seq += 1;
     // Rounded progress
-    upload_image(endpoint, seq, "progress-rounded-track", rounded_image((40, 44, 52, 255)))?; seq += 1;
-    upload_image(endpoint, seq, "progress-rounded-fill", rounded_image((220, 100, 180, 255)))?; seq += 1;
+    upload_image(
+        endpoint,
+        seq,
+        "progress-rounded-track",
+        rounded_image((40, 44, 52, 255)),
+    )?;
+    seq += 1;
+    upload_image(
+        endpoint,
+        seq,
+        "progress-rounded-fill",
+        rounded_image((220, 100, 180, 255)),
+    )?;
+    seq += 1;
     // Square slider thumb
-    upload_image(endpoint, seq, "slider-square-thumb", border_image((255, 200, 60, 255), (200, 150, 30, 255)))?; seq += 1;
-    upload_image(endpoint, seq, "slider-square-track", solid_image(50, 50, 60, 255))?; seq += 1;
-    upload_image(endpoint, seq, "slider-square-fill", solid_image(255, 200, 60, 255))?; seq += 1;
+    upload_image(
+        endpoint,
+        seq,
+        "slider-square-thumb",
+        border_image((255, 200, 60, 255), (200, 150, 30, 255)),
+    )?;
+    seq += 1;
+    upload_image(
+        endpoint,
+        seq,
+        "slider-square-track",
+        solid_image(50, 50, 60, 255),
+    )?;
+    seq += 1;
+    upload_image(
+        endpoint,
+        seq,
+        "slider-square-fill",
+        solid_image(255, 200, 60, 255),
+    )?;
+    seq += 1;
     // Scrollbar variants
-    upload_image(endpoint, seq, "scrollbar-fat-track", solid_image(50, 30, 20, 255))?; seq += 1;
-    upload_image(endpoint, seq, "scrollbar-fat-thumb", border_image((255, 160, 40, 255), (220, 120, 20, 255)))?; seq += 1;
-    upload_image(endpoint, seq, "scrollbar-dark-track", solid_image(18, 18, 24, 255))?; seq += 1;
-    upload_image(endpoint, seq, "scrollbar-dark-thumb", solid_image(60, 100, 180, 220))?; seq += 1;
+    upload_image(
+        endpoint,
+        seq,
+        "scrollbar-fat-track",
+        solid_image(50, 30, 20, 255),
+    )?;
+    seq += 1;
+    upload_image(
+        endpoint,
+        seq,
+        "scrollbar-fat-thumb",
+        border_image((255, 160, 40, 255), (220, 120, 20, 255)),
+    )?;
+    seq += 1;
+    upload_image(
+        endpoint,
+        seq,
+        "scrollbar-dark-track",
+        solid_image(18, 18, 24, 255),
+    )?;
+    seq += 1;
+    upload_image(
+        endpoint,
+        seq,
+        "scrollbar-dark-thumb",
+        solid_image(60, 100, 180, 220),
+    )?;
+    seq += 1;
     // Radio variants
-    upload_image(endpoint, seq, "radio-circle-ring", ring_image((100, 200, 140, 255)))?; seq += 1;
-    upload_image(endpoint, seq, "radio-circle-dot", circle_image(100, 220, 160, 255))?; seq += 1;
-    upload_image(endpoint, seq, "radio-card-body", border_image((80, 160, 200, 255), (20, 50, 70, 255)))?; seq += 1;
-    upload_image(endpoint, seq, "radio-card-icon", solid_image(120, 200, 240, 255))?; seq += 1;
+    upload_image(
+        endpoint,
+        seq,
+        "radio-circle-ring",
+        ring_image((100, 200, 140, 255)),
+    )?;
+    seq += 1;
+    upload_image(
+        endpoint,
+        seq,
+        "radio-circle-dot",
+        circle_image(100, 220, 160, 255),
+    )?;
+    seq += 1;
+    upload_image(
+        endpoint,
+        seq,
+        "radio-card-body",
+        border_image((80, 160, 200, 255), (20, 50, 70, 255)),
+    )?;
+    seq += 1;
+    upload_image(
+        endpoint,
+        seq,
+        "radio-card-icon",
+        solid_image(120, 200, 240, 255),
+    )?;
+    seq += 1;
     // Tooltip variants
-    upload_image(endpoint, seq, "tooltip-dark-bg", solid_image(20, 20, 28, 250))?; seq += 1;
-    upload_image(endpoint, seq, "tooltip-accent-bg", border_image((60, 120, 220, 255), (30, 50, 90, 245)))?; seq += 1;
+    upload_image(
+        endpoint,
+        seq,
+        "tooltip-dark-bg",
+        solid_image(20, 20, 28, 250),
+    )?;
+    seq += 1;
+    upload_image(
+        endpoint,
+        seq,
+        "tooltip-accent-bg",
+        border_image((60, 120, 220, 255), (30, 50, 90, 245)),
+    )?;
+    seq += 1;
     println!("Uploaded {} skin images", seq - 1000);
     Ok(())
 }
@@ -299,10 +571,10 @@ fn launch() -> std::io::Result<Child> {
 }
 
 fn load_nui_fragment() -> Result<(UiNode, Vec<UiEffect>), String> {
-    let source = std::fs::read_to_string(NUI_PATH)
-        .map_err(|error| format!("read nui failed: {error}"))?;
-    let document = parse_nui_flow(&source)
-        .map_err(|error| format!("parse nui failed: {error:?}"))?;
+    let source =
+        std::fs::read_to_string(NUI_PATH).map_err(|error| format!("read nui failed: {error}"))?;
+    let document =
+        parse_nui_flow(&source).map_err(|error| format!("parse nui failed: {error:?}"))?;
     let ir = lower_nui_flow(&document);
     let effects = lower_nui_flow_effects(&document);
     Ok((ir.root, effects))
@@ -316,15 +588,29 @@ struct TreeState {
 }
 
 impl TreeState {
-    fn new() -> Self { Self { project_expanded: true, crates_expanded: true } }
-    fn toggle_project(&mut self) { self.project_expanded = !self.project_expanded; }
-    fn toggle_crates(&mut self) { self.crates_expanded = !self.crates_expanded; }
+    fn new() -> Self {
+        Self {
+            project_expanded: true,
+            crates_expanded: true,
+        }
+    }
+    fn toggle_project(&mut self) {
+        self.project_expanded = !self.project_expanded;
+    }
+    fn toggle_crates(&mut self) {
+        self.crates_expanded = !self.crates_expanded;
+    }
     fn apply(&self, node: &mut UiNode) {
         match node.node_id.0.as_str() {
             "tree-root" => {
                 if let Some(text) = &mut node.text {
                     *text = TextRef::Literal {
-                        value: if self.project_expanded { "▼ project/" } else { "▶ project/" }.into(),
+                        value: if self.project_expanded {
+                            "▼ project/"
+                        } else {
+                            "▶ project/"
+                        }
+                        .into(),
                     };
                 }
             }
@@ -332,7 +618,12 @@ impl TreeState {
                 node.visible = self.project_expanded;
                 if let Some(text) = &mut node.text {
                     *text = TextRef::Literal {
-                        value: if self.crates_expanded { "▼ crates/" } else { "▶ crates/" }.into(),
+                        value: if self.crates_expanded {
+                            "▼ crates/"
+                        } else {
+                            "▶ crates/"
+                        }
+                        .into(),
                     };
                 }
             }
@@ -417,92 +708,150 @@ impl AppState {
         vec![
             UiEffect::ControlPresentation {
                 node_id: UiNodeId("check-demo".into()),
-                state: UiControlPresentation::Toggle { selected: self.checkbox_state },
+                state: UiControlPresentation::Toggle {
+                    selected: self.checkbox_state,
+                },
             },
             UiEffect::ControlPresentation {
                 node_id: UiNodeId("radio-demo".into()),
-                state: UiControlPresentation::Toggle { selected: self.radio_state },
+                state: UiControlPresentation::Toggle {
+                    selected: self.radio_state,
+                },
             },
             UiEffect::ControlPresentation {
                 node_id: UiNodeId("switch-demo".into()),
-                state: UiControlPresentation::Toggle { selected: self.switch_state },
+                state: UiControlPresentation::Toggle {
+                    selected: self.switch_state,
+                },
             },
             UiEffect::ControlPresentation {
                 node_id: UiNodeId("slider-demo".into()),
-                state: UiControlPresentation::Numeric { value: self.slider_val, min: 0.0, max: 100.0 },
+                state: UiControlPresentation::Numeric {
+                    value: self.slider_val,
+                    min: 0.0,
+                    max: 100.0,
+                },
             },
             UiEffect::ControlPresentation {
                 node_id: UiNodeId("progress-demo".into()),
-                state: UiControlPresentation::Numeric { value: self.progress_val, min: 0.0, max: 1.0 },
+                state: UiControlPresentation::Numeric {
+                    value: self.progress_val,
+                    min: 0.0,
+                    max: 1.0,
+                },
             },
             UiEffect::ControlPresentation {
                 node_id: UiNodeId("scroll-demo".into()),
-                state: UiControlPresentation::Scroll { position: self.scroll_pos },
+                state: UiControlPresentation::Scroll {
+                    position: self.scroll_pos,
+                },
             },
             // Skin variant sliders
             UiEffect::ControlPresentation {
                 node_id: UiNodeId("skin-slider-def".into()),
-                state: UiControlPresentation::Numeric { value: self.slider_val, min: 0.0, max: 100.0 },
+                state: UiControlPresentation::Numeric {
+                    value: self.slider_val,
+                    min: 0.0,
+                    max: 100.0,
+                },
             },
             UiEffect::ControlPresentation {
                 node_id: UiNodeId("skin-slider-fat".into()),
-                state: UiControlPresentation::Numeric { value: self.slider_val, min: 0.0, max: 100.0 },
+                state: UiControlPresentation::Numeric {
+                    value: self.slider_val,
+                    min: 0.0,
+                    max: 100.0,
+                },
             },
             UiEffect::ControlPresentation {
                 node_id: UiNodeId("skin-slider-min".into()),
-                state: UiControlPresentation::Numeric { value: self.slider_val, min: 0.0, max: 100.0 },
+                state: UiControlPresentation::Numeric {
+                    value: self.slider_val,
+                    min: 0.0,
+                    max: 100.0,
+                },
             },
             // Skin variant checkboxes (independent states)
             UiEffect::ControlPresentation {
                 node_id: UiNodeId("skin-check-def".into()),
-                state: UiControlPresentation::Toggle { selected: self.skin_check_def },
+                state: UiControlPresentation::Toggle {
+                    selected: self.skin_check_def,
+                },
             },
             UiEffect::ControlPresentation {
                 node_id: UiNodeId("skin-check-circle".into()),
-                state: UiControlPresentation::Toggle { selected: self.skin_check_circle },
+                state: UiControlPresentation::Toggle {
+                    selected: self.skin_check_circle,
+                },
             },
             UiEffect::ControlPresentation {
                 node_id: UiNodeId("skin-check-card".into()),
-                state: UiControlPresentation::Toggle { selected: self.skin_check_card },
+                state: UiControlPresentation::Toggle {
+                    selected: self.skin_check_card,
+                },
             },
             // Skin variant progress bars
             UiEffect::ControlPresentation {
                 node_id: UiNodeId("skin-prog-def".into()),
-                state: UiControlPresentation::Numeric { value: self.progress_val, min: 0.0, max: 1.0 },
+                state: UiControlPresentation::Numeric {
+                    value: self.progress_val,
+                    min: 0.0,
+                    max: 1.0,
+                },
             },
             UiEffect::ControlPresentation {
                 node_id: UiNodeId("skin-prog-striped".into()),
-                state: UiControlPresentation::Numeric { value: self.progress_val, min: 0.0, max: 1.0 },
+                state: UiControlPresentation::Numeric {
+                    value: self.progress_val,
+                    min: 0.0,
+                    max: 1.0,
+                },
             },
             UiEffect::ControlPresentation {
                 node_id: UiNodeId("skin-prog-rounded".into()),
-                state: UiControlPresentation::Numeric { value: self.progress_val, min: 0.0, max: 1.0 },
+                state: UiControlPresentation::Numeric {
+                    value: self.progress_val,
+                    min: 0.0,
+                    max: 1.0,
+                },
             },
             // Scrollbar variants
             UiEffect::ControlPresentation {
                 node_id: UiNodeId("skin-scroll-def".into()),
-                state: UiControlPresentation::Scroll { position: self.scroll_pos },
+                state: UiControlPresentation::Scroll {
+                    position: self.scroll_pos,
+                },
             },
             UiEffect::ControlPresentation {
                 node_id: UiNodeId("skin-scroll-fat".into()),
-                state: UiControlPresentation::Scroll { position: self.scroll_pos },
+                state: UiControlPresentation::Scroll {
+                    position: self.scroll_pos,
+                },
             },
             UiEffect::ControlPresentation {
                 node_id: UiNodeId("skin-scroll-dark".into()),
-                state: UiControlPresentation::Scroll { position: self.scroll_pos },
+                state: UiControlPresentation::Scroll {
+                    position: self.scroll_pos,
+                },
             },
             // Radio variants
             UiEffect::ControlPresentation {
                 node_id: UiNodeId("skin-radio-def".into()),
-                state: UiControlPresentation::Toggle { selected: self.skin_radio_def },
+                state: UiControlPresentation::Toggle {
+                    selected: self.skin_radio_def,
+                },
             },
             UiEffect::ControlPresentation {
                 node_id: UiNodeId("skin-radio-circle".into()),
-                state: UiControlPresentation::Toggle { selected: self.skin_radio_circle },
+                state: UiControlPresentation::Toggle {
+                    selected: self.skin_radio_circle,
+                },
             },
             UiEffect::ControlPresentation {
                 node_id: UiNodeId("skin-radio-card".into()),
-                state: UiControlPresentation::Toggle { selected: self.skin_radio_card },
+                state: UiControlPresentation::Toggle {
+                    selected: self.skin_radio_card,
+                },
             },
         ]
     }
@@ -527,21 +876,36 @@ impl AppState {
         if node.node_id.0 == "acc-h1" {
             if let Some(text) = &mut node.text {
                 *text = TextRef::Literal {
-                    value: if self.acc_general { "▼ General Settings" } else { "▶ General Settings" }.into(),
+                    value: if self.acc_general {
+                        "▼ General Settings"
+                    } else {
+                        "▶ General Settings"
+                    }
+                    .into(),
                 };
             }
         }
         if node.node_id.0 == "acc-h2" {
             if let Some(text) = &mut node.text {
                 *text = TextRef::Literal {
-                    value: if self.acc_advanced { "▼ Advanced Options" } else { "▶ Advanced Options" }.into(),
+                    value: if self.acc_advanced {
+                        "▼ Advanced Options"
+                    } else {
+                        "▶ Advanced Options"
+                    }
+                    .into(),
                 };
             }
         }
         if node.node_id.0 == "acc-h3" {
             if let Some(text) = &mut node.text {
                 *text = TextRef::Literal {
-                    value: if self.acc_about { "▼ About" } else { "▶ About" }.into(),
+                    value: if self.acc_about {
+                        "▼ About"
+                    } else {
+                        "▶ About"
+                    }
+                    .into(),
                 };
             }
         }
@@ -559,8 +923,10 @@ impl AppState {
                 };
             }
         }
-        if node.node_id.0 == "mb-dd-1" || node.node_id.0 == "mb-dd-2"
-            || node.node_id.0 == "mb-dd-3" || node.node_id.0 == "mb-dd-4"
+        if node.node_id.0 == "mb-dd-1"
+            || node.node_id.0 == "mb-dd-2"
+            || node.node_id.0 == "mb-dd-3"
+            || node.node_id.0 == "mb-dd-4"
         {
             if let Some(menu) = &self.active_menu {
                 if let Some(text) = &mut node.text {
@@ -572,9 +938,14 @@ impl AppState {
                         _ => &["Item 1", "Item 2", "Item 3", "Item 4"],
                     };
                     let idx = match node.node_id.0.as_str() {
-                        "mb-dd-1" => 0, "mb-dd-2" => 1, "mb-dd-3" => 2, _ => 3,
+                        "mb-dd-1" => 0,
+                        "mb-dd-2" => 1,
+                        "mb-dd-3" => 2,
+                        _ => 3,
                     };
-                    *text = TextRef::Literal { value: items[idx].into() };
+                    *text = TextRef::Literal {
+                        value: items[idx].into(),
+                    };
                 }
             }
         }
@@ -614,18 +985,33 @@ impl AppState {
             "demo.button.click" => {
                 self.click_count += 1;
                 self.progress_val = (self.progress_val + 0.05).min(1.0);
-                println!("[button] clicked {} times, progress={:.2}", self.click_count, self.progress_val);
+                println!(
+                    "[button] clicked {} times, progress={:.2}",
+                    self.click_count, self.progress_val
+                );
             }
             "demo.check.toggle" => {
                 self.checkbox_state = !self.checkbox_state;
                 println!("[checkbox] -> {}", self.checkbox_state);
             }
-            "demo.skin.check.def" => { self.skin_check_def = !self.skin_check_def; }
-            "demo.skin.check.circle" => { self.skin_check_circle = !self.skin_check_circle; }
-            "demo.skin.check.card" => { self.skin_check_card = !self.skin_check_card; }
-            "demo.skin.radio.def" => { self.skin_radio_def = !self.skin_radio_def; }
-            "demo.skin.radio.circle" => { self.skin_radio_circle = !self.skin_radio_circle; }
-            "demo.skin.radio.card" => { self.skin_radio_card = !self.skin_radio_card; }
+            "demo.skin.check.def" => {
+                self.skin_check_def = !self.skin_check_def;
+            }
+            "demo.skin.check.circle" => {
+                self.skin_check_circle = !self.skin_check_circle;
+            }
+            "demo.skin.check.card" => {
+                self.skin_check_card = !self.skin_check_card;
+            }
+            "demo.skin.radio.def" => {
+                self.skin_radio_def = !self.skin_radio_def;
+            }
+            "demo.skin.radio.circle" => {
+                self.skin_radio_circle = !self.skin_radio_circle;
+            }
+            "demo.skin.radio.card" => {
+                self.skin_radio_card = !self.skin_radio_card;
+            }
             "demo.radio.toggle" => {
                 self.radio_state = !self.radio_state;
                 println!("[radio] -> {}", self.radio_state);
@@ -655,18 +1041,42 @@ impl AppState {
                 let labels = ["50/50", "30/70", "70/30"];
                 println!("[splitter] mode={}", labels[self.splitter_mode as usize]);
             }
-            "demo.tree.root" => { self.tree.toggle_project(); println!("[tree] project={}", self.tree.project_expanded); }
-            "demo.tree.crates" => { self.tree.toggle_crates(); println!("[tree] crates={}", self.tree.crates_expanded); }
-            "demo.tree.docs" | "demo.tree.cases" | "demo.tree.schema" | "demo.tree.runtime" | "demo.tree.wgpu" => {
+            "demo.tree.root" => {
+                self.tree.toggle_project();
+                println!("[tree] project={}", self.tree.project_expanded);
+            }
+            "demo.tree.crates" => {
+                self.tree.toggle_crates();
+                println!("[tree] crates={}", self.tree.crates_expanded);
+            }
+            "demo.tree.docs" | "demo.tree.cases" | "demo.tree.schema" | "demo.tree.runtime"
+            | "demo.tree.wgpu" => {
                 println!("[tree] leaf: {action}");
             }
-            "demo.acc.general" => { self.acc_general = !self.acc_general; println!("[acc] general={}", self.acc_general); }
-            "demo.acc.advanced" => { self.acc_advanced = !self.acc_advanced; println!("[acc] advanced={}", self.acc_advanced); }
-            "demo.acc.about" => { self.acc_about = !self.acc_about; println!("[acc] about={}", self.acc_about); }
-            "demo.mb.file" => { self.toggle_menu("file"); }
-            "demo.mb.edit" => { self.toggle_menu("edit"); }
-            "demo.mb.view" => { self.toggle_menu("view"); }
-            "demo.mb.help" => { self.toggle_menu("help"); }
+            "demo.acc.general" => {
+                self.acc_general = !self.acc_general;
+                println!("[acc] general={}", self.acc_general);
+            }
+            "demo.acc.advanced" => {
+                self.acc_advanced = !self.acc_advanced;
+                println!("[acc] advanced={}", self.acc_advanced);
+            }
+            "demo.acc.about" => {
+                self.acc_about = !self.acc_about;
+                println!("[acc] about={}", self.acc_about);
+            }
+            "demo.mb.file" => {
+                self.toggle_menu("file");
+            }
+            "demo.mb.edit" => {
+                self.toggle_menu("edit");
+            }
+            "demo.mb.view" => {
+                self.toggle_menu("view");
+            }
+            "demo.mb.help" => {
+                self.toggle_menu("help");
+            }
             "demo.mb.dd1" | "demo.mb.dd2" | "demo.mb.dd3" | "demo.mb.dd4" => {
                 println!("[mb] dropdown item: {action}");
                 self.active_menu = None;
@@ -690,22 +1100,33 @@ fn start_ui_host_server(click_queue: Arc<Mutex<Vec<String>>>) {
     let endpoint: SocketAddr = UI_ENDPOINT.parse().unwrap();
     let server = match RpcServer::bind(endpoint) {
         Ok(server) => server,
-        Err(error) => { eprintln!("[ui-host] bind failed: {error}"); return; }
+        Err(error) => {
+            eprintln!("[ui-host] bind failed: {error}");
+            return;
+        }
     };
     println!("[ui-host] listening on {UI_ENDPOINT}");
     thread::spawn(move || {
         let _ = server.serve_until(move |req: RpcRequest| {
             if req.method == "service.shutdown" {
-                return (RpcResponse {
-                    request_id: req.request_id.clone(), status: RpcStatus::Accepted,
-                    revision: None, result: Some(json!({"state":"accepted"})),
-                    error: None, snapshot: None,
-                }, false);
+                return (
+                    RpcResponse {
+                        request_id: req.request_id.clone(),
+                        status: RpcStatus::Accepted,
+                        revision: None,
+                        result: Some(json!({"state":"accepted"})),
+                        error: None,
+                        snapshot: None,
+                    },
+                    false,
+                );
             }
             if req.method == "ui.host.inbound" {
                 if let Ok(event) = serde_json::from_value::<UiSemanticEvent>(req.params.clone()) {
                     // 处理 F32 控制值（Slider/Scrollbar 拖拽提交）
-                    if let Some(neon_ui_schema::UiSemanticPayloadValue::F32 { value }) = &event.control_value {
+                    if let Some(neon_ui_schema::UiSemanticPayloadValue::F32 { value }) =
+                        &event.control_value
+                    {
                         if let neon_ui_schema::UiIntent::Invoke { action, .. } = &event.intent {
                             println!("[ui-host] control_value {action} = {value}");
                             if let Ok(mut q) = click_queue.lock() {
@@ -716,15 +1137,23 @@ fn start_ui_host_server(click_queue: Arc<Mutex<Vec<String>>>) {
                     // 处理字符串 action
                     if let neon_ui_schema::UiIntent::Invoke { action, .. } = event.intent {
                         println!("[ui-host] click: {action}");
-                        if let Ok(mut q) = click_queue.lock() { q.push(action); }
+                        if let Ok(mut q) = click_queue.lock() {
+                            q.push(action);
+                        }
                     }
                 }
             }
-            (RpcResponse {
-                request_id: req.request_id.clone(), status: RpcStatus::Accepted,
-                revision: None, result: Some(json!({"state":"accepted"})),
-                error: None, snapshot: None,
-            }, true)
+            (
+                RpcResponse {
+                    request_id: req.request_id.clone(),
+                    status: RpcStatus::Accepted,
+                    revision: None,
+                    result: Some(json!({"state":"accepted"})),
+                    error: None,
+                    snapshot: None,
+                },
+                true,
+            )
         });
     });
 }
@@ -732,7 +1161,11 @@ fn start_ui_host_server(click_queue: Arc<Mutex<Vec<String>>>) {
 fn main() -> Result<(), String> {
     println!("=== Component Showcase Probe (interactive) ===");
     let (root, base_effects) = load_nui_fragment()?;
-    println!("Parsed: root={}, effects={}", root.node_id.0, base_effects.len());
+    println!(
+        "Parsed: root={}, effects={}",
+        root.node_id.0,
+        base_effects.len()
+    );
 
     let click_queue = Arc::new(Mutex::new(Vec::<String>::new()));
     start_ui_host_server(click_queue.clone());
@@ -761,14 +1194,22 @@ fn main() -> Result<(), String> {
         root: display_root,
         effects,
     };
-    call(endpoint, "wgpu.ui.submit_fragment", revision,
-        serde_json::to_value(&UiCommand::SubmitFragment { submission: UiFragmentSubmission::new(fragment) }).unwrap())?;
+    call(
+        endpoint,
+        "wgpu.ui.submit_fragment",
+        revision,
+        serde_json::to_value(&UiCommand::SubmitFragment {
+            submission: UiFragmentSubmission::new(fragment),
+        })
+        .unwrap(),
+    )?;
     println!("Initial fragment submitted. Click around!");
 
     loop {
         thread::sleep(Duration::from_millis(200));
         if child.try_wait().ok().flatten().is_some() {
-            println!("Runtime exited"); break;
+            println!("Runtime exited");
+            break;
         }
 
         let clicks: Vec<String> = {
@@ -791,9 +1232,15 @@ fn main() -> Result<(), String> {
             root: display_root,
             effects,
         };
-        if let Err(e) = call(endpoint, "wgpu.ui.submit_fragment", revision,
-            serde_json::to_value(&UiCommand::SubmitFragment { submission: UiFragmentSubmission::new(fragment) }).unwrap())
-        {
+        if let Err(e) = call(
+            endpoint,
+            "wgpu.ui.submit_fragment",
+            revision,
+            serde_json::to_value(&UiCommand::SubmitFragment {
+                submission: UiFragmentSubmission::new(fragment),
+            })
+            .unwrap(),
+        ) {
             eprintln!("heartbeat failed: {e}");
         }
         let _ = changed;

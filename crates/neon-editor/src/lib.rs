@@ -27,12 +27,12 @@ pub use grammar::FlowGrammar;
 use grammar::nui_flow_default;
 pub use highlight::{HighlightCache, LineTokens, Span, TokenClass};
 pub use languages::{Language, LanguageKind};
-pub use provider::{LspServerConfig, SyntaxProvider};
-pub use registry::{
-    default_registry, register_default_lsp, register_default_syntax, LanguageRegistry,
-};
 pub use lsp::{
     LspClient, LspDiagnostic, LspEndpoint, LspError, LspLocation, LspPosition, LspRange, LspSymbol,
+};
+pub use provider::{LspServerConfig, SyntaxProvider};
+pub use registry::{
+    LanguageRegistry, default_registry, register_default_lsp, register_default_syntax,
 };
 pub use symbols::{SymbolIndex, SymbolKind};
 
@@ -271,12 +271,9 @@ impl EditorCore {
 
     pub fn completions(&self, position: Position) -> Vec<CompletionItem> {
         match self.language.kind {
-            LanguageKind::NuiFlow => completion::completions(
-                &self.buffer,
-                &self.grammar,
-                &self.symbols,
-                position,
-            ),
+            LanguageKind::NuiFlow => {
+                completion::completions(&self.buffer, &self.grammar, &self.symbols, position)
+            }
             // Non-Flow languages: built-in keyword tables give instant
             // feedback; full semantic completions come from the LSP client
             // bridge at the runtime layer (SDK editor.completion.request).

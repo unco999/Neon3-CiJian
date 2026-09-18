@@ -2,10 +2,10 @@
 //! and sorting kernel emission. WGSL legality is verified by compiling the
 //! generated module with `create_shader_module` on a headless device.
 
+use neon_gpu_ecs::EcsError;
 use neon_gpu_ecs::generator::{check_limits, check_schedule_conflicts, generate_wgsl};
 use neon_gpu_ecs::ir::*;
 use neon_gpu_ecs::tests_support::physics_world;
-use neon_gpu_ecs::EcsError;
 
 /// Headless compute device following the `ai_test_device` pattern of
 /// neon-wgpu-runtime. Default limits suffice here because
@@ -51,14 +51,30 @@ fn group0_bindings_follow_the_layout_contract() {
     let wgsl = generate_wgsl(&physics_world()).unwrap();
     // Fixed group 0 slots.
     assert!(wgsl.contains("@group(0) @binding(0) var<storage, read_write> entityActive"));
-    assert!(wgsl.contains("@group(0) @binding(1) var<storage, read_write> queryCounts : array<atomic<u32>>"));
-    assert!(wgsl.contains("@group(0) @binding(3) var<storage, read_write> framePrepBuffer : array<QueryRange>"));
-    assert!(wgsl.contains("@group(0) @binding(5) var<storage, read_write> indirectArgs : array<vec3u>"));
-    assert!(wgsl.contains("@group(0) @binding(7) var<storage, read_write> commandCount : atomic<u32>"));
+    assert!(wgsl.contains(
+        "@group(0) @binding(1) var<storage, read_write> queryCounts : array<atomic<u32>>"
+    ));
+    assert!(wgsl.contains(
+        "@group(0) @binding(3) var<storage, read_write> framePrepBuffer : array<QueryRange>"
+    ));
+    assert!(
+        wgsl.contains("@group(0) @binding(5) var<storage, read_write> indirectArgs : array<vec3u>")
+    );
+    assert!(
+        wgsl.contains("@group(0) @binding(7) var<storage, read_write> commandCount : atomic<u32>")
+    );
     // Three bindings per component: data / version / baseline, slots 8..16.
     assert!(wgsl.contains("@group(0) @binding(8) var<storage, read_write> ecs_c0 : array<vec3f>"));
-    assert!(wgsl.contains("@group(0) @binding(9) var<storage, read_write> ecs_cv0 : array<atomic<u32>>"));
-    assert!(wgsl.contains("@group(0) @binding(10) var<storage, read_write> ecs_cb0 : array<atomic<u32>>"));
+    assert!(
+        wgsl.contains(
+            "@group(0) @binding(9) var<storage, read_write> ecs_cv0 : array<atomic<u32>>"
+        )
+    );
+    assert!(
+        wgsl.contains(
+            "@group(0) @binding(10) var<storage, read_write> ecs_cb0 : array<atomic<u32>>"
+        )
+    );
     assert!(wgsl.contains("@group(0) @binding(11) var<storage, read_write> ecs_c1 : array<vec3f>"));
     assert!(wgsl.contains("@group(0) @binding(14) var<storage, read_write> ecs_c2 : array<f32>"));
     // Group 1: DeltaTime uniform + render instance buffer.
@@ -108,14 +124,36 @@ fn atomic_components_use_atomic_accessors() {
         ty: ComponentType::U32,
         default_value: vec![0; 4],
     };
-    ir.queries[0].with.push(ComponentAccess { component_id: 2, access_type: AccessType::ReadWrite });
+    ir.queries[0].with.push(ComponentAccess {
+        component_id: 2,
+        access_type: AccessType::ReadWrite,
+    });
     // health += 1 via Load/BinaryOp/Store on the U32 component.
-    ir.systems[0].instructions.splice(5..5, [
-        Instr::Load { dest: 4, component_id: 2, access: AccessType::ReadWrite },
-        Instr::Const { dest: 5, ty: ComponentType::U32, bytes: 1u32.to_le_bytes().to_vec() },
-        Instr::BinaryOp { dest: 4, lhs: 4, rhs: 5, op: BinaryOpCode::Add },
-        Instr::Store { src: 4, component_id: 2 },
-    ]);
+    ir.systems[0].instructions.splice(
+        5..5,
+        [
+            Instr::Load {
+                dest: 4,
+                component_id: 2,
+                access: AccessType::ReadWrite,
+            },
+            Instr::Const {
+                dest: 5,
+                ty: ComponentType::U32,
+                bytes: 1u32.to_le_bytes().to_vec(),
+            },
+            Instr::BinaryOp {
+                dest: 4,
+                lhs: 4,
+                rhs: 5,
+                op: BinaryOpCode::Add,
+            },
+            Instr::Store {
+                src: 4,
+                component_id: 2,
+            },
+        ],
+    );
     ir.systems[0].local_var_count = 6;
     let wgsl = generate_wgsl(&ir).unwrap();
     assert!(wgsl.contains("ecs_c2 : array<atomic<u32>>"));
@@ -132,7 +170,10 @@ fn bool_components_use_select_for_stores() {
         ty: ComponentType::Bool,
         default_value: vec![1, 0, 0, 0],
     });
-    ir.queries[0].with.push(ComponentAccess { component_id: 3, access_type: AccessType::ReadWrite });
+    ir.queries[0].with.push(ComponentAccess {
+        component_id: 3,
+        access_type: AccessType::ReadWrite,
+    });
     ir.systems.push(SystemDef {
         id: 1,
         name: "kill".into(),
@@ -140,9 +181,20 @@ fn bool_components_use_select_for_stores() {
         resource_refs: vec![],
         local_var_count: 2,
         instructions: vec![
-            Instr::Load { dest: 0, component_id: 3, access: AccessType::ReadWrite },
-            Instr::UnaryOp { dest: 1, src: 0, op: UnaryOpCode::Not },
-            Instr::Store { src: 1, component_id: 3 },
+            Instr::Load {
+                dest: 0,
+                component_id: 3,
+                access: AccessType::ReadWrite,
+            },
+            Instr::UnaryOp {
+                dest: 1,
+                src: 0,
+                op: UnaryOpCode::Not,
+            },
+            Instr::Store {
+                src: 1,
+                component_id: 3,
+            },
             Instr::Return,
         ],
     });
@@ -174,8 +226,15 @@ fn schedule_conflict_is_rejected_before_generation() {
         resource_refs: vec![],
         local_var_count: 1,
         instructions: vec![
-            Instr::Load { dest: 0, component_id: 1, access: AccessType::ReadWrite },
-            Instr::Store { src: 0, component_id: 1 },
+            Instr::Load {
+                dest: 0,
+                component_id: 1,
+                access: AccessType::ReadWrite,
+            },
+            Instr::Store {
+                src: 0,
+                component_id: 1,
+            },
             Instr::Return,
         ],
     });
@@ -213,10 +272,26 @@ fn mixed_type_binary_op_is_rejected() {
     let mut ir = physics_world();
     // v0 = Transform(vec3f), v2 = DeltaTime(f32); adding them must fail.
     ir.systems[0].instructions = vec![
-        Instr::Load { dest: 0, component_id: 0, access: AccessType::ReadWrite },
-        Instr::Load { dest: 1, component_id: 1, access: AccessType::ReadWrite },
-        Instr::LoadResource { dest: 2, resource_id: 0 },
-        Instr::BinaryOp { dest: 0, lhs: 0, rhs: 2, op: BinaryOpCode::Add },
+        Instr::Load {
+            dest: 0,
+            component_id: 0,
+            access: AccessType::ReadWrite,
+        },
+        Instr::Load {
+            dest: 1,
+            component_id: 1,
+            access: AccessType::ReadWrite,
+        },
+        Instr::LoadResource {
+            dest: 2,
+            resource_id: 0,
+        },
+        Instr::BinaryOp {
+            dest: 0,
+            lhs: 0,
+            rhs: 2,
+            op: BinaryOpCode::Add,
+        },
         Instr::Return,
     ];
     match generate_wgsl(&ir) {
@@ -231,12 +306,20 @@ fn mixed_type_binary_op_is_rejected() {
 fn unassigned_local_read_is_rejected() {
     let mut ir = physics_world();
     ir.systems[0].instructions = vec![
-        Instr::BinaryOp { dest: 0, lhs: 1, rhs: 2, op: BinaryOpCode::Add },
+        Instr::BinaryOp {
+            dest: 0,
+            lhs: 1,
+            rhs: 2,
+            op: BinaryOpCode::Add,
+        },
         Instr::Return,
     ];
     match generate_wgsl(&ir) {
         Err(EcsError::WgslInvalid(message)) => {
-            assert!(message.contains("reads v1 before any assignment"), "{message}");
+            assert!(
+                message.contains("reads v1 before any assignment"),
+                "{message}"
+            );
         }
         other => panic!("expected WgslInvalid, got {other:?}"),
     }

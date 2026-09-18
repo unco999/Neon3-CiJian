@@ -19,7 +19,7 @@ use neon_ui_schema::{
     UiFragmentSubmission, UiIntent, UiNode, UiNodeId, UiNodeKind, UiPointerButton,
     UiPointerDeltaMode, UiPointerEventType, UiStyle, UiTransform,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 const PROBE: &str = "component-interaction.v1";
 

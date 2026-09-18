@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use neon_ipc::{RpcClient, RpcServer};
 use neon_protocol::{
-    ClientIdentity, ClientKind, PROTOCOL_VERSION, RequestId, RpcRequest, RpcResponse,
-    RpcStatus, ServiceName,
+    ClientIdentity, ClientKind, PROTOCOL_VERSION, RequestId, RpcRequest, RpcResponse, RpcStatus,
+    ServiceName,
 };
 use neon_ui_runtime::UiRuntime;
 use serde_json::{Value, json};
@@ -49,7 +49,10 @@ fn call(endpoint: SocketAddr, request: &RpcRequest) -> Result<RpcResponse, Strin
 
 fn diagnostic_response_check(response: &RpcResponse) -> Result<Value, String> {
     if response.status != RpcStatus::Rejected {
-        return Err(format!("expected rejected response, got {:?}", response.status));
+        return Err(format!(
+            "expected rejected response, got {:?}",
+            response.status
+        ));
     }
     let error = response
         .error
@@ -88,7 +91,10 @@ fn diagnostic_response_check(response: &RpcResponse) -> Result<Value, String> {
 
 fn valid_response_check(response: &RpcResponse) -> Result<Value, String> {
     if response.status != RpcStatus::Accepted {
-        return Err(format!("expected accepted response, got {:?}", response.status));
+        return Err(format!(
+            "expected accepted response, got {:?}",
+            response.status
+        ));
     }
     let result = response
         .result
@@ -115,8 +121,10 @@ fn run() -> Result<Vec<Value>, String> {
             .parse::<SocketAddr>()
             .map_err(|error| error.to_string())?,
     )
+    .map_err(|error| error.to_string())?;
+    let endpoint = reservation
+        .local_addr()
         .map_err(|error| error.to_string())?;
-    let endpoint = reservation.local_addr().map_err(|error| error.to_string())?;
     drop(reservation);
 
     let server = std::thread::spawn(move || {

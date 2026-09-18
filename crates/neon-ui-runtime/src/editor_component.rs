@@ -25,7 +25,7 @@ use neon_editor::{
 use neon_ui_schema::{
     TextRef, UiCodeEditorDeclaration, UiCodeEditorPresentation, UiEditorCompletionItem,
     UiEditorCompletionSnapshot, UiEditorDocumentBinding, UiEditorEditFx, UiEditorInputEvent,
-    UiEffect, UiFragment, UiFragmentId, UiEditorKeyKind, UiEditorTokenSpan, UiIntent, UiNode,
+    UiEditorKeyKind, UiEditorTokenSpan, UiEffect, UiFragment, UiFragmentId, UiIntent, UiNode,
     UiNodeKind,
 };
 
@@ -404,11 +404,7 @@ impl EditorComponent {
     }
 
     fn auto_complete(&mut self) {
-        let line = self
-            .core
-            .buffer()
-            .line(self.caret.line)
-            .unwrap_or_default();
+        let line = self.core.buffer().line(self.caret.line).unwrap_or_default();
         let before = line
             .chars()
             .take(self.caret.column as usize)
@@ -447,11 +443,7 @@ impl EditorComponent {
 
     /// Routes a renderer-forwarded input event. Returns any document
     /// commits produced (explicit save / blur).
-    pub fn handle_input(
-        &mut self,
-        event: &UiEditorInputEvent,
-        now: f32,
-    ) -> Vec<EditorCommit> {
+    pub fn handle_input(&mut self, event: &UiEditorInputEvent, now: f32) -> Vec<EditorCommit> {
         match event {
             UiEditorInputEvent::Key {
                 kind,
@@ -657,7 +649,7 @@ impl EditorComponent {
                             self.caret = self.core.delete(start, end);
                             self.selection_anchor = None;
                             let events = self.core.take_edit_events();
-            self.take_edit_fx(events, now);
+                            self.take_edit_fx(events, now);
                             self.mark_edit(now);
                             self.revision += 1;
                         }
@@ -679,7 +671,7 @@ impl EditorComponent {
                         self.selection_anchor = None;
                         self.completion = None;
                         let events = self.core.take_edit_events();
-            self.take_edit_fx(events, now);
+                        self.take_edit_fx(events, now);
                         self.mark_edit(now);
                         self.revision += 1;
                     }
@@ -689,7 +681,7 @@ impl EditorComponent {
                         self.selection_anchor = None;
                         self.completion = None;
                         let events = self.core.take_edit_events();
-            self.take_edit_fx(events, now);
+                        self.take_edit_fx(events, now);
                         self.mark_edit(now);
                         self.revision += 1;
                     }
@@ -782,23 +774,21 @@ impl EditorComponent {
                 true
             }
             "Enter" => {
-                let line_text = self
-                    .core
-                    .buffer()
-                    .line(self.caret.line)
-                    .unwrap_or_default();
+                let line_text = self.core.buffer().line(self.caret.line).unwrap_or_default();
                 let indent: String = line_text
                     .chars()
                     .take_while(|ch| *ch == ' ' || *ch == '\t')
                     .collect();
                 // Auto-indent one extra level after an opening bracket.
-                let before_caret: String = line_text.chars().take(self.caret.column as usize).collect();
+                let before_caret: String =
+                    line_text.chars().take(self.caret.column as usize).collect();
                 let trimmed = before_caret.trim_end();
-                let extra: String = if trimmed.ends_with('{') || trimmed.ends_with('(') || trimmed.ends_with('[') {
-                    " ".repeat(self.declaration.tab_size as usize)
-                } else {
-                    String::new()
-                };
+                let extra: String =
+                    if trimmed.ends_with('{') || trimmed.ends_with('(') || trimmed.ends_with('[') {
+                        " ".repeat(self.declaration.tab_size as usize)
+                    } else {
+                        String::new()
+                    };
                 self.insert_text(&format!("\n{indent}{extra}"), now);
                 true
             }
@@ -816,8 +806,7 @@ impl EditorComponent {
                         let old_col = self.caret.column;
                         self.core
                             .delete(Position::new(line, 0), Position::new(line, remove as u32));
-                        self.caret =
-                            Position::new(line, old_col.saturating_sub(remove as u32));
+                        self.caret = Position::new(line, old_col.saturating_sub(remove as u32));
                         self.mark_edit(now);
                         self.revision += 1;
                     }
@@ -829,28 +818,20 @@ impl EditorComponent {
             }
             "Backspace" => {
                 if ctrl {
-                    let line = self
-                        .core
-                        .buffer()
-                        .line(self.caret.line)
-                        .unwrap_or_default();
+                    let line = self.core.buffer().line(self.caret.line).unwrap_or_default();
                     let chars: Vec<char> = line.chars().collect();
                     let mut column = self.caret.column as usize;
-                    while column > 0
-                        && chars.get(column - 1).is_some_and(|c| c.is_whitespace())
-                    {
+                    while column > 0 && chars.get(column - 1).is_some_and(|c| c.is_whitespace()) {
                         column -= 1;
                     }
-                    while column > 0
-                        && chars.get(column - 1).is_some_and(|c| !c.is_whitespace())
-                    {
+                    while column > 0 && chars.get(column - 1).is_some_and(|c| !c.is_whitespace()) {
                         column -= 1;
                     }
                     let start = Position::new(self.caret.line, column as u32);
                     self.caret = self.core.delete(start, self.caret);
                     self.completion = None;
                     let events = self.core.take_edit_events();
-            self.take_edit_fx(events, now);
+                    self.take_edit_fx(events, now);
                     self.mark_edit(now);
                     self.revision += 1;
                 } else {
@@ -861,17 +842,11 @@ impl EditorComponent {
             }
             "Delete" => {
                 if ctrl {
-                    let line = self
-                        .core
-                        .buffer()
-                        .line(self.caret.line)
-                        .unwrap_or_default();
+                    let line = self.core.buffer().line(self.caret.line).unwrap_or_default();
                     let chars: Vec<char> = line.chars().collect();
                     let mut column = self.caret.column as usize;
                     let len = chars.len();
-                    while column < len
-                        && chars.get(column).is_some_and(|c| !c.is_whitespace())
-                    {
+                    while column < len && chars.get(column).is_some_and(|c| !c.is_whitespace()) {
                         column += 1;
                     }
                     while column < len && chars.get(column).is_some_and(|c| c.is_whitespace()) {
@@ -881,7 +856,7 @@ impl EditorComponent {
                     self.caret = self.core.delete(self.caret, end);
                     self.completion = None;
                     let events = self.core.take_edit_events();
-            self.take_edit_fx(events, now);
+                    self.take_edit_fx(events, now);
                     self.mark_edit(now);
                     self.revision += 1;
                 } else {
@@ -892,39 +867,25 @@ impl EditorComponent {
             }
             "ArrowLeft" => {
                 if ctrl {
-                    let line = self
-                        .core
-                        .buffer()
-                        .line(self.caret.line)
-                        .unwrap_or_default();
+                    let line = self.core.buffer().line(self.caret.line).unwrap_or_default();
                     let chars: Vec<char> = line.chars().collect();
                     let mut column = self.caret.column as usize;
-                    while column > 0
-                        && chars.get(column - 1).is_some_and(|c| c.is_whitespace())
-                    {
+                    while column > 0 && chars.get(column - 1).is_some_and(|c| c.is_whitespace()) {
                         column -= 1;
                     }
-                    while column > 0
-                        && chars.get(column - 1).is_some_and(|c| !c.is_whitespace())
-                    {
+                    while column > 0 && chars.get(column - 1).is_some_and(|c| !c.is_whitespace()) {
                         column -= 1;
                     }
                     self.move_caret(Position::new(self.caret.line, column as u32), shift);
                 } else if self.caret.column > 0 {
-                    self.move_caret(
-                        Position::new(self.caret.line, self.caret.column - 1),
-                        shift,
-                    );
+                    self.move_caret(Position::new(self.caret.line, self.caret.column - 1), shift);
                 } else if self.caret.line > 0 {
                     let previous_len = self
                         .core
                         .buffer()
                         .line(self.caret.line - 1)
                         .map_or(0, |line| line.chars().count() as u32);
-                    self.move_caret(
-                        Position::new(self.caret.line - 1, previous_len),
-                        shift,
-                    );
+                    self.move_caret(Position::new(self.caret.line - 1, previous_len), shift);
                 }
                 true
             }
@@ -935,17 +896,11 @@ impl EditorComponent {
                     .line(self.caret.line)
                     .map_or(0, |line| line.chars().count() as u32);
                 if ctrl {
-                    let line = self
-                        .core
-                        .buffer()
-                        .line(self.caret.line)
-                        .unwrap_or_default();
+                    let line = self.core.buffer().line(self.caret.line).unwrap_or_default();
                     let chars: Vec<char> = line.chars().collect();
                     let mut column = self.caret.column as usize;
                     let len = chars.len();
-                    while column < len
-                        && chars.get(column).is_some_and(|c| !c.is_whitespace())
-                    {
+                    while column < len && chars.get(column).is_some_and(|c| !c.is_whitespace()) {
                         column += 1;
                     }
                     while column < len && chars.get(column).is_some_and(|c| c.is_whitespace()) {
@@ -953,10 +908,7 @@ impl EditorComponent {
                     }
                     self.move_caret(Position::new(self.caret.line, column as u32), shift);
                 } else if self.caret.column < line_len {
-                    self.move_caret(
-                        Position::new(self.caret.line, self.caret.column + 1),
-                        shift,
-                    );
+                    self.move_caret(Position::new(self.caret.line, self.caret.column + 1), shift);
                 } else if self.caret.line + 1 < self.core.buffer().line_count() {
                     self.move_caret(Position::new(self.caret.line + 1, 0), shift);
                 }
@@ -986,10 +938,7 @@ impl EditorComponent {
                     .line
                     .saturating_add(1)
                     .min(self.core.buffer().line_count().saturating_sub(1));
-                self.move_caret(
-                    Position::new(line, self.caret.column.min(next_len)),
-                    shift,
-                );
+                self.move_caret(Position::new(line, self.caret.column.min(next_len)), shift);
                 true
             }
             "Home" => {
@@ -1060,11 +1009,7 @@ impl EditorComponent {
         let viewport_w = (viewport_width - gutter_width).max(1.0);
         let raster_px = self.declaration.font_size * self.font_scale;
         let advance = raster_px * MONO_ADVANCE_FACTOR;
-        let line_text = self
-            .core
-            .buffer()
-            .line(self.caret.line)
-            .unwrap_or_default();
+        let line_text = self.core.buffer().line(self.caret.line).unwrap_or_default();
         let caret_x = self.caret.column as f32 * advance;
         if caret_x < self.scroll_x {
             self.scroll_x = caret_x;
@@ -1099,17 +1044,17 @@ impl EditorComponent {
         row_height: f32,
         gutter_width: f32,
     ) {
-        self.caret = self.core.buffer().clamp_position(Position::new(line, column));
+        self.caret = self
+            .core
+            .buffer()
+            .clamp_position(Position::new(line, column));
         self.selection_anchor = end_line.zip(end_column).map(|(line, column)| {
-            self.core.buffer().clamp_position(Position::new(line, column))
+            self.core
+                .buffer()
+                .clamp_position(Position::new(line, column))
         });
         self.focus = true;
-        self.scroll_caret_into_view(
-            viewport_height,
-            viewport_width,
-            row_height,
-            gutter_width,
-        );
+        self.scroll_caret_into_view(viewport_height, viewport_width, row_height, gutter_width);
     }
 
     // ------------------------------------------------------- presentation
@@ -1149,18 +1094,21 @@ impl EditorComponent {
             }
             token_rows.push(spans);
         }
-        let completion = self.completion.as_ref().map(|c| UiEditorCompletionSnapshot {
-            items: c
-                .items
-                .iter()
-                .map(|item| UiEditorCompletionItem {
-                    label: item.label.clone(),
-                    kind: format!("{:?}", item.kind),
-                    detail: item.detail.clone(),
-                })
-                .collect(),
-            selected: c.selected as u32,
-        });
+        let completion = self
+            .completion
+            .as_ref()
+            .map(|c| UiEditorCompletionSnapshot {
+                items: c
+                    .items
+                    .iter()
+                    .map(|item| UiEditorCompletionItem {
+                        label: item.label.clone(),
+                        kind: format!("{:?}", item.kind),
+                        detail: item.detail.clone(),
+                    })
+                    .collect(),
+                selected: c.selected as u32,
+            });
         UiCodeEditorPresentation {
             node_key: self.declaration.node_key.clone(),
             document: self.declaration.document.clone(),
@@ -1224,8 +1172,7 @@ impl EditorComponentRegistry {
         desired: &HashMap<String, (UiCodeEditorDeclaration, Option<String>, String)>,
         provider: Option<&dyn EditorDocumentProvider>,
     ) {
-        self.editors
-            .retain(|path, _| desired.contains_key(path));
+        self.editors.retain(|path, _| desired.contains_key(path));
         for (path, (declaration, event_action, source)) in desired {
             let mut declaration = declaration.clone();
             let mut source = source.clone();
@@ -1253,7 +1200,8 @@ impl EditorComponentRegistry {
                 state.declaration = declaration.clone();
                 state.event_action = event_action.clone();
                 if needs_rebuild {
-                    state.core = EditorCore::from_language(&source, core_language_for(&declaration));
+                    state.core =
+                        EditorCore::from_language(&source, core_language_for(&declaration));
                     state.adopted_source = source.clone();
                     state.caret = Position::START;
                     state.selection_anchor = None;
@@ -1278,11 +1226,7 @@ impl EditorComponentRegistry {
     }
 
     /// Routes an input event to the owning component and returns commits.
-    pub fn handle_input(
-        &mut self,
-        event: &UiEditorInputEvent,
-        now: f32,
-    ) -> Vec<EditorCommit> {
+    pub fn handle_input(&mut self, event: &UiEditorInputEvent, now: f32) -> Vec<EditorCommit> {
         let path = match event {
             UiEditorInputEvent::Key { path, .. }
             | UiEditorInputEvent::PointerPress { path, .. }
@@ -1320,8 +1264,12 @@ impl EditorComponentRegistry {
                 .find(|candidate| candidate.ends_with(path) || path.ends_with(candidate.as_str()))
                 .cloned()
         };
-        let Some(resolved_path) = resolved_path else { return false };
-        let Some(state) = self.editors.get_mut(&resolved_path) else { return false };
+        let Some(resolved_path) = resolved_path else {
+            return false;
+        };
+        let Some(state) = self.editors.get_mut(&resolved_path) else {
+            return false;
+        };
         state.reveal(
             line,
             column,
@@ -1446,7 +1394,11 @@ impl EditorBridge {
                 }
             }
             for effect in &fragment.effects {
-                let UiEffect::CodeEditorDeclaration { node_key, declaration } = effect else {
+                let UiEffect::CodeEditorDeclaration {
+                    node_key,
+                    declaration,
+                } = effect
+                else {
                     continue;
                 };
                 // Only accept declarations whose lowered node is still a
@@ -1475,25 +1427,20 @@ impl EditorBridge {
                         });
                     }
                 }
-                desired.insert(
-                    path,
-                    (declaration, events.get(node_key).cloned(), source),
-                );
+                desired.insert(path, (declaration, events.get(node_key).cloned(), source));
             }
         }
         let mut registry = self.registry.lock().expect("editor bridge registry lock");
         registry.reconcile_with_provider(&desired, self.document_provider.as_deref());
-        *self.presentations.lock().expect("editor bridge presentations lock") =
-            registry.to_presentations(0.0);
+        *self
+            .presentations
+            .lock()
+            .expect("editor bridge presentations lock") = registry.to_presentations(0.0);
     }
 
     /// Routes one renderer input event into the component registry, returns
     /// the commits produced, and republishes the updated presentations.
-    pub fn handle_input(
-        &self,
-        event: &UiEditorInputEvent,
-        now: f32,
-    ) -> Vec<EditorCommit> {
+    pub fn handle_input(&self, event: &UiEditorInputEvent, now: f32) -> Vec<EditorCommit> {
         let mut registry = self.registry.lock().expect("editor bridge registry lock");
         let commits = registry.handle_input(event, now);
         if let Some(provider) = self.document_provider.as_ref() {
@@ -1503,8 +1450,10 @@ impl EditorBridge {
                 }
             }
         }
-        *self.presentations.lock().expect("editor bridge presentations lock") =
-            registry.to_presentations(now);
+        *self
+            .presentations
+            .lock()
+            .expect("editor bridge presentations lock") = registry.to_presentations(now);
         commits
     }
 
@@ -1526,8 +1475,10 @@ impl EditorBridge {
                 state.adopt_document_frame(&frame);
             }
         }
-        *self.presentations.lock().expect("editor bridge presentations lock") =
-            registry.to_presentations(0.0);
+        *self
+            .presentations
+            .lock()
+            .expect("editor bridge presentations lock") = registry.to_presentations(0.0);
     }
 
     /// Host-directed editor reveal. The returned presentation is the
@@ -1560,8 +1511,13 @@ impl EditorBridge {
             return None;
         }
         let presentations = registry.to_presentations(now);
-        *self.presentations.lock().expect("editor bridge presentations lock") = presentations.clone();
-        presentations.into_iter().find(|presentation| presentation.node_key == path)
+        *self
+            .presentations
+            .lock()
+            .expect("editor bridge presentations lock") = presentations.clone();
+        presentations
+            .into_iter()
+            .find(|presentation| editor_path_matches(path, &presentation.node_key))
     }
 }
 
@@ -1569,6 +1525,10 @@ impl Default for EditorBridge {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn editor_path_matches(requested_path: &str, node_key: &str) -> bool {
+    requested_path == node_key || requested_path.ends_with(&format!("/{node_key}"))
 }
 
 /// Collects node kinds (node_id -> kind) for lower validation.
@@ -1590,11 +1550,13 @@ fn collect_node_literal_text(node: &UiNode, out: &mut HashMap<String, String>) {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use neon_ui_schema::{UiCodeEditorDeclaration, UiEditorInputEvent, UiEditorKeyKind, UiEditorLanguage, UiEditorWrap};
+    use neon_ui_schema::{
+        UiCodeEditorDeclaration, UiEditorInputEvent, UiEditorKeyKind, UiEditorLanguage,
+        UiEditorWrap,
+    };
 
     fn ts_declaration() -> UiCodeEditorDeclaration {
         UiCodeEditorDeclaration {
@@ -1640,7 +1602,9 @@ mod tests {
     }
 
     fn classes(row: &[neon_ui_schema::UiEditorTokenSpan]) -> Vec<(String, String)> {
-        row.iter().map(|t| (t.class.clone(), t.text.clone())).collect()
+        row.iter()
+            .map(|t| (t.class.clone(), t.text.clone()))
+            .collect()
     }
 
     #[test]
@@ -1674,8 +1638,7 @@ mod tests {
         eprintln!("[ui] source lines={}", pres.source.split('\n').count());
         eprintln!(
             "[ui] token_rows={}",
-            pres
-                .token_rows
+            pres.token_rows
                 .iter()
                 .enumerate()
                 .map(|(i, r)| format!(
@@ -1688,7 +1651,11 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join(" | ")
         );
-        assert!(pres.token_rows.len() >= 7, "rows = {}", pres.token_rows.len());
+        assert!(
+            pres.token_rows.len() >= 7,
+            "rows = {}",
+            pres.token_rows.len()
+        );
         // Every keyword must classify as Keyword even on syntactically
         // invalid lines (the lexer-level fallback guarantees this).
         // Input lands at the caret (START), so the final buffer is:
@@ -1696,7 +1663,13 @@ mod tests {
         //   const t makeTrack / let x / // comment
         // Every keyword must classify as Keyword (lexer fallback), including
         // keywords inside syntax-error regions.
-        for (row, kw) in [(0, "const"), (1, "const"), (2, "class"), (3, "const"), (4, "let")] {
+        for (row, kw) in [
+            (0, "const"),
+            (1, "const"),
+            (2, "class"),
+            (3, "const"),
+            (4, "let"),
+        ] {
             let row1 = &pres.token_rows[row];
             assert!(
                 row1.iter().any(|t| t.class == "Keyword" && t.text == kw),
@@ -1719,7 +1692,9 @@ mod tests {
         register_providers();
         let mut comp = EditorComponent::new(
             ts_declaration(),
-            &(0..300).map(|line| format!("const value_{line} = {line};\n")).collect::<String>(),
+            &(0..300)
+                .map(|line| format!("const value_{line} = {line};\n"))
+                .collect::<String>(),
         );
         comp.reveal(220, 4, Some(222), Some(10), 200.0, 868.0, 20.0, 56.0);
         let presentation = comp.to_presentation(1.0);
@@ -1728,6 +1703,13 @@ mod tests {
         assert_eq!(presentation.selection_anchor_line, Some(222));
         assert_eq!(presentation.selection_anchor_column, Some(10));
         assert!(presentation.scroll_y > 0.0);
+    }
+
+    #[test]
+    fn host_reveal_accepts_full_fragment_path_for_node_key() {
+        assert!(editor_path_matches("surface.ide-shell/editor", "editor"));
+        assert!(editor_path_matches("editor", "editor"));
+        assert!(!editor_path_matches("surface.ide-shell/editor-extra", "editor"));
     }
 
     fn named_key(path: &str, name: &str, shift: bool) -> UiEditorInputEvent {
@@ -1777,7 +1759,12 @@ mod tests {
         register_providers();
         let mut comp = EditorComponent::new(ts_declaration(), "");
         comp.handle_input(&type_key("source-view", '('), 0.0);
-        assert_eq!(comp.core.buffer().text(), "()", "type ( -> (), got {:?}", comp.core.buffer().text());
+        assert_eq!(
+            comp.core.buffer().text(),
+            "()",
+            "type ( -> (), got {:?}",
+            comp.core.buffer().text()
+        );
         // Caret should be between the parens.
         assert_eq!(comp.caret.column, 1, "caret should be at col 1 between ()");
     }
@@ -1791,7 +1778,12 @@ mod tests {
         assert_eq!(comp.caret.column, 1);
         // Typing ( when the next char is ) should step over it.
         comp.handle_input(&type_key("source-view", '('), 0.0);
-        assert_eq!(comp.core.buffer().text(), "()", "buffer unchanged, got {:?}", comp.core.buffer().text());
+        assert_eq!(
+            comp.core.buffer().text(),
+            "()",
+            "buffer unchanged, got {:?}",
+            comp.core.buffer().text()
+        );
         assert_eq!(comp.caret.column, 2, "caret should be past the closer");
     }
 
@@ -1804,7 +1796,12 @@ mod tests {
         assert_eq!(comp.caret.column, 1);
         // Type ) — should skip over the existing ).
         comp.handle_input(&type_key("source-view", ')'), 0.0);
-        assert_eq!(comp.core.buffer().text(), "()", "buffer unchanged, got {:?}", comp.core.buffer().text());
+        assert_eq!(
+            comp.core.buffer().text(),
+            "()",
+            "buffer unchanged, got {:?}",
+            comp.core.buffer().text()
+        );
         assert_eq!(comp.caret.column, 2, "caret should skip past )");
     }
 

@@ -1,7 +1,9 @@
 use std::time::{Duration, Instant};
 
 use neon_ipc::RpcClient;
-use neon_protocol::{ClientIdentity, ClientKind, ProtocolVersion, RequestId, RpcRequest, ServiceName};
+use neon_protocol::{
+    ClientIdentity, ClientKind, ProtocolVersion, RequestId, RpcRequest, ServiceName,
+};
 use serde_json::json;
 
 const FLOW: &str = "version 1\nsurface surface.probe revision 1\nbudget nodes=16 bindings=4 instances=16 text=8 glyphs=64 events=4 clips=2\nflow probe\nsurface root overlay w 320 h 200 fill #102030\n  text title value \"local flow probe\"\n";
@@ -36,7 +38,8 @@ fn main() {
         .and_then(|client| client.with_timeout(Duration::from_secs(5)))
         .and_then(|mut client| client.call(&request()));
     let elapsed_ms = started.elapsed().as_millis();
-    let pass = matches!(&result, Ok(response) if response.status == neon_protocol::RpcStatus::Accepted);
+    let pass =
+        matches!(&result, Ok(response) if response.status == neon_protocol::RpcStatus::Accepted);
     println!(
         "{}",
         json!({

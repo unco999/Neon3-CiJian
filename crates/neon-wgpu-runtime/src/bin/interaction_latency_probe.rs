@@ -5,9 +5,8 @@ use neon_protocol::{
     ClientIdentity, ClientKind, ProtocolVersion, RequestId, Revision, RpcRequest, ServiceName,
 };
 use neon_ui_schema::{
-    UI_FRAGMENT_SCHEMA_VERSION, UiBounds, UiCommand, UiFragment, UiFragmentId,
+    UI_FRAGMENT_SCHEMA_VERSION, UiBounds, UiClipShape, UiCommand, UiFragment, UiFragmentId,
     UiFragmentSubmission, UiNode, UiNodeId, UiNodeKind, UiStyle,
-    UiClipShape,
 };
 use serde_json::json;
 

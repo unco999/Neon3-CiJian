@@ -887,8 +887,14 @@ mod tests {
             }),
         };
         let encoded = serde_json::to_value(&response).unwrap();
-        assert_eq!(encoded["error"]["details"]["diagnostics"][0]["stage"], "parse");
-        assert_eq!(serde_json::from_value::<RpcResponse>(encoded).unwrap(), response);
+        assert_eq!(
+            encoded["error"]["details"]["diagnostics"][0]["stage"],
+            "parse"
+        );
+        assert_eq!(
+            serde_json::from_value::<RpcResponse>(encoded).unwrap(),
+            response
+        );
     }
 
     #[test]

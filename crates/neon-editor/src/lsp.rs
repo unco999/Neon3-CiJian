@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc::{channel, Sender};
+use std::sync::mpsc::{Sender, channel};
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
@@ -182,7 +182,9 @@ impl LspClient {
         let reader_thread = std::thread::spawn(move || {
             let mut reader = BufReader::new(reader);
             loop {
-                let Some(line) = read_lsp_message(&mut reader) else { break };
+                let Some(line) = read_lsp_message(&mut reader) else {
+                    break;
+                };
                 let Ok(value) = serde_json::from_str::<Value>(&line) else {
                     continue;
                 };
@@ -221,10 +223,7 @@ impl LspClient {
             }),
             std::time::Duration::from_secs(5),
         )?;
-        client.notify(
-            "initialized",
-            json!({}),
-        )?;
+        client.notify("initialized", json!({}))?;
         client.initialized = true;
         Ok(client)
     }
@@ -269,7 +268,10 @@ impl LspClient {
             }
             Ok(Err(error)) => Err(error),
             Err(_) => {
-                let _ = self.pending.lock().map(|mut guard| guard.responders.remove(&id.to_string()));
+                let _ = self
+                    .pending
+                    .lock()
+                    .map(|mut guard| guard.responders.remove(&id.to_string()));
                 Err(LspError::Protocol("request timed out".into()))
             }
         }
@@ -284,16 +286,15 @@ impl LspClient {
     }
 
     fn send(&mut self, message: Value) -> Result<(), LspError> {
-        let body = serde_json::to_string(&message).map_err(|e| {
-            LspError::Protocol(format!("serialize request: {e}"))
-        })?;
+        let body = serde_json::to_string(&message)
+            .map_err(|e| LspError::Protocol(format!("serialize request: {e}")))?;
         let mutex = self
             .writer
             .take()
             .ok_or_else(|| LspError::Protocol("writer already taken".into()))?;
-        let mut writer = mutex.lock().map_err(|_| {
-            LspError::Protocol("lsp writer poisoned".into())
-        })?;
+        let mut writer = mutex
+            .lock()
+            .map_err(|_| LspError::Protocol("lsp writer poisoned".into()))?;
         write!(*writer, "Content-Length: {}\r\n\r\n{}", body.len(), body)?;
         writer.flush()?;
         drop(writer);
@@ -302,7 +303,12 @@ impl LspClient {
     }
 
     /// Open a document in the server (textDocument/didOpen).
-    pub fn open_document(&mut self, uri: &str, language_id: &str, text: &str) -> Result<(), LspError> {
+    pub fn open_document(
+        &mut self,
+        uri: &str,
+        language_id: &str,
+        text: &str,
+    ) -> Result<(), LspError> {
         self.notify(
             "textDocument/didOpen",
             json!({
@@ -337,12 +343,7 @@ impl LspClient {
     }
 
     /// Notify a document edit (textDocument/didChange, full sync).
-    pub fn change_document(
-        &mut self,
-        uri: &str,
-        version: i64,
-        text: &str,
-    ) -> Result<(), LspError> {
+    pub fn change_document(&mut self, uri: &str, version: i64, text: &str) -> Result<(), LspError> {
         self.notify(
             "textDocument/didChange",
             json!({
@@ -369,11 +370,7 @@ impl LspClient {
     }
 
     /// `textDocument/hover` — raw LSP result (markdown/plaintext contents).
-    pub fn request_hover(
-        &mut self,
-        uri: &str,
-        position: Position,
-    ) -> Result<Value, LspError> {
+    pub fn request_hover(&mut self, uri: &str, position: Position) -> Result<Value, LspError> {
         self.request(
             "textDocument/hover",
             json!({
@@ -529,7 +526,10 @@ fn parse_symbols(result: Value) -> Vec<LspSymbol> {
             if entry.get("selectionRange").is_some() {
                 let name = entry.get("name")?.as_str()?.to_string();
                 let kind = entry.get("kind").and_then(Value::as_u64).unwrap_or(0) as u32;
-                let detail = entry.get("detail").and_then(Value::as_str).map(String::from);
+                let detail = entry
+                    .get("detail")
+                    .and_then(Value::as_str)
+                    .map(String::from);
                 let range: LspRange = serde_json::from_value(entry.get("range")?.clone()).ok()?;
                 let selection_range: LspRange =
                     serde_json::from_value(entry.get("selectionRange")?.clone()).ok()?;
@@ -555,7 +555,10 @@ fn parse_symbols(result: Value) -> Vec<LspSymbol> {
                 // SymbolInformation form: name + location.
                 let name = entry.get("name")?.as_str()?.to_string();
                 let kind = entry.get("kind").and_then(Value::as_u64).unwrap_or(0) as u32;
-                let detail = entry.get("containerName").and_then(Value::as_str).map(String::from);
+                let detail = entry
+                    .get("containerName")
+                    .and_then(Value::as_str)
+                    .map(String::from);
                 let location = entry.get("location")?;
                 let _uri = location.get("uri")?.as_str()?.to_string();
                 let range: LspRange =
@@ -623,10 +626,12 @@ fn parse_completion_result(result: Value) -> Vec<CompletionItem> {
                     let range = edit.get("range");
                     let start = range.and_then(|r| r.get("start"));
                     let end = range.and_then(|r| r.get("end"));
-                    let to_position = |p: Option<&Value>| Position::new(
-                        p.and_then(|v| v["line"].as_u64()).unwrap_or(0) as u32,
-                        p.and_then(|v| v["character"].as_u64()).unwrap_or(0) as u32,
-                    );
+                    let to_position = |p: Option<&Value>| {
+                        Position::new(
+                            p.and_then(|v| v["line"].as_u64()).unwrap_or(0) as u32,
+                            p.and_then(|v| v["character"].as_u64()).unwrap_or(0) as u32,
+                        )
+                    };
                     (to_position(start), to_position(end))
                 }
                 _ => (Position::START, Position::START),

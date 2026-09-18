@@ -10,7 +10,9 @@
 //!   cargo run -p neon-ui-runtime --bin nui_guide_render -- 127.0.0.1:43130 docs/media/nui-guide
 
 use neon_ipc::RpcClient;
-use neon_protocol::{ClientIdentity, ClientKind, PROTOCOL_VERSION, RequestId, RpcRequest, RpcStatus, ServiceName};
+use neon_protocol::{
+    ClientIdentity, ClientKind, PROTOCOL_VERSION, RequestId, RpcRequest, RpcStatus, ServiceName,
+};
 use serde_json::{Value, json};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -40,11 +42,13 @@ struct GuideExample {
 const CANVAS_W: u32 = 560;
 const CANVAS_H: u32 = 300;
 
-const fn ex(
-    name: &'static str,
-    flow: &'static str,
-) -> GuideExample {
-    GuideExample { name, width: CANVAS_W, height: CANVAS_H, flow }
+const fn ex(name: &'static str, flow: &'static str) -> GuideExample {
+    GuideExample {
+        name,
+        width: CANVAS_W,
+        height: CANVAS_H,
+        flow,
+    }
 }
 
 const EXAMPLES: &[GuideExample] = &[
@@ -85,7 +89,12 @@ const EXAMPLES: &[GuideExample] = &[
     ),
 ];
 
-fn request(client: &mut RpcClient, target: &str, method: &str, params: Value) -> Result<Value, String> {
+fn request(
+    client: &mut RpcClient,
+    target: &str,
+    method: &str,
+    params: Value,
+) -> Result<Value, String> {
     let request = RpcRequest {
         protocol: "neon3.rpc".into(),
         version: PROTOCOL_VERSION,
@@ -104,8 +113,16 @@ fn request(client: &mut RpcClient, target: &str, method: &str, params: Value) ->
     };
     let response = client.call(&request).map_err(|e| e.to_string())?;
     if response.status != RpcStatus::Accepted {
-        let code = response.error.as_ref().map(|e| e.code.clone()).unwrap_or_default();
-        let message = response.error.as_ref().map(|e| e.message.clone()).unwrap_or_default();
+        let code = response
+            .error
+            .as_ref()
+            .map(|e| e.code.clone())
+            .unwrap_or_default();
+        let message = response
+            .error
+            .as_ref()
+            .map(|e| e.message.clone())
+            .unwrap_or_default();
         return Err(format!("{method} rejected: {code} {message}"));
     }
     Ok(response.result.unwrap_or(Value::Null))
@@ -128,7 +145,11 @@ fn main() {
 
     // Health first.
     let health = request(&mut client, "wgpu-runtime", "service.health", json!({})).expect("health");
-    assert_eq!(health.get("status").and_then(Value::as_str), Some("healthy"), "server must be healthy");
+    assert_eq!(
+        health.get("status").and_then(Value::as_str),
+        Some("healthy"),
+        "server must be healthy"
+    );
 
     // One shared surface reused across examples; each submit replaces the
     // previous fragment so the render loop keeps producing frames (avoids the
@@ -141,8 +162,12 @@ fn main() {
             "wgpu-runtime",
             "ui.flow.submit",
             json!({"source": example.flow}),
-        ).unwrap_or_else(|e| panic!("{} submit: {e}", example.name));
-        let _declared = submitted.get("surface_id").and_then(Value::as_str).unwrap_or(surface_id);
+        )
+        .unwrap_or_else(|e| panic!("{} submit: {e}", example.name));
+        let _declared = submitted
+            .get("surface_id")
+            .and_then(Value::as_str)
+            .unwrap_or(surface_id);
 
         if !opened {
             let _opened = request(
@@ -159,7 +184,8 @@ fn main() {
                     "depth": false,
                     "buffer_count": 2,
                 }),
-            ).unwrap_or_else(|e| panic!("{} open: {e}", example.name));
+            )
+            .unwrap_or_else(|e| panic!("{} open: {e}", example.name));
             opened = true;
         }
 
@@ -170,13 +196,23 @@ fn main() {
             "wgpu-runtime",
             "render.surface.capture_png",
             json!({"surface_id": surface_id, "path": png_path.to_string_lossy()}),
-        ).unwrap_or_else(|e| panic!("{} capture: {e}", example.name));
+        )
+        .unwrap_or_else(|e| panic!("{} capture: {e}", example.name));
         println!(
             "{} -> {} ({}) frame={}",
             example.name,
-            captured.get("artifact_path").and_then(Value::as_str).unwrap_or("?"),
-            captured.get("rgba_bytes").and_then(Value::as_u64).unwrap_or(0),
-            captured.get("frame_sequence").and_then(Value::as_u64).unwrap_or(0),
+            captured
+                .get("artifact_path")
+                .and_then(Value::as_str)
+                .unwrap_or("?"),
+            captured
+                .get("rgba_bytes")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            captured
+                .get("frame_sequence")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
         );
     }
 

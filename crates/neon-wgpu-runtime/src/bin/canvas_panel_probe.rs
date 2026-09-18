@@ -17,8 +17,8 @@ use neon_protocol::{
     ServiceName,
 };
 use neon_ui_schema::{
-    UiBounds, UiCanvasData, UiCanvasLine, UiCanvasPoint, UiClipShape, UiCommand, UiFragment, UiFragmentId,
-    UiFragmentSubmission, UiNode, UiNodeId, UiNodeKind, UiStyle,
+    UiBounds, UiCanvasData, UiCanvasLine, UiCanvasPoint, UiClipShape, UiCommand, UiFragment,
+    UiFragmentId, UiFragmentSubmission, UiNode, UiNodeId, UiNodeKind, UiStyle,
 };
 use serde_json::json;
 

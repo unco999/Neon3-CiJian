@@ -1,4 +1,4 @@
-﻿//! Headless UI declaration runtime. It must not create windows or GPU objects.
+//! Headless UI declaration runtime. It must not create windows or GPU objects.
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
@@ -20,9 +20,10 @@ use neon_protocol::{
 };
 use neon_ui_schema::{
     ERROR_DATA_GRID_CELL_INVALID, ERROR_FRAGMENT_REVISION_STALE, ERROR_INPUT_SEQUENCE_STALE,
-    ERROR_INTENT_NOT_BOUND, ERROR_RENDERER_EPOCH_MISMATCH, ERROR_UI_PROGRAM_CAPACITY_OVERFLOW,
-    ERROR_UI_PROGRAM_DUPLICATE_INPUT_CHANGE, ERROR_UI_PROGRAM_EVENT_CONTROL_UNAVAILABLE,
-    ERROR_UI_PROGRAM_EVENT_DUPLICATE_IDEMPOTENCY_KEY,
+    ERROR_INTENT_NOT_BOUND, ERROR_NUI_FLOW_ACTIVATION, ERROR_NUI_FLOW_COMPILE,
+    ERROR_NUI_FLOW_PARSE, ERROR_NUI_FLOW_SOURCE_REQUIRED, ERROR_RENDERER_EPOCH_MISMATCH,
+    ERROR_UI_PROGRAM_CAPACITY_OVERFLOW, ERROR_UI_PROGRAM_DUPLICATE_INPUT_CHANGE,
+    ERROR_UI_PROGRAM_EVENT_CONTROL_UNAVAILABLE, ERROR_UI_PROGRAM_EVENT_DUPLICATE_IDEMPOTENCY_KEY,
     ERROR_UI_PROGRAM_EVENT_INTERACTION_EPOCH_MISMATCH, ERROR_UI_PROGRAM_EVENT_INVALID_SOURCE,
     ERROR_UI_PROGRAM_EVENT_PAYLOAD_REJECTED, ERROR_UI_PROGRAM_EVENT_STALE_REVISION,
     ERROR_UI_PROGRAM_INPUT_TYPE_MISMATCH, ERROR_UI_PROGRAM_INPUT_UPDATE_FORBIDDEN,
@@ -30,19 +31,17 @@ use neon_ui_schema::{
     ERROR_UI_PROGRAM_TEXT_REGISTRY_CAPACITY_OVERFLOW,
     ERROR_UI_PROGRAM_TEXT_REGISTRY_GENERATION_MISMATCH,
     ERROR_UI_PROGRAM_TEXT_REGISTRY_STALE_REVISION, ERROR_UI_PROGRAM_TEXT_TOO_LONG,
-    ERROR_NUI_FLOW_ACTIVATION, ERROR_NUI_FLOW_COMPILE, ERROR_NUI_FLOW_PARSE,
-    ERROR_NUI_FLOW_SOURCE_REQUIRED, ERROR_UI_PROGRAM_UNKNOWN_INPUT_KEY,
-    ERROR_UI_PROGRAM_UNKNOWN_TEXT_HANDLE, NuiFlowCompileReport, NuiFlowCompileStatus,
-    NuiFlowDiagnostic, NuiFlowDiagnosticStage, NuiFlowDocument,
+    ERROR_UI_PROGRAM_UNKNOWN_INPUT_KEY, ERROR_UI_PROGRAM_UNKNOWN_TEXT_HANDLE, NuiFlowCompileReport,
+    NuiFlowCompileStatus, NuiFlowDiagnostic, NuiFlowDiagnosticStage, NuiFlowDocument,
     NuiFlowStateStyle, TextRef, UI_SURFACE_SCHEMA_VERSION, UiBinding, UiBoundProperty, UiBounds,
-    UiBranchPredicate, UiBranchRecord, UiCommand, UiCpuFrameOutput, UiCpuNodeState,
+    UiBranchPredicate, UiBranchRecord, UiClipShape, UiCommand, UiCpuFrameOutput, UiCpuNodeState,
     UiCpuRenderPrimitive, UiCpuSemanticTarget, UiCpuViewport, UiDataGridCellTarget,
     UiDataGridDeclaration, UiDataGridFrame, UiDataGridInputFrame, UiDataGridRecord,
     UiDependencyIndex, UiDiagnostic, UiDiagnosticSeverity, UiDiagnosticsState, UiEffect,
     UiEventTraceRecord, UiFragment, UiFragmentId, UiFragmentSubmission, UiHostFragmentContext,
     UiHostInbound, UiHostPublication, UiInputChange, UiInputFrame, UiInputKind, UiInputSchema,
     UiInputUpdateClass, UiInputValue, UiInputValueSource, UiInspectorState, UiInspectorTab,
-    UiIntent, UiIrDocument, UiClipShape, UiNode, UiNodeId, UiNodeKind, UiProgram, UiProgramCapability,
+    UiIntent, UiIrDocument, UiNode, UiNodeId, UiNodeKind, UiProgram, UiProgramCapability,
     UiProgramCapabilityOwner, UiProgramCapabilityStatus, UiProgramDragDropEvent,
     UiProgramLayoutRecord, UiProgramLiteralText, UiProgramNode, UiProgramResourceKind,
     UiProgramRevision, UiProgramSemanticEvent, UiProgramSemanticEventKind,
@@ -71,9 +70,9 @@ pub use event_publisher::{EVENT_VARIABLE_CHANGED, FLOW_EVENT_PREFIX, UiVariableE
 use host_adapter::UiHostAdapter;
 pub use host_adapter::UiHostAdapterConfig;
 pub use nui_flow::{
-    NuiFlowError, apply_nui_ir_patch, apply_ui_patch, bind_nui_flow_resources, compile_nui_flow_program,
-    find_node_mut, format_nui_flow, lower_nui_flow, lower_nui_flow_effects, parse_nui_flow,
-    parse_nui_flow_patch,
+    NuiFlowError, apply_nui_ir_patch, apply_ui_patch, bind_nui_flow_resources,
+    compile_nui_flow_program, find_node_mut, format_nui_flow, lower_nui_flow,
+    lower_nui_flow_effects, parse_nui_flow, parse_nui_flow_patch,
 };
 pub mod editor_component;
 pub use nui_state_machine::{
@@ -1107,9 +1106,10 @@ pub fn compile_nui_flow_source(
     let document = parse_nui_flow(source).map_err(|error| NuiFlowCompileError {
         report: flow_parse_report("nui-flow", &error),
     })?;
-    let program = compile_nui_flow_program(&document, revision).map_err(|error| NuiFlowCompileError {
-        report: flow_compile_report(&document, &error),
-    })?;
+    let program =
+        compile_nui_flow_program(&document, revision).map_err(|error| NuiFlowCompileError {
+            report: flow_compile_report(&document, &error),
+        })?;
     Ok(NuiFlowCompiledProgram { document, program })
 }
 
@@ -1168,10 +1168,7 @@ fn flow_compile_report(
     }
 }
 
-fn flow_valid_report(
-    document: &NuiFlowDocument,
-    program: &UiProgram,
-) -> NuiFlowCompileReport {
+fn flow_valid_report(document: &NuiFlowDocument, program: &UiProgram) -> NuiFlowCompileReport {
     NuiFlowCompileReport {
         schema_version: neon_ui_schema::NUI_FLOW_DIAGNOSTIC_SCHEMA_VERSION,
         status: NuiFlowCompileStatus::Valid,
@@ -1257,8 +1254,7 @@ fn flow_program_revision(document: &NuiFlowDocument) -> UiProgramRevision {
 fn compile_flow_source_for_rpc(
     source: &str,
 ) -> Result<NuiFlowCompiledProgram, NuiFlowCompileReport> {
-    let document = parse_nui_flow(source)
-        .map_err(|error| flow_parse_report("nui-flow", &error))?;
+    let document = parse_nui_flow(source).map_err(|error| flow_parse_report("nui-flow", &error))?;
     let revision = flow_program_revision(&document);
     let program = compile_nui_flow_program(&document, revision)
         .map_err(|error| flow_compile_report(&document, &error))?;
@@ -1313,13 +1309,9 @@ pub struct UiProgramSemanticEventRouter {
     trace: Vec<UiEventTraceRecord>,
 }
 
-
 /// Evaluate a simple comparison expression: "$left op right".
 /// Returns None if the expression references missing inputs or has invalid types.
-fn eval_derived_expression(
-    expr: &str,
-    inputs: &UiResolvedInputs,
-) -> Option<bool> {
+fn eval_derived_expression(expr: &str, inputs: &UiResolvedInputs) -> Option<bool> {
     let parts: Vec<&str> = expr.split_whitespace().collect();
     if parts.len() != 3 {
         return None;
@@ -1327,14 +1319,22 @@ fn eval_derived_expression(
     let left = resolve_operand(parts[0], inputs)?;
     let right = resolve_operand(parts[2], inputs)?;
     match (left, right) {
-        (UiInputValue::F32 { value: l }, UiInputValue::F32 { value: r }) => Some(compare_f32(l, r, parts[1])),
-        (UiInputValue::I32 { value: l }, UiInputValue::I32 { value: r }) => Some(compare_i64(l as i64, r as i64, parts[1])),
-        (UiInputValue::U32 { value: l }, UiInputValue::U32 { value: r }) => Some(compare_i64(l as i64, r as i64, parts[1])),
-        (UiInputValue::Bool { value: l }, UiInputValue::Bool { value: r }) => Some(match parts[1] {
-            "==" => l == r,
-            "!=" => l != r,
-            _ => false,
-        }),
+        (UiInputValue::F32 { value: l }, UiInputValue::F32 { value: r }) => {
+            Some(compare_f32(l, r, parts[1]))
+        }
+        (UiInputValue::I32 { value: l }, UiInputValue::I32 { value: r }) => {
+            Some(compare_i64(l as i64, r as i64, parts[1]))
+        }
+        (UiInputValue::U32 { value: l }, UiInputValue::U32 { value: r }) => {
+            Some(compare_i64(l as i64, r as i64, parts[1]))
+        }
+        (UiInputValue::Bool { value: l }, UiInputValue::Bool { value: r }) => {
+            Some(match parts[1] {
+                "==" => l == r,
+                "!=" => l != r,
+                _ => false,
+            })
+        }
         _ => None,
     }
 }
@@ -1603,7 +1603,9 @@ fn input_value_as_event_payload(value: &UiInputValue) -> Option<UiSemanticPayloa
         UiInputValue::Vec2 { .. } | UiInputValue::Vec4 { .. } | UiInputValue::Color { .. } => {
             return None;
         }
-        UiInputValue::CanvasData { .. } | UiInputValue::Struct { .. } | UiInputValue::Array { .. } => return None,
+        UiInputValue::CanvasData { .. }
+        | UiInputValue::Struct { .. }
+        | UiInputValue::Array { .. } => return None,
     })
 }
 
@@ -1758,7 +1760,9 @@ fn input_value_to_json(value: &UiInputValue) -> serde_json::Value {
         UiInputValue::CanvasData { value } => json!({"canvas_data": value}),
         UiInputValue::Struct { fields } => {
             let mut map = serde_json::Map::new();
-            for (k, v) in fields { map.insert(k.clone(), input_value_to_json(v)); }
+            for (k, v) in fields {
+                map.insert(k.clone(), input_value_to_json(v));
+            }
             serde_json::Value::Object(map)
         }
         UiInputValue::Array { elements, .. } => {
@@ -3337,6 +3341,7 @@ impl UiRuntime {
         json!({
             "program_revision": program_revision,
             "state_revision": state_revision,
+            "flow_document_revision": self.flow_document.as_ref().map(|document| document.ir.revision),
             "states": self.flow_state_machine.as_ref().map(NuiFlowStateMachineRuntime::states_snapshot),
             "pending_motions": self.pending_motions.iter().map(pending_motion_debug).collect::<Vec<_>>(),
             "last_transitions": self
@@ -3446,12 +3451,7 @@ impl UiRuntime {
             ),
             Err(report) => {
                 let (code, message) = report_error_summary(&report);
-                self.rejected_with_flow_report(
-                    request.request_id,
-                    &code,
-                    &message,
-                    report,
-                )
+                self.rejected_with_flow_report(request.request_id, &code, &message, report)
             }
         }
     }
@@ -3834,36 +3834,52 @@ impl UiRuntime {
     ) -> Result<RpcResponse, TransportError> {
         // Accept the formal UiPatch envelope while retaining the legacy
         // adapter below during the full-mount fallback phase.
-        if request.params.get("base_revision").is_some()
-            && request.params.get("revision").is_none()
+        if request.params.get("base_revision").is_some() && request.params.get("revision").is_none()
         {
             if let Some(base_revision) = request.params.get("base_revision").cloned() {
                 request.params["revision"] = base_revision;
             }
-            if let Some(operations) = request.params.get_mut("operations").and_then(Value::as_array_mut) {
+            if let Some(operations) = request
+                .params
+                .get_mut("operations")
+                .and_then(Value::as_array_mut)
+            {
                 for operation in operations {
-                    let op = operation.get("op").and_then(Value::as_str).unwrap_or("").to_owned();
+                    let op = operation
+                        .get("op")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_owned();
                     match op.as_str() {
                         "set_property" => {
                             operation["kind"] = Value::String("set".into());
-                            operation["path"] = operation.get("node_path").cloned().unwrap_or(Value::Null);
-                            operation["property"] = operation.get("property").cloned().unwrap_or(Value::Null);
+                            operation["path"] =
+                                operation.get("node_path").cloned().unwrap_or(Value::Null);
+                            operation["property"] =
+                                operation.get("property").cloned().unwrap_or(Value::Null);
                         }
                         "insert_node" => {
                             operation["kind"] = Value::String("insert".into());
-                            operation["path"] = operation.get("parent_path").cloned().unwrap_or(Value::Null);
-                            operation["node"] = operation.get("node").cloned().unwrap_or(Value::Null);
-                            operation["index"] = operation.get("index").cloned().unwrap_or(json!(0));
+                            operation["path"] =
+                                operation.get("parent_path").cloned().unwrap_or(Value::Null);
+                            operation["node"] =
+                                operation.get("node").cloned().unwrap_or(Value::Null);
+                            operation["index"] =
+                                operation.get("index").cloned().unwrap_or(json!(0));
                         }
                         "remove_node" => {
                             operation["kind"] = Value::String("remove".into());
-                            operation["path"] = operation.get("node_path").cloned().unwrap_or(Value::Null);
+                            operation["path"] =
+                                operation.get("node_path").cloned().unwrap_or(Value::Null);
                         }
                         "move_node" => {
                             operation["kind"] = Value::String("move".into());
-                            operation["path"] = operation.get("node_path").cloned().unwrap_or(Value::Null);
-                            operation["parent"] = operation.get("parent_path").cloned().unwrap_or(Value::Null);
-                            operation["index"] = operation.get("index").cloned().unwrap_or(json!(0));
+                            operation["path"] =
+                                operation.get("node_path").cloned().unwrap_or(Value::Null);
+                            operation["parent"] =
+                                operation.get("parent_path").cloned().unwrap_or(Value::Null);
+                            operation["index"] =
+                                operation.get("index").cloned().unwrap_or(json!(0));
                         }
                         "replace_children" | "start_transition" | "set_input" => {}
                         _ => {}
@@ -3871,16 +3887,24 @@ impl UiRuntime {
                 }
             }
         }
-        let current_doc = self.flow_document.as_ref()
+        let current_doc = self
+            .flow_document
+            .as_ref()
             .ok_or_else(|| TransportError::Io(std::io::Error::other("no active flow")))?;
 
         // Build UiIrPatch from structured params (bypasses text patch restrictions).
-        let revision = request.params.get("revision")
+        let revision = request
+            .params
+            .get("revision")
             .and_then(Value::as_u64)
             .ok_or_else(|| TransportError::Io(std::io::Error::other("revision required")))?;
-        let ops_arr = request.params.get("operations")
+        let ops_arr = request
+            .params
+            .get("operations")
             .and_then(Value::as_array)
-            .ok_or_else(|| TransportError::Io(std::io::Error::other("operations array required")))?;
+            .ok_or_else(|| {
+                TransportError::Io(std::io::Error::other("operations array required"))
+            })?;
         let ops_clone = ops_arr.clone();
         let mut operations = Vec::new();
         for op in ops_arr {
@@ -3893,50 +3917,89 @@ impl UiRuntime {
             }
             let (kind_enum, payload) = match kind {
                 "set" => {
-                    let raw_value = op.get("value").map(|value| {
-                        value.as_str().map(str::to_owned).unwrap_or_else(|| value.to_string())
-                    }).unwrap_or_default();
+                    let raw_value = op
+                        .get("value")
+                        .map(|value| {
+                            value
+                                .as_str()
+                                .map(str::to_owned)
+                                .unwrap_or_else(|| value.to_string())
+                        })
+                        .unwrap_or_default();
                     let payload_value = if property == "value" {
-                         if op.get("value").is_some_and(Value::is_string) { format!("\"{}\"", raw_value.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")) } else { raw_value.clone() }
+                        if op.get("value").is_some_and(Value::is_string) {
+                            format!(
+                                "\"{}\"",
+                                raw_value
+                                    .replace('\\', "\\\\")
+                                    .replace('"', "\\\"")
+                                    .replace('\n', "\\n")
+                            )
+                        } else {
+                            raw_value.clone()
+                        }
                     } else {
                         raw_value.to_string()
                     };
-                    (neon_ui_schema::UiIrPatchOperationKind::Set,
-                     Some(json!({"property": property, "value": payload_value})))
+                    (
+                        neon_ui_schema::UiIrPatchOperationKind::Set,
+                        Some(json!({"property": property, "value": payload_value})),
+                    )
                 }
                 "insert" => {
                     if let Some(node) = op.get("node") {
-                        (neon_ui_schema::UiIrPatchOperationKind::Insert,
-                         Some(json!({"node": node, "index": op.get("index").and_then(Value::as_u64).unwrap_or(0)})))
+                        (
+                            neon_ui_schema::UiIrPatchOperationKind::Insert,
+                            Some(
+                                json!({"node": node, "index": op.get("index").and_then(Value::as_u64).unwrap_or(0)}),
+                            ),
+                        )
                     } else {
-                    let k = op.get("kind_name").and_then(Value::as_str).unwrap_or("panel");
-                    let key = op.get("node_key").and_then(Value::as_str).unwrap_or("new");
-                    (neon_ui_schema::UiIrPatchOperationKind::Insert,
-                     Some(json!({"kind": k, "key": key})))
+                        let k = op
+                            .get("kind_name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("panel");
+                        let key = op.get("node_key").and_then(Value::as_str).unwrap_or("new");
+                        (
+                            neon_ui_schema::UiIrPatchOperationKind::Insert,
+                            Some(json!({"kind": k, "key": key})),
+                        )
                     }
                 }
                 "remove" => (neon_ui_schema::UiIrPatchOperationKind::Remove, None),
                 "move" => {
                     let parent = op.get("parent").and_then(Value::as_str).unwrap_or("root");
-                    (neon_ui_schema::UiIrPatchOperationKind::Move,
-                     Some(json!({"parent": parent})))
+                    (
+                        neon_ui_schema::UiIrPatchOperationKind::Move,
+                        Some(json!({"parent": parent})),
+                    )
                 }
-                _ => return Err(TransportError::Io(std::io::Error::other(format!("unknown op kind: {kind}")))),
+                _ => {
+                    return Err(TransportError::Io(std::io::Error::other(format!(
+                        "unknown op kind: {kind}"
+                    ))));
+                }
             };
             operations.push(neon_ui_schema::UiIrPatchOperation {
                 kind: kind_enum,
                 target_path: path.into(),
                 expected_revision: Revision(revision),
                 payload,
-                source_span: neon_ui_schema::NuiSourceSpan { line: 0, column: 0, end_line: 0, end_column: 0 },
+                source_span: neon_ui_schema::NuiSourceSpan {
+                    line: 0,
+                    column: 0,
+                    end_line: 0,
+                    end_column: 0,
+                },
             });
         }
         let patch = neon_ui_schema::UiIrPatch {
             expected_revision: Revision(revision),
             operations,
         };
-        let mut new_ir = apply_nui_ir_patch(&current_doc.ir, &patch)
-            .map_err(|e| TransportError::Io(std::io::Error::other(format!("patch apply: {e:?}"))))?;
+        let mut new_ir = apply_nui_ir_patch(&current_doc.ir, &patch).map_err(|e| {
+            TransportError::Io(std::io::Error::other(format!("patch apply: {e:?}")))
+        })?;
         // Apply source_file overrides from structured operations (set path property=source_file value="/abs/path").
         for op in &ops_clone {
             if op.get("kind").and_then(Value::as_str) == Some("set")
@@ -3959,13 +4022,17 @@ impl UiRuntime {
             if let Some(ref path) = decl.source_file {
                 match std::fs::read_to_string(path) {
                     Ok(text) => source_paths.push((node_key.clone(), text)),
-                    Err(e) => eprintln!("[neon-ui-runtime] source_file read failed: {}: {}", path, e),
+                    Err(e) => {
+                        eprintln!("[neon-ui-runtime] source_file read failed: {}: {}", path, e)
+                    }
                 }
             }
         }
         for (node_key, text) in &source_paths {
             if let Some(node) = find_node_mut(&mut new_ir.root, node_key) {
-                node.text = Some(neon_ui_schema::TextRef::Literal { value: text.clone() });
+                node.text = Some(neon_ui_schema::TextRef::Literal {
+                    value: text.clone(),
+                });
             }
         }
         // Rebuild NuiFlowDocument with patched IR, preserving other fields.
@@ -3985,11 +4052,15 @@ impl UiRuntime {
                 neon_ui_schema::UI_CANVAS_POINTS_LINES_CAPABILITY_NAME,
                 neon_ui_schema::UI_TIMELINE_ANIMATION_CAPABILITY_NAME,
                 neon_ui_schema::UI_CODE_EDITOR_CAPABILITY_NAME,
-            ].into_iter().map(|n| UiProgramCapability {
-                name: n.into(), version: 1,
+            ]
+            .into_iter()
+            .map(|n| UiProgramCapability {
+                name: n.into(),
+                version: 1,
                 owner: UiProgramCapabilityOwner::SharedContract,
                 status: UiProgramCapabilityStatus::Supported,
-            }).collect(),
+            })
+            .collect(),
         };
         let program = compile_nui_flow_program(&new_doc, revision)
             .map_err(|e| TransportError::Io(std::io::Error::other(format!("compile: {e:?}"))))?;
@@ -3998,15 +4069,27 @@ impl UiRuntime {
         // literal text has a fresh TextHandle. Update the input_schema slots so
         // that adapter.activate() picks up the new source content.
         for editor in new_doc.ir.code_editors.values() {
-            if let Some(lit) = program.literal_texts.iter().find(|l| l.node_key == editor.node_key) {
+            if let Some(lit) = program
+                .literal_texts
+                .iter()
+                .find(|l| l.node_key == editor.node_key)
+            {
                 let slot_key = &editor.source_input_key;
-                if let Some(slot) = new_doc.input_schema.slots.iter_mut().find(|s| &s.key == slot_key) {
-                    slot.default_value = neon_ui_schema::UiInputValue::TextHandle { value: lit.handle };
+                if let Some(slot) = new_doc
+                    .input_schema
+                    .slots
+                    .iter_mut()
+                    .find(|s| &s.key == slot_key)
+                {
+                    slot.default_value =
+                        neon_ui_schema::UiInputValue::TextHandle { value: lit.handle };
                 }
             }
         }
 
-        let fragment_revision = self.cached_fragment.as_ref()
+        let fragment_revision = self
+            .cached_fragment
+            .as_ref()
             .map_or(Revision(1), |c| Revision(c.revision.0 + 1));
         let mut fragment = UiFragment {
             fragment_id: UiFragmentId(new_doc.ir.surface_id.0.clone()),
@@ -4014,11 +4097,17 @@ impl UiRuntime {
             root: new_doc.ir.root.clone(),
             effects: lower_nui_flow_effects(&new_doc),
         };
-        let adapter = UiHostAdapter::activate(program.clone(), new_doc.input_schema.clone(), self.epoch)
-            .map_err(|e| TransportError::Io(std::io::Error::other(e.message)))?
-            .with_event_publisher(self.eventd_endpoint, self.client.clone());
+        let adapter =
+            UiHostAdapter::activate(program.clone(), new_doc.input_schema.clone(), self.epoch)
+                .map_err(|e| TransportError::Io(std::io::Error::other(e.message)))?
+                .with_event_publisher(self.eventd_endpoint, self.client.clone());
         let initial_inputs = adapter.snapshot().scalar_inputs;
-        refresh_fragment_from_program(&mut fragment, &program, &initial_inputs, &new_doc.input_schema);
+        refresh_fragment_from_program(
+            &mut fragment,
+            &program,
+            &initial_inputs,
+            &new_doc.input_schema,
+        );
         self.host_adapter = Some(adapter);
         let forwarded = RpcRequest {
             protocol: "neon3.rpc".into(),
@@ -4038,7 +4127,12 @@ impl UiRuntime {
             self.flow_state_machine = Some(NuiFlowStateMachineRuntime::new(&new_doc));
             self.flow_document = Some(new_doc.clone());
             let mut enriched = response;
-            enriched.result = Some(json!({"state": "patched", "program_revision": program.revision}));
+            enriched.result =
+                Some(json!({
+                    "state": "patched",
+                    "program_revision": program.revision,
+                    "flow_document_revision": new_doc.ir.revision,
+                }));
             return Ok(enriched);
         }
         Ok(response)
@@ -4281,7 +4375,13 @@ impl UiRuntime {
                     let publish = neon_protocol::EventPublish {
                         protocol: "neon3.event".into(),
                         version: neon_protocol::PROTOCOL_VERSION,
-                        request_id: neon_protocol::RequestId(format!("ui-click-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0))),
+                        request_id: neon_protocol::RequestId(format!(
+                            "ui-click-{}",
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_nanos())
+                                .unwrap_or(0)
+                        )),
                         publisher: self.client.clone(),
                         name: event_name,
                         schema_version: 1,
@@ -4289,9 +4389,11 @@ impl UiRuntime {
                         idempotency_key: None,
                     };
                     match client.publish(&publish) {
-                    Ok(_) => eprintln!("[neon-ui-runtime] published eventd event: {event_name_clone}"),
-                    Err(e) => eprintln!("[neon-ui-runtime] failed to publish eventd: {e}"),
-                }
+                        Ok(_) => eprintln!(
+                            "[neon-ui-runtime] published eventd event: {event_name_clone}"
+                        ),
+                        Err(e) => eprintln!("[neon-ui-runtime] failed to publish eventd: {e}"),
+                    }
                 }
             }
         }
@@ -5678,8 +5780,7 @@ impl UiRuntime {
         let Some(fragment) = self.cached_fragment.as_ref() else {
             return Err(ERROR_INTENT_NOT_BOUND);
         };
-        if fragment.revision != event.fragment.revision
-        {
+        if fragment.revision != event.fragment.revision {
             return Err(ERROR_FRAGMENT_REVISION_STALE);
         }
         let data_grid_cell = event
@@ -5697,8 +5798,7 @@ impl UiRuntime {
         }));
         if let Some(frag) = &self.cached_fragment {
             for effect in &frag.effects {
-                if let UiEffect::SemanticIntent { intent } = effect {
-                }
+                if let UiEffect::SemanticIntent { intent } = effect {}
             }
         }
         if !(bound || declared_drop || data_grid_cell.is_some()) {
@@ -7844,7 +7944,7 @@ mod tests {
                     offset: 0,
                     representation,
                 },
-            derived_expression: None,
+                derived_expression: None,
             }],
             grid_slots: Vec::new(),
             flow_name: String::new(),
@@ -7931,7 +8031,7 @@ mod tests {
                     offset: 0,
                     representation,
                 },
-            derived_expression: None,
+                derived_expression: None,
             }],
             grid_slots: Vec::new(),
             flow_name: String::new(),

@@ -9,7 +9,10 @@ fn main() {
             format!("NEON_CONTINUOUS_RENDER={:?}\nargs={:?}\n", env_val, args),
         );
     }
-    eprintln!("[neon-wgpu] startup: NEON_CONTINUOUS_RENDER={:?}, args={:?}", env_val, args);
+    eprintln!(
+        "[neon-wgpu] startup: NEON_CONTINUOUS_RENDER={:?}, args={:?}",
+        env_val, args
+    );
     if args
         .get(1)
         .is_some_and(|argument| argument == "--headless-server")

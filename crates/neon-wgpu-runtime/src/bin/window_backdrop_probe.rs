@@ -70,7 +70,10 @@ fn main() -> io::Result<()> {
             Err(error) if started.elapsed() < TIMEOUT => {
                 thread::sleep(Duration::from_millis(100));
                 if service.try_wait()?.is_some() {
-                    println!("{}", json!({"probe":"window-backdrop","stage":"error","error":error,"pass":false}));
+                    println!(
+                        "{}",
+                        json!({"probe":"window-backdrop","stage":"error","error":error,"pass":false})
+                    );
                     return Err(io::Error::other("renderer exited before health check"));
                 }
             }
@@ -78,13 +81,20 @@ fn main() -> io::Result<()> {
         }
     };
     let snapshot = call(endpoint, "debug.window.input.snapshot", 2).map_err(io::Error::other)?;
-    let backdrop = snapshot.get("window_backdrop").cloned().unwrap_or_else(|| json!({}));
+    let backdrop = snapshot
+        .get("window_backdrop")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
     let active = backdrop.get("active").and_then(Value::as_str);
     let alpha_mode = backdrop.get("surface_alpha_mode").and_then(Value::as_str);
     let shell = snapshot.get("shell_frame").cloned().unwrap_or(Value::Null);
     let shell_status = shell.get("status").and_then(Value::as_str);
-    let producer = shell.get("producer_bounds_logical").and_then(Value::as_array);
-    let consumer = shell.get("consumer_region_physical").and_then(Value::as_array);
+    let producer = shell
+        .get("producer_bounds_logical")
+        .and_then(Value::as_array);
+    let consumer = shell
+        .get("consumer_region_physical")
+        .and_then(Value::as_array);
     let frame = shell.get("frame").and_then(Value::as_u64);
     let scale = shell.get("scale_factor").and_then(Value::as_f64);
     let geometry_pass = shell_status == Some("paired")
@@ -116,5 +126,9 @@ fn main() -> io::Result<()> {
     if service.try_wait()?.is_none() {
         let _ = service.kill();
     }
-    if pass { Ok(()) } else { Err(io::Error::other("Acrylic backdrop was not active")) }
+    if pass {
+        Ok(())
+    } else {
+        Err(io::Error::other("Acrylic backdrop was not active"))
+    }
 }

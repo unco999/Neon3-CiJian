@@ -15,13 +15,17 @@ fn main() {
 
     let test_chars = vec!['a', 'b', '+', '_', '-', '=', '0', 'A', 'g', 'p', 'y', 'j'];
 
-    println!("{:<6} {:>8} {:>8} {:>8} {:>8} {:>10} {:>10}", "char", "xmin", "ymin", "width", "height", "advance", "plane_min_y");
+    println!(
+        "{:<6} {:>8} {:>8} {:>8} {:>8} {:>10} {:>10}",
+        "char", "xmin", "ymin", "width", "height", "advance", "plane_min_y"
+    );
     println!("{}", "-".repeat(70));
 
     for ch in test_chars {
         let metrics = font.metrics(ch, size);
         let plane_min_y = -metrics.bounds.height - metrics.bounds.ymin;
-        println!("{:<6} {:>8.2} {:>8.2} {:>8.2} {:>8.2} {:>10.2} {:>10.2}",
+        println!(
+            "{:<6} {:>8.2} {:>8.2} {:>8.2} {:>8.2} {:>10.2} {:>10.2}",
             ch,
             metrics.xmin,
             metrics.bounds.ymin,

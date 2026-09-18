@@ -1,7 +1,7 @@
 //! Generator-level validation: schedule conflicts and binding limits.
 
-use crate::ir::EcsIr;
 use crate::EcsError;
+use crate::ir::EcsIr;
 use std::collections::HashMap;
 
 /// Group 0 storage bindings needed for this world: 8 fixed slots plus three

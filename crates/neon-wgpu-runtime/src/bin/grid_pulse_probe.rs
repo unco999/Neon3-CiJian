@@ -17,8 +17,8 @@ use neon_protocol::{
     ServiceName,
 };
 use neon_ui_schema::{
-    UiBounds, UiClipShape, UiCommand, UiEffect, UiFragment, UiFragmentId, UiFragmentSubmission, UiNode,
-    UiNodeId, UiNodeKind, UiStyle,
+    UiBounds, UiClipShape, UiCommand, UiEffect, UiFragment, UiFragmentId, UiFragmentSubmission,
+    UiNode, UiNodeId, UiNodeKind, UiStyle,
 };
 use serde_json::json;
 
@@ -73,7 +73,12 @@ fn panel(id: &str, x: f32, y: f32, w: f32, h: f32, color: [f32; 4], visible: boo
     UiNode {
         node_id: UiNodeId(id.into()),
         kind: UiNodeKind::Panel,
-        bounds: UiBounds { x, y, width: w, height: h },
+        bounds: UiBounds {
+            x,
+            y,
+            width: w,
+            height: h,
+        },
         layout: None,
         visible,
         enabled: true,
@@ -117,7 +122,9 @@ fn grid_fragment(seed: u32, revision: u32) -> (UiFragment, usize) {
             let i = r * COLS + c;
             let v = next();
             let visible = v > 0.5;
-            if visible { visible_count += 1; }
+            if visible {
+                visible_count += 1;
+            }
             let x = PADDING + c as f32 * (CELL + GAP);
             let y = PADDING + 32.0 + r as f32 * (CELL + GAP);
             // Color shifts with seed to test color churn
@@ -129,14 +136,27 @@ fn grid_fragment(seed: u32, revision: u32) -> (UiFragment, usize) {
                 // Normal: blue-cyan, brightness varies with seed
                 [0.2 + hue * 0.2, 0.5 + hue * 0.2, 1.0, 1.0]
             };
-            cells.push(panel(&format!("cell_{i}"), x, y, CELL, CELL, color, visible));
+            cells.push(panel(
+                &format!("cell_{i}"),
+                x,
+                y,
+                CELL,
+                CELL,
+                color,
+                visible,
+            ));
         }
     }
 
     let root = UiNode {
         node_id: UiNodeId("root".into()),
         kind: UiNodeKind::Panel,
-        bounds: UiBounds { x: 0.0, y: 0.0, width: PADDING * 2.0 + grid_w, height: PADDING * 2.0 + grid_h + 32.0 },
+        bounds: UiBounds {
+            x: 0.0,
+            y: 0.0,
+            width: PADDING * 2.0 + grid_w,
+            height: PADDING * 2.0 + grid_h + 32.0,
+        },
         layout: None,
         visible: true,
         enabled: true,
@@ -155,12 +175,15 @@ fn grid_fragment(seed: u32, revision: u32) -> (UiFragment, usize) {
         children: cells,
     };
 
-    (UiFragment {
-        fragment_id: UiFragmentId("grid-pulse".into()),
-        revision: Revision(revision as u64),
-        root,
-        effects: Vec::<UiEffect>::new(),
-    }, visible_count)
+    (
+        UiFragment {
+            fragment_id: UiFragmentId("grid-pulse".into()),
+            revision: Revision(revision as u64),
+            root,
+            effects: Vec::<UiEffect>::new(),
+        },
+        visible_count,
+    )
 }
 
 fn main() -> std::io::Result<()> {
@@ -228,14 +251,19 @@ fn main() -> std::io::Result<()> {
 
     println!("[grid-pulse] high-frequency loop complete: {UPDATE_ITERATIONS} iterations");
     println!("[grid-pulse]   failures: {failures}/{UPDATE_ITERATIONS}");
-    println!("[grid-pulse]   submit time: min={min_time_ms:.2}ms max={max_time_ms:.2}ms avg={:.2}ms", total_time_ms / UPDATE_ITERATIONS as f64);
+    println!(
+        "[grid-pulse]   submit time: min={min_time_ms:.2}ms max={max_time_ms:.2}ms avg={:.2}ms",
+        total_time_ms / UPDATE_ITERATIONS as f64
+    );
     println!("[grid-pulse]   last frame: {last_visible}/36 cells visible");
     println!("[grid-pulse] entering live update mode (Ctrl+C to exit)...");
 
     // Live update loop: keep changing the grid at ~10fps so the window stays active
     let mut live_iter = UPDATE_ITERATIONS;
     loop {
-        let seed = (live_iter as u32).wrapping_mul(2654435761).wrapping_add(12345);
+        let seed = (live_iter as u32)
+            .wrapping_mul(2654435761)
+            .wrapping_add(12345);
         let (fragment, visible_count) = grid_fragment(seed, 1 + live_iter as u32);
         let seq = 100 + live_iter as u64;
         let _ = call(
