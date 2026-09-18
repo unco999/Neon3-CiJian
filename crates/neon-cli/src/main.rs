@@ -12,6 +12,7 @@ fn main() -> ExitCode {
             neon_cli::debug_usage(),
             neon_cli::event_usage()
         );
+        println!("{}", neon_cli::rpc_usage());
         return ExitCode::SUCCESS;
     }
     if args.first().is_some_and(|command| command == "debug") {
@@ -25,7 +26,10 @@ fn main() -> ExitCode {
         return match neon_cli::execute_debug(command) {
             Ok(output) => {
                 println!("{output}");
-                if output["response"]["status"] == "accepted" {
+                if output["timeout"] == true {
+                    ExitCode::from(2)
+                } else if output["status"] == "passed" || output["response"]["status"] == "accepted"
+                {
                     ExitCode::SUCCESS
                 } else {
                     ExitCode::from(1)
@@ -52,6 +56,32 @@ fn main() -> ExitCode {
             Ok(output) => {
                 println!("{output}");
                 ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({"status": "failed", "error": {"code": "transport_failed", "message": error.to_string()}})
+                );
+                ExitCode::from(1)
+            }
+        };
+    }
+    if args.first().is_some_and(|command| command == "rpc") {
+        let command = match neon_cli::RpcCommand::parse(&args) {
+            Ok(command) => command,
+            Err(error) => {
+                eprintln!("{error}");
+                return ExitCode::from(2);
+            }
+        };
+        return match neon_cli::execute_rpc(command) {
+            Ok(output) => {
+                println!("{output}");
+                if output["response"]["status"] == "accepted" {
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::from(1)
+                }
             }
             Err(error) => {
                 eprintln!(
@@ -96,6 +126,8 @@ fn main() -> ExitCode {
             "--quiet",
             "-p",
             "neon-wgpu-runtime",
+            "--bin",
+            "neon-wgpu-runtime",
             "--",
             "--headless-server",
             &endpoint.to_string(),
@@ -105,7 +137,9 @@ fn main() -> ExitCode {
         .spawn()
         .expect("must start headless WGPU runtime");
 
-    let deadline = Instant::now() + Duration::from_secs(10);
+    // The first invocation may compile the WGPU runtime. Keep the bound
+    // explicit while allowing a cold workspace to become ready.
+    let deadline = Instant::now() + Duration::from_secs(60);
     let outcome = loop {
         match if scenario == neon_cli::DETAIL_TOGGLE_SCENARIO_ID {
             neon_cli::run_detail_toggle_scenario(endpoint)
@@ -116,6 +150,7 @@ fn main() -> ExitCode {
             Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
             Err(error) => {
                 let _ = server.kill();
+                let _ = server.wait();
                 eprintln!(
                     "{}",
                     serde_json::json!({"scenario": scenario, "status": "failed", "error": error.to_string()})
@@ -124,6 +159,10 @@ fn main() -> ExitCode {
             }
         }
     };
+    // Headless runtime serves until it receives service.shutdown. A scenario
+    // is an owned one-shot session, so terminate the child after its final
+    // response rather than waiting forever for an unrelated control request.
+    let _ = server.kill();
     let _ = server.wait();
     println!(
         "{}",

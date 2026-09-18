@@ -678,9 +678,83 @@ snapshot，不能继续提交旧 revision 的 command。
 neon dev status
 neon dev logs --service terrain-runtime --request <id>
 neon dev restart --service ui-runtime
-neon debug trace --request <id>
-neon test scenario <id>
+neon-cli debug trace query <endpoint> '{"request_id":"<id>"}'
+neon-cli scenario <id> --headless
 ```
+
+## 23.1 当前标准 Debug 流程（CLI / SDK / AI）
+
+Neon3 的外部 SDK、CLI 和 AI 必须使用公开的 `neon3.rpc` / `neon3.event` 协议观察和操作服务。
+`neon-cli` 是公开协议 client，不是业务状态 owner，也不能通过 UI 坐标、窗口控件编号或日志文本推断状态。
+
+当前推荐的确定性流程如下：
+
+```text
+1. 读取 .neon/manifest.json，获得 service endpoint / pid / epoch / capability
+2. neon-cli debug snapshot --manifest .neon/manifest.json
+3. neon-cli rpc <typed-method> --endpoint <endpoint> --params-json '{...}'
+4. 保存响应中的 request_id / revision / job_id
+5. neon-cli debug wait --ep <endpoint> --revision +1 --timeout 2s
+6. neon-cli debug snapshot <endpoint> --diff before.json
+7. neon-cli debug command get <endpoint> <request_id>
+8. neon-cli debug trace query <endpoint> '{"request_id":"<request_id>"}'
+```
+
+### 公开 CLI Debug 能力
+
+```powershell
+# 聚合所有 manifest 服务的 health、describe 和 snapshot
+neon-cli debug snapshot [--manifest <path>] [--service <name>]
+
+# 比较前后 snapshot，输出 changed_paths 与 from/to
+neon-cli debug snapshot <endpoint> --diff <before.json>
+
+# 等待 revision 条件，不得使用固定 sleep 猜测完成
+neon-cli debug wait --ep <endpoint> --revision <N|+delta> --timeout <Nms|Ns>
+
+# 查询 command receipt 和结构化 trace
+neon-cli debug command get <endpoint> <request_id>
+neon-cli debug trace query <endpoint> '{"request_id":"<request_id>"}'
+
+# 通过语义节点路径触发输入，不使用坐标猜测
+neon-cli debug input activate <endpoint> <semantic-node-path>
+
+# 未封装 method 使用公开 RPC 逃生舱
+neon-cli rpc <method> --endpoint <endpoint> [--service <service>] \
+  [--params-json '{...}'] [--idempotency-key <key>]
+```
+
+### 输出与退出码规则
+
+- 所有观察和 probe 必须输出结构化 JSON 或 JSONL，至少包含 request ID、service、epoch、sequence/revision、相关中间值和最终 `status`。
+- `debug wait` 条件满足时退出码为 `0`；有界超时退出码为 `2`；transport、协议或服务错误退出码为 `1`。
+- 聚合 snapshot 的顶层 `status` 只有所有已配置服务的 health、describe 和适配 snapshot 都成功时才是 `passed`。
+- 服务断线、epoch 变化、revision conflict、capability 缺失和 command rejection 必须保留稳定 error code，不得转成成功或静默空结果。
+
+### 必须遵守的诊断顺序
+
+跨进程、UI 或 GPU 问题必须按以下链路定位：
+
+```text
+request_id
+  -> command receipt / journal
+  -> service snapshot and revision
+  -> job status (如有)
+  -> render diagnostics / graph snapshot
+  -> frame capture (只作为补充证据)
+```
+
+不能先扩大 timeout、重复点击、读取 React/local state 或依赖截图猜测业务状态。
+
+### 明确禁止
+
+- 不得用 `sleep`、固定毫秒延迟或“等几秒”代替 `debug wait`、job status 或 revision 条件。
+- 不得把 UI element ID、鼠标坐标、React local state 或截图识别结果写入跨进程业务协议。
+- 不得让 CLI 直接读取或写入项目文件；项目写入必须走 `neon-projectd`。
+- 不得让业务 runtime 创建 GPU 资源；页面渲染状态必须通过 `neon-wgpu-runtime` 的 snapshot/diagnostics 查询。
+- 不得把 human-readable 日志作为唯一验收证据；必须保存 JSON/JSONL response、trace 和 scenario artifact。
+
+当前功能和示例以 `docs/neon-cli-debug-capabilities.md` 为准。OCR、无限 watch、长连接 trace follow、PNG golden image assertion 和完整 dev supervisor 尚未作为 SDK Debug 查询能力的前置条件。
 
 ## 24. 公共 workspace 增补
 

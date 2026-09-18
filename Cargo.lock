@@ -993,6 +993,7 @@ dependencies = [
  "neon-ipc",
  "neon-protocol",
  "neon-ui-schema",
+ "serde",
  "serde_json",
 ]
 

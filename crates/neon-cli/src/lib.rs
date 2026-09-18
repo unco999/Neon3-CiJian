@@ -1,6 +1,8 @@
 //! Public protocol client helpers. This crate must not create windows or GPU objects.
 
 use std::net::SocketAddr;
+use std::path::Path;
+use std::time::{Duration, Instant};
 
 use neon_ipc::{EventClient, RpcClient, TransportError};
 use neon_protocol::{
@@ -8,20 +10,81 @@ use neon_protocol::{
     ProtocolVersion, RequestId, Revision, RpcRequest, RpcResponse, RpcStatus, ServiceName,
 };
 use neon_ui_schema::{
-    TextRef, UiBounds, UiClipShape, UiCommand, UiEffect, UiFragment, UiFragmentId, UiFragmentRevision,
-    UiFragmentSubmission, UiIntent, UiNode, UiNodeId, UiNodeKind, UiPointerMetadata,
-    UiSemanticEvent, UiSemanticEventType, UiStyle,
+    TextRef, UiBounds, UiClipShape, UiCommand, UiEffect, UiFragment, UiFragmentId,
+    UiFragmentRevision, UiFragmentSubmission, UiIntent, UiNode, UiNodeId, UiNodeKind,
+    UiPointerMetadata, UiSemanticEvent, UiSemanticEventType, UiStyle,
 };
+use serde::Deserialize;
 use serde_json::{Value, json};
 
 pub const SCENARIO_ID: &str = "ui.static-fragment.submit.v1";
 pub const DETAIL_TOGGLE_SCENARIO_ID: &str = "ui.detail-toggle.v1";
+
+/// Resolve the public protocol target for a method when the caller does not
+/// provide an explicit service. Keep this table transport-independent so SDK
+/// wrappers can use the same routing contract as the CLI.
+pub fn default_target(method: &str) -> &'static str {
+    match method {
+        m if m.starts_with("wgpu.") => "wgpu-runtime",
+        m if m.starts_with("render.") => "wgpu-runtime",
+        m if m.starts_with("debug.window.") => "wgpu-runtime",
+        m if m.starts_with("debug.interaction.") => "wgpu-runtime",
+        m if m == "debug.snapshot.get" => "wgpu-runtime",
+        m if m.starts_with("ui.") => "ui-runtime",
+        m if m.starts_with("debug.ui.") => "ui-runtime",
+        m if m.starts_with("debug.trace.")
+            || m.starts_with("debug.command.")
+            || m.starts_with("debug.journal.")
+            || m.starts_with("debug.replay.") =>
+        {
+            "ui-runtime"
+        }
+        m if m.starts_with("event.") => "eventd",
+        m if m.starts_with("editor.") => "editor-runtime",
+        m if m.starts_with("project.")
+            || m.starts_with("asset.")
+            || m.starts_with("transaction.") =>
+        {
+            "neon-projectd"
+        }
+        m if m.starts_with("terrain.") => "neon-terrain-runtime",
+        m if m.starts_with("resource.") => "neon-resource-runtime",
+        _ => "ui-runtime",
+    }
+}
 
 /// Read-only debug RPC commands exposed by the public CLI.
 #[derive(Debug, PartialEq)]
 pub enum DebugCommand {
     Snapshot {
         endpoint: SocketAddr,
+    },
+    SnapshotAggregate {
+        manifest: String,
+        service: Option<String>,
+    },
+    SnapshotDiff {
+        endpoint: SocketAddr,
+        service: Option<String>,
+        before: String,
+    },
+    WaitRevision {
+        endpoint: SocketAddr,
+        service: Option<String>,
+        target: RevisionTarget,
+        timeout: Duration,
+    },
+    CommandGet {
+        endpoint: SocketAddr,
+        request_id: String,
+    },
+    TraceQuery {
+        endpoint: SocketAddr,
+        query: Value,
+    },
+    InputActivateTarget {
+        endpoint: SocketAddr,
+        semantic_node_path: String,
     },
     InteractionGet {
         endpoint: SocketAddr,
@@ -45,12 +108,221 @@ pub enum DebugCommand {
     },
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum RevisionTarget {
+    Absolute(u64),
+    Delta(u64),
+}
+
+/// Escape hatch for methods that do not have a dedicated CLI wrapper yet.
+#[derive(Debug, PartialEq)]
+pub struct RpcCommand {
+    pub endpoint: SocketAddr,
+    pub method: String,
+    pub service: Option<String>,
+    pub params: Value,
+    pub idempotency_key: Option<String>,
+}
+
+impl RpcCommand {
+    pub fn parse(args: &[String]) -> Result<Self, String> {
+        if args.len() < 3 || args[0] != "rpc" {
+            return Err(rpc_usage().into());
+        }
+        let method = args[1].clone();
+        let mut endpoint = None;
+        let mut service = None;
+        let mut params = json!({});
+        let mut idempotency_key = None;
+        let mut index = 2;
+        while index < args.len() {
+            let flag = args[index].as_str();
+            let value = args
+                .get(index + 1)
+                .ok_or_else(|| format!("missing value for {flag}"))?;
+            match flag {
+                "--endpoint" => endpoint = Some(parse_endpoint(value)?),
+                "--service" => service = Some(value.clone()),
+                "--params-json" => {
+                    params = serde_json::from_str(value)
+                        .map_err(|error| format!("params must be JSON: {error}"))?;
+                }
+                "--idempotency-key" => idempotency_key = Some(value.clone()),
+                _ => return Err(format!("unknown rpc option '{flag}'\n{}", rpc_usage())),
+            }
+            index += 2;
+        }
+        if !params.is_object() {
+            return Err("params must be a JSON object".into());
+        }
+        Ok(Self {
+            endpoint: endpoint.ok_or("rpc requires --endpoint <host:port>")?,
+            method,
+            service,
+            params,
+            idempotency_key,
+        })
+    }
+}
+
+pub fn rpc_usage() -> &'static str {
+    "neon-cli rpc <method> --endpoint <endpoint> [--service <service>] [--params-json '{...}'] [--idempotency-key <key>]"
+}
+
 impl DebugCommand {
     pub fn parse(args: &[String]) -> Result<Self, String> {
         match args {
+            [debug, snapshot] if debug == "debug" && snapshot == "snapshot" => {
+                Ok(Self::SnapshotAggregate {
+                    manifest: default_manifest_path(),
+                    service: None,
+                })
+            }
+            [debug, snapshot, flag, manifest]
+                if debug == "debug" && snapshot == "snapshot" && flag == "--manifest" =>
+            {
+                Ok(Self::SnapshotAggregate {
+                    manifest: manifest.clone(),
+                    service: None,
+                })
+            }
+            [debug, snapshot, endpoint, diff_flag, before]
+                if debug == "debug" && snapshot == "snapshot" && diff_flag == "--diff" =>
+            {
+                Ok(Self::SnapshotDiff {
+                    endpoint: parse_endpoint(endpoint)?,
+                    service: None,
+                    before: before.clone(),
+                })
+            }
+            [
+                debug,
+                snapshot,
+                endpoint,
+                service_flag,
+                service,
+                diff_flag,
+                before,
+            ] if debug == "debug"
+                && snapshot == "snapshot"
+                && service_flag == "--service"
+                && diff_flag == "--diff" =>
+            {
+                Ok(Self::SnapshotDiff {
+                    endpoint: parse_endpoint(endpoint)?,
+                    service: Some(service.clone()),
+                    before: before.clone(),
+                })
+            }
+            [debug, snapshot, flag, service]
+                if debug == "debug" && snapshot == "snapshot" && flag == "--service" =>
+            {
+                Ok(Self::SnapshotAggregate {
+                    manifest: default_manifest_path(),
+                    service: Some(service.clone()),
+                })
+            }
+            [
+                debug,
+                snapshot,
+                manifest_flag,
+                manifest,
+                service_flag,
+                service,
+            ] if debug == "debug"
+                && snapshot == "snapshot"
+                && ((manifest_flag == "--manifest" && service_flag == "--service")
+                    || (manifest_flag == "--service" && service_flag == "--manifest")) =>
+            {
+                let (manifest, service) = if manifest_flag == "--manifest" {
+                    (manifest.clone(), service.clone())
+                } else {
+                    (service.clone(), manifest.clone())
+                };
+                Ok(Self::SnapshotAggregate {
+                    manifest,
+                    service: Some(service),
+                })
+            }
             [debug, snapshot, endpoint] if debug == "debug" && snapshot == "snapshot" => {
                 Ok(Self::Snapshot {
                     endpoint: parse_endpoint(endpoint)?,
+                })
+            }
+            [
+                debug,
+                wait,
+                ep_flag,
+                endpoint,
+                revision_flag,
+                revision,
+                timeout_flag,
+                timeout,
+            ] if debug == "debug"
+                && wait == "wait"
+                && ep_flag == "--ep"
+                && revision_flag == "--revision"
+                && timeout_flag == "--timeout" =>
+            {
+                Ok(Self::WaitRevision {
+                    endpoint: parse_endpoint(endpoint)?,
+                    service: None,
+                    target: parse_revision_target(revision)?,
+                    timeout: parse_duration(timeout)?,
+                })
+            }
+            [
+                debug,
+                wait,
+                ep_flag,
+                endpoint,
+                service_flag,
+                service,
+                revision_flag,
+                revision,
+                timeout_flag,
+                timeout,
+            ] if debug == "debug"
+                && wait == "wait"
+                && ep_flag == "--ep"
+                && service_flag == "--service"
+                && revision_flag == "--revision"
+                && timeout_flag == "--timeout" =>
+            {
+                Ok(Self::WaitRevision {
+                    endpoint: parse_endpoint(endpoint)?,
+                    service: Some(service.clone()),
+                    target: parse_revision_target(revision)?,
+                    timeout: parse_duration(timeout)?,
+                })
+            }
+            [debug, command, get, endpoint, request_id]
+                if debug == "debug" && command == "command" && get == "get" =>
+            {
+                Ok(Self::CommandGet {
+                    endpoint: parse_endpoint(endpoint)?,
+                    request_id: request_id.clone(),
+                })
+            }
+            [debug, trace, query, endpoint, query_json]
+                if debug == "debug" && trace == "trace" && query == "query" =>
+            {
+                let query: Value = serde_json::from_str(query_json)
+                    .map_err(|error| format!("trace query must be JSON: {error}"))?;
+                if !query.is_object() {
+                    return Err("trace query must be a JSON object".into());
+                }
+                Ok(Self::TraceQuery {
+                    endpoint: parse_endpoint(endpoint)?,
+                    query,
+                })
+            }
+            [debug, input, activate, endpoint, node_path]
+                if debug == "debug" && input == "input" && activate == "activate" =>
+            {
+                Ok(Self::InputActivateTarget {
+                    endpoint: parse_endpoint(endpoint)?,
+                    semantic_node_path: node_path.clone(),
                 })
             }
             [debug, interaction, get, endpoint, interaction_id]
@@ -126,6 +398,13 @@ impl DebugCommand {
             | Self::RenderCapture { endpoint, .. }
             | Self::WorldUiCapture { endpoint, .. }
             | Self::WorldUiCamera { endpoint } => *endpoint,
+            Self::SnapshotAggregate { .. } => {
+                panic!("aggregate snapshot does not have one endpoint")
+            }
+            Self::SnapshotDiff { endpoint, .. } | Self::WaitRevision { endpoint, .. } => *endpoint,
+            Self::CommandGet { endpoint, .. }
+            | Self::TraceQuery { endpoint, .. }
+            | Self::InputActivateTarget { endpoint, .. } => *endpoint,
         }
     }
 
@@ -146,12 +425,32 @@ impl DebugCommand {
                 json!({"path": path, "width": size[0], "height": size[1]}),
             ),
             Self::WorldUiCamera { .. } => ("wgpu.world_ui.lab.camera.snapshot", json!({})),
+            Self::SnapshotAggregate { .. } => {
+                panic!("aggregate snapshot is executed without a single RPC method")
+            }
+            Self::SnapshotDiff { .. } | Self::WaitRevision { .. } => {
+                panic!("composite debug command has no single RPC method")
+            }
+            Self::CommandGet { request_id, .. } => {
+                ("debug.command.get", json!({"request_id": request_id}))
+            }
+            Self::TraceQuery { query, .. } => ("debug.trace.query", query.clone()),
+            Self::InputActivateTarget {
+                semantic_node_path, ..
+            } => (
+                "debug.window.input.activate_target",
+                json!({"semantic_node_path": semantic_node_path}),
+            ),
         }
     }
 }
 
+fn default_manifest_path() -> String {
+    ".neon/manifest.json".into()
+}
+
 pub fn debug_usage() -> &'static str {
-    "neon-cli debug snapshot <endpoint>\nneon-cli debug interaction get <endpoint> <interaction-id>\nneon-cli debug interaction query <endpoint> [<query-json>]\nneon-cli debug render capture <endpoint> <output.png>\nneon-cli debug world-ui capture <endpoint> <output.png> [width height]\nneon-cli debug world-ui camera <endpoint>"
+    "neon-cli debug snapshot [--manifest <path>] [--service <name>]\nneon-cli debug snapshot <endpoint> [--diff <before.json>]\nneon-cli debug wait --ep <endpoint> --revision <N|+delta> --timeout <Nms|Ns>\nneon-cli debug command get <endpoint> <request-id>\nneon-cli debug trace query <endpoint> <query-json>\nneon-cli debug input activate <endpoint> <semantic-node-path>\nneon-cli debug interaction get <endpoint> <interaction-id>\nneon-cli debug interaction query <endpoint> [<query-json>]\nneon-cli debug render capture <endpoint> <output.png>\nneon-cli debug world-ui capture <endpoint> <output.png> [width height]\nneon-cli debug world-ui camera <endpoint>"
 }
 
 /// Event module commands for the dedicated `neon3.event` protocol.
@@ -316,13 +615,332 @@ fn parse_capture_dimension(value: &str) -> Result<u32, String> {
         .map_err(|_| format!("capture dimension must be an integer: {value}"))
 }
 
+fn parse_revision_target(value: &str) -> Result<RevisionTarget, String> {
+    if let Some(delta) = value.strip_prefix('+') {
+        return delta
+            .parse::<u64>()
+            .map(RevisionTarget::Delta)
+            .map_err(|_| format!("revision delta must be an integer: {value}"));
+    }
+    value
+        .parse::<u64>()
+        .map(RevisionTarget::Absolute)
+        .map_err(|_| format!("revision must be an integer or +delta: {value}"))
+}
+
+fn parse_duration(value: &str) -> Result<Duration, String> {
+    let (number, multiplier) = if let Some(value) = value.strip_suffix("ms") {
+        (value, 1)
+    } else if let Some(value) = value.strip_suffix('s') {
+        (value, 1_000)
+    } else {
+        return Err(format!("duration must use ms or s suffix: {value}"));
+    };
+    let millis = number
+        .parse::<u64>()
+        .map_err(|_| format!("duration must be an integer: {value}"))?
+        .saturating_mul(multiplier);
+    Ok(Duration::from_millis(millis))
+}
+
 pub fn execute_debug(command: DebugCommand) -> Result<Value, TransportError> {
+    match command {
+        DebugCommand::SnapshotAggregate { manifest, service } => {
+            return execute_snapshot_aggregate(&manifest, service.as_deref());
+        }
+        DebugCommand::SnapshotDiff {
+            endpoint,
+            service,
+            before,
+        } => {
+            return execute_snapshot_diff(endpoint, service.as_deref(), &before);
+        }
+        DebugCommand::WaitRevision {
+            endpoint,
+            service,
+            target,
+            timeout,
+        } => {
+            return execute_wait_revision(endpoint, service.as_deref(), target, timeout);
+        }
+        _ => {}
+    }
     let endpoint = command.endpoint();
     let (method, params) = command.method_and_params();
-    let response = debug_call(endpoint, method, params)?;
+    let target = default_target(method);
+    let response = call_rpc(endpoint, method, params, target, None)?;
     Ok(json!({
         "endpoint": endpoint.to_string(),
         "method": method,
+        "target": target,
+        "response": response,
+    }))
+}
+
+fn request_target<'a>(service: Option<&'a str>, method: &'a str) -> &'a str {
+    service.unwrap_or_else(|| default_target(method))
+}
+
+fn snapshot_for(
+    endpoint: SocketAddr,
+    service: Option<&str>,
+) -> Result<RpcResponse, TransportError> {
+    call_rpc(
+        endpoint,
+        "debug.snapshot.get",
+        json!({}),
+        request_target(service, "debug.snapshot.get"),
+        None,
+    )
+}
+
+pub fn execute_snapshot_diff(
+    endpoint: SocketAddr,
+    service: Option<&str>,
+    before_path: &str,
+) -> Result<Value, TransportError> {
+    let before: Value = serde_json::from_str(
+        &std::fs::read_to_string(Path::new(before_path)).map_err(TransportError::Io)?,
+    )?;
+    let response = snapshot_for(endpoint, service)?;
+    let after = response.result.clone().unwrap_or(Value::Null);
+    let mut changes = Vec::new();
+    diff_values(&before, &after, "$", &mut changes);
+    Ok(json!({
+        "status": if response.status == RpcStatus::Accepted { "passed" } else { "failed" },
+        "endpoint": endpoint.to_string(),
+        "request_id": response.request_id,
+        "diff": {
+            "changed_paths": changes.iter().map(|change| change["path"].clone()).collect::<Vec<_>>(),
+            "changes": changes,
+        },
+        "snapshot": after,
+        "error": response.error,
+    }))
+}
+
+fn diff_values(before: &Value, after: &Value, path: &str, changes: &mut Vec<Value>) {
+    match (before, after) {
+        (Value::Object(before), Value::Object(after)) => {
+            let keys = before
+                .keys()
+                .chain(after.keys())
+                .collect::<std::collections::BTreeSet<_>>();
+            for key in keys {
+                let child = format!("{path}.{key}");
+                match (before.get(key), after.get(key)) {
+                    (Some(before), Some(after)) => diff_values(before, after, &child, changes),
+                    (Some(before), None) => {
+                        changes.push(json!({"path": child, "from": before, "to": Value::Null}))
+                    }
+                    (None, Some(after)) => {
+                        changes.push(json!({"path": child, "from": Value::Null, "to": after}))
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        }
+        (Value::Array(before), Value::Array(after)) if before == after => {}
+        _ if before != after => changes.push(json!({"path": path, "from": before, "to": after})),
+        _ => {}
+    }
+}
+
+pub fn execute_wait_revision(
+    endpoint: SocketAddr,
+    service: Option<&str>,
+    target: RevisionTarget,
+    timeout: Duration,
+) -> Result<Value, TransportError> {
+    let started = Instant::now();
+    let initial = snapshot_for(endpoint, service)?;
+    let initial_revision = initial.revision.map(|revision| revision.0).unwrap_or(0);
+    let wanted = match target {
+        RevisionTarget::Absolute(revision) => revision,
+        RevisionTarget::Delta(delta) => initial_revision.saturating_add(delta),
+    };
+    let mut last = initial;
+    loop {
+        let current = last.revision.map(|revision| revision.0).unwrap_or(0);
+        if current >= wanted {
+            return Ok(json!({
+                "wait": "revision",
+                "condition": format!("revision >= {wanted}"),
+                "matched": true,
+                "timeout": false,
+                "elapsed_ms": started.elapsed().as_millis(),
+                "matched_revision": current,
+                "final_snapshot": last.result,
+            }));
+        }
+        if started.elapsed() >= timeout {
+            return Ok(json!({
+                "wait": "revision",
+                "condition": format!("revision >= {wanted}"),
+                "matched": false,
+                "timeout": true,
+                "elapsed_ms": started.elapsed().as_millis(),
+                "last_revision": current,
+            }));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+        last = snapshot_for(endpoint, service)?;
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct ServiceManifestEntry {
+    pub endpoint: SocketAddr,
+    #[serde(default)]
+    pub pid: Option<u32>,
+    #[serde(default)]
+    pub epoch: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct ServiceManifest {
+    #[serde(default)]
+    pub services: std::collections::BTreeMap<String, ServiceManifestEntry>,
+    #[serde(default)]
+    pub eventd_endpoint: Option<SocketAddr>,
+    #[serde(default)]
+    pub ui_endpoint: Option<SocketAddr>,
+    #[serde(default)]
+    pub wgpu_endpoint: Option<SocketAddr>,
+    #[serde(default)]
+    pub editor_endpoint: Option<SocketAddr>,
+    #[serde(default)]
+    pub projectd_endpoint: Option<SocketAddr>,
+}
+
+impl ServiceManifest {
+    pub fn entries(&self) -> Vec<(String, ServiceManifestEntry)> {
+        if !self.services.is_empty() {
+            return self
+                .services
+                .iter()
+                .map(|(name, entry)| (name.clone(), entry.clone()))
+                .collect();
+        }
+        [
+            ("eventd", self.eventd_endpoint),
+            ("ui-runtime", self.ui_endpoint),
+            ("wgpu-runtime", self.wgpu_endpoint),
+            ("editor-runtime", self.editor_endpoint),
+            ("neon-projectd", self.projectd_endpoint),
+        ]
+        .into_iter()
+        .filter_map(|(name, endpoint)| {
+            endpoint.map(|endpoint| {
+                (
+                    name.into(),
+                    ServiceManifestEntry {
+                        endpoint,
+                        pid: None,
+                        epoch: None,
+                    },
+                )
+            })
+        })
+        .collect()
+    }
+}
+
+fn snapshot_method(service: &str) -> Option<&'static str> {
+    match service {
+        "wgpu-runtime" => Some("debug.snapshot.get"),
+        "ui-runtime" => Some("debug.snapshot.get"),
+        "eventd" => Some("event.snapshot"),
+        "editor-runtime" => Some("editor.document.snapshot.get"),
+        "neon-projectd" => Some("project.summary"),
+        _ => None,
+    }
+}
+
+pub fn execute_snapshot_aggregate(
+    manifest_path: &str,
+    requested_service: Option<&str>,
+) -> Result<Value, TransportError> {
+    let source = std::fs::read_to_string(Path::new(manifest_path)).map_err(TransportError::Io)?;
+    let manifest: ServiceManifest = serde_json::from_str(&source)?;
+    let entries = manifest
+        .entries()
+        .into_iter()
+        .filter(|(name, _)| requested_service.is_none_or(|requested| requested == name));
+    let mut services = serde_json::Map::new();
+    for (name, entry) in entries {
+        let mut record = json!({
+            "endpoint": entry.endpoint.to_string(),
+            "pid": entry.pid,
+            "manifest_epoch": entry.epoch,
+        });
+        let health = call_rpc(entry.endpoint, "service.health", json!({}), &name, None);
+        let describe = call_rpc(entry.endpoint, "service.describe", json!({}), &name, None);
+        let snapshot = snapshot_method(&name).map(|method| {
+            // The manifest endpoint is an explicit service selection. This
+            // matters for methods such as debug.snapshot.get that have more
+            // than one service implementation.
+            call_rpc(entry.endpoint, method, json!({}), &name, None)
+        });
+        record["health"] = rpc_result_json(health);
+        record["describe"] = rpc_result_json(describe);
+        record["snapshot_method"] =
+            snapshot_method(&name).map_or(Value::Null, |method| json!(method));
+        record["snapshot"] = snapshot.map_or(Value::Null, rpc_result_json);
+        services.insert(name, record);
+    }
+    let status = if services.is_empty()
+        || services.values().any(|service| {
+            service["health"]["status"] != "accepted"
+                || service["describe"]["status"] != "accepted"
+                || (service["snapshot_method"] != Value::Null
+                    && service["snapshot"]["status"] != "accepted")
+        }) {
+        "failed"
+    } else {
+        "passed"
+    };
+    Ok(json!({
+        "manifest": manifest_path,
+        "status": status,
+        "services": services,
+    }))
+}
+
+fn rpc_result_json(result: Result<RpcResponse, TransportError>) -> Value {
+    match result {
+        Ok(response) => json!({
+            "status": response.status,
+            "request_id": response.request_id,
+            "revision": response.revision,
+            "result": response.result,
+            "snapshot": response.snapshot,
+            "error": response.error,
+        }),
+        Err(error) => json!({
+            "status": "transport_failed",
+            "error": {"code": "transport_failed", "message": error.to_string()},
+        }),
+    }
+}
+
+pub fn execute_rpc(command: RpcCommand) -> Result<Value, TransportError> {
+    let target = command
+        .service
+        .as_deref()
+        .unwrap_or_else(|| default_target(&command.method));
+    let response = call_rpc(
+        command.endpoint,
+        &command.method,
+        command.params.clone(),
+        target,
+        command.idempotency_key.as_deref(),
+    )?;
+    Ok(json!({
+        "endpoint": command.endpoint.to_string(),
+        "method": command.method,
+        "target": target,
+        "params": command.params,
         "response": response,
     }))
 }
@@ -333,10 +951,12 @@ fn parse_endpoint(value: &str) -> Result<SocketAddr, String> {
         .map_err(|error| format!("invalid endpoint '{value}': {error}"))
 }
 
-fn debug_call(
+fn call_rpc(
     endpoint: SocketAddr,
     method: &str,
     params: Value,
+    target: &str,
+    idempotency_key: Option<&str>,
 ) -> Result<RpcResponse, TransportError> {
     let request = RpcRequest {
         protocol: "neon3.rpc".into(),
@@ -348,11 +968,11 @@ fn debug_call(
             pid: std::process::id(),
             origin: "neon-cli".into(),
         },
-        target: ServiceName("wgpu-runtime".into()),
+        target: ServiceName(target.into()),
         method: method.into(),
         params,
         expected_revision: None,
-        idempotency_key: None,
+        idempotency_key: idempotency_key.map(str::to_owned),
     };
     let mut client = RpcClient::connect(endpoint)?;
     client.call(&request)
@@ -756,6 +1376,7 @@ fn call(
     params: Value,
     idempotency_key: Option<&str>,
 ) -> Result<RpcResponse, TransportError> {
+    let target = default_target(method);
     let request = RpcRequest {
         protocol: "neon3.rpc".into(),
         version: ProtocolVersion { major: 1, minor: 0 },
@@ -766,7 +1387,7 @@ fn call(
             pid: std::process::id(),
             origin: "neon-cli".into(),
         },
-        target: ServiceName("wgpu-runtime".into()),
+        target: ServiceName(target.into()),
         method: method.into(),
         params,
         expected_revision: None,
@@ -779,7 +1400,7 @@ fn call(
 fn record_step(steps: &mut Vec<Value>, method: &str, response: &RpcResponse) {
     steps.push(json!({
         "method": method,
-        "target": "wgpu-runtime",
+        "target": default_target(method),
         "status": response.status,
         "request_id": response.request_id,
         "revision": response.revision,
@@ -1133,5 +1754,118 @@ mod tests {
         assert_eq!(output["method"], "debug.interaction.get");
         assert_eq!(output["response"]["status"], "accepted");
         thread.join().unwrap();
+    }
+
+    #[test]
+    fn default_target_routes_public_method_families() {
+        assert_eq!(default_target("ui.flow.compile"), "ui-runtime");
+        assert_eq!(default_target("debug.snapshot.get"), "wgpu-runtime");
+        assert_eq!(default_target("debug.trace.query"), "ui-runtime");
+        assert_eq!(default_target("render.surface.open"), "wgpu-runtime");
+        assert_eq!(default_target("event.snapshot"), "eventd");
+        assert_eq!(default_target("editor.document.open"), "editor-runtime");
+        assert_eq!(
+            default_target("terrain.preview.begin"),
+            "neon-terrain-runtime"
+        );
+        assert_eq!(
+            default_target("resource.pick.open"),
+            "neon-resource-runtime"
+        );
+    }
+
+    #[test]
+    fn rpc_command_accepts_explicit_service_and_json_options() {
+        let command = RpcCommand::parse(&[
+            "rpc".into(),
+            "ui.flow.compile".into(),
+            "--endpoint".into(),
+            "127.0.0.1:4010".into(),
+            "--service".into(),
+            "ui-runtime".into(),
+            "--params-json".into(),
+            r#"{"source":"version 1"}"#.into(),
+            "--idempotency-key".into(),
+            "compile-1".into(),
+        ])
+        .unwrap();
+        assert_eq!(command.service.as_deref(), Some("ui-runtime"));
+        assert_eq!(command.params["source"], "version 1");
+        assert_eq!(command.idempotency_key.as_deref(), Some("compile-1"));
+    }
+
+    #[test]
+    fn manifest_accepts_legacy_endpoint_fields() {
+        let manifest: ServiceManifest = serde_json::from_value(json!({
+            "ui_endpoint": "127.0.0.1:39102",
+            "wgpu_endpoint": "127.0.0.1:39103"
+        }))
+        .unwrap();
+        let entries = manifest.entries();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].0, "ui-runtime");
+        assert_eq!(entries[1].0, "wgpu-runtime");
+    }
+
+    #[test]
+    fn debug_commands_parse_wait_and_diff_forms() {
+        assert_eq!(
+            DebugCommand::parse(&[
+                "debug".into(),
+                "wait".into(),
+                "--ep".into(),
+                "127.0.0.1:39103".into(),
+                "--revision".into(),
+                "+1".into(),
+                "--timeout".into(),
+                "2s".into(),
+            ]),
+            Ok(DebugCommand::WaitRevision {
+                endpoint: "127.0.0.1:39103".parse().unwrap(),
+                service: None,
+                target: RevisionTarget::Delta(1),
+                timeout: Duration::from_secs(2),
+            })
+        );
+        assert_eq!(
+            DebugCommand::parse(&[
+                "debug".into(),
+                "snapshot".into(),
+                "127.0.0.1:39103".into(),
+                "--diff".into(),
+                "before.json".into(),
+            ]),
+            Ok(DebugCommand::SnapshotDiff {
+                endpoint: "127.0.0.1:39103".parse().unwrap(),
+                service: None,
+                before: "before.json".into(),
+            })
+        );
+        assert_eq!(
+            DebugCommand::parse(&[
+                "debug".into(),
+                "command".into(),
+                "get".into(),
+                "127.0.0.1:39103".into(),
+                "request-1".into(),
+            ]),
+            Ok(DebugCommand::CommandGet {
+                endpoint: "127.0.0.1:39103".parse().unwrap(),
+                request_id: "request-1".into(),
+            })
+        );
+        assert_eq!(
+            DebugCommand::parse(&[
+                "debug".into(),
+                "input".into(),
+                "activate".into(),
+                "127.0.0.1:39103".into(),
+                "root/save".into(),
+            ]),
+            Ok(DebugCommand::InputActivateTarget {
+                endpoint: "127.0.0.1:39103".parse().unwrap(),
+                semantic_node_path: "root/save".into(),
+            })
+        );
     }
 }
