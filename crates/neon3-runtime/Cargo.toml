@@ -19,3 +19,4 @@ neon-editor-runtime = { path = "../neon-editor-runtime" }
 neon-editor = { path = "../neon-editor" }
 neon-languages = { path = "../neon-languages" }
 neon-ipc = { path = "../neon-ipc" }
+serde_json = "1.0"

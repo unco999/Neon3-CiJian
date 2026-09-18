@@ -486,6 +486,7 @@ impl EditorComponent {
                 *gutter_width,
                 now,
             ),
+            UiEditorInputEvent::Reveal { .. } => Vec::new(),
         }
     }
 
@@ -1047,6 +1048,33 @@ impl EditorComponent {
         self.scroll_y = self.scroll_y.clamp(0.0, max_y);
     }
 
+    /// Apply a host-directed reveal using the editor's own caret, selection,
+    /// and scroll calculations. This is the consumer-side state used by Agent
+    /// visual operation acknowledgements.
+    pub fn reveal(
+        &mut self,
+        line: u32,
+        column: u32,
+        end_line: Option<u32>,
+        end_column: Option<u32>,
+        viewport_height: f32,
+        viewport_width: f32,
+        row_height: f32,
+        gutter_width: f32,
+    ) {
+        self.caret = self.core.buffer().clamp_position(Position::new(line, column));
+        self.selection_anchor = end_line.zip(end_column).map(|(line, column)| {
+            self.core.buffer().clamp_position(Position::new(line, column))
+        });
+        self.focus = true;
+        self.scroll_caret_into_view(
+            viewport_height,
+            viewport_width,
+            row_height,
+            gutter_width,
+        );
+    }
+
     // ------------------------------------------------------- presentation
 
     /// Projects the current editing state into the renderer presentation.
@@ -1185,13 +1213,40 @@ impl EditorComponentRegistry {
             | UiEditorInputEvent::Scroll { path, .. }
             | UiEditorInputEvent::Zoom { path, .. }
             | UiEditorInputEvent::ImePreedit { path, .. }
-            | UiEditorInputEvent::ImeCommit { path, .. } => path.clone(),
+            | UiEditorInputEvent::ImeCommit { path, .. }
+            | UiEditorInputEvent::Reveal { path, .. } => path.clone(),
             UiEditorInputEvent::PointerRelease => return Vec::new(),
         };
         let Some(state) = self.editors.get_mut(&path) else {
             return Vec::new();
         };
         state.handle_input(event, now)
+    }
+
+    pub fn reveal(
+        &mut self,
+        path: &str,
+        line: u32,
+        column: u32,
+        end_line: Option<u32>,
+        end_column: Option<u32>,
+        viewport_height: f32,
+        viewport_width: f32,
+        row_height: f32,
+        gutter_width: f32,
+    ) -> bool {
+        let Some(state) = self.editors.get_mut(path) else { return false };
+        state.reveal(
+            line,
+            column,
+            end_line,
+            end_column,
+            viewport_height,
+            viewport_width,
+            row_height,
+            gutter_width,
+        );
+        true
     }
 
     pub fn focused(&self) -> Option<&str> {
@@ -1328,6 +1383,40 @@ impl EditorBridge {
         *self.presentations.lock().expect("editor bridge presentations lock") =
             registry.to_presentations(now);
         commits
+    }
+
+    /// Host-directed editor reveal. The returned presentation is the
+    /// consumer-side acknowledgement for a visual operation.
+    pub fn reveal(
+        &self,
+        path: &str,
+        line: u32,
+        column: u32,
+        end_line: Option<u32>,
+        end_column: Option<u32>,
+        viewport_height: f32,
+        viewport_width: f32,
+        row_height: f32,
+        gutter_width: f32,
+        now: f32,
+    ) -> Option<UiCodeEditorPresentation> {
+        let mut registry = self.registry.lock().expect("editor bridge registry lock");
+        if !registry.reveal(
+            path,
+            line,
+            column,
+            end_line,
+            end_column,
+            viewport_height,
+            viewport_width,
+            row_height,
+            gutter_width,
+        ) {
+            return None;
+        }
+        let presentations = registry.to_presentations(now);
+        *self.presentations.lock().expect("editor bridge presentations lock") = presentations.clone();
+        presentations.into_iter().find(|presentation| presentation.node_key == path)
     }
 }
 
@@ -1477,6 +1566,22 @@ mod tests {
             "row 5 should be Comment, got {:?}",
             classes(&pres.token_rows[5])
         );
+    }
+
+    #[test]
+    fn host_reveal_updates_caret_selection_and_scroll() {
+        register_providers();
+        let mut comp = EditorComponent::new(
+            ts_declaration(),
+            &(0..300).map(|line| format!("const value_{line} = {line};\n")).collect::<String>(),
+        );
+        comp.reveal(220, 4, Some(222), Some(10), 200.0, 868.0, 20.0, 56.0);
+        let presentation = comp.to_presentation(1.0);
+        assert_eq!(presentation.caret_line, 220);
+        assert_eq!(presentation.caret_column, 4);
+        assert_eq!(presentation.selection_anchor_line, Some(222));
+        assert_eq!(presentation.selection_anchor_column, Some(10));
+        assert!(presentation.scroll_y > 0.0);
     }
 
     fn named_key(path: &str, name: &str, shift: bool) -> UiEditorInputEvent {

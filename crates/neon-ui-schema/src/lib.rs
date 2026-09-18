@@ -4077,6 +4077,22 @@ pub enum UiEditorInputEvent {
         row_height: f32,
         gutter_width: f32,
     },
+    /// Host-directed reveal used by Agent visual operations. The editor owns
+    /// caret, selection, and scroll-into-view state; the renderer remains a
+    /// presentation sink.
+    Reveal {
+        path: String,
+        line: u32,
+        column: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        end_line: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        end_column: Option<u32>,
+        viewport_height: f32,
+        viewport_width: f32,
+        row_height: f32,
+        gutter_width: f32,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

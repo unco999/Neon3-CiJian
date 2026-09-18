@@ -4223,7 +4223,14 @@ impl UiRuntime {
                 let action = &event.intent;
                 let event_name = format!("ui.click.{action}");
                 let event_name_clone = event_name.clone();
-                let payload = json!({"intent": action, "params": event.payload, "event_id": event.event_id, "node_path": event.source_node_key });
+                let payload = json!({
+                    "intent": action,
+                    "params": event.payload,
+                    "event_id": event.event_id,
+                    "node_path": event.source_node_key,
+                    "committed_text": event.committed_text,
+                    "control_value": event.requested_value,
+                });
                 if let Ok(mut client) = neon_ipc::EventClient::connect(eventd) {
                     let publish = neon_protocol::EventPublish {
                         protocol: "neon3.event".into(),

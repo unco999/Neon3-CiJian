@@ -271,6 +271,7 @@ fn main() {
     };
     let handle = neon_wgpu_runtime::EditorBridgeHandle {
         input_sink: Some(input_sink),
+        reveal_sink: None,
         external_presentations: Some(editor_bridge.presentations.clone()),
         fragment_observer: Some(fragment_observer),
     };

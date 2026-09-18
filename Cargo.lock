@@ -1191,6 +1191,7 @@ dependencies = [
  "neon-ui-runtime",
  "neon-ui-schema",
  "neon-wgpu-runtime",
+ "serde_json",
 ]
 
 [[package]]

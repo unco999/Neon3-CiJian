@@ -1885,6 +1885,16 @@ fn resolve_shell_cut(size: [f32; 2], declared: [f32; 4]) -> [f32; 4] {
     cut
 }
 
+fn normalized_splitter_value(
+    container_start: f32,
+    container_size: f32,
+    splitter_size: f32,
+    splitter_pos: f32,
+) -> f32 {
+    let usable = (container_size - splitter_size).max(1.0);
+    ((splitter_pos - container_start) / usable).clamp(0.0, 1.0)
+}
+
 /// Active splitter drag state. Records the left/right panel indices and
 /// the current drag ratio so sampling can resize panels in real time.
 struct SplitterDrag {
@@ -2042,6 +2052,18 @@ pub struct UiWgpuRenderer {
     context_menu_bindings: HashMap<String, String>,
     /// The currently visible context menu ID (only one shown at a time).
     active_context_menu_id: Option<String>,
+    /// The currently visible declarative Popup owned by a MenuBar or another
+    /// popup trigger. Hidden Popup nodes are retained in the plan so opening
+    /// and dismissing a menu stays renderer-local and does not require a
+    /// fragment replacement.
+    active_popup_id: Option<String>,
+    /// Monotonic local topology revision for Popup/Accordion visibility.
+    interaction_plan_revision: u64,
+    applied_interaction_plan_revision: u64,
+    /// Renderer-local expansion state for Accordion sections. The key is the
+    /// stable header node path; the domain may still overwrite the final
+    /// subtree through a new fragment publication.
+    accordion_expanded: HashMap<String, bool>,
     /// Active splitter drag state, if any.
     splitter_drag: Option<SplitterDrag>,
     /// Persistent splitter positions (x coordinate) keyed by splitter node path.
@@ -3277,6 +3299,10 @@ impl UiWgpuRenderer {
             context_menu_anchor: None,
             context_menu_bindings: HashMap::new(),
             active_context_menu_id: None,
+            active_popup_id: None,
+            interaction_plan_revision: 0,
+            applied_interaction_plan_revision: 0,
+            accordion_expanded: HashMap::new(),
             splitter_drag: None,
             splitter_positions: HashMap::new(),
             builtin_numerics: HashMap::new(),
@@ -4618,8 +4644,12 @@ impl UiWgpuRenderer {
         let visual = self.visual_at(index);
         if !matches!(
             visual.kind,
-            UiNodeKind::Checkbox | UiNodeKind::RadioButton | UiNodeKind::Selectable
-        ) {
+            UiNodeKind::Checkbox
+                | UiNodeKind::RadioButton
+                | UiNodeKind::Selectable
+                | UiNodeKind::Switch
+        ) && !self.is_treeview_child(node_path)
+        {
             return None;
         }
         let selected = self
@@ -4632,7 +4662,13 @@ impl UiWgpuRenderer {
             .or_else(|| match &visual.presentation {
                 Some(UiControlPresentation::Toggle { selected }) => Some(*selected),
                 _ => None,
-            })?;
+            })
+            .or_else(|| self.is_treeview_child(node_path).then(|| {
+                self.builtin_toggles
+                    .get(node_path)
+                    .copied()
+                    .unwrap_or(true)
+            }))?;
         let new_selected = !selected;
         let value = UiSemanticPayloadValue::Bool {
             value: new_selected,
@@ -4660,14 +4696,150 @@ impl UiWgpuRenderer {
         self.pointer_visual_dirty = true;
     }
 
-    /// Toggle TreeView node expand/collapse state.
-    /// Returns true if expanded, false if collapsed.
-    pub(crate) fn toggle_treeview_node(&mut self, node_path: &str) -> bool {
-        let current = self.builtin_toggles.get(node_path).copied().unwrap_or(true);
-        let new = !current;
-        self.builtin_toggles.insert(node_path.to_owned(), new);
+    /// Toggles a MenuBar-owned Popup at the pointer. Menu headers remain
+    /// ordinary semantic children, so the declared header intent is still
+    /// forwarded on release while the popup opens immediately in WGPU.
+    pub(crate) fn toggle_menu_bar_popup_at_pointer(&mut self) -> bool {
+        let Some(pointer) = self.pointer_position else {
+            return false;
+        };
+        let Some((menu_bar_id, popup_id)) = self
+            .plan
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, node)| {
+                let parent_id = node.parent_id.as_deref()?;
+                let parent = self.plan.iter().find(|candidate| candidate.id == parent_id)?;
+                if parent.target.kind != UiNodeKind::MenuBar
+                    || node.target.kind == UiNodeKind::Popup
+                    || !contains(self.visual_at(index).bounds, pointer)
+                    || !contains(self.visual_at(index).clip, pointer)
+                {
+                    return None;
+                }
+                let popup = self
+                    .plan
+                    .iter()
+                    .find(|candidate| {
+                        candidate.parent_id.as_deref() == Some(parent_id)
+                            && candidate.target.kind == UiNodeKind::Popup
+                    })
+                    .map(|candidate| candidate.id.clone())?;
+                Some((parent_id.to_owned(), popup))
+            })
+        else {
+            return false;
+        };
+        let _ = menu_bar_id;
+        if self.active_popup_id.as_deref() == Some(popup_id.as_str()) {
+            self.active_popup_id = None;
+        } else {
+            self.active_popup_id = Some(popup_id);
+        }
+        self.interaction_plan_revision = self.interaction_plan_revision.saturating_add(1);
         self.pointer_visual_dirty = true;
-        new
+        true
+    }
+
+    /// Closes an active Popup when the pointer is outside both the popup and
+    /// its owning MenuBar. Returns whether a popup was dismissed.
+    pub(crate) fn dismiss_popup_at_pointer(&mut self) -> bool {
+        let Some(active_popup) = self.active_popup_id.as_deref() else {
+            return false;
+        };
+        let Some(pointer) = self.pointer_position else {
+            return false;
+        };
+        let Some(popup_index) = self.plan.iter().position(|node| node.id == active_popup) else {
+            self.active_popup_id = None;
+            self.pointer_visual_dirty = true;
+            return true;
+        };
+        if contains(self.visual_at(popup_index).bounds, pointer) {
+            return false;
+        }
+        let owner_id = self.plan[popup_index].parent_id.as_deref();
+        let in_owner = owner_id.is_some_and(|owner_id| {
+            self.plan.iter().enumerate().any(|(index, node)| {
+                node.parent_id.as_deref() == Some(owner_id)
+                    && node.target.kind != UiNodeKind::Popup
+                    && contains(self.visual_at(index).bounds, pointer)
+            })
+        });
+        if in_owner {
+            return false;
+        }
+        self.active_popup_id = None;
+        self.interaction_plan_revision = self.interaction_plan_revision.saturating_add(1);
+        self.pointer_visual_dirty = true;
+        true
+    }
+
+    pub(crate) fn close_active_popup(&mut self) {
+        if self.active_popup_id.take().is_some() {
+            self.interaction_plan_revision = self.interaction_plan_revision.saturating_add(1);
+            self.pointer_visual_dirty = true;
+        }
+    }
+
+    pub(crate) fn active_popup_contains(&self, node_path: &str) -> bool {
+        let Some(active_popup) = self.active_popup_id.as_deref() else {
+            return false;
+        };
+        if node_path == active_popup {
+            return true;
+        }
+        let mut current = Some(node_path);
+        while let Some(id) = current {
+            if id == active_popup {
+                return true;
+            }
+            current = self
+                .plan
+                .iter()
+                .find(|node| node.id == id)
+                .and_then(|node| node.parent_id.as_deref());
+        }
+        false
+    }
+
+    /// Toggles an Accordion section whose direct child owns the pointer. A
+    /// child with a semantic binding is treated as the section header; the
+    /// next sibling content block is hidden until the next bound header.
+    pub(crate) fn toggle_accordion_at_pointer(&mut self) -> bool {
+        let Some(pointer) = self.pointer_position else {
+            return false;
+        };
+        let Some(header_id) = self
+            .plan
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, node)| {
+                let parent_id = node.parent_id.as_deref()?;
+                let parent = self.plan.iter().find(|candidate| candidate.id == parent_id)?;
+                if parent.target.kind != UiNodeKind::Accordion
+                    || !contains(self.visual_at(index).bounds, pointer)
+                    || !contains(self.visual_at(index).clip, pointer)
+                    || node.target.bounds.height > 48.0
+                {
+                    return None;
+                }
+                Some(node.id.clone())
+            })
+        else {
+            return false;
+        };
+        let expanded = !self
+            .accordion_expanded
+            .get(&header_id)
+            .copied()
+            .unwrap_or(true);
+        self.accordion_expanded.insert(header_id, expanded);
+        self.interaction_plan_revision = self.interaction_plan_revision.saturating_add(1);
+        self.pointer_visual_dirty = true;
+        true
     }
 
     /// Check if a node is a TreeView child (parent is TreeView).
@@ -4797,13 +4969,57 @@ impl UiWgpuRenderer {
         self.pointer_visual_dirty = true;
     }
 
-    /// Finish the splitter drag and persist the final position.
-    pub(crate) fn finish_splitter_drag(&mut self) {
+    /// Current normalized splitter value, bounded to the usable container
+    /// extent. This is the semantic value sent to the UI host, while the
+    /// renderer keeps the pixel position private.
+    pub(crate) fn splitter_control_value(&self) -> Option<UiSemanticPayloadValue> {
+        let drag = self.splitter_drag.as_ref()?;
+        Some(UiSemanticPayloadValue::F32 {
+            value: normalized_splitter_value(
+                drag.container_start,
+                drag.container_size,
+                drag.splitter_size,
+                drag.splitter_pos,
+            ),
+        })
+    }
+
+    /// Finish the splitter drag and persist the final position. Returns the
+    /// stable node path and normalized semantic value for the reliable host
+    /// event.
+    pub(crate) fn finish_splitter_drag(&mut self) -> Option<(String, UiSemanticPayloadValue)> {
         if let Some(drag) = self.splitter_drag.take() {
+            let value = UiSemanticPayloadValue::F32 {
+                value: normalized_splitter_value(
+                    drag.container_start,
+                    drag.container_size,
+                    drag.splitter_size,
+                    drag.splitter_pos,
+                ),
+            };
             self.splitter_positions
                 .insert(drag.splitter_path.clone(), drag.splitter_pos);
             self.pointer_visual_dirty = true;
+            return Some((drag.splitter_path, value));
         }
+        None
+    }
+
+    /// Cancel the splitter drag and restore the original bounds captured at
+    /// pointer-down. No pixel position is persisted and no semantic commit is
+    /// produced.
+    pub(crate) fn cancel_splitter_drag(&mut self) -> bool {
+        let Some(drag) = self.splitter_drag.take() else {
+            return false;
+        };
+        for (index, bounds) in drag.original_bounds {
+            if let Some(node) = self.plan.get_mut(index) {
+                node.target.bounds = bounds;
+                node.target.clip = bounds;
+            }
+        }
+        self.pointer_visual_dirty = true;
+        true
     }
 
     /// Apply active splitter drag to target bounds BEFORE sampling.
@@ -10200,6 +10416,7 @@ impl UiWgpuRenderer {
         let viewport_changed = self.plan_viewport_revision != self.viewport_revision;
         let matches = self.plan_revisions.len() == fragments.len()
             && !viewport_changed
+            && self.interaction_plan_revision == self.applied_interaction_plan_revision
             && fragments
                 .iter()
                 .all(|(id, fragment)| self.plan_revisions.get(id) == Some(&fragment.revision));
@@ -10399,6 +10616,45 @@ impl UiWgpuRenderer {
             }
             false
         };
+        // Popup nodes use the same retained-plan strategy as ContextMenu.
+        // Only the active MenuBar-owned popup is allowed to paint and receive
+        // hits; this keeps opening/closing local and prevents hidden popup
+        // children from stealing pointer input.
+        let active_popup_suffix = self
+            .active_popup_id
+            .as_deref()
+            .map(|active| format!("/{active}"));
+        let is_active_popup = |id: &str| -> bool {
+            self.active_popup_id.as_deref().is_some_and(|active| {
+                id == active
+                    || active_popup_suffix
+                        .as_deref()
+                        .is_some_and(|suffix| id.ends_with(suffix))
+            })
+        };
+        let hidden_popup_ids: HashSet<String> = nodes
+            .iter()
+            .filter(|(id, _, target, _)| {
+                matches!(target.kind, UiNodeKind::Popup)
+                    && !is_active_popup(id)
+            })
+            .map(|(id, _, _, _)| id.clone())
+            .collect();
+        let is_popup_hidden = |id: &str| -> bool {
+            let mut current = Some(id.to_string());
+            while let Some(cid) = current {
+                if hidden_popup_ids.contains(&cid) {
+                    return true;
+                }
+                current = parent_map.get(&cid).cloned().flatten();
+            }
+            false
+        };
+        let accordion_parents: HashSet<String> = nodes
+            .iter()
+            .filter(|(_, _, target, _)| target.kind == UiNodeKind::Accordion)
+            .map(|(id, _, _, _)| id.clone())
+            .collect();
         // Compute position deltas for visible context menus (anchor placement).
         let mut ctx_deltas: std::collections::HashMap<String, (f32, f32)> =
             std::collections::HashMap::new();
@@ -10425,10 +10681,26 @@ impl UiWgpuRenderer {
         };
         let mut filtered_nodes = Vec::with_capacity(nodes.len());
         let mut skip_until_indent: Option<f32> = None;
+        let mut collapsed_accordion_section: Option<String> = None;
+        let mut pending_accordion_collapse: Option<String> = None;
         for (id, parent_id, mut target, transition) in nodes {
             // Skip hidden context menus and all their descendants.
-            if is_ctx_hidden(&id) {
+            if is_ctx_hidden(&id) || is_popup_hidden(&id) {
                 continue;
+            }
+            if let Some(section) = collapsed_accordion_section.as_deref() {
+                let mut current = Some(id.clone());
+                let mut inside = false;
+                while let Some(node_id) = current {
+                    if node_id == section {
+                        inside = true;
+                        break;
+                    }
+                    current = parent_map.get(&node_id).cloned().flatten();
+                }
+                if inside {
+                    continue;
+                }
             }
             // Move visible context menu and descendants to anchor position.
             if let Some((dx, dy)) = ctx_delta_for(&id) {
@@ -10456,6 +10728,24 @@ impl UiWgpuRenderer {
                 }
             } else {
                 skip_until_indent = None;
+            }
+            let parent_is_accordion = parent_id
+                .as_ref()
+                .is_some_and(|pid| accordion_parents.contains(pid));
+            if parent_is_accordion {
+                let header_like = target.bounds.height <= 48.0;
+                if header_like {
+                    let expanded = self.accordion_expanded.get(&id).copied().unwrap_or(true);
+                    pending_accordion_collapse = (!expanded).then(|| parent_id.clone().unwrap());
+                    collapsed_accordion_section = None;
+                } else if pending_accordion_collapse.as_deref() == parent_id.as_deref() {
+                    collapsed_accordion_section = Some(id.clone());
+                    pending_accordion_collapse = None;
+                    continue;
+                }
+            } else if parent_id.is_none() {
+                collapsed_accordion_section = None;
+                pending_accordion_collapse = None;
             }
             filtered_nodes.push((id, parent_id, target, transition));
         }
@@ -10784,6 +11074,7 @@ impl UiWgpuRenderer {
                 .map(|(id, fragment)| (id.clone(), fragment.revision)),
         );
         self.plan_viewport_revision = self.viewport_revision;
+        self.applied_interaction_plan_revision = self.interaction_plan_revision;
         true
     }
 
@@ -15357,10 +15648,11 @@ fn flatten_node(
         width: 2_000_000.0,
         height: 2_000_000.0,
     });
-    // ContextMenu nodes are always included in the flattened list; their
-    // actual visibility is controlled by the active_context_menu_id filter
-    // that runs after flattening. Other invisible nodes are skipped here.
-    if (!node.visible && !matches!(node.kind, UiNodeKind::ContextMenu))
+    // ContextMenu and Popup nodes are always included in the flattened list;
+    // their actual visibility is controlled by the active popup filters that
+    // run after flattening. Other invisible nodes are skipped here.
+    if (!node.visible
+        && !matches!(node.kind, UiNodeKind::ContextMenu | UiNodeKind::Popup))
         || hidden_world_nodes.contains(node.node_id.0.as_str())
     {
         return;
@@ -16388,6 +16680,14 @@ mod tests {
     use std::sync::Mutex;
 
     static GPU_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn splitter_semantic_value_is_normalized_and_clamped() {
+        assert_eq!(normalized_splitter_value(100.0, 500.0, 8.0, 100.0), 0.0);
+        assert_eq!(normalized_splitter_value(100.0, 500.0, 8.0, 346.0), 0.5);
+        assert_eq!(normalized_splitter_value(100.0, 500.0, 8.0, 900.0), 1.0);
+        assert_eq!(normalized_splitter_value(100.0, 0.0, 8.0, 100.0), 0.0);
+    }
 
     fn fixture_font() -> AssetBytes {
         AssetBytes {
@@ -17641,6 +17941,91 @@ mod tests {
                 .get("toggle-prediction/feature-toggle"),
             Some(UiSemanticPayloadValue::Bool { value: false })
         ));
+    }
+
+    #[test]
+    fn switch_prediction_uses_the_same_toggle_contract_as_checkbox() {
+        let _gpu_test = GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let (device, _queue) = test_device("neon3-ui-switch-prediction");
+        let mut switch = node();
+        switch.node_id = UiNodeId("switch-demo".into());
+        switch.kind = UiNodeKind::Switch;
+        switch.bounds = UiBounds {
+            x: 10.0,
+            y: 10.0,
+            width: 120.0,
+            height: 30.0,
+        };
+        switch.enter_transition = None;
+        let mut root = node();
+        root.enter_transition = None;
+        root.children = vec![switch];
+        let fragment_id = UiFragmentId("switch-prediction".into());
+        let fragment = UiFragment {
+            fragment_id: fragment_id.clone(),
+            revision: Revision(1),
+            root,
+            effects: vec![UiEffect::ControlPresentation {
+                node_id: UiNodeId("switch-demo".into()),
+                state: UiControlPresentation::Toggle { selected: true },
+            }],
+        };
+        let fragments = HashMap::from([(fragment_id, fragment)]);
+        let mut renderer = UiWgpuRenderer::new(&device, wgpu::TextureFormat::Rgba8Unorm);
+        renderer.refresh_plan(&fragments, [256.0, 128.0]);
+        renderer.refresh_hit_bindings(&fragments);
+        renderer.compose_sampled_visuals(0.0);
+        let (value, _) = renderer
+            .finish_toggle_control("switch-prediction/switch-demo")
+            .expect("switch should produce a local toggle prediction");
+        assert_eq!(value, UiSemanticPayloadValue::Bool { value: false });
+    }
+
+    #[test]
+    fn tree_child_toggle_returns_the_new_expansion_value() {
+        let _gpu_test = GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let (device, _queue) = test_device("neon3-ui-tree-toggle");
+        let mut tree = node();
+        tree.node_id = UiNodeId("tree".into());
+        tree.kind = UiNodeKind::TreeView;
+        tree.bounds = UiBounds {
+            x: 0.0,
+            y: 0.0,
+            width: 220.0,
+            height: 120.0,
+        };
+        tree.enter_transition = None;
+        let mut child = node();
+        child.node_id = UiNodeId("tree-root".into());
+        child.kind = UiNodeKind::Label;
+        child.bounds = UiBounds {
+            x: 8.0,
+            y: 8.0,
+            width: 200.0,
+            height: 24.0,
+        };
+        child.enter_transition = None;
+        tree.children = vec![child];
+        let fragment_id = UiFragmentId("tree-toggle".into());
+        let fragment = UiFragment {
+            fragment_id: fragment_id.clone(),
+            revision: Revision(1),
+            root: tree,
+            effects: Vec::new(),
+        };
+        let fragments = HashMap::from([(fragment_id, fragment)]);
+        let mut renderer = UiWgpuRenderer::new(&device, wgpu::TextureFormat::Rgba8Unorm);
+        renderer.refresh_plan(&fragments, [256.0, 128.0]);
+        renderer.refresh_hit_bindings(&fragments);
+        renderer.compose_sampled_visuals(0.0);
+        let (value, _) = renderer
+            .finish_toggle_control("tree-toggle/tree-root")
+            .expect("tree child should produce an expansion prediction");
+        assert_eq!(value, UiSemanticPayloadValue::Bool { value: false });
     }
 
     #[test]

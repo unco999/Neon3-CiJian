@@ -42,6 +42,20 @@ fn main() {
     }
 
     let windowed = args.iter().any(|argument| argument == "--window");
+    if windowed {
+        // Windowed case shells are full-viewport transparent compositions;
+        // acrylic is the native backdrop and Flow supplies only transparent
+        // content layers above it. Explicit environment values still win.
+        if std::env::var_os("NEON_WINDOW_BACKDROP").is_none() {
+            unsafe { std::env::set_var("NEON_WINDOW_BACKDROP", "acrylic") };
+        }
+        if std::env::var_os("NEON_WINDOW_MAXIMIZED").is_none() {
+            unsafe { std::env::set_var("NEON_WINDOW_MAXIMIZED", "1") };
+        }
+        if std::env::var_os("NEON_WINDOW_CHROME").is_none() {
+            unsafe { std::env::set_var("NEON_WINDOW_CHROME", "borderless") };
+        }
+    }
     let eventd_endpoint = parse_addr(&args, "--eventd", "127.0.0.1:39101");
     let ui_endpoint = parse_addr(&args, "--ui", "127.0.0.1:39102");
     let wgpu_endpoint = parse_addr(&args, "--wgpu", "127.0.0.1:39103");
@@ -153,8 +167,27 @@ fn main() {
                 let bridge = editor_bridge.clone();
                 Box::new(move |fragments| bridge.sync_fragments(fragments))
             };
+            let reveal_sink: Box<dyn FnMut(serde_json::Value, f32) -> Option<neon_ui_schema::UiCodeEditorPresentation> + Send> = {
+                let bridge = editor_bridge.clone();
+                Box::new(move |params, now| {
+                    let path = params.get("path")?.as_str()?.to_string();
+                    bridge.reveal(
+                        &path,
+                        params.get("line")?.as_u64()? as u32,
+                        params.get("column")?.as_u64()? as u32,
+                        params.get("end_line").and_then(|v| v.as_u64()).map(|v| v as u32),
+                        params.get("end_column").and_then(|v| v.as_u64()).map(|v| v as u32),
+                        params.get("viewport_height").and_then(|v| v.as_f64()).unwrap_or(720.0) as f32,
+                        params.get("viewport_width").and_then(|v| v.as_f64()).unwrap_or(1200.0) as f32,
+                        params.get("row_height").and_then(|v| v.as_f64()).unwrap_or(20.0) as f32,
+                        params.get("gutter_width").and_then(|v| v.as_f64()).unwrap_or(56.0) as f32,
+                        now,
+                    )
+                })
+            };
             let handle = neon_wgpu_runtime::EditorBridgeHandle {
                 input_sink: Some(input_sink),
+                reveal_sink: Some(reveal_sink),
                 external_presentations: Some(editor_bridge.presentations.clone()),
                 fragment_observer: Some(fragment_observer),
             };

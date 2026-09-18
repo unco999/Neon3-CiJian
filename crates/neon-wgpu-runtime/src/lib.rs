@@ -66,6 +66,7 @@ pub struct EditorBridgeHandle {
                 + Send,
         >,
     >,
+    pub reveal_sink: Option<Box<dyn FnMut(Value, f32) -> Option<neon_ui_schema::UiCodeEditorPresentation> + Send>>,
     pub external_presentations:
         Option<Arc<Mutex<Vec<neon_ui_schema::UiCodeEditorPresentation>>>>,
     pub fragment_observer:
@@ -322,7 +323,7 @@ struct WindowBackdropState {
 impl WindowBackdrop {
     fn from_environment() -> (Self, WindowBackdropState) {
         let requested = std::env::var("NEON_WINDOW_BACKDROP")
-            .unwrap_or_else(|_| "none".into())
+            .unwrap_or_else(|_| "acrylic".into())
             .trim()
             .to_ascii_lowercase();
         Self::from_value(&requested)
@@ -1854,6 +1855,9 @@ impl WindowedRuntime {
         );
         match event.event_type {
             UiPointerEventType::Enter | UiPointerEventType::Move => {
+                if gpu.ui.splitter_drag_active() {
+                    gpu.ui.update_splitter_drag();
+                }
                 gpu.input.set_hover_id(gpu.ui.hit_id_at_pointer());
                 gpu.pending_hit_pixel = Some([
                     pointer[0]
@@ -1899,6 +1903,25 @@ impl WindowedRuntime {
                     self.redraw_pending = true;
                     return Ok(json!({"state": "choice_popup_toggled"}));
                 }
+                if let Some((_, binding)) = gpu.ui.hit_binding_at_pointer()
+                    && gpu.ui.is_splitter_binding(&binding.node_path)
+                {
+                    if !gpu.ui.begin_splitter_drag(&binding.node_path) {
+                        return Err("splitter_begin_rejected".into());
+                    }
+                    gpu.input.set_hover_id(gpu.ui.hit_id_at_pointer());
+                    gpu.input
+                        .pointer_down()
+                        .map_err(|_| "splitter_capture_failed".to_owned())?;
+                    gpu.captured_binding = Some(binding.clone());
+                    gpu.pending_control_value = gpu.ui.splitter_control_value();
+                    self.redraw_pending = true;
+                    return Ok(json!({
+                        "state": "splitter_captured",
+                        "node_path": binding.node_path,
+                        "control_value": gpu.ui.splitter_control_value(),
+                    }));
+                }
                 gpu.input.set_hover_id(gpu.ui.hit_id_at_pointer());
                 gpu.input
                     .pointer_down()
@@ -1919,6 +1942,13 @@ impl WindowedRuntime {
                 Ok(json!({"state": "captured"}))
             }
             UiPointerEventType::Up => {
+                if gpu.ui.splitter_drag_active() {
+                    if let Some((node_path, value)) = gpu.ui.finish_splitter_drag() {
+                        gpu.pending_control_value = Some(value.clone());
+                        self.redraw_pending = true;
+                        let _ = node_path;
+                    }
+                }
                 let Some(released) = release_captured_binding(gpu) else {
                     return Ok(json!({"state": "released"}));
                 };
@@ -1942,37 +1972,8 @@ impl WindowedRuntime {
                     control_value: released.control_value,
                     drag_drop: None,
                 };
-                // Publish button click to eventd for external SDK subscription.
-                if let Some(endpoint) = self.eventd_endpoint {
-                    if let neon_ui_schema::UiIntent::Invoke { ref action, ref params } = semantic_event.intent {
-                        let action = action.clone();
-                        let params = params.clone();
-                        let node_path = released.binding.node_path.clone();
-                        let epoch = self.epoch;
-                        let seq = released.sequence;
-                        thread::spawn(move || {
-                            let publisher = ClientIdentity {
-                                kind: ClientKind::WgpuRuntime,
-                                instance_id: format!("window-{epoch}"),
-                                pid: std::process::id(),
-                                origin: "neon-wgpu-runtime".into(),
-                            };
-                            let publish = neon_protocol::EventPublish {
-                                protocol: "neon3.event".into(),
-                                version: PROTOCOL_VERSION,
-                                request_id: RequestId(format!("ui-click-{epoch}-{seq}")),
-                                publisher,
-                                name: format!("ui.click.{action}"),
-                                schema_version: 1,
-                                payload: json!({ "action": action, "node_path": node_path, "params": params }),
-                                idempotency_key: Some(format!("ui-click:{epoch}:{seq}")),
-                            };
-                            if let Err(e) = EventClient::connect(endpoint).and_then(|mut c| c.publish(&publish)) {
-                                eprintln!("[neon-wgpu-runtime] click event publish failed: {e}");
-                            }
-                        });
-                    }
-                }
+                // Note: eventd publish is handled by the UI runtime (host forward path),
+                // not here, to avoid double-publishing click events.
                 Ok(json!({"semantic_event": semantic_event}))
             }
             UiPointerEventType::Wheel => {
@@ -1988,10 +1989,12 @@ impl WindowedRuntime {
                 Ok(json!({"state": "scrolled"}))
             }
             UiPointerEventType::Leave | UiPointerEventType::Cancel => {
+                let splitter_cancelled = gpu.ui.cancel_splitter_drag();
                 gpu.captured_binding = None;
                 gpu.pending_control_value = None;
                 gpu.input.cancel();
-                Ok(json!({"state": "cancelled"}))
+                self.redraw_pending |= splitter_cancelled;
+                Ok(json!({"state": if splitter_cancelled { "splitter_cancelled" } else { "cancelled" }}))
             }
         }
     }
@@ -2073,6 +2076,7 @@ impl WindowedRuntime {
             event_loop.create_proxy(),
             runtime.interaction_traces.clone(),
             runtime.world_ui_lab_camera.clone(),
+            None,
         );
         runtime.applied_composition_revision = Revision(0);
         runtime.redraw_pending = true;
@@ -2233,12 +2237,14 @@ impl WindowedRuntime {
         }
         if let Some(endpoint) = endpoint {
             let interaction_traces = runtime.interaction_traces.clone();
+            let reveal_sink = runtime.editor_bridge.as_mut().and_then(|bridge| bridge.reveal_sink.take());
             spawn_window_server(
                 epoch,
                 endpoint,
                 proxy,
                 interaction_traces,
                 runtime.world_ui_lab_camera.clone(),
+                reveal_sink,
             );
         }
         event_loop
@@ -2260,7 +2266,32 @@ impl WindowedRuntime {
             .with_decorations(!matches!(
                 std::env::var("NEON_WINDOW_CHROME").as_deref(),
                 Ok("borderless")
-            ));
+            ))
+            .with_fullscreen(if matches!(
+                std::env::var("NEON_WINDOW_FULLSCREEN").as_deref(),
+                Ok("borderless") | Ok("1") | Ok("true")
+            ) {
+                // Official winit borderless fullscreen: the surface fills the
+                // whole monitor and the OS never restores/shrinks it on drag.
+                Some(winit::window::Fullscreen::Borderless(None))
+            } else {
+                None
+            })
+            .with_maximized(
+                if matches!(
+                    std::env::var("NEON_WINDOW_FULLSCREEN").as_deref(),
+                    Ok("borderless") | Ok("1") | Ok("true")
+                ) {
+                    false
+                } else {
+                    std::env::var("NEON_WINDOW_MAXIMIZED")
+                        .map(|value| !matches!(
+                            value.trim().to_ascii_lowercase().as_str(),
+                            "0" | "false" | "off"
+                        ))
+                        .unwrap_or(true)
+                },
+            );
         let window = event_loop
             .create_window(window_attributes)
             .map_err(|error| format!("create window: {error}"))?;
@@ -2312,7 +2343,7 @@ impl WindowedRuntime {
             instance,
             self.world_ui_lab_camera.clone(),
             backdrop.requests_transparency(),
-            true, // acrylic_requested: the composition surface path
+            matches!(backdrop, WindowBackdrop::Acrylic),
         )?;
         // Apply any HWND-level fallback attributes after the composition tree
         // has been created. The actual glass and content are WinRT visuals.
@@ -2568,6 +2599,17 @@ impl WindowedRuntime {
     }
 
     fn request_scripted_initial_size(&mut self) {
+        // Full-screen acrylic shells own the viewport. A Flow root is a
+        // composition surface description, not a request to shrink a
+        // maximized native window back to the old fixture dimensions.
+        if self
+            .window
+            .as_ref()
+            .is_some_and(|window| window.is_maximized())
+        {
+            self.initial_window_sizing.resize_accepted();
+            return;
+        }
         let Some(gpu) = self.gpu.as_ref() else {
             return;
         };
@@ -2850,20 +2892,22 @@ impl WindowedRuntime {
                 // The window only converges to the shell size after the first
                 // fragment resolves; a 1280x800 default canvas around the shell
                 // would still expose the full-window system backdrop.
-                if let Some([fit_w, fit_h]) = self
-                    .shell_window_fit
-                    .observe([bounds.width, bounds.height], [logical[0], logical[1]])
-                {
-                    if let Some(accepted) = window.request_inner_size(winit::dpi::LogicalSize::new(
-                        f64::from(fit_w),
-                        f64::from(fit_h),
-                    )) {
-                        pending_window_resize = Some(accepted);
-                    } else {
-                        // The window manager did not apply the request; stop
-                        // asking so the region clip still takes effect.
-                        self.shell_window_fit.requested_logical = None;
-                        self.shell_window_fit.resolved = true;
+                if !window.is_maximized() {
+                    if let Some([fit_w, fit_h]) = self
+                        .shell_window_fit
+                        .observe([bounds.width, bounds.height], [logical[0], logical[1]])
+                    {
+                        if let Some(accepted) = window.request_inner_size(winit::dpi::LogicalSize::new(
+                            f64::from(fit_w),
+                            f64::from(fit_h),
+                        )) {
+                            pending_window_resize = Some(accepted);
+                        } else {
+                            // The window manager did not apply the request; stop
+                            // asking so the region clip still takes effect.
+                            self.shell_window_fit.requested_logical = None;
+                            self.shell_window_fit.resolved = true;
+                        }
                     }
                 }
                 apply_window_shell_region(
@@ -4232,6 +4276,9 @@ impl HeadlessExternalGpu {
                 if presentation_ui.value_gesture_active() {
                     presentation_ui.update_value_gesture();
                 }
+                if presentation_ui.splitter_drag_active() {
+                    presentation_ui.update_splitter_drag();
+                }
                 self.input.set_hover_id(None);
                 Ok(json!({"state": "observed"}))
             }
@@ -4275,6 +4322,24 @@ impl HeadlessExternalGpu {
                     self.input.cancel();
                     return Ok(json!({"state": "choice_popup_toggled"}));
                 }
+                if let Some((_, binding)) = ui.hit_binding_at_pointer()
+                    && ui.is_splitter_binding(&binding.node_path)
+                {
+                    if !presentation_ui.begin_splitter_drag(&binding.node_path) {
+                        return Err("splitter_begin_rejected".into());
+                    }
+                    self.input.set_hover_id(ui.hit_id_at_pointer());
+                    self.input
+                        .pointer_down()
+                        .map_err(|_| "splitter_capture_failed".to_owned())?;
+                    self.captured_binding = Some(binding.clone());
+                    self.pending_control_value = presentation_ui.splitter_control_value();
+                    return Ok(json!({
+                        "state": "splitter_captured",
+                        "node_path": binding.node_path,
+                        "control_value": self.pending_control_value,
+                    }));
+                }
                 let current_hit = ui.hit_binding_at_pointer();
                 self.input
                     .set_hover_id(current_hit.as_ref().map(|(hit_id, _)| *hit_id));
@@ -4309,6 +4374,11 @@ impl HeadlessExternalGpu {
             }
             UiPointerEventType::Up => {
                 self.perf.pointer_up_received += 1;
+                if presentation_ui.splitter_drag_active() {
+                    if let Some((_, value)) = presentation_ui.finish_splitter_drag() {
+                        self.pending_control_value = Some(value);
+                    }
+                }
                 let capture_id = self.input.capture_id;
                 let binding = self
                     .captured_binding
@@ -7393,6 +7463,7 @@ fn forward_pointer_click(
 ) {
     let queued_at = Instant::now();
     let node_path = diagnostic_node_path(&binding);
+    eprintln!("[wgpu-click] node_path={:?}", node_path);
     let Some(intent) = binding.intent.clone() else {
         if let Ok(mut state) = delivery.lock() {
             *state = json!({"state": "not_sent", "reason": "semantic_binding_missing"});
@@ -8184,7 +8255,13 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                     if let Some((_, binding)) = gpu.ui.hit_binding_at_pointer()
                         && gpu.ui.is_splitter_binding(&binding.node_path)
                     {
-                        gpu.ui.begin_splitter_drag(&binding.node_path);
+                        if !gpu.ui.begin_splitter_drag(&binding.node_path) {
+                            return;
+                        }
+                        gpu.input.set_hover_id(gpu.ui.hit_id_at_pointer());
+                        let _ = gpu.input.pointer_down();
+                        gpu.captured_binding = Some(binding.clone());
+                        gpu.pending_control_value = gpu.ui.splitter_control_value();
                         self.redraw_pending = true;
                         return;
                     }
@@ -8200,8 +8277,18 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                     .as_ref()
                     .is_some_and(|gpu| gpu.ui.hit_binding_at_pointer().is_none())
                 {
-                    if let Some(window) = self.window.as_ref() {
-                        let _ = window.drag_window();
+                    // A maximized borderless shell is locked to fullscreen.
+                    // The native drag_window() restores (un-maximizes) the
+                    // window and shrinks it, so never start a drag while the
+                    // window is maximized. Dragging is only allowed for a
+                    // restored (floating) window, where it cannot shrink.
+                    let locked = self.window.as_ref().is_some_and(|window| {
+                        window.is_maximized() || window.fullscreen().is_some()
+                    });
+                    if !locked {
+                        if let Some(window) = self.window.as_ref() {
+                            let _ = window.drag_window();
+                        }
                     }
                     return;
                 }
@@ -8371,7 +8458,7 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                         gpu.pending_control_value = Some(value);
                         append_interaction_record(
                             &interaction_traces,
-                            interaction_id,
+                            interaction_id.clone(),
                             InteractionTraceStage::HitCaptureResolved,
                             InteractionTraceOutcome::Accepted,
                             None,
@@ -8400,7 +8487,7 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                             .expect("binding was just assigned");
                         append_interaction_record(
                             &interaction_traces,
-                            interaction_id,
+                            interaction_id.clone(),
                             InteractionTraceStage::HitCaptureResolved,
                             InteractionTraceOutcome::Accepted,
                             None,
@@ -8414,7 +8501,22 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                         gpu.pending_control_value = None;
                         gpu.input.cancel();
                         self.redraw_pending = true;
-                    } else if gpu.ui.toggle_dropdown_at_pointer() {
+                    } else if gpu.ui.dismiss_popup_at_pointer() {
+                        gpu.captured_binding = None;
+                        gpu.pending_control_value = None;
+                        gpu.input.cancel();
+                        self.redraw_pending = true;
+                    } else {
+                        // MenuBar and Accordion keep their immediate visual
+                        // state in the renderer. Their declared child intent
+                        // still follows the normal capture/release path below.
+                        let menu_toggled = gpu.ui.toggle_menu_bar_popup_at_pointer();
+                        let accordion_toggled = gpu.ui.toggle_accordion_at_pointer();
+                        if menu_toggled || accordion_toggled {
+                            self.redraw_pending = true;
+                        }
+                    }
+                    if gpu.ui.toggle_dropdown_at_pointer() {
                         gpu.captured_binding = None;
                         gpu.input.cancel();
                         self.redraw_pending = true;
@@ -8569,7 +8671,9 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                 }
                 // Splitter drag: finish
                 if let Some(gpu) = self.gpu.as_mut() {
-                    gpu.ui.finish_splitter_drag();
+                    if let Some((_, value)) = gpu.ui.finish_splitter_drag() {
+                        gpu.pending_control_value = Some(value);
+                    }
                     self.redraw_pending = true;
                 }
                 if let Ok(mut camera) = self.world_ui_lab_camera.lock() {
@@ -8709,11 +8813,13 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                     );
                 }
                 if let Some(Ok(released)) = binding {
-                    // Built-in TreeView expand/collapse
-                    if let Some(gpu) = self.gpu.as_mut() {
-                        if gpu.ui.is_treeview_child(&released.binding.node_path) {
-                            gpu.ui.toggle_treeview_node(&released.binding.node_path);
-                            self.redraw_pending = true;
+                    let popup_item_release = self
+                        .gpu
+                        .as_ref()
+                        .is_some_and(|gpu| gpu.ui.active_popup_contains(&released.binding.node_path));
+                    if popup_item_release {
+                        if let Some(gpu) = self.gpu.as_mut() {
+                            gpu.ui.close_active_popup();
                         }
                     }
                     let local_window_action = released.binding.intent.as_ref().and_then(|intent| {
@@ -8751,37 +8857,7 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                             "release_without_semantic_binding".into()
                         };
                     }
-                    // Publish button click to eventd for external SDK subscription.
-                    if let Some(endpoint) = self.eventd_endpoint {
-                        let intent_opt = released.binding.intent.clone();
-                        if let Some(neon_ui_schema::UiIntent::Invoke { action, params }) = intent_opt {
-                            let params = params.clone();
-                            let node_path = released.binding.node_path.clone();
-                            let epoch = self.epoch;
-                            let seq = released.sequence;
-                            thread::spawn(move || {
-                                let publisher = ClientIdentity {
-                                    kind: ClientKind::WgpuRuntime,
-                                    instance_id: format!("window-{epoch}"),
-                                    pid: std::process::id(),
-                                    origin: "neon-wgpu-runtime".into(),
-                                };
-                                let publish = neon_protocol::EventPublish {
-                                    protocol: "neon3.event".into(),
-                                    version: PROTOCOL_VERSION,
-                                    request_id: RequestId(format!("ui-click-{epoch}-{seq}")),
-                                    publisher,
-                                    name: format!("ui.click.{action}"),
-                                    schema_version: 1,
-                                    payload: json!({ "action": action, "node_path": node_path, "params": params }),
-                                    idempotency_key: Some(format!("ui-click:{epoch}:{seq}")),
-                                };
-                                if let Err(e) = EventClient::connect(endpoint).and_then(|mut c| c.publish(&publish)) {
-                                    eprintln!("[neon-wgpu-runtime] click event publish failed: {e}");
-                                }
-                            });
-                        }
-                    }
+                    // Note: eventd publish handled by UI runtime host-forward path (line ~3976).
                     let interaction_id = self
                         .gpu
                         .as_mut()
@@ -9927,6 +10003,44 @@ fn handle_window_debug_snapshot(
     }
 }
 
+fn handle_editor_visual_reveal(runtime: &mut WgpuRuntime, request: RpcRequest) -> RpcResponse {
+    let Some(sink) = runtime.editor_reveal_sink.as_mut() else {
+        return runtime.reject(request.request_id, "editor_reveal_unavailable", "editor reveal sink is not connected", None);
+    };
+    let params = request.params;
+    let path = params.get("path").and_then(Value::as_str).unwrap_or("").to_string();
+    let line = params.get("line").and_then(Value::as_u64).unwrap_or(0) as u32;
+    let column = params.get("column").and_then(Value::as_u64).unwrap_or(0) as u32;
+    let end_line = params.get("end_line").and_then(Value::as_u64).map(|v| v as u32);
+    let end_column = params.get("end_column").and_then(Value::as_u64).map(|v| v as u32);
+    let event = json!({
+        "path": path,
+        "line": line.saturating_sub(1),
+        "column": column,
+        "end_line": end_line.map(|v| v.saturating_sub(1)),
+        "end_column": end_column,
+        "viewport_height": params.get("viewport_height").and_then(Value::as_f64).unwrap_or(720.0),
+        "viewport_width": params.get("viewport_width").and_then(Value::as_f64).unwrap_or(1200.0),
+        "row_height": params.get("row_height").and_then(Value::as_f64).unwrap_or(20.0),
+        "gutter_width": params.get("gutter_width").and_then(Value::as_f64).unwrap_or(56.0),
+    });
+    let now = std::time::Instant::now().elapsed().as_secs_f32();
+    match sink(event, now) {
+        Some(presentation) => runtime.accept(request.request_id, json!({
+            "state": "revealed",
+            "node_key": presentation.node_key,
+            "presentation_revision": presentation.revision,
+            "caret_line": presentation.caret_line + 1,
+            "caret_column": presentation.caret_column,
+            "selection_anchor_line": presentation.selection_anchor_line.map(|v| v + 1),
+            "selection_anchor_column": presentation.selection_anchor_column,
+            "scroll_x": presentation.scroll_x,
+            "scroll_y": presentation.scroll_y,
+        })),
+        None => runtime.reject(request.request_id, "editor_document_not_found", "editor node path is not active", None),
+    }
+}
+
 fn handle_window_animation_control(
     runtime: &mut WgpuRuntime,
     proxy: &EventLoopProxy<WindowCommand>,
@@ -10697,6 +10811,7 @@ fn spawn_window_server(
     proxy: EventLoopProxy<WindowCommand>,
     interaction_traces: Arc<Mutex<InteractionTraceStore>>,
     world_ui_lab_camera: Arc<Mutex<WorldUiLabCameraController>>,
+    reveal_sink: Option<Box<dyn FnMut(Value, f32) -> Option<neon_ui_schema::UiCodeEditorPresentation> + Send>>,
 ) {
     thread::spawn(move || {
         let server = match neon_ipc::BlockingRpcServer::bind(endpoint) {
@@ -10712,6 +10827,7 @@ fn spawn_window_server(
             interaction_traces,
             world_ui_lab_camera,
         )));
+        runtime.lock().expect("runtime lock").editor_reveal_sink = reveal_sink;
         let handler_proxy = proxy.clone();
         if let Err(error) = server.serve_until(
             move |request| {
@@ -10771,6 +10887,8 @@ fn spawn_window_server(
                     handle_window_animation_control(&mut runtime, &proxy, request)
                 } else if request.method == "debug.snapshot.get" {
                     handle_window_debug_snapshot(&mut runtime, &proxy, request.request_id)
+                } else if request.method == "editor.visual.reveal" {
+                    handle_editor_visual_reveal(&mut runtime, request)
                 } else if request.method == "debug.window.input.snapshot" {
                     handle_window_input_debug_snapshot(&mut runtime, &proxy, request.request_id)
                 } else if request.method == "debug.window.images" {
@@ -11373,6 +11491,8 @@ pub struct WgpuRuntime {
     /// Android single-endpoint sessions).
     editor_fragment_observer:
         Option<Box<dyn FnMut(&HashMap<UiFragmentId, UiFragment>) + Send>>,
+    editor_reveal_sink:
+        Option<Box<dyn FnMut(Value, f32) -> Option<neon_ui_schema::UiCodeEditorPresentation> + Send>>,
 }
 
 impl WgpuRuntime {
@@ -11407,6 +11527,7 @@ impl WgpuRuntime {
             ui_surface_id: None,
             shader_registry: shader_registry::ShaderRegistry::new(),
             editor_fragment_observer: None,
+            editor_reveal_sink: None,
         }
     }
 
@@ -11416,6 +11537,13 @@ impl WgpuRuntime {
         observer: Option<Box<dyn FnMut(&HashMap<UiFragmentId, UiFragment>) + Send>>,
     ) {
         self.editor_fragment_observer = observer;
+    }
+
+    pub fn set_editor_reveal_sink(
+        &mut self,
+        sink: Option<Box<dyn FnMut(Value, f32) -> Option<neon_ui_schema::UiCodeEditorPresentation> + Send>>,
+    ) {
+        self.editor_reveal_sink = sink;
     }
 
     fn window_control(
