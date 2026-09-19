@@ -284,6 +284,15 @@ fn check_step(case: &str, created: u64, removed: u64, moved: u64, updated: u64) 
     }
 }
 
+/// Each instance plane holds a permutation of the instances the frame drew, so a
+/// frame can write a given record at most once per plane. More than that means
+/// two change caches are diffing against the same buffer, which uploads every
+/// changed record twice and lets a cache describe bytes the buffer no longer holds.
+fn writes_each_record_once(timings: &UiDrawStageTimings) -> bool {
+    let count = timings.instance_count as u32;
+    timings.instance_records_written <= count && timings.depth_records_written <= count
+}
+
 fn run_case(
     runner: &mut Runner,
     case: &str,
@@ -307,7 +316,8 @@ fn run_case(
         && stats.removed == 0
         && stats.updated == 0
         && stats.moved == 0
-        && timings.instance_count > 0;
+        && timings.instance_count > 0
+        && writes_each_record_once(&timings);
     emit(json!({
         "probe": "ui_reconcile_baseline.v1",
         "case": format!("{case}/base"),
@@ -333,7 +343,8 @@ fn run_case(
         && !static_timings.instance_rebuilt
         && static_timings.instance_count == timings.instance_count
         && static_timings.instance_count > 0
-        && static_timings.buffer_ranges_written() == 0;
+        && static_timings.buffer_ranges_written() == 0
+        && writes_each_record_once(&static_timings);
     emit(json!({
         "probe": "ui_reconcile_baseline.v1",
         "case": format!("{case}/static-repeat"),
@@ -366,7 +377,8 @@ fn run_case(
             stats.moved,
             stats.updated,
         ) && timings.instance_count > 0
-            && timings.plan_refresh != UiPlanRefreshCause::Reused;
+            && timings.plan_refresh != UiPlanRefreshCause::Reused
+            && writes_each_record_once(&timings);
         emit(json!({
             "probe": "ui_reconcile_baseline.v1",
             "case": format!("{case}/{step}"),
@@ -391,7 +403,8 @@ fn run_case(
             && settle.instance_count == timings.instance_count
             && settle.buffer_ranges_written() == 0
             && settle.frame_sequence > timings.frame_sequence
-            && settle.fragment_revision == timings.fragment_revision;
+            && settle.fragment_revision == timings.fragment_revision
+            && writes_each_record_once(&settle);
         emit(json!({
             "probe": "ui_reconcile_baseline.v1",
             "case": format!("{case}/{step}/settle"),
@@ -458,6 +471,7 @@ fn run_invalidation_scenario(
         && changed.composition_invalidation == expect_invalidation
         && !changed.composition_reused
         && changed.instance_count > 0
+        && writes_each_record_once(&changed)
         && narrower;
     emit(json!({
         "probe": "ui_reconcile_baseline.v1",
@@ -496,7 +510,8 @@ fn run_invalidation_scenario(
     let settle_pass = settle.composition_reused
         && !settle.instance_rebuilt
         && settle.instance_count > 0
-        && settle.buffer_ranges_written() == 0;
+        && settle.buffer_ranges_written() == 0
+        && writes_each_record_once(&settle);
     emit(json!({
         "probe": "ui_reconcile_baseline.v1",
         "case": format!("scenario/{scenario}/settle"),

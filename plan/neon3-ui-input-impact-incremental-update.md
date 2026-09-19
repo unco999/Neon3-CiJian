@@ -877,7 +877,41 @@ drag/scroll/splitter/press/exit/材质/绘制模式等原因由 lib 测试覆盖
   `UiCodeEditorDeclaration` + presentation fixture，probe 也拿不到 `pub(crate)` 编辑器入口。
   popup/text-material 原因同理，只有代码路径和枚举名字。
 - hit/text/image/material plane 仍是整段重写，未接 range 写入（阶段四）。
-- `uploaded_instances`（文档顺序）与 `uploaded_ordered_instances`（分组/canvas 顺序）是同一块
-  `instance_buffer` 上的两份独立变更缓存，各自不知道 buffer 的真实物理内容，交替绘制两条 pass 时
-  可能互相覆盖成“差异非空但内容相同”的多写。修法是把缓存改成 buffer 物理内容单例（阶段一后续）。
 - `UiWgpuRenderer` 仍未消费 `UiFrameDelta`：静态帧已不重建，但真实 fragment 变化仍是整树重采样。
+
+### 阶段一后续（1b）：instance buffer 只留一份物理内容缓存 — 已完成
+
+审计上一轮留下的“仍未做到”第 3 条时确认它比预想更严重：`draw()` 内部有两次写入同一块
+`instance_buffer`。
+
+- 症状来源：probe 的 100 行首帧 `color_records: 202`，而 `instance_count: 101` —— 每条记录被写两遍。
+- 根因：`draw()` 先把 canonical 的 `self.instances` 按 `uploaded_instances` 差异写进
+  `instance_buffer`，随后 grouped pass 又把 `ordered_rects`（同一批记录的 paint-group 重排，
+  覆盖全部实例）按 `uploaded_ordered_instances` 差异写进同一块 buffer。真正参与绘制的只有
+  `ordered_rects` 顺序（`set_vertex_buffer(0, instance_buffer)` 只出现在 grouped pass），
+  所以第一次写入是纯多余带宽，并且让 `uploaded_instances` 与 buffer 的物理内容彻底脱钩——
+  两份缓存互相不知情，任何一份的“无差异”判断都可能是错的。
+- 另一个漏点：grouped pass 的扩容分支重建 `instance_buffer` 和 `depth_instance_buffer` 时
+  不清任何变更缓存（新 buffer 全零，旧记录并不存在），会把“无需重写”误判成“已经一致”。
+- 修法：删掉 canonical 上传，只保留 grouped 写入这一份缓存，并把它改名为
+  `instance_buffer_contents`（“buffer 现在物理上装的是什么”）；两处扩容分支统一清空该缓存，
+  grouped 扩容同时清空 `uploaded_depth_instances`。
+- probe 新增不变量 `writes_each_record_once()`：每个 plane 的 `records_written` 不得超过
+  `instance_count`，base / static-repeat / 每个 step / 每个 settle / 每个失效场景都套用。
+
+实测（同一 probe、同一 fixture，改动前后）：
+
+```text
+case                              before  after
+A_property_set_1/base             202     101   records
+A_property_set_1/set                2       1
+D_selection_only_500/set            2       1
+G_reorder_batch_100/move10         40      20
+```
+
+- `cargo run -q -p neon-wgpu-runtime --bin ui_reconcile_baseline_probe` → exit `0`，
+  48 条 `"pass":true`、0 条 `"pass":false`，`status: "passed"`。
+- `cargo test -p neon-wgpu-runtime --lib ui_renderer`（跳过两个存量挂起项）→
+  `108 passed; 8 failed`，失败名单与本轮改动前逐名相同。
+- `cargo run -q -p neon-wgpu-runtime --bin ui_input_incremental_probe` → `"status":"passed"`。
+- `rustfmt --edition 2024 --check`（本轮两文件）→ 干净；`cargo check -q --workspace --all-targets` → exit `0`。

@@ -2128,8 +2128,10 @@ pub struct UiWgpuRenderer {
     debug_semantic_nodes: Vec<DebugSemanticNode>,
     sampled: Vec<UiVisual>,
     instances: Vec<UiInstance>,
-    uploaded_instances: Vec<UiInstance>,
-    uploaded_ordered_instances: Vec<UiInstance>,
+    /// Records currently sitting in `instance_buffer`, in the paint-group order
+    /// the grouped pass draws. It is the single change cache for that buffer, so
+    /// a sparse write can always diff against the buffer's real content.
+    instance_buffer_contents: Vec<UiInstance>,
     uploaded_depth_instances: Vec<UiInstance>,
     viewport_physical_size: [u32; 2],
     viewport_logical_size: [f32; 2],
@@ -3400,8 +3402,7 @@ impl UiWgpuRenderer {
             debug_semantic_nodes: Vec::new(),
             sampled: Vec::new(),
             instances: Vec::new(),
-            uploaded_instances: Vec::new(),
-            uploaded_ordered_instances: Vec::new(),
+            instance_buffer_contents: Vec::new(),
             uploaded_depth_instances: Vec::new(),
             viewport_physical_size: [0, 0],
             viewport_logical_size: [0.0, 0.0],
@@ -7819,8 +7820,7 @@ impl UiWgpuRenderer {
         if self.instances.len() > self.instance_capacity {
             self.instance_capacity = self.instances.len().next_power_of_two();
             self.instance_buffer = create_instance_buffer(device, self.instance_capacity);
-            self.uploaded_instances.clear();
-            self.uploaded_ordered_instances.clear();
+            self.instance_buffer_contents.clear();
         }
         if self.instance_capacity > self.depth_instance_capacity {
             self.depth_instance_capacity = self.instance_capacity;
@@ -7838,23 +7838,12 @@ impl UiWgpuRenderer {
             self.popup_instance_buffer =
                 create_instance_buffer(device, self.popup_instance_capacity);
         }
-        // Transition records are immutable after begin/retarget. During the
-        // animation WGSL samples `animation` from the time uniform, so avoid
-        // re-uploading panel data every frame.
-        if self.instances != self.uploaded_instances {
-            let stage = Instant::now();
-            let written = write_changed_instance_ranges(
-                queue,
-                &self.instance_buffer,
-                &self.uploaded_instances,
-                &self.instances,
-            );
-            instance_range_writes += written.0;
-            instance_records_written += written.1;
-            instance_bytes_written += written.2;
-            self.uploaded_instances.clone_from(&self.instances);
-            buffer_upload_ms += stage.elapsed().as_secs_f32() * 1000.0;
-        }
+        // `self.instances` is never uploaded here. The grouped pass below is the
+        // only consumer of `instance_buffer`, and it draws `ordered_rects`, a
+        // paint-group reordering of the same records. Writing the canonical
+        // order first would duplicate every changed record and leave
+        // `instance_buffer_contents` describing bytes the buffer no longer
+        // holds.
         if !material_payload.is_empty() {
             let stage = Instant::now();
             queue.write_buffer(
@@ -10146,6 +10135,10 @@ impl UiWgpuRenderer {
             self.depth_instance_capacity = self.instance_capacity;
             self.depth_instance_buffer =
                 create_instance_buffer(device, self.depth_instance_capacity);
+            // A replacement buffer starts zeroed, so no previously uploaded
+            // record survives; the change caches must forget them too.
+            self.instance_buffer_contents.clear();
+            self.uploaded_depth_instances.clear();
         }
         if ordered_images.len() > self.image_capacity {
             self.image_capacity = ordered_images.len().next_power_of_two();
@@ -10167,13 +10160,13 @@ impl UiWgpuRenderer {
         let written = write_changed_instance_ranges(
             queue,
             &self.instance_buffer,
-            &self.uploaded_ordered_instances,
+            &self.instance_buffer_contents,
             &ordered_rects,
         );
         instance_range_writes += written.0;
         instance_records_written += written.1;
         instance_bytes_written += written.2;
-        self.uploaded_ordered_instances.clone_from(&ordered_rects);
+        self.instance_buffer_contents.clone_from(&ordered_rects);
         pass.set_bind_group(0, &self.view_bind_group, &[]);
         pass.set_vertex_buffer(0, self.instance_buffer.slice(..));
         if !ordered_images.is_empty() {
