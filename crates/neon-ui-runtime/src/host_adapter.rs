@@ -136,6 +136,10 @@ impl UiHostAdapter {
         &self.program
     }
 
+    pub fn renderer_epoch(&self) -> u64 {
+        self.renderer_epoch
+    }
+
     /// Attaches the UI Runtime's directed-event publisher. The event name is
     /// derived from the active Flow's `flow <name>` declaration and each input
     /// slot's `emitevent` attribute: only declared variables emit

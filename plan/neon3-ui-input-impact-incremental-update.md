@@ -915,3 +915,79 @@ G_reorder_batch_100/move10         40      20
   `108 passed; 8 failed`，失败名单与本轮改动前逐名相同。
 - `cargo run -q -p neon-wgpu-runtime --bin ui_input_incremental_probe` → `"status":"passed"`。
 - `rustfmt --edition 2024 --check`（本轮两文件）→ 干净；`cargo check -q --workspace --all-targets` → exit `0`。
+
+### 阶段二：UI Runtime 的 retained frame 接通生产发布路径 — 已完成
+
+目标：`neon-ui-runtime` 的每一次 input 发布不再“重新求值整棵树 + 重写全部节点 + 重建全部派生
+presentation”，而是带着上一份 retained frame，只跑 dirty slot 命中的 binding、只写受影响节点、
+只重建这些节点的派生效果；首次 frame、fragment revision 跳跃、renderer epoch 变化、无 dirty
+slot、程序重载必须回落 full rebuild。
+
+落地方式：
+
+1. `UiRetainedProjection`（`lib.rs`）= `UiRetainedFrame` + `fragment_revision` + `renderer_epoch`
+   + `kinds` 索引，挂在 `UiRuntime::retained_projection`（`Option`，进程内永不 clone）。
+   选择 `UiRuntime` 而不是 `UiHostAdapter` 持有：后者在每次 host publication 都会被 clone
+   （`complete_host_forward`），挂上去等于在热路径上加一次 O(N) 深拷贝。
+2. 新入口 `refresh_fragment_with_projection(...)`（`lib.rs:2017`）替换四个生产发布点的
+   `refresh_fragment_from_program`：`ui.flow.submit`、`ui.flow.patch`、`ui.host.forward`、
+   `ui.input.apply`。守卫顺序固定为 renderer_epoch → fragment_revision → 空 dirty slot，
+   任一不满足都带稳定 code 回落全量；`apply_ui_impact_set` 自身的 program_revision /
+   revision 单调 / degraded 守卫继续在后兜底。
+3. `apply_program_states(..., only)` 成为 delta 与 full 两条路径共用的唯一写入器：节点写入、
+   派生 effect 的 `retain` + 重建全部受 `only` 约束，因此两条路径不可能写入不同内容，
+   也不可能出现“delta 少写但 full 多写”的口径分歧。effect 作用域取 `impact.node_keys`
+   而不是 `delta.changed_states`：canvas_data 槽变脏会改 effect 但不改 `UiCpuNodeState`。
+4. 非权威内容一律丢弃 projection（`drop_retained_projection`）：optimistic motion、
+   host presentation 替换、`handle_fragment_submit`、`submit_static_fragment`。retained delta
+   只能重建 impact 图可达的节点，可达性由编译器决定而不是由调用点“希望”决定，所以只要
+   fragment 里存在权威求值没覆盖的值，就必须回到全量。
+5. `UiFragmentRefresh` 是 producer/consumer 两半的记录：`dirty_slots / changed_bindings /
+   changed_nodes / bindings_executed / bindings_total / nodes_written / tree_nodes_visited /
+   effects_rebuilt / layout_rebuilt / primitives_rebuilt / fallback_code`，经
+   `record_fragment_refresh` 以 `ui.fragment.refresh` 事件写入 journal，供 CLI/AI 查询。
+   `layout_rebuilt` 与 `primitives_rebuilt` 分开：CPU delta 永不重排 layout，可见性翻转只会
+   重新链接 primitive assembly，把两者混成一个字段会让“静态帧不得重建全量数据”无法判定。
+
+实测（新 probe `ui_retained_refresh_probe`，双车道：一条保留 projection，一条每次先丢弃）：
+
+```text
+10 节点 fixture                                  结果
+activation/full_pass                             full, nodes_written 10/10
+publication_left/delta   left → left-panel       delta, bindings 1/3, changed_nodes 1,
+                                                 nodes_written 2/10, effects_rebuilt 0,
+                                                 layout_rebuilt false
+publication_speed/delta  speed → speed-slider    delta, nodes_written 1, effects_rebuilt 1
+guard/{fragment_revision_jump,renderer_epoch,
+      without_dirty_slot}                        全部回落，code 逐名匹配
+guard/fallback_reseeds                           回落重新播种，下一次发布仍是 delta
+optimistic/healed_by_full_pass                   丢弃后全量修复，两车道内容一致
+optimistic/delta_resumes                         再下一次仍是 delta
+604 节点（600 filler）
+  activation full      5260 µs
+  同一发布 full 重建   5312 µs   nodes_written 604/604, bindings 3/3
+  同一发布 delta       1666 µs   nodes_written   2/604, bindings 1/3, effects 0
+```
+
+可见性 binding 的作用域含其布局祖先（`ui_input_impact.rs:103`），所以左面板的一次翻转写 2 个
+节点（自身 + root）而不是 1 个；这是编译期图给的口径，probe 按 2 断言。
+
+仍未做到（下一轮候选，probe 里如实上报不掩盖）：
+
+1. `tree_nodes_visited == 604`：写入已经收窄，但 `apply_program_states` 仍遍历整棵
+   `UiNode` 树做 membership 判断。需要一个“受影响节点 → 树路径”的剪枝索引，把遍历本身
+   也降到 O(impacted)，这是 delta 1666 µs 的主要剩余成本。
+2. 4 个生产发布点之外，编辑器活动/popup/text-material 的失效路径仍走全量（阶段四范围）。
+3. renderer 侧尚未直接消费 `UiFrameDelta`（阶段三）。
+
+验证：
+
+- `cargo run -q -p neon-ui-runtime --bin ui_retained_refresh_probe` → exit `0`，
+  14 条 `"pass":true`、0 条 `"pass":false`。
+- `cargo test -q -p neon-ui-runtime --lib` → `246 passed; 0 failed`（新增
+  `retained_projection_matches_full_refresh_and_refuses_stale_sessions`）。
+- `cargo run -q -p neon-wgpu-runtime --bin ui_reconcile_baseline_probe` → exit `0`。
+- `cargo run -q -p neon-wgpu-runtime --bin ui_input_incremental_probe` → `"status":"passed"`。
+- `cargo fmt --all -- --check` → 干净；`cargo check -q --workspace --all-targets` → exit `0`。
+- 存量债务未变：`cargo test -p neon-wgpu-runtime --lib ui_renderer` 的 8 个失败与阶段一
+  逐名相同，本轮没有重跑全量 wgpu 套件（耗时 70 s+ 且与本轮改动无耦合），记录为存量。

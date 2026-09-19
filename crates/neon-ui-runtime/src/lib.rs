@@ -1,7 +1,7 @@
 //! Headless UI declaration runtime. It must not create windows or GPU objects.
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     net::SocketAddr,
     sync::mpsc::{self, Receiver, Sender},
     time::Instant,
@@ -1919,8 +1919,27 @@ fn program_semantic_event_kind(
     }
 }
 
+/// The authoritative CPU evaluation always resolves a program against the
+/// unbounded logical viewport: this runtime owns no surface, so the renderer's
+/// real viewport cannot change which node states are true.
+fn authoritative_cpu_viewport() -> UiCpuViewport {
+    UiCpuViewport {
+        logical_bounds: UiBounds {
+            x: 0.0,
+            y: 0.0,
+            width: f32::MAX,
+            height: f32::MAX,
+        },
+        revision: Revision(0),
+    }
+}
+
 /// Re-applies the compiled program to a submitted fragment after an external
 /// scalar publication. Grid effects are intentionally maintained separately.
+///
+/// This is the full pass: every binding runs and every derived presentation is
+/// rebuilt. `refresh_fragment_with_projection` is the production entry point
+/// and only reaches this work when the retained projection cannot advance.
 fn refresh_fragment_from_program(
     fragment: &mut UiFragment,
     program: &UiProgram,
@@ -1930,15 +1949,7 @@ fn refresh_fragment_from_program(
     let evaluated = evaluate_ui_program(
         program,
         inputs,
-        UiCpuViewport {
-            logical_bounds: UiBounds {
-                x: 0.0,
-                y: 0.0,
-                width: f32::MAX,
-                height: f32::MAX,
-            },
-            revision: Revision(0),
-        },
+        authoritative_cpu_viewport(),
         &UiLocalPresentationState::default(),
     );
     let states = evaluated
@@ -1946,12 +1957,210 @@ fn refresh_fragment_from_program(
         .into_iter()
         .map(|state| (state.node_key.clone(), state))
         .collect::<BTreeMap<_, _>>();
+    let kinds = program
+        .nodes
+        .iter()
+        .map(|node| (node.key.clone(), node.kind.clone()))
+        .collect::<BTreeMap<_, _>>();
+    apply_program_states(fragment, program, inputs, schema, &states, &kinds, None);
+}
+
+/// The last authoritative CPU evaluation of the active program, plus the
+/// fragment revision and renderer session it was written into. A fragment
+/// written by anything other than the authoritative evaluation (an optimistic
+/// motion, a host presentation replacement) drops it, so a delta can never
+/// leave an optimistic value standing where authority disagrees.
+pub struct UiRetainedProjection {
+    frame: ui_retained_evaluator::UiRetainedFrame,
+    fragment_revision: Revision,
+    renderer_epoch: u64,
+    kinds: BTreeMap<String, UiNodeKind>,
+}
+
+/// What one production fragment refresh actually redid. Both the probe and the
+/// forwarded diagnostics read these numbers, so neither the UI runtime nor the
+/// renderer can claim the other's work happened.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct UiFragmentRefresh {
+    pub delta_applied: bool,
+    /// Stable code naming why the full pass had to run.
+    pub fallback_code: &'static str,
+    pub input_revision: Revision,
+    pub dirty_slots: Vec<String>,
+    /// Binding ids the retained evaluator re-executed.
+    pub changed_bindings: Vec<u32>,
+    pub bindings_executed: usize,
+    pub bindings_total: usize,
+    /// Nodes whose authoritative CPU state actually changed.
+    pub changed_nodes: Vec<String>,
+    pub nodes_total: usize,
+    pub tree_nodes_visited: usize,
+    pub nodes_written: usize,
+    pub effects_rebuilt: usize,
+    /// True only when the whole tree was re-laid out, which the retained path
+    /// never does. A visibility flip re-links the primitive assembly instead;
+    /// that is reported by `primitives_rebuilt`.
+    pub layout_rebuilt: bool,
+    pub primitives_rebuilt: bool,
+}
+
+/// Node a program-derived presentation effect belongs to.
+fn derived_effect_node(effect: &UiEffect) -> Option<&str> {
+    match effect {
+        UiEffect::ControlPresentation { node_id, .. } | UiEffect::CanvasData { node_id, .. } => {
+            Some(node_id.0.as_str())
+        }
+        _ => None,
+    }
+}
+
+/// Advances the retained projection for one input publication and writes only
+/// the nodes the compiled impact graph reaches. Any guard failure falls back to
+/// the golden full evaluation, which re-seeds the projection from its output.
+pub fn refresh_fragment_with_projection(
+    projection: &mut Option<UiRetainedProjection>,
+    fragment: &mut UiFragment,
+    program: &UiProgram,
+    inputs: &UiResolvedInputs,
+    schema: &UiInputSchema,
+    renderer_epoch: u64,
+    changed_slots: &[String],
+) -> UiFragmentRefresh {
+    let local = UiLocalPresentationState::default();
+    let bindings_total = program.binding_records.len();
+    let nodes_total = program.nodes.len();
+    let mut fallback_code = "ui_retained_first_frame";
+    if let Some(current) = projection.as_mut() {
+        fallback_code = if current.renderer_epoch != renderer_epoch {
+            "ui_retained_renderer_epoch"
+        } else if current.fragment_revision.0 + 1 != fragment.revision.0 {
+            "ui_retained_fragment_revision_jump"
+        } else if changed_slots.is_empty() {
+            "ui_retained_without_dirty_slot"
+        } else {
+            let impact = ui_retained_evaluator::UiImpactSet::from_input_publication(
+                program,
+                changed_slots,
+                inputs.input_revision,
+                fragment.revision,
+            );
+            match ui_retained_evaluator::apply_ui_impact_set(
+                program,
+                &mut current.frame,
+                inputs,
+                &local,
+                &impact,
+            ) {
+                Ok(delta) => {
+                    let scope = impact.node_keys.iter().cloned().collect::<BTreeSet<_>>();
+                    let (visited, written, effects_rebuilt) = apply_program_states(
+                        fragment,
+                        program,
+                        inputs,
+                        schema,
+                        current.frame.states(),
+                        &current.kinds,
+                        Some(&scope),
+                    );
+                    current.fragment_revision = fragment.revision;
+                    let changed_bindings = delta.executed_binding_ids;
+                    return UiFragmentRefresh {
+                        delta_applied: true,
+                        fallback_code: "ui_retained_delta_applied",
+                        input_revision: inputs.input_revision,
+                        dirty_slots: changed_slots.to_vec(),
+                        bindings_executed: changed_bindings.len(),
+                        bindings_total,
+                        changed_bindings,
+                        changed_nodes: delta
+                            .changed_states
+                            .iter()
+                            .map(|state| state.node_key.clone())
+                            .collect(),
+                        nodes_total,
+                        tree_nodes_visited: visited,
+                        nodes_written: written,
+                        effects_rebuilt,
+                        layout_rebuilt: !delta.layout_unchanged,
+                        primitives_rebuilt: delta.render_primitives_rebuilt,
+                    };
+                }
+                Err(error) => error.code,
+            }
+        };
+    }
+    let frame = ui_retained_evaluator::evaluate_ui_program_initial(
+        program,
+        inputs,
+        authoritative_cpu_viewport(),
+        &local,
+    );
+    let kinds = program
+        .nodes
+        .iter()
+        .map(|node| (node.key.clone(), node.kind.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let (visited, written, effects_rebuilt) = apply_program_states(
+        fragment,
+        program,
+        inputs,
+        schema,
+        frame.states(),
+        &kinds,
+        None,
+    );
+    *projection = Some(UiRetainedProjection {
+        frame,
+        fragment_revision: fragment.revision,
+        renderer_epoch,
+        kinds,
+    });
+    UiFragmentRefresh {
+        delta_applied: false,
+        fallback_code,
+        input_revision: inputs.input_revision,
+        dirty_slots: changed_slots.to_vec(),
+        changed_bindings: Vec::new(),
+        bindings_executed: bindings_total,
+        bindings_total,
+        changed_nodes: Vec::new(),
+        nodes_total,
+        tree_nodes_visited: visited,
+        nodes_written: written,
+        effects_rebuilt,
+        layout_rebuilt: true,
+        primitives_rebuilt: true,
+    }
+}
+
+/// Writes evaluated node states into the submitted fragment tree and rebuilds
+/// the presentation effects the program derives from them. `only` restricts
+/// every write and every rebuild to the nodes one impact set reaches, which is
+/// what makes an input delta unable to rebuild unrelated UI data. Returns
+/// `(tree nodes visited, nodes written, derived effects rebuilt)`.
+fn apply_program_states(
+    fragment: &mut UiFragment,
+    program: &UiProgram,
+    inputs: &UiResolvedInputs,
+    schema: &UiInputSchema,
+    states: &BTreeMap<String, UiCpuNodeState>,
+    kinds: &BTreeMap<String, UiNodeKind>,
+    only: Option<&BTreeSet<String>>,
+) -> (usize, usize, usize) {
     fn apply(
         node: &mut UiNode,
         states: &BTreeMap<String, UiCpuNodeState>,
         kinds: &BTreeMap<String, UiNodeKind>,
+        only: Option<&BTreeSet<String>>,
+        visited: &mut usize,
+        written: &mut usize,
     ) {
-        if let Some(state) = states.get(&node.node_id.0) {
+        *visited += 1;
+        if only.map_or(true, |only| only.contains(&node.node_id.0))
+            && let Some(state) = states.get(&node.node_id.0)
+        {
+            *written += 1;
             node.visible = state.visible;
             node.enabled = state.enabled;
             node.style.opacity = state.opacity;
@@ -1967,23 +2176,33 @@ fn refresh_fragment_from_program(
             }
         }
         for child in &mut node.children {
-            apply(child, states, kinds);
+            apply(child, states, kinds, only, visited, written);
         }
     }
-    let kinds = program
-        .nodes
-        .iter()
-        .map(|node| (node.key.clone(), node.kind.clone()))
-        .collect::<BTreeMap<_, _>>();
-    apply(&mut fragment.root, &states, &kinds);
+    let mut visited = 0;
+    let mut written = 0;
+    apply(
+        &mut fragment.root,
+        states,
+        kinds,
+        only,
+        &mut visited,
+        &mut written,
+    );
     fragment.effects.retain(|effect| {
-        !matches!(
-            effect,
-            UiEffect::ControlPresentation { .. } | UiEffect::CanvasData { .. }
-        )
+        match (derived_effect_node(effect), only) {
+            // Only the reached nodes are rebuilt, so their stale effects go.
+            (Some(node_key), Some(only)) => !only.contains(node_key),
+            (Some(_), None) => false,
+            (None, _) => true,
+        }
     });
+    let mut rebuilt = 0;
     for binding in &program.binding_records {
         if binding.property != UiBoundProperty::CanvasData {
+            continue;
+        }
+        if only.map_or(false, |only| !only.contains(&binding.node_key)) {
             continue;
         }
         let Some(neon_ui_schema::UiResolvedInputValue {
@@ -1997,8 +2216,12 @@ fn refresh_fragment_from_program(
             node_id: UiNodeId(binding.node_key.clone()),
             data: value.clone(),
         });
+        rebuilt += 1;
     }
     for node in &program.nodes {
+        if only.map_or(false, |only| !only.contains(&node.key)) {
+            continue;
+        }
         let Some(state) = states.get(&node.key) else {
             continue;
         };
@@ -2114,8 +2337,10 @@ fn refresh_fragment_from_program(
                 node_id: UiNodeId(node.key.clone()),
                 state,
             });
+            rebuilt += 1;
         }
     }
+    (visited, written, rebuilt)
 }
 
 fn same_payload_kind(left: &UiSemanticPayloadValue, right: &UiSemanticPayloadValue) -> bool {
@@ -3252,6 +3477,10 @@ pub struct UiRuntime {
     ai_terrain: AiTerrainPanelState,
     showcase_text: String,
     host_adapter: Option<UiHostAdapter>,
+    /// Last authoritative CPU evaluation of the active program. It is dropped
+    /// as soon as anything else writes cached-fragment content, so an input
+    /// delta can never leave an optimistic value standing.
+    retained_projection: Option<UiRetainedProjection>,
     eventd_endpoint: Option<SocketAddr>,
     interaction_traces: InteractionTraceStore,
     flow_document: Option<NuiFlowDocument>,
@@ -3318,6 +3547,7 @@ impl UiRuntime {
             ai_terrain: AiTerrainPanelState::default(),
             showcase_text: String::new(),
             host_adapter: None,
+            retained_projection: None,
             eventd_endpoint: None,
             interaction_traces: InteractionTraceStore::default(),
             flow_document: None,
@@ -3916,12 +4146,16 @@ impl UiRuntime {
         // fragment reaches WGPU. Otherwise mutually exclusive branches all
         // render until the first input publication arrives.
         let initial_inputs = adapter.snapshot().scalar_inputs;
-        refresh_fragment_from_program(
+        let refresh = refresh_fragment_with_projection(
+            &mut self.retained_projection,
             &mut fragment,
-            &program,
+            adapter.program(),
             &initial_inputs,
-            &document.input_schema,
+            adapter.input_schema(),
+            adapter.renderer_epoch(),
+            &[],
         );
+        self.record_fragment_refresh("ui.flow.submit", &request.request_id, &refresh);
         self.host_adapter = Some(adapter);
         timings.fragment_ms = elapsed_ms(fragment_started);
         let forwarded = RpcRequest {
@@ -4421,12 +4655,16 @@ impl UiRuntime {
         }
         .with_event_publisher(self.eventd_endpoint, self.client.clone());
         let initial_inputs = adapter.snapshot().scalar_inputs;
-        refresh_fragment_from_program(
+        let refresh = refresh_fragment_with_projection(
+            &mut self.retained_projection,
             &mut fragment,
-            &program,
+            adapter.program(),
             &initial_inputs,
-            &new_doc.input_schema,
+            adapter.input_schema(),
+            adapter.renderer_epoch(),
+            &[],
         );
+        self.record_fragment_refresh("ui.flow.patch", &request.request_id, &refresh);
         self.host_adapter = Some(adapter);
         timings.fragment_ms = elapsed_ms(fragment_started);
         let forwarded = RpcRequest {
@@ -4883,6 +5121,37 @@ impl UiRuntime {
         self.complete_host_forward(wgpu_endpoint, prep, host_response, next_flow_state_machine)
     }
 
+    /// Reports what one authoritative fragment refresh actually redid. This is
+    /// the producer half of the incremental update contract: the record names
+    /// the dirty slots it consumed, the bindings it re-executed, the nodes it
+    /// wrote, and the stable code for why a full pass was or was not needed.
+    fn record_fragment_refresh(
+        &self,
+        lane: &'static str,
+        request_id: &RequestId,
+        refresh: &UiFragmentRefresh,
+    ) {
+        eprintln!(
+            "{}",
+            json!({
+                "event": "ui.fragment.refresh",
+                "service": SERVICE_NAME,
+                "epoch": self.epoch,
+                "lane": lane,
+                "request_id": request_id.0,
+                "refresh": refresh,
+            })
+        );
+    }
+
+    /// Drops the retained CPU projection because something other than the
+    /// authoritative evaluation wrote cached fragment content (an optimistic
+    /// motion, a host presentation replacement, or a domain-submitted fragment).
+    /// The next refresh then has to heal every node with a full pass.
+    fn drop_retained_projection(&mut self) {
+        self.retained_projection = None;
+    }
+
     /// Applies a completed host response to the runtime: parses the publication,
     /// creates the updated fragment (with grid effects and pending motions),
     /// submits it to the renderer, and records the interaction trace. Shared by
@@ -5021,20 +5290,26 @@ impl UiRuntime {
                     }
                 };
             candidate = replacement_adapter;
+            // The host authored this fragment's content, so no retained
+            // evaluation can claim what the next refresh starts from.
+            self.drop_retained_projection();
             replacement_fragment
         } else {
             let mut updated = fragment.clone();
             updated.revision = Revision(updated.revision.0 + 1);
-            refresh_fragment_from_program(
+            let publication = publication_result
+                .as_ref()
+                .expect("ordinary publication has a result");
+            let refresh = refresh_fragment_with_projection(
+                &mut self.retained_projection,
                 &mut updated,
                 candidate.program(),
-                &publication_result
-                    .as_ref()
-                    .expect("ordinary publication has a result")
-                    .snapshot
-                    .scalar_inputs,
+                &publication.snapshot.scalar_inputs,
                 candidate.input_schema(),
+                candidate.renderer_epoch(),
+                &publication.changed_slots,
             );
+            self.record_fragment_refresh("ui.host.forward", &request_id, &refresh);
             updated
         };
         // Re-apply the selected motion after the authoritative publication.
@@ -5043,6 +5318,9 @@ impl UiRuntime {
         // state target with the declaration's base value.
         if !selected_motions.is_empty() {
             apply_transitions_to_fragment(&mut updated, &selected_motions);
+            // The cached fragment now carries optimistic values the evaluation
+            // did not write; the next refresh must heal every node.
+            self.drop_retained_projection();
         }
         if let Some(publication_result) = &publication_result {
             for effect in &mut updated.effects {
@@ -5626,6 +5904,9 @@ impl UiRuntime {
             Err((code, message)) => return self.rejected(request.request_id, code, message),
         };
         let revision = fragment.revision;
+        // A domain-submitted fragment replaces the authoritative content, so
+        // the next publication has to heal the whole tree.
+        self.drop_retained_projection();
         self.cached_fragment = Some(fragment);
         self.accepted(
             request.request_id,
@@ -5931,12 +6212,16 @@ impl UiRuntime {
                 };
                 let mut updated = active.clone();
                 updated.revision = Revision(active.revision.0.saturating_add(1));
-                refresh_fragment_from_program(
+                let refresh = refresh_fragment_with_projection(
+                    &mut self.retained_projection,
                     &mut updated,
                     adapter.program(),
                     &result.snapshot.scalar_inputs,
                     adapter.input_schema(),
+                    adapter.renderer_epoch(),
+                    &result.changed_slots,
                 );
+                self.record_fragment_refresh("ui.input.apply", &request.request_id, &refresh);
                 let submitted = self.forward_fragment(
                     wgpu_endpoint,
                     RpcRequest {
@@ -6063,6 +6348,7 @@ impl UiRuntime {
         // next host publication. Keep the cache at the same revision or the
         // deferred host lane will submit the old revision and every following
         // interaction will fail with fragment_revision_stale.
+        self.drop_retained_projection();
         self.cached_fragment = Some(next_fragment);
         Ok(())
     }
@@ -6418,6 +6704,9 @@ impl UiRuntime {
         let response = client.call(&request)?;
         let event = match response.status {
             RpcStatus::Accepted => {
+                // A caller-supplied static fragment replaces authoritative
+                // content; the next publication must heal the whole tree.
+                self.drop_retained_projection();
                 self.cached_fragment = Some(fragment);
                 EVENT_COMMAND_ACCEPTED
             }
@@ -8064,6 +8353,189 @@ mod tests {
                 Some(ERROR_UI_PROGRAM_EVENT_CONTROL_UNAVAILABLE)
             );
         }
+    }
+
+    /// Every node field the fragment writer is allowed to change, in tree order.
+    fn fragment_writes(fragment: &UiFragment) -> Vec<String> {
+        fn walk(node: &UiNode, out: &mut Vec<String>) {
+            out.push(format!(
+                "{}|{}|{}|{:?}|{}",
+                node.node_id.0, node.visible, node.enabled, node.text, node.style.opacity
+            ));
+            for child in &node.children {
+                walk(child, out);
+            }
+        }
+        let mut out = Vec::new();
+        walk(&fragment.root, &mut out);
+        out
+    }
+
+    /// Derived presentations as a set: a delta appends the ones it rebuilt while
+    /// the full pass rebuilds all of them in program order, and the renderer keys
+    /// presentations by node path, so order carries no meaning.
+    fn fragment_presentations(fragment: &UiFragment) -> Vec<String> {
+        let mut effects = fragment
+            .effects
+            .iter()
+            .map(|effect| format!("{effect:?}"))
+            .collect::<Vec<_>>();
+        effects.sort();
+        effects
+    }
+
+    /// The retained projection must write the same fragment the pure full
+    /// refresh writes for one input publication, and must refuse — rather than
+    /// half-apply — when the fragment revision or renderer session it was seeded
+    /// against has moved.
+    #[test]
+    fn retained_projection_matches_full_refresh_and_refuses_stale_sessions() {
+        let (document, program) =
+            crate::demo_domain::component_gallery_program(gallery_asset()).unwrap();
+        let revision = program.revision.clone();
+        let schema = document.input_schema.clone();
+        let mut store = UiInputStore::activate(revision.clone(), schema.clone()).unwrap();
+        let make_fragment = || UiFragment {
+            fragment_id: UiFragmentId("retained-refresh".into()),
+            revision: Revision(1),
+            root: document.ir.root.clone(),
+            effects: lower_nui_flow_effects(&document),
+        };
+        let mut delta_lane = make_fragment();
+        let mut full_lane = make_fragment();
+        let publish = |store: &mut UiInputStore, key: &str, value: UiInputValue| {
+            let base = store.snapshot();
+            store
+                .apply(
+                    UiInputWriter::External,
+                    UiInputFrame {
+                        program_revision: revision.clone(),
+                        expected_input_revision: base.input_revision,
+                        request_id: format!("retained-refresh-{key}"),
+                        idempotency_key: format!("retained-refresh-{key}"),
+                        changes: vec![UiInputChange {
+                            key: key.into(),
+                            value,
+                        }],
+                    },
+                )
+                .unwrap()
+                .changed_slots
+        };
+
+        // Activation has nothing retained, so both lanes run the full pass.
+        let mut projection: Option<UiRetainedProjection> = None;
+        delta_lane.revision = Revision(2);
+        full_lane.revision = Revision(2);
+        let seeded = refresh_fragment_with_projection(
+            &mut projection,
+            &mut delta_lane,
+            &program,
+            &store.snapshot(),
+            &schema,
+            1,
+            &[],
+        );
+        let seeded_full = refresh_fragment_with_projection(
+            &mut None,
+            &mut full_lane,
+            &program,
+            &store.snapshot(),
+            &schema,
+            1,
+            &[],
+        );
+        assert!(!seeded.delta_applied);
+        assert_eq!(seeded.fallback_code, "ui_retained_first_frame");
+        assert_eq!(seeded.bindings_executed, seeded.bindings_total);
+        assert_eq!(seeded.nodes_written, seeded_full.nodes_written);
+        assert_eq!(fragment_writes(&delta_lane), fragment_writes(&full_lane));
+        assert_eq!(
+            fragment_presentations(&delta_lane),
+            fragment_presentations(&full_lane)
+        );
+
+        // One numeric publication reaches one node and one presentation.
+        let changed = publish(
+            &mut store,
+            "slider_value",
+            UiInputValue::F32 { value: 0.75 },
+        );
+        delta_lane.revision = Revision(3);
+        full_lane.revision = Revision(3);
+        let delta = refresh_fragment_with_projection(
+            &mut projection,
+            &mut delta_lane,
+            &program,
+            &store.snapshot(),
+            &schema,
+            1,
+            &changed,
+        );
+        let full = refresh_fragment_with_projection(
+            &mut None,
+            &mut full_lane,
+            &program,
+            &store.snapshot(),
+            &schema,
+            1,
+            &changed,
+        );
+        assert!(delta.delta_applied);
+        assert_eq!(delta.fallback_code, "ui_retained_delta_applied");
+        assert_eq!(delta.dirty_slots, vec!["slider_value".to_owned()]);
+        assert!(
+            delta.changed_nodes.contains(&"exposure-slider".to_owned()),
+            "delta changed nodes: {:?}",
+            delta.changed_nodes
+        );
+        assert!(delta.nodes_written < seeded.nodes_written);
+        assert!(delta.effects_rebuilt < full.effects_rebuilt);
+        assert!(delta.effects_rebuilt > 0);
+        assert!(delta.bindings_executed < delta.bindings_total);
+        assert!(!delta.layout_rebuilt);
+        assert_eq!(delta.input_revision, Revision(1));
+        assert_eq!(fragment_writes(&delta_lane), fragment_writes(&full_lane));
+        assert_eq!(
+            fragment_presentations(&delta_lane),
+            fragment_presentations(&full_lane)
+        );
+
+        // Guards: each stale condition falls back to the full pass by code.
+        let jumped = refresh_fragment_with_projection(
+            &mut projection,
+            &mut delta_lane,
+            &program,
+            &store.snapshot(),
+            &schema,
+            1,
+            &changed,
+        );
+        assert_eq!(jumped.fallback_code, "ui_retained_fragment_revision_jump");
+        delta_lane.revision = Revision(4);
+        let epoch = refresh_fragment_with_projection(
+            &mut projection,
+            &mut delta_lane,
+            &program,
+            &store.snapshot(),
+            &schema,
+            2,
+            &changed,
+        );
+        assert_eq!(epoch.fallback_code, "ui_retained_renderer_epoch");
+        assert!(!epoch.delta_applied);
+        delta_lane.revision = Revision(5);
+        let slotless = refresh_fragment_with_projection(
+            &mut projection,
+            &mut delta_lane,
+            &program,
+            &store.snapshot(),
+            &schema,
+            2,
+            &[],
+        );
+        assert_eq!(slotless.fallback_code, "ui_retained_without_dirty_slot");
+        assert!(!slotless.delta_applied);
     }
 
     #[test]

@@ -303,6 +303,7 @@ impl UiIncrementalUpdateRecord {
     }
 }
 
+#[derive(Clone, Debug)]
 pub struct UiRetainedFrame {
     program_revision: UiProgramRevision,
     input_revision: Revision,
@@ -346,6 +347,13 @@ impl UiRetainedFrame {
         self.degraded
     }
 
+    /// Retained authoritative state per compiled node. The production refresh
+    /// path reads the impacted entries from here instead of materializing a
+    /// whole `UiCpuFrameOutput`.
+    pub fn states(&self) -> &BTreeMap<String, UiCpuNodeState> {
+        &self.states
+    }
+
     pub fn previews(&self) -> impl Iterator<Item = (UiInteractionKind, &str)> {
         self.previews
             .iter()
@@ -361,6 +369,7 @@ impl UiRetainedFrame {
     }
 }
 
+#[derive(Clone, Debug)]
 struct NodeSeed {
     visible: bool,
     enabled: bool,
@@ -376,6 +385,11 @@ pub fn evaluate_ui_program_initial(
     local: &UiLocalPresentationState,
 ) -> UiRetainedFrame {
     let golden = crate::evaluate_ui_program(program, inputs, viewport, local);
+    let literals = program
+        .literal_texts
+        .iter()
+        .map(|entry| (entry.node_key.as_str(), entry.handle))
+        .collect::<BTreeMap<_, _>>();
     let seeds = program
         .node_templates
         .iter()
@@ -389,11 +403,7 @@ pub fn evaluate_ui_program_initial(
                     scroll_offset: template
                         .layout
                         .map_or([0.0; 2], |layout| layout.scroll_offset),
-                    literal_text: program
-                        .literal_texts
-                        .iter()
-                        .find(|entry| entry.node_key == template.node_id.0)
-                        .map(|entry| entry.handle),
+                    literal_text: literals.get(template.node_id.0.as_str()).copied(),
                 },
             )
         })
