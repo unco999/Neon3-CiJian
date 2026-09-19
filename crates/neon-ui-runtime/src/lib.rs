@@ -9734,3 +9734,4 @@ mod tests {
     }
 }
 pub mod ui_keyed_diff;
+pub mod ui_patch_batcher;

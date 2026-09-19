@@ -254,7 +254,7 @@ same parent child list changed significantly
 
 ## 5. Phase 3：Patch coalescing 和 frame batching
 
-状态：`TODO`
+状态：`DONE（2026-09-19）`
 
 ### 目标
 
@@ -302,6 +302,24 @@ transaction-1 fill active -> warning -> success
 - 高频 token 不触发 full Flow compile。
 - patch revision 严格递增。
 - 重复状态不会产生 patch。
+
+### 完成证据（2026-09-19）
+
+- `crates/neon-ui-runtime/src/ui_patch_batcher.rs`：`UiPatchBatcher`
+  （`enqueue`/`flush`/`note_ack`/`note_rejected`）。SetProperty 按
+  `(node_path, property)` last-value-wins 合并；结构/transition/input 操作保持
+  到达顺序；ack 未返回时 `flush` 拒绝发出下一批（上表 “renderer ack 未返回” 行）。
+- `crates/neon-ui-runtime/src/bin/ui_patch_coalesce_probe.rs`
+  （`ui-patch-coalesce.v1`，JSONL）6/6 pass：
+  `fifty_events_one_patch`（50 事件 → 1 patch、50 ops、apply 后 fixed point）、
+  `token_stream_last_value_wins`（16 次 token → 1 个 set、0 结构 op）、
+  `ack_gate_and_strict_revisions`（base 11→12→13 严格递增、2 次被 gate 阻塞）、
+  `duplicate_state_no_patch`、`mixed_ops_keep_order_and_converge`、
+  `rejection_adopts_authoritative_revision`（rejected 后采用权威 revision 并丢弃旧批）。
+- 时间窗 flush 策略（< 16ms tick、30-60ms token coalesce、immediate flush）属于
+  event loop 调度，推迟到 Phase 7 落地；本阶段固化的是合并语义与 revision 纪律。
+- 验证：`cargo test -p neon-ui-runtime --lib` 198/198（含 batcher 5 个单元测试）、
+  probe 6/6、`cargo fmt -- --check` 干净、clippy 对新增文件 0 告警。
 
 ---
 
