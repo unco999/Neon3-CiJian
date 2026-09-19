@@ -325,7 +325,7 @@ transaction-1 fill active -> warning -> success
 
 ## 6. Phase 4：Neon3 runtime patch pipeline 优化
 
-状态：`TODO`
+状态：`DONE（2026-09-19，R2/R3 按编译器调研结论收敛为安全子集）`
 
 ### 目标
 
@@ -343,6 +343,36 @@ transaction-1 fill active -> warning -> success
 | R6 | 增加 patch telemetry | patch_apply/compile/fragment/reconcile 分开统计 |
 
 注意：不能为了性能绕过 revision 校验、source hash 或 renderer ack。
+
+### 完成证据（2026-09-19）
+
+- R1：`ui.flow.patch` 新增 `dry_run: true`。patch 在 IR 克隆上完整校验
+  （含 revision 校验），返回 `impacted_nodes` / `patch_kind` / `would_apply_revision`，
+  不 compile、不 submit、不改动任何 runtime 状态；dry-run 后同 revision 的真实 patch 仍可用。
+- R2：每个 patch 响应携带 `patch_kind`（`property_only` / `structural`）。编译器调研
+  （Explore 报告）证明 program 内嵌节点属性值（node_templates、layout_records、literal
+  text handles、layout_hash、glyph 容量门），因此 **program/adapter 级 property-only 复用不安全**，
+  未实现；安全子集落地为：`NuiFlowStateMachineRuntime` 不再每 patch 重建
+  （`state_machines` 声明不可能被 patch 触及，旧实现每次 patch 都会重置活着的 statechart 状态）。
+- R3：source-file digest 缓存 `UiRuntime::source_file_digests`：`source_file` 绑定文件的
+  (mtime, size) digest 不变时跳过磁盘读取与全文 clone；digest 与 flow_document 在同一
+  commit 点提交，失败/被拒的 patch 会强制下次重读。wgpu renderer 侧的按 key 资源复用
+  （created==0）已在 Phase 1 K3 证明。
+- R4：compile 失败 / stale revision / 非法 patch / activation 失败全部改为结构化
+  `rejected`，error code 稳定（`ui_flow_patch_stale_revision`、`nui_flow_compile`、
+  `ui_flow_patch_apply_failed`、`ui_flow_activation_failed`、`ui_flow_patch_params_invalid`、
+  `ui_flow_patch_no_active_flow`），result 携带
+  `{"state":"patch_rejected","fallback":"previous_program_retained","retained_revision":N}`；
+  旧 program/adapter/fragment 保持不变，后续健康 patch 正常 accepted。
+- R5：renderer 拒绝替换 fragment 时返回
+  `{"state":"patch_render_fallback","fallback_reason":"<renderer error code>"}`，
+  不提交任何状态，同一 patch 可在原 revision 直接重试。
+- R6：accepted patch 响应携带 `timing_ms` 全阶段拆分（patch_apply/compile/fragment/forward…）
+  与 renderer ack 的原始 result（`renderer` 字段，含 graph revision / reconcile 信息）。
+- Probe：`ui_patch_revision_probe`（`ui-patch-revision.v1`）5 case 全绿，含 scripted
+  renderer rejection；`ui_patch_baseline_probe` 全场景回归通过。
+- 验证：`cargo test -p neon-ui-runtime --lib` 198/198、revision probe 5/5、baseline probe
+  pass、`cargo fmt -- --check` 干净、clippy 对改动文件 0 告警。
 
 ---
 

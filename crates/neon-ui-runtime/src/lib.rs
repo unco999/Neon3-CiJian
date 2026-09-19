@@ -1284,6 +1284,36 @@ fn elapsed_ms(started: Instant) -> f64 {
     started.elapsed().as_secs_f64() * 1000.0
 }
 
+/// Phase 4 (R1): the semantic nodes directly targeted by a patch operation
+/// list. Set/remove/move contribute their path; insert contributes the new
+/// parent and the inserted node's key. The list is sorted and deduplicated.
+fn impacted_nodes_for_patch(operations: &[Value]) -> Vec<String> {
+    let mut impacted = std::collections::BTreeSet::new();
+    for operation in operations {
+        let kind = operation
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or("set");
+        let path = operation.get("path").and_then(Value::as_str).unwrap_or("");
+        impacted.insert(path.to_owned());
+        if kind == "insert" {
+            let key = operation
+                .get("node_key")
+                .and_then(Value::as_str)
+                .or_else(|| {
+                    operation
+                        .get("node")
+                        .and_then(|node| node.get("node_id"))
+                        .and_then(Value::as_str)
+                });
+            if let Some(key) = key {
+                impacted.insert(format!("{path}/{key}"));
+            }
+        }
+    }
+    impacted.into_iter().collect()
+}
+
 fn compile_flow_source_for_rpc(
     source: &str,
 ) -> Result<NuiFlowCompiledProgram, NuiFlowCompileReport> {
@@ -3196,6 +3226,11 @@ pub struct UiRuntime {
     /// `serve_forwarder` path sets this; unit tests that call the method
     /// directly keep the default synchronous behavior.
     async_host_forward: bool,
+    /// Phase 4 (R3): last observed `(path, mtime, size)` digest of each code
+    /// editor's `source_file`. While the digest is unchanged across patches,
+    /// the committed IR already carries the last-read content, so the patch
+    /// pipeline skips the disk re-read and the full text clone.
+    source_file_digests: HashMap<String, (String, std::time::SystemTime, u64)>,
 }
 
 /// Context captured during the sync prep phase of a host forward. The caller
@@ -3243,6 +3278,7 @@ impl UiRuntime {
             last_state_transitions: Vec::new(),
             pending_host_forwards: VecDeque::new(),
             async_host_forward: false,
+            source_file_digests: HashMap::new(),
         }
     }
 
@@ -3946,24 +3982,35 @@ impl UiRuntime {
                 }
             }
         }
-        let current_doc = self
-            .flow_document
-            .as_ref()
-            .ok_or_else(|| TransportError::Io(std::io::Error::other("no active flow")))?;
+        // R4: the previous program/adapter/fragment stay authoritative until
+        // the renderer accepts the new one, so every pre-commit failure is a
+        // structured rejection that reports what was retained, never a
+        // transport error.
+        let Some(current_doc) = self.flow_document.clone() else {
+            return Ok(self.rejected_at_revision(
+                request.request_id.clone(),
+                "ui_flow_patch_no_active_flow",
+                "ui.flow.patch requires an active flow document",
+                Revision(0),
+                Some(json!({"state": "patch_rejected", "fallback": "no_previous_program"})),
+            ));
+        };
 
         // Build UiIrPatch from structured params (bypasses text patch restrictions).
-        let revision = request
-            .params
-            .get("revision")
-            .and_then(Value::as_u64)
-            .ok_or_else(|| TransportError::Io(std::io::Error::other("revision required")))?;
-        let ops_arr = request
-            .params
-            .get("operations")
-            .and_then(Value::as_array)
-            .ok_or_else(|| {
-                TransportError::Io(std::io::Error::other("operations array required"))
-            })?;
+        let Some(revision) = request.params.get("revision").and_then(Value::as_u64) else {
+            return Ok(self.rejected(
+                request.request_id.clone(),
+                "ui_flow_patch_params_invalid",
+                "revision (u64) is required",
+            ));
+        };
+        let Some(ops_arr) = request.params.get("operations").and_then(Value::as_array) else {
+            return Ok(self.rejected(
+                request.request_id.clone(),
+                "ui_flow_patch_params_invalid",
+                "operations array is required",
+            ));
+        };
         let ops_clone = ops_arr.clone();
         let mut operations = Vec::new();
         for op in ops_arr {
@@ -4034,9 +4081,11 @@ impl UiRuntime {
                     )
                 }
                 _ => {
-                    return Err(TransportError::Io(std::io::Error::other(format!(
-                        "unknown op kind: {kind}"
-                    ))));
+                    return Ok(self.rejected(
+                        request.request_id.clone(),
+                        "ui_flow_patch_params_invalid",
+                        &format!("unknown op kind: {kind}"),
+                    ));
                 }
             };
             operations.push(neon_ui_schema::UiIrPatchOperation {
@@ -4056,9 +4105,66 @@ impl UiRuntime {
             expected_revision: Revision(revision),
             operations,
         };
-        let mut new_ir = apply_nui_ir_patch(&current_doc.ir, &patch).map_err(|e| {
-            TransportError::Io(std::io::Error::other(format!("patch apply: {e:?}")))
-        })?;
+        let retained_revision = current_doc.ir.revision;
+        let patch_kind = if ops_arr.iter().all(|operation| {
+            operation
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or("set")
+                == "set"
+        }) {
+            "property_only"
+        } else {
+            "structural"
+        };
+        let impacted = impacted_nodes_for_patch(ops_arr);
+        let mut new_ir = match apply_nui_ir_patch(&current_doc.ir, &patch) {
+            Ok(applied) => applied,
+            Err(error) => {
+                // Surface stale-revision conflicts as their own stable code;
+                // renderer retries and journals key off the distinction.
+                let inner = error
+                    .diagnostics
+                    .first()
+                    .map(|diagnostic| diagnostic.code.as_str())
+                    .unwrap_or("");
+                let code = if inner == "nui_flow_stale_patch_revision" {
+                    "ui_flow_patch_stale_revision"
+                } else {
+                    "ui_flow_patch_apply_failed"
+                };
+                return Ok(self.retained_patch_rejection(
+                    request.request_id.clone(),
+                    code,
+                    &format!("{error:?}"),
+                    retained_revision,
+                ));
+            }
+        };
+        if request
+            .params
+            .get("dry_run")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            // R1: dry runs validate the patch against a throwaway IR clone
+            // and report the impacted set without compiling, submitting, or
+            // mutating any runtime state.
+            timings.patch_apply_ms = elapsed_ms(patch_started);
+            timings.total_ms = elapsed_ms(total_started);
+            return Ok(self.accepted(
+                request.request_id.clone(),
+                json!({
+                    "state": "dry_run",
+                    "patch_kind": patch_kind,
+                    "impacted_nodes": impacted,
+                    "operation_count": ops_arr.len(),
+                    "current_revision": retained_revision.0,
+                    "would_apply_revision": new_ir.revision.0,
+                    "timing_ms": timings.to_json(),
+                }),
+            ));
+        }
         // Apply source_file overrides from structured operations (set path property=source_file value="/abs/path").
         for op in &ops_clone {
             if op.get("kind").and_then(Value::as_str) == Some("set")
@@ -4079,11 +4185,43 @@ impl UiRuntime {
         timings.patch_apply_ms = elapsed_ms(patch_started);
         let source_read_started = Instant::now();
         let mut source_paths: Vec<(String, String)> = Vec::new();
+        let mut digests_to_commit: HashMap<String, (String, std::time::SystemTime, u64)> =
+            HashMap::new();
         for (node_key, decl) in &new_ir.code_editors {
             if let Some(ref path) = decl.source_file {
+                // R3: re-read only when the file's (mtime, size) digest moved
+                // since the previous patch; same-size edits inside one clock
+                // tick are missed and picked up by any later patch. Digests
+                // commit together with the document, so a patch that fails
+                // before commit forces a fresh read next time.
+                let digest = std::fs::metadata(path).ok().and_then(|metadata| {
+                    metadata
+                        .modified()
+                        .ok()
+                        .map(|modified| (modified, metadata.len()))
+                });
+                let unchanged = digest.is_some_and(|(modified, len)| {
+                    self.source_file_digests.get(node_key).is_some_and(
+                        |(cached_path, cached_modified, cached_len)| {
+                            cached_path == path
+                                && *cached_modified == modified
+                                && *cached_len == len
+                        },
+                    )
+                });
+                if unchanged {
+                    continue;
+                }
                 match std::fs::read_to_string(path) {
-                    Ok(text) => source_paths.push((node_key.clone(), text)),
+                    Ok(text) => {
+                        if let Some((modified, len)) = digest {
+                            digests_to_commit
+                                .insert(node_key.clone(), (path.clone(), modified, len));
+                        }
+                        source_paths.push((node_key.clone(), text));
+                    }
                     Err(e) => {
+                        self.source_file_digests.remove(node_key);
                         eprintln!("[neon-ui-runtime] source_file read failed: {}: {}", path, e)
                     }
                 }
@@ -4098,8 +4236,8 @@ impl UiRuntime {
         }
         timings.source_read_ms = elapsed_ms(source_read_started);
         let compile_started = Instant::now();
-        // Rebuild NuiFlowDocument with patched IR, preserving other fields.
-        let mut new_doc = current_doc.clone();
+        // Patch the document by replacing its IR; other fields are preserved.
+        let mut new_doc = current_doc;
         new_doc.ir = new_ir;
         let revision = UiProgramRevision {
             program_id: new_doc.ir.surface_id.0.clone(),
@@ -4125,8 +4263,26 @@ impl UiRuntime {
             })
             .collect(),
         };
-        let program = compile_nui_flow_program(&new_doc, revision)
-            .map_err(|e| TransportError::Io(std::io::Error::other(format!("compile: {e:?}"))))?;
+        let program = match compile_nui_flow_program(&new_doc, revision) {
+            Ok(program) => program,
+            Err(error) => {
+                let report = flow_compile_report(&new_doc, &error);
+                let (code, message) = report_error_summary(&report);
+                let mut response = self.rejected_with_flow_report(
+                    request.request_id.clone(),
+                    &code,
+                    &message,
+                    report,
+                );
+                response.result = Some(json!({
+                    "state": "patch_rejected",
+                    "fallback": "previous_program_retained",
+                    "retained_revision": retained_revision.0,
+                    "patch_kind": patch_kind,
+                }));
+                return Ok(response);
+            }
+        };
 
         // Sync code_editor source slots: after patch, the code_editor node's new
         // literal text has a fresh TextHandle. Update the input_schema slots so
@@ -4162,10 +4318,22 @@ impl UiRuntime {
             root: new_doc.ir.root.clone(),
             effects: lower_nui_flow_effects(&new_doc),
         };
-        let adapter =
-            UiHostAdapter::activate(program.clone(), new_doc.input_schema.clone(), self.epoch)
-                .map_err(|e| TransportError::Io(std::io::Error::other(e.message)))?
-                .with_event_publisher(self.eventd_endpoint, self.client.clone());
+        let adapter = match UiHostAdapter::activate(
+            program.clone(),
+            new_doc.input_schema.clone(),
+            self.epoch,
+        ) {
+            Ok(adapter) => adapter,
+            Err(error) => {
+                return Ok(self.retained_patch_rejection(
+                    request.request_id.clone(),
+                    "ui_flow_activation_failed",
+                    &error.message,
+                    retained_revision,
+                ));
+            }
+        }
+        .with_event_publisher(self.eventd_endpoint, self.client.clone());
         let initial_inputs = adapter.snapshot().scalar_inputs;
         refresh_fragment_from_program(
             &mut fragment,
@@ -4189,22 +4357,51 @@ impl UiRuntime {
             idempotency_key: request.idempotency_key.clone(),
         };
         let forward_started = Instant::now();
-        let response = self.forward_fragment(wgpu_endpoint, forwarded)?;
+        let mut response = self.forward_fragment(wgpu_endpoint, forwarded)?;
         timings.forward_ms = elapsed_ms(forward_started);
+        timings.total_ms = elapsed_ms(total_started);
         if response.status == RpcStatus::Accepted {
-            self.flow_state_machine = Some(NuiFlowStateMachineRuntime::new(&new_doc));
-            self.flow_document = Some(new_doc.clone());
-            timings.total_ms = elapsed_ms(total_started);
+            // R2: `NuiFlowStateMachineRuntime::new` reads only
+            // `document.state_machines`, which no patch operation can
+            // modify, so rebuilding it per patch merely reset live
+            // machine state. Construct once; structural changes arrive
+            // through `ui.flow.submit`, which replaces the machine.
+            if self.flow_state_machine.is_none() {
+                self.flow_state_machine = Some(NuiFlowStateMachineRuntime::new(&new_doc));
+            }
+            let document_revision = new_doc.ir.revision;
+            self.flow_document = Some(new_doc);
+            self.source_file_digests.extend(digests_to_commit);
+            let renderer = response.result.take();
             let mut enriched = response;
             enriched.result = Some(json!({
                 "state": "patched",
                 "program_revision": program.revision,
-                "flow_document_revision": new_doc.ir.revision,
+                "flow_document_revision": document_revision,
+                "patch_kind": patch_kind,
+                "impacted_node_count": impacted.len(),
+                "renderer": renderer,
                 "timing_ms": timings.to_json(),
             }));
             return Ok(enriched);
         }
-        Ok(response)
+        // R5: the renderer refused the replacement fragment. Nothing was
+        // committed, so the previous program, adapter, and fragment remain
+        // authoritative; report the explicit fallback reason.
+        let reason = response
+            .error
+            .as_ref()
+            .map(|error| error.code.clone())
+            .unwrap_or_else(|| "renderer_submit_rejected".to_owned());
+        let mut fallback = response;
+        fallback.result = Some(json!({
+            "state": "patch_render_fallback",
+            "fallback_reason": reason,
+            "retained_revision": retained_revision.0,
+            "patch_kind": patch_kind,
+            "timing_ms": timings.to_json(),
+        }));
+        Ok(fallback)
     }
 
     fn handle_interaction_get(&mut self, request: RpcRequest) -> RpcResponse {
@@ -5969,6 +6166,26 @@ impl UiRuntime {
                 details: None,
             }),
         }
+    }
+
+    /// Phase 4 (R4): a patch failure before renderer acceptance leaves the
+    /// previous program, adapter, and fragment untouched; the rejection
+    /// carries that retention explicitly so clients never infer it.
+    fn retained_patch_rejection(
+        &mut self,
+        request_id: RequestId,
+        code: &str,
+        message: &str,
+        retained_revision: Revision,
+    ) -> RpcResponse {
+        let mut response =
+            self.rejected_at_revision(request_id, code, message, retained_revision, None);
+        response.result = Some(json!({
+            "state": "patch_rejected",
+            "fallback": "previous_program_retained",
+            "retained_revision": retained_revision.0,
+        }));
+        response
     }
 
     fn record_receipt(
