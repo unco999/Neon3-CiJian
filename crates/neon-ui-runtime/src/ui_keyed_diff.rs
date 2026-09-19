@@ -8,10 +8,20 @@
 //!
 //! Ordering follows the plan's canonical sequence:
 //! `RemoveNode` (deepest first) -> structural pre-order (`MoveNode` /
-//! `InsertNode` / `ReplaceChildren` interleaved per parent in new-tree order)
-//! -> `SetProperty`. Structural operations resolve nodes by their globally
-//! unique stable key (guaranteed by the Phase 1 IR contract), so paths never
-//! depend on array indexes surviving an earlier operation.
+//! `InsertNode` / `ReplaceChildren` emitted while walking the new tree in
+//! pre-order, one parent block at a time) -> `SetProperty`. Structural
+//! operations resolve nodes by their globally unique stable key (guaranteed
+//! by the Phase 1 IR contract), so paths never depend on array indexes
+//! surviving an earlier operation.
+//!
+//! Index correctness: a parent block writes its children in ascending new
+//! index, so every absolute index is only valid once the children that will
+//! leave that parent have already departed and the children arriving from
+//! elsewhere have landed. The emitter therefore tracks, per parent, which
+//! kept nodes are still physically inside it when the block runs (stayers
+//! plus nodes escaping to a parent walked later) and skips an explicit
+//! `MoveNode` for a stayer only while it already sits at the write head of
+//! that list.
 //! `StartTransition` and `SetInput` are presentation intents a projection
 //! owner appends explicitly; the diff never infers them.
 //!
@@ -118,8 +128,9 @@ pub fn diff_projection_trees(
         return Err(UiDiffRootMismatch::IdentityChanged);
     }
     let mut diff = Diff::default();
-    diff.index_old(old_root, old_root.node_id.0.clone(), None, 0, &Vec::new());
-    diff.analyze_new(new_root, new_root.node_id.0.clone(), None, &Vec::new());
+    diff.index_old(old_root, old_root.node_id.0.clone(), None, &Vec::new());
+    diff.analyze_new(new_root, None);
+    diff.mark_escapes();
     diff.emit_walk(new_root, new_root.node_id.0.clone());
     diff.finish()
 }
@@ -128,7 +139,6 @@ struct OldEntry<'a> {
     node: &'a UiNode,
     path: String,
     parent_key: Option<String>,
-    index: usize,
     ancestors: Vec<String>,
 }
 
@@ -145,9 +155,20 @@ struct Diff<'a> {
     /// (kept in place, consumed by a replace, or deleted inside an inserted
     /// subtree). Anything left unconsumed becomes a `RemoveNode`.
     consumed: HashSet<String>,
-    /// Old keys from which at least one kept node was reparented away; the
-    /// subtrees under these keys are never eligible for `ReplaceChildren`.
-    escaped: HashSet<String>,
+    /// Keys of every new node that keeps its old identity. Emission consults
+    /// this to decide whether a kept node can arrive by move or must insert.
+    kept: HashSet<String>,
+    /// New-tree pre-order index per key. Emission walks in exactly this
+    /// order, so the index doubles as the timeline position of a node's
+    /// structural operation.
+    pre: HashMap<String, usize>,
+    /// New-tree parent key per node (absent for the root).
+    parent_new: HashMap<String, String>,
+    visit_order: Vec<String>,
+    next_pre: usize,
+    /// For an old container key, the latest timeline position at which any
+    /// still-live kept node underneath it escapes to a different parent.
+    escape_max: HashMap<String, usize>,
     removed: Vec<(usize, UiPatchOp)>,
     structural: Vec<UiPatchOp>,
     sets: Vec<UiPatchOp>,
@@ -159,7 +180,6 @@ impl<'a> Diff<'a> {
         node: &'a UiNode,
         path: String,
         parent_key: Option<String>,
-        index: usize,
         ancestors: &[String],
     ) {
         let mut ancestors = ancestors.to_vec();
@@ -173,16 +193,14 @@ impl<'a> Diff<'a> {
                 node,
                 path: path.clone(),
                 parent_key,
-                index,
                 ancestors: ancestors.clone(),
             });
         }
-        for (child_index, child) in node.children.iter().enumerate() {
+        for child in &node.children {
             self.index_old(
                 child,
                 format!("{path}/{}", child.node_id.0),
                 Some(node.node_id.0.clone()),
-                child_index,
                 &ancestors,
             );
         }
@@ -195,65 +213,72 @@ impl<'a> Diff<'a> {
             .filter(|entry| node_identity(entry.node) == node_identity(node))
     }
 
-    /// First pass: record globally which new nodes keep an old key, marking
-    /// reparenting escapes before any emission decides on `ReplaceChildren`.
-    fn analyze_new(
-        &mut self,
-        node: &'a UiNode,
-        path: String,
-        parent_key: Option<&str>,
-        ancestors: &[String],
-    ) {
-        let reparented = self
-            .kept_entry(node)
-            .is_some_and(|entry| entry.parent_key.as_deref() != parent_key);
-        if reparented {
-            let ancestors = self
-                .old
-                .entries
-                .get(&node.node_id.0)
-                .map(|entry| entry.ancestors.clone())
-                .expect("kept node has an old entry");
-            for escaped_key in ancestors.iter().take(ancestors.len() - 1) {
-                self.escaped.insert(escaped_key.clone());
-            }
+    /// First pass: record globally which new nodes keep an old identity and
+    /// fix the new-tree pre-order timeline each later decision compares
+    /// against.
+    fn analyze_new(&mut self, node: &'a UiNode, parent_key: Option<&str>) {
+        let key = node.node_id.0.clone();
+        self.pre.insert(key.clone(), self.next_pre);
+        self.next_pre += 1;
+        self.visit_order.push(key.clone());
+        if let Some(parent) = parent_key {
+            self.parent_new.insert(key.clone(), parent.to_owned());
         }
-        let mut ancestors = ancestors.to_vec();
-        ancestors.push(node.node_id.0.clone());
+        if self.kept_entry(node).is_some() {
+            self.kept.insert(key);
+        }
         for child in &node.children {
-            self.analyze_new(
-                child,
-                format!("{path}/{}", child.node_id.0),
-                Some(node.node_id.0.as_str()),
-                &ancestors,
-            );
+            self.analyze_new(child, Some(node.node_id.0.as_str()));
         }
     }
 
-    /// Second pass in new-tree pre-order: emits structural operations and
+    /// Second pass: for every live kept node that changed parents, mark each
+    /// of its strict old ancestors with the timeline position at which the
+    /// escape executes. An old subtree cannot be wholesale-replaced while
+    /// one of its live inhabitants still escapes later.
+    fn mark_escapes(&mut self) {
+        for key in &self.visit_order {
+            let Some(entry) = self.old.entries.get(key) else {
+                continue;
+            };
+            if !self.kept.contains(key) || !self.ancestors_alive(entry) {
+                continue;
+            }
+            if self.parent_new.get(key).map(String::as_str) == entry.parent_key.as_deref() {
+                continue; // staying inside the same parent is not an escape
+            }
+            let when = self.pre[key];
+            for ancestor in entry.ancestors[..entry.ancestors.len() - 1].iter() {
+                let slot = self.escape_max.entry(ancestor.clone()).or_insert(0);
+                *slot = (*slot).max(when);
+            }
+        }
+    }
+
+    /// Third pass in new-tree pre-order: emits structural operations and
     /// property sets so every destination parent exists before its children
     /// are touched.
     fn emit_walk(&mut self, new_node: &'a UiNode, path: String) {
-        if let Some((old_node, _)) = self
-            .kept_entry(new_node)
-            .map(|entry| (entry.node, entry.path.clone()))
-        {
-            self.consumed.insert(new_node.node_id.0.clone());
+        let key = new_node.node_id.0.clone();
+        if let Some(old_node) = self.kept_entry(new_node).map(|entry| entry.node) {
+            self.consumed.insert(key.clone());
             emit_property_sets(&mut self.sets, old_node, new_node, &path);
         }
-        let keep_children: Vec<bool> = new_node
+        let entry = self.old.entries.get(&key);
+        let all_inserts = new_node
             .children
             .iter()
-            .map(|child| self.kept_entry(child).is_some())
-            .collect();
-        let entry = self.old.entries.get(&new_node.node_id.0);
+            .all(|child| self.kept_entry(child).is_none());
+        let escape_blocked = self
+            .escape_max
+            .get(&key)
+            .is_some_and(|when| *when > self.pre[&key]);
         let replace = !new_node.children.is_empty()
-            && !keep_children.iter().any(|keep| *keep)
+            && all_inserts
+            && !escape_blocked
             && entry.is_some_and(|entry| {
                 node_identity(entry.node) == node_identity(new_node)
-                    && entry.path == path
                     && entry.node.children.len() >= REPLACE_CHILDREN_MIN_STRUCTURAL
-                    && !subtree_has_key_below_root(entry.node, &self.escaped)
             });
         if replace {
             let old_node = entry.expect("replace requires a matched parent").node;
@@ -264,16 +289,52 @@ impl<'a> Diff<'a> {
             });
             return;
         }
+        // The list this block actually sees: kept children of the old parent,
+        // minus nodes that already departed to parents walked earlier, plus
+        // the departing nodes that are still physically present as junk in
+        // front of the write head. Stayers must appear in the same relative
+        // order as in the new tree, or every one of them needs an explicit
+        // move; the head check below encodes exactly that.
+        let mut queue: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+        if let Some(entry) = entry {
+            for old_child in &entry.node.children {
+                let child_key = old_child.node_id.0.clone();
+                let Some(child_entry) = self.old.entries.get(&child_key) else {
+                    continue;
+                };
+                if !self.kept.contains(&child_key) || !self.ancestors_alive(child_entry) {
+                    continue;
+                }
+                let stayer =
+                    self.parent_new.get(&child_key).map(String::as_str) == Some(key.as_str());
+                if stayer || self.pre[&child_key] > self.pre[&key] {
+                    queue.push_back(child_key);
+                }
+            }
+        }
         for (index, child) in new_node.children.iter().enumerate() {
             let child_path = format!("{path}/{}", child.node_id.0);
             let kept = self
                 .kept_entry(child)
-                .map(|entry| (entry.parent_key.clone(), entry.index));
+                .map(|entry| (entry.parent_key.clone(), self.ancestors_alive(entry)));
             match kept {
-                Some((parent_key, old_index)) => {
-                    if parent_key.as_deref() != Some(new_node.node_id.0.as_str())
-                        || old_index != index
-                    {
+                Some((parent_key, true)) => {
+                    let stays_here = parent_key.as_deref() == Some(key.as_str());
+                    let at_head =
+                        queue.front().map(String::as_str) == Some(child.node_id.0.as_str());
+                    if stays_here && at_head {
+                        // The stayer already sits at the write head, so the
+                        // absolute indexes of later operations stay valid
+                        // without touching it.
+                        queue.pop_front();
+                    } else {
+                        if stays_here {
+                            let position =
+                                queue.iter().position(|queued| *queued == child.node_id.0);
+                            if let Some(position) = position {
+                                queue.remove(position);
+                            }
+                        }
                         self.structural.push(UiPatchOp::MoveNode {
                             node_path: child_path.clone(),
                             parent_path: path.clone(),
@@ -281,6 +342,15 @@ impl<'a> Diff<'a> {
                         });
                     }
                     self.emit_walk(child, child_path);
+                }
+                Some((_, false)) => {
+                    // The old copy is destroyed together with a removed
+                    // ancestor, so arriving via move is impossible.
+                    self.structural.push(UiPatchOp::InsertNode {
+                        parent_path: path.clone(),
+                        index,
+                        node: child.clone(),
+                    });
                 }
                 None => {
                     self.structural.push(UiPatchOp::InsertNode {
@@ -291,6 +361,14 @@ impl<'a> Diff<'a> {
                 }
             }
         }
+    }
+
+    /// Every strict old ancestor of the entry must itself be kept for the
+    /// node to survive removals and arrive via a move instead of an insert.
+    fn ancestors_alive(&self, entry: &OldEntry<'a>) -> bool {
+        entry.ancestors[..entry.ancestors.len() - 1]
+            .iter()
+            .all(|ancestor| self.kept.contains(ancestor))
     }
 
     fn finish(mut self) -> Result<UiTreeDiff, UiDiffRootMismatch> {
@@ -324,15 +402,6 @@ impl<'a> Diff<'a> {
         merge_operations(&mut operations);
         Ok(UiTreeDiff { operations })
     }
-}
-
-/// Keys whose subtree must not be wholesale replaced because a kept node
-/// escaped out of them. The queried node itself is exempt: only keys strictly
-/// below a replace candidate matter.
-fn subtree_has_key_below_root(node: &UiNode, escaped: &HashSet<String>) -> bool {
-    node.children.iter().any(|child| {
-        escaped.contains(&child.node_id.0) || subtree_has_key_below_root(child, escaped)
-    })
 }
 
 fn mark_consumed_subtree(consumed: &mut HashSet<String>, node: &UiNode) {
@@ -581,7 +650,6 @@ mod tests {
                 "remove root/y/c",
                 "move root/y -> root[0]",
                 "move root/y/b -> root/y[0]",
-                "move root/x -> root[1]",
                 "insert d@root/x[1]",
             ]
         );
@@ -675,6 +743,90 @@ mod tests {
     }
 
     #[test]
+    fn removing_a_sibling_does_not_move_survivors() {
+        let old = node(
+            "root",
+            UiNodeKind::Panel,
+            vec![text("a", "A"), text("b", "B"), text("c", "C")],
+        );
+        let new = node(
+            "root",
+            UiNodeKind::Panel,
+            vec![text("a", "A"), text("c", "C")],
+        );
+        let diff = diff_projection_trees(&old, &new).expect("root matches");
+        assert_eq!(summarize_operations(&diff), ["remove root/b"]);
+    }
+
+    #[test]
+    fn random_churn_replays_through_ops_to_a_fixed_point() {
+        let mut seed = 0x9E3779B97F4A7C15_u64;
+        let mut pick = move || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 37) as usize
+        };
+        for round in 0..200 {
+            let old = random_tree(&mut pick);
+            let new = random_tree(&mut pick);
+            let diff = diff_projection_trees(&old, &new).unwrap_or_else(|reason| {
+                panic!("round {round}: root must stay patchable ({reason:?})")
+            });
+            let applied = apply_ops(&old, &diff.operations);
+            assert_eq!(
+                serde_json::to_value(&applied).expect("serialize applied"),
+                serde_json::to_value(&new).expect("serialize new"),
+                "round {round}: ops did not produce the target tree ({:?}); old children = {}",
+                summarize_operations(&diff),
+                serde_json::to_string(&old).expect("serialize old")
+            );
+            let rediff = diff_projection_trees(&applied, &new).expect("root still matches");
+            assert!(
+                rediff.is_empty(),
+                "round {round}: residual ops {residual:?}",
+                residual = summarize_operations(&rediff)
+            );
+        }
+    }
+
+    /// Builds a randomized tree over a shared key pool so consecutive calls
+    /// exercise keeps, removes, inserts, reparents, reorders, and sets.
+    fn random_tree<F: FnMut() -> usize>(pick: &mut F) -> UiNode {
+        let mut buckets: [Vec<UiNode>; 4] = Default::default();
+        for index in 0..16 {
+            let slot = pick() % 5;
+            if slot == 4 {
+                continue;
+            }
+            let mut item = text(
+                &format!("t{index}"),
+                if pick() % 2 == 0 { "A" } else { "B" },
+            );
+            item.visible = pick() % 3 != 0;
+            item.bounds.width = (pick() % 80) as f32;
+            buckets[slot].push(item);
+        }
+        for bucket in &mut buckets {
+            for position in (1..bucket.len()).rev() {
+                bucket.swap(position, pick() % (position + 1));
+            }
+        }
+        let mut children: Vec<UiNode> = (0..3)
+            .filter(|_| pick() % 6 != 0)
+            .map(|container| {
+                node(
+                    &format!("c{container}"),
+                    UiNodeKind::Panel,
+                    std::mem::take(&mut buckets[container]),
+                )
+            })
+            .collect();
+        children.append(&mut buckets[3]);
+        node("root", UiNodeKind::Panel, children)
+    }
+
+    #[test]
     fn wholesale_child_list_swap_collapses_to_replace_children() {
         let old_children: Vec<UiNode> = (0..10).map(|i| text(&format!("o{i}"), "old")).collect();
         let new_children: Vec<UiNode> = (0..10).map(|i| text(&format!("n{i}"), "new")).collect();
@@ -697,9 +849,10 @@ mod tests {
     #[test]
     fn replace_children_is_blocked_when_a_key_escapes_the_subtree() {
         // old:  root -> [ stage[ a1..a7, deep[o8] ] ]
-        // new:  root -> [ stage[ holder[o8], b1, b2 ] ]
-        // The kept key o8 escapes stage's old subtree, so stage must fall back
-        // to explicit ops instead of ReplaceChildren.
+        // new:  root -> [ stage[ b1, b2 ], deep[o8] ]
+        // `deep` is kept but reparented out of stage, and stage's block runs
+        // before that escape move, so replacing stage would destroy a live
+        // node. Stage must fall back to explicit ops instead.
         let mut stage_children: Vec<UiNode> =
             (0..7).map(|i| text(&format!("a{i}"), "old")).collect();
         stage_children.push(node("deep", UiNodeKind::Panel, vec![text("o8", "old")]));
@@ -711,33 +864,37 @@ mod tests {
         let new = node(
             "root",
             UiNodeKind::Panel,
-            vec![node(
-                "stage",
-                UiNodeKind::Panel,
-                vec![
-                    node("holder", UiNodeKind::Panel, vec![text("o8", "old")]),
-                    text("b1", "new"),
-                    text("b2", "new"),
-                ],
-            )],
+            vec![
+                node(
+                    "stage",
+                    UiNodeKind::Panel,
+                    vec![text("b1", "new"), text("b2", "new")],
+                ),
+                node("deep", UiNodeKind::Panel, vec![text("o8", "old")]),
+            ],
         );
         let diff = diff_projection_trees(&old, &new).expect("root matches");
         let summary = summarize_operations(&diff);
         assert!(
             !summary.iter().any(|entry| entry.starts_with("replace ")),
-            "escaped keys must force explicit ops: {summary:?}"
-        );
-        // o8's old position is removed with its container subtree, and the
-        // new holder subtree arrives as one explicit insert.
-        assert!(
-            summary
-                .iter()
-                .any(|entry| entry == "remove root/stage/deep")
+            "escaping live keys must force explicit ops: {summary:?}"
         );
         assert!(
             summary
                 .iter()
-                .any(|entry| entry == "insert holder@root/stage[0]")
+                .any(|entry| entry == "move root/deep -> root[1]"),
+            "the escape must arrive as an explicit move: {summary:?}"
+        );
+        assert!(
+            summary
+                .iter()
+                .any(|entry| entry == "insert b1@root/stage[0]"),
+            "stage must rebuild with explicit inserts: {summary:?}"
+        );
+        let applied = apply_ops(&old, &diff.operations);
+        assert_eq!(
+            serde_json::to_value(&applied).expect("serialize applied"),
+            serde_json::to_value(&new).expect("serialize new")
         );
     }
 
@@ -779,7 +936,6 @@ mod tests {
             [
                 "remove workspace/b",
                 "insert c@workspace[0]",
-                "move workspace/a -> workspace[1]",
                 "set workspace/a.value",
             ]
         );

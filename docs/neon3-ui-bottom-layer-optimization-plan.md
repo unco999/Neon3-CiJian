@@ -173,7 +173,24 @@ change:<change-id>
 
 ## 4. Phase 2：实现通用 Keyed UI Diff
 
-状态：`TODO`
+状态：`DONE（2026-09-19）`，实现位于 `crates/neon-ui-runtime/src/ui_keyed_diff.rs`
+（`diff_projection_trees` / `build_ui_patch` / `summarize_operations`）。
+
+验收证据：
+
+- D1：`identical_trees_produce_no_operations`、`single_property_change_emits_one_set`。
+- D2：`insert_remove_reorder_and_reparent_follow_keys`、`key_change_is_remove_plus_insert_never_reuse`、
+  `removing_a_sibling_does_not_move_survivors`（删除/插入兄弟不产生 survivor move）。
+- D3：结构操作按新树 pre-order 时间线发射；每个 parent 的 write-head 队列决定 stayer 是否需要
+  显式 `MoveNode`，逃逸节点在其 parent block 之后离开时视为 junk、之前离开时自动缺席。
+  `random_churn_replays_through_ops_to_a_fixed_point`（200 轮随机增删改移重排，回放后二次 diff 为空）。
+- D4：`merge_keeps_last_value_per_node_and_property`。
+- D5：`wholesale_child_list_swap_collapses_to_replace_children`、
+  `replace_children_is_blocked_when_a_key_escapes_the_subtree`（live 逃逸 key 强制显式操作）。
+- D6：`tests/fixtures/ui_keyed_diff_{old,new,expected_ops}.json` 稳定回放；
+  `diff_ops_apply_through_the_public_patch_contract` 证明经公开 `apply_ui_patch` 收敛到不动点。
+- Probe：`ui_patch_keyed_diff_probe`（7 case：no_op/set/insert/remove/reorder/key_change/replace，
+  全部 `pass: true`；reorder 3 节点轮换只发 1 个 move，remove 只发 1 个 remove）。
 
 ### 推荐抽象
 
