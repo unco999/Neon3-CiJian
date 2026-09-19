@@ -1,44 +1,61 @@
 //! Headless input-to-GPU incremental update probe.
 //!
-//! This probe separates three contracts that are easy to conflate:
-//! input dirty-slot precision, GPU input-buffer upload precision, and full CPU
-//! UI evaluation. It emits JSONL and intentionally reports the last one as a
-//! diagnostic limitation rather than hiding it behind a passing upload test.
+//! This probe separates four contracts that are easy to conflate: input dirty
+//! slot precision, CPU retained evaluation scope, GPU upload scope, and renderer
+//! composition. It only reports `end_to_end_incremental` when the CPU delta and
+//! the GPU delta were both narrower than a full pass *and* the retained frame
+//! still equals the golden full evaluation.
 
 use neon_protocol::Revision;
+use neon_ui_runtime::ui_retained_evaluator::{
+    UiImpactSet, apply_ui_impact_set, evaluate_ui_program_initial,
+};
 use neon_ui_runtime::{
     UiInputStore, UiInputWriter, UiLocalPresentationState, compile_nui_flow_program,
     evaluate_ui_program, parse_nui_flow,
 };
 use neon_ui_schema::{
-    UI_PROGRAM_CAPABILITY_NAME, UI_PROGRAM_SCHEMA_VERSION, UiBounds, UiInputChange, UiInputFrame,
-    UiInputValue, UiProgramCapability, UiProgramCapabilityOwner, UiProgramCapabilityStatus,
-    UiProgramRevision,
+    UI_PROGRAM_CAPABILITY_NAME, UI_PROGRAM_DELTA_CAPABILITY_NAME, UI_PROGRAM_SCHEMA_VERSION,
+    UiBounds, UiCpuViewport, UiInputChange, UiInputFrame, UiInputValue, UiProgramCapability,
+    UiProgramCapabilityOwner, UiProgramCapabilityStatus, UiProgramRevision,
 };
 use neon_wgpu_runtime::GpuUiProgramBackend;
 use serde_json::json;
 
 const FLOW: &str = "version 1
 surface surface.input-incremental revision 1
-budget nodes=8 bindings=8 instances=8 text=8 glyphs=64 events=8 clips=8
+budget nodes=16 bindings=16 instances=16 text=16 glyphs=64 events=16 clips=16
 input left bool default false
 input right bool default false
 surface root row w 200 h 80
   panel left-panel visible $left w 80 h 40
   panel right-panel visible $right w 80 h 40
+  panel filler-a w 20 h 20
+  panel filler-b w 20 h 20
+  panel filler-c w 20 h 20
+  panel filler-d w 20 h 20
 ";
 
-fn revision() -> UiProgramRevision {
+fn revision(delta_capable: bool) -> UiProgramRevision {
+    let mut capabilities = vec![UiProgramCapability {
+        name: UI_PROGRAM_CAPABILITY_NAME.into(),
+        version: 1,
+        owner: UiProgramCapabilityOwner::SharedContract,
+        status: UiProgramCapabilityStatus::Supported,
+    }];
+    if delta_capable {
+        capabilities.push(UiProgramCapability {
+            name: UI_PROGRAM_DELTA_CAPABILITY_NAME.into(),
+            version: 1,
+            owner: UiProgramCapabilityOwner::WgpuRuntime,
+            status: UiProgramCapabilityStatus::Supported,
+        });
+    }
     UiProgramRevision {
         program_id: "surface.input-incremental".into(),
         revision: Revision(1),
         schema_version: UI_PROGRAM_SCHEMA_VERSION,
-        capabilities: vec![UiProgramCapability {
-            name: UI_PROGRAM_CAPABILITY_NAME.into(),
-            version: 1,
-            owner: UiProgramCapabilityOwner::SharedContract,
-            status: UiProgramCapabilityStatus::Supported,
-        }],
+        capabilities,
     }
 }
 
@@ -77,7 +94,7 @@ fn run() -> serde_json::Value {
             return json!({"status":"failed","stage":"parse","error":format!("{error:?}")});
         }
     };
-    let program_revision = revision();
+    let program_revision = revision(true);
     let program = match compile_nui_flow_program(&document, program_revision.clone()) {
         Ok(program) => program,
         Err(error) => {
@@ -89,26 +106,31 @@ fn run() -> serde_json::Value {
         Err(error) => return json!({"status":"failed","stage":"input_activate","error":error.code}),
     };
     let (device, queue) = device();
-    let mut gpu = GpuUiProgramBackend::new(1);
     let viewport = UiBounds {
         x: 0.0,
         y: 0.0,
         width: 200.0,
         height: 80.0,
     };
-    if let Err(error) = gpu.stage(&device, &queue, &program, &store.snapshot(), viewport) {
-        return json!({"status":"failed","stage":"gpu_stage_initial","error":error.code});
-    }
+    let cpu_viewport = UiCpuViewport {
+        logical_bounds: viewport,
+        revision: Revision(1),
+    };
+    let local = UiLocalPresentationState::default();
+    let mut gpu = GpuUiProgramBackend::new(1);
+    let delta_negotiated = match gpu.stage(&device, &queue, &program, &store.snapshot(), viewport) {
+        Ok(negotiated) => negotiated,
+        Err(error) => {
+            return json!({"status":"failed","stage":"gpu_stage_initial","error":error.code});
+        }
+    };
     let _ = gpu.activate_at_frame_boundary();
-    let initial_cpu = evaluate_ui_program(
-        &program,
-        &store.snapshot(),
-        neon_ui_schema::UiCpuViewport {
-            logical_bounds: viewport,
-            revision: Revision(1),
-        },
-        &UiLocalPresentationState::default(),
-    );
+    let mut retained =
+        evaluate_ui_program_initial(&program, &store.snapshot(), cpu_viewport, &local);
+    let golden_initial = evaluate_ui_program(&program, &store.snapshot(), cpu_viewport, &local);
+    if retained.frame() != golden_initial {
+        return json!({"status":"failed","stage":"initial_equality"});
+    }
     let frame = UiInputFrame {
         program_revision: program.revision.clone(),
         expected_input_revision: Revision(0),
@@ -123,63 +145,140 @@ fn run() -> serde_json::Value {
         Ok(applied) => applied,
         Err(error) => return json!({"status":"failed","stage":"input_apply","error":error.code}),
     };
-    if let Err(error) = gpu.stage(&device, &queue, &program, &applied.snapshot, viewport) {
-        return json!({"status":"failed","stage":"gpu_stage_changed","error":error.code});
-    }
-    let gpu_frame = gpu.activate_at_frame_boundary();
+    let impact = UiImpactSet::from_input_publication(
+        &program,
+        &applied.changed_slots,
+        applied.input_revision,
+        Revision(1),
+    );
+    let delta =
+        match apply_ui_impact_set(&program, &mut retained, &applied.snapshot, &local, &impact) {
+            Ok(delta) => delta,
+            Err(error) => {
+                return json!({"status":"failed","stage":"cpu_delta","error":error.code});
+            }
+        };
+    let upload = match gpu.apply_frame_delta(&queue, &program, &applied.snapshot, &impact, &delta) {
+        Ok(upload) => upload,
+        Err(error) => {
+            return json!(
+                {"status":"failed","stage":"gpu_delta","error":error.code,
+                 "detail":error.node_key}
+            );
+        }
+    };
+    let _ = gpu.activate_at_frame_boundary();
+    let golden_changed = evaluate_ui_program(&program, &applied.snapshot, cpu_viewport, &local);
+    let frames_equal = retained.frame() == golden_changed;
     let changed_binding_ids = program
         .dependency_index
         .input_to_bindings
         .get("left")
         .cloned()
         .unwrap_or_default();
-    let changed_nodes: Vec<String> = changed_binding_ids
-        .iter()
-        .filter_map(|id| {
-            program
-                .binding_records
-                .iter()
-                .find(|binding| binding.binding_id == *id)
-        })
-        .map(|binding| binding.node_key.clone())
-        .collect();
-    let changed_cpu = evaluate_ui_program(
-        &program,
-        &applied.snapshot,
-        neon_ui_schema::UiCpuViewport {
-            logical_bounds: viewport,
-            revision: Revision(1),
-        },
-        &UiLocalPresentationState::default(),
-    );
     let stats = gpu.upload_stats();
-    let upload_stats = json!({
-        "static_buffer_uploads": stats.static_buffer_uploads,
-        "full_input_uploads": stats.full_input_uploads,
-        "partial_input_uploads": stats.partial_input_uploads,
-        "input_slot_writes": stats.input_slot_writes,
-        "skipped_input_uploads": stats.skipped_input_uploads,
-    });
-    let pass = applied.changed_slots == vec!["left".to_owned()]
+    let cpu_incremental = delta.executed_binding_ids == changed_binding_ids
+        && delta.executed_binding_ids.len() < program.binding_records.len()
+        && delta.changed_states.iter().any(|state| state.visible)
+        && delta.input_revision == applied.input_revision;
+    let gpu_incremental = upload.bytes_written < upload.bytes_for_full_upload
+        && upload.node_keys == vec!["left-panel".to_owned()]
+        && upload.instance_records_written == 1
+        && upload.input_slot_writes == 1;
+    // A program revision that never negotiated the capability must not be able to
+    // take the delta path, even with a well-formed impact set and delta.
+    let (uncapable, uncapable_code) = uncapped_delta_rejected(&device, &queue, &document);
+    let end_to_end_incremental =
+        delta_negotiated && cpu_incremental && gpu_incremental && frames_equal;
+    let pass = end_to_end_incremental
+        && uncapable
+        && applied.changed_slots == vec!["left".to_owned()]
         && store.dirty_slots() == vec!["left".to_owned()]
-        && changed_nodes == vec!["left-panel".to_owned()]
-        && gpu_frame
-            .as_ref()
-            .is_some_and(|frame| frame.dirty_slots == vec!["left".to_owned()])
-        && stats.static_buffer_uploads == 3
+        && delta.changed_states.len() == 1
+        && stats.static_buffer_uploads == 4
         && stats.full_input_uploads == 1
-        && stats.partial_input_uploads == 1
-        && stats.input_slot_writes == 1
-        && initial_cpu.nodes.len() == changed_cpu.nodes.len();
+        && stats.partial_input_uploads == 0
+        && stats.delta_uploads == 1;
     json!({
-        "probe": "ui-input-incremental.v1",
+        "probe": "ui-input-incremental.v2",
         "status": if pass { "passed" } else { "failed" },
         "input": {"changed_key": "left", "program_revision": program.revision.revision, "input_revision": applied.input_revision.0},
         "producer": {"changed_slots": applied.changed_slots, "dirty_slots": store.dirty_slots()},
-        "dependency": {"binding_ids": changed_binding_ids, "node_keys": changed_nodes},
-        "consumer": {"gpu_dirty_slots": gpu_frame.map(|frame| frame.dirty_slots), "upload_stats": upload_stats},
-        "cpu_evaluation": {"initial_node_count": initial_cpu.nodes.len(), "changed_node_count": changed_cpu.nodes.len(), "scope": "full_program", "end_to_end_incremental": false},
-        "warnings": ["CPU evaluate_ui_program still materializes all nodes and traverses all bindings; only input upload and GPU dirty metadata are sparse."],
+        "dependency": {"binding_ids": changed_binding_ids, "node_keys": impact.node_keys, "domains": impact.domains},
+        "cpu_delta": {"scope": "impacted_bindings_only", "executed_binding_ids": delta.executed_binding_ids, "total_bindings": program.binding_records.len(), "changed_states": delta.changed_states, "primitives_rebuilt": delta.render_primitives_rebuilt, "layout_unchanged": delta.layout_unchanged, "narrower_than_full": cpu_incremental},
+        "consumer": {"gpu_delta": upload, "upload_stats": stats, "capability_negotiated": delta_negotiated, "narrower_than_full": gpu_incremental},
+        "equality_oracle": {"retained_frame_equals_golden_full_evaluation": frames_equal},
+        "capability_gate": {"delta_without_capability_rejected": uncapable, "observed_code": uncapable_code},
+        "end_to_end_incremental": end_to_end_incremental,
+        "warnings": ["The GPU ranges written here are the program adapter's instance, input and dirty planes. The production composition path in UiWgpuRenderer still rebuilds its own instance list per frame; this probe does not claim that pass is incremental."],
         "pass": pass,
     })
+}
+
+/// Publishes an input against a revision that never negotiated the delta
+/// capability and confirms the renderer refuses to narrow it.
+fn uncapped_delta_rejected(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    document: &neon_ui_schema::NuiFlowDocument,
+) -> (bool, String) {
+    let program_revision = revision(false);
+    let Ok(program) = compile_nui_flow_program(document, program_revision.clone()) else {
+        return (false, "compile".to_owned());
+    };
+    let Ok(mut store) = UiInputStore::activate(program_revision, document.input_schema.clone())
+    else {
+        return (false, "input_activate".to_owned());
+    };
+    let viewport = UiBounds {
+        x: 0.0,
+        y: 0.0,
+        width: 200.0,
+        height: 80.0,
+    };
+    let local = UiLocalPresentationState::default();
+    let cpu_viewport = UiCpuViewport {
+        logical_bounds: viewport,
+        revision: Revision(1),
+    };
+    let base = store.snapshot();
+    let mut gpu = GpuUiProgramBackend::new(2);
+    if gpu.stage(device, queue, &program, &base, viewport).is_err() {
+        return (false, "stage".to_owned());
+    }
+    let applied = match store.apply(
+        UiInputWriter::External,
+        UiInputFrame {
+            program_revision: program.revision.clone(),
+            expected_input_revision: base.input_revision,
+            request_id: "ui-input-incremental-probe-uncapped".into(),
+            idempotency_key: "ui-input-incremental-probe-uncapped-left".into(),
+            changes: vec![UiInputChange {
+                key: "left".into(),
+                value: UiInputValue::Bool { value: true },
+            }],
+        },
+    ) {
+        Ok(applied) => applied,
+        Err(error) => return (false, format!("input_apply:{}", error.code)),
+    };
+    let impact = UiImpactSet::from_input_publication(
+        &program,
+        &applied.changed_slots,
+        applied.input_revision,
+        Revision(1),
+    );
+    let mut retained = evaluate_ui_program_initial(&program, &base, cpu_viewport, &local);
+    let Ok(delta) =
+        apply_ui_impact_set(&program, &mut retained, &applied.snapshot, &local, &impact)
+    else {
+        return (false, "cpu_delta".to_owned());
+    };
+    match gpu.apply_frame_delta(queue, &program, &applied.snapshot, &impact, &delta) {
+        Err(error) => (
+            error.code == "ui_program_delta_capability_missing",
+            error.code.to_owned(),
+        ),
+        Ok(_) => (false, "accepted".to_owned()),
+    }
 }

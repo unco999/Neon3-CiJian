@@ -5,15 +5,22 @@
 //! or a replacement for the UI runtime's CPU execution backend.
 
 use std::collections::BTreeMap;
+use std::rc::Rc;
 use std::time::Instant;
 
 use neon_protocol::Revision;
+use neon_ui_runtime::ui_retained_evaluator::{UiChangeCause, UiFrameDelta, UiImpactSet};
 use neon_ui_schema::{
     UiBoundProperty, UiBounds, UiBranchPredicate, UiDiagnostic, UiDiagnosticSeverity,
     UiGpuBackendAdapter, UiGpuFrameState, UiGpuLayoutNode, UiGpuLayoutReadback, UiGpuPassTiming,
-    UiGpuUploadStatus, UiInputValue, UiProgram, UiProgramRevision, UiResolvedInputs,
-    UiResourceBudget,
+    UiGpuUploadStatus, UiInputValue, UiInvalidationDomain, UiProgram, UiProgramRevision,
+    UiResolvedInputs, UiResourceBudget,
 };
+
+/// Every record in the program buffers is one 16-byte slot.
+const RECORD_STRIDE: u64 = 16;
+/// The dirty buffer packs `u32` words: word 0 is the dirty slot count.
+const DIRTY_WORD: u64 = 4;
 
 #[derive(Debug)]
 pub struct UiGpuProgramBuffers {
@@ -30,24 +37,150 @@ pub struct UiGpuProgramBuffers {
     capacity: UiResourceBudget,
 }
 
+/// Process-local map from a stable program node key to the byte ranges that the
+/// node owns in this revision's GPU buffers.
+///
+/// The offsets are private to this process and valid only for the buffers
+/// created from the same program revision. They never enter the IR, the
+/// cross-process protocol, a hit id or a project file: the impact graph hands
+/// the renderer node *keys*, and this index is the renderer's own answer to
+/// "which bytes are those keys?".
+#[derive(Default)]
+struct GpuNodeRanges {
+    /// node key -> (first offset, record count) in `instance_buffer`.
+    instances: BTreeMap<String, (u64, u32)>,
+}
+
+impl GpuNodeRanges {
+    fn is_covered(&self, node_key: &str) -> bool {
+        self.instances.contains_key(node_key)
+    }
+}
+
+/// Slot layout of the input buffer, derived once per program revision.
+///
+/// Rebuilding it scans every resolved input, so the partial-upload path keeps
+/// it around and only re-derives it when a touched key's expansion no longer
+/// matches its cached width.
+struct InputSlotLayout {
+    /// top-level input key -> starting slot index, in `BTreeMap` order.
+    starts: BTreeMap<String, usize>,
+    /// top-level input key -> number of 16-byte slots the value expands into.
+    widths: BTreeMap<String, usize>,
+}
+
+impl InputSlotLayout {
+    fn build(inputs: &UiResolvedInputs, budget: &UiResourceBudget) -> Self {
+        let mut starts = BTreeMap::new();
+        let mut widths = BTreeMap::new();
+        let mut cursor = 0usize;
+        for (key, value) in inputs.values.iter() {
+            if cursor >= budget.max_bindings as usize {
+                break;
+            }
+            let width = flatten_value(&value.value).len();
+            starts.insert(key.clone(), cursor);
+            widths.insert(key.clone(), width);
+            cursor += width;
+        }
+        Self { starts, widths }
+    }
+
+    /// Detects a layout the cache no longer describes by checking only the keys
+    /// this frame touches, so the common delta stays proportional to the change.
+    fn is_stale_for(&self, inputs: &UiResolvedInputs, keys: &[String]) -> bool {
+        keys.iter().any(|key| {
+            let top = key.split('.').next().unwrap_or(key.as_str());
+            match (self.widths.get(top), inputs.values.get(top)) {
+                (Some(width), Some(value)) => *width != flatten_value(&value.value).len(),
+                (None, Some(_)) => true,
+                _ => false,
+            }
+        })
+    }
+}
+
 /// Upload counters used by headless acceptance probes. These counters describe
 /// producer-to-GPU upload scope; they do not claim that CPU layout evaluation
 /// or renderer composition is incremental.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub struct UiGpuUploadStats {
     pub static_buffer_uploads: u64,
     pub full_input_uploads: u64,
     pub partial_input_uploads: u64,
     pub input_slot_writes: u64,
     pub skipped_input_uploads: u64,
+    /// Deltas applied through `apply_frame_delta` instead of a full re-stage.
+    pub delta_uploads: u64,
+    /// Per-node instance records rewritten by delta uploads.
+    pub delta_instance_records: u64,
+    pub delta_skipped_no_capability: u64,
+    pub bytes_written: u64,
+    pub bytes_written_by_full_uploads: u64,
 }
 
 #[derive(Clone)]
 struct StagedProgram {
-    program: UiProgram,
+    program: Rc<UiProgram>,
     inputs: UiResolvedInputs,
     viewport: UiBounds,
     dirty_slots: Vec<String>,
+}
+
+/// Everything this adapter derived from one program revision.
+struct ProgramArtifacts {
+    program: Rc<UiProgram>,
+    buffers: UiGpuProgramBuffers,
+    ranges: GpuNodeRanges,
+    input_layout: InputSlotLayout,
+    /// Bytes a full re-stage of this revision writes; the delta denominator.
+    full_upload_bytes: u64,
+    /// Words of `dirty_buffer` that still hold a previous frame's slot list.
+    dirty_words: u32,
+}
+
+impl ProgramArtifacts {
+    fn new(device: &wgpu::Device, program: &UiProgram, inputs: &UiResolvedInputs) -> Self {
+        Self {
+            buffers: create_buffers(device, program),
+            ranges: plan_node_ranges(program),
+            program: Rc::new(program.clone()),
+            input_layout: InputSlotLayout::build(inputs, &program.resource_budget),
+            full_upload_bytes: full_upload_bytes(program, inputs),
+            dirty_words: 0,
+        }
+    }
+}
+
+/// Counters accumulated while a full stage runs, merged into the shared stats
+/// after the buffer borrow ends.
+#[derive(Default)]
+struct StageWrites {
+    static_buffer_uploads: u64,
+    full_input_uploads: u64,
+    partial_input_uploads: u64,
+    skipped_input_uploads: u64,
+    input_slot_writes: u64,
+    bytes_written: u64,
+    bytes_written_by_full_uploads: u64,
+    dirty_words_written: u32,
+}
+
+/// Byte scope of one delta upload, measured against a full re-upload of the
+/// same buffers. Probes use it to prove the write touched a fraction of the
+/// program; it says nothing about renderer composition.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct UiGpuDeltaUpload {
+    pub program_revision: u64,
+    pub input_revision: u64,
+    pub node_keys: Vec<String>,
+    pub input_slot_writes: u32,
+    pub instance_records_written: u32,
+    pub dirty_words_written: u32,
+    pub bytes_written: u64,
+    pub bytes_for_full_upload: u64,
 }
 
 /// WGPU-owner adapter. A staged update is only made observable by
@@ -55,7 +188,7 @@ struct StagedProgram {
 /// or input revision from being rendered.
 pub struct GpuUiProgramBackend {
     renderer_epoch: u64,
-    buffers: Option<UiGpuProgramBuffers>,
+    artifacts: Option<ProgramArtifacts>,
     staged: Option<StagedProgram>,
     active: Option<StagedProgram>,
     frame_sequence: u64,
@@ -69,7 +202,7 @@ impl GpuUiProgramBackend {
     pub fn new(renderer_epoch: u64) -> Self {
         Self {
             renderer_epoch,
-            buffers: None,
+            artifacts: None,
             staged: None,
             active: None,
             frame_sequence: 0,
@@ -80,6 +213,12 @@ impl GpuUiProgramBackend {
         }
     }
 
+    /// Full re-upload of a program revision and its resolved inputs.
+    ///
+    /// Returns whether this revision negotiated
+    /// `ui.program.delta.v1`. When it did not, the caller must keep coming back
+    /// here for every change, because the renderer may not claim a node-key to
+    /// range index that was never agreed.
     pub fn stage(
         &mut self,
         device: &wgpu::Device,
@@ -87,7 +226,7 @@ impl GpuUiProgramBackend {
         program: &UiProgram,
         inputs: &UiResolvedInputs,
         viewport: UiBounds,
-    ) -> Result<(), UiDiagnostic> {
+    ) -> Result<bool, UiDiagnostic> {
         let started = Instant::now();
         if program.revision != inputs.program_revision {
             return Err(diagnostic(
@@ -98,78 +237,304 @@ impl GpuUiProgramBackend {
                 program.revision.revision,
             ));
         }
-        if !fits_budget(program) {
-            let error = diagnostic(
-                "ui_program_capacity_overflow",
-                "program records exceed their declared resource budget",
-                None,
-                None,
-                program.revision.revision,
-            );
-            self.diagnostics.push(error.clone());
-            return Err(error);
-        }
-        let recreate = self.buffers.as_ref().is_none_or(|current| {
-            current.program_revision != program.revision
-                || current.capacity != program.resource_budget
+        let recreate = self.artifacts.as_ref().is_none_or(|artifacts| {
+            artifacts.buffers.program_revision != program.revision
+                || artifacts.buffers.capacity != program.resource_budget
         });
         if recreate {
-            self.buffers = Some(create_buffers(device, program));
-        }
-        let buffers = self.buffers.as_ref().expect("created above");
-        let program_upload = started.elapsed().as_micros() as u64;
-        let input_started = Instant::now();
-        if recreate {
-            queue.write_buffer(
-                &buffers.node_buffer,
-                0,
-                &record_bytes(program.nodes.len(), 16),
-            );
-            queue.write_buffer(
-                &buffers.binding_buffer,
-                0,
-                &record_bytes(program.binding_records.len(), 16),
-            );
-            queue.write_buffer(
-                &buffers.branch_buffer,
-                0,
-                &record_bytes(program.branch_records.len(), 4),
-            );
-            self.upload_stats.static_buffer_uploads += 3;
-        }
-        // Input buffer: full upload on first stage / program change, partial
-        // upload when only specific slots changed and the buffer already exists.
-        if recreate {
-            queue.write_buffer(
-                &buffers.input_buffer,
-                0,
-                &pack_inputs(inputs, &program.resource_budget),
-            );
-            self.upload_stats.full_input_uploads += 1;
-        } else if !inputs.changed_slots.is_empty() {
-            let updates = pack_changed_slots(inputs, &program.resource_budget);
-            for (offset, slot_bytes) in updates {
-                queue.write_buffer(&buffers.input_buffer, offset, &slot_bytes);
-                self.upload_stats.input_slot_writes += 1;
+            if !fits_budget(program) {
+                let error = diagnostic(
+                    "ui_program_capacity_overflow",
+                    "program records exceed their declared resource budget",
+                    None,
+                    None,
+                    program.revision.revision,
+                );
+                self.diagnostics.push(error.clone());
+                return Err(error);
             }
-            self.upload_stats.partial_input_uploads += 1;
-        } else {
-            self.upload_stats.skipped_input_uploads += 1;
+            self.artifacts = Some(ProgramArtifacts::new(device, program, inputs));
         }
-        queue.write_buffer(
-            &buffers.dirty_buffer,
-            0,
-            &record_bytes(inputs.changed_slots.len(), 4),
-        );
-        self.last_timing.program_upload_us = program_upload;
+        let budget = program.resource_budget.clone();
+        let input_started = Instant::now();
+        let mut writes = StageWrites::default();
+        let staged_program = {
+            let artifacts = self.artifacts.as_mut().expect("created above");
+            if recreate
+                || artifacts
+                    .input_layout
+                    .is_stale_for(inputs, &inputs.changed_slots)
+            {
+                artifacts.input_layout = InputSlotLayout::build(inputs, &budget);
+            }
+            let buffers = &artifacts.buffers;
+            if recreate {
+                queue.write_buffer(
+                    &buffers.node_buffer,
+                    0,
+                    &record_bytes(program.nodes.len(), RECORD_STRIDE as usize),
+                );
+                queue.write_buffer(
+                    &buffers.binding_buffer,
+                    0,
+                    &record_bytes(program.binding_records.len(), RECORD_STRIDE as usize),
+                );
+                queue.write_buffer(
+                    &buffers.branch_buffer,
+                    0,
+                    &record_bytes(program.branch_records.len(), DIRTY_WORD as usize),
+                );
+                writes.static_buffer_uploads += 3;
+            }
+            // Input buffer: full upload on first stage or program change,
+            // slot-exact writes when only specific slots moved.
+            if recreate {
+                let bytes = pack_inputs(inputs, &budget);
+                writes.bytes_written_by_full_uploads += bytes.len() as u64;
+                queue.write_buffer(&buffers.input_buffer, 0, &bytes);
+                writes.full_input_uploads += 1;
+            } else if !inputs.changed_slots.is_empty() {
+                let updates = pack_slots_for(
+                    &inputs.changed_slots,
+                    inputs,
+                    &budget,
+                    &artifacts.input_layout,
+                );
+                for (offset, slot_bytes) in updates {
+                    queue.write_buffer(&buffers.input_buffer, offset, &slot_bytes);
+                    writes.input_slot_writes += 1;
+                    writes.bytes_written += slot_bytes.len() as u64;
+                }
+                writes.partial_input_uploads += 1;
+            } else {
+                writes.skipped_input_uploads += 1;
+            }
+            // The logical layout plane carries the program's resolved bounds and
+            // is uploaded once per revision: an input publication can change a
+            // node's presentation state, never its logical layout.
+            if recreate {
+                let bytes = pack_layout_records(program, &budget);
+                writes.bytes_written_by_full_uploads += bytes.len() as u64;
+                queue.write_buffer(&buffers.layout_buffer, 0, &bytes);
+                writes.static_buffer_uploads += 1;
+            }
+            writes.dirty_words_written = write_dirty_slots(
+                queue,
+                buffers,
+                &artifacts.input_layout,
+                inputs,
+                artifacts.dirty_words,
+            );
+            artifacts.dirty_words = writes.dirty_words_written.max(1);
+            Rc::clone(&artifacts.program)
+        };
+        self.upload_stats.static_buffer_uploads += writes.static_buffer_uploads;
+        self.upload_stats.full_input_uploads += writes.full_input_uploads;
+        self.upload_stats.partial_input_uploads += writes.partial_input_uploads;
+        self.upload_stats.skipped_input_uploads += writes.skipped_input_uploads;
+        self.upload_stats.input_slot_writes += writes.input_slot_writes;
+        self.upload_stats.bytes_written += writes.bytes_written;
+        self.upload_stats.bytes_written_by_full_uploads += writes.bytes_written_by_full_uploads;
+        self.last_timing.program_upload_us = started.elapsed().as_micros() as u64;
         self.last_timing.input_upload_us = input_started.elapsed().as_micros() as u64;
         self.staged = Some(StagedProgram {
-            program: program.clone(),
+            program: staged_program,
             inputs: inputs.clone(),
             viewport,
             dirty_slots: inputs.changed_slots.clone(),
         });
-        Ok(())
+        Ok(program.revision.supports_delta_upload())
+    }
+
+    /// Narrow a resolved input publication to the buffer ranges the compile-time
+    /// impact graph says it can reach.
+    ///
+    /// This is the delta half of the `ui.program.delta.v1` contract: the impact
+    /// set carries stable node *keys*, this process resolves them to byte ranges,
+    /// and only those ranges are written. Any mismatch in cause, revision,
+    /// capability or coverage is reported as a diagnostic so the caller falls
+    /// back to [`Self::stage`]; a delta is never silently applied to the wrong
+    /// range.
+    pub fn apply_frame_delta(
+        &mut self,
+        queue: &wgpu::Queue,
+        program: &UiProgram,
+        inputs: &UiResolvedInputs,
+        impact: &UiImpactSet,
+        delta: &UiFrameDelta,
+    ) -> Result<UiGpuDeltaUpload, UiDiagnostic> {
+        let revision = program.revision.revision;
+        if !program.revision.supports_delta_upload() {
+            self.upload_stats.delta_skipped_no_capability += 1;
+            return Err(diagnostic(
+                "ui_program_delta_capability_missing",
+                "program revision did not negotiate ui.program.delta.v1",
+                None,
+                None,
+                revision,
+            ));
+        }
+        if program.revision != inputs.program_revision {
+            return Err(diagnostic(
+                "ui_program_stale_input_revision",
+                "input revision belongs to a different program",
+                None,
+                None,
+                revision,
+            ));
+        }
+        if delta.cause != UiChangeCause::InputPublication {
+            return Err(diagnostic(
+                "ui_program_delta_unsupported_cause",
+                "only an authoritative input publication may drive a program delta; \
+                 interaction previews stay renderer-local",
+                None,
+                None,
+                revision,
+            ));
+        }
+        if delta.input_revision != inputs.input_revision {
+            return Err(diagnostic(
+                "ui_program_delta_stale",
+                "frame delta was computed for a different input revision",
+                None,
+                None,
+                revision,
+            ));
+        }
+        let base = self
+            .staged
+            .as_ref()
+            .or(self.active.as_ref())
+            .ok_or_else(|| {
+                diagnostic(
+                    "ui_program_delta_without_base",
+                    "no program revision is uploaded; a delta needs a full stage first",
+                    None,
+                    None,
+                    revision,
+                )
+            })?;
+        if base.program.revision != program.revision {
+            return Err(diagnostic(
+                "ui_program_delta_without_base",
+                "uploaded program revision differs from the delta's program",
+                None,
+                None,
+                revision,
+            ));
+        }
+        if !delta.layout_unchanged {
+            return Err(diagnostic(
+                "ui_program_delta_needs_full_stage",
+                "the change reaches logical layout, which this revision uploads in full",
+                None,
+                None,
+                revision,
+            ));
+        }
+        let base_viewport = base.viewport;
+        let uncovered = {
+            let artifacts = self.artifacts.as_ref().expect("base implies artifacts");
+            let mut keys: Vec<String> = delta
+                .changed_states
+                .iter()
+                .filter(|state| !artifacts.ranges.is_covered(&state.node_key))
+                .map(|state| state.node_key.clone())
+                .collect();
+            keys.sort();
+            keys.dedup();
+            keys
+        };
+        if !uncovered.is_empty() {
+            return Err(diagnostic(
+                "ui_program_delta_uncovered_node",
+                "delta reached a node with no range in this revision's buffers",
+                Some(uncovered.join(",")),
+                None,
+                revision,
+            ));
+        }
+
+        let touches_state = delta.domains_executed.iter().any(|domain| {
+            matches!(
+                domain,
+                UiInvalidationDomain::NodeState
+                    | UiInvalidationDomain::ColorInstances
+                    | UiInvalidationDomain::DepthInstances
+                    | UiInvalidationDomain::HitTarget
+            )
+        });
+        let mut upload = UiGpuDeltaUpload {
+            program_revision: revision.0,
+            input_revision: delta.input_revision.0,
+            node_keys: delta
+                .changed_states
+                .iter()
+                .map(|state| state.node_key.clone())
+                .collect(),
+            ..UiGpuDeltaUpload::default()
+        };
+        upload.node_keys.sort();
+        upload.node_keys.dedup();
+        let program_rc = {
+            let artifacts = self.artifacts.as_mut().expect("base implies artifacts");
+            let budget = program.resource_budget.clone();
+            let program_keys = union_input_keys(
+                impact.input_keys.as_slice(),
+                inputs.changed_slots.as_slice(),
+            );
+            upload.bytes_for_full_upload = artifacts.full_upload_bytes;
+            if artifacts.input_layout.is_stale_for(inputs, &program_keys) {
+                artifacts.input_layout = InputSlotLayout::build(inputs, &budget);
+            }
+            for (offset, slot_bytes) in
+                pack_slots_for(&program_keys, inputs, &budget, &artifacts.input_layout)
+            {
+                queue.write_buffer(&artifacts.buffers.input_buffer, offset, &slot_bytes);
+                upload.input_slot_writes += 1;
+                upload.bytes_written += slot_bytes.len() as u64;
+            }
+            if touches_state {
+                for state in &delta.changed_states {
+                    let Some((offset, count)) =
+                        artifacts.ranges.instances.get(&state.node_key).copied()
+                    else {
+                        continue;
+                    };
+                    let record = state_record_bytes(state);
+                    let capacity = artifacts.buffers.instance_buffer.size() as usize;
+                    if offset as usize + record.len() > capacity {
+                        continue;
+                    }
+                    queue.write_buffer(&artifacts.buffers.instance_buffer, offset, &record);
+                    upload.instance_records_written += count;
+                    upload.bytes_written += record.len() as u64;
+                }
+            }
+            let words = write_dirty_slots(
+                queue,
+                &artifacts.buffers,
+                &artifacts.input_layout,
+                inputs,
+                artifacts.dirty_words,
+            );
+            upload.dirty_words_written = words;
+            upload.bytes_written += u64::from(words) * DIRTY_WORD;
+            artifacts.dirty_words = words.max(1);
+            Rc::clone(&artifacts.program)
+        };
+        self.upload_stats.delta_uploads += 1;
+        self.upload_stats.delta_instance_records += upload.instance_records_written as u64;
+        self.upload_stats.input_slot_writes += upload.input_slot_writes as u64;
+        self.upload_stats.bytes_written += upload.bytes_written;
+        self.staged = Some(StagedProgram {
+            program: program_rc,
+            inputs: inputs.clone(),
+            viewport: base_viewport,
+            dirty_slots: inputs.changed_slots.clone(),
+        });
+        Ok(upload)
     }
 
     pub fn activate_at_frame_boundary(&mut self) -> Option<UiGpuFrameState> {
@@ -290,9 +655,9 @@ impl GpuUiProgramBackend {
                 UiGpuUploadStatus::Empty
             },
             capacity: self
-                .buffers
+                .artifacts
                 .as_ref()
-                .map(|buffers| buffers.capacity.clone())
+                .map(|artifacts| artifacts.buffers.capacity.clone())
                 .unwrap_or_else(empty_budget),
             diagnostics: self.diagnostics.clone(),
             last_timing: self.last_timing.clone(),
@@ -415,9 +780,148 @@ fn buffer(device: &wgpu::Device, label: &'static str, size: u64) -> wgpu::Buffer
         mapped_at_creation: false,
     })
 }
-fn record_bytes(records: usize, stride: usize) -> Vec<u8> {
-    vec![0; (records.max(1) * stride).max(4)]
+fn record_len(records: usize, stride: u64) -> u64 {
+    ((records.max(1)) as u64 * stride).max(4)
 }
+fn record_bytes(records: usize, stride: usize) -> Vec<u8> {
+    vec![0; record_len(records, stride as u64) as usize]
+}
+
+/// Bytes a full re-stage of this revision writes. Measured against the ranges
+/// actually uploaded, so a delta's share is never inflated by buffers the
+/// adapter leaves untouched.
+fn full_upload_bytes(program: &UiProgram, inputs: &UiResolvedInputs) -> u64 {
+    let budget = &program.resource_budget;
+    record_len(program.nodes.len(), RECORD_STRIDE)
+        + record_len(program.binding_records.len(), RECORD_STRIDE)
+        + record_len(program.branch_records.len(), DIRTY_WORD)
+        + record_len(program.layout_records.len(), RECORD_STRIDE)
+        + record_len(inputs.changed_slots.len().max(1), DIRTY_WORD)
+        + (budget.max_bindings.max(1) as u64) * RECORD_STRIDE
+}
+
+/// Builds the process-local node key to instance-range index for one revision.
+///
+/// Template nodes claim `max_instances` consecutive records because a shader
+/// expands them at draw time; every other node claims exactly one presentation
+/// state record. A node that does not fit the declared instance budget gets no
+/// range, which makes `apply_frame_delta` reject it and fall back to a full
+/// upload instead of writing somewhere arbitrary.
+fn plan_node_ranges(program: &UiProgram) -> GpuNodeRanges {
+    let capacity = program.resource_budget.max_instances as u64;
+    let mut instances: BTreeMap<String, (u64, u32)> = BTreeMap::new();
+    let mut cursor = 0u64;
+    for record in &program.template_records {
+        let count = record.max_instances.max(1) as u64;
+        for key in &record.node_range {
+            if cursor + count > capacity {
+                continue;
+            }
+            instances.insert(key.clone(), (cursor * RECORD_STRIDE, count as u32));
+            cursor += count;
+        }
+    }
+    for node in &program.nodes {
+        if cursor + 1 > capacity || instances.contains_key(&node.key) {
+            continue;
+        }
+        instances.insert(node.key.clone(), (cursor * RECORD_STRIDE, 1));
+        cursor += 1;
+    }
+    GpuNodeRanges { instances }
+}
+
+/// The 16-byte presentation state record a shader samples per instance:
+/// state flags, numeric value, opacity and scroll offset.
+fn state_record_bytes(state: &neon_ui_schema::UiCpuNodeState) -> [u8; RECORD_STRIDE as usize] {
+    let flags = u32::from(state.visible)
+        | (u32::from(state.enabled) << 1)
+        | (u32::from(state.selected) << 2)
+        | (u32::from(state.active) << 3);
+    let mut bytes = [0u8; RECORD_STRIDE as usize];
+    bytes[0..4].copy_from_slice(&flags.to_le_bytes());
+    bytes[4..8].copy_from_slice(&state.numeric_value.unwrap_or(0.0).to_le_bytes());
+    bytes[8..12].copy_from_slice(&state.opacity.to_le_bytes());
+    bytes[12..16].copy_from_slice(&state.scroll_offset[0].to_le_bytes());
+    bytes
+}
+
+/// Packs every logical layout record as one contiguous plane. Logical layout is
+/// program data, not input state, so it is uploaded in full with the revision.
+fn pack_layout_records(program: &UiProgram, budget: &UiResourceBudget) -> Vec<u8> {
+    let mut bytes = vec![0u8; record_len(budget.max_nodes as usize, RECORD_STRIDE) as usize];
+    for (index, record) in program.layout_records.iter().enumerate() {
+        let offset = index * RECORD_STRIDE as usize;
+        if offset + RECORD_STRIDE as usize > bytes.len() {
+            break;
+        }
+        bytes[offset..offset + 16].copy_from_slice(&bounds_bytes(&record.bounds));
+    }
+    bytes
+}
+
+fn bounds_bytes(bounds: &UiBounds) -> [u8; 16] {
+    let mut bytes = [0u8; 16];
+    for (index, value) in [bounds.x, bounds.y, bounds.width, bounds.height]
+        .into_iter()
+        .enumerate()
+    {
+        bytes[index * 4..(index + 1) * 4].copy_from_slice(&value.to_le_bytes());
+    }
+    bytes
+}
+
+/// Writes `[count, slot indices..]` into the dirty plane and clears whatever the
+/// previous frame left beyond the new list, so a consumer never reads a stale
+/// tail as part of this frame.
+fn write_dirty_slots(
+    queue: &wgpu::Queue,
+    buffers: &UiGpuProgramBuffers,
+    layout: &InputSlotLayout,
+    inputs: &UiResolvedInputs,
+    previous_words: u32,
+) -> u32 {
+    let capacity_words = (buffers.dirty_buffer.size() / DIRTY_WORD).max(1);
+    let mut slots = inputs
+        .changed_slots
+        .iter()
+        .filter_map(|key| {
+            layout
+                .starts
+                .get(key.split('.').next().unwrap_or(key.as_str()))
+        })
+        .map(|index| *index as u32)
+        .collect::<Vec<u32>>();
+    slots.sort_unstable();
+    slots.dedup();
+    slots.truncate((capacity_words - 1).max(1) as usize);
+    let mut words = Vec::with_capacity(slots.len() + 1);
+    words.push(slots.len() as u32);
+    words.extend(slots.iter());
+    let written = words.len() as u64;
+    let previous_words = u64::from(previous_words).min(capacity_words);
+    if written < previous_words {
+        words.resize(previous_words as usize, 0);
+    }
+    let bytes = words
+        .into_iter()
+        .flat_map(|word| word.to_le_bytes())
+        .collect::<Vec<u8>>();
+    queue.write_buffer(&buffers.dirty_buffer, 0, &bytes);
+    written as u32
+}
+
+/// Union of the keys the impact graph names and the keys the producer reports as
+/// moved. Writing the union means a graph/producer disagreement can never leave
+/// a stale slot on the GPU; the graph still decides which *nodes* are touched.
+fn union_input_keys(impact_keys: &[String], changed_keys: &[String]) -> Vec<String> {
+    let mut keys = impact_keys.to_vec();
+    keys.extend(changed_keys.iter().cloned());
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
 fn pack_inputs(inputs: &UiResolvedInputs, budget: &UiResourceBudget) -> Vec<u8> {
     let mut bytes = vec![0; (budget.max_bindings.max(1) as usize) * 16];
     let mut slot_cursor = 0usize;
@@ -497,20 +1001,6 @@ fn pack_single_slot(value: &UiInputValue) -> [u8; 16] {
     bytes
 }
 
-/// Builds a key -> starting-slot-index map, accounting for Struct multi-slot expansion.
-fn slot_index_map(inputs: &UiResolvedInputs, budget: &UiResourceBudget) -> BTreeMap<String, usize> {
-    let mut map = BTreeMap::new();
-    let mut cursor = 0usize;
-    for (key, value) in inputs.values.iter() {
-        if cursor >= budget.max_bindings as usize {
-            break;
-        }
-        map.insert(key.clone(), cursor);
-        cursor += flatten_value(&value.value).len();
-    }
-    map
-}
-
 /// Resolves a dotted path to a reference of the nested field value.
 fn resolve_field_path<'a>(value: &'a UiInputValue, path: &str) -> Option<&'a UiInputValue> {
     let mut current = value;
@@ -525,17 +1015,29 @@ fn resolve_field_path<'a>(value: &'a UiInputValue, path: &str) -> Option<&'a UiI
     Some(current)
 }
 
-/// Returns (offset, 16-byte slot) pairs for changed slots. Supports "key" and "key.field" paths.
-fn pack_changed_slots(
+/// Slot-exact writes for one frame's key list, resolved through a cached layout.
+/// Building the layout scans every input, so the adapter keeps one per program
+/// revision and re-derives it only when it goes stale.
+fn pack_slots_for(
+    keys: &[String],
     inputs: &UiResolvedInputs,
     budget: &UiResourceBudget,
+    layout: &InputSlotLayout,
 ) -> Vec<(u64, [u8; 16])> {
-    if inputs.changed_slots.is_empty() {
+    if keys.is_empty() {
         return Vec::new();
     }
-    let index_map = slot_index_map(inputs, budget);
-    let mut updates = Vec::with_capacity(inputs.changed_slots.len());
-    for key in &inputs.changed_slots {
+    pack_slots_with_map(keys, inputs, budget, &layout.starts)
+}
+
+fn pack_slots_with_map(
+    keys: &[String],
+    inputs: &UiResolvedInputs,
+    budget: &UiResourceBudget,
+    index_map: &BTreeMap<String, usize>,
+) -> Vec<(u64, [u8; 16])> {
+    let mut updates = Vec::with_capacity(keys.len());
+    for key in keys {
         let (top_key, field_path) = match key.split_once('.') {
             Some((top, rest)) => (top, Some(rest)),
             None => (key.as_str(), None),
@@ -796,6 +1298,12 @@ mod tests {
         assert_eq!(&bytes[0..16], &[0u8; 16]);
     }
 
+    /// Runs the cached-layout slot pack the adapter actually uses.
+    fn pack_changed(inputs: &UiResolvedInputs, budget: &UiResourceBudget) -> Vec<(u64, [u8; 16])> {
+        let layout = InputSlotLayout::build(inputs, budget);
+        pack_slots_for(&inputs.changed_slots, inputs, budget, &layout)
+    }
+
     fn make_inputs_with_changes(
         pairs: Vec<(&str, UiInputValue)>,
         changed: Vec<&str>,
@@ -806,14 +1314,14 @@ mod tests {
     }
 
     #[test]
-    fn pack_changed_slots_returns_empty_when_no_changes() {
+    fn pack_slots_for_returns_empty_when_no_changes() {
         let inputs = make_inputs(vec![("a", UiInputValue::F32 { value: 1.0 })]);
-        let updates = pack_changed_slots(&inputs, &test_budget(4));
+        let updates = pack_changed(&inputs, &test_budget(4));
         assert!(updates.is_empty());
     }
 
     #[test]
-    fn pack_changed_slots_returns_correct_offset_and_bytes() {
+    fn pack_slots_for_returns_correct_offset_and_bytes() {
         let inputs = make_inputs_with_changes(
             vec![
                 ("a", UiInputValue::F32 { value: 1.0 }),
@@ -822,7 +1330,7 @@ mod tests {
             ],
             vec!["b"],
         );
-        let updates = pack_changed_slots(&inputs, &test_budget(4));
+        let updates = pack_changed(&inputs, &test_budget(4));
         assert_eq!(updates.len(), 1);
         // "b" is the second key in BTreeMap order -> index 1 -> offset 16
         assert_eq!(updates[0].0, 16);
@@ -831,7 +1339,7 @@ mod tests {
     }
 
     #[test]
-    fn pack_changed_slots_handles_multiple_changes() {
+    fn pack_slots_for_handles_multiple_changes() {
         let inputs = make_inputs_with_changes(
             vec![
                 ("a", UiInputValue::F32 { value: 1.0 }),
@@ -840,7 +1348,7 @@ mod tests {
             ],
             vec!["a", "c"],
         );
-        let updates = pack_changed_slots(&inputs, &test_budget(4));
+        let updates = pack_changed(&inputs, &test_budget(4));
         assert_eq!(updates.len(), 2);
         // "a" -> index 0 -> offset 0, "c" -> index 2 -> offset 32
         assert_eq!(updates[0].0, 0);
@@ -850,17 +1358,17 @@ mod tests {
     }
 
     #[test]
-    fn pack_changed_slots_ignores_unknown_keys() {
+    fn pack_slots_for_ignores_unknown_keys() {
         let inputs = make_inputs_with_changes(
             vec![("a", UiInputValue::F32 { value: 1.0 })],
             vec!["nonexistent"],
         );
-        let updates = pack_changed_slots(&inputs, &test_budget(4));
+        let updates = pack_changed(&inputs, &test_budget(4));
         assert!(updates.is_empty());
     }
 
     #[test]
-    fn pack_changed_slots_matches_full_pack_for_changed_slot() {
+    fn pack_slots_for_matches_full_pack_for_changed_slot() {
         // The partial bytes for a changed slot must equal the corresponding
         // 16-byte region in the full pack.
         let inputs = make_inputs_with_changes(
@@ -881,7 +1389,7 @@ mod tests {
             vec!["b"],
         );
         let full = pack_inputs(&inputs, &test_budget(4));
-        let partial = pack_changed_slots(&inputs, &test_budget(4));
+        let partial = pack_changed(&inputs, &test_budget(4));
         assert_eq!(partial.len(), 1);
         assert_eq!(partial[0].0, 16);
         assert_eq!(partial[0].1, &full[16..32]);
@@ -973,7 +1481,7 @@ mod tests {
             ("mp", UiInputValue::F32 { value: 0.5 }),
         ]);
         let inputs = make_inputs_with_changes(vec![("player", player)], vec!["player.mp"]);
-        let updates = pack_changed_slots(&inputs, &test_budget(4));
+        let updates = pack_changed(&inputs, &test_budget(4));
         // player.mp is the second field -> offset 1 within struct -> absolute slot 1 -> offset 16
         assert_eq!(updates.len(), 1);
         assert_eq!(updates[0].0, 16);
@@ -987,7 +1495,7 @@ mod tests {
             ("mp", UiInputValue::F32 { value: 0.5 }),
         ]);
         let inputs = make_inputs_with_changes(vec![("player", player)], vec!["player"]);
-        let updates = pack_changed_slots(&inputs, &test_budget(4));
+        let updates = pack_changed(&inputs, &test_budget(4));
         assert_eq!(updates.len(), 2);
         assert_eq!(updates[0].0, 0); // hp
         assert_eq!(updates[1].0, 16); // mp
@@ -1065,5 +1573,170 @@ mod tests {
             length: 10,
         };
         assert_eq!(struct_kind.gpu_slot_count(), 20);
+    }
+
+    const PLAN_FLOW: &str = "version 1
+surface test.surface revision 1
+budget nodes=16 bindings=16 instances=16 text=16 glyphs=64 events=16 clips=16
+input left bool default false
+input right bool default false
+surface root row w 200 h 80
+  panel left-panel visible $left w 80 h 40
+  panel right-panel visible $right w 80 h 40
+  panel filler-a w 20 h 20
+  panel filler-b w 20 h 20
+";
+
+    fn program_from_flow(flow: &str) -> UiProgram {
+        let document = neon_ui_runtime::parse_nui_flow(flow).expect("flow parses");
+        let revision = UiProgramRevision {
+            program_id: "test.surface".into(),
+            revision: Revision(1),
+            schema_version: 1,
+            capabilities: vec![UiProgramCapability {
+                name: "ui.program.v1".into(),
+                version: 1,
+                owner: UiProgramCapabilityOwner::SharedContract,
+                status: UiProgramCapabilityStatus::Supported,
+            }],
+        };
+        neon_ui_runtime::compile_nui_flow_program(&document, revision).expect("flow compiles")
+    }
+
+    #[test]
+    fn every_node_gets_its_own_instance_range() {
+        let program = program_from_flow(PLAN_FLOW);
+        let ranges = plan_node_ranges(&program);
+        let mut offsets: Vec<u64> = ranges
+            .instances
+            .values()
+            .map(|(offset, _)| *offset)
+            .collect();
+        offsets.sort_unstable();
+        let total = offsets.len();
+        offsets.dedup();
+        assert_eq!(offsets.len(), total, "instance ranges must not overlap");
+        for node in &program.nodes {
+            assert!(ranges.is_covered(&node.key), "{} uncovered", node.key);
+            assert_eq!(
+                ranges.instances[&node.key].1, 1,
+                "a non-template node owns exactly one presentation record"
+            );
+        }
+    }
+
+    #[test]
+    fn nodes_beyond_the_instance_budget_stay_uncovered() {
+        let mut program = program_from_flow(PLAN_FLOW);
+        program.resource_budget.max_instances = 2;
+        let ranges = plan_node_ranges(&program);
+        assert_eq!(ranges.instances.len(), 2);
+        assert_eq!(
+            program
+                .nodes
+                .iter()
+                .filter(|node| ranges.is_covered(&node.key))
+                .count(),
+            2,
+            "an uncovered node must send the delta back to a full upload"
+        );
+    }
+
+    #[test]
+    fn layout_records_are_packed_at_the_record_stride() {
+        let program = program_from_flow(PLAN_FLOW);
+        let bytes = pack_layout_records(&program, &program.resource_budget);
+        assert_eq!(
+            &bytes[0..4],
+            &program.layout_records[0].bounds.x.to_le_bytes()
+        );
+        assert_eq!(
+            &bytes[16..20],
+            &program.layout_records[1].bounds.x.to_le_bytes()
+        );
+    }
+
+    #[test]
+    fn state_record_encodes_flags_numeric_and_opacity() {
+        let state = neon_ui_schema::UiCpuNodeState {
+            node_key: "n".into(),
+            visible: true,
+            enabled: true,
+            selected: false,
+            active: true,
+            numeric_value: Some(2.5),
+            state_token: None,
+            text: None,
+            image: None,
+            opacity: 0.5,
+            scroll_offset: [1.25, 0.0],
+        };
+        let bytes = state_record_bytes(&state);
+        assert_eq!(u32::from_le_bytes(bytes[0..4].try_into().unwrap()), 0b1011);
+        assert_eq!(f32::from_le_bytes(bytes[4..8].try_into().unwrap()), 2.5);
+        assert_eq!(f32::from_le_bytes(bytes[8..12].try_into().unwrap()), 0.5);
+        assert_eq!(
+            f32::from_le_bytes(bytes[12..16].try_into().unwrap()),
+            1.25,
+            "the record stays one 16-byte slot"
+        );
+    }
+
+    #[test]
+    fn cached_slot_layout_only_rebuilds_for_keys_it_cannot_explain() {
+        let budget = test_budget(4);
+        let single = make_inputs(vec![("a", UiInputValue::F32 { value: 1.0 })]);
+        let cached = InputSlotLayout::build(&single, &budget);
+        let both = make_inputs_with_changes(
+            vec![
+                ("a", UiInputValue::F32 { value: 1.0 }),
+                ("b", UiInputValue::F32 { value: 2.0 }),
+            ],
+            vec!["b"],
+        );
+        assert!(
+            cached.is_stale_for(&both, &both.changed_slots),
+            "a key the cache never saw must invalidate it"
+        );
+        let unchanged = make_inputs_with_changes(
+            vec![
+                ("a", UiInputValue::F32 { value: 1.0 }),
+                ("b", UiInputValue::F32 { value: 2.0 }),
+            ],
+            vec!["a"],
+        );
+        let wide = InputSlotLayout::build(&both, &budget);
+        assert!(
+            !wide.is_stale_for(&unchanged, &unchanged.changed_slots),
+            "a plain value change must not rescan the layout"
+        );
+        let grown = make_inputs_with_changes(
+            vec![
+                (
+                    "a",
+                    struct_value(vec![
+                        ("x", UiInputValue::F32 { value: 1.0 }),
+                        ("y", UiInputValue::F32 { value: 2.0 }),
+                    ]),
+                ),
+                ("b", UiInputValue::F32 { value: 2.0 }),
+            ],
+            vec!["a"],
+        );
+        assert!(
+            wide.is_stale_for(&grown, &grown.changed_slots),
+            "a wider expansion under a known key must invalidate the cache"
+        );
+    }
+
+    #[test]
+    fn union_input_keys_sorts_and_dedups() {
+        let keys = |values: &[&str]| -> Vec<String> {
+            values.iter().map(|value| (*value).to_owned()).collect()
+        };
+        assert_eq!(
+            union_input_keys(&keys(&["b", "a"]), &keys(&["a", "c"])),
+            keys(&["a", "b", "c"])
+        );
     }
 }

@@ -37,6 +37,11 @@ pub const UI_TIMELINE_ANIMATION_CAPABILITY_NAME: &str = "ui.timeline.animation.v
 /// the renderer-neutral declaration; WGPU editing composition is negotiated by
 /// a later capability revision.
 pub const UI_CODE_EDITOR_CAPABILITY_NAME: &str = "ui.code_editor.v1";
+/// The renderer consumes a compile-time input impact set and writes only the
+/// buffer ranges that the change can reach. Without this capability a program
+/// must be re-uploaded in full, because the caller cannot assume the renderer
+/// owns a node-key to range index.
+pub const UI_PROGRAM_DELTA_CAPABILITY_NAME: &str = "ui.program.delta.v1";
 
 pub const ERROR_UI_PROGRAM_UNSUPPORTED_SCHEMA: &str = "ui_program_unsupported_schema";
 pub const ERROR_UI_PROGRAM_UNSUPPORTED_CAPABILITY: &str = "ui_program_unsupported_capability";
@@ -670,6 +675,17 @@ pub struct UiProgramRevision {
 }
 
 impl UiProgramRevision {
+    /// Whether the renderer may narrow an input publication to the buffer
+    /// ranges its impact graph names. Without this capability every change must
+    /// go through a full re-upload.
+    pub fn supports_delta_upload(&self) -> bool {
+        self.capabilities.iter().any(|capability| {
+            capability.name == UI_PROGRAM_DELTA_CAPABILITY_NAME
+                && capability.version == 1
+                && capability.status == UiProgramCapabilityStatus::Supported
+        })
+    }
+
     pub fn validate_baseline(&self) -> Result<(), UiSchemaError> {
         if self.program_id.trim().is_empty() {
             return Err(UiSchemaError::EmptyProgramId);
@@ -701,6 +717,7 @@ impl UiProgramRevision {
                     | UI_CANVAS_POINTS_LINES_CAPABILITY_NAME
                     | UI_TIMELINE_ANIMATION_CAPABILITY_NAME
                     | UI_CODE_EDITOR_CAPABILITY_NAME
+                    | UI_PROGRAM_DELTA_CAPABILITY_NAME
             ) || capability.version != 1
             {
                 return Err(UiSchemaError::UnsupportedProgramCapability);

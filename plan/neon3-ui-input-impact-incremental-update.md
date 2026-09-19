@@ -727,5 +727,73 @@ JSONL probe 能输出 producer/consumer 范围和最终结果
   - `cargo clippy -q -p neon-ui-runtime --lib --all-targets` → 新增/改动文件 0 warning。
   - `cargo check -q --workspace --all-targets` → exit code `0`。
 
-### Phase D: WGPU ranges — 未开始（GPU 上传统计与 headless probe 已先行落地，
-commit `b833761`）
+### Phase D: WGPU ranges — CPU→GPU 链路已完成（program adapter 层）
+
+前置的 GPU 上传统计与 headless probe 骨架在 commit `b833761`。本节记录 §6/§12 要求的
+renderer-local range 写入与端到端增量证明。
+
+- 能力协商（§6.3）：新增 `UI_PROGRAM_DELTA_CAPABILITY_NAME = "ui.program.delta.v1"`
+  （`crates/neon-ui-schema/src/lib.rs`），加入 `validate_baseline` 白名单，并提供
+  `UiProgramRevision::supports_delta_upload()` 作为唯一判定入口。
+  `stage()` 现在返回该 revision 是否协商了 delta；未协商时
+  `apply_frame_delta` 一律 `ui_program_delta_capability_missing`，调用方必须回到
+  `stage()` 全量上传。renderer 不得宣称一个从未协商过的 node key→range 索引。
+- renderer-local 索引（§6.1）：`GpuNodeRanges`（`ui_program_gpu.rs`）在每次 buffer
+  创建时由 `plan_node_ranges(program)` 建立 `node key -> (instance 起始偏移, 记录数)`。
+  template 节点按 `max_instances` 预留连续记录，其余节点各占 1 条。超出
+  `max_instances` 预算的节点**不进入索引**，于是 delta 路径以
+  `ui_program_delta_uncovered_node` 拒绝并退回全量上传，而不是写到任意偏移。
+  偏移只存在于 WGPU 进程，不进 IR、不进协议、不进 hit id（§11）。
+- 真实记录内容，不再是占位零：`state_record_bytes` 把 `UiCpuNodeState` 的
+  visible/enabled/selected/active flags、numeric value、opacity、scroll offset 编成一条
+  16 字节 presentation record；`pack_layout_records` 把 program 的 logical bounds 编成
+  layout plane（随 revision 全量上传一次，因为 input publication 不改 logical layout）。
+  dirty plane 现在写 `[count, slot indices..]` 并按上一帧长度清零尾部，之前每帧写的是
+  全零且长度都没写。
+- delta 入口：`apply_frame_delta(queue, program, inputs, impact, delta)` 是
+  `UiImpactSet`/`UiFrameDelta` 在 `neon-wgpu-runtime` 的第一个真实消费者。它按
+  `delta.changed_states` 的 node key 解析 range 只写这些记录，input slot 取
+  `impact.input_keys` 与 `inputs.changed_slots` 的并集（图与生产者不一致时不留脏 slot），
+  并返回 `UiGpuDeltaUpload { node_keys, input_slot_writes, instance_records_written,
+  dirty_words_written, bytes_written, bytes_for_full_upload }`。`bytes_for_full_upload`
+  只统计 adapter 真正会写的 plane，不用没碰过的 buffer 充分母。
+- 守卫顺序：capability → program/input revision 一致 → cause 必须是
+  `InputPublication` → delta revision 未过期 → 已有全量 base →
+  `!layout_unchanged` 直接 `ui_program_delta_needs_full_stage` → node 覆盖检查。
+  任一失败都是稳定 error code 的 diagnostic，调用方据此回退，绝不静默半写。
+- 去掉的不必要全量工作：`stage()` 每帧 `program.clone()`（整个 `UiProgram`，含
+  shader source、dependency index、BTreeMap）改为按 revision 只 clone 一次并共享
+  `Rc<UiProgram>`；`slot_index_map` 每次 partial upload 重扫全部 input 改为
+  `InputSlotLayout` 缓存，只在被触及的 key 解释不了时重建（`is_stale_for` 只检查
+  changed keys，代价与改动量成正比）；`fits_budget` 从每次 stage 移到只在
+  recreate 时检查；dirty buffer 不再无条件重写。
+- §9 WGPU 覆盖：range 索引/预算外不覆盖、layout stride、state record 编码、
+  slot layout 缓存失效、`union_input_keys`（`plan_node_ranges_...`、
+  `layout_records_are_packed_at_the_record_stride`、
+  `state_record_encodes_flags_numeric_and_opacity`、
+  `cached_slot_layout_only_rebuilds_for_keys_it_cannot_explain`、
+  `union_input_keys_sorts_and_dedups`）。
+- 端到端证据（`ui_input_incremental_probe.rs` v2）：`end_to_end_incremental` 现在是
+  计算值而不是硬编码 `false`，要求同时满足 delta 能力已协商、CPU delta 只执行受影响
+  binding（`executed_binding_ids` 严格少于全部 binding）、GPU 写入字节严格少于全量、
+  且 retained frame 与 golden 全量求值逐字段相等。实测：
+  `bytes_written: 40` vs `bytes_for_full_upload: 520`，`instance_records_written: 1`，
+  `input_slot_writes: 1`，`executed_binding_ids: [0]`（total 2），
+  `retained_frame_equals_golden_full_evaluation: true`，
+  `delta_without_capability_rejected: true`（observed code
+  `ui_program_delta_capability_missing`），`status: "passed"`。
+- 仍然没有做到的（不得宣称）：生产合成路径 `UiWgpuRenderer` 每帧仍重建自己的
+  instance list（`ui_renderer.rs` 的 `refresh_plan` / 全 buffer 写入），本 Phase 只覆盖
+  program adapter 的 upload scope；`UiGpuUploadStats` 与 probe 的 warning 字段都明确写了
+  这一点。跨进程交互预览的批量提交（§9 Interaction 3 的另一半）也仍在 renderer 之外。
+- 证据：
+  - `cargo run -q -p neon-wgpu-runtime --bin ui_input_incremental_probe` → `status:
+    "passed"`，`end_to_end_incremental: true`（完整 JSON 见 diary）。
+  - `cargo test -q -p neon-wgpu-runtime --lib ui_program_gpu` →
+    `test result: ok. 26 passed; 0 failed`（原 20 + 新增 6）。
+  - `cargo test -q -p neon-ui-schema` → `39 passed; 0 failed`。
+  - `cargo test -q -p neon-ui-runtime --lib` → `245 passed; 0 failed`。
+  - `cargo clippy -q -p neon-wgpu-runtime --lib --bins` → 改动文件仅剩既有模式告警
+    （`clip_buffer`/`diagnostic_buffer` never read、`result_large_err`、
+    `sample_layout_readback` 的 collapsible match），无新增类别。
+  - `cargo check -q --workspace --all-targets` → exit code `0`。
