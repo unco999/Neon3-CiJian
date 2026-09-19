@@ -960,8 +960,8 @@ impl super::UiWgpuRenderer {
     /// Reconciles renderer-local presentation mirrors with the submitted
     /// fragments: `CodeEditorDeclaration` effects provide the declaration
     /// (theme / materials / font), `CodeEditorPresentation` effects provide
-    /// the per-frame editing snapshot. A mirror rebuilds only when the
-    /// presentation revision changes.
+    /// the per-frame editing snapshot. A mirror rebuilds when the presentation
+    /// revision, document identity, or source changes.
     pub(crate) fn reconcile_editors(
         &mut self,
         fragments: &HashMap<neon_ui_schema::UiFragmentId, UiFragment>,
@@ -1029,7 +1029,25 @@ impl super::UiWgpuRenderer {
         // Create / update mirrors.
         for (path, (declaration, presentation)) in desired {
             if let Some(state) = self.editors.get_mut(&path) {
-                if state.presentation_revision != presentation.revision {
+                let document_changed = state
+                    .declaration
+                    .document
+                    .as_ref()
+                    .map(|binding| binding.document_id.as_str())
+                    != presentation
+                        .document
+                        .as_ref()
+                        .map(|binding| binding.document_id.as_str());
+                let source_changed = state.lines
+                    != presentation
+                        .source
+                        .split('\n')
+                        .map(str::to_string)
+                        .collect::<Vec<_>>();
+                if state.presentation_revision != presentation.revision
+                    || document_changed
+                    || source_changed
+                {
                     *state = EditorRuntimeState::from_presentation(declaration, presentation);
                 }
             } else {

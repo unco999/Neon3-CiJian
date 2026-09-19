@@ -1747,7 +1747,12 @@ mod tests {
             },
             0.0,
         );
-        assert!(registry.editors.get(&path).is_some_and(|editor| editor.focus));
+        assert!(
+            registry
+                .editors
+                .get(&path)
+                .is_some_and(|editor| editor.focus)
+        );
 
         let mut second = first;
         second.document = Some(UiEditorDocumentBinding {
@@ -1761,7 +1766,10 @@ mod tests {
             (second, None, "second.rs\n".to_string()),
         )]));
 
-        let presentation = registry.to_presentations(0.0).pop().expect("editor presentation");
+        let presentation = registry
+            .to_presentations(0.0)
+            .pop()
+            .expect("editor presentation");
         assert_eq!(presentation.source, "second.rs\n");
         assert_eq!(presentation.document.unwrap().document_id, "second.rs");
         assert!(!presentation.focus, "focus must not carry across documents");

@@ -317,10 +317,9 @@ fn main() {
         let _ui_task = {
             let ui = ui;
             let wgpu = wgpu;
-            // Dead domain endpoint: the forwarder falls back to empty publications
-            // when host RPC fails, which is correct for self-contained FLOW apps
-            // whose state machines run locally.  Pointing at editor-runtime would
-            // make it reject `ui.host.inbound` instead of failing the connect.
+            // Windowed IDE flows use the local UI adapter and eventd. The
+            // forwarder has a bounded local fallback when no domain host is
+            // present, so do not point semantic clicks at editor-runtime.
             let dead_domain: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
             let eventd = eventd;
             std::thread::spawn(move || {
