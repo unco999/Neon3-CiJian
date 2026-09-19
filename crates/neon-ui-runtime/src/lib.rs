@@ -1284,6 +1284,21 @@ fn elapsed_ms(started: Instant) -> f64 {
     started.elapsed().as_secs_f64() * 1000.0
 }
 
+/// Map an IR/UiPatch application failure onto the stable RPC rejection code.
+fn patch_apply_error_code(error: &NuiFlowError) -> (String, String) {
+    let inner = error
+        .diagnostics
+        .first()
+        .map(|diagnostic| diagnostic.code.as_str())
+        .unwrap_or("");
+    let code = if inner == "nui_flow_stale_patch_revision" {
+        "ui_flow_patch_stale_revision"
+    } else {
+        "ui_flow_patch_apply_failed"
+    };
+    (code.to_owned(), format!("{error:?}"))
+}
+
 /// Phase 4 (R1): the semantic nodes directly targeted by a patch operation
 /// list. Set/remove/move contribute their path; insert contributes the new
 /// parent and the inserted node's key. The list is sorted and deduplicated.
@@ -1294,7 +1309,12 @@ fn impacted_nodes_for_patch(operations: &[Value]) -> Vec<String> {
             .get("kind")
             .and_then(Value::as_str)
             .unwrap_or("set");
-        let path = operation.get("path").and_then(Value::as_str).unwrap_or("");
+        let path = operation
+            .get("path")
+            .and_then(Value::as_str)
+            .or_else(|| operation.get("node_path").and_then(Value::as_str))
+            .or_else(|| operation.get("parent_path").and_then(Value::as_str))
+            .unwrap_or("");
         impacted.insert(path.to_owned());
         if kind == "insert" {
             let key = operation
@@ -3927,6 +3947,10 @@ impl UiRuntime {
         let total_started = Instant::now();
         let mut timings = UiFlowStageTimings::default();
         let patch_started = Instant::now();
+        // `UiPatchOp` rejects unknown fields, so the formal operations must
+        // be deserialized from the pristine array before the legacy adapter
+        // injects alias fields into `request.params`.
+        let formal_operations = request.params.get("operations").cloned();
         // Accept the formal UiPatch envelope while retaining the legacy
         // adapter below during the full-mount fallback phase.
         if request.params.get("base_revision").is_some() && request.params.get("revision").is_none()
@@ -4012,6 +4036,18 @@ impl UiRuntime {
             ));
         };
         let ops_clone = ops_arr.clone();
+        // Phase 6: presentation-intent operations (`start_transition`,
+        // `replace_children`, `set_input`) have no `UiIrPatchOperation`
+        // equivalent, so a patch containing them is deserialized as a formal
+        // `UiPatch` and replayed through `apply_ui_patch`, which bumps the
+        // revision exactly once. Mixing them with legacy kind-form operations
+        // is a structured rejection, never a silent no-op.
+        let has_presentation_op = ops_arr.iter().any(|operation| {
+            matches!(
+                operation.get("op").and_then(Value::as_str),
+                Some("start_transition" | "replace_children" | "set_input")
+            )
+        });
         let mut operations = Vec::new();
         for op in ops_arr {
             let kind = op.get("kind").and_then(Value::as_str).unwrap_or("set");
@@ -4106,37 +4142,58 @@ impl UiRuntime {
             operations,
         };
         let retained_revision = current_doc.ir.revision;
-        let patch_kind = if ops_arr.iter().all(|operation| {
-            operation
-                .get("kind")
-                .and_then(Value::as_str)
-                .unwrap_or("set")
-                == "set"
-        }) {
+        let patch_kind = if if has_presentation_op {
+            ops_arr.iter().all(|operation| {
+                matches!(
+                    operation.get("op").and_then(Value::as_str),
+                    Some("set_property" | "start_transition" | "set_input")
+                )
+            })
+        } else {
+            ops_arr.iter().all(|operation| {
+                operation
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .unwrap_or("set")
+                    == "set"
+            })
+        } {
             "property_only"
         } else {
             "structural"
         };
         let impacted = impacted_nodes_for_patch(ops_arr);
-        let mut new_ir = match apply_nui_ir_patch(&current_doc.ir, &patch) {
+        // Stale-revision conflicts keep their own stable code; renderer
+        // retries and journals key off the distinction.
+        let applied = if has_presentation_op {
+            match formal_operations
+                .as_ref()
+                .and_then(|value| {
+                    serde_json::from_value::<Vec<neon_ui_schema::UiPatchOp>>(value.clone()).ok()
+                })
+                .map(|operations| neon_ui_schema::UiPatch {
+                    surface_id: current_doc.ir.surface_id.0.clone(),
+                    base_revision: revision,
+                    operations,
+                }) {
+                Some(ui_patch) => apply_ui_patch(&current_doc.ir, &ui_patch)
+                    .map_err(|error| patch_apply_error_code(&error)),
+                None => Err((
+                    "ui_flow_patch_params_invalid".to_owned(),
+                    "presentation-intent patches must use the formal operation envelope".to_owned(),
+                )),
+            }
+        } else {
+            apply_nui_ir_patch(&current_doc.ir, &patch)
+                .map_err(|error| patch_apply_error_code(&error))
+        };
+        let mut new_ir = match applied {
             Ok(applied) => applied,
-            Err(error) => {
-                // Surface stale-revision conflicts as their own stable code;
-                // renderer retries and journals key off the distinction.
-                let inner = error
-                    .diagnostics
-                    .first()
-                    .map(|diagnostic| diagnostic.code.as_str())
-                    .unwrap_or("");
-                let code = if inner == "nui_flow_stale_patch_revision" {
-                    "ui_flow_patch_stale_revision"
-                } else {
-                    "ui_flow_patch_apply_failed"
-                };
+            Err((code, message)) => {
                 return Ok(self.retained_patch_rejection(
                     request.request_id.clone(),
-                    code,
-                    &format!("{error:?}"),
+                    &code,
+                    &message,
                     retained_revision,
                 ));
             }
@@ -9949,7 +10006,151 @@ mod tests {
         host_thread.join().unwrap().unwrap();
         renderer_thread.join().unwrap().unwrap();
     }
+
+    fn transition_test_source() -> String {
+        "version 1\nsurface surface.transition.test revision 3\nflow ide\nbudget nodes=64 bindings=64 instances=64 text=64 glyphs=512 events=8 clips=8\nsurface workspace column w 200 h 200 fill #101418 opacity 1\n  text item w 200 h 20 fill #00000000 opacity 1 value \"alpha\"\n"
+            .to_owned()
+    }
+
+    fn find_flow_node<'a>(node: &'a UiNode, key: &str) -> Option<&'a UiNode> {
+        if node.node_id.0 == key {
+            return Some(node);
+        }
+        node.children
+            .iter()
+            .find_map(|child| find_flow_node(child, key))
+    }
+
+    #[test]
+    fn rpc_start_transition_patch_lands_on_the_ir_with_one_revision_bump() {
+        let renderer = RpcServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let renderer_endpoint = renderer.local_addr().unwrap();
+        let renderer_thread = thread::spawn(move || {
+            let mut count = 0_u64;
+            let _ = renderer.serve_until(|request| {
+                count += 1;
+                (
+                    RpcResponse {
+                        request_id: request.request_id,
+                        status: RpcStatus::Accepted,
+                        revision: Some(Revision(count)),
+                        result: Some(json!({"graph_revision": count, "fragment_count": 1})),
+                        snapshot: None,
+                        error: None,
+                    },
+                    count < 2,
+                )
+            });
+        });
+        let mut runtime = UiRuntime::new(1, "transition-patch-test");
+        let client = runtime.client.clone();
+        let request = |method: &str, params: Value| RpcRequest {
+            protocol: "neon3.rpc".into(),
+            version: PROTOCOL_VERSION,
+            request_id: RequestId(format!("transition-{method}")),
+            client: client.clone(),
+            target: ServiceName(SERVICE_NAME.into()),
+            method: method.into(),
+            params,
+            expected_revision: None,
+            idempotency_key: Some(format!("transition-{method}")),
+        };
+        let submit = runtime
+            .forward_flow_source(
+                renderer_endpoint,
+                request("submit", json!({"source": transition_test_source()})),
+            )
+            .unwrap();
+        assert_eq!(
+            submit.status,
+            RpcStatus::Accepted,
+            "submit rejected: {:?}",
+            submit.error
+        );
+        let base = runtime
+            .flow_document
+            .as_ref()
+            .expect("active flow document")
+            .ir
+            .revision
+            .0;
+        let transition = neon_ui_schema::UiTransition {
+            delay_ms: 0,
+            duration_ms: 220,
+            easing: neon_ui_schema::UiEasing::EaseOut,
+            from: neon_ui_schema::UiTransitionState {
+                opacity: Some(0.4),
+                ..Default::default()
+            },
+            motion_key: Some("success-sweep-1".into()),
+            timeline: None,
+        };
+        let operations = vec![
+            neon_ui_schema::UiPatchOp::SetProperty {
+                node_path: "workspace/item".into(),
+                property: "value".into(),
+                value: json!("alpha completed"),
+            },
+            neon_ui_schema::UiPatchOp::StartTransition {
+                node_path: "workspace/item".into(),
+                transition: transition.clone(),
+            },
+        ];
+        let response = runtime
+            .apply_flow_patch(
+                renderer_endpoint,
+                request(
+                    "patch",
+                    json!({
+                        "surface_id": "surface.transition.test",
+                        "base_revision": base,
+                        "operations": serde_json::to_value(&operations).unwrap(),
+                    }),
+                ),
+            )
+            .unwrap();
+        assert_eq!(response.status, RpcStatus::Accepted, "{:?}", response.error);
+        let result = response.result.expect("accepted patch result");
+        assert_eq!(result["patch_kind"], "property_only");
+        assert_eq!(result["flow_document_revision"], base + 1);
+        let document = runtime.flow_document.as_ref().unwrap();
+        assert_eq!(document.ir.revision.0, base + 1);
+        let item = find_flow_node(&document.ir.root, "item").expect("item row");
+        assert_eq!(item.enter_transition.as_ref(), Some(&transition));
+
+        // Legacy kind-form operations mixed with a presentation intent must
+        // not be silently coerced into bogus sets: the whole patch is a
+        // structured rejection and the document keeps its revision.
+        let mixed = json!([
+            {"kind": "set", "path": "item", "property": "value", "value": "beta"},
+            {"op": "start_transition", "node_path": "workspace/item",
+             "transition": {"duration_ms": 100}}
+        ]);
+        let rejected = runtime
+            .apply_flow_patch(
+                renderer_endpoint,
+                request(
+                    "patch-mixed",
+                    json!({
+                        "surface_id": "surface.transition.test",
+                        "base_revision": base + 1,
+                        "operations": mixed,
+                    }),
+                ),
+            )
+            .unwrap();
+        assert_eq!(rejected.status, RpcStatus::Rejected);
+        assert_eq!(
+            rejected.error.expect("rejection error").code,
+            "ui_flow_patch_params_invalid"
+        );
+        assert_eq!(
+            runtime.flow_document.as_ref().unwrap().ir.revision.0,
+            base + 1
+        );
+        renderer_thread.join().unwrap();
+    }
 }
+pub mod ide_projection;
 pub mod ui_keyed_diff;
 pub mod ui_patch_batcher;
-pub mod ide_projection;

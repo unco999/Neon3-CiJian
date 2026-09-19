@@ -469,7 +469,7 @@ approval:<id>
 
 ## 8. Phase 6：动态效果和交互反馈
 
-状态：`TODO`
+状态：`IN_PROGRESS`（Stage 6a `DONE` 2026-09-19）
 
 动态效果必须绑定状态变化，不使用无意义的常驻动画。
 
@@ -488,6 +488,29 @@ approval:<id>
 - 动效不触发 Flow remount。
 - 动效只通过 `StartTransition`、state token 或 renderer-local transition。
 - 失败状态不能只靠颜色表达，必须有文字和操作。
+
+### Stage 6a 完成证据（2026-09-19）
+
+- 修复 `ui.flow.patch` RPC 通道对 presentation op 的处理：此前 adapter 只识别
+  legacy `kind` 形状，`start_transition` / `replace_children` / `set_input` 会被静默
+  降级为默认 "set"，`StartTransition` 永远无法到达 IR。现在含 presentation op 的
+  patch 走正式 `neon_ui_schema::UiPatch` envelope（在 legacy 归一化之前捕获原始
+  `operations`，规避 `deny_unknown_fields`），由 IR 级 `apply_ui_patch` 应用：
+  单次 revision bump + validate，不 remount、不改布局尺寸。
+- 禁止 silent no-op：presentation op 与 legacy `kind` 形状混用时结构化拒绝
+  `ui_flow_patch_params_invalid`，文档 revision 不变；stale revision 仍映射稳定码
+  `ui_flow_patch_stale_revision`（提取为 `patch_apply_error_code` helper）。
+- `patch_kind` 分类扩展：presentation 路径下 set_property/start_transition/set_input
+  全部计入 `property_only`，混入结构 op 才报 `structural`。
+- 测试：新单测 `rpc_start_transition_patch_lands_on_the_ir_with_one_revision_bump`
+  端到端（真实 runtime + fake renderer 转发）断言 Accepted、`patch_kind =
+  property_only`、revision 恰好 +1、目标节点 `enter_transition` 与提交的
+  `UiTransition`（含 `motion_key`）逐字段相等、混形 patch 被
+  `ui_flow_patch_params_invalid` 拒绝且 revision 不变。
+  `cargo test -p neon-ui-runtime --lib` 213/213。
+- 未完成（Stage 6b/6c）：projection 层的 transition intent API（Completed/Blocked
+  一次性动效、Failed 的文字 + Retry 操作行）、renderer 侧“立即触发该 transition”
+  入口（当前动画引擎仅在目标 visual 变化时启动 track）。
 
 ---
 
