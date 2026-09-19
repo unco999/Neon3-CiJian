@@ -469,7 +469,8 @@ approval:<id>
 
 ## 8. Phase 6：动态效果和交互反馈
 
-状态：`IN_PROGRESS`（Stage 6a/6b `DONE` 2026-09-19）
+状态：`IN_PROGRESS`（Stage 6a/6b/6c `DONE` 2026-09-19；Running/Queued 低频常驻动效
+与 patch-insert Button 的 intent 接线记入后续交互接线阶段）
 
 动态效果必须绑定状态变化，不使用无意义的常驻动画。
 
@@ -508,8 +509,8 @@ approval:<id>
   `UiTransition`（含 `motion_key`）逐字段相等、混形 patch 被
   `ui_flow_patch_params_invalid` 拒绝且 revision 不变。
   `cargo test -p neon-ui-runtime --lib` 213/213。
-- 未完成（Stage 6c）：renderer 侧“立即触发该 transition”入口（当前动画引擎仅在目标
-  visual 变化时启动 track）。
+- 未完成（Stage 6c，现已完成，见下）：renderer 侧“立即触发该 transition”入口的
+  处理（最终采用状态 tint 驱动既有触发路径，见 Stage 6c）。
 
 ### Stage 6b 完成证据（2026-09-19）
 
@@ -537,6 +538,29 @@ approval:<id>
   动效属 renderer-local 常驻动画，同样依赖该后续（避免常驻伪动效）。
 - 验收层级：`service-ready` + probe 级 `composition-ready`；未声称
   `wgpu-rendered`/`interactive-accepted`。
+
+### Stage 6c 完成证据（2026-09-19）
+
+- 渲染触发路径结论：wgpu renderer 动画引擎（`ui_renderer.rs` `sample_with_history`）
+  只在目标 visual 相对上次渲染发生变化时启动 track（`source == target` 时显式走
+  settled no-op 分支，防止常驻 remount 抖动）。因此"仅挂 `enter_transition` 而视觉
+  不变"的 patch 永远不会播放动效。
+- 决策（方案 A）：不新增 renderer "立即触发"入口，改为让状态变化本身携带
+  presentation tint——task 行按状态填色（Completed `#1d3a24` / Failed `#3a1d1d` /
+  Queued、Running 透明），`fill` set 与 `StartTransition` 同 patch 下发：
+  fill 变化启动 track，transition 的 `from.opacity`（0.6 sweep / 0.25 flash）给出
+  一次性入场动效；retry 回到 Running 时 fill 复原为纯状态变化、零动效。
+- 该设计满足 §8 约束：动效不改布局尺寸（只动 opacity/color）、不触发 Flow
+  remount（全部增量 patch）、只经 `StartTransition` + 状态视觉变化；失败态仍由
+  文本 + Button 操作行表达，颜色只是补充。
+- renderer 侧 update 触发行为已有 headless 引擎测试覆盖
+  （`transition_samples_current_state_for_updates`、
+  `retarget_records_superseded_and_uses_current_sample_as_new_from`；本阶段未重跑
+  wgpu 全量套件以控制时长）。
+- 验证：`cargo test -q -p neon-ui-runtime --lib` 219/219；probe 断言更新后四套全绿
+  （file-tree 8/8、agent-task 7/7、plan-dependency 3/3、motion-feedback 3/3，均
+  1 submit + 全增量 patch，complete 现在为 `set fill + set value + transition` 的
+  `property_only` patch）。
 
 ---
 

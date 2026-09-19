@@ -40,6 +40,11 @@ pub const FILE_TREE_ROW_HEIGHT: f32 = 20.0;
 pub const TRANSPARENT_FILL: &str = "#00000000";
 pub const SELECTED_FILL: &str = "#2f5d8a";
 pub const BUSY_OPACITY: f32 = 0.45;
+/// Terminal-status row tints. The fill change is also what physically starts
+/// the renderer's one-shot motion track (the engine only animates when the
+/// target visual moved), so the sweep/flash is bound to the state change.
+pub const COMPLETED_FILL: &str = "#1d3a24";
+pub const FAILED_FILL: &str = "#3a1d1d";
 
 /// Encodes an arbitrary domain identity into a valid Flow node key. The
 /// mapping is injective: `_` doubles, `.` and `-` get short tags, and every
@@ -574,6 +579,11 @@ impl AgentWorkbenchProjection {
     }
 
     fn task_row(task: &AgentTask, width: f32) -> UiNode {
+        let fill = match task.status {
+            TaskStatus::Completed => COMPLETED_FILL,
+            TaskStatus::Failed => FAILED_FILL,
+            TaskStatus::Queued | TaskStatus::Running => TRANSPARENT_FILL,
+        };
         row(
             &format!(
                 "task.{}.{}",
@@ -583,7 +593,7 @@ impl AgentWorkbenchProjection {
             format!("{} / {}: {}", task.plan, task.name, task.status.label()),
             width,
             FILE_TREE_ROW_HEIGHT,
-            TRANSPARENT_FILL,
+            fill,
             1.0,
             true,
         )
@@ -602,7 +612,7 @@ impl AgentWorkbenchProjection {
             format!("retry {} / {}", task.plan, task.name),
             width,
             FILE_TREE_ROW_HEIGHT,
-            "#3a1d1d",
+            FAILED_FILL,
             1.0,
             true,
         );
@@ -1156,6 +1166,7 @@ mod tests {
         only_sets(
             &summary,
             &[
+                "set workspace/agent/agent.section.tasks/agent.plan.list/task.alpha.build.fill",
                 "set workspace/agent/agent.section.tasks/agent.plan.list/task.alpha.build.value",
                 "transition workspace/agent/agent.section.tasks/agent.plan.list/task.alpha.build",
             ],
@@ -1185,6 +1196,7 @@ mod tests {
             summary,
             [
                 "insert task.alpha.deploy@workspace/agent/agent.section.tasks/agent.plan.list[1]",
+                "set workspace/agent/agent.section.tasks/agent.plan.list/task.alpha.build.fill",
                 "set workspace/agent/agent.section.tasks/agent.plan.list/task.alpha.build.value",
                 "transition workspace/agent/agent.section.tasks/agent.plan.list/task.alpha.build",
             ]
@@ -1298,6 +1310,7 @@ mod tests {
         assert_eq!(
             summarize_patch_operations(&patch),
             [
+                "set workspace/agent/agent.section.tasks/agent.plan.list/task.alpha.build.fill",
                 "set workspace/agent/agent.section.tasks/agent.plan.list/task.alpha.build.value",
                 "transition workspace/agent/agent.section.tasks/agent.plan.list/task.alpha.build",
             ]
@@ -1324,6 +1337,7 @@ mod tests {
             ops,
             [
                 "insert task.alpha.build.retry@workspace/agent/agent.section.tasks/agent.plan.list[1]",
+                "set workspace/agent/agent.section.tasks/agent.plan.list/task.alpha.build.fill",
                 "set workspace/agent/agent.section.tasks/agent.plan.list/task.alpha.build.value",
                 "transition workspace/agent/agent.section.tasks/agent.plan.list/task.alpha.build",
             ]
@@ -1355,6 +1369,7 @@ mod tests {
             ops,
             [
                 "remove workspace/agent/agent.section.tasks/agent.plan.list/task.alpha.build.retry",
+                "set workspace/agent/agent.section.tasks/agent.plan.list/task.alpha.build.fill",
                 "set workspace/agent/agent.section.tasks/agent.plan.list/task.alpha.build.value",
             ]
         );

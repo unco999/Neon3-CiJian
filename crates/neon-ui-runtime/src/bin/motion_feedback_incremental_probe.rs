@@ -273,10 +273,11 @@ fn run() -> Result<(), String> {
         BASE_REVISION,
     ) {
         Ok(outcome) => {
-            let pass = outcome.operations.len() == 3
+            let pass = outcome.operations.len() == 4
                 && outcome.operations[0]
                     == format!("insert task.alpha.build.retry@{PLAN_LIST_PATH}[1]")
-                && outcome.operations[1] == format!("set {TASK_PATH}.value")
+                && outcome.operations[1] == format!("set {TASK_PATH}.fill")
+                && outcome.operations[2] == format!("set {TASK_PATH}.value")
                 && has_transition(&outcome.operations)
                 && outcome.patch_kind == "structural";
             emit(
@@ -305,9 +306,10 @@ fn run() -> Result<(), String> {
         BASE_REVISION + 1,
     ) {
         Ok(outcome) => {
-            let pass = outcome.operations.len() == 2
+            let pass = outcome.operations.len() == 3
                 && outcome.operations[0] == format!("remove {RETRY_PATH}")
-                && outcome.operations[1] == format!("set {TASK_PATH}.value")
+                && outcome.operations[1] == format!("set {TASK_PATH}.fill")
+                && outcome.operations[2] == format!("set {TASK_PATH}.value")
                 && !has_transition(&outcome.operations);
             emit(
                 "retry_is_quiet_state",
@@ -342,8 +344,9 @@ fn run() -> Result<(), String> {
         BASE_REVISION + 2,
     ) {
         Ok(outcome) => {
-            let pass = outcome.operations.len() == 2
-                && outcome.operations[0] == format!("set {TASK_PATH}.value")
+            let pass = outcome.operations.len() == 3
+                && outcome.operations[0] == format!("set {TASK_PATH}.fill")
+                && outcome.operations[1] == format!("set {TASK_PATH}.value")
                 && has_transition(&outcome.operations)
                 && outcome.patch_kind == "property_only";
             emit(

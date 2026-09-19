@@ -290,12 +290,15 @@ fn run() -> Result<(), String> {
         BASE_REVISION,
     ) {
         Ok(outcome) => {
-            let pass = outcome.operations.len() == 3
+            let pass = outcome.operations.len() == 4
                 && outcome.operations[0].starts_with("insert task.alpha.deploy")
                 && outcome.operations[1].starts_with(
-                    "set workspace/agent/agent.section.tasks/agent.plan.list/task.alpha.build",
+                    "set workspace/agent/agent.section.tasks/agent.plan.list/task.alpha.build.fill",
                 )
-                && outcome.operations[2]
+                && outcome.operations[2].starts_with(
+                    "set workspace/agent/agent.section.tasks/agent.plan.list/task.alpha.build.value",
+                )
+                && outcome.operations[3]
                     == "transition workspace/agent/agent.section.tasks/agent.plan.list/task.alpha.build"
                 && outcome.patch_kind == "structural";
             emit(
@@ -330,12 +333,15 @@ fn run() -> Result<(), String> {
         BASE_REVISION + 1,
     ) {
         Ok(outcome) => {
-            let pass = outcome.operations.len() == 3
+            let pass = outcome.operations.len() == 4
                 && outcome.operations[0].starts_with("insert task.alpha.package")
                 && outcome.operations[1].starts_with(
-                    "set workspace/agent/agent.section.tasks/agent.plan.list/task.alpha.deploy",
+                    "set workspace/agent/agent.section.tasks/agent.plan.list/task.alpha.deploy.fill",
                 )
-                && outcome.operations[2]
+                && outcome.operations[2].starts_with(
+                    "set workspace/agent/agent.section.tasks/agent.plan.list/task.alpha.deploy.value",
+                )
+                && outcome.operations[3]
                     == "transition workspace/agent/agent.section.tasks/agent.plan.list/task.alpha.deploy"
                 && outcome.patch_kind == "structural";
             emit(
