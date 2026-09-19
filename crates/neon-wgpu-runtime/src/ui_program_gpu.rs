@@ -30,6 +30,18 @@ pub struct UiGpuProgramBuffers {
     capacity: UiResourceBudget,
 }
 
+/// Upload counters used by headless acceptance probes. These counters describe
+/// producer-to-GPU upload scope; they do not claim that CPU layout evaluation
+/// or renderer composition is incremental.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct UiGpuUploadStats {
+    pub static_buffer_uploads: u64,
+    pub full_input_uploads: u64,
+    pub partial_input_uploads: u64,
+    pub input_slot_writes: u64,
+    pub skipped_input_uploads: u64,
+}
+
 #[derive(Clone)]
 struct StagedProgram {
     program: UiProgram,
@@ -50,6 +62,7 @@ pub struct GpuUiProgramBackend {
     diagnostics: Vec<UiDiagnostic>,
     last_timing: UiGpuPassTiming,
     last_readback: Option<UiGpuLayoutReadback>,
+    upload_stats: UiGpuUploadStats,
 }
 
 impl GpuUiProgramBackend {
@@ -63,6 +76,7 @@ impl GpuUiProgramBackend {
             diagnostics: Vec::new(),
             last_timing: zero_timing(),
             last_readback: None,
+            upload_stats: UiGpuUploadStats::default(),
         }
     }
 
@@ -105,33 +119,42 @@ impl GpuUiProgramBackend {
         let buffers = self.buffers.as_ref().expect("created above");
         let program_upload = started.elapsed().as_micros() as u64;
         let input_started = Instant::now();
-        queue.write_buffer(
-            &buffers.node_buffer,
-            0,
-            &record_bytes(program.nodes.len(), 16),
-        );
-        queue.write_buffer(
-            &buffers.binding_buffer,
-            0,
-            &record_bytes(program.binding_records.len(), 16),
-        );
-        queue.write_buffer(
-            &buffers.branch_buffer,
-            0,
-            &record_bytes(program.branch_records.len(), 4),
-        );
+        if recreate {
+            queue.write_buffer(
+                &buffers.node_buffer,
+                0,
+                &record_bytes(program.nodes.len(), 16),
+            );
+            queue.write_buffer(
+                &buffers.binding_buffer,
+                0,
+                &record_bytes(program.binding_records.len(), 16),
+            );
+            queue.write_buffer(
+                &buffers.branch_buffer,
+                0,
+                &record_bytes(program.branch_records.len(), 4),
+            );
+            self.upload_stats.static_buffer_uploads += 3;
+        }
         // Input buffer: full upload on first stage / program change, partial
         // upload when only specific slots changed and the buffer already exists.
-        if recreate || inputs.changed_slots.is_empty() {
+        if recreate {
             queue.write_buffer(
                 &buffers.input_buffer,
                 0,
                 &pack_inputs(inputs, &program.resource_budget),
             );
-        } else {
-            for (offset, slot_bytes) in pack_changed_slots(inputs, &program.resource_budget) {
+            self.upload_stats.full_input_uploads += 1;
+        } else if !inputs.changed_slots.is_empty() {
+            let updates = pack_changed_slots(inputs, &program.resource_budget);
+            for (offset, slot_bytes) in updates {
                 queue.write_buffer(&buffers.input_buffer, offset, &slot_bytes);
+                self.upload_stats.input_slot_writes += 1;
             }
+            self.upload_stats.partial_input_uploads += 1;
+        } else {
+            self.upload_stats.skipped_input_uploads += 1;
         }
         queue.write_buffer(
             &buffers.dirty_buffer,
@@ -278,6 +301,10 @@ impl GpuUiProgramBackend {
 
     pub fn last_readback(&self) -> Option<&UiGpuLayoutReadback> {
         self.last_readback.as_ref()
+    }
+
+    pub fn upload_stats(&self) -> &UiGpuUploadStats {
+        &self.upload_stats
     }
 
     /// Differential diagnostic for the subset currently represented by the
