@@ -1719,6 +1719,10 @@ pub struct UiDrawStageTimings {
     pub text_layout_ms: f32,
     pub group_sort_ms: f32,
     pub buffer_upload_ms: f32,
+    pub instance_range_writes: u32,
+    pub instance_records_written: u32,
+    pub instance_bytes_written: u64,
+    pub composition_reused: bool,
 }
 
 /// Phase 0 baseline (B0-3): node counters from the last full retained plan
@@ -1994,6 +1998,7 @@ pub struct UiWgpuRenderer {
     sampled: Vec<UiVisual>,
     instances: Vec<UiInstance>,
     uploaded_instances: Vec<UiInstance>,
+    uploaded_ordered_instances: Vec<UiInstance>,
     uploaded_depth_instances: Vec<UiInstance>,
     viewport_physical_size: [u32; 2],
     viewport_logical_size: [f32; 2],
@@ -2020,6 +2025,10 @@ pub struct UiWgpuRenderer {
     animation_epoch: u64,
     animation_clock_seconds: f32,
     last_frame_snapshot: Option<VisualFrameSnapshot>,
+    /// Retained result of visual sampling for static frames.
+    cached_top_layer: Vec<Option<usize>>,
+    composition_cache_valid: bool,
+    last_instance_mode: Option<UiDrawMode>,
     animation_history: VecDeque<UiAnimationInstance>,
     pointer_position: Option<[f32; 2]>,
     pressed_until_seconds: f32,
@@ -3258,6 +3267,7 @@ impl UiWgpuRenderer {
             sampled: Vec::new(),
             instances: Vec::new(),
             uploaded_instances: Vec::new(),
+            uploaded_ordered_instances: Vec::new(),
             uploaded_depth_instances: Vec::new(),
             viewport_physical_size: [0, 0],
             viewport_logical_size: [0.0, 0.0],
@@ -3281,6 +3291,9 @@ impl UiWgpuRenderer {
             animation_epoch: 1,
             animation_clock_seconds: 0.0,
             last_frame_snapshot: None,
+            cached_top_layer: Vec::new(),
+            composition_cache_valid: false,
+            last_instance_mode: None,
             animation_history: VecDeque::with_capacity(64),
             pointer_position: None,
             pressed_until_seconds: 0.0,
@@ -3881,6 +3894,8 @@ impl UiWgpuRenderer {
                 })
                 .collect(),
         });
+        self.cached_top_layer = top_layer.clone();
+        self.composition_cache_valid = true;
         top_layer
     }
 
@@ -7372,15 +7387,34 @@ impl UiWgpuRenderer {
         );
         self.view_buffer_viewport_revision = self.viewport_revision;
         let stage = Instant::now();
-        self.refresh_plan(fragments, viewport_logical_size);
+        let plan_rebuilt = self.refresh_plan(fragments, viewport_logical_size);
         // Code-editor mirrors reconcile against the (possibly new) plan and
         // fragment declarations. Adopting host document frames only while
         // unfocused keeps local typing authoritative.
         self.reconcile_editors(fragments);
         let refresh_plan_ms = stage.elapsed().as_secs_f32() * 1000.0;
-        self.instances.clear();
         let stage = Instant::now();
-        let top_layer = self.compose_sampled_visuals(time_seconds);
+        let can_reuse_composition = !plan_rebuilt
+            && self.composition_cache_valid
+            && self.cached_top_layer.len() == self.plan.len()
+            && !self.pointer_visual_dirty
+            && self.active.is_empty()
+            && self.drag.is_none()
+            && self.value_gesture.is_none()
+            && self.splitter_drag.is_none()
+            && self.scroll_drag.is_none()
+            && self.scroll_pan.is_none()
+            && !self.has_editor_activity();
+        let (top_layer, composition_reused) = if can_reuse_composition {
+            (self.cached_top_layer.clone(), true)
+        } else {
+            let top_layer = self.compose_sampled_visuals(time_seconds);
+            (top_layer, false)
+        };
+        let reuse_instances = composition_reused
+            && self.last_instance_mode == Some(mode)
+            && self.node_materials.is_empty();
+        self.instances.clear();
         let visible_top_layer = top_layer
             .iter()
             .map(|root| {
@@ -7391,6 +7425,9 @@ impl UiWgpuRenderer {
             .collect::<Vec<_>>();
         let compose_visuals_ms = stage.elapsed().as_secs_f32() * 1000.0;
         let mut buffer_upload_ms = 0.0_f32;
+        let mut instance_range_writes = 0_u32;
+        let mut instance_records_written = 0_u32;
+        let mut instance_bytes_written = 0_u64;
         let plan_index = self
             .plan
             .iter()
@@ -7402,69 +7439,71 @@ impl UiWgpuRenderer {
         // or component chrome can occlude the item under the pointer.
         let mut drag_preview_instances = Vec::new();
         let mut material_instances = BTreeMap::<u32, BTreeMap<String, Vec<UiInstance>>>::new();
-        for index in 0..self.plan.len() {
-            if self.plan[index].instance_index.is_none()
-                || top_layer[index].is_some()
-                || !sampled_in_mode(&self.sampled[index], mode)
-                || !composition_layer_is(
-                    self.composition_layers
-                        .get(&self.plan[index].id)
-                        .copied()
-                        .unwrap_or_default(),
-                    mode,
-                )
-            {
-                continue;
+        if !reuse_instances {
+            for index in 0..self.plan.len() {
+                if self.plan[index].instance_index.is_none()
+                    || top_layer[index].is_some()
+                    || !sampled_in_mode(&self.sampled[index], mode)
+                    || !composition_layer_is(
+                        self.composition_layers
+                            .get(&self.plan[index].id)
+                            .copied()
+                            .unwrap_or_default(),
+                        mode,
+                    )
+                {
+                    continue;
+                }
+                let visual = &self.sampled[index];
+                let instance = self.instance(visual, &self.plan[index].id, time_seconds);
+                let chrome = self
+                    .component_chrome_instances(visual, &self.plan[index].id)
+                    .into_iter()
+                    .enumerate()
+                    .map(|(chrome_index, chrome)| {
+                        self.decorate_chrome_instance(visual, instance, chrome_index, chrome)
+                    })
+                    .collect::<Vec<_>>();
+                let material_instance = self
+                    .node_materials
+                    .get(
+                        self.plan[index]
+                            .id
+                            .rsplit('/')
+                            .next()
+                            .unwrap_or(self.plan[index].id.as_str()),
+                    )
+                    .and_then(|material| {
+                        self.material_pipelines
+                            .contains_key(&material.package_id)
+                            .then(|| {
+                                (
+                                    material.package_id.clone(),
+                                    self.material_instance(
+                                        visual,
+                                        &self.plan[index].id,
+                                        material,
+                                        time_seconds,
+                                    ),
+                                )
+                            })
+                    });
+                let destination = if self.drag_offset_for_node(index, &plan_index).is_some() {
+                    &mut drag_preview_instances
+                } else {
+                    &mut self.instances
+                };
+                destination.push(instance);
+                if let Some((package_id, material)) = material_instance {
+                    material_instances
+                        .entry(visual.paint_group_id)
+                        .or_default()
+                        .entry(package_id)
+                        .or_default()
+                        .push(material);
+                }
+                destination.extend(chrome);
             }
-            let visual = &self.sampled[index];
-            let instance = self.instance(visual, &self.plan[index].id, time_seconds);
-            let chrome = self
-                .component_chrome_instances(visual, &self.plan[index].id)
-                .into_iter()
-                .enumerate()
-                .map(|(chrome_index, chrome)| {
-                    self.decorate_chrome_instance(visual, instance, chrome_index, chrome)
-                })
-                .collect::<Vec<_>>();
-            let material_instance = self
-                .node_materials
-                .get(
-                    self.plan[index]
-                        .id
-                        .rsplit('/')
-                        .next()
-                        .unwrap_or(self.plan[index].id.as_str()),
-                )
-                .and_then(|material| {
-                    self.material_pipelines
-                        .contains_key(&material.package_id)
-                        .then(|| {
-                            (
-                                material.package_id.clone(),
-                                self.material_instance(
-                                    visual,
-                                    &self.plan[index].id,
-                                    material,
-                                    time_seconds,
-                                ),
-                            )
-                        })
-                });
-            let destination = if self.drag_offset_for_node(index, &plan_index).is_some() {
-                &mut drag_preview_instances
-            } else {
-                &mut self.instances
-            };
-            destination.push(instance);
-            if let Some((package_id, material)) = material_instance {
-                material_instances
-                    .entry(visual.paint_group_id)
-                    .or_default()
-                    .entry(package_id)
-                    .or_default()
-                    .push(material);
-            }
-            destination.extend(chrome);
         }
         // Material draws are recorded into one command buffer, so each package
         // needs a stable range in a single upload. Writing different package
@@ -7582,6 +7621,7 @@ impl UiWgpuRenderer {
             self.instance_capacity = self.instances.len().next_power_of_two();
             self.instance_buffer = create_instance_buffer(device, self.instance_capacity);
             self.uploaded_instances.clear();
+            self.uploaded_ordered_instances.clear();
         }
         if self.instance_capacity > self.depth_instance_capacity {
             self.depth_instance_capacity = self.instance_capacity;
@@ -7604,11 +7644,15 @@ impl UiWgpuRenderer {
         // re-uploading panel data every frame.
         if self.instances != self.uploaded_instances {
             let stage = Instant::now();
-            queue.write_buffer(
+            let written = write_changed_instance_ranges(
+                queue,
                 &self.instance_buffer,
-                0,
-                bytemuck::cast_slice(&self.instances),
+                &self.uploaded_instances,
+                &self.instances,
             );
+            instance_range_writes += written.0;
+            instance_records_written += written.1;
+            instance_bytes_written += written.2;
             self.uploaded_instances.clone_from(&self.instances);
             buffer_upload_ms += stage.elapsed().as_secs_f32() * 1000.0;
         }
@@ -9921,11 +9965,16 @@ impl UiWgpuRenderer {
             self.canvas_capacity = ordered_canvas.len().next_power_of_two();
             self.canvas_buffer = create_canvas_buffer(device, self.canvas_capacity);
         }
-        queue.write_buffer(
+        let written = write_changed_instance_ranges(
+            queue,
             &self.instance_buffer,
-            0,
-            bytemuck::cast_slice(&ordered_rects),
+            &self.uploaded_ordered_instances,
+            &ordered_rects,
         );
+        instance_range_writes += written.0;
+        instance_records_written += written.1;
+        instance_bytes_written += written.2;
+        self.uploaded_ordered_instances.clone_from(&ordered_rects);
         pass.set_bind_group(0, &self.view_bind_group, &[]);
         pass.set_vertex_buffer(0, self.instance_buffer.slice(..));
         if !ordered_images.is_empty() {
@@ -10036,14 +10085,11 @@ impl UiWgpuRenderer {
             }
         }
 
-        // Restore the complete color snapshot. External depth uses its own
-        // buffer, so its later upload cannot mutate color-pass instances.
+        // The grouped color buffer is already complete for this pass. Do not
+        // restore the canonical instance order here: draw calls use explicit
+        // ranges, and restoring it would turn every sparse update into a full
+        // upload without changing any pixels.
         let stage = Instant::now();
-        queue.write_buffer(
-            &self.instance_buffer,
-            0,
-            bytemuck::cast_slice(&self.instances),
-        );
         if !popup_instances.is_empty() {
             queue.write_buffer(
                 &self.popup_instance_buffer,
@@ -10094,7 +10140,12 @@ impl UiWgpuRenderer {
             text_layout_ms,
             group_sort_ms,
             buffer_upload_ms,
+            instance_range_writes,
+            instance_records_written,
+            instance_bytes_written,
+            composition_reused,
         };
+        self.last_instance_mode = Some(mode);
     }
 
     /// Zero the event ring counter before this frame's material passes write to it.
@@ -10259,6 +10310,7 @@ impl UiWgpuRenderer {
     /// plan before consuming that projected snapshot.
     pub(crate) fn invalidate_plan(&mut self) {
         self.plan_revisions.clear();
+        self.composition_cache_valid = false;
         // The text layout cache is tied to the same fragment revision set.
         // When the plan is invalidated (e.g. camera/anchor projection change),
         // the text positions may have shifted, so clear the cache to force
@@ -10273,6 +10325,7 @@ impl UiWgpuRenderer {
     /// and clears the cache.
     pub(crate) fn invalidate_plan_for_world_transform(&mut self) {
         self.plan_revisions.clear();
+        self.composition_cache_valid = false;
     }
 
     fn update_viewport(&mut self, physical_size: [u32; 2], logical_size: [f32; 2]) -> bool {
@@ -10347,10 +10400,11 @@ impl UiWgpuRenderer {
             return;
         }
         if self.uploaded_depth_instances != ordered_depth_instances {
-            queue.write_buffer(
+            write_changed_instance_ranges(
+                queue,
                 &self.depth_instance_buffer,
-                0,
-                bytemuck::cast_slice(&ordered_depth_instances),
+                &self.uploaded_depth_instances,
+                &ordered_depth_instances,
             );
             self.uploaded_depth_instances = ordered_depth_instances.clone();
         }
@@ -16722,6 +16776,43 @@ fn normalize_logical_viewport(logical_size: [f32; 2], physical_size: [u32; 2]) -
     })
 }
 
+/// Writes only changed contiguous instance records. The cache is renderer
+/// local; semantic node/range ownership stays outside this physical helper.
+fn write_changed_instance_ranges(
+    queue: &wgpu::Queue,
+    buffer: &wgpu::Buffer,
+    previous: &[UiInstance],
+    current: &[UiInstance],
+) -> (u32, u32, u64) {
+    let common = previous.len().min(current.len());
+    let mut ranges = Vec::<(usize, usize)>::new();
+    let mut index = 0;
+    while index < common {
+        if previous[index] == current[index] {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        index += 1;
+        while index < common && previous[index] != current[index] {
+            index += 1;
+        }
+        ranges.push((start, index));
+    }
+    if current.len() > common {
+        ranges.push((common, current.len()));
+    }
+    let stride = std::mem::size_of::<UiInstance>();
+    let mut bytes_written = 0_u64;
+    for (start, end) in &ranges {
+        let bytes = bytemuck::cast_slice(&current[*start..*end]);
+        queue.write_buffer(buffer, (*start * stride) as u64, bytes);
+        bytes_written += bytes.len() as u64;
+    }
+    let records = ranges.iter().map(|(start, end)| end - start).sum::<usize>();
+    (ranges.len() as u32, records as u32, bytes_written)
+}
+
 fn intersect_clip(inherited: Option<UiBounds>, bounds: UiBounds) -> UiBounds {
     let Some(parent) = inherited else {
         return bounds;
@@ -16741,6 +16832,34 @@ fn intersect_clip(inherited: Option<UiBounds>, bounds: UiBounds) -> UiBounds {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn changed_instance_ranges_are_contiguous_and_offsetable() {
+        let previous = vec![UiInstance::zeroed(); 5];
+        let mut current = previous.clone();
+        current[1].depth = 0.25;
+        current[2].depth = 0.5;
+        current[4].depth = 0.75;
+        let mut ranges = Vec::new();
+        let mut index = 0;
+        while index < previous.len() {
+            if previous[index] == current[index] {
+                index += 1;
+                continue;
+            }
+            let start = index;
+            index += 1;
+            while index < previous.len() && previous[index] != current[index] {
+                index += 1;
+            }
+            ranges.push((start, index));
+        }
+        assert_eq!(ranges, vec![(1, 3), (4, 5)]);
+        assert_eq!(
+            ranges[0].0 * std::mem::size_of::<UiInstance>(),
+            std::mem::size_of::<UiInstance>()
+        );
+    }
     use neon_protocol::{
         ClientIdentity, ClientKind, ProtocolVersion, RequestId, Revision, RpcRequest, RpcStatus,
         ServiceName, UiImageSource,

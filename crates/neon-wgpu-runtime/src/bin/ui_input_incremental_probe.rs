@@ -210,7 +210,7 @@ fn run() -> serde_json::Value {
         "equality_oracle": {"retained_frame_equals_golden_full_evaluation": frames_equal},
         "capability_gate": {"delta_without_capability_rejected": uncapable, "observed_code": uncapable_code},
         "end_to_end_incremental": end_to_end_incremental,
-        "warnings": ["The GPU ranges written here are the program adapter's instance, input and dirty planes. The production composition path in UiWgpuRenderer still rebuilds its own instance list per frame; this probe does not claim that pass is incremental."],
+        "warnings": ["The program adapter proves input/dirty/node range writes. UiWgpuRenderer retains static composition and instance data; animated, interactive, material, popup, and fragment-change frames still rebuild the required CPU draw data."],
         "pass": pass,
     })
 }

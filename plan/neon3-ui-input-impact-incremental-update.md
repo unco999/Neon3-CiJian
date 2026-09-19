@@ -782,12 +782,15 @@ renderer-local range 写入与端到端增量证明。
   `retained_frame_equals_golden_full_evaluation: true`，
   `delta_without_capability_rejected: true`（observed code
   `ui_program_delta_capability_missing`），`status: "passed"`。
-- 仍然没有做到的（不得宣称）：生产合成路径 `UiWgpuRenderer` 每帧仍重建自己的
-  instance list（`ui_renderer.rs` 的 `refresh_plan` / 全 buffer 写入），本 Phase 只覆盖
-  program adapter 的 upload scope；`UiGpuUploadStats` 与 probe 的 warning 字段都明确写了
-  这一点。跨进程交互预览的批量提交（§9 Interaction 3 的另一半）也仍在 renderer 之外。
+- 生产合成路径 `UiWgpuRenderer` 仍会每帧重建 CPU instance vector，以保留动画采样、绘制分组、
+  popup 和 legacy fragment composition 的语义；静态且无交互/编辑器/动画活动时现在复用 retained
+  composition 和 instance vector，不再进入节点采样和普通实例重建；动态帧已接入 renderer-local 的连续变化区间写入：
+  color/depth instance buffer 只通过 `queue.write_buffer(offset, range)` 写实际变化记录，
+  同帧无变化不写入，结构扩容/重排自动回到安全的必要范围写入。`ui_reconcile_baseline_probe`
+  输出真实的 range、record 和 byte 统计。跨进程交互预览的批量提交（§9 Interaction 3 的另一半）
+  仍在 renderer 之外。
 - 证据：
-  - `cargo run -q -p neon-wgpu-runtime --bin ui_input_incremental_probe` → `status:
+   - `cargo run -q -p neon-wgpu-runtime --bin ui_input_incremental_probe` → `status:
     "passed"`，`end_to_end_incremental: true`（完整 JSON 见 diary）。
   - `cargo test -q -p neon-wgpu-runtime --lib ui_program_gpu` →
     `test result: ok. 26 passed; 0 failed`（原 20 + 新增 6）。
@@ -796,4 +799,6 @@ renderer-local range 写入与端到端增量证明。
   - `cargo clippy -q -p neon-wgpu-runtime --lib --bins` → 改动文件仅剩既有模式告警
     （`clip_buffer`/`diagnostic_buffer` never read、`result_large_err`、
     `sample_layout_readback` 的 collapsible match），无新增类别。
-  - `cargo check -q --workspace --all-targets` → exit code `0`。
+   - `cargo run -q -p neon-wgpu-runtime --bin ui_reconcile_baseline_probe` → `status: "passed"`；
+     100-row 首帧 `47672` bytes，单节点更新 `472` bytes，实际输出包含 range/record/byte 统计。
+   - `cargo check -q --workspace --all-targets` → exit code `0`。

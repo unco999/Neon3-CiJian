@@ -14,7 +14,7 @@ use neon_ui_runtime::{apply_nui_ir_patch, parse_nui_flow};
 use neon_ui_schema::{
     NuiSourceSpan, UiFragment, UiFragmentId, UiIrPatch, UiIrPatchOperation, UiIrPatchOperationKind,
 };
-use neon_wgpu_runtime::{UiDrawMode, UiWgpuRenderer};
+use neon_wgpu_runtime::{UiDrawMode, UiDrawStageTimings, UiWgpuRenderer};
 use serde_json::{Value, json};
 
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
@@ -122,7 +122,7 @@ impl Runner {
         self.draw_sequence = 0;
     }
 
-    fn draw(&mut self, fragment: &UiFragment) -> (f64, f32) {
+    fn draw(&mut self, fragment: &UiFragment) -> (f64, UiDrawStageTimings) {
         self.draw_sequence += 1;
         let fragments = HashMap::from([(fragment.fragment_id.clone(), fragment.clone())]);
         let started = Instant::now();
@@ -168,7 +168,7 @@ impl Runner {
             .expect("probe poll");
         (
             started.elapsed().as_secs_f64() * 1000.0,
-            self.renderer.stage_timings().refresh_plan_ms,
+            self.renderer.stage_timings(),
         )
     }
 }
@@ -255,7 +255,7 @@ fn run_case(
     let mut revision = ir.revision;
     let mut fragment = fragment_from(revision, ir.root.clone());
     let mut failures = 0_u64;
-    let (draw_ms, refresh_ms) = runner.draw(&fragment);
+    let (draw_ms, timings) = runner.draw(&fragment);
     let stats = runner.renderer.reconcile_stats();
     // A fresh renderer must create every planned node (root panel + rows) and
     // report no removals, updates or moves.
@@ -269,11 +269,35 @@ fn run_case(
         "input": {"node_count": node_count, "operation_count": 0},
         "producer": {"patch_sequence": 0, "base_revision": 3, "ir_revision": revision.0},
         "consumer": {"fragment_revision": fragment.revision.0, "draw_sequence": runner.draw_sequence},
-        "timing_ms": {"draw": draw_ms, "refresh_plan": refresh_ms},
+        "timing_ms": {"draw": draw_ms, "refresh_plan": timings.refresh_plan_ms,
+            "buffer_upload": timings.buffer_upload_ms,
+            "composition_reused": timings.composition_reused},
+        "instance_upload": {"range_writes": timings.instance_range_writes,
+            "records_written": timings.instance_records_written,
+            "bytes_written": timings.instance_bytes_written},
         "retained": stats,
         "pass": pass,
     }));
     if !pass {
+        failures += 1;
+    }
+    let (_, static_timings) = runner.draw(&fragment);
+    let static_pass = static_timings.composition_reused
+        && static_timings.instance_range_writes == 0
+        && static_timings.instance_records_written == 0
+        && static_timings.instance_bytes_written == 0;
+    emit(json!({
+        "probe": "ui_reconcile_baseline.v1",
+        "case": format!("{case}/static-repeat"),
+        "input": {"node_count": node_count, "operation_count": 0},
+        "consumer": {"fragment_revision": fragment.revision.0, "draw_sequence": runner.draw_sequence},
+        "timing_ms": {"composition_reused": static_timings.composition_reused},
+        "instance_upload": {"range_writes": static_timings.instance_range_writes,
+            "records_written": static_timings.instance_records_written,
+            "bytes_written": static_timings.instance_bytes_written},
+        "pass": static_pass,
+    }));
+    if !static_pass {
         failures += 1;
     }
     for (step_index, (step, operations)) in steps.into_iter().enumerate() {
@@ -288,7 +312,7 @@ fn run_case(
         };
         revision = ir.revision;
         fragment = fragment_from(revision, ir.root.clone());
-        let (draw_ms, refresh_ms) = runner.draw(&fragment);
+        let (draw_ms, timings) = runner.draw(&fragment);
         let stats = runner.renderer.reconcile_stats();
         let pass = check_step(
             &format!("{case}/{step}"),
@@ -303,7 +327,12 @@ fn run_case(
             "input": {"node_count": node_count, "operation_count": operation_count},
             "producer": {"patch_sequence": step_index as u64 + 1, "base_revision": revision.0 - 1, "ir_revision": revision.0},
             "consumer": {"fragment_revision": fragment.revision.0, "draw_sequence": runner.draw_sequence},
-            "timing_ms": {"draw": draw_ms, "refresh_plan": refresh_ms},
+            "timing_ms": {"draw": draw_ms, "refresh_plan": timings.refresh_plan_ms,
+                "buffer_upload": timings.buffer_upload_ms,
+                "composition_reused": timings.composition_reused},
+            "instance_upload": {"range_writes": timings.instance_range_writes,
+                "records_written": timings.instance_records_written,
+                "bytes_written": timings.instance_bytes_written},
             "retained": stats,
             "pass": pass,
         }));
