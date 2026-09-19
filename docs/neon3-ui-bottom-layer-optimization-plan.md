@@ -469,7 +469,7 @@ approval:<id>
 
 ## 8. Phase 6：动态效果和交互反馈
 
-状态：`IN_PROGRESS`（Stage 6a `DONE` 2026-09-19）
+状态：`IN_PROGRESS`（Stage 6a/6b `DONE` 2026-09-19）
 
 动态效果必须绑定状态变化，不使用无意义的常驻动画。
 
@@ -508,9 +508,35 @@ approval:<id>
   `UiTransition`（含 `motion_key`）逐字段相等、混形 patch 被
   `ui_flow_patch_params_invalid` 拒绝且 revision 不变。
   `cargo test -p neon-ui-runtime --lib` 213/213。
-- 未完成（Stage 6b/6c）：projection 层的 transition intent API（Completed/Blocked
-  一次性动效、Failed 的文字 + Retry 操作行）、renderer 侧“立即触发该 transition”
-  入口（当前动画引擎仅在目标 visual 变化时启动 track）。
+- 未完成（Stage 6c）：renderer 侧“立即触发该 transition”入口（当前动画引擎仅在目标
+  visual 变化时启动 track）。
+
+### Stage 6b 完成证据（2026-09-19）
+
+- projection 层动效意图 API：`AgentWorkbenchProjection::set_task_status` 在状态真正
+  变化时入队一次性 `UiTransition`（Completed = success sweep 240ms、Failed = error
+  flash 180ms，均只改 opacity，`motion_key` 单调序号防重放）；`sync()` 把意图排空为
+  `StartTransition` ops 追加到同一 patch，与 diff 共享一次 revision bump。
+- 约束：transition 只允许命中当前文档中已存在的行（IR 在 patch inserts 之前解析
+  StartTransition），未露面依赖任务的终态改动 = `NoChange`（0 跨进程流量）；tree 无
+  变化但有 motion 时发 motion-only patch（仍单 revision bump）。retry 按下是纯状态
+  变化（remove + set，0 transition）。
+- 失败态不止颜色：行文本 `plan / name: failed` + 新增 Button-kind `task.<p>.<n>.retry`
+  操作行（文本 `retry plan / name`），随 patch 增量 insert，retry 后增量 remove；
+  Flow writer/parser 对 `button` 节点类型补齐（round-trip parity 测试）。
+- 单测：6 个新用例（sweep 同 patch、failed 三 op 合成、retry 无动效、隐藏任务静默、
+  motion-only patch、button parity），`cargo test -p neon-ui-runtime --lib` 219/219。
+- Probe（真实 `serve_forwarder` RPC）：`motion-feedback-incremental.v1` 3/3
+  （failed = insert+set+transition `structural`、retry = remove+set 无 transition、
+  complete = set+transition `property_only`）；Phase 5 三个 probe 同步更新断言后
+  8/8、7/7、3/3 全绿。
+- 已知缺口（如实记录，计入后续阶段）：程序事件表（`node_key -> intent`）只在初始
+  submit 的 Flow source 中声明，IR patch insert 的 Button 暂时无法携带 intent；
+  retry 按钮当前是 presentation + 结构正确的操作行，intent 接线需要 program 层补丁
+  通道（或预声明事件节点），归入 6c 之后的交互接线阶段。Running/Queued 低频持续
+  动效属 renderer-local 常驻动画，同样依赖该后续（避免常驻伪动效）。
+- 验收层级：`service-ready` + probe 级 `composition-ready`；未声称
+  `wgpu-rendered`/`interactive-accepted`。
 
 ---
 

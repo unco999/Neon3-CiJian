@@ -1,10 +1,11 @@
-//! Phase 5: plan-dependency gating probe (plan section 10).
+//! Phase 6 Stage 6b: state-bound motion feedback probe (plan section 8).
 //!
-//! Task rows are visibility-gated by their `depends_on` edge: a queued task
-//! with an unsatisfied dependency must not exist in the UI tree at all, so
-//! domain changes to it produce zero cross-process traffic. Completing a
-//! task must then release exactly one dependent row as a single insert plus
-//! one property set on the completed row — never a full Flow submit.
+//! Drives the agent workbench through the real `neon-ui-runtime` RPC pipeline
+//! and asserts the motion contract: a failed task lands its status text, a
+//! visible retry action row, and a one-shot error flash in ONE patch;
+//! retrying is a plain state change (remove + set, zero transitions); a
+//! completion carries exactly one trailing success sweep and stays
+//! `property_only`. One submit for the session, everything else patched.
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -21,20 +22,24 @@ use neon_ui_runtime::ide_projection::{
 use serde_json::{Value, json};
 
 const EPOCH: u64 = 1;
-const SURFACE: &str = "surface.ide.plan";
-const BASE_REVISION: u64 = 21;
+const SURFACE: &str = "surface.ide.motion";
+const BASE_REVISION: u64 = 41;
+const TASK_PATH: &str = "workspace/agent/agent.section.tasks/agent.plan.list/task.alpha.build";
+const RETRY_PATH: &str =
+    "workspace/agent/agent.section.tasks/agent.plan.list/task.alpha.build.retry";
+const PLAN_LIST_PATH: &str = "workspace/agent/agent.section.tasks/agent.plan.list";
 
 fn client_identity() -> ClientIdentity {
     ClientIdentity {
         kind: ClientKind::Cli,
-        instance_id: "plan-dependency-incremental-probe".into(),
+        instance_id: "motion-feedback-incremental-probe".into(),
         pid: std::process::id(),
-        origin: "plan-dependency-incremental-probe".into(),
+        origin: "motion-feedback-incremental-probe".into(),
     }
 }
 
 fn request(method: &str, params: Value) -> RpcRequest {
-    let id = format!("plan-dependency-incremental-{}", uuid());
+    let id = format!("motion-feedback-incremental-{}", uuid());
     RpcRequest {
         protocol: "neon3.rpc".into(),
         version: PROTOCOL_VERSION,
@@ -107,18 +112,6 @@ fn seeded_workspace() -> IdeWorkspaceProjection {
         status: TaskStatus::Running,
         depends_on: None,
     });
-    workspace.agent.add_task(AgentTask {
-        plan: "alpha".into(),
-        name: "deploy".into(),
-        status: TaskStatus::Queued,
-        depends_on: Some("build".into()),
-    });
-    workspace.agent.add_task(AgentTask {
-        plan: "alpha".into(),
-        name: "package".into(),
-        status: TaskStatus::Queued,
-        depends_on: Some("deploy".into()),
-    });
     workspace
 }
 
@@ -189,6 +182,12 @@ fn drive_case(
     })
 }
 
+fn has_transition(operations: &[String]) -> bool {
+    operations
+        .iter()
+        .any(|entry| entry == &format!("transition {TASK_PATH}"))
+}
+
 fn run() -> Result<(), String> {
     let renderer_endpoint = fake_renderer()?;
     let any_port: SocketAddr = "127.0.0.1:0".parse().expect("static address");
@@ -252,7 +251,7 @@ fn run() -> Result<(), String> {
         sequence += 1;
         let mut record = record;
         let object = record.as_object_mut().expect("record object");
-        object.insert("probe".to_owned(), json!("plan-dependency-incremental.v1"));
+        object.insert("probe".to_owned(), json!("motion-feedback-incremental.v1"));
         object.insert("sequence".to_owned(), json!(sequence));
         object.insert("case".to_owned(), json!(case));
         object.insert("input".to_owned(), input);
@@ -263,44 +262,26 @@ fn run() -> Result<(), String> {
         println!("{record}");
     };
 
-    // Case 1: the gated chain must be collapsed to the build row only, so
-    // mutating a hidden dependent task is a pure no-change domain event.
+    // Case 1: failure is text + action + one-shot flash, all in one patch.
     workspace
         .agent
-        .set_task_status("alpha", "package", TaskStatus::Running);
-    let quiet = matches!(workspace.sync(), IdeProjectionUpdate::NoChange);
-    emit(
-        "gated_change_is_quiet",
-        json!({"action": "set_task_status", "task": "alpha/package", "status": "running"}),
-        json!({
-            "operations": [],
-            "retained": {"submits": 1, "patches": 0},
-        }),
-        quiet,
-    );
-
-    // Case 2: completing the build releases its direct dependent with one
-    // insert, one property set, and the one-shot success sweep transition on
-    // the completed row.
-    workspace.agent.complete_task("alpha", "build");
+        .set_task_status("alpha", "build", TaskStatus::Failed);
     match drive_case(
         ui_endpoint,
         &mut workspace,
-        "complete_releases_direct",
+        "failed_feedback",
         BASE_REVISION,
     ) {
         Ok(outcome) => {
             let pass = outcome.operations.len() == 3
-                && outcome.operations[0].starts_with("insert task.alpha.deploy")
-                && outcome.operations[1].starts_with(
-                    "set workspace/agent/agent.section.tasks/agent.plan.list/task.alpha.build",
-                )
-                && outcome.operations[2]
-                    == "transition workspace/agent/agent.section.tasks/agent.plan.list/task.alpha.build"
+                && outcome.operations[0]
+                    == format!("insert task.alpha.build.retry@{PLAN_LIST_PATH}[1]")
+                && outcome.operations[1] == format!("set {TASK_PATH}.value")
+                && has_transition(&outcome.operations)
                 && outcome.patch_kind == "structural";
             emit(
-                "complete_releases_direct",
-                json!({"action": "complete_task", "task": "alpha/build"}),
+                "failed_feedback",
+                json!({"action": "set_task_status", "status": "failed"}),
                 json!({
                     "operations": outcome.operations,
                     "program_revision": outcome.program_revision,
@@ -312,35 +293,25 @@ fn run() -> Result<(), String> {
                 pass,
             );
         }
-        Err(error) => emit(
-            "complete_releases_direct",
-            json!({}),
-            json!({"error": error}),
-            false,
-        ),
+        Err(error) => emit("failed_feedback", json!({}), json!({"error": error}), false),
     }
 
-    // Case 3: completing the released task cascades to the next dependent,
-    // still as one insert plus one set plus the trailing sweep.
-    workspace.agent.complete_task("alpha", "deploy");
+    // Case 2: retrying is a plain state change — remove + set, zero motion.
+    workspace.agent.retry_task("alpha", "build");
     match drive_case(
         ui_endpoint,
         &mut workspace,
-        "complete_releases_chain",
+        "retry_is_quiet_state",
         BASE_REVISION + 1,
     ) {
         Ok(outcome) => {
-            let pass = outcome.operations.len() == 3
-                && outcome.operations[0].starts_with("insert task.alpha.package")
-                && outcome.operations[1].starts_with(
-                    "set workspace/agent/agent.section.tasks/agent.plan.list/task.alpha.deploy",
-                )
-                && outcome.operations[2]
-                    == "transition workspace/agent/agent.section.tasks/agent.plan.list/task.alpha.deploy"
-                && outcome.patch_kind == "structural";
+            let pass = outcome.operations.len() == 2
+                && outcome.operations[0] == format!("remove {RETRY_PATH}")
+                && outcome.operations[1] == format!("set {TASK_PATH}.value")
+                && !has_transition(&outcome.operations);
             emit(
-                "complete_releases_chain",
-                json!({"action": "complete_task", "task": "alpha/deploy"}),
+                "retry_is_quiet_state",
+                json!({"action": "retry_task"}),
                 json!({
                     "operations": outcome.operations,
                     "program_revision": outcome.program_revision,
@@ -353,7 +324,44 @@ fn run() -> Result<(), String> {
             );
         }
         Err(error) => emit(
-            "complete_releases_chain",
+            "retry_is_quiet_state",
+            json!({}),
+            json!({"error": error}),
+            false,
+        ),
+    }
+
+    // Case 3: completion is property-only: one set plus the trailing sweep.
+    workspace
+        .agent
+        .set_task_status("alpha", "build", TaskStatus::Completed);
+    match drive_case(
+        ui_endpoint,
+        &mut workspace,
+        "success_sweep_property_only",
+        BASE_REVISION + 2,
+    ) {
+        Ok(outcome) => {
+            let pass = outcome.operations.len() == 2
+                && outcome.operations[0] == format!("set {TASK_PATH}.value")
+                && has_transition(&outcome.operations)
+                && outcome.patch_kind == "property_only";
+            emit(
+                "success_sweep_property_only",
+                json!({"action": "set_task_status", "status": "completed"}),
+                json!({
+                    "operations": outcome.operations,
+                    "program_revision": outcome.program_revision,
+                    "flow_document_revision": outcome.flow_document_revision,
+                    "frame_sequence": outcome.frame_sequence,
+                    "retained": {"submits": 1, "patches": 3},
+                    "timing_ms": outcome.timing_ms,
+                }),
+                pass,
+            );
+        }
+        Err(error) => emit(
+            "success_sweep_property_only",
             json!({}),
             json!({"error": error}),
             false,
@@ -372,7 +380,7 @@ fn run() -> Result<(), String> {
     println!(
         "{}",
         json!({
-            "probe": "plan-dependency-incremental.v1",
+            "probe": "motion-feedback-incremental.v1",
             "final": true,
             "pass": failures == 0,
             "failed_cases": failures,
@@ -390,7 +398,7 @@ fn main() {
         println!(
             "{}",
             json!({
-                "probe": "plan-dependency-incremental.v1",
+                "probe": "motion-feedback-incremental.v1",
                 "final": true,
                 "pass": false,
                 "error": {"code": "probe_failed", "message": error},
