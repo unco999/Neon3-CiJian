@@ -1722,7 +1722,138 @@ pub struct UiDrawStageTimings {
     pub instance_range_writes: u32,
     pub instance_records_written: u32,
     pub instance_bytes_written: u64,
+    pub depth_range_writes: u32,
+    pub depth_records_written: u32,
+    pub depth_bytes_written: u64,
     pub composition_reused: bool,
+    /// Monotonic color-pass counter, so a producer frame and the consumer
+    /// writes it caused can be paired even when nothing was rebuilt.
+    pub frame_sequence: u64,
+    /// Highest fragment revision the retained composition was built from.
+    pub fragment_revision: u64,
+    /// Interaction/input revision the drawn frame consumed. This is the
+    /// renderer-local input revision: it advances when local input changes the
+    /// interaction plan and only reaches `applied` once a frame has consumed it.
+    pub input_revision: u64,
+    pub plan_refresh: UiPlanRefreshCause,
+    pub composition_invalidation: UiCompositionInvalidation,
+    pub instance_reuse_blocker: UiInstanceReuseBlocker,
+    pub instance_rebuilt: bool,
+    /// Instances the frame actually drew. A reused frame must keep this
+    /// identical to the previous one; zero here with `composition_reused` set
+    /// would mean the fast path dropped the draw data.
+    pub instance_count: usize,
+}
+
+impl UiDrawStageTimings {
+    /// Ranges written into any instance plane this frame (color/canvas and depth).
+    pub fn buffer_ranges_written(&self) -> u32 {
+        self.instance_range_writes + self.depth_range_writes
+    }
+}
+
+/// Why the last `refresh_plan` call rebuilt the retained plan (or kept it).
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UiPlanRefreshCause {
+    /// Fragment revisions, viewport, interaction plan and transient state all
+    /// matched, so no plan work ran.
+    #[default]
+    Reused,
+    /// No plan exists yet.
+    FirstFrame,
+    /// A fragment revision differs from the retained plan.
+    FragmentRevision,
+    /// Viewport size changed, so logical bounds must be recomputed.
+    Viewport,
+    /// Local interaction state changed the plan without a publication yet.
+    InteractionRevision,
+    /// A data-grid scroll hold moved a viewport.
+    DataGridScrollHold,
+    /// The retained plan still references nodes that are no longer live.
+    StaleExitingPlan,
+    /// An editor needs a layout pass this frame.
+    EditorActivity,
+}
+
+impl UiPlanRefreshCause {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Reused => "reused",
+            Self::FirstFrame => "first_frame",
+            Self::FragmentRevision => "fragment_revision",
+            Self::Viewport => "viewport",
+            Self::InteractionRevision => "interaction_revision",
+            Self::DataGridScrollHold => "data_grid_scroll_hold",
+            Self::StaleExitingPlan => "stale_exiting_plan",
+            Self::EditorActivity => "editor_activity",
+        }
+    }
+}
+
+/// Why the retained composition cache could not be reused for this frame. The
+/// first matching condition wins, so diagnostics name exactly one cause.
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UiCompositionInvalidation {
+    #[default]
+    Reused,
+    PlanRebuilt,
+    CacheNeverBuilt,
+    CachedShapeChanged,
+    /// Hover/focus feedback must be resampled.
+    PointerVisual,
+    /// A press or running transition is still animating on the CPU.
+    ActivePress,
+    /// Exit animations keep sampling their departing node until they finish.
+    ExitAnimation,
+    Drag,
+    ValueGesture,
+    SplitterDrag,
+    ScrollDrag,
+    ScrollPan,
+    EditorActivity,
+}
+
+impl UiCompositionInvalidation {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Reused => "reused",
+            Self::PlanRebuilt => "plan_rebuilt",
+            Self::CacheNeverBuilt => "cache_never_built",
+            Self::CachedShapeChanged => "cached_shape_changed",
+            Self::PointerVisual => "pointer_visual",
+            Self::ActivePress => "active_press",
+            Self::ExitAnimation => "exit_animation",
+            Self::Drag => "drag",
+            Self::ValueGesture => "value_gesture",
+            Self::SplitterDrag => "splitter_drag",
+            Self::ScrollDrag => "scroll_drag",
+            Self::ScrollPan => "scroll_pan",
+            Self::EditorActivity => "editor_activity",
+        }
+    }
+}
+
+/// Why the ordinary instance vector was rebuilt even though composition reuse
+/// was otherwise available.
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UiInstanceReuseBlocker {
+    #[default]
+    Reused,
+    CompositionRebuilt,
+    DrawModeChanged,
+    /// Material instances need a per-package upload range.
+    MaterialPresent,
+}
+
+impl UiInstanceReuseBlocker {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Reused => "reused",
+            Self::CompositionRebuilt => "composition_rebuilt",
+            Self::DrawModeChanged => "draw_mode_changed",
+            Self::MaterialPresent => "material_present",
+        }
+    }
 }
 
 /// Phase 0 baseline (B0-3): node counters from the last full retained plan
@@ -2029,6 +2160,9 @@ pub struct UiWgpuRenderer {
     cached_top_layer: Vec<Option<usize>>,
     composition_cache_valid: bool,
     last_instance_mode: Option<UiDrawMode>,
+    /// Monotonic color-pass counter used to pair producer input with consumer
+    /// buffer writes in diagnostics.
+    frame_sequence: u64,
     animation_history: VecDeque<UiAnimationInstance>,
     pointer_position: Option<[f32; 2]>,
     pressed_until_seconds: f32,
@@ -3294,6 +3428,7 @@ impl UiWgpuRenderer {
             cached_top_layer: Vec::new(),
             composition_cache_valid: false,
             last_instance_mode: None,
+            frame_sequence: 0,
             animation_history: VecDeque::with_capacity(64),
             pointer_position: None,
             pressed_until_seconds: 0.0,
@@ -6308,6 +6443,73 @@ impl UiWgpuRenderer {
         })
     }
 
+    /// First reason the retained composition cannot be reused this frame.
+    /// Sampling reads press/exit animation state, drag and scroll gestures, and
+    /// editor layout, so every input to `compose_sampled_visuals` that is not
+    /// already covered by a plan rebuild has to name itself here.
+    fn composition_invalidation(
+        &self,
+        plan_refresh: UiPlanRefreshCause,
+    ) -> UiCompositionInvalidation {
+        if plan_refresh != UiPlanRefreshCause::Reused {
+            return UiCompositionInvalidation::PlanRebuilt;
+        }
+        if !self.composition_cache_valid {
+            return UiCompositionInvalidation::CacheNeverBuilt;
+        }
+        if self.cached_top_layer.len() != self.plan.len() {
+            return UiCompositionInvalidation::CachedShapeChanged;
+        }
+        if self.pointer_visual_dirty {
+            return UiCompositionInvalidation::PointerVisual;
+        }
+        if !self.active.is_empty() {
+            return UiCompositionInvalidation::ActivePress;
+        }
+        if !self.exiting.is_empty() {
+            return UiCompositionInvalidation::ExitAnimation;
+        }
+        if self.drag.is_some() {
+            return UiCompositionInvalidation::Drag;
+        }
+        if self.value_gesture.is_some() {
+            return UiCompositionInvalidation::ValueGesture;
+        }
+        if self.splitter_drag.is_some() {
+            return UiCompositionInvalidation::SplitterDrag;
+        }
+        if self.scroll_drag.is_some() {
+            return UiCompositionInvalidation::ScrollDrag;
+        }
+        if self.scroll_pan.is_some() {
+            return UiCompositionInvalidation::ScrollPan;
+        }
+        if self.has_editor_activity() {
+            return UiCompositionInvalidation::EditorActivity;
+        }
+        UiCompositionInvalidation::Reused
+    }
+
+    /// First reason the ordinary instance vector must be rebuilt even though the
+    /// composition may have been reused. Material instances need per-package
+    /// upload ranges, so they never take the retained path.
+    fn instance_reuse_blocker(
+        &self,
+        composition_reused: bool,
+        mode: UiDrawMode,
+    ) -> UiInstanceReuseBlocker {
+        if !composition_reused {
+            return UiInstanceReuseBlocker::CompositionRebuilt;
+        }
+        if self.last_instance_mode != Some(mode) {
+            return UiInstanceReuseBlocker::DrawModeChanged;
+        }
+        if !self.node_materials.is_empty() {
+            return UiInstanceReuseBlocker::MaterialPresent;
+        }
+        UiInstanceReuseBlocker::Reused
+    }
+
     pub(crate) fn expire_one_shot_text_materials(&mut self, time_seconds: f32) -> bool {
         let mut expired_text_materials = false;
         let mut active_text_materials = false;
@@ -7386,35 +7588,24 @@ impl UiWgpuRenderer {
             }),
         );
         self.view_buffer_viewport_revision = self.viewport_revision;
+        self.frame_sequence = self.frame_sequence.wrapping_add(1).max(1);
         let stage = Instant::now();
-        let plan_rebuilt = self.refresh_plan(fragments, viewport_logical_size);
+        let plan_refresh = self.refresh_plan(fragments, viewport_logical_size);
         // Code-editor mirrors reconcile against the (possibly new) plan and
         // fragment declarations. Adopting host document frames only while
         // unfocused keeps local typing authoritative.
         self.reconcile_editors(fragments);
         let refresh_plan_ms = stage.elapsed().as_secs_f32() * 1000.0;
         let stage = Instant::now();
-        let can_reuse_composition = !plan_rebuilt
-            && self.composition_cache_valid
-            && self.cached_top_layer.len() == self.plan.len()
-            && !self.pointer_visual_dirty
-            && self.active.is_empty()
-            && self.drag.is_none()
-            && self.value_gesture.is_none()
-            && self.splitter_drag.is_none()
-            && self.scroll_drag.is_none()
-            && self.scroll_pan.is_none()
-            && !self.has_editor_activity();
-        let (top_layer, composition_reused) = if can_reuse_composition {
-            (self.cached_top_layer.clone(), true)
+        let invalidation = self.composition_invalidation(plan_refresh);
+        let composition_reused = invalidation == UiCompositionInvalidation::Reused;
+        let top_layer = if composition_reused {
+            self.cached_top_layer.clone()
         } else {
-            let top_layer = self.compose_sampled_visuals(time_seconds);
-            (top_layer, false)
+            self.compose_sampled_visuals(time_seconds)
         };
-        let reuse_instances = composition_reused
-            && self.last_instance_mode == Some(mode)
-            && self.node_materials.is_empty();
-        self.instances.clear();
+        let blocker = self.instance_reuse_blocker(composition_reused, mode);
+        let reuse_instances = blocker == UiInstanceReuseBlocker::Reused;
         let visible_top_layer = top_layer
             .iter()
             .map(|root| {
@@ -7440,6 +7631,10 @@ impl UiWgpuRenderer {
         let mut drag_preview_instances = Vec::new();
         let mut material_instances = BTreeMap::<u32, BTreeMap<String, Vec<UiInstance>>>::new();
         if !reuse_instances {
+            // The retained vector is only replaced when this frame actually
+            // resamples: clearing it up front would make a reused frame draw
+            // zero instances while still reporting a successful upload.
+            self.instances.clear();
             for index in 0..self.plan.len() {
                 if self.plan[index].instance_index.is_none()
                     || top_layer[index].is_some()
@@ -7614,7 +7809,11 @@ impl UiWgpuRenderer {
             // current-line/selection rects draw beneath glyphs (in the
             // ordinary instance pass, after every panel).
             popup_instances.extend(editor_layout.editor_popup_rects);
-            self.instances.extend(editor_layout.editor_rects);
+            if !reuse_instances {
+                // Editor rects are already part of the retained vector when the
+                // frame reused it; appending again would grow it every frame.
+                self.instances.extend(editor_layout.editor_rects);
+            }
         }
         self.last_panel_instance_count = self.instances.len();
         if self.instances.len() > self.instance_capacity {
@@ -10143,7 +10342,23 @@ impl UiWgpuRenderer {
             instance_range_writes,
             instance_records_written,
             instance_bytes_written,
+            depth_range_writes: 0,
+            depth_records_written: 0,
+            depth_bytes_written: 0,
             composition_reused,
+            frame_sequence: self.frame_sequence,
+            fragment_revision: self
+                .plan_revisions
+                .values()
+                .map(|revision| revision.0)
+                .max()
+                .unwrap_or_default(),
+            input_revision: self.applied_interaction_plan_revision,
+            plan_refresh,
+            composition_invalidation: invalidation,
+            instance_reuse_blocker: blocker,
+            instance_rebuilt: !reuse_instances,
+            instance_count: self.instances.len(),
         };
         self.last_instance_mode = Some(mode);
     }
@@ -10400,13 +10615,20 @@ impl UiWgpuRenderer {
             return;
         }
         if self.uploaded_depth_instances != ordered_depth_instances {
-            write_changed_instance_ranges(
+            let written = write_changed_instance_ranges(
                 queue,
                 &self.depth_instance_buffer,
                 &self.uploaded_depth_instances,
                 &ordered_depth_instances,
             );
+            self.last_stage_timings.depth_range_writes = written.0;
+            self.last_stage_timings.depth_records_written = written.1;
+            self.last_stage_timings.depth_bytes_written = written.2;
             self.uploaded_depth_instances = ordered_depth_instances.clone();
+        } else {
+            self.last_stage_timings.depth_range_writes = 0;
+            self.last_stage_timings.depth_records_written = 0;
+            self.last_stage_timings.depth_bytes_written = 0;
         }
         pass.set_pipeline(rect_pipeline);
         pass.set_bind_group(0, &self.view_bind_group, &[]);
@@ -10500,7 +10722,7 @@ impl UiWgpuRenderer {
         &mut self,
         fragments: &HashMap<neon_ui_schema::UiFragmentId, UiFragment>,
         viewport_logical_size: [f32; 2],
-    ) -> bool {
+    ) -> UiPlanRefreshCause {
         self.reconcile_pending_local_presentations(fragments);
         let data_grid_hold_changed = self.reconcile_data_grid_scroll_holds(fragments);
         let viewport_logical_size =
@@ -10510,12 +10732,14 @@ impl UiWgpuRenderer {
             self.viewport_revision = self.viewport_revision.wrapping_add(1).max(1);
         }
         let viewport_changed = self.plan_viewport_revision != self.viewport_revision;
-        let matches = self.plan_revisions.len() == fragments.len()
-            && !viewport_changed
-            && self.interaction_plan_revision == self.applied_interaction_plan_revision
-            && fragments
+        let revision_mismatch = self.plan_revisions.len() != fragments.len()
+            || !fragments
                 .iter()
                 .all(|(id, fragment)| self.plan_revisions.get(id) == Some(&fragment.revision));
+        let matches = !revision_mismatch
+            && !viewport_changed
+            && self.interaction_plan_revision == self.applied_interaction_plan_revision
+            && !data_grid_hold_changed;
         let stale_exiting_plan = self.exiting.is_empty()
             && self
                 .plan
@@ -10523,12 +10747,32 @@ impl UiWgpuRenderer {
                 .any(|node| !self.live_node_ids.contains(&node.id));
         // One-shot text materials must expire on wall-clock time even when the
         // fragment never changes, so run expiry before the plan-reuse early
-        // return.
-        self.expire_one_shot_text_materials(self.animation_clock_seconds);
-        if matches && !data_grid_hold_changed && !stale_exiting_plan && !self.has_editor_activity()
-        {
-            return false;
+        // return. Removal is a presentation change: the affected node's instance
+        // has to fall back to its default material, which only a rebuild emits.
+        let text_material_expired =
+            self.expire_one_shot_text_materials(self.animation_clock_seconds);
+        if matches && !stale_exiting_plan && !text_material_expired && !self.has_editor_activity() {
+            return UiPlanRefreshCause::Reused;
         }
+        let cause = if self.plan.is_empty() && self.plan_revisions.is_empty() {
+            UiPlanRefreshCause::FirstFrame
+        } else if revision_mismatch {
+            UiPlanRefreshCause::FragmentRevision
+        } else if viewport_changed {
+            UiPlanRefreshCause::Viewport
+        } else if self.interaction_plan_revision != self.applied_interaction_plan_revision {
+            UiPlanRefreshCause::InteractionRevision
+        } else if data_grid_hold_changed {
+            UiPlanRefreshCause::DataGridScrollHold
+        } else if text_material_expired {
+            // Reported as fragment-level rebuild cause because the material is
+            // declared by the fragment's effects.
+            UiPlanRefreshCause::FragmentRevision
+        } else if self.has_editor_activity() {
+            UiPlanRefreshCause::EditorActivity
+        } else {
+            UiPlanRefreshCause::StaleExitingPlan
+        };
         let previous_text_materials = self.node_text_materials.clone();
         self.nine_slices.clear();
         self.node_cuts.clear();
@@ -11207,7 +11451,7 @@ impl UiWgpuRenderer {
         );
         self.plan_viewport_revision = self.viewport_revision;
         self.applied_interaction_plan_revision = self.interaction_plan_revision;
-        true
+        cause
     }
 
     fn reconcile_data_grid_scroll_holds(
@@ -17122,7 +17366,10 @@ mod tests {
         };
         let mut fragments = HashMap::from([(fragment_id, fragment)]);
         let mut renderer = UiWgpuRenderer::new(&device, wgpu::TextureFormat::Rgba8Unorm);
-        assert!(renderer.refresh_plan(&fragments, [100.0, 80.0]));
+        assert_ne!(
+            renderer.refresh_plan(&fragments, [100.0, 80.0]),
+            UiPlanRefreshCause::Reused
+        );
         assert_eq!(
             renderer.debug_drag_gesture_points("nested-source", "drop-target"),
             Ok(([25.0, 23.0], [75.0, 25.0]))
@@ -17149,7 +17396,10 @@ mod tests {
                 effects: Vec::new(),
             },
         );
-        assert!(renderer.refresh_plan(&fragments, [100.0, 80.0]));
+        assert_ne!(
+            renderer.refresh_plan(&fragments, [100.0, 80.0]),
+            UiPlanRefreshCause::Reused
+        );
         assert_eq!(
             renderer.debug_drag_gesture_points("nested-source", "drop-target"),
             Err("ambiguous_semantic_node_key")
@@ -25760,6 +26010,288 @@ mod tests {
             pixels
                 .chunks_exact(4)
                 .any(|pixel| pixel[0] > 0 && pixel[3] > 0)
+        );
+    }
+
+    fn invalidation_matrix_fragments() -> HashMap<UiFragmentId, UiFragment> {
+        let mut panel = node();
+        panel.node_id = UiNodeId("panel".into());
+        panel.bounds = UiBounds {
+            x: 8.0,
+            y: 8.0,
+            width: 60.0,
+            height: 40.0,
+        };
+        panel.enter_transition = None;
+        let mut root = node();
+        root.node_id = UiNodeId("root".into());
+        root.bounds = UiBounds {
+            x: 0.0,
+            y: 0.0,
+            width: 100.0,
+            height: 100.0,
+        };
+        root.children = vec![panel];
+        root.enter_transition = None;
+        let fragment_id = UiFragmentId("invalidation-matrix".into());
+        HashMap::from([(
+            fragment_id.clone(),
+            UiFragment {
+                fragment_id,
+                revision: Revision(1),
+                root,
+                effects: Vec::new(),
+            },
+        )])
+    }
+
+    fn matrix_active_transition(target: UiVisual) -> ActiveTransition {
+        let transition = UiTransition {
+            delay_ms: 0,
+            duration_ms: 300,
+            easing: UiEasing::Linear,
+            from: UiTransitionState {
+                opacity: Some(0.4),
+                ..UiTransitionState::default()
+            },
+            motion_key: Some("invalidation-matrix".into()),
+            timeline: None,
+        };
+        ActiveTransition {
+            identity: AnimationIdentity {
+                node_id: "invalidation-matrix/root".into(),
+                generation: 1,
+            },
+            transition_id: 1,
+            program_revision: Revision(1),
+            source_frame_sequence: 1,
+            animation_epoch: 1,
+            reason: AnimationReason::Transition,
+            retarget_source: None,
+            from: transition_source(&target, &transition),
+            target: target.clone(),
+            from_transform: UiTransform::default(),
+            target_transform: UiTransform::default(),
+            started_at_seconds: 1.0,
+            transition,
+        }
+    }
+
+    /// Every input-only state names exactly one composition reason, never forces
+    /// a plan rebuild, and returns the frame to the reused path once cleared.
+    #[test]
+    fn interaction_states_each_name_their_own_composition_invalidation_reason() {
+        let _gpu_test = GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let (device, _queue) = test_device("neon3-ui-invalidation-reasons");
+        let mut renderer = UiWgpuRenderer::new(&device, wgpu::TextureFormat::Rgba8Unorm);
+        let fragments = invalidation_matrix_fragments();
+        renderer.prepare_interaction(&fragments, [100, 100], [100.0, 100.0], 1.0);
+        assert_eq!(
+            renderer.composition_invalidation(UiPlanRefreshCause::Reused),
+            UiCompositionInvalidation::Reused,
+            "a prepared static frame must not name any invalidation"
+        );
+
+        let matrix_fragments = &fragments;
+        let assert_reason =
+            |renderer: &mut UiWgpuRenderer, reason: UiCompositionInvalidation, label: &str| {
+                assert_eq!(
+                    renderer.composition_invalidation(UiPlanRefreshCause::Reused),
+                    reason,
+                    "{label} must name {} and nothing earlier in the chain",
+                    reason.as_str()
+                );
+                assert_eq!(
+                    renderer.refresh_plan(matrix_fragments, [100.0, 100.0]),
+                    UiPlanRefreshCause::Reused,
+                    "{label} is composition-only: it must never re-flow the retained plan"
+                );
+                assert_eq!(
+                    renderer.composition_invalidation(UiPlanRefreshCause::Reused),
+                    reason,
+                    "{label} must survive a reused plan refresh"
+                );
+            };
+
+        renderer.pointer_visual_dirty = true;
+        assert_reason(
+            &mut renderer,
+            UiCompositionInvalidation::PointerVisual,
+            "hover",
+        );
+        renderer.pointer_visual_dirty = false;
+        assert_eq!(
+            renderer.composition_invalidation(UiPlanRefreshCause::Reused),
+            UiCompositionInvalidation::Reused,
+            "an unrelated hover flag clear must return to the reused path"
+        );
+
+        let target = renderer.sampled[0].clone();
+        let active = matrix_active_transition(target.clone());
+        renderer
+            .active
+            .insert(active.identity.node_id.clone(), active.clone());
+        assert_reason(
+            &mut renderer,
+            UiCompositionInvalidation::ActivePress,
+            "press/transition",
+        );
+        renderer.active.clear();
+        renderer.exiting.insert(
+            active.identity.clone(),
+            ExitingNode {
+                transition: active,
+                remove_after_seconds: 3.0,
+                target,
+                order: 0,
+            },
+        );
+        assert_reason(
+            &mut renderer,
+            UiCompositionInvalidation::ExitAnimation,
+            "exit animation",
+        );
+        renderer.exiting.clear();
+        assert_eq!(
+            renderer.composition_invalidation(UiPlanRefreshCause::Reused),
+            UiCompositionInvalidation::Reused
+        );
+
+        renderer.drag = Some(RendererDrag {
+            binding: neon_ui_schema::UiDragBinding {
+                key: "matrix-drag".into(),
+                source_node_id: UiNodeId("panel".into()),
+                axis: neon_ui_schema::UiDragAxis::Both,
+                snap: 0.0,
+                threshold: 0.0,
+                boundary: neon_ui_schema::UiDragBoundary::Free,
+            },
+            fragment: neon_ui_schema::UiFragmentRevision {
+                id: UiFragmentId("invalidation-matrix".into()),
+                revision: Revision(1),
+            },
+            source_path: "invalidation-matrix/panel".into(),
+            source_bounds: UiBounds {
+                x: 8.0,
+                y: 8.0,
+                width: 60.0,
+                height: 40.0,
+            },
+            boundary_bounds: None,
+            start: [8.0, 8.0],
+            origin: [0.0, 0.0],
+            moved: true,
+        });
+        assert_reason(&mut renderer, UiCompositionInvalidation::Drag, "drag");
+        renderer.drag = None;
+
+        renderer.value_gesture = Some(UiValueGesture {
+            node_path: "invalidation-matrix/panel".into(),
+            kind: UiNodeKind::Panel,
+            bounds: UiBounds {
+                x: 8.0,
+                y: 8.0,
+                width: 60.0,
+                height: 40.0,
+            },
+            min: 0.0,
+            max: 1.0,
+        });
+        assert_reason(
+            &mut renderer,
+            UiCompositionInvalidation::ValueGesture,
+            "value gesture",
+        );
+        renderer.value_gesture = None;
+
+        renderer.splitter_drag = Some(SplitterDrag {
+            left_index: 0,
+            right_index: 1,
+            splitter_path: "invalidation-matrix/panel".into(),
+            horizontal: true,
+            container_start: 0.0,
+            container_size: 100.0,
+            splitter_size: 4.0,
+            pointer_offset: 2.0,
+            splitter_pos: 48.0,
+            original_bounds: Vec::new(),
+        });
+        assert_reason(
+            &mut renderer,
+            UiCompositionInvalidation::SplitterDrag,
+            "splitter drag",
+        );
+        renderer.splitter_drag = None;
+
+        renderer.scroll_drag = Some(ScrollDrag {
+            node_path: "invalidation-matrix/panel".into(),
+            axis: ScrollAxis::Y,
+            pointer_start: 20.0,
+            offset_start: 0.0,
+        });
+        assert_reason(
+            &mut renderer,
+            UiCompositionInvalidation::ScrollDrag,
+            "scrollbar drag",
+        );
+        renderer.scroll_drag = None;
+
+        renderer.scroll_pan = Some(ScrollPan {
+            node_path: "invalidation-matrix/panel".into(),
+            pointer_start: [20.0, 20.0],
+            offset_start: [0.0, 0.0],
+        });
+        assert_reason(
+            &mut renderer,
+            UiCompositionInvalidation::ScrollPan,
+            "content pan",
+        );
+        renderer.scroll_pan = None;
+        assert_eq!(
+            renderer.composition_invalidation(UiPlanRefreshCause::Reused),
+            UiCompositionInvalidation::Reused,
+            "every gesture cleared must leave the static frame reused"
+        );
+    }
+
+    #[test]
+    fn instance_vector_reuse_requires_the_same_mode_and_no_material_instances() {
+        let _gpu_test = GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let (device, _queue) = test_device("neon3-ui-instance-reuse-blockers");
+        let mut renderer = UiWgpuRenderer::new(&device, wgpu::TextureFormat::Rgba8Unorm);
+        let fragments = invalidation_matrix_fragments();
+        renderer.prepare_interaction(&fragments, [100, 100], [100.0, 100.0], 1.0);
+        renderer.last_instance_mode = Some(UiDrawMode::Screen);
+        assert_eq!(
+            renderer.instance_reuse_blocker(true, UiDrawMode::Screen),
+            UiInstanceReuseBlocker::Reused
+        );
+        assert_eq!(
+            renderer.instance_reuse_blocker(true, UiDrawMode::World),
+            UiInstanceReuseBlocker::DrawModeChanged
+        );
+        renderer.node_materials.insert(
+            "panel".into(),
+            neon_ui_schema::UiMaterialRef {
+                package_id: "glow".into(),
+                version: 1,
+                fallback: String::new(),
+                overflow: [0.0; 4],
+                parameters: Default::default(),
+            },
+        );
+        assert_eq!(
+            renderer.instance_reuse_blocker(true, UiDrawMode::Screen),
+            UiInstanceReuseBlocker::MaterialPresent
+        );
+        renderer.node_materials.clear();
+        assert_eq!(
+            renderer.instance_reuse_blocker(false, UiDrawMode::Screen),
+            UiInstanceReuseBlocker::CompositionRebuilt
         );
     }
 }

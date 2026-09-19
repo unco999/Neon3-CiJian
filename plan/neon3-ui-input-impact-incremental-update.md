@@ -802,3 +802,82 @@ renderer-local range 写入与端到端增量证明。
    - `cargo run -q -p neon-wgpu-runtime --bin ui_reconcile_baseline_probe` → `status: "passed"`；
      100-row 首帧 `47672` bytes，单节点更新 `472` bytes，实际输出包含 range/record/byte 统计。
    - `cargo check -q --workspace --all-targets` → exit code `0`。
+
+### 阶段一（renderer 侧）：每次失效必须自己说明原因 — 已完成
+
+对应 §6.2/§8 的生产合成路径部分。目标是让 `UiWgpuRenderer` 的每一帧都能回答“为什么重建”，
+而不是让人从行为反推。三条互不重叠的原因轴：
+
+- `UiPlanRefreshCause`（`refresh_plan` 是否重排树）：`Reused`/`FirstFrame`/`FragmentRevision`/
+  `Viewport`/`InteractionRevision`/`DataGridScrollHold`/`StaleExitingPlan`/`EditorActivity`。
+  `revision_mismatch` 从合并条件里拆出来，viewport 变化不再伪装成 fragment 变化。
+- `UiCompositionInvalidation`（retained top-layer 能否复用）：固定优先级取第一个命中原因，
+  `PlanRebuilt → CacheNeverBuilt → CachedShapeChanged → PointerVisual → ActivePress →
+  ExitAnimation → Drag → ValueGesture → SplitterDrag → ScrollDrag → ScrollPan → EditorActivity → Reused`。
+- `UiInstanceReuseBlocker`（普通 instance vector 为何重采样）：`CompositionRebuilt`/`DrawModeChanged`/
+  `MaterialPresent`/`Reused`。
+
+`UiDrawStageTimings` 新增 `frame_sequence`（color pass 单调计数）、`fragment_revision`（retained plan
+的最高 revision）、`input_revision`（renderer-local `applied_interaction_plan_revision`）、
+`composition_reused`、`instance_rebuilt`、`instance_count`、`plan_refresh`、
+`composition_invalidation`、`instance_reuse_blocker`、`depth_range_writes/records/bytes` 与
+`buffer_ranges_written()`。三个 enum 从 `neon-wgpu-runtime` lib 根导出，probe 直接断言字符串。
+
+发现并修掉的真 bug：
+
+1. 复用帧画零实例。`self.instances.clear()` 无条件执行，而填充只在 `!reuse_instances` 分支里，
+   于是 `composition_reused == true` 的帧把上一帧的 instance vector 清空后不再重建，
+   同时把 `uploaded_instances` 一起清空，导致下一个重建帧把全部 202 条记录重新写一遍。
+   现在 clear 与 editor-rects 追加都移进 `!reuse_instances` 分支。实测
+   `A_property_set_1/set` 的 `color_records` 从 `202` 降到 `2`（`instance_count: 101`）。
+2. 复用判断漏掉退出动画：`exiting` 非空时旧代码仍会复用 composition，退场节点被冻结在最后一次
+   采样上。新增 `ExitAnimation` 原因与守卫。
+3. 一次性 text material 到期结果被丢弃：`expire_one_shot_text_materials` 的返回值以前没参与
+   plan 复用判断，静态 fragment 上 material 到期会留下旧 instance。现在它在早退之前运行并强制重建
+   （报告为 `FragmentRevision`，因为 material 由 fragment effects 声明）。
+
+覆盖方式按可见性拆分：`src/bin/` 只能看到公开 API，所以 probe 承担 fragment revision、
+viewport、pointer hover 三个场景（`run_invalidation_scenario` 每帧断言“变化前一帧复用且
+`buffer_ranges_written == 0`、变化帧命中且只命中预期原因、`instance_count > 0`、窄更新时
+`0 < color_records < instance_count`、settle 帧重新复用且 `frame_sequence` 递增）；
+drag/scroll/splitter/press/exit/材质/绘制模式等原因由 lib 测试覆盖：
+
+- `interaction_states_each_name_their_own_composition_invalidation_reason`：hover、press/transition、
+  exit animation、drag、value gesture、splitter drag、scrollbar drag、content pan 每个状态都必须
+  命名自己的原因，且 `refresh_plan` 在同一帧仍返回 `Reused`（交互只重采样，绝不重排树），清空后回到 `Reused`。
+- `instance_vector_reuse_requires_the_same_mode_and_no_material_instances`：四个 blocker 各自命中。
+
+证据（全部为实际输出）：
+
+- `cargo run -q -p neon-wgpu-runtime --bin ui_reconcile_baseline_probe` → exit `0`，
+  48 条 `"pass":true`、0 条 `"pass":false`，最终
+  `{"failures":0,"final":true,"pass":true,"probe":"ui_reconcile_baseline.v1","status":"passed"}`。
+- `scenario/fragment_revision/invalidate` → `plan_refresh: "fragment_revision"`、
+  `composition_invalidation: "plan_rebuilt"`、`color_records: 2` / `instance_count: 21`、`color_bytes: 472`；
+  `scenario/viewport/invalidate` → `plan_refresh: "viewport"`；
+  `scenario/pointer_hover/invalidate` → `plan_refresh: "reused"`、
+  `composition_invalidation: "pointer_visual"`、2 records / 472 bytes；
+  `scenario/pointer_hover/hover-held` → 仍为 `pointer_visual` 但 `buffer_ranges_written: 0`
+  （hover 稳定后不再写 buffer）。
+- `cargo test -p neon-wgpu-runtime --lib ui_renderer`（跳过两个已知挂起项）→
+  `test result: FAILED. 108 passed; 8 failed; 114 filtered out; finished in 76.28s`。
+  8 个失败与 HEAD（`badffb5`）同一命令的失败集合逐名相同（HEAD：`106 passed; 8 failed`，
+  差值正好是本轮新增 2 个测试），因此不是本轮回归；已按要求单独记录而不是改测试或 probe。
+  另有 `focus_uses_topmost_plan_order_instead_of_hash_map_iteration_order` 与
+  `real_ai_generation_composes_through_a_gpu_render_surface` 两个存量超时/挂起项被跳过。
+- `cargo test -q -p neon-ui-runtime --lib` → `245 passed; 0 failed`。
+- `rustfmt --edition 2024 --check`（本轮三个文件）→ 干净。
+- `cargo clippy -q -p neon-wgpu-runtime --lib --bins` → 新代码区域只剩两条存量告警
+  （`draw()` 9 参数、`for index in 0..self.plan.len()` 索引 `top_layer`），两者在 HEAD 同位置同形状已存在。
+- `cargo check -q --workspace --all-targets` → exit `0`。
+
+仍未做到（不得宣称已完成）：
+
+- `EditorActivity` 原因没有任何测试覆盖：构造 `editor_renderer::EditorRuntimeState` 需要完整的
+  `UiCodeEditorDeclaration` + presentation fixture，probe 也拿不到 `pub(crate)` 编辑器入口。
+  popup/text-material 原因同理，只有代码路径和枚举名字。
+- hit/text/image/material plane 仍是整段重写，未接 range 写入（阶段四）。
+- `uploaded_instances`（文档顺序）与 `uploaded_ordered_instances`（分组/canvas 顺序）是同一块
+  `instance_buffer` 上的两份独立变更缓存，各自不知道 buffer 的真实物理内容，交替绘制两条 pass 时
+  可能互相覆盖成“差异非空但内容相同”的多写。修法是把缓存改成 buffer 物理内容单例（阶段一后续）。
+- `UiWgpuRenderer` 仍未消费 `UiFrameDelta`：静态帧已不重建，但真实 fragment 变化仍是整树重采样。

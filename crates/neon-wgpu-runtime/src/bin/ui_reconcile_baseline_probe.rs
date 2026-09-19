@@ -14,7 +14,10 @@ use neon_ui_runtime::{apply_nui_ir_patch, parse_nui_flow};
 use neon_ui_schema::{
     NuiSourceSpan, UiFragment, UiFragmentId, UiIrPatch, UiIrPatchOperation, UiIrPatchOperationKind,
 };
-use neon_wgpu_runtime::{UiDrawMode, UiDrawStageTimings, UiWgpuRenderer};
+use neon_wgpu_runtime::{
+    UiCompositionInvalidation, UiDrawMode, UiDrawStageTimings, UiInstanceReuseBlocker,
+    UiPlanRefreshCause, UiWgpuRenderer,
+};
 use serde_json::{Value, json};
 
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
@@ -123,6 +126,16 @@ impl Runner {
     }
 
     fn draw(&mut self, fragment: &UiFragment) -> (f64, UiDrawStageTimings) {
+        self.draw_at(fragment, [1200.0, 11000.0])
+    }
+
+    /// One drawn frame, with the logical viewport under test. `viewport` only
+    /// changes the layout basis; the physical target stays fixed.
+    fn draw_at(
+        &mut self,
+        fragment: &UiFragment,
+        logical_viewport: [f32; 2],
+    ) -> (f64, UiDrawStageTimings) {
         self.draw_sequence += 1;
         let fragments = HashMap::from([(fragment.fragment_id.clone(), fragment.clone())]);
         let started = Instant::now();
@@ -154,7 +167,7 @@ impl Runner {
                 &mut pass,
                 &fragments,
                 [WIDTH, HEIGHT],
-                [1200.0, 11000.0],
+                logical_viewport,
                 self.draw_sequence as f32 / 60.0,
                 UiDrawMode::Screen,
             );
@@ -212,6 +225,37 @@ fn emit(record: Value) {
     println!("{record}");
 }
 
+/// Full frame self-explanation: what revision it was built from, whether the
+/// retained composition and instance vector were reused, which single condition
+/// prevented reuse, and how many buffer ranges actually reached the queue.
+fn frame_json(timings: &UiDrawStageTimings) -> Value {
+    json!({
+        "frame_sequence": timings.frame_sequence,
+        "fragment_revision": timings.fragment_revision,
+        "input_revision": timings.input_revision,
+        "composition_reused": timings.composition_reused,
+        "plan_refresh": timings.plan_refresh.as_str(),
+        "composition_invalidation": timings.composition_invalidation.as_str(),
+        "instance_rebuilt": timings.instance_rebuilt,
+        "instance_reuse_blocker": timings.instance_reuse_blocker.as_str(),
+        "instance_count": timings.instance_count,
+        "buffer_ranges_written": timings.buffer_ranges_written(),
+        "color_ranges": timings.instance_range_writes,
+        "color_records": timings.instance_records_written,
+        "color_bytes": timings.instance_bytes_written,
+        "depth_ranges": timings.depth_range_writes,
+        "depth_records": timings.depth_records_written,
+        "depth_bytes": timings.depth_bytes_written,
+        "timing_ms": {
+            "refresh_plan": timings.refresh_plan_ms,
+            "compose_visuals": timings.compose_visuals_ms,
+            "text_layout": timings.text_layout_ms,
+            "group_sort": timings.group_sort_ms,
+            "buffer_upload": timings.buffer_upload_ms,
+        },
+    })
+}
+
 fn fail(message: &str) -> ! {
     emit(json!({
         "probe": "ui_reconcile_baseline.v1",
@@ -262,39 +306,40 @@ fn run_case(
     let pass = stats.created == node_count as u64 + 1
         && stats.removed == 0
         && stats.updated == 0
-        && stats.moved == 0;
+        && stats.moved == 0
+        && timings.instance_count > 0;
     emit(json!({
         "probe": "ui_reconcile_baseline.v1",
         "case": format!("{case}/base"),
         "input": {"node_count": node_count, "operation_count": 0},
         "producer": {"patch_sequence": 0, "base_revision": 3, "ir_revision": revision.0},
         "consumer": {"fragment_revision": fragment.revision.0, "draw_sequence": runner.draw_sequence},
-        "timing_ms": {"draw": draw_ms, "refresh_plan": timings.refresh_plan_ms,
-            "buffer_upload": timings.buffer_upload_ms,
-            "composition_reused": timings.composition_reused},
-        "instance_upload": {"range_writes": timings.instance_range_writes,
-            "records_written": timings.instance_records_written,
-            "bytes_written": timings.instance_bytes_written},
+        "draw_ms": draw_ms,
+        "frame": frame_json(&timings),
         "retained": stats,
         "pass": pass,
     }));
     if !pass {
         failures += 1;
     }
+    // Static repeat: the same fragment and an advanced clock must reuse the
+    // retained composition, keep drawing the same instance count, and write
+    // nothing to any instance buffer.
     let (_, static_timings) = runner.draw(&fragment);
     let static_pass = static_timings.composition_reused
-        && static_timings.instance_range_writes == 0
-        && static_timings.instance_records_written == 0
-        && static_timings.instance_bytes_written == 0;
+        && static_timings.composition_invalidation == UiCompositionInvalidation::Reused
+        && static_timings.plan_refresh == UiPlanRefreshCause::Reused
+        && static_timings.instance_reuse_blocker == UiInstanceReuseBlocker::Reused
+        && !static_timings.instance_rebuilt
+        && static_timings.instance_count == timings.instance_count
+        && static_timings.instance_count > 0
+        && static_timings.buffer_ranges_written() == 0;
     emit(json!({
         "probe": "ui_reconcile_baseline.v1",
         "case": format!("{case}/static-repeat"),
         "input": {"node_count": node_count, "operation_count": 0},
         "consumer": {"fragment_revision": fragment.revision.0, "draw_sequence": runner.draw_sequence},
-        "timing_ms": {"composition_reused": static_timings.composition_reused},
-        "instance_upload": {"range_writes": static_timings.instance_range_writes,
-            "records_written": static_timings.instance_records_written,
-            "bytes_written": static_timings.instance_bytes_written},
+        "frame": frame_json(&static_timings),
         "pass": static_pass,
     }));
     if !static_pass {
@@ -320,25 +365,147 @@ fn run_case(
             stats.removed,
             stats.moved,
             stats.updated,
-        );
+        ) && timings.instance_count > 0
+            && timings.plan_refresh != UiPlanRefreshCause::Reused;
         emit(json!({
             "probe": "ui_reconcile_baseline.v1",
             "case": format!("{case}/{step}"),
             "input": {"node_count": node_count, "operation_count": operation_count},
             "producer": {"patch_sequence": step_index as u64 + 1, "base_revision": revision.0 - 1, "ir_revision": revision.0},
             "consumer": {"fragment_revision": fragment.revision.0, "draw_sequence": runner.draw_sequence},
-            "timing_ms": {"draw": draw_ms, "refresh_plan": timings.refresh_plan_ms,
-                "buffer_upload": timings.buffer_upload_ms,
-                "composition_reused": timings.composition_reused},
-            "instance_upload": {"range_writes": timings.instance_range_writes,
-                "records_written": timings.instance_records_written,
-                "bytes_written": timings.instance_bytes_written},
+            "draw_ms": draw_ms,
+            "frame": frame_json(&timings),
             "retained": stats,
             "pass": pass,
         }));
         if !pass {
             failures += 1;
         }
+        // Settle frame: the very next frame carries no new change, so it must
+        // fall back onto the retained path and write nothing. Pairing the
+        // changed frame's `frame_sequence` with this one proves the fast path
+        // recovers after a real rebuild.
+        let (_, settle) = runner.draw(&fragment);
+        let settle_pass = settle.composition_reused
+            && !settle.instance_rebuilt
+            && settle.instance_count == timings.instance_count
+            && settle.buffer_ranges_written() == 0
+            && settle.frame_sequence > timings.frame_sequence
+            && settle.fragment_revision == timings.fragment_revision;
+        emit(json!({
+            "probe": "ui_reconcile_baseline.v1",
+            "case": format!("{case}/{step}/settle"),
+            "input": {"node_count": node_count, "operation_count": 0},
+            "producer": {"changed_frame_sequence": timings.frame_sequence},
+            "consumer": {"fragment_revision": fragment.revision.0, "draw_sequence": runner.draw_sequence},
+            "frame": frame_json(&settle),
+            "pass": settle_pass,
+        }));
+        if !settle_pass {
+            failures += 1;
+        }
+    }
+    failures
+}
+
+/// One invalidation source: proves the three properties the fast path must keep
+/// simultaneously. `expect` names the cause the renderer must report, and every
+/// scenario re-checks that the frame after it settles back onto the retained
+/// path with zero buffer writes.
+fn run_invalidation_scenario(
+    runner: &mut Runner,
+    scenario: &'static str,
+    node_count: usize,
+    operations: Vec<UiIrPatchOperation>,
+    viewport: [f32; 2],
+    hover: Option<[f32; 2]>,
+    expect_plan: UiPlanRefreshCause,
+    expect_invalidation: UiCompositionInvalidation,
+    narrow: bool,
+) -> u64 {
+    runner.reset();
+    let document = match parse_nui_flow(&flow_source(node_count, 3)) {
+        Ok(document) => document,
+        Err(error) => fail(&format!("{scenario}: parse failed: {error:?}")),
+    };
+    let mut ir = document.ir.clone();
+    let mut fragment = fragment_from(ir.revision, ir.root.clone());
+    let (_, base) = runner.draw(&fragment);
+    let (_, before) = runner.draw(&fragment);
+    if !operations.is_empty() {
+        let patch = UiIrPatch {
+            expected_revision: ir.revision,
+            operations,
+        };
+        match apply_nui_ir_patch(&ir, &patch) {
+            Ok(patched) => ir = patched,
+            Err(error) => fail(&format!("{scenario}: patch failed: {error:?}")),
+        }
+        fragment = fragment_from(ir.revision, ir.root.clone());
+    }
+    if let Some(position) = hover {
+        runner.renderer.set_pointer_position(position);
+    }
+    let (_, changed) = runner.draw_at(&fragment, viewport);
+    let narrower = !narrow
+        || (changed.instance_count > 1
+            && changed.instance_records_written > 0
+            && changed.instance_records_written < changed.instance_count as u32);
+    let pass = before.composition_reused
+        && before.buffer_ranges_written() == 0
+        && before.instance_count == base.instance_count
+        && changed.plan_refresh == expect_plan
+        && changed.composition_invalidation == expect_invalidation
+        && !changed.composition_reused
+        && changed.instance_count > 0
+        && narrower;
+    emit(json!({
+        "probe": "ui_reconcile_baseline.v1",
+        "case": format!("scenario/{scenario}/invalidate"),
+        "input": {"node_count": node_count, "hover": hover, "viewport": viewport},
+        "producer": {"ir_revision": ir.revision.0, "fragment_revision": fragment.revision.0},
+        "consumer": {
+            "static_frame_sequence": before.frame_sequence,
+            "changed_frame_sequence": changed.frame_sequence,
+        },
+        "expected": {"plan_refresh": expect_plan.as_str(),
+            "composition_invalidation": expect_invalidation.as_str()},
+        "before": frame_json(&before),
+        "frame": frame_json(&changed),
+        "pass": pass,
+    }));
+    let mut failures = if pass { 0 } else { 1 };
+    // The same frame content must settle back onto the retained path.
+    if let Some(position) = hover {
+        // Re-asserting the same pointer position must not keep the frame dirty.
+        runner.renderer.set_pointer_position(position);
+        let (_, held) = runner.draw_at(&fragment, viewport);
+        let held_pass = held.composition_invalidation == UiCompositionInvalidation::PointerVisual;
+        emit(json!({
+            "probe": "ui_reconcile_baseline.v1",
+            "case": format!("scenario/{scenario}/hover-held"),
+            "input": {"node_count": node_count},
+            "frame": frame_json(&held),
+            "pass": held_pass,
+        }));
+        if !held_pass {
+            failures += 1;
+        }
+    }
+    let (_, settle) = runner.draw_at(&fragment, viewport);
+    let settle_pass = settle.composition_reused
+        && !settle.instance_rebuilt
+        && settle.instance_count > 0
+        && settle.buffer_ranges_written() == 0;
+    emit(json!({
+        "probe": "ui_reconcile_baseline.v1",
+        "case": format!("scenario/{scenario}/settle"),
+        "input": {"node_count": node_count},
+        "frame": frame_json(&settle),
+        "pass": settle_pass,
+    }));
+    if !settle_pass {
+        failures += 1;
     }
     failures
 }
@@ -415,6 +582,44 @@ fn main() {
         "H_large_batch_1000",
         1000,
         vec![("batch100", set_rows(100, "opacity", "0.25", 3))],
+    );
+
+    // Invalidation-source scenarios. Each one proves: the static frame before
+    // the change reused everything and wrote nothing, the named source rebuilds
+    // and reports itself as the cause, and the frame after it settles back onto
+    // the retained path.
+    failures += run_invalidation_scenario(
+        &mut runner,
+        "fragment_revision",
+        20,
+        vec![set_op("root/row-0019", 3, "opacity", "0.5")],
+        [1200.0, 11000.0],
+        None,
+        UiPlanRefreshCause::FragmentRevision,
+        UiCompositionInvalidation::PlanRebuilt,
+        true,
+    );
+    failures += run_invalidation_scenario(
+        &mut runner,
+        "viewport",
+        20,
+        Vec::new(),
+        [900.0, 8000.0],
+        None,
+        UiPlanRefreshCause::Viewport,
+        UiCompositionInvalidation::PlanRebuilt,
+        false,
+    );
+    failures += run_invalidation_scenario(
+        &mut runner,
+        "pointer_hover",
+        20,
+        Vec::new(),
+        [1200.0, 11000.0],
+        Some([10.0, 10.0]),
+        UiPlanRefreshCause::Reused,
+        UiCompositionInvalidation::PointerVisual,
+        false,
     );
 
     emit(json!({

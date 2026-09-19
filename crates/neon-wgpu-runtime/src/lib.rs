@@ -266,7 +266,10 @@ pub use ui_renderer::editor_renderer::EditorCommit;
 use ui_renderer::{
     LocalPresentationCommit, PendingLocalPresentationKey, UiHitBinding, set_global_view_extras,
 };
-pub use ui_renderer::{UiDrawMode, UiDrawStageTimings, UiReconcileStats, UiWgpuRenderer};
+pub use ui_renderer::{
+    UiCompositionInvalidation, UiDrawMode, UiDrawStageTimings, UiInstanceReuseBlocker,
+    UiPlanRefreshCause, UiReconcileStats, UiWgpuRenderer,
+};
 use world_ui_pipeline::{WorldUiCamera, WorldUiCameraState, WorldUiPipeline};
 
 pub const SERVICE_NAME: &str = "wgpu-runtime";
