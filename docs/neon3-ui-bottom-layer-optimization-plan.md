@@ -378,7 +378,7 @@ transaction-1 fill active -> warning -> success
 
 ## 7. Phase 5：Neon IDE 两棵 UI projection
 
-状态：`TODO`
+状态：`DONE`（2026-09-19）
 
 ### 7.1 FileTreeProjection
 
@@ -430,6 +430,40 @@ approval:<id>
 - 新增 task 只 insert 一个节点。
 - 删除 task 只 remove 一个节点。
 - 面板切换不重建整个 workspace。
+
+### 完成证据（2026-09-19）
+
+- 新增 `crates/neon-ui-runtime/src/ide_projection.rs`：`FileTreeProjection` +
+  `AgentWorkbenchProjection` + `IdeWorkspaceProjection`。projection 直接构造与 Flow
+  parser 归一化形状逐字段一致的 `UiNode` 树；`generated_source_parses_back_to_the_projection_tree`
+  单测证明 `initial_source()` 解析回的空 diff（builder/parser parity）。
+- 计划中的 `task:<plan>/<task>` 稳定 key 因 Flow `valid_key` 词汇限制（不允许 `:`，`/`
+  会破坏语义 path）改用单射编码 `encode_key_segment`（`-`→`_h`、`.`→`_d`、`/`→`_x2f`、
+  `_`→`__`），key 语义不变：状态变化只 set 属性，列表变化才 insert/remove。
+- `IdeWorkspaceProjection::sync()` 走 Phase 2 keyed diff → `build_ui_patch`，本地对
+  baseline IR 回放推进 revision；任何无法增量补丁的情况显式返回
+  `IdeProjectionUpdate::FullSubmitRequired`，禁止 silent no-op。IR `move_node` 忽略
+  index（追加到尾部），因此 projection 的顺序语义全部通过 insert/remove 表达，不 emit move。
+- 单测：`cargo test -p neon-ui-runtime --lib` 212/212，其中本模块 14 个（select/switch
+  仅 2 个 set、expand/collapse 连续 insert/remove、rename = 1 remove + 1 insert、
+  busy = opacity set、无变化 = NoChange、task 状态 = 单 set、complete 释放 dependent =
+  1 insert + 1 set、add/remove task 单 op、面板切换仅 `visible` set 且不出 agent 子树、
+  approval/change resolve 保持 key、key 编码单射且 Flow-valid）。
+- Probe（真实 `serve_forwarder` RPC 管线 + headless fake renderer，1 次 submit 之后全部
+  走 `ui.flow.patch`）：
+  - `file-tree-incremental.v1` 8/8：select/switch/busy 为 `property_only`；collapse =
+    2 remove + 1 set（目录标记）、expand = 2 insert + 1 set；add/remove/rename 分别为
+    1 insert / 1 remove / 1 remove + 1 insert；revision 7→15，renderer frame 1→9。
+  - `agent-task-incremental.v1` 7/7：status line、task 状态、approval resolve 均为单
+    set `property_only`；add_task/record_transaction 各 1 insert；remove_task 1 remove；
+    面板切换恰好 `set workspace/agent/agent.section.records.visible` 且 0 个 op 触及
+    sidebar；每 patch 端到端 total ≈ 2.6–4.5ms。
+  - `plan-dependency-incremental.v1` 3/3：依赖未满足的 task 不在 UI 树中，对其状态改动
+    = `NoChange`（0 跨进程流量）；complete 直接/链式 dependent 各恰好 1 insert + 1 set
+    （`structural`）。
+- 验收层级：`service-ready` + probe 级 `composition-ready`（renderer ack 计数验证）；
+  外部 Neon IDE host 切换到这棵 projection 属于后续接入工作。
+
 
 ---
 
