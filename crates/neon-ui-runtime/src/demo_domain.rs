@@ -2100,7 +2100,15 @@ mod tests {
                 neon_ui_schema::UiProgramSemanticEventStatus::Accepted
             );
             let updated = domain.apply(&event).unwrap();
-            assert_eq!(updated.inputs.input_revision, Revision(index as u64 + 1));
+            // The input store only advances its revision when a publication
+            // writes a canonical value that differs from the current state;
+            // a same-value commit keeps the snapshot, and the command receipt
+            // revision stays separate from the UI state revision.
+            let published = updated.inputs.values != snapshot.inputs.values;
+            assert_eq!(
+                updated.inputs.input_revision,
+                Revision(snapshot.inputs.input_revision.0 + u64::from(published))
+            );
             assert!(updated.visible_status.values().any(|status| status != ""));
             router.replace_resolved_inputs(updated.inputs);
         }

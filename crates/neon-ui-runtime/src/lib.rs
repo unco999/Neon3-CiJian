@@ -68,6 +68,7 @@ pub mod nui_flow;
 pub mod nui_state_machine;
 pub mod terrain_workbench;
 pub mod ui_input_impact;
+pub mod ui_retained_evaluator;
 pub use event_publisher::{EVENT_VARIABLE_CHANGED, FLOW_EVENT_PREFIX, UiVariableEventPublisher};
 use host_adapter::UiHostAdapter;
 pub use host_adapter::UiHostAdapterConfig;
@@ -660,6 +661,22 @@ impl UiInputStore {
                     last_update_revision: next_revision,
                 },
             );
+        }
+        // A frame whose canonicalized values all equal the current state has
+        // no observable UI effect: keep the old snapshot, revision, and dirty
+        // set. The idempotent receipt below still records the request, so the
+        // command receipt and the UI state revision stay separate.
+        if changed_slots.is_empty() {
+            let snapshot = self.resolved_inputs.clone();
+            let result = UiInputApplyResult {
+                input_revision: snapshot.input_revision,
+                changed_slots,
+                variable_changes,
+                snapshot,
+            };
+            self.idempotent_results
+                .insert(frame.idempotency_key, result.clone());
+            return Ok(result);
         }
         let snapshot = UiResolvedInputs {
             program_revision: self.resolved_inputs.program_revision.clone(),
@@ -2821,7 +2838,7 @@ fn cumulative_drag_offset(
     total
 }
 
-fn branch_predicate_matches(
+pub(crate) fn branch_predicate_matches(
     predicate: &UiBranchPredicate,
     inputs: &UiResolvedInputs,
     local: &UiLocalPresentationState,
@@ -3065,7 +3082,7 @@ fn resolve_binding_value<'a>(
     Some(current)
 }
 
-fn apply_binding(
+pub(crate) fn apply_binding(
     state: &mut UiCpuNodeState,
     property: &UiBoundProperty,
     value: &UiInputValue,
@@ -3115,7 +3132,7 @@ fn apply_binding(
         )),
     }
 }
-fn cpu_diagnostic(
+pub(crate) fn cpu_diagnostic(
     code: &'static str,
     message: &'static str,
     node_key: Option<&str>,

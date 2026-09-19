@@ -622,3 +622,62 @@ JSONL probe 能输出 producer/consumer 范围和最终结果
 ```
 
 只有 input buffer 局部写入、retained plan 复用或 patch 操作数量减少，不能单独宣称完成。
+
+## 13. 实施状态与证据
+
+### Phase A: metadata — 已完成（commit `59b2ad3`）
+
+- `neon-ui-schema`：`UiInvalidationDomain`、`UiBoundProperty::invalidation_domains()`、
+  `UiBindingImpact`、`UiInputImpact`、`UiInteractionKind`、`UiInteractionImpact`。
+  `UiDependencyIndex` 增加 `#[serde(default)] input_impacts` / `interaction_impacts`，
+  domain 列表按声明序排序去重，round-trip 字节稳定。
+- `neon-ui-runtime/src/ui_input_impact.rs`：编译期构建 input/interaction impact，含
+  branch predicate input key 归因、layout ancestor 闭包、derived slot（`input x bool =
+  $hp < 0.3`）到源 slot 的不动点继承、drag/drop 交互合并。
+- 证据：`cargo test -q -p neon-ui-runtime --lib ui_input_impact` →
+  `test result: ok. 7 passed; 0 failed`。
+
+### Phase B: CPU retained delta — 已完成
+
+- `crates/neon-ui-runtime/src/ui_retained_evaluator.rs`：
+  `UiImpactSet::from_input_publication`、`evaluate_ui_program_initial`、
+  `apply_ui_impact_set`、`UiFrameDelta`。
+- 回放集合 = impacted binding 所属 node ∪ 受影响 branch 的 `node_range`。刻意不含
+  layout ancestor：ancestor 自身没有 binding，纳入就会执行其兄弟 binding，违反
+  §9 CPU 测试 1。ancestor 的可观察影响只有可见性链，由 primitive assembly 重连体现。
+- 每个回放节点重放它自己的全部 binding（binding_id 升序），使结果与 full evaluator 的
+  “按 binding 顺序写入”完全一致；覆盖该节点的 branch 用预索引 `branches_covering_node`
+  重新 gate，predicate 不满足时强制 `visible = false`。
+- `layout_unchanged` 语义：`logical_layout` 记录只来自编译记录加 local presentation
+  拖拽偏移，`InputPublication` 类 delta 不会改写它；可见性翻转只触发
+  `rebuild_primitive_assembly`（含 root clamp），由 `render_primitives_rebuilt` 单独报告。
+- 任何 diagnostic 逃逸或 revision/presentation/cause 守卫不匹配都返回稳定错误码
+  （`ui_incremental_stale_frame` / `ui_incremental_unsupported_cause` /
+  `ui_incremental_unknown_binding` / `ui_incremental_unknown_branch` /
+  `ui_incremental_diagnostic_escape`）并把 frame 标记为 `degraded`，调用方回退 golden
+  full evaluator；不做静默猜测。
+- 输入存储契约（§4.2）：全等值 publication 不再 bump revision、不产生 dirty slot，
+  保留旧 snapshot；idempotent receipt 仍被记录，command receipt revision 与 UI state
+  revision 保持分离。
+- 范围决定：DataGrid/template 行数据不进入 `input_impacts`，因为行数据通过 runtime
+  publication 而非具名 input slot 到达；其增量由 Phase D 的 renderer range 写入覆盖。
+- 生产路径现状：`refresh_fragment_from_program` 仍调用 full evaluator，retained 路径
+  目前是并行的、被 oracle 证明的实现；切换到默认路径在 Phase C/D 完成后进行。
+- 证据（实际命令输出）：
+  - `cargo test -q -p neon-ui-runtime --lib ui_retained_evaluator` →
+    `test result: ok. 7 passed; 0 failed`（含 §9 测试 1–5 与多 slot union、stale 拒绝、
+    跨 7 步变更序列的 full/incremental 逐字段相等 oracle）。
+  - `cargo test -q -p neon-ui-runtime --lib` → `233 passed; 0 failed`。
+  - `cargo clippy -q -p neon-ui-runtime --lib --all-targets` →
+    `ui_retained_evaluator.rs` 0 warning。
+  - `cargo check -q --workspace --all-targets` → exit code `0`。
+  - `rustfmt --edition 2024 --check` 对新增/改动文件 → 无 diff。
+- 因存储契约变更而调整的既有测试：`demo_domain` 组件画廊 headless scenario 原先断言
+  “每个语义事件必定 `Revision(index + 1)`”。第 12 个事件（`gallery-text` 的
+  TextEditCommit 回写同一文本）在新契约下是真正的 no-op，因此该断言改为按 publication
+  是否真的改变 slot 值来推导期望 revision（改变了 +1，未改变保持不变），其余断言不变。
+
+### Phase C: interaction convergence — 未开始
+
+### Phase D: WGPU ranges — 未开始（GPU 上传统计与 headless probe 已先行落地，
+commit `b833761`）
