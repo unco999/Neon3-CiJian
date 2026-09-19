@@ -266,7 +266,7 @@ pub use ui_renderer::editor_renderer::EditorCommit;
 use ui_renderer::{
     LocalPresentationCommit, PendingLocalPresentationKey, UiHitBinding, set_global_view_extras,
 };
-pub use ui_renderer::{UiDrawMode, UiWgpuRenderer};
+pub use ui_renderer::{UiDrawMode, UiDrawStageTimings, UiReconcileStats, UiWgpuRenderer};
 use world_ui_pipeline::{WorldUiCamera, WorldUiCameraState, WorldUiPipeline};
 
 pub const SERVICE_NAME: &str = "wgpu-runtime";
@@ -5293,6 +5293,11 @@ impl HeadlessExternalGpu {
                 "screen": self.screen_ui.layout_counters(),
                 "world": self.world_ui.layout_counters(),
                 "unified": self.ui.layout_counters(),
+            },
+            "reconcile_stats": {
+                "screen": self.screen_ui.reconcile_stats(),
+                "world": self.world_ui.reconcile_stats(),
+                "unified": self.ui.reconcile_stats(),
             },
             "frames": timings,
         })
@@ -15222,6 +15227,107 @@ mod tests {
         let center = 4 * (32 * 64 + 32);
         assert_eq!(&rendered[0][center..center + 4], [0, 0, 0, 255]);
         assert_eq!(&rendered[1][center..center + 4], [255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn reconcile_stats_track_keyed_node_lifecycle_across_fragment_revisions() {
+        let (device, queue) = test_device("neon3-ui-reconcile-stats");
+        let mut renderer = UiWgpuRenderer::new(&device, wgpu::TextureFormat::Rgba8Unorm);
+        let node = |id: &str, kind: UiNodeKind, children: Vec<UiNode>| UiNode {
+            node_id: UiNodeId(id.into()),
+            kind,
+            bounds: UiBounds {
+                x: 0.0,
+                y: 0.0,
+                width: 10.0,
+                height: 10.0,
+            },
+            layout: None,
+            visible: true,
+            enabled: true,
+            text_key: None,
+            text: None,
+            image: None,
+            surface: None,
+            style: UiStyle::default(),
+            enter_transition: None,
+            world_depth: None,
+            world_scale: None,
+            clip_shape: UiClipShape::default(),
+            children,
+        };
+        let label = |id: &str, opacity: f32| UiNode {
+            style: UiStyle {
+                opacity,
+                ..UiStyle::default()
+            },
+            ..node(id, UiNodeKind::Label, vec![])
+        };
+        let mut draw = |children: Vec<UiNode>, revision: u64| {
+            let root = node("root", UiNodeKind::Panel, children);
+            let fragment = UiFragment {
+                fragment_id: UiFragmentId("reconcile-stats".into()),
+                revision: Revision(revision),
+                root,
+                effects: Vec::new(),
+            };
+            let fragments = HashMap::from([(fragment.fragment_id.clone(), fragment.clone())]);
+            let _ = ui_renderer::render_renderer_offscreen_for_test(
+                &mut renderer,
+                &device,
+                &queue,
+                wgpu::TextureFormat::Rgba8Unorm,
+                &fragments,
+                [64, 64],
+                0.0,
+            );
+            renderer.reconcile_stats()
+        };
+
+        let a = || label("a", 1.0);
+        let b = || label("b", 1.0);
+
+        let stats = draw(vec![a(), b()], 1);
+        assert_eq!(
+            (stats.created, stats.removed, stats.updated, stats.moved),
+            (3, 0, 0, 0),
+            "a fresh renderer creates every planned node"
+        );
+
+        let changed_b = || UiNode {
+            style: UiStyle {
+                opacity: 0.5,
+                ..UiStyle::default()
+            },
+            ..label("b", 0.5)
+        };
+        let stats = draw(vec![a(), changed_b()], 2);
+        assert_eq!(
+            (stats.retained, stats.created, stats.removed, stats.updated),
+            (3, 0, 0, 1),
+            "one property change updates exactly one node"
+        );
+
+        let stats = draw(vec![a()], 3);
+        assert_eq!(
+            (stats.retained, stats.created, stats.removed),
+            (2, 0, 1),
+            "dropping a node removes exactly one"
+        );
+
+        let stats = draw(vec![a(), label("c", 1.0)], 4);
+        assert_eq!(
+            (stats.retained, stats.created, stats.removed),
+            (2, 1, 0),
+            "a new stable key is created while shared nodes are retained"
+        );
+
+        let stats = draw(vec![label("c", 1.0), a()], 5);
+        assert_eq!(
+            (stats.retained, stats.created, stats.removed, stats.moved),
+            (3, 0, 0, 2),
+            "reordering two retained nodes reports two moves"
+        );
     }
 
     #[test]

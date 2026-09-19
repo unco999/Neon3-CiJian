@@ -1187,8 +1187,21 @@ impl EditorComponentRegistry {
                 }
             }
             if let Some(state) = self.editors.get_mut(path) {
+                // A retained renderer node can represent a different document
+                // after a Flow remount. Focus belongs to the old document and
+                // must not prevent replacing the component buffer.
+                let document_changed = state
+                    .declaration
+                    .document
+                    .as_ref()
+                    .map(|binding| binding.document_id.as_str())
+                    != declaration
+                        .document
+                        .as_ref()
+                        .map(|binding| binding.document_id.as_str());
                 let needs_rebuild = state.declaration.language != declaration.language
-                    || (state.adopted_source != source && !state.focus);
+                    || document_changed
+                    || state.adopted_source != source;
                 if state.declaration.document != declaration.document {
                     if let Some(binding) = declaration.document.as_ref()
                         && let Some(provider) = provider
@@ -1205,6 +1218,7 @@ impl EditorComponentRegistry {
                     state.adopted_source = source.clone();
                     state.caret = Position::START;
                     state.selection_anchor = None;
+                    state.focus = false;
                     state.completion = None;
                     state.scroll_x = 0.0;
                     state.scroll_y = 0.0;
@@ -1470,7 +1484,7 @@ impl EditorBridge {
                 continue;
             };
             if let Some(frame) = provider.take_snapshot(&binding.document_id)
-                && frame.binding.revision != binding.revision
+                && (frame.binding != *binding || frame.source != state.adopted_source)
             {
                 state.adopt_document_frame(&frame);
             }
@@ -1709,7 +1723,48 @@ mod tests {
     fn host_reveal_accepts_full_fragment_path_for_node_key() {
         assert!(editor_path_matches("surface.ide-shell/editor", "editor"));
         assert!(editor_path_matches("editor", "editor"));
-        assert!(!editor_path_matches("surface.ide-shell/editor-extra", "editor"));
+        assert!(!editor_path_matches(
+            "surface.ide-shell/editor-extra",
+            "editor"
+        ));
+    }
+
+    #[test]
+    fn focused_editor_replaces_buffer_when_document_changes() {
+        register_providers();
+        let mut registry = EditorComponentRegistry::new();
+        let path = "surface.ide-shell/editor".to_string();
+        let first = ts_declaration();
+        registry.reconcile(&HashMap::from([(
+            path.clone(),
+            (first.clone(), None, "first.rs\n".to_string()),
+        )]));
+        registry.handle_input(
+            &UiEditorInputEvent::PointerPress {
+                path: path.clone(),
+                line: 0,
+                column: 0,
+            },
+            0.0,
+        );
+        assert!(registry.editors.get(&path).is_some_and(|editor| editor.focus));
+
+        let mut second = first;
+        second.document = Some(UiEditorDocumentBinding {
+            document_id: "second.rs".into(),
+            session_id: "test".into(),
+            epoch: 1,
+            ..UiEditorDocumentBinding::default()
+        });
+        registry.reconcile(&HashMap::from([(
+            path.clone(),
+            (second, None, "second.rs\n".to_string()),
+        )]));
+
+        let presentation = registry.to_presentations(0.0).pop().expect("editor presentation");
+        assert_eq!(presentation.source, "second.rs\n");
+        assert_eq!(presentation.document.unwrap().document_id, "second.rs");
+        assert!(!presentation.focus, "focus must not carry across documents");
     }
 
     fn named_key(path: &str, name: &str, shift: bool) -> UiEditorInputEvent {

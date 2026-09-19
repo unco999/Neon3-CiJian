@@ -1713,12 +1713,44 @@ struct CachedTextLayout {
 /// Per-draw stage timings collected on the last color pass. Diagnostics only;
 /// collecting these never alters rendering behavior or draw order.
 #[derive(Default, Clone, Copy)]
-pub(crate) struct UiDrawStageTimings {
+pub struct UiDrawStageTimings {
     pub refresh_plan_ms: f32,
     pub compose_visuals_ms: f32,
     pub text_layout_ms: f32,
     pub group_sort_ms: f32,
     pub buffer_upload_ms: f32,
+}
+
+/// Phase 0 baseline (B0-3): node counters from the last full retained plan
+/// reconcile. All counters describe one `refresh_plan` rebuild; frames that
+/// early-return through the plan-reuse cache leave the previous counters
+/// untouched, so readers always see the most recent structural reconcile.
+///
+/// `moved` is a reorder heuristic: a retained node counts as moved when its
+/// position within the retained subsequence changed between the previous and
+/// new flatten order. A pure insertion elsewhere does not mark existing nodes
+/// as moved; a genuine reorder may over-count participants until the orders
+/// re-converge.
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct UiReconcileStats {
+    pub retained: u64,
+    pub created: u64,
+    pub removed: u64,
+    pub updated: u64,
+    pub moved: u64,
+}
+
+fn visuals_equal_for_reconcile(previous: &UiVisual, current: &UiVisual) -> bool {
+    // Paint group ids are assigned after the reconcile point and rewrite
+    // `target.paint_group_id` in place; they are not authored visual state.
+    if previous.paint_group_id != 0 || current.paint_group_id != 0 {
+        let mut previous = previous.clone();
+        let mut current = current.clone();
+        previous.paint_group_id = 0;
+        current.paint_group_id = 0;
+        return previous == current;
+    }
+    previous == current
 }
 
 #[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
@@ -1982,6 +2014,7 @@ pub struct UiWgpuRenderer {
     paused_animations: HashMap<String, PausedAnimation>,
     node_generations: HashMap<String, u64>,
     live_node_ids: HashSet<String>,
+    last_reconcile_stats: UiReconcileStats,
     next_transition_id: u64,
     animation_frame_sequence: u64,
     animation_epoch: u64,
@@ -3242,6 +3275,7 @@ impl UiWgpuRenderer {
             paused_animations: HashMap::new(),
             node_generations: HashMap::new(),
             live_node_ids: HashSet::new(),
+            last_reconcile_stats: UiReconcileStats::default(),
             next_transition_id: 1,
             animation_frame_sequence: 0,
             animation_epoch: 1,
@@ -6825,6 +6859,7 @@ impl UiWgpuRenderer {
             "paused_nodes": self.paused_animations.keys().cloned().collect::<Vec<_>>(),
             "exit_transition_keys": exit_transition_keys,
             "live_node_count": self.live_node_ids.len(),
+            "reconcile_stats": self.last_reconcile_stats,
             "last_exit_reconciliation": self.last_exit_reconciliation,
             "exiting": self
                 .exiting
@@ -10148,6 +10183,16 @@ impl UiWgpuRenderer {
         self.last_stage_timings
     }
 
+    /// B0-3: counters from the most recent full retained plan reconcile.
+    pub fn reconcile_stats(&self) -> UiReconcileStats {
+        self.last_reconcile_stats
+    }
+
+    /// B0-3: per-stage timings of the most recent color pass.
+    pub fn stage_timings(&self) -> UiDrawStageTimings {
+        self.last_stage_timings
+    }
+
     pub(crate) fn layout_counters(&self) -> Value {
         json!({
             "layout_count": self.layout_counters.layout_count,
@@ -10757,6 +10802,43 @@ impl UiWgpuRenderer {
             self.node_generations.insert(id.clone(), generation);
         }
         self.live_node_ids = live.clone();
+        {
+            // B0-3: `self.plan` still holds the previous plan here; it is
+            // cleared and rebuilt further below.
+            let mut stats = UiReconcileStats::default();
+            let previous_by_id: HashMap<&str, &PlannedNode> = self
+                .plan
+                .iter()
+                .map(|node| (node.id.as_str(), node))
+                .collect();
+            let mut new_retained: Vec<&str> = Vec::with_capacity(nodes.len());
+            for (id, _, target, _) in &nodes {
+                if previous_live.contains(id) {
+                    stats.retained += 1;
+                    new_retained.push(id.as_str());
+                    if let Some(previous) = previous_by_id.get(id.as_str())
+                        && !visuals_equal_for_reconcile(&previous.target, target)
+                    {
+                        stats.updated += 1;
+                    }
+                } else {
+                    stats.created += 1;
+                }
+            }
+            stats.removed = previous_live.difference(&live).count() as u64;
+            let old_retained: Vec<&str> = self
+                .plan
+                .iter()
+                .filter(|node| live.contains(&node.id))
+                .map(|node| node.id.as_str())
+                .collect();
+            stats.moved = old_retained
+                .iter()
+                .zip(&new_retained)
+                .filter(|(previous, current)| previous != current)
+                .count() as u64;
+            self.last_reconcile_stats = stats;
+        }
         if viewport_changed {
             self.current.clear();
             self.current_identities.clear();

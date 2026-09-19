@@ -3613,7 +3613,11 @@ impl UiRuntime {
         // previous completion. A synchronous forward still preserves the
         // single ordered command lane and guarantees one click -> one
         // publication -> one fragment submission.
-        runtime.async_host_forward = true;
+        // Windowed hosts may only provide the renderer and eventd endpoints.
+        // In that topology semantic UI events must use the local adapter
+        // fallback; queueing them behind a missing domain host drops clicks
+        // after sending them to the dead endpoint used by the old launcher.
+        runtime.async_host_forward = false;
         let (host_completion_tx, host_completion_rx) = mpsc::channel();
         let mut active_host_forwards = 0_usize;
         let result = server.serve_until(|request| {
@@ -4192,13 +4196,12 @@ impl UiRuntime {
             self.flow_document = Some(new_doc.clone());
             timings.total_ms = elapsed_ms(total_started);
             let mut enriched = response;
-            enriched.result =
-                Some(json!({
-                    "state": "patched",
-                    "program_revision": program.revision,
-                    "flow_document_revision": new_doc.ir.revision,
-                    "timing_ms": timings.to_json(),
-                }));
+            enriched.result = Some(json!({
+                "state": "patched",
+                "program_revision": program.revision,
+                "flow_document_revision": new_doc.ir.revision,
+                "timing_ms": timings.to_json(),
+            }));
             return Ok(enriched);
         }
         Ok(response)

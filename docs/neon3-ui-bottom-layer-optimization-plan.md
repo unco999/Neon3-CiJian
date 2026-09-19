@@ -82,7 +82,10 @@ ui.flow.patch
 
 ## 2. Phase 0：建立性能基线
 
-状态：`TODO`
+状态：`DONE（2026-09-19）`。测量结果、JSONL 机器比较格式与性能预算见
+[`ui-phase0-performance-baseline.md`](./ui-phase0-performance-baseline.md)。
+生产者 probe：`cargo run -p neon-ui-runtime --bin ui_patch_baseline_probe`；
+消费者 probe：`cargo run -p neon-wgpu-runtime --bin ui_reconcile_baseline_probe`。
 
 ### 任务
 
