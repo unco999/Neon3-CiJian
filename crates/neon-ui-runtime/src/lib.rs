@@ -4,6 +4,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     net::SocketAddr,
     sync::mpsc::{self, Receiver, Sender},
+    time::Instant,
 };
 
 use neon_ipc::{RpcClient, RpcServer, TransportError};
@@ -1251,13 +1252,56 @@ fn flow_program_revision(document: &NuiFlowDocument) -> UiProgramRevision {
     }
 }
 
+/// Phase 0 performance baseline (B0-1/B0-2): per-stage wall time of the flow
+/// pipeline. Serialized into the `timing_ms` block of accepted submit/patch
+/// responses so probes can compare stages across runs.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct UiFlowStageTimings {
+    pub parse_ms: f64,
+    pub patch_apply_ms: f64,
+    pub source_read_ms: f64,
+    pub compile_ms: f64,
+    pub fragment_ms: f64,
+    pub forward_ms: f64,
+    pub total_ms: f64,
+}
+
+impl UiFlowStageTimings {
+    fn to_json(&self) -> Value {
+        json!({
+            "parse": self.parse_ms,
+            "patch_apply": self.patch_apply_ms,
+            "source_read": self.source_read_ms,
+            "compile": self.compile_ms,
+            "fragment": self.fragment_ms,
+            "forward": self.forward_ms,
+            "total": self.total_ms,
+        })
+    }
+}
+
+fn elapsed_ms(started: Instant) -> f64 {
+    started.elapsed().as_secs_f64() * 1000.0
+}
+
 fn compile_flow_source_for_rpc(
     source: &str,
 ) -> Result<NuiFlowCompiledProgram, NuiFlowCompileReport> {
+    compile_flow_source_with_timings(source, &mut UiFlowStageTimings::default())
+}
+
+fn compile_flow_source_with_timings(
+    source: &str,
+    timings: &mut UiFlowStageTimings,
+) -> Result<NuiFlowCompiledProgram, NuiFlowCompileReport> {
+    let started = Instant::now();
     let document = parse_nui_flow(source).map_err(|error| flow_parse_report("nui-flow", &error))?;
+    timings.parse_ms = elapsed_ms(started);
+    let started = Instant::now();
     let revision = flow_program_revision(&document);
     let program = compile_nui_flow_program(&document, revision)
         .map_err(|error| flow_compile_report(&document, &error))?;
+    timings.compile_ms = elapsed_ms(started);
     Ok(NuiFlowCompiledProgram { document, program })
 }
 
@@ -3703,6 +3747,8 @@ impl UiRuntime {
                 "endpoint": wgpu_endpoint.to_string()
             })
         );
+        let total_started = Instant::now();
+        let mut timings = UiFlowStageTimings::default();
         let Some(source) = request
             .params
             .get("source")
@@ -3720,7 +3766,7 @@ impl UiRuntime {
                 ),
             ));
         };
-        let compiled = match compile_flow_source_for_rpc(source) {
+        let compiled = match compile_flow_source_with_timings(source, &mut timings) {
             Ok(compiled) => compiled,
             Err(report) => {
                 let (code, message) = report_error_summary(&report);
@@ -3744,6 +3790,7 @@ impl UiRuntime {
         );
         // Re-submitting the same flow advances the fragment revision so the
         // renderer accepts the replacement instead of treating it as stale.
+        let fragment_started = Instant::now();
         let fragment_revision = self
             .cached_fragment
             .as_ref()
@@ -3787,6 +3834,7 @@ impl UiRuntime {
             &document.input_schema,
         );
         self.host_adapter = Some(adapter);
+        timings.fragment_ms = elapsed_ms(fragment_started);
         let forwarded = RpcRequest {
             protocol: "neon3.rpc".into(),
             version: PROTOCOL_VERSION,
@@ -3800,7 +3848,9 @@ impl UiRuntime {
             expected_revision: None,
             idempotency_key: request.idempotency_key.clone(),
         };
+        let forward_started = Instant::now();
         let response = self.forward_fragment(wgpu_endpoint, forwarded)?;
+        timings.forward_ms = elapsed_ms(forward_started);
         eprintln!(
             "{}",
             json!({
@@ -3812,12 +3862,14 @@ impl UiRuntime {
         if response.status == RpcStatus::Accepted {
             self.flow_state_machine = Some(NuiFlowStateMachineRuntime::new(&document));
             self.flow_document = Some(document.clone());
+            timings.total_ms = elapsed_ms(total_started);
             let mut enriched = response;
             enriched.result = Some(json!({
                 "state": "accepted",
                 "program_revision": program.revision,
                 "input_schema": document.input_schema,
                 "surface_id": document.ir.surface_id,
+                "timing_ms": timings.to_json(),
                 "renderer": enriched.result,
             }));
             return Ok(enriched);
@@ -3832,6 +3884,9 @@ impl UiRuntime {
         wgpu_endpoint: SocketAddr,
         mut request: RpcRequest,
     ) -> Result<RpcResponse, TransportError> {
+        let total_started = Instant::now();
+        let mut timings = UiFlowStageTimings::default();
+        let patch_started = Instant::now();
         // Accept the formal UiPatch envelope while retaining the legacy
         // adapter below during the full-mount fallback phase.
         if request.params.get("base_revision").is_some() && request.params.get("revision").is_none()
@@ -4017,6 +4072,8 @@ impl UiRuntime {
         }
         // If any code_editor has source_file set, read content from disk and
         // update the node's text directly (no RPC transfer of file content).
+        timings.patch_apply_ms = elapsed_ms(patch_started);
+        let source_read_started = Instant::now();
         let mut source_paths: Vec<(String, String)> = Vec::new();
         for (node_key, decl) in &new_ir.code_editors {
             if let Some(ref path) = decl.source_file {
@@ -4035,6 +4092,8 @@ impl UiRuntime {
                 });
             }
         }
+        timings.source_read_ms = elapsed_ms(source_read_started);
+        let compile_started = Instant::now();
         // Rebuild NuiFlowDocument with patched IR, preserving other fields.
         let mut new_doc = current_doc.clone();
         new_doc.ir = new_ir;
@@ -4087,6 +4146,8 @@ impl UiRuntime {
             }
         }
 
+        timings.compile_ms = elapsed_ms(compile_started);
+        let fragment_started = Instant::now();
         let fragment_revision = self
             .cached_fragment
             .as_ref()
@@ -4109,6 +4170,7 @@ impl UiRuntime {
             &new_doc.input_schema,
         );
         self.host_adapter = Some(adapter);
+        timings.fragment_ms = elapsed_ms(fragment_started);
         let forwarded = RpcRequest {
             protocol: "neon3.rpc".into(),
             version: PROTOCOL_VERSION,
@@ -4122,16 +4184,20 @@ impl UiRuntime {
             expected_revision: None,
             idempotency_key: request.idempotency_key.clone(),
         };
+        let forward_started = Instant::now();
         let response = self.forward_fragment(wgpu_endpoint, forwarded)?;
+        timings.forward_ms = elapsed_ms(forward_started);
         if response.status == RpcStatus::Accepted {
             self.flow_state_machine = Some(NuiFlowStateMachineRuntime::new(&new_doc));
             self.flow_document = Some(new_doc.clone());
+            timings.total_ms = elapsed_ms(total_started);
             let mut enriched = response;
             enriched.result =
                 Some(json!({
                     "state": "patched",
                     "program_revision": program.revision,
                     "flow_document_revision": new_doc.ir.revision,
+                    "timing_ms": timings.to_json(),
                 }));
             return Ok(enriched);
         }
