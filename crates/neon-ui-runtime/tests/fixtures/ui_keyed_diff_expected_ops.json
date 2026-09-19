@@ -1,0 +1,10 @@
+[
+  "remove workbench/rail/task-2",
+  "move workbench/rail/task-3 -> workbench/rail[0]",
+  "move workbench/rail/task-1 -> workbench/rail[1]",
+  "insert task-4@workbench/rail[2]",
+  "insert task-5@workbench/rail[3]",
+  "replace workbench/sidebar",
+  "set workbench/rail/task-3.value",
+  "set workbench/rail/task-1.enabled"
+]

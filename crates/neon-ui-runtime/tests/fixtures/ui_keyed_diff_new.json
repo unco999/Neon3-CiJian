@@ -1,0 +1,83 @@
+{
+  "schema_version": 1,
+  "root": {
+    "node_id": "workbench",
+    "kind": "panel",
+    "bounds": { "x": 0.0, "y": 0.0, "width": 1200.0, "height": 800.0 },
+    "visible": true,
+    "enabled": true,
+    "text_key": null,
+    "children": [
+      {
+        "node_id": "rail",
+        "kind": "panel",
+        "bounds": { "x": 0.0, "y": 0.0, "width": 240.0, "height": 800.0 },
+        "visible": true,
+        "enabled": true,
+        "text_key": null,
+        "children": [
+          {
+            "node_id": "task-3",
+            "kind": "label",
+            "bounds": { "x": 0.0, "y": 0.0, "width": 220.0, "height": 24.0 },
+            "visible": true,
+            "enabled": true,
+            "text_key": null,
+            "text": { "kind": "literal", "value": "Testing" },
+            "children": []
+          },
+          {
+            "node_id": "task-1",
+            "kind": "label",
+            "bounds": { "x": 0.0, "y": 0.0, "width": 220.0, "height": 24.0 },
+            "visible": true,
+            "enabled": false,
+            "text_key": null,
+            "text": { "kind": "literal", "value": "Install" },
+            "children": []
+          },
+          {
+            "node_id": "task-4",
+            "kind": "label",
+            "bounds": { "x": 0.0, "y": 0.0, "width": 220.0, "height": 24.0 },
+            "visible": true,
+            "enabled": true,
+            "text_key": null,
+            "text": { "kind": "literal", "value": "Lint" },
+            "children": []
+          },
+          {
+            "node_id": "task-5",
+            "kind": "label",
+            "bounds": { "x": 0.0, "y": 0.0, "width": 220.0, "height": 24.0 },
+            "visible": true,
+            "enabled": true,
+            "text_key": null,
+            "text": { "kind": "literal", "value": "Package" },
+            "children": []
+          }
+        ]
+      },
+      {
+        "node_id": "sidebar",
+        "kind": "panel",
+        "bounds": { "x": 240.0, "y": 0.0, "width": 320.0, "height": 800.0 },
+        "visible": true,
+        "enabled": true,
+        "text_key": null,
+        "children": [
+          { "node_id": "f0", "kind": "label", "bounds": { "x": 0.0, "y": 0.0, "width": 300.0, "height": 20.0 }, "visible": true, "enabled": true, "text_key": null, "text": { "kind": "literal", "value": "new0" }, "children": [] },
+          { "node_id": "f1", "kind": "label", "bounds": { "x": 0.0, "y": 0.0, "width": 300.0, "height": 20.0 }, "visible": true, "enabled": true, "text_key": null, "text": { "kind": "literal", "value": "new1" }, "children": [] },
+          { "node_id": "f2", "kind": "label", "bounds": { "x": 0.0, "y": 0.0, "width": 300.0, "height": 20.0 }, "visible": true, "enabled": true, "text_key": null, "text": { "kind": "literal", "value": "new2" }, "children": [] },
+          { "node_id": "f3", "kind": "label", "bounds": { "x": 0.0, "y": 0.0, "width": 300.0, "height": 20.0 }, "visible": true, "enabled": true, "text_key": null, "text": { "kind": "literal", "value": "new3" }, "children": [] },
+          { "node_id": "f4", "kind": "label", "bounds": { "x": 0.0, "y": 0.0, "width": 300.0, "height": 20.0 }, "visible": true, "enabled": true, "text_key": null, "text": { "kind": "literal", "value": "new4" }, "children": [] },
+          { "node_id": "f5", "kind": "label", "bounds": { "x": 0.0, "y": 0.0, "width": 300.0, "height": 20.0 }, "visible": true, "enabled": true, "text_key": null, "text": { "kind": "literal", "value": "new5" }, "children": [] },
+          { "node_id": "f6", "kind": "label", "bounds": { "x": 0.0, "y": 0.0, "width": 300.0, "height": 20.0 }, "visible": true, "enabled": true, "text_key": null, "text": { "kind": "literal", "value": "new6" }, "children": [] },
+          { "node_id": "f7", "kind": "label", "bounds": { "x": 0.0, "y": 0.0, "width": 300.0, "height": 20.0 }, "visible": true, "enabled": true, "text_key": null, "text": { "kind": "literal", "value": "new7" }, "children": [] },
+          { "node_id": "f8", "kind": "label", "bounds": { "x": 0.0, "y": 0.0, "width": 300.0, "height": 20.0 }, "visible": true, "enabled": true, "text_key": null, "text": { "kind": "literal", "value": "new8" }, "children": [] },
+          { "node_id": "f9", "kind": "label", "bounds": { "x": 0.0, "y": 0.0, "width": 300.0, "height": 20.0 }, "visible": true, "enabled": true, "text_key": null, "text": { "kind": "literal", "value": "new9" }, "children": [] }
+        ]
+      }
+    ]
+  }
+}

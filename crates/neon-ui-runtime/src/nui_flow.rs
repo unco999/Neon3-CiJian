@@ -1940,6 +1940,11 @@ pub fn apply_ui_patch(
     document: &UiIrDocument,
     patch: &neon_ui_schema::UiPatch,
 ) -> FlowResult<UiIrDocument> {
+    /// Semantic paths resolve against their final stable key; the leading
+    /// segments are context for the IR patch operations that parse paths.
+    fn semantic_path_key(path: &str) -> &str {
+        path.rsplit('/').next().unwrap_or(path)
+    }
     if document.surface_id.0 != patch.surface_id {
         return Err(error(
             "nui_flow_patch_surface_mismatch",
@@ -2005,14 +2010,15 @@ pub fn apply_ui_patch(
                 parent_path,
                 children,
             } => {
-                let parent = find_node_mut(&mut result.root, parent_path).ok_or_else(|| {
-                    error(
-                        "nui_flow_unknown_patch_target",
-                        "replace parent does not exist",
-                        1,
-                        1,
-                    )
-                })?;
+                let parent = find_node_mut(&mut result.root, semantic_path_key(parent_path))
+                    .ok_or_else(|| {
+                        error(
+                            "nui_flow_unknown_patch_target",
+                            "replace parent does not exist",
+                            1,
+                            1,
+                        )
+                    })?;
                 parent.children = children.clone();
             }
             neon_ui_schema::UiPatchOp::MoveNode {
@@ -2022,19 +2028,20 @@ pub fn apply_ui_patch(
             } => {
                 move_node(
                     &mut result.root,
-                    node_path,
+                    semantic_path_key(node_path),
                     Some(&json!({"parent": parent_path})),
                     &span(1, 1, "structured patch"),
                 )?;
-                let node_key = node_path.rsplit('/').next().unwrap_or(node_path);
-                let parent = find_node_mut(&mut result.root, parent_path).ok_or_else(|| {
-                    error(
-                        "nui_flow_unknown_patch_target",
-                        "move destination does not exist",
-                        1,
-                        1,
-                    )
-                })?;
+                let node_key = semantic_path_key(node_path);
+                let parent = find_node_mut(&mut result.root, semantic_path_key(parent_path))
+                    .ok_or_else(|| {
+                        error(
+                            "nui_flow_unknown_patch_target",
+                            "move destination does not exist",
+                            1,
+                            1,
+                        )
+                    })?;
                 if let Some(position) = parent
                     .children
                     .iter()
@@ -2050,14 +2057,15 @@ pub fn apply_ui_patch(
                 node_path,
                 transition,
             } => {
-                let node = find_node_mut(&mut result.root, node_path).ok_or_else(|| {
-                    error(
-                        "nui_flow_unknown_patch_target",
-                        "transition target does not exist",
-                        1,
-                        1,
-                    )
-                })?;
+                let node = find_node_mut(&mut result.root, semantic_path_key(node_path))
+                    .ok_or_else(|| {
+                        error(
+                            "nui_flow_unknown_patch_target",
+                            "transition target does not exist",
+                            1,
+                            1,
+                        )
+                    })?;
                 node.enter_transition = Some(transition.clone());
             }
             neon_ui_schema::UiPatchOp::SetInput { .. } => {}

@@ -1,0 +1,73 @@
+{
+  "schema_version": 1,
+  "root": {
+    "node_id": "workbench",
+    "kind": "panel",
+    "bounds": { "x": 0.0, "y": 0.0, "width": 1200.0, "height": 800.0 },
+    "visible": true,
+    "enabled": true,
+    "text_key": null,
+    "children": [
+      {
+        "node_id": "rail",
+        "kind": "panel",
+        "bounds": { "x": 0.0, "y": 0.0, "width": 240.0, "height": 800.0 },
+        "visible": true,
+        "enabled": true,
+        "text_key": null,
+        "children": [
+          {
+            "node_id": "task-1",
+            "kind": "label",
+            "bounds": { "x": 0.0, "y": 0.0, "width": 220.0, "height": 24.0 },
+            "visible": true,
+            "enabled": true,
+            "text_key": null,
+            "text": { "kind": "literal", "value": "Install" },
+            "children": []
+          },
+          {
+            "node_id": "task-2",
+            "kind": "label",
+            "bounds": { "x": 0.0, "y": 0.0, "width": 220.0, "height": 24.0 },
+            "visible": true,
+            "enabled": true,
+            "text_key": null,
+            "text": { "kind": "literal", "value": "Build" },
+            "children": []
+          },
+          {
+            "node_id": "task-3",
+            "kind": "label",
+            "bounds": { "x": 0.0, "y": 0.0, "width": 220.0, "height": 24.0 },
+            "visible": true,
+            "enabled": true,
+            "text_key": null,
+            "text": { "kind": "literal", "value": "Test" },
+            "children": []
+          }
+        ]
+      },
+      {
+        "node_id": "sidebar",
+        "kind": "panel",
+        "bounds": { "x": 240.0, "y": 0.0, "width": 320.0, "height": 800.0 },
+        "visible": true,
+        "enabled": true,
+        "text_key": null,
+        "children": [
+          { "node_id": "o0", "kind": "label", "bounds": { "x": 0.0, "y": 0.0, "width": 300.0, "height": 20.0 }, "visible": true, "enabled": true, "text_key": null, "text": { "kind": "literal", "value": "old0" }, "children": [] },
+          { "node_id": "o1", "kind": "label", "bounds": { "x": 0.0, "y": 0.0, "width": 300.0, "height": 20.0 }, "visible": true, "enabled": true, "text_key": null, "text": { "kind": "literal", "value": "old1" }, "children": [] },
+          { "node_id": "o2", "kind": "label", "bounds": { "x": 0.0, "y": 0.0, "width": 300.0, "height": 20.0 }, "visible": true, "enabled": true, "text_key": null, "text": { "kind": "literal", "value": "old2" }, "children": [] },
+          { "node_id": "o3", "kind": "label", "bounds": { "x": 0.0, "y": 0.0, "width": 300.0, "height": 20.0 }, "visible": true, "enabled": true, "text_key": null, "text": { "kind": "literal", "value": "old3" }, "children": [] },
+          { "node_id": "o4", "kind": "label", "bounds": { "x": 0.0, "y": 0.0, "width": 300.0, "height": 20.0 }, "visible": true, "enabled": true, "text_key": null, "text": { "kind": "literal", "value": "old4" }, "children": [] },
+          { "node_id": "o5", "kind": "label", "bounds": { "x": 0.0, "y": 0.0, "width": 300.0, "height": 20.0 }, "visible": true, "enabled": true, "text_key": null, "text": { "kind": "literal", "value": "old5" }, "children": [] },
+          { "node_id": "o6", "kind": "label", "bounds": { "x": 0.0, "y": 0.0, "width": 300.0, "height": 20.0 }, "visible": true, "enabled": true, "text_key": null, "text": { "kind": "literal", "value": "old6" }, "children": [] },
+          { "node_id": "o7", "kind": "label", "bounds": { "x": 0.0, "y": 0.0, "width": 300.0, "height": 20.0 }, "visible": true, "enabled": true, "text_key": null, "text": { "kind": "literal", "value": "old7" }, "children": [] },
+          { "node_id": "o8", "kind": "label", "bounds": { "x": 0.0, "y": 0.0, "width": 300.0, "height": 20.0 }, "visible": true, "enabled": true, "text_key": null, "text": { "kind": "literal", "value": "old8" }, "children": [] },
+          { "node_id": "o9", "kind": "label", "bounds": { "x": 0.0, "y": 0.0, "width": 300.0, "height": 20.0 }, "visible": true, "enabled": true, "text_key": null, "text": { "kind": "literal", "value": "old9" }, "children": [] }
+        ]
+      }
+    ]
+  }
+}
