@@ -129,7 +129,14 @@ case G: 100 个节点批量重排
 
 ## 3. Phase 1：统一 stable key 和 semantic path
 
-状态：`TODO`
+状态：`DONE（2026-09-19）`。K1-K5 验收由以下测试固化：
+`nui_flow::tests::duplicate_node_keys_are_rejected_with_a_structured_diagnostic`、
+`nui_flow::tests::patch_insert_rejects_a_key_that_already_exists_anywhere_in_the_tree`（K1）；
+`nui_flow::tests::patch_accepts_semantic_paths_but_rejects_indexes`、
+`nui_flow::tests::patch_topology_follows_stable_keys_after_reordering`（K2）；
+`neon-wgpu-runtime` 的
+`tests::reconcile_stats_track_keyed_node_lifecycle_across_fragment_revisions`（K3/K4/K5，
+配合 `ui_reconcile_baseline_probe` 的 G 场景 created==0）。
 
 ### 目标
 

@@ -8436,6 +8436,108 @@ panel workspace row gap 8
     }
 
     #[test]
+    fn duplicate_node_keys_are_rejected_with_a_structured_diagnostic() {
+        let error = parse_nui_flow(
+            "surface workspace\n  button water value \"Water\"\n  text water value \"duplicate\"\n",
+        )
+        .expect_err("a node key may only appear once per Flow document");
+        assert_eq!(error.diagnostics[0].code, "ui_ir_duplicate_key");
+        assert_eq!(error.diagnostics[0].span.line, 3);
+    }
+
+    #[test]
+    fn patch_insert_rejects_a_key_that_already_exists_anywhere_in_the_tree() {
+        let document = parse_nui_flow(WORKBENCH).unwrap();
+        let by_kind = parse_nui_flow_patch("@ revision 12\n+ workspace text water\n").unwrap();
+        let error = apply_nui_ir_patch(&document.ir, &by_kind).unwrap_err();
+        assert_eq!(error.diagnostics[0].code, "nui_flow_invalid_patch");
+        assert!(error.diagnostics[0].message.contains("already exists"));
+
+        let mut water = document.ir.root.children[0].children[0].clone();
+        water.text = Some(TextRef::Literal {
+            value: "renamed".into(),
+        });
+        let patch = UiIrPatch {
+            expected_revision: Revision(12),
+            operations: vec![UiIrPatchOperation {
+                kind: UiIrPatchOperationKind::Insert,
+                target_path: "workspace".into(),
+                expected_revision: Revision(12),
+                payload: Some(json!({
+                    "node": serde_json::to_value(&water).expect("node serializes"),
+                    "index": 0,
+                })),
+                source_span: span(1, 1, "structured insert"),
+            }],
+        };
+        let error = apply_nui_ir_patch(&document.ir, &patch).unwrap_err();
+        assert_eq!(error.diagnostics[0].code, "nui_flow_invalid_patch");
+        assert!(error.diagnostics[0].message.contains("already exists"));
+    }
+
+    #[test]
+    fn patch_topology_follows_stable_keys_after_reordering() {
+        let document = parse_nui_flow(WORKBENCH).unwrap();
+        // Move `title` out of inspector into rail; it lands at the end of rail.
+        let moved = apply_nui_ir_patch(
+            &document.ir,
+            &parse_nui_flow_patch("@ revision 12\n> title workspace/rail\n").unwrap(),
+        )
+        .expect("move by stable key");
+        let rail = &moved.root.children[0];
+        assert_eq!(rail.node_id.0, "rail");
+        assert_eq!(rail.children.last().unwrap().node_id.0, "title");
+        assert!(moved.root.children[1].children.is_empty());
+
+        // Inserting another row at the end of rail does not move `title`'s
+        // identity: later patches still resolve it by its new semantic path,
+        // and the old parent path correctly stops resolving.
+        let reordered = apply_nui_ir_patch(
+            &moved,
+            &parse_nui_flow_patch(
+                "@ revision 13\n+ workspace/rail text probe\n~ /workspace/rail/title value \"Renamed\"\n",
+            )
+            .unwrap(),
+        )
+        .expect("keyed patches survive positional shifts");
+        let rail = &reordered.root.children[0];
+        assert_eq!(
+            rail.children
+                .iter()
+                .map(|child| child.node_id.0.as_str())
+                .collect::<Vec<_>>(),
+            vec!["water", "title", "probe"]
+        );
+        assert_eq!(
+            rail.children[1].text,
+            Some(TextRef::Literal {
+                value: "Renamed".into()
+            })
+        );
+        let stale =
+            parse_nui_flow_patch("@ revision 14\n~ /workspace/inspector/title value \"x\"\n")
+                .unwrap();
+        let error = apply_nui_ir_patch(&reordered, &stale).unwrap_err();
+        assert_eq!(error.diagnostics[0].code, "nui_flow_unknown_patch_target");
+
+        // Removing a middle child by stable semantic path leaves the rest in
+        // declaration order, independent of array indexes.
+        let removed = apply_nui_ir_patch(
+            &reordered,
+            &parse_nui_flow_patch("@ revision 14\n- /workspace/rail/title\n").unwrap(),
+        )
+        .expect("remove by stable path");
+        let rail = &removed.root.children[0];
+        assert_eq!(
+            rail.children
+                .iter()
+                .map(|child| child.node_id.0.as_str())
+                .collect::<Vec<_>>(),
+            vec!["water", "probe"]
+        );
+    }
+
+    #[test]
     fn formatter_and_quoted_text_are_deterministic() {
         let formatted = format_nui_flow(WORKBENCH).unwrap();
         assert_eq!(format_nui_flow(&formatted).unwrap(), formatted);

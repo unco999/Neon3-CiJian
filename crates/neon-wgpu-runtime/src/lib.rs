@@ -15328,6 +15328,21 @@ mod tests {
             (3, 0, 0, 2),
             "reordering two retained nodes reports two moves"
         );
+
+        // K4: renaming a key at one position is an explicit remove+create;
+        // the renderer must not reuse the old node for the new key.
+        let stats = draw(vec![label("c2", 1.0), a()], 6);
+        assert_eq!(
+            (
+                stats.retained,
+                stats.created,
+                stats.removed,
+                stats.moved,
+                stats.updated
+            ),
+            (2, 1, 1, 0, 0),
+            "a key change is remove+create, never a silent reuse"
+        );
     }
 
     #[test]
