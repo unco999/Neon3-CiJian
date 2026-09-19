@@ -12,11 +12,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use neon_protocol::Revision;
 use neon_ui_schema::{
     UiBounds, UiCpuFrameOutput, UiCpuNodeState, UiCpuRenderPrimitive, UiCpuSemanticTarget,
-    UiCpuViewport, UiInputValue, UiInvalidationDomain, UiProgram, UiProgramRevision,
-    UiResolvedInputs, UiTextHandle, sort_dedup_domains,
+    UiCpuViewport, UiInputValue, UiInteractionKind, UiInvalidationDomain, UiProgram,
+    UiProgramRevision, UiResolvedInputs, UiTextHandle, sort_dedup_domains,
 };
 
-use crate::UiLocalPresentationState;
+use crate::{UiLocalPresentationState, ui_input_impact::preview_domains_for};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UiChangeCause {
@@ -24,6 +24,23 @@ pub enum UiChangeCause {
     LocalInteractionPreview,
     LocalInteractionCommit,
     ProgramActivation,
+}
+
+/// Stable error codes for the incremental path. A rejected delta never leaves
+/// the retained frame partially updated, except where the contract says a stale
+/// preview must be dropped so it can never be drawn again.
+pub mod error_codes {
+    pub const STALE_FRAME: &str = "ui_incremental_stale_frame";
+    pub const UNSUPPORTED_CAUSE: &str = "ui_incremental_unsupported_cause";
+    pub const UNKNOWN_BINDING: &str = "ui_incremental_unknown_binding";
+    pub const UNKNOWN_BRANCH: &str = "ui_incremental_unknown_branch";
+    pub const DIAGNOSTIC_ESCAPE: &str = "ui_incremental_diagnostic_escape";
+    pub const UNKNOWN_INTERACTION_NODE: &str = "ui_incremental_unknown_interaction_node";
+    pub const UNDECLARED_INTERACTION_KIND: &str = "ui_incremental_undeclared_interaction_kind";
+    pub const STALE_PREVIEW: &str = "ui_incremental_stale_preview";
+    pub const PREVIEW_EPOCH_MISMATCH: &str = "ui_incremental_preview_epoch_mismatch";
+    pub const NO_ACTIVE_PREVIEW: &str = "ui_incremental_no_active_preview";
+    pub const CONFIRM_WITHOUT_AUTHORITY: &str = "ui_incremental_confirm_without_authority";
 }
 
 /// The proven and consequence set of one change, normalized before it reaches
@@ -41,6 +58,10 @@ pub struct UiImpactSet {
     pub semantic_sequence: Option<u64>,
     pub input_revision: Revision,
     pub fragment_revision: Revision,
+    /// Set by the local-interaction builder only. A preview names exactly one
+    /// interaction kind, and it belongs to the renderer epoch that sampled it.
+    pub interaction_kind: Option<UiInteractionKind>,
+    pub renderer_epoch: Option<u64>,
 }
 
 impl UiImpactSet {
@@ -74,7 +95,50 @@ impl UiImpactSet {
             semantic_sequence: None,
             input_revision,
             fragment_revision,
+            interaction_kind: None,
+            renderer_epoch: None,
         }
+    }
+
+    /// Builds the preview scope of one renderer-local interaction from the
+    /// compiled interaction impact graph. It never carries binding ids, branch
+    /// keys or input keys: a preview is presentation only and must not be able
+    /// to reach authoritative state through this set.
+    pub fn from_local_interaction(
+        program: &UiProgram,
+        kind: UiInteractionKind,
+        node_key: &str,
+        renderer_epoch: u64,
+        semantic_sequence: Option<u64>,
+        input_revision: Revision,
+        fragment_revision: Revision,
+    ) -> Result<Self, UiIncrementalError> {
+        let Some(impact) = program.dependency_index.interaction_impacts.get(node_key) else {
+            return Err(UiIncrementalError {
+                code: error_codes::UNKNOWN_INTERACTION_NODE,
+            });
+        };
+        if !impact.interaction_kinds.contains(&kind) {
+            return Err(UiIncrementalError {
+                code: error_codes::UNDECLARED_INTERACTION_KIND,
+            });
+        }
+        Ok(Self {
+            cause: UiChangeCause::LocalInteractionPreview,
+            input_keys: Vec::new(),
+            interaction_nodes: vec![node_key.to_owned()],
+            binding_ids: Vec::new(),
+            node_keys: vec![node_key.to_owned()],
+            domains: preview_domains_for(std::slice::from_ref(&kind))
+                .into_iter()
+                .collect(),
+            branch_keys: Vec::new(),
+            semantic_sequence,
+            input_revision,
+            fragment_revision,
+            interaction_kind: Some(kind),
+            renderer_epoch: Some(renderer_epoch),
+        })
     }
 }
 
@@ -99,14 +163,144 @@ pub struct UiFrameDelta {
     /// list to be re-linked (no dependency work happens in that pass).
     pub render_primitives_rebuilt: bool,
     pub layout_unchanged: bool,
+    /// Populated by `LocalInteractionPreview` deltas only. A preview never
+    /// changes `changed_states`, `input_revision` or the primitive assembly; it
+    /// only names the node and domains whose presentation ranges must update.
+    pub preview_kind: Option<UiInteractionKind>,
+    pub preview_node_key: Option<String>,
+    /// The node that previously held this preview kind, if any. The renderer
+    /// must restore it in the same frame.
+    pub displaced_preview_node_key: Option<String>,
+    pub preview_revision: Revision,
+    /// Previews dropped because an authoritative publication reached the node
+    /// they were predicting. Their nodes return to authoritative appearance.
+    pub superseded_preview_kinds: Vec<UiInteractionKind>,
 }
 
-struct NodeSeed {
-    visible: bool,
-    enabled: bool,
-    opacity: f32,
-    scroll_offset: [f32; 2],
-    literal_text: Option<UiTextHandle>,
+/// How an active renderer preview ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UiPreviewResolution {
+    /// The authoritative input arrived and matches what the preview showed.
+    Confirmed,
+    /// The domain rejected or reverted the interaction.
+    RolledBack,
+    /// Focus loss, capture cancel, or an abandoned interaction.
+    Cancelled,
+}
+
+/// Bookkeeping record for one ended preview. The renderer uses `domains` to
+/// restore exactly the ranges the preview had touched.
+#[derive(Clone, Debug, PartialEq)]
+pub struct UiPreviewResolutionRecord {
+    pub resolution: UiPreviewResolution,
+    pub kind: UiInteractionKind,
+    pub node_key: String,
+    pub domains: Vec<UiInvalidationDomain>,
+    pub preview_revision: Revision,
+    pub input_revision: Revision,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct ActivePreview {
+    node_key: String,
+    /// Authoritative input revision the preview was drawn against. Confirming
+    /// requires that the authoritative frame has moved past it.
+    input_revision: Revision,
+    semantic_sequence: Option<u64>,
+}
+
+/// Structured record of one incremental update, per the design's diagnostics
+/// contract. The CPU side fills everything it owns and leaves
+/// `gpu_ranges_written` empty until the renderer reports its local ranges, so
+/// neither layer can claim the other's work happened.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct UiIncrementalUpdateRecord {
+    pub event: &'static str,
+    pub cause: &'static str,
+    pub input_revision: Revision,
+    pub fragment_revision: Revision,
+    pub input_keys: Vec<String>,
+    pub binding_ids: Vec<u32>,
+    pub node_keys: Vec<String>,
+    pub domains: Vec<UiInvalidationDomain>,
+    pub layout_rebuilt: bool,
+    pub text_remeasured: bool,
+    pub primitives_rebuilt: bool,
+    pub preview_kind: Option<UiInteractionKind>,
+    pub preview_revision: Revision,
+    pub superseded_preview_kinds: Vec<UiInteractionKind>,
+    pub gpu_ranges_written: Option<u64>,
+    pub status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<&'static str>,
+}
+
+impl UiIncrementalUpdateRecord {
+    pub fn cause_name(cause: UiChangeCause) -> &'static str {
+        match cause {
+            UiChangeCause::InputPublication => "input_publication",
+            UiChangeCause::LocalInteractionPreview => "local_interaction_preview",
+            UiChangeCause::LocalInteractionCommit => "local_interaction_commit",
+            UiChangeCause::ProgramActivation => "program_activation",
+        }
+    }
+
+    pub fn applied(impact: &UiImpactSet, delta: &UiFrameDelta) -> Self {
+        let mut node_keys: Vec<String> = delta
+            .changed_states
+            .iter()
+            .map(|state| state.node_key.clone())
+            .collect();
+        if let Some(node_key) = delta.preview_node_key.as_ref() {
+            node_keys.push(node_key.clone());
+        }
+        node_keys.sort();
+        node_keys.dedup();
+        Self {
+            event: "ui.incremental_update.applied",
+            cause: Self::cause_name(impact.cause),
+            input_revision: delta.input_revision,
+            fragment_revision: impact.fragment_revision,
+            input_keys: impact.input_keys.clone(),
+            binding_ids: delta.executed_binding_ids.clone(),
+            node_keys,
+            domains: delta.domains_executed.clone(),
+            layout_rebuilt: !delta.layout_unchanged,
+            text_remeasured: delta
+                .domains_executed
+                .contains(&UiInvalidationDomain::TextLayout),
+            primitives_rebuilt: delta.render_primitives_rebuilt,
+            preview_kind: delta.preview_kind,
+            preview_revision: delta.preview_revision,
+            superseded_preview_kinds: delta.superseded_preview_kinds.clone(),
+            gpu_ranges_written: None,
+            status: "applied",
+            code: None,
+        }
+    }
+
+    pub fn rejected(impact: &UiImpactSet, code: &'static str) -> Self {
+        Self {
+            event: "ui.incremental_update.rejected",
+            cause: Self::cause_name(impact.cause),
+            input_revision: impact.input_revision,
+            fragment_revision: impact.fragment_revision,
+            input_keys: impact.input_keys.clone(),
+            binding_ids: Vec::new(),
+            node_keys: Vec::new(),
+            domains: Vec::new(),
+            layout_rebuilt: false,
+            text_remeasured: false,
+            primitives_rebuilt: false,
+            preview_kind: impact.interaction_kind,
+            preview_revision: Revision(0),
+            superseded_preview_kinds: Vec::new(),
+            gpu_ranges_written: None,
+            status: "rejected",
+            code: Some(code),
+        }
+    }
 }
 
 pub struct UiRetainedFrame {
@@ -124,11 +318,17 @@ pub struct UiRetainedFrame {
     bindings_by_node: BTreeMap<String, Vec<u32>>,
     branches_covering_node: BTreeMap<String, Vec<usize>>,
     degraded: bool,
+    /// One active preview per interaction kind: a single pointer and focus
+    /// owner can only predict one node per kind at a time.
+    previews: BTreeMap<UiInteractionKind, ActivePreview>,
+    preview_revision: Revision,
+    renderer_epoch: u64,
 }
 
 impl UiRetainedFrame {
     /// Full materialization assembled from retained parts; equals the golden
-    /// evaluator output for the same inputs.
+    /// evaluator output for the same inputs. Previews are deliberately absent:
+    /// they are renderer-local prediction, never authoritative CPU node state.
     pub fn frame(&self) -> UiCpuFrameOutput {
         UiCpuFrameOutput {
             program_revision: self.program_revision.clone(),
@@ -145,6 +345,28 @@ impl UiRetainedFrame {
     pub fn degraded(&self) -> bool {
         self.degraded
     }
+
+    pub fn previews(&self) -> impl Iterator<Item = (UiInteractionKind, &str)> {
+        self.previews
+            .iter()
+            .map(|(kind, active)| (*kind, active.node_key.as_str()))
+    }
+
+    pub fn preview_revision(&self) -> Revision {
+        self.preview_revision
+    }
+
+    pub fn renderer_epoch(&self) -> u64 {
+        self.renderer_epoch
+    }
+}
+
+struct NodeSeed {
+    visible: bool,
+    enabled: bool,
+    opacity: f32,
+    scroll_offset: [f32; 2],
+    literal_text: Option<UiTextHandle>,
 }
 
 pub fn evaluate_ui_program_initial(
@@ -214,6 +436,9 @@ pub fn evaluate_ui_program_initial(
         // healthy contract; incremental updates must then fall back to the
         // golden evaluator instead of partially reproducing error ordering.
         degraded: !golden.diagnostics.is_empty(),
+        previews: BTreeMap::new(),
+        preview_revision: Revision(0),
+        renderer_epoch: 0,
     }
 }
 
@@ -224,9 +449,27 @@ pub fn apply_ui_impact_set(
     local: &UiLocalPresentationState,
     impact: &UiImpactSet,
 ) -> Result<UiFrameDelta, UiIncrementalError> {
-    if impact.cause != UiChangeCause::InputPublication || !impact.interaction_nodes.is_empty() {
+    match impact.cause {
+        UiChangeCause::InputPublication => {}
+        // A preview is renderer prediction. It is applied through the same
+        // impact-set entry point but never reads or writes authoritative
+        // inputs, so it is handled in its own narrow path.
+        UiChangeCause::LocalInteractionPreview => {
+            return apply_local_interaction_preview(program, retained, impact);
+        }
+        // A commit is not a CPU-side consequence: the authoritative path is
+        // semantic event -> domain -> input publication, which arrives as an
+        // InputPublication set. Commit bookkeeping lives in the preview
+        // resolution API.
+        UiChangeCause::LocalInteractionCommit | UiChangeCause::ProgramActivation => {
+            return Err(UiIncrementalError {
+                code: error_codes::UNSUPPORTED_CAUSE,
+            });
+        }
+    }
+    if !impact.interaction_nodes.is_empty() {
         return Err(UiIncrementalError {
-            code: "ui_incremental_unsupported_cause",
+            code: error_codes::UNSUPPORTED_CAUSE,
         });
     }
     if retained.degraded
@@ -237,7 +480,7 @@ pub fn apply_ui_impact_set(
         || retained.presentation_revision != local.revision
     {
         return Err(UiIncrementalError {
-            code: "ui_incremental_stale_frame",
+            code: error_codes::STALE_FRAME,
         });
     }
     let mut replay_nodes: BTreeSet<&str> = BTreeSet::new();
@@ -248,7 +491,7 @@ pub fn apply_ui_impact_set(
             .find(|binding| binding.binding_id == *binding_id)
         else {
             return Err(UiIncrementalError {
-                code: "ui_incremental_unknown_binding",
+                code: error_codes::UNKNOWN_BINDING,
             });
         };
         replay_nodes.insert(binding.node_key.as_str());
@@ -261,7 +504,7 @@ pub fn apply_ui_impact_set(
             .find(|branch| &branch.branch_key == branch_key)
         else {
             return Err(UiIncrementalError {
-                code: "ui_incremental_unknown_branch",
+                code: error_codes::UNKNOWN_BRANCH,
             });
         };
         evaluated_branch_keys.push(branch.branch_key.clone());
@@ -372,6 +615,27 @@ pub fn apply_ui_impact_set(
     retained.input_revision = impact.input_revision;
     let mut domains_executed: Vec<UiInvalidationDomain> = impact.domains.iter().copied().collect();
     sort_dedup_domains(&mut domains_executed);
+    // Authoritative state now describes these nodes, so any preview predicting
+    // them must stop being drawn. The renderer restores them through the same
+    // domains a resolution record would report.
+    let mut superseded_preview_kinds: Vec<UiInteractionKind> = retained
+        .previews
+        .iter()
+        .filter(|(_, active)| {
+            changed_states
+                .iter()
+                .any(|state| state.node_key == active.node_key)
+        })
+        .map(|(kind, _)| *kind)
+        .collect();
+    if !superseded_preview_kinds.is_empty() {
+        for kind in &superseded_preview_kinds {
+            retained.previews.remove(kind);
+        }
+        retained.preview_revision = Revision(retained.preview_revision.0 + 1);
+    }
+    superseded_preview_kinds.sort();
+    superseded_preview_kinds.dedup();
     Ok(UiFrameDelta {
         cause: impact.cause,
         input_revision: impact.input_revision,
@@ -382,7 +646,155 @@ pub fn apply_ui_impact_set(
         changed_semantic_targets,
         render_primitives_rebuilt,
         layout_unchanged: true,
+        preview_kind: None,
+        preview_node_key: None,
+        displaced_preview_node_key: None,
+        preview_revision: retained.preview_revision,
+        superseded_preview_kinds,
     })
+}
+
+fn apply_local_interaction_preview(
+    program: &UiProgram,
+    retained: &mut UiRetainedFrame,
+    impact: &UiImpactSet,
+) -> Result<UiFrameDelta, UiIncrementalError> {
+    let Some(kind) = impact.interaction_kind else {
+        return Err(UiIncrementalError {
+            code: error_codes::UNSUPPORTED_CAUSE,
+        });
+    };
+    let [node_key] = impact.interaction_nodes.as_slice() else {
+        return Err(UiIncrementalError {
+            code: error_codes::UNSUPPORTED_CAUSE,
+        });
+    };
+    if retained.degraded || retained.program_revision != program.revision {
+        return Err(UiIncrementalError {
+            code: error_codes::STALE_FRAME,
+        });
+    }
+    let epoch = impact.renderer_epoch.unwrap_or(retained.renderer_epoch);
+    if retained.renderer_epoch != 0 && epoch != retained.renderer_epoch {
+        // Previews belong to the renderer session that sampled them. Never map
+        // an old epoch's prediction onto the new surface; the caller must
+        // clear previews explicitly for the new epoch.
+        return Err(UiIncrementalError {
+            code: error_codes::PREVIEW_EPOCH_MISMATCH,
+        });
+    }
+    if impact.input_revision != retained.input_revision {
+        // The displayed authoritative frame has moved past this interaction, so
+        // the prediction can never be confirmed. Drop it as part of rejecting.
+        retained.previews.remove(&kind);
+        return Err(UiIncrementalError {
+            code: error_codes::STALE_PREVIEW,
+        });
+    }
+    let Some(compiled) = program.dependency_index.interaction_impacts.get(node_key) else {
+        return Err(UiIncrementalError {
+            code: error_codes::UNKNOWN_INTERACTION_NODE,
+        });
+    };
+    if !compiled.interaction_kinds.contains(&kind) {
+        return Err(UiIncrementalError {
+            code: error_codes::UNDECLARED_INTERACTION_KIND,
+        });
+    }
+    let displaced = retained
+        .previews
+        .insert(
+            kind,
+            ActivePreview {
+                node_key: node_key.clone(),
+                input_revision: impact.input_revision,
+                semantic_sequence: impact.semantic_sequence,
+            },
+        )
+        .filter(|active| &active.node_key != node_key)
+        .map(|active| active.node_key);
+    retained.preview_revision = Revision(retained.preview_revision.0 + 1);
+    if retained.renderer_epoch == 0 {
+        retained.renderer_epoch = epoch;
+    }
+    Ok(UiFrameDelta {
+        cause: impact.cause,
+        // A preview never advances the authoritative revision.
+        input_revision: retained.input_revision,
+        executed_binding_ids: Vec::new(),
+        evaluated_branch_keys: Vec::new(),
+        domains_executed: preview_domains_for(std::slice::from_ref(&kind)),
+        changed_states: Vec::new(),
+        changed_semantic_targets: Vec::new(),
+        render_primitives_rebuilt: false,
+        layout_unchanged: true,
+        preview_kind: Some(kind),
+        preview_node_key: Some(node_key.clone()),
+        displaced_preview_node_key: displaced,
+        preview_revision: retained.preview_revision,
+        superseded_preview_kinds: Vec::new(),
+    })
+}
+
+/// Ends one active preview. `Confirmed` requires that the authoritative frame
+/// has actually moved past the revision the preview predicted, which is what
+/// keeps a local prediction from being mistaken for domain authority.
+pub fn resolve_ui_interaction_preview(
+    retained: &mut UiRetainedFrame,
+    kind: UiInteractionKind,
+    resolution: UiPreviewResolution,
+) -> Result<UiPreviewResolutionRecord, UiIncrementalError> {
+    let Some(active) = retained.previews.get(&kind).cloned() else {
+        return Err(UiIncrementalError {
+            code: error_codes::NO_ACTIVE_PREVIEW,
+        });
+    };
+    if resolution == UiPreviewResolution::Confirmed
+        && retained.input_revision.0 <= active.input_revision.0
+    {
+        return Err(UiIncrementalError {
+            code: error_codes::CONFIRM_WITHOUT_AUTHORITY,
+        });
+    }
+    retained.previews.remove(&kind);
+    retained.preview_revision = Revision(retained.preview_revision.0 + 1);
+    Ok(UiPreviewResolutionRecord {
+        resolution,
+        kind,
+        node_key: active.node_key,
+        domains: preview_domains_for(std::slice::from_ref(&kind)),
+        preview_revision: retained.preview_revision,
+        input_revision: active.input_revision,
+    })
+}
+
+/// Clears every preview because the renderer session changed (epoch reset,
+/// focus loss, device loss, or an abandoned capture). Returns one restore
+/// record per dropped preview so the renderer can put every touched range back.
+pub fn reset_ui_interaction_previews(
+    retained: &mut UiRetainedFrame,
+    renderer_epoch: u64,
+) -> Vec<UiPreviewResolutionRecord> {
+    if retained.previews.is_empty() {
+        retained.renderer_epoch = renderer_epoch;
+        return Vec::new();
+    }
+    retained.preview_revision = Revision(retained.preview_revision.0 + 1);
+    retained.renderer_epoch = renderer_epoch;
+    let records = retained
+        .previews
+        .iter()
+        .map(|(kind, active)| UiPreviewResolutionRecord {
+            resolution: UiPreviewResolution::Cancelled,
+            kind: *kind,
+            node_key: active.node_key.clone(),
+            domains: preview_domains_for(std::slice::from_ref(kind)),
+            preview_revision: retained.preview_revision,
+            input_revision: active.input_revision,
+        })
+        .collect();
+    retained.previews.clear();
+    records
 }
 
 fn apply_one_binding(
@@ -737,5 +1149,422 @@ surface root row w 400 h 300
         expected_ids.sort_unstable();
         assert_eq!(delta.executed_binding_ids, expected_ids);
         assert_eq!(harness.retained.frame(), harness.golden());
+    }
+
+    // --- Phase C: renderer-local interaction previews --------------------
+
+    const INTERACTION_FLOW: &str = "version 1
+surface surface.interact revision 1
+budget nodes=16 bindings=16 instances=16 text=8 glyphs=64 events=8 clips=8
+input flag bool default false
+input level_value i32 default 5
+surface root row w 400 h 300
+  switch tog checked $flag w 40 h 20
+  slider level numeric $level_value w 100 h 20
+  button act event app.act w 60 h 24
+  panel plain w 40 h 40
+";
+
+    fn interaction_revision() -> UiProgramRevision {
+        UiProgramRevision {
+            program_id: "surface.interact".into(),
+            revision: Revision(1),
+            schema_version: UI_PROGRAM_SCHEMA_VERSION,
+            capabilities: vec![UiProgramCapability {
+                name: UI_PROGRAM_CAPABILITY_NAME.into(),
+                version: 1,
+                owner: UiProgramCapabilityOwner::SharedContract,
+                status: UiProgramCapabilityStatus::Supported,
+            }],
+        }
+    }
+
+    fn interaction_harness() -> Harness {
+        let document = parse_nui_flow(INTERACTION_FLOW).expect("interaction fixture must parse");
+        let program_revision = interaction_revision();
+        let program = compile_nui_flow_program(&document, program_revision.clone()).unwrap();
+        let store =
+            UiInputStore::activate(program_revision, document.input_schema.clone()).unwrap();
+        let retained = evaluate_ui_program_initial(
+            &program,
+            &store.snapshot(),
+            viewport(),
+            &UiLocalPresentationState::default(),
+        );
+        assert!(!retained.degraded());
+        Harness {
+            program,
+            store,
+            retained,
+        }
+    }
+
+    impl Harness {
+        fn preview(
+            &mut self,
+            kind: UiInteractionKind,
+            node_key: &str,
+        ) -> Result<UiFrameDelta, UiIncrementalError> {
+            self.preview_at(kind, node_key, 7)
+        }
+
+        fn preview_at(
+            &mut self,
+            kind: UiInteractionKind,
+            node_key: &str,
+            renderer_epoch: u64,
+        ) -> Result<UiFrameDelta, UiIncrementalError> {
+            let impact = UiImpactSet::from_local_interaction(
+                &self.program,
+                kind,
+                node_key,
+                renderer_epoch,
+                Some(1),
+                self.store.snapshot().input_revision,
+                Revision(1),
+            )?;
+            apply_ui_impact_set(
+                &self.program,
+                &mut self.retained,
+                &self.store.snapshot(),
+                &UiLocalPresentationState::default(),
+                &impact,
+            )
+        }
+    }
+
+    #[test]
+    fn interaction_preview_leaves_the_authoritative_frame_untouched() {
+        let mut harness = interaction_harness();
+        let before = harness.retained.frame();
+        let delta = harness
+            .preview(UiInteractionKind::Hover, "act")
+            .expect("button declares hover");
+        assert_eq!(delta.cause, UiChangeCause::LocalInteractionPreview);
+        assert!(delta.executed_binding_ids.is_empty());
+        assert!(delta.evaluated_branch_keys.is_empty());
+        assert!(delta.changed_states.is_empty());
+        assert!(!delta.render_primitives_rebuilt);
+        assert_eq!(
+            delta.domains_executed,
+            vec![
+                UiInvalidationDomain::ColorInstances,
+                UiInvalidationDomain::InteractionPresentation,
+            ]
+        );
+        assert_eq!(
+            delta.preview_kind,
+            Some(UiInteractionKind::Hover),
+            "the delta must name the preview it applied"
+        );
+        assert_eq!(delta.preview_node_key.as_deref(), Some("act"));
+        assert_eq!(delta.input_revision, Revision(0));
+        assert_eq!(harness.store.snapshot().input_revision, Revision(0));
+        assert_eq!(harness.retained.frame(), before);
+        assert_eq!(harness.retained.frame(), harness.golden());
+    }
+
+    #[test]
+    fn one_preview_per_kind_and_the_displaced_node_is_reported() {
+        let mut harness = interaction_harness();
+        harness
+            .preview(UiInteractionKind::Hover, "level")
+            .expect("slider declares hover");
+        let delta = harness
+            .preview(UiInteractionKind::Hover, "act")
+            .expect("button declares hover");
+        assert_eq!(delta.displaced_preview_node_key.as_deref(), Some("level"));
+        harness
+            .preview(UiInteractionKind::Pressed, "act")
+            .expect("button declares pressed");
+        let previews: Vec<(UiInteractionKind, &str)> = harness.retained.previews().collect();
+        assert_eq!(
+            previews,
+            vec![
+                (UiInteractionKind::Hover, "act"),
+                (UiInteractionKind::Pressed, "act"),
+            ]
+        );
+    }
+
+    #[test]
+    fn undeclared_kinds_and_non_interactive_nodes_are_rejected() {
+        let mut harness = interaction_harness();
+        assert_eq!(
+            harness
+                .preview(UiInteractionKind::TogglePreview, "act")
+                .unwrap_err()
+                .code,
+            error_codes::UNDECLARED_INTERACTION_KIND
+        );
+        assert_eq!(
+            harness
+                .preview(UiInteractionKind::Hover, "plain")
+                .unwrap_err()
+                .code,
+            error_codes::UNKNOWN_INTERACTION_NODE
+        );
+        assert_eq!(harness.retained.previews().count(), 0);
+        assert_eq!(harness.retained.preview_revision(), Revision(0));
+    }
+
+    #[test]
+    fn confirm_requires_authority_while_rollback_and_cancel_always_clear() {
+        let mut harness = interaction_harness();
+        harness
+            .preview(UiInteractionKind::TogglePreview, "tog")
+            .expect("switch declares toggle preview");
+        assert_eq!(
+            resolve_ui_interaction_preview(
+                &mut harness.retained,
+                UiInteractionKind::TogglePreview,
+                UiPreviewResolution::Confirmed,
+            )
+            .unwrap_err()
+            .code,
+            error_codes::CONFIRM_WITHOUT_AUTHORITY,
+            "a prediction may never confirm itself"
+        );
+        assert_eq!(harness.retained.previews().count(), 1);
+        let record = resolve_ui_interaction_preview(
+            &mut harness.retained,
+            UiInteractionKind::TogglePreview,
+            UiPreviewResolution::RolledBack,
+        )
+        .expect("rollback must always be allowed");
+        assert_eq!(record.node_key.as_str(), "tog");
+        assert_eq!(
+            record.domains,
+            vec![
+                UiInvalidationDomain::ColorInstances,
+                UiInvalidationDomain::InteractionPresentation,
+            ]
+        );
+        assert_eq!(harness.retained.previews().count(), 0);
+        assert_eq!(
+            resolve_ui_interaction_preview(
+                &mut harness.retained,
+                UiInteractionKind::TogglePreview,
+                UiPreviewResolution::Cancelled,
+            )
+            .unwrap_err()
+            .code,
+            error_codes::NO_ACTIVE_PREVIEW
+        );
+    }
+
+    #[test]
+    fn authoritative_publication_supersedes_the_preview_it_predicted() {
+        let mut harness = interaction_harness();
+        harness
+            .preview(UiInteractionKind::TogglePreview, "tog")
+            .expect("toggle preview on a switch");
+        harness
+            .preview(UiInteractionKind::Pressed, "act")
+            .expect("pressed on the button");
+        let impact = harness.publish("flag", bool_input(true));
+        let delta = harness.apply(&impact);
+        assert_eq!(
+            delta.superseded_preview_kinds,
+            vec![UiInteractionKind::TogglePreview],
+            "only the predicted node's preview is dropped"
+        );
+        assert!(
+            delta
+                .changed_states
+                .iter()
+                .any(|state| state.node_key == "tog")
+        );
+        // The button was untouched by authority, so its preview survives and is
+        // now confirmable because the authoritative frame moved forward.
+        let confirmed = resolve_ui_interaction_preview(
+            &mut harness.retained,
+            UiInteractionKind::Pressed,
+            UiPreviewResolution::Confirmed,
+        )
+        .expect("authority advanced past the preview");
+        assert_eq!(confirmed.node_key.as_str(), "act");
+        assert_eq!(harness.retained.previews().count(), 0);
+        assert_eq!(harness.retained.frame(), harness.golden());
+    }
+
+    #[test]
+    fn stale_preview_is_rejected_and_its_overlay_is_dropped() {
+        let mut harness = interaction_harness();
+        harness
+            .preview(UiInteractionKind::Hover, "act")
+            .expect("button declares hover");
+        let impact = harness.publish("flag", bool_input(true));
+        harness.apply(&impact);
+        let stale = UiImpactSet::from_local_interaction(
+            &harness.program,
+            UiInteractionKind::Hover,
+            "act",
+            7,
+            Some(1),
+            Revision(0),
+            Revision(1),
+        )
+        .expect("declared kind");
+        let error = apply_ui_impact_set(
+            &harness.program,
+            &mut harness.retained,
+            &harness.store.snapshot(),
+            &UiLocalPresentationState::default(),
+            &stale,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, error_codes::STALE_PREVIEW);
+        assert_eq!(
+            harness.retained.previews().count(),
+            0,
+            "a preview that can never be confirmed must not stay drawn"
+        );
+        let record = UiIncrementalUpdateRecord::rejected(&stale, error.code);
+        assert_eq!(record.status, "rejected");
+        assert_eq!(record.code, Some(error_codes::STALE_PREVIEW));
+    }
+
+    #[test]
+    fn epoch_reset_clears_every_preview_before_new_predictions() {
+        let mut harness = interaction_harness();
+        harness
+            .preview(UiInteractionKind::Hover, "act")
+            .expect("hover");
+        harness
+            .preview(UiInteractionKind::NumericPreview, "level")
+            .expect("numeric preview");
+        let records = reset_ui_interaction_previews(&mut harness.retained, 8);
+        assert_eq!(records.len(), 2);
+        assert!(
+            records
+                .iter()
+                .all(|record| record.resolution == UiPreviewResolution::Cancelled)
+        );
+        assert_eq!(harness.retained.renderer_epoch(), 8);
+        assert_eq!(harness.retained.previews().count(), 0);
+        assert_eq!(
+            harness
+                .preview(UiInteractionKind::Hover, "act")
+                .unwrap_err()
+                .code,
+            error_codes::PREVIEW_EPOCH_MISMATCH,
+            "old-epoch samples may not map onto the new renderer session"
+        );
+        harness
+            .preview_at(UiInteractionKind::Hover, "act", 8)
+            .expect("new epoch previews apply");
+        assert_eq!(harness.retained.previews().count(), 1);
+    }
+
+    #[test]
+    fn repeated_slider_preview_costs_no_revision_and_one_commit_publishes_once() {
+        let mut harness = interaction_harness();
+        for step in 1..=5 {
+            let delta = harness
+                .preview(UiInteractionKind::NumericPreview, "level")
+                .expect("slider declares numeric preview");
+            assert_eq!(delta.input_revision, Revision(0));
+            assert_eq!(delta.preview_revision, Revision(step));
+            assert_eq!(delta.displaced_preview_node_key, None);
+        }
+        assert_eq!(harness.store.snapshot().input_revision, Revision(0));
+        assert_eq!(harness.retained.frame(), harness.golden());
+        let impact = harness.publish("level_value", UiInputValue::I32 { value: 9 });
+        let delta = harness.apply(&impact);
+        assert_eq!(delta.input_revision, Revision(1));
+        assert_eq!(
+            delta
+                .changed_states
+                .iter()
+                .map(|state| state.node_key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["level"]
+        );
+        assert_eq!(harness.retained.frame(), harness.golden());
+    }
+
+    #[test]
+    fn interaction_record_links_the_node_to_its_authoritative_input() {
+        let mut harness = interaction_harness();
+        let toggle = &harness.program.dependency_index.interaction_impacts["tog"];
+        assert_eq!(toggle.controlled_input_keys, vec!["flag".to_owned()]);
+        assert_eq!(
+            harness.program.dependency_index.interaction_impacts["act"].semantic_intents,
+            vec!["app.act".to_owned()]
+        );
+        let expected: Vec<u32> = harness
+            .program
+            .binding_records
+            .iter()
+            .filter(|binding| binding.node_key == "tog")
+            .map(|binding| binding.binding_id)
+            .collect();
+        let impact = harness.publish("flag", bool_input(true));
+        assert_eq!(impact.binding_ids, expected);
+    }
+
+    #[test]
+    fn commit_and_activation_causes_never_reach_the_cpu_delta_path() {
+        let mut harness = interaction_harness();
+        for cause in [
+            UiChangeCause::LocalInteractionCommit,
+            UiChangeCause::ProgramActivation,
+        ] {
+            let mut impact = UiImpactSet::from_input_publication(
+                &harness.program,
+                &[],
+                Revision(1),
+                Revision(1),
+            );
+            impact.cause = cause;
+            assert_eq!(
+                apply_ui_impact_set(
+                    &harness.program,
+                    &mut harness.retained,
+                    &harness.store.snapshot(),
+                    &UiLocalPresentationState::default(),
+                    &impact,
+                )
+                .unwrap_err()
+                .code,
+                error_codes::UNSUPPORTED_CAUSE
+            );
+        }
+    }
+
+    #[test]
+    fn incremental_update_record_reports_the_applied_scope() {
+        let mut harness = interaction_harness();
+        let impact = harness.publish("flag", bool_input(true));
+        let delta = harness.apply(&impact);
+        let value =
+            serde_json::to_value(UiIncrementalUpdateRecord::applied(&impact, &delta)).unwrap();
+        assert_eq!(value["event"], "ui.incremental_update.applied");
+        assert_eq!(value["cause"], "input_publication");
+        assert_eq!(value["status"], "applied");
+        assert_eq!(value["input_revision"], 1);
+        assert_eq!(value["input_keys"][0], "flag");
+        assert_eq!(value["gpu_ranges_written"], serde_json::Value::Null);
+        assert_eq!(value["text_remeasured"], false);
+        let domains: Vec<&str> = value["domains"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|domain| domain.as_str().unwrap())
+            .collect();
+        assert!(
+            domains.contains(&"node_state") && domains.contains(&"color_instances"),
+            "the active binding's domains must be reported: {domains:?}"
+        );
+        assert!(
+            !domains.contains(&"text_layout") && !domains.contains(&"hit_target"),
+            "an Active binding must not claim text or hit regeneration: {domains:?}"
+        );
+        assert_eq!(
+            value["node_keys"],
+            serde_json::json!(["tog"]),
+            "only the node whose authoritative state actually moved is reported"
+        );
     }
 }

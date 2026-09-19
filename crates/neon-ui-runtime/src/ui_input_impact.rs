@@ -300,7 +300,7 @@ fn interaction_kinds_for(kind: &UiNodeKind) -> Option<&'static [UiInteractionKin
     })
 }
 
-fn preview_domains_for(kinds: &[UiInteractionKind]) -> Vec<UiInvalidationDomain> {
+pub(crate) fn preview_domains_for(kinds: &[UiInteractionKind]) -> Vec<UiInvalidationDomain> {
     use UiInteractionKind::*;
     let mut domains = Vec::new();
     for kind in kinds {

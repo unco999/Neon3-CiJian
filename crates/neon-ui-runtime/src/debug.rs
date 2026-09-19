@@ -25,6 +25,19 @@ pub struct UiReplayResult {
     pub matched_expected_frames: bool,
 }
 
+/// Machine-readable answer to "what invalidates this node". It reports only
+/// stable node keys, binding ids, branch keys and invalidation domains.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct UiNodeImpactSummary {
+    pub node_key: String,
+    pub binding_ids: Vec<u32>,
+    pub bound_properties: Vec<String>,
+    pub branch_keys: Vec<String>,
+    pub input_keys: Vec<String>,
+    pub domains: Vec<neon_ui_schema::UiInvalidationDomain>,
+}
+
 /// Runtime-owned state for the public debug methods. The domain is still
 /// responsible for supplying frames; this facade only validates and explains.
 pub struct UiDebugSession {
@@ -287,6 +300,69 @@ impl UiDebugSession {
     pub fn input_snapshot(&self) -> UiResolvedInputs {
         self.inputs.snapshot()
     }
+    /// Compiled invalidation scope of one input slot. An input with no bindings
+    /// still returns a record with empty impacts so "no effect" is provable
+    /// rather than inferred from a missing entry.
+    pub fn input_impact(&self, key: &str) -> Option<&neon_ui_schema::UiInputImpact> {
+        self.program.dependency_index.input_impacts.get(key)
+    }
+    /// Compiled renderer preview scope of one node: which interaction kinds it
+    /// declares, which domains a preview touches, and which intents and inputs
+    /// its authoritative events carry.
+    pub fn interaction_impact(&self, key: &str) -> Option<&neon_ui_schema::UiInteractionImpact> {
+        self.program.dependency_index.interaction_impacts.get(key)
+    }
+    /// Reverse lookup: everything that can invalidate one node.
+    pub fn node_impact(&self, key: &str) -> Option<UiNodeImpactSummary> {
+        if !self.program.nodes.iter().any(|node| node.key == key) {
+            return None;
+        }
+        let mut binding_ids = Vec::new();
+        let mut bound_properties = Vec::new();
+        for binding in self
+            .program
+            .binding_records
+            .iter()
+            .filter(|binding| binding.node_key == key)
+        {
+            binding_ids.push(binding.binding_id);
+            bound_properties.push(format!("{:?}", binding.property));
+        }
+        let branch_keys: Vec<String> = self
+            .program
+            .branch_records
+            .iter()
+            .filter(|branch| branch.node_range.iter().any(|node| node == key))
+            .map(|branch| branch.branch_key.clone())
+            .collect();
+        let mut input_keys = Vec::new();
+        let mut domains: Vec<neon_ui_schema::UiInvalidationDomain> = Vec::new();
+        for (input_key, impact) in &self.program.dependency_index.input_impacts {
+            let reaches = impact.affected_node_keys.iter().any(|node| node == key)
+                || impact
+                    .binding_impacts
+                    .iter()
+                    .any(|binding| binding.node_key == key)
+                || impact
+                    .branch_keys
+                    .iter()
+                    .any(|branch| branch_keys.contains(branch));
+            if reaches {
+                input_keys.push(input_key.clone());
+                domains.extend(impact.domains.iter().copied());
+            }
+        }
+        input_keys.sort();
+        neon_ui_schema::sort_dedup_domains(&mut domains);
+        Some(UiNodeImpactSummary {
+            node_key: key.to_owned(),
+            binding_ids,
+            bound_properties,
+            branch_keys,
+            input_keys,
+            domains,
+        })
+    }
     pub fn text_handle(
         &self,
         handle: UiTextHandle,
@@ -484,5 +560,94 @@ fn rejected_patch(
         required_input_schema_changes: Vec::new(),
         budget,
         diagnostics: vec![diagnostic(code, &message, None, base)],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parse_nui_flow;
+    use neon_ui_schema::{
+        UI_PROGRAM_CAPABILITY_NAME, UI_PROGRAM_SCHEMA_VERSION, UiBounds, UiCpuViewport,
+        UiInputSchema, UiProgramCapability, UiProgramCapabilityOwner, UiProgramCapabilityStatus,
+        UiProgramRevision,
+    };
+
+    const FLOW: &str = "version 1
+surface surface.debug revision 1
+budget nodes=8 bindings=8 instances=8 text=4 glyphs=32 events=4 clips=4
+input show bool default false
+input amount i32 default 3
+input unused bool default false
+surface root row w 200 h 200
+  panel hidden-panel visible $show w 40 h 40
+  slider gauge numeric $amount w 60 h 20
+  button act event app.act w 40 h 20
+";
+
+    fn session() -> UiDebugSession {
+        let document = parse_nui_flow(FLOW).expect("debug fixture must parse");
+        let schema: UiInputSchema = document.input_schema.clone();
+        let revision = UiProgramRevision {
+            program_id: "surface.debug".into(),
+            revision: Revision(1),
+            schema_version: UI_PROGRAM_SCHEMA_VERSION,
+            capabilities: vec![UiProgramCapability {
+                name: UI_PROGRAM_CAPABILITY_NAME.into(),
+                version: 1,
+                owner: UiProgramCapabilityOwner::SharedContract,
+                status: UiProgramCapabilityStatus::Supported,
+            }],
+        };
+        let viewport = UiCpuViewport {
+            logical_bounds: UiBounds {
+                x: 0.0,
+                y: 0.0,
+                width: 200.0,
+                height: 200.0,
+            },
+            revision: Revision(1),
+        };
+        UiDebugSession::activate(
+            document.ir,
+            revision,
+            schema,
+            UiTextRegistry::new("debug", 8, 64).unwrap(),
+            viewport,
+            FLOW,
+            1,
+        )
+        .expect("debug session must activate")
+    }
+
+    #[test]
+    fn impact_queries_answer_from_the_compiled_graph() {
+        let session = session();
+        let show = session.input_impact("show").expect("declared input slot");
+        assert!(
+            show.affected_node_keys.contains(&"hidden-panel".to_owned()),
+            "the bound node must be listed: {:?}",
+            show.affected_node_keys
+        );
+        assert!(
+            session
+                .input_impact("unused")
+                .is_some_and(|impact| impact.binding_ids.is_empty()),
+            "an unbound input must still answer with an empty, diagnosable impact"
+        );
+        let gauge = session.node_impact("gauge").expect("compiled node");
+        assert_eq!(gauge.input_keys, vec!["amount".to_owned()]);
+        assert_eq!(gauge.binding_ids.len(), 1);
+        assert!(
+            gauge
+                .domains
+                .contains(&neon_ui_schema::UiInvalidationDomain::NodeState),
+            "{:?}",
+            gauge.domains
+        );
+        let act = session.interaction_impact("act").expect("interactive node");
+        assert_eq!(act.semantic_intents, vec!["app.act".to_owned()]);
+        assert!(session.interaction_impact("hidden-panel").is_none());
+        assert!(session.node_impact("missing-node").is_none());
     }
 }

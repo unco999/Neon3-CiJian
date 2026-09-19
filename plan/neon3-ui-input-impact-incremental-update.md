@@ -677,7 +677,55 @@ JSONL probe 能输出 producer/consumer 范围和最终结果
   TextEditCommit 回写同一文本）在新契约下是真正的 no-op，因此该断言改为按 publication
   是否真的改变 slot 值来推导期望 revision（改变了 +1，未改变保持不变），其余断言不变。
 
-### Phase C: interaction convergence — 未开始
+### Phase C: interaction convergence — CPU 侧已完成
+
+- `UiImpactSet::from_local_interaction(program, kind, node_key, renderer_epoch,
+  semantic_sequence, input_revision, fragment_revision)`：只从编译期
+  `interaction_impacts` 取范围；不携带 binding id、branch key 或 input key，因此
+  preview 在类型层面就不可能触达权威求值。未声明的 kind 返回
+  `ui_incremental_undeclared_interaction_kind`，非交互节点返回
+  `ui_incremental_unknown_interaction_node`。
+- preview 以 kind 为键保存在 retained frame 的 overlay 里（一个指针/焦点同一 kind
+  只能预测一个节点），并记录它预测时的 `input_revision` 与 `semantic_sequence`。
+  `UiRetainedFrame::frame()` 不含 overlay，所以权威 frame 与 golden evaluator 恒等。
+- 生命周期：
+  - `apply_ui_impact_set` 的 `LocalInteractionPreview` 分支只返回
+    `preview_kind/preview_node_key/displaced_preview_node_key/preview_revision`，
+    `input_revision`、`changed_states`、primitive assembly 全部不动；
+  - `resolve_ui_interaction_preview(Confirmed)` 要求权威 revision 已经前进，否则
+    `ui_incremental_confirm_without_authority`，即“预测不能自我确认”；
+    `RolledBack`/`Cancelled` 总是允许并返回需要恢复的 domains；
+  - 权威 publication 命中被预测节点时，delta 报 `superseded_preview_kinds` 并丢弃该
+    overlay；
+  - `impact.input_revision` 落后于当前显示帧 → `ui_incremental_stale_preview`，同时在
+    拒绝时删除该 overlay（它永远不可能被确认）；
+  - epoch 不一致 → `ui_incremental_preview_epoch_mismatch` 且不改状态，调用方必须显式
+    `reset_ui_interaction_previews(new_epoch)`，该函数返回每个被清除 preview 的恢复记录。
+  - `LocalInteractionCommit`/`ProgramActivation` 作为 cause 进入 CPU delta 路径会被拒绝：
+    commit 的权威路径是 semantic event → domain → InputPublication。
+- 诊断（§8）：`UiIncrementalUpdateRecord::applied/rejected` 产出
+  `ui.incremental_update.applied|rejected` 结构化记录，含 cause、input revision、
+  input keys、binding ids、changed node keys、domains、layout/text/primitives 标记、
+  preview 信息与 status。`gpu_ranges_written` 在 CPU 侧固定为 `null`，只有 renderer
+  报告后才有值，避免任一层替另一层宣称完成。
+- AI 查询（§8）：`UiDebugSession::input_impact` / `interaction_impact` /
+  `node_impact`（反向：哪些 input、binding、branch、domain 能打到一个节点），返回
+  只含稳定 node key / binding id / domain 的 `UiNodeImpactSummary`。
+- §9 Interaction 覆盖：1 preview 不改权威（`interaction_preview_leaves_the_authoritative_frame_untouched`）；
+  2 confirm/rollback/cancel/epoch reset（`confirm_requires_authority_...`、
+  `authoritative_publication_supersedes_...`、`epoch_reset_clears_every_preview_...`）；
+  3 slider 连续 preview 不产生 revision、commit 只发布一次
+  （`repeated_slider_preview_costs_no_revision_and_one_commit_publishes_once`，跨进程 RPC
+  批量的另一半在 Phase D 的 renderer 侧）；4 事件返回的 input frame 产生正确 impact
+  （`interaction_record_links_the_node_to_its_authoritative_input`）；
+  5 stale interaction 清理 preview（`stale_preview_is_rejected_and_its_overlay_is_dropped`）。
+- 证据：
+  - `cargo test -q -p neon-ui-runtime --lib ui_retained_evaluator` →
+    `test result: ok. 18 passed; 0 failed`（Phase B 7 + Phase C 11）。
+  - `cargo test -q -p neon-ui-runtime --lib debug::tests` → `1 passed; 0 failed`。
+  - `cargo test -q -p neon-ui-runtime --lib` → `245 passed; 0 failed`。
+  - `cargo clippy -q -p neon-ui-runtime --lib --all-targets` → 新增/改动文件 0 warning。
+  - `cargo check -q --workspace --all-targets` → exit code `0`。
 
 ### Phase D: WGPU ranges — 未开始（GPU 上传统计与 headless probe 已先行落地，
 commit `b833761`）
