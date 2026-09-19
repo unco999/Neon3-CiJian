@@ -743,11 +743,7 @@ mod tests {
                 max_events: 1,
                 max_clips: 0,
             },
-            dependency_index: neon_ui_schema::UiDependencyIndex {
-                input_to_bindings: BTreeMap::new(),
-                node_to_source_span: BTreeMap::new(),
-                node_to_dependents: BTreeMap::new(),
-            },
+            dependency_index: neon_ui_schema::UiDependencyIndex::default(),
             layout_hash: "layout".into(),
         };
         UiHostAdapter::activate(program, schema, 7).unwrap()
@@ -1268,11 +1264,7 @@ mod tests {
                 max_events: 0,
                 max_clips: 0,
             },
-            dependency_index: neon_ui_schema::UiDependencyIndex {
-                input_to_bindings: BTreeMap::new(),
-                node_to_source_span: BTreeMap::new(),
-                node_to_dependents: BTreeMap::new(),
-            },
+            dependency_index: neon_ui_schema::UiDependencyIndex::default(),
             layout_hash: "layout".into(),
         };
         let mut adapter = UiHostAdapter::activate(program, schema, 7)

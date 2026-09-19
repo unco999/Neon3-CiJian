@@ -67,6 +67,7 @@ pub mod host_adapter;
 pub mod nui_flow;
 pub mod nui_state_machine;
 pub mod terrain_workbench;
+pub mod ui_input_impact;
 pub use event_publisher::{EVENT_VARIABLE_CHANGED, FLOW_EVENT_PREFIX, UiVariableEventPublisher};
 use host_adapter::UiHostAdapter;
 pub use host_adapter::UiHostAdapterConfig;
@@ -2584,6 +2585,17 @@ pub fn compile_ui_program(
         input_to_bindings,
         node_to_source_span,
         node_to_dependents,
+        input_impacts: ui_input_impact::build_input_impacts(
+            schema,
+            &bindings,
+            &branch_records,
+            &nodes,
+        ),
+        interaction_impacts: ui_input_impact::build_interaction_impacts(
+            &nodes,
+            &bindings,
+            &document.events,
+        ),
     };
     let layout_hash = stable_program_hash(document, schema, &nodes, &bindings);
     Ok(UiProgram {

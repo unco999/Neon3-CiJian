@@ -1391,6 +1391,19 @@ pub fn compile_nui_flow_program(
             intent: drop.emit_intent.clone(),
         })
         .collect();
+    crate::ui_input_impact::apply_drag_drop_interactions(
+        &mut program.dependency_index.interaction_impacts,
+        &program
+            .drag_records
+            .iter()
+            .map(|drag| drag.source_node_key.clone())
+            .collect::<Vec<_>>(),
+        &program
+            .drop_records
+            .iter()
+            .map(|drop| (drop.target_node_key.clone(), drop.intent.clone()))
+            .collect::<Vec<_>>(),
+    );
     for node in &mut program.nodes {
         if let Some(span) = document.source_map.get(&node.key) {
             let source_span = UiSourceSpan {

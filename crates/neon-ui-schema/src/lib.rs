@@ -3348,12 +3348,124 @@ pub struct UiBinding {
     pub default_resolved_value: UiInputValue,
 }
 
+/// What a change forces to be regenerated. Declaration order is the canonical
+/// serialization order for every domain list in this crate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UiInvalidationDomain {
+    NodeState,
+    Layout,
+    TextLayout,
+    Resource,
+    ColorInstances,
+    DepthInstances,
+    HitTarget,
+    SemanticBindings,
+    InteractionPresentation,
+}
+
+/// A bound property's minimum regeneration set. The first revision of this
+/// table over-marks deliberately: a missing domain causes stale pixels, an
+/// extra domain only costs work.
+impl UiBoundProperty {
+    pub fn invalidation_domains(&self) -> Vec<UiInvalidationDomain> {
+        use UiInvalidationDomain::*;
+        match self {
+            Self::Visible => vec![NodeState, Layout, ColorInstances, DepthInstances, HitTarget],
+            Self::Enabled => vec![NodeState, ColorInstances, HitTarget],
+            Self::TextValue => vec![
+                NodeState,
+                Layout,
+                TextLayout,
+                ColorInstances,
+                DepthInstances,
+            ],
+            Self::Selected => vec![NodeState, ColorInstances],
+            Self::Active => vec![NodeState, ColorInstances],
+            Self::NumericValue => vec![NodeState, ColorInstances],
+            Self::ImageAsset => vec![NodeState, Resource, ColorInstances, DepthInstances],
+            Self::Opacity => vec![NodeState, ColorInstances, DepthInstances],
+            Self::StateToken => vec![NodeState, ColorInstances],
+            Self::ScrollOffset => {
+                vec![NodeState, Layout, ColorInstances, DepthInstances, HitTarget]
+            }
+            Self::CanvasData => vec![NodeState, Resource, ColorInstances, HitTarget],
+        }
+    }
+}
+
+/// A single binding's contribution to the impact graph.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiBindingImpact {
+    pub binding_id: u32,
+    pub node_key: String,
+    pub property: UiBoundProperty,
+    pub domains: Vec<UiInvalidationDomain>,
+}
+
+/// The complete serialized consequence set of one input slot. Every declared
+/// input has a record even when it binds nothing, so consumers can distinguish
+/// "no impact" from "not analyzed".
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiInputImpact {
+    pub input_key: String,
+    pub binding_impacts: Vec<UiBindingImpact>,
+    pub binding_ids: Vec<u32>,
+    pub branch_keys: Vec<String>,
+    pub affected_node_keys: Vec<String>,
+    pub domains: Vec<UiInvalidationDomain>,
+}
+
+/// Renderer-local interaction families. These never write authoritative
+/// inputs; they only select which local presentation domains change.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum UiInteractionKind {
+    #[default]
+    Hover,
+    Pressed,
+    Focus,
+    TogglePreview,
+    NumericPreview,
+    ChoicePreview,
+    TextEditPreview,
+    ScrollPreview,
+    DragPreview,
+    DropResolution,
+}
+
+/// Compile-time consequence set for renderer-local interaction on one node.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiInteractionImpact {
+    pub node_key: String,
+    pub interaction_kinds: Vec<UiInteractionKind>,
+    pub preview_domains: Vec<UiInvalidationDomain>,
+    pub semantic_intents: Vec<String>,
+    pub controlled_input_keys: Vec<String>,
+}
+
+pub fn sort_dedup_domains(domains: &mut Vec<UiInvalidationDomain>) {
+    domains.sort();
+    domains.dedup();
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UiDependencyIndex {
     pub input_to_bindings: std::collections::BTreeMap<String, Vec<u32>>,
     pub node_to_source_span: std::collections::BTreeMap<String, Option<UiSourceSpan>>,
     pub node_to_dependents: std::collections::BTreeMap<String, Vec<u32>>,
+    /// Present in every program compiled after this field landed; older
+    /// fixtures deserialize with an empty map and no impact guarantee.
+    #[serde(default)]
+    pub input_impacts: std::collections::BTreeMap<String, UiInputImpact>,
+    #[serde(default)]
+    pub interaction_impacts: std::collections::BTreeMap<String, UiInteractionImpact>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
