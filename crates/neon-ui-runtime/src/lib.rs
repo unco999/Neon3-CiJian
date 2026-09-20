@@ -39,13 +39,13 @@ use neon_ui_schema::{
     UiCpuRenderPrimitive, UiCpuSemanticTarget, UiCpuViewport, UiDataGridCellTarget,
     UiDataGridDeclaration, UiDataGridFrame, UiDataGridInputFrame, UiDataGridRecord,
     UiDependencyIndex, UiDiagnostic, UiDiagnosticSeverity, UiDiagnosticsState, UiEffect,
-    UiEventTraceRecord, UiFragment, UiFragmentId, UiFragmentSubmission, UiHostFragmentContext,
-    UiHostInbound, UiHostPublication, UiInputChange, UiInputFrame, UiInputKind, UiInputSchema,
-    UiInputUpdateClass, UiInputValue, UiInputValueSource, UiInspectorState, UiInspectorTab,
-    UiIntent, UiIrDocument, UiNode, UiNodeId, UiNodeKind, UiProgram, UiProgramCapability,
-    UiProgramCapabilityOwner, UiProgramCapabilityStatus, UiProgramDragDropEvent,
-    UiProgramLayoutRecord, UiProgramLiteralText, UiProgramNode, UiProgramResourceKind,
-    UiProgramRevision, UiProgramSemanticEvent, UiProgramSemanticEventKind,
+    UiEventTraceRecord, UiFragment, UiFragmentDelta, UiFragmentId, UiFragmentSubmission,
+    UiHostFragmentContext, UiHostInbound, UiHostPublication, UiInputChange, UiInputFrame,
+    UiInputKind, UiInputSchema, UiInputUpdateClass, UiInputValue, UiInputValueSource,
+    UiInspectorState, UiInspectorTab, UiIntent, UiIrDocument, UiNode, UiNodeId, UiNodeKind,
+    UiProgram, UiProgramCapability, UiProgramCapabilityOwner, UiProgramCapabilityStatus,
+    UiProgramDragDropEvent, UiProgramLayoutRecord, UiProgramLiteralText, UiProgramNode,
+    UiProgramResourceKind, UiProgramRevision, UiProgramSemanticEvent, UiProgramSemanticEventKind,
     UiProgramSemanticEventResult, UiProgramSemanticEventStatus, UiRepeatFrame,
     UiResolvedInputValue, UiResolvedInputs, UiSchemaError, UiSemanticEvent,
     UiSemanticInteractionMetadata, UiSemanticPayloadValue, UiStyle, UiSurfaceEvent,
@@ -2012,6 +2012,36 @@ fn derived_effect_node(effect: &UiEffect) -> Option<&str> {
             Some(node_id.0.as_str())
         }
         _ => None,
+    }
+}
+
+fn find_changed_nodes(root: &UiNode, keys: &BTreeSet<String>, out: &mut Vec<UiNode>) {
+    if keys.contains(root.node_id.0.as_str()) {
+        out.push(root.clone());
+    }
+    for child in &root.children {
+        find_changed_nodes(child, keys, out);
+    }
+}
+
+fn fragment_delta(
+    base: &UiFragment,
+    updated: &UiFragment,
+    refresh: &UiFragmentRefresh,
+) -> UiFragmentDelta {
+    let keys = refresh
+        .changed_nodes
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut changed_nodes = Vec::new();
+    find_changed_nodes(&updated.root, &keys, &mut changed_nodes);
+    UiFragmentDelta {
+        fragment_id: updated.fragment_id.clone(),
+        base_revision: base.revision,
+        revision: updated.revision,
+        changed_nodes,
+        effects: (refresh.effects_rebuilt > 0).then(|| updated.effects.clone()),
     }
 }
 
@@ -4490,10 +4520,11 @@ impl UiRuntime {
             if op.get("kind").and_then(Value::as_str) == Some("set")
                 && op.get("property").and_then(Value::as_str) == Some("source_file")
             {
-                if let (Some(node_key), Some(new_path)) = (
+                if let (Some(path), Some(new_path)) = (
                     op.get("path").and_then(Value::as_str),
                     op.get("value").and_then(Value::as_str),
                 ) {
+                    let node_key = path.rsplit('/').next().unwrap_or(path);
                     if let Some(decl) = new_ir.code_editors.get_mut(node_key) {
                         decl.source_file = Some(new_path.to_string());
                     }
@@ -6222,25 +6253,64 @@ impl UiRuntime {
                     &result.changed_slots,
                 );
                 self.record_fragment_refresh("ui.input.apply", &request.request_id, &refresh);
-                let submitted = self.forward_fragment(
-                    wgpu_endpoint,
-                    RpcRequest {
+                let delta = fragment_delta(&active, &updated, &refresh);
+                let use_delta = refresh.delta_applied && !delta.changed_nodes.is_empty();
+                let (method, params) = if use_delta {
+                    (
+                        "wgpu.ui.submit_fragment_delta",
+                        json!(UiCommand::SubmitFragmentDelta { delta }),
+                    )
+                } else {
+                    (
+                        "wgpu.ui.submit_fragment",
+                        json!(UiCommand::SubmitFragment {
+                            submission: UiFragmentSubmission::new(updated.clone())
+                        }),
+                    )
+                };
+                let mut submitted = RpcClient::connect(wgpu_endpoint).and_then(|mut client| {
+                    client.call(&RpcRequest {
                         protocol: "neon3.rpc".into(),
                         version: PROTOCOL_VERSION,
                         request_id: RequestId(format!("{}-fragment", request.request_id.0)),
                         client: self.client.clone(),
                         target: ServiceName(SERVICE_NAME.into()),
-                        method: "ui.fragment.submit".into(),
-                        params: json!(UiCommand::SubmitFragment {
-                            submission: UiFragmentSubmission::new(updated.clone())
-                        }),
+                        method: method.into(),
+                        params,
                         expected_revision: Some(active.revision),
                         idempotency_key: Some(format!(
                             "ui-input-fragment:{}",
                             request.idempotency_key.clone().unwrap_or_default()
                         )),
-                    },
-                );
+                    })
+                });
+                if use_delta
+                    && submitted
+                        .as_ref()
+                        .is_ok_and(|response| response.status != RpcStatus::Accepted)
+                {
+                    submitted = RpcClient::connect(wgpu_endpoint).and_then(|mut client| {
+                        client.call(&RpcRequest {
+                            protocol: "neon3.rpc".into(),
+                            version: PROTOCOL_VERSION,
+                            request_id: RequestId(format!(
+                                "{}-fragment-full",
+                                request.request_id.0
+                            )),
+                            client: self.client.clone(),
+                            target: ServiceName(SERVICE_NAME.into()),
+                            method: "wgpu.ui.submit_fragment".into(),
+                            params: json!(UiCommand::SubmitFragment {
+                                submission: UiFragmentSubmission::new(updated.clone())
+                            }),
+                            expected_revision: Some(active.revision),
+                            idempotency_key: Some(format!(
+                                "ui-input-fragment-full:{}",
+                                request.idempotency_key.clone().unwrap_or_default()
+                            )),
+                        })
+                    });
+                }
                 let Ok(submitted) = submitted else {
                     return self.rejected(
                         request.request_id,

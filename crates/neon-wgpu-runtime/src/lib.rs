@@ -411,6 +411,16 @@ impl WindowBackdrop {
 /// premultiplied clear so it is below transparent UI pixels but in the visual
 /// that actually reaches the screen.
 /// Parse `{ extras: [[f32;4]; 10] }` from RPC params for wgpu.ui.set_view_extras.
+fn replace_fragment_node(root: &mut UiNode, replacement: &UiNode) -> bool {
+    if root.node_id == replacement.node_id {
+        *root = replacement.clone();
+        return true;
+    }
+    root.children
+        .iter_mut()
+        .any(|child| replace_fragment_node(child, replacement))
+}
+
 fn parse_view_extras(params: &Value) -> Result<[[f32; 4]; 10], String> {
     let arr = params
         .get("extras")
@@ -12500,13 +12510,16 @@ impl WgpuRuntime {
         if matches!(
             request.method.as_str(),
             "wgpu.ui.submit_fragment"
+                | "wgpu.ui.submit_fragment_delta"
                 | "wgpu.ui.remove_fragment"
                 | "wgpu.world.info.configure"
                 | "wgpu.world.camera.submit_frame"
         ) {
             if matches!(
                 request.method.as_str(),
-                "wgpu.ui.submit_fragment" | "wgpu.ui.remove_fragment"
+                "wgpu.ui.submit_fragment"
+                    | "wgpu.ui.submit_fragment_delta"
+                    | "wgpu.ui.remove_fragment"
             ) && request.client.kind == ClientKind::UiReactClient
             {
                 return self.reject(
@@ -12616,6 +12629,9 @@ impl WgpuRuntime {
             "debug.interaction.get" => self.interaction_get(request_id, request.params),
             "debug.interaction.query" => self.interaction_query(request_id, request.params),
             "wgpu.ui.submit_fragment" => self.submit_fragment(request_id, request.params),
+            "wgpu.ui.submit_fragment_delta" => {
+                self.submit_fragment_delta(request_id, request.params)
+            }
             "wgpu.ui.remove_fragment" => self.remove_fragment(request_id, request.params),
             "wgpu.shader.register" => self.shader_register(request_id, request.params),
             "wgpu.shader.state" => self.accept(request_id, self.shader_registry.snapshot()),
@@ -12886,6 +12902,88 @@ impl WgpuRuntime {
         self.graph_revision = Revision(self.graph_revision.0 + 1);
         self.hit_target_generation += 1;
         self.accept(request_id, diagnostics_value(self.diagnostics()))
+    }
+
+    fn submit_fragment_delta(&mut self, request_id: RequestId, params: Value) -> RpcResponse {
+        let command = match serde_json::from_value::<UiCommand>(params) {
+            Ok(UiCommand::SubmitFragmentDelta { delta }) => delta,
+            Ok(_) => {
+                return self.reject(
+                    request_id,
+                    "invalid_request",
+                    "expected submit_fragment_delta command",
+                    None,
+                );
+            }
+            Err(error) => {
+                return self.reject(
+                    request_id,
+                    "invalid_request",
+                    &format!("invalid UI delta: {error}"),
+                    None,
+                );
+            }
+        };
+        let Some(resident_revision) = self
+            .fragments
+            .get(&command.fragment_id)
+            .map(|fragment| fragment.revision)
+        else {
+            return self.reject(
+                request_id,
+                "ui_delta_base_missing",
+                "base fragment is not resident",
+                None,
+            );
+        };
+        if resident_revision != command.base_revision {
+            return self.reject(
+                request_id,
+                "ui_delta_base_revision_conflict",
+                "delta base revision is not resident",
+                Some(resident_revision),
+            );
+        }
+        if command.revision <= command.base_revision {
+            return self.reject(
+                request_id,
+                "ui_delta_revision_invalid",
+                "delta revision must advance",
+                Some(resident_revision),
+            );
+        }
+        let Some(current) = self.fragments.get_mut(&command.fragment_id) else {
+            return self.reject(
+                request_id,
+                "ui_delta_base_missing",
+                "base fragment is not resident",
+                None,
+            );
+        };
+        let mut changed = 0usize;
+        for node in command.changed_nodes {
+            if replace_fragment_node(&mut current.root, &node) {
+                changed += 1;
+            } else {
+                return self.reject(
+                    request_id,
+                    "ui_delta_node_missing",
+                    "changed node is not resident; submit a full fragment",
+                    Some(resident_revision),
+                );
+            }
+        }
+        if let Some(effects) = command.effects {
+            current.effects = effects;
+        }
+        current.revision = command.revision;
+        self.graph_revision = Revision(self.graph_revision.0 + 1);
+        self.hit_target_generation += 1;
+        let revision = current.revision;
+        self.accept(
+            request_id,
+            json!({"mode":"delta","changed_nodes":changed,"fragment_revision":revision}),
+        )
     }
 
     /// `wgpu.shader.register`: adopt a validated custom shader package.

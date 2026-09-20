@@ -1,0 +1,67 @@
+[neon-wgpu] startup: NEON_CONTINUOUS_RENDER=Err(NotPresent), args=["D:\\Neon3\\target\\debug\\neon-wgpu-runtime.exe", "--window-server", "127.0.0.1:39302"]
+{"backend":"dx12","event":"wgpu.backend.selected","mode":"windowed","reason":"d3d12_shared_texture_v1"}
+{"adapter":"NVIDIA GeForce RTX 3060 Ti","backend":"dx12","event":"wgpu.adapter.selected","luid":"000000000000c210"}
+{"alpha_mode":"PreMultiplied","composition_swapchain":true,"event":"neon.window.surface.configured","format":"Bgra8UnormSrgb","height":1408,"width":2576}
+neon-wgpu surface present mode: Mailbox
+Error: "wgpu.ui.submit_fragment_delta rejected: Some(RpcError { code: \"unsupported_method\", message: \"method is not supported\", current_revision: None, object_id: None, details: None })"
+world-ui-lab camera focus: window=true surface=false target=render.world-ui-lab.preview
+world-ui-lab camera focus: window=true surface=false target=render.world-ui-lab.preview
+world-ui-lab camera focus: window=true surface=false target=render.world-ui-lab.preview
+world-ui-lab camera focus: window=true surface=false target=render.world-ui-lab.preview
+world-ui-lab camera focus: window=true surface=false target=render.world-ui-lab.preview
+world-ui-lab camera focus: window=true surface=false target=render.world-ui-lab.preview
+world-ui-lab camera focus: window=true surface=false target=render.world-ui-lab.preview
+world-ui-lab camera focus: window=true surface=false target=render.world-ui-lab.preview
+world-ui-lab camera focus: window=true surface=false target=render.world-ui-lab.preview
+world-ui-lab camera focus: window=true surface=false target=render.world-ui-lab.preview
+world-ui-lab camera focus: window=true surface=false target=render.world-ui-lab.preview
+world-ui-lab camera focus: window=true surface=false target=render.world-ui-lab.preview
+world-ui-lab camera focus: window=true surface=false target=render.world-ui-lab.preview
+world-ui-lab camera focus: window=true surface=false target=render.world-ui-lab.preview
+world-ui-lab camera focus: window=true surface=false target=render.world-ui-lab.preview
+world-ui-lab camera focus: window=true surface=false target=render.world-ui-lab.preview
+world-ui-lab camera focus: window=true surface=false target=render.world-ui-lab.preview
+world-ui-lab camera focus: window=true surface=false target=render.world-ui-lab.preview
+world-ui-lab camera focus: window=true surface=false target=render.world-ui-lab.preview
+world-ui-lab camera focus: window=true surface=false target=render.world-ui-lab.preview
+world-ui-lab camera focus: window=true surface=false target=render.world-ui-lab.preview
+world-ui-lab camera focus: window=true surface=false target=render.world-ui-lab.preview
+world-ui-lab camera focus: window=true surface=false target=render.world-ui-lab.preview
+world-ui-lab camera focus: window=true surface=false target=render.world-ui-lab.preview
+world-ui-lab camera focus: window=true surface=false target=render.world-ui-lab.preview
+world-ui-lab camera focus: window=true surface=false target=render.world-ui-lab.preview
+world-ui-lab camera focus: window=true surface=false target=render.world-ui-lab.preview
+world-ui-lab camera focus: window=true surface=false target=render.world-ui-lab.preview
+world-ui-lab camera focus: window=true surface=false target=render.world-ui-lab.preview
+world-ui-lab camera focus: window=true surface=false target=render.world-ui-lab.preview
+world-ui-lab camera focus: window=true surface=false target=render.world-ui-lab.preview
+world-ui-lab camera focus: window=true surface=false target=render.world-ui-lab.preview
+world-ui-lab camera focus: window=true surface=false target=render.world-ui-lab.preview
+world-ui-lab camera focus: window=true surface=false target=render.world-ui-lab.preview
+world-ui-lab camera focus: window=true surface=false target=render.world-ui-lab.preview
+world-ui-lab camera focus: window=true surface=false target=render.world-ui-lab.preview
+world-ui-lab camera focus: window=true surface=false target=render.world-ui-lab.preview
+world-ui-lab camera focus: window=true surface=false target=render.world-ui-lab.preview
+world-ui-lab camera focus: window=true surface=false target=render.world-ui-lab.preview
+world-ui-lab camera focus: window=true surface=false target=render.world-ui-lab.preview
+world-ui-lab camera focus: window=true surface=false target=render.world-ui-lab.preview
+world-ui-lab camera focus: window=true surface=false target=render.world-ui-lab.preview
+world-ui-lab camera focus: window=true surface=false target=render.world-ui-lab.preview
+world-ui-lab camera focus: window=true surface=false target=render.world-ui-lab.preview
+world-ui-lab camera focus: window=true surface=false target=render.world-ui-lab.preview
+world-ui-lab camera focus: window=true surface=false target=render.world-ui-lab.preview
+world-ui-lab camera focus: window=true surface=false target=render.world-ui-lab.preview
+world-ui-lab camera focus: window=true surface=false target=render.world-ui-lab.preview
+world-ui-lab camera focus: window=true surface=false target=render.world-ui-lab.preview
+world-ui-lab camera focus: window=true surface=false target=render.world-ui-lab.preview
+world-ui-lab camera focus: window=true surface=false target=render.world-ui-lab.preview
+world-ui-lab camera focus: window=true surface=false target=render.world-ui-lab.preview
+world-ui-lab camera focus: window=true surface=false target=render.world-ui-lab.preview
+world-ui-lab camera focus: window=true surface=false target=render.world-ui-lab.preview
+world-ui-lab camera focus: window=true surface=false target=render.world-ui-lab.preview
+world-ui-lab camera focus: window=true surface=false target=render.world-ui-lab.preview
+world-ui-lab camera focus: window=true surface=false target=render.world-ui-lab.preview
+world-ui-lab camera focus: window=true surface=false target=render.world-ui-lab.preview
+world-ui-lab camera focus: window=true surface=false target=render.world-ui-lab.preview
+world-ui-lab camera focus: window=true surface=false target=render.world-ui-lab.preview
+world-ui-lab camera focus: window=true surface=false target=render.world-ui-lab.preview

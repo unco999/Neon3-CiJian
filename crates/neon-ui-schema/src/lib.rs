@@ -2368,10 +2368,27 @@ pub enum UiCommand {
     SubmitFragment {
         submission: UiFragmentSubmission,
     },
+    /// Patch an already accepted fragment without resending its static tree.
+    /// The consumer applies the node records against `base_revision`; any
+    /// topology or revision mismatch must reject and force a full submission.
+    SubmitFragmentDelta {
+        delta: UiFragmentDelta,
+    },
     RemoveFragment {
         fragment_id: UiFragmentId,
         revision: Revision,
     },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiFragmentDelta {
+    pub fragment_id: UiFragmentId,
+    pub base_revision: Revision,
+    pub revision: Revision,
+    pub changed_nodes: Vec<UiNode>,
+    #[serde(default)]
+    pub effects: Option<Vec<UiEffect>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

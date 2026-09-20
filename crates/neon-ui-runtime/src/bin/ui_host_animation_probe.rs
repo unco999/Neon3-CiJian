@@ -132,7 +132,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     has_transition(&submission.fragment.root, "left-panel"),
                     has_transition(&submission.fragment.root, "right-panel"),
                 ),
-                Ok(UiCommand::RemoveFragment { .. }) | Err(_) => (Revision(0), false, false),
+                Ok(UiCommand::RemoveFragment { .. })
+                | Ok(UiCommand::SubmitFragmentDelta { .. })
+                | Err(_) => (Revision(0), false, false),
             };
             let _ = renderer_events.send(json!({
                 "kind": "renderer.fragment",
