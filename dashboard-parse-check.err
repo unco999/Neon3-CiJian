@@ -1,0 +1,35 @@
+[neon-wgpu] startup: NEON_CONTINUOUS_RENDER=Err(NotPresent), args=["D:\\Neon3\\target\\debug\\neon-wgpu-runtime.exe", "--window-server", "127.0.0.1:39302", "127.0.0.1:39303"]
+{"backend":"dx12","event":"wgpu.backend.selected","mode":"windowed","reason":"d3d12_shared_texture_v1"}
+{"adapter":"NVIDIA GeForce RTX 3060 Ti","backend":"dx12","event":"wgpu.adapter.selected","luid":"000000000000c210"}
+{"alpha_mode":"PreMultiplied","composition_swapchain":true,"event":"neon.window.surface.configured","format":"Bgra8UnormSrgb","height":1408,"width":2576}
+neon-wgpu surface present mode: Mailbox
+world-ui-lab camera focus: window=true surface=false target=render.world-ui-lab.preview
+[wgpu-click] node_path=Some("")
+[srv] ui.host.inbound: read=7.9877479s handle=1.9709ms
+world-ui-lab camera focus: window=true surface=false target=render.world-ui-lab.preview
+[wgpu-click] node_path=Some("incremental-dashboard/theme-button")
+[srv] ui.host.inbound: read=674.5758ms handle=1.7497ms
+world-ui-lab camera focus: window=true surface=false target=render.world-ui-lab.preview
+[wgpu-click] node_path=Some("incremental-dashboard/theme-button")
+[srv] ui.host.inbound: read=758.1678ms handle=346.7µs
+world-ui-lab camera focus: window=true surface=false target=render.world-ui-lab.preview
+[wgpu-click] node_path=Some("incremental-dashboard/theme-button")
+[srv] ui.host.inbound: read=811.8687ms handle=329.7µs
+world-ui-lab camera focus: window=true surface=false target=render.world-ui-lab.preview
+[wgpu-click] node_path=Some("")
+[srv] ui.host.inbound: read=1.1874207s handle=393µs
+world-ui-lab camera focus: window=true surface=false target=render.world-ui-lab.preview
+[wgpu-click] node_path=Some("incremental-dashboard/theme-button")
+[srv] ui.host.inbound: read=3.9656466s handle=320.4µs
+world-ui-lab camera focus: window=true surface=false target=render.world-ui-lab.preview
+[wgpu-click] node_path=Some("incremental-dashboard/theme-button")
+[srv] ui.host.inbound: read=1.439911s handle=373.9µs
+world-ui-lab camera focus: window=true surface=false target=render.world-ui-lab.preview
+[wgpu-click] node_path=Some("incremental-dashboard/theme-button")
+[srv] ui.host.inbound: read=1.4109153s handle=404.6µs
+world-ui-lab camera focus: window=true surface=false target=render.world-ui-lab.preview
+[wgpu-click] node_path=Some("")
+[srv] ui.host.inbound: read=6.7110173s handle=334.5µs
+world-ui-lab camera focus: window=true surface=false target=render.world-ui-lab.preview
+[wgpu-click] node_path=Some("")
+[srv] ui.host.inbound: read=516.4913ms handle=439.3µs

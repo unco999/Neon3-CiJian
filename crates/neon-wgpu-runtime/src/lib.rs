@@ -11006,6 +11006,7 @@ fn spawn_window_server(
                 let mutates_composition = matches!(
                     request.method.as_str(),
                     "wgpu.ui.submit_fragment"
+                        | "wgpu.ui.submit_fragment_delta"
                         | "wgpu.ui.remove_fragment"
                         | "ui.flow.submit"
                         | "wgpu.world.info.configure"

@@ -7,6 +7,13 @@ AI 创建或修改 NUI Flow 前，还必须阅读 [AI NUI Flow Authoring](docs/n
 与 `plan/neon3-nui-flow.md`。NUI Flow 只允许声明式 UI 和受限的本地 presentation
 statechart，不能承载领域规则、项目写入、代码执行或 GPU 资源操作。
 
+当前 UI 增量更新的完整规则见 [Neon3 UI Architecture Summary](docs/neon3-ui-architecture-summary.md)。
+新增 UI 必须遵守：input -> dependency impact -> retained delta -> WGPU sparse write；普通
+input/style 变化不得无条件重建完整 fragment、instance 或 GPU buffer。Flow 中所有动态绑定必须
+引用已声明的 input；互斥样式使用显式 input，不使用未被属性支持的 `!$input` 表达式。验收必须
+同时证明 changed nodes、delta consumer 应用和最终视觉变化，不能只根据 RPC accepted 或日志
+中的 `submit_rpc` 宣称渲染成功。
+
 ## 1. 已确认的核心模型
 
 Neon3 使用多个独立、可单独启动和重启的无窗口业务进程，但所有 wgpu 渲染集中在唯一的

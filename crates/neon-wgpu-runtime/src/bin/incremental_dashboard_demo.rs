@@ -23,9 +23,9 @@ use neon_ui_runtime::{
 };
 use neon_ui_schema::{
     UI_PROGRAM_CAPABILITY_NAME, UI_PROGRAM_SCHEMA_VERSION, UiCommand, UiFragment, UiFragmentDelta,
-    UiFragmentId, UiFragmentSubmission, UiInputChange, UiInputFrame, UiInputValue,
+    UiFragmentId, UiFragmentSubmission, UiInputChange, UiInputFrame, UiInputValue, UiIntent,
     UiProgramCapability, UiProgramCapabilityOwner, UiProgramCapabilityStatus, UiProgramRevision,
-    UiIntent, UiSemanticEvent,
+    UiSemanticEvent,
 };
 use serde_json::json;
 
@@ -33,7 +33,7 @@ const ENDPOINT: &str = "127.0.0.1:39302";
 const UI_ENDPOINT: &str = "127.0.0.1:39303";
 const VIEWPORT_W: f32 = 1200.0;
 const VIEWPORT_H: f32 = 760.0;
-const RUN_FOR: Duration = Duration::from_secs(18);
+const RUN_FOR: Duration = Duration::from_secs(120);
 
 fn request(method: &str, sequence: u64, params: serde_json::Value) -> RpcRequest {
     RpcRequest {
@@ -80,7 +80,8 @@ fn launch() -> Result<Child, String> {
 }
 
 fn start_ui_host(queue: std::sync::Arc<std::sync::Mutex<Vec<String>>>) -> Result<(), String> {
-    let server = RpcServer::bind(UI_ENDPOINT.parse().unwrap()).map_err(|error| error.to_string())?;
+    let server =
+        RpcServer::bind(UI_ENDPOINT.parse().unwrap()).map_err(|error| error.to_string())?;
     thread::spawn(move || {
         let _ = server.serve_until(move |request: RpcRequest| {
             if request.method == "ui.host.inbound"
@@ -88,7 +89,12 @@ fn start_ui_host(queue: std::sync::Arc<std::sync::Mutex<Vec<String>>>) -> Result
                 && let UiIntent::Invoke { action, .. } = event.intent
                 && let Ok(mut events) = queue.lock()
             {
-                events.push(action);
+                let value = match event.control_value {
+                    Some(neon_ui_schema::UiSemanticPayloadValue::Bool { value }) => format!(":{value}"),
+                    _ => String::new(),
+                };
+                println!("{}", json!({"probe":"incremental-dashboard.v1","event":"semantic_click_received","action":action,"control_value":value}));
+                events.push(format!("{action}{value}"));
             }
             (
                 RpcResponse {
@@ -108,21 +114,38 @@ fn start_ui_host(queue: std::sync::Arc<std::sync::Mutex<Vec<String>>>) -> Result
 
 fn dashboard_flow() -> String {
     let mut flow = format!(
-        "version 1\nsurface incremental-dashboard revision 1\nbudget nodes=256 bindings=64 instances=256 text=128 glyphs=4096 events=32 clips=256\ninput cpu f32:0..1 default 0.45\ninput memory f32:0..1 default 0.62\ninput network f32:0..1 default 0.35\ninput alerts bool default false\ninput selected bool default true\nsurface root overlay w {VIEWPORT_W} h {VIEWPORT_H} fill #0A1020\n"
+        "version 1\nsurface incremental-dashboard revision 1\nbudget nodes=256 bindings=64 instances=256 text=128 glyphs=4096 events=32 clips=256\ninput theme_light bool default true\ninput theme_dark bool default false\nsurface root overlay w {VIEWPORT_W} h {VIEWPORT_H} fill #0A1020\n"
     );
     flow.push_str("  panel header x 24 y 18 w 1152 h 58 fill #111D35 radius 8\n");
     flow.push_str("    text title x 20 y 10 w 460 h 26 value \"NEON3 / RETAINED TELEMETRY\"\n");
     flow.push_str("    text subtitle x 20 y 35 w 700 h 16 value \"Input impact graph · retained CPU frame · sparse GPU ranges\"\n");
-    flow.push_str("  panel alert-banner x 24 y 88 w 1152 h 34 fill #8A2638 opacity 0.92 visible $alerts radius 6\n");
-    flow.push_str("    text alert-text x 18 y 7 w 700 h 18 value \"ALERT: localized input update, surrounding dashboard retained\"\n");
+    flow.push_str("  button theme-button x 980 y 30 w 170 h 28 value \"Toggle Theme\" event dashboard.theme.toggle\n");
+    flow.push_str(
+        "  panel light-theme x 24 y 88 w 1152 h 642 fill #E8EEF7 visible $theme_light radius 8\n",
+    );
+    flow.push_str(
+        "    text theme-label x 24 y 18 w 400 h 24 value \"LIGHT THEME / RETAINED STRUCTURE\"\n",
+    );
+    flow.push_str("    text theme-detail x 24 y 48 w 900 h 18 value \"Only the theme layer changes; chart, table, and control topology remain resident\"\n");
+    flow.push_str("    panel theme-accent-a x 24 y 84 w 520 h 96 fill #FFFFFF radius 8\n");
+    flow.push_str("    panel theme-accent-b x 570 y 84 w 540 h 96 fill #D8E5F5 radius 8\n");
+    flow.push_str("    text theme-status x 24 y 210 w 900 h 22 value \"STATUS: local semantic input update\"\n");
+    flow.push_str(
+        "  panel dark-theme x 24 y 88 w 1152 h 642 fill #172033 visible $theme_dark radius 8\n",
+    );
+    flow.push_str("    text theme-label-dark x 24 y 18 w 400 h 24 value \"DARK THEME / RETAINED STRUCTURE\"\n");
+    flow.push_str("    text theme-detail-dark x 24 y 48 w 900 h 18 value \"Only the theme layer changes; chart, table, and control topology remain resident\"\n");
+    flow.push_str("    panel theme-accent-dark-a x 24 y 84 w 520 h 96 fill #243B5A radius 8\n");
+    flow.push_str("    panel theme-accent-dark-b x 570 y 84 w 540 h 96 fill #304B70 radius 8\n");
+    flow.push_str("    text theme-status-dark x 24 y 210 w 900 h 22 value \"STATUS: local semantic input update\"\n");
 
     let cards = [
-        ("cpu-card", "CPU LOAD", "#163B63", 0.45, "cpu"),
-        ("memory-card", "MEMORY", "#214E48", 0.62, "memory"),
-        ("network-card", "NETWORK", "#563D25", 0.35, "network"),
-        ("stable-card", "FRAME RATE", "#33285E", 0.98, "none"),
+        ("cpu-card", "CPU LOAD", "#163B63", 0.45),
+        ("memory-card", "MEMORY", "#214E48", 0.62),
+        ("network-card", "NETWORK", "#563D25", 0.35),
+        ("stable-card", "FRAME RATE", "#33285E", 0.98),
     ];
-    for (index, (id, label, color, _, input)) in cards.iter().enumerate() {
+    for (index, (id, label, color, ratio)) in cards.iter().enumerate() {
         let x = 24.0 + index as f32 * 288.0;
         flow.push_str(&format!(
             "  panel {id} x {x} y 138 w 270 h 106 fill {color} radius 8\n"
@@ -130,15 +153,13 @@ fn dashboard_flow() -> String {
         flow.push_str(&format!(
             "    text {id}-label x 16 y 12 w 200 h 18 value \"{label}\"\n"
         ));
-        if *input == "none" {
-            flow.push_str(&format!(
-                "    text {id}-value x 16 y 38 w 220 h 30 value \"60 FPS\"\n"
-            ));
-        } else {
-            flow.push_str(&format!(
-                "    progress_bar {id}-bar x 16 y 72 w 238 h 12 numeric ${input}\n"
-            ));
-        }
+        flow.push_str(&format!(
+            "    text {id}-value x 16 y 38 w 220 h 30 value \"{label}\"\n"
+        ));
+        flow.push_str(&format!(
+            "    panel {id}-bar x 16 y 72 w {} h 12 fill #6EA8FE radius 3\n",
+            (238.0 * ratio) as u32
+        ));
     }
 
     flow.push_str("  panel chart-panel x 24 y 264 w 690 h 300 fill #101A2C radius 8\n");
@@ -150,9 +171,18 @@ fn dashboard_flow() -> String {
         let y = 64.0 + (index / 16) as f32 * 100.0;
         let h = 28.0 + ((index * 37) % 60) as f32;
         let color = if index % 5 == 0 { "#E6A23C" } else { "#3B82F6" };
-        flow.push_str(&format!(
-            "    panel bar-{index} x {x} y {y} w 25 h {h} fill {color} radius 3\n"
-        ));
+        if index % 3 == 0 {
+            flow.push_str(&format!(
+                "    panel bar-{index}-light x {x} y {y} w 25 h {h} fill #3B82F6 visible $theme_light radius 3\n"
+            ));
+            flow.push_str(&format!(
+                "    panel bar-{index}-dark x {x} y {y} w 25 h {h} fill #F97316 visible $theme_dark radius 3\n"
+            ));
+        } else {
+            flow.push_str(&format!(
+                "    panel bar-{index} x {x} y {y} w 25 h {h} fill {color} radius 3\n"
+            ));
+        }
     }
     flow.push_str("    text chart-foot x 18 y 270 w 620 h 18 value \"blue: retained samples, amber: alert boundary\"\n");
 
@@ -233,6 +263,8 @@ fn submit_delta(endpoint: SocketAddr, delta: UiFragmentDelta, sequence: u64) -> 
 
 fn main() -> Result<(), String> {
     let endpoint: SocketAddr = ENDPOINT.parse().unwrap();
+    let ui_events = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    start_ui_host(ui_events.clone())?;
     let mut child = launch()?;
     let started = Instant::now();
     while started.elapsed() < Duration::from_secs(15) {
@@ -304,30 +336,32 @@ fn main() -> Result<(), String> {
         json!({"probe":"incremental-dashboard.v1","event":"frame_submitted","sequence":0,"timing_ms":{"refresh":0.0,"submit_rpc":submit_rpc_ms},"producer":{"input_revision":first.input_revision,"delta_applied":first.delta_applied,"bindings_executed":first.bindings_executed,"bindings_total":first.bindings_total,"nodes_written":first.nodes_written,"nodes_total":first.nodes_total},"consumer":{"fragment_revision":fragment.revision,"transport":"neon3.rpc","method":"wgpu.ui.submit_fragment"},"status":"passed"})
     );
 
-    let updates = [
-        ("cpu", 0.78_f32),
-        ("memory", 0.31),
-        ("network", 0.91),
-        ("alerts", 1.0),
-        ("selected", 0.0),
-        ("cpu", 0.36),
-        ("memory", 0.84),
-        ("alerts", 0.0),
-        ("network", 0.42),
-        ("selected", 1.0),
-        ("cpu", 0.67),
-        ("memory", 0.48),
-    ];
     let demo_started = Instant::now();
-    for (sequence, (key, value)) in updates.iter().enumerate() {
-        let base = store.snapshot();
-        let input_value = if *key == "alerts" || *key == "selected" {
-            UiInputValue::Bool {
-                value: *value > 0.5,
-            }
-        } else {
-            UiInputValue::F32 { value: *value }
+    let mut sequence = 0usize;
+    while demo_started.elapsed() < RUN_FOR {
+        let action = ui_events.lock().ok().and_then(|mut events| events.pop());
+        let Some(action) = action else {
+            thread::sleep(Duration::from_millis(16));
+            continue;
         };
+        let (dark, source) = match action.as_str() {
+            value if value.starts_with("dashboard.theme.toggle:") => {
+                (value.ends_with("true"), "click")
+            }
+            "dashboard.theme.toggle" => {
+                let current = matches!(
+                    store
+                        .snapshot()
+                        .values
+                        .get("theme_dark")
+                        .map(|value| &value.value),
+                    Some(UiInputValue::Bool { value: true })
+                );
+                (!current, "click")
+            }
+            _ => continue,
+        };
+        let base = store.snapshot();
         let applied = store
             .apply(
                 UiInputWriter::External,
@@ -336,10 +370,16 @@ fn main() -> Result<(), String> {
                     expected_input_revision: base.input_revision,
                     request_id: format!("dashboard-input-{sequence}"),
                     idempotency_key: format!("dashboard-input-{sequence}"),
-                    changes: vec![UiInputChange {
-                        key: (*key).into(),
-                        value: input_value,
-                    }],
+                    changes: vec![
+                        UiInputChange {
+                            key: "theme_dark".into(),
+                            value: UiInputValue::Bool { value: dark },
+                        },
+                        UiInputChange {
+                            key: "theme_light".into(),
+                            value: UiInputValue::Bool { value: !dark },
+                        },
+                    ],
                 },
             )
             .map_err(|error| error.code.to_owned())?;
@@ -372,18 +412,20 @@ fn main() -> Result<(), String> {
         let submit_rpc_ms = submit_started.elapsed().as_secs_f64() * 1000.0;
         println!(
             "{}",
-            json!({"probe":"incremental-dashboard.v1","event":"frame_submitted","sequence":sequence+1,"timing_ms":{"refresh":refresh_ms,"submit_rpc":submit_rpc_ms},"producer":{"input_key":key,"input_revision":refresh.input_revision,"dirty_slots":refresh.dirty_slots,"changed_bindings":refresh.changed_bindings,"changed_nodes":refresh.changed_nodes,"bindings_executed":refresh.bindings_executed,"bindings_total":refresh.bindings_total,"nodes_written":refresh.nodes_written,"nodes_total":refresh.nodes_total,"delta_applied":refresh.delta_applied},"consumer":{"fragment_revision":fragment.revision,"transport":"neon3.rpc","method":"wgpu.ui.submit_fragment_delta","payload":"changed_nodes_plus_optional_effects"},"status":"passed"})
+            json!({"probe":"incremental-dashboard.v1","event":"frame_submitted","sequence":sequence+1,"source":source,"timing_ms":{"refresh":refresh_ms,"submit_rpc":submit_rpc_ms},"producer":{"input_key":"theme_dark","input_values":{"theme_dark":dark,"theme_light":!dark},"input_revision":refresh.input_revision,"dirty_slots":refresh.dirty_slots,"changed_bindings":refresh.changed_bindings,"changed_nodes":refresh.changed_nodes,"bindings_executed":refresh.bindings_executed,"bindings_total":refresh.bindings_total,"nodes_written":refresh.nodes_written,"nodes_total":refresh.nodes_total,"delta_applied":refresh.delta_applied},"consumer":{"fragment_revision":fragment.revision,"transport":"neon3.rpc","method":"wgpu.ui.submit_fragment_delta","payload":"changed_nodes_plus_optional_effects"},"status":"passed"})
         );
-        thread::sleep(Duration::from_millis(1100));
-        if demo_started.elapsed() >= RUN_FOR {
-            break;
-        }
+        sequence += 1;
+        thread::sleep(Duration::from_millis(if source == "click" {
+            16
+        } else {
+            1100
+        }));
     }
     thread::sleep(Duration::from_secs(2));
     let _ = child.kill();
     println!(
         "{}",
-        json!({"probe":"incremental-dashboard.v1","final":true,"status":"passed","visual":"windowed_dashboard","frames":updates.len()+1,"scope":"CPU retained projection + public WGPU fragment delta + renderer sparse buffer path","known_boundary":"Topology/layout changes still require full fragment fallback"})
+        json!({"probe":"incremental-dashboard.v1","final":true,"status":"passed","visual":"windowed_dashboard","frames":sequence+1,"scope":"CPU retained projection + public WGPU fragment delta + renderer sparse buffer path","known_boundary":"This demo only mutates resident nodes; no full-fragment fallback is used"})
     );
     Ok(())
 }
