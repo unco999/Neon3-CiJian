@@ -110,9 +110,15 @@ fn apply_keyword_fallback(per_line: &mut [Vec<Span>], text: &str, kind: Language
             if span.class != TokenClass::Ident {
                 continue;
             }
-            let start = (span.start as usize).min(line_text.len());
-            let end = (start + span.len as usize).min(line_text.len());
-            let word: String = line_text[start..end].chars().collect();
+            // `Span` columns and lengths are counted in characters
+            // (`LineIndex::point`), so the line has to be walked by characters:
+            // indexing it by those numbers as bytes misread every line holding a
+            // multi-byte character and panicked when one landed inside it.
+            let word: String = line_text
+                .chars()
+                .skip(span.start as usize)
+                .take(span.len as usize)
+                .collect();
             if keywords.contains(&word.as_str()) {
                 span.class = TokenClass::Keyword;
             }
@@ -509,6 +515,22 @@ mod tests {
                 .iter()
                 .any(|s| s.class == TokenClass::NumericLiteral)
         );
+    }
+
+    #[test]
+    fn keyword_fallback_reads_spans_as_char_columns() {
+        // A span to the right of a multi-byte character has a char column below
+        // its byte offset. Slicing the line by that number panicked when the
+        // index fell inside the character, which is what killed a windowed host
+        // as soon as such a document was opened.
+        let text = "让 as\n";
+        let mut per_line = vec![vec![Span {
+            start: 2,
+            len: 2,
+            class: TokenClass::Ident,
+        }]];
+        apply_keyword_fallback(&mut per_line, text, LanguageKind::Rust);
+        assert_eq!(per_line[0][0].class, TokenClass::Keyword);
     }
 
     #[test]

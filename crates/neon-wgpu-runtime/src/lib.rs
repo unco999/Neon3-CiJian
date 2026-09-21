@@ -12538,7 +12538,19 @@ impl WgpuRuntime {
                     None,
                 );
             };
-            if let Some(response) = self.idempotent_responses.get(idempotency_key) {
+            // A recorded answer may only stand in for a retry of the upload it was
+            // recorded for. An upload naming a fragment revision this renderer does
+            // not hold is a different command: replaying across it would answer
+            // "accepted" while discarding the new composition.
+            let replaces_resident_content = upload_target(&request.method, &request.params)
+                .is_some_and(|(fragment_id, revision)| {
+                    self.fragments
+                        .get(&UiFragmentId(fragment_id))
+                        .map_or(true, |current| revision > current.revision.0)
+                });
+            if let Some(response) = self.idempotent_responses.get(idempotency_key)
+                && !replaces_resident_content
+            {
                 let mut response = response.clone();
                 response.request_id = request_id.clone();
                 self.record_receipt(&request_id, CommandState::Accepted, None);
@@ -13631,6 +13643,23 @@ fn diagnostics_value(diagnostics: RenderDiagnostics) -> Value {
     })
 }
 
+/// Which fragment a fragment upload asks the renderer to hold afterwards, read
+/// straight off the params so the payload is not deserialized twice.
+fn upload_target(method: &str, params: &Value) -> Option<(String, u64)> {
+    let (id, revision) = match method {
+        "wgpu.ui.submit_fragment" => (
+            params.pointer("/submission/fragment/fragment_id")?,
+            params.pointer("/submission/fragment/revision")?,
+        ),
+        "wgpu.ui.submit_fragment_delta" => (
+            params.pointer("/delta/fragment_id")?,
+            params.pointer("/delta/revision")?,
+        ),
+        _ => return None,
+    };
+    Some((id.as_str()?.to_owned(), revision.as_u64()?))
+}
+
 fn composition_graph_snapshot(graph_revision: Revision, hit_target_generation: u64) -> Value {
     json!({
         "graph_revision": graph_revision, "hit_target_generation": hit_target_generation,
@@ -14412,6 +14441,54 @@ mod tests {
         assert_eq!(response.error.unwrap().code, "external_host_required");
     }
 
+    /// A repeated idempotency key may only stand in for a *retry*. An upload that
+    /// names a fragment revision the renderer does not hold has to be applied:
+    /// replaying across it answers "accepted" while the composition is dropped,
+    /// which is how a client that uploads without a per-frame key went deaf.
+    #[test]
+    fn reused_idempotency_key_cannot_replay_over_a_newer_fragment_revision() {
+        fn submit_with_shared_key(runtime: &mut WgpuRuntime, revision: u64) -> RpcResponse {
+            let mut request = request(
+                &format!("submit-fragment-{revision}"),
+                "wgpu.ui.submit_fragment",
+                json!(UiCommand::SubmitFragment {
+                    submission: UiFragmentSubmission::new(fragment(revision)),
+                }),
+            );
+            request.idempotency_key = Some("shared-upload-key".into());
+            runtime.handle(request)
+        }
+        fn resident(runtime: &WgpuRuntime) -> Option<Revision> {
+            runtime
+                .fragments
+                .get(&UiFragmentId("static-fragment".into()))
+                .map(|fragment| fragment.revision)
+        }
+
+        let mut runtime = WgpuRuntime::headless(1);
+        assert_eq!(
+            submit_with_shared_key(&mut runtime, 1).status,
+            RpcStatus::Accepted
+        );
+        assert_eq!(resident(&runtime), Some(Revision(1)));
+        assert_eq!(
+            submit_with_shared_key(&mut runtime, 2).status,
+            RpcStatus::Accepted
+        );
+        assert_eq!(
+            resident(&runtime),
+            Some(Revision(2)),
+            "the newer revision must reach the fragments map, not the replay cache"
+        );
+
+        // A real retry — the same revision the renderer already holds — still replays.
+        assert_eq!(
+            submit_with_shared_key(&mut runtime, 1).status,
+            RpcStatus::Accepted
+        );
+        assert_eq!(resident(&runtime), Some(Revision(2)));
+    }
+
     #[test]
     fn camera_gated_world_panel_is_hidden_until_a_matching_frame_arrives() {
         let mut runtime = WgpuRuntime::headless(1);
@@ -15093,7 +15170,8 @@ mod tests {
     fn repeated_idempotency_key_does_not_mutate_twice() {
         let mut runtime = WgpuRuntime::headless(1);
         let first = runtime.handle(submit("first", 1));
-        let mut repeat = submit("repeat", 2);
+        // The same command, replayed: same fragment, same revision.
+        let mut repeat = submit("repeat", 1);
         repeat.idempotency_key = Some("key-first".into());
         let repeated = runtime.handle(repeat);
         assert_eq!(first.status, RpcStatus::Accepted);

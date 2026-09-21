@@ -15,6 +15,14 @@ pub use async_rpc::{
 
 pub const DEFAULT_MAX_FRAME_SIZE: usize = 128 * 1024 * 1024;
 
+/// Upper bound on the TCP handshake alone. A loopback dial normally completes in well
+/// under a millisecond, so this only ever fires when nothing will accept.
+///
+/// It has to be bounded because Windows spends ~2 s retrying before it reports
+/// `ConnectionRefused` for a closed loopback port, and an unbounded connect therefore
+/// stalls the entire serving thread that dialed it - not just the one request.
+pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_millis(100);
+
 #[derive(Debug)]
 pub enum TransportError {
     FrameTooLarge { size: usize, max: usize },
@@ -112,8 +120,23 @@ pub struct RpcClient {
 
 impl RpcClient {
     pub fn connect(endpoint: SocketAddr) -> Result<Self, TransportError> {
+        Self::connect_with_timeout(endpoint, DEFAULT_CONNECT_TIMEOUT)
+    }
+
+    /// Connects with an explicit handshake bound. The length of the wait for a peer
+    /// that is not there is a property of the operating system, not of this protocol,
+    /// so it must be chosen here rather than inherited from the stack default.
+    pub fn connect_with_timeout(
+        endpoint: SocketAddr,
+        connect_timeout: Duration,
+    ) -> Result<Self, TransportError> {
         ensure_loopback(endpoint)?;
-        let stream = TcpStream::connect(endpoint).map_err(map_io_error)?;
+        let stream =
+            TcpStream::connect_timeout(&endpoint, connect_timeout).map_err(map_io_error)?;
+        // This protocol is request/response over a fresh connection: a partly-filled
+        // segment would wait for the peer's delayed acknowledgement before the request
+        // is ever delivered.
+        stream.set_nodelay(true).map_err(map_io_error)?;
         Ok(Self {
             stream,
             max_frame_size: DEFAULT_MAX_FRAME_SIZE,
@@ -151,7 +174,9 @@ pub struct EventClient {
 impl EventClient {
     pub fn connect(endpoint: SocketAddr) -> Result<Self, TransportError> {
         ensure_loopback(endpoint)?;
-        let stream = TcpStream::connect(endpoint).map_err(map_io_error)?;
+        let stream =
+            TcpStream::connect_timeout(&endpoint, DEFAULT_CONNECT_TIMEOUT).map_err(map_io_error)?;
+        stream.set_nodelay(true).map_err(map_io_error)?;
         Ok(Self {
             stream,
             max_frame_size: DEFAULT_MAX_FRAME_SIZE,
@@ -468,6 +493,35 @@ mod tests {
             RpcServer::bind(endpoint),
             Err(TransportError::Io(_))
         ));
+    }
+
+    /// Windows reports a refused loopback port only after retrying for ~2 s, which is
+    /// long enough to stall every request queued behind the one that dialed. Both
+    /// clients have to bound that handshake rather than inherit it from the stack.
+    #[test]
+    fn an_absent_service_fails_fast_instead_of_earning_a_multi_second_stall() {
+        let closed = {
+            let server = TcpListener::bind("127.0.0.1:0").unwrap();
+            server.local_addr().unwrap()
+        };
+
+        let started = std::time::Instant::now();
+        let dialed = RpcClient::connect(closed);
+        let elapsed = started.elapsed();
+        assert!(dialed.is_err(), "connecting to a closed port must fail");
+        assert!(
+            elapsed < Duration::from_millis(1000),
+            "RpcClient::connect to a closed port took {elapsed:?}"
+        );
+
+        let started = std::time::Instant::now();
+        let dialed = EventClient::connect(closed);
+        let elapsed = started.elapsed();
+        assert!(dialed.is_err(), "connecting to a closed port must fail");
+        assert!(
+            elapsed < Duration::from_millis(1000),
+            "EventClient::connect to a closed port took {elapsed:?}"
+        );
     }
 
     #[test]

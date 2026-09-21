@@ -16,10 +16,10 @@
 //! `--headless` (default) runs the headless WGPU server; `--window` opens the
 //! windowed runtime (window server manages the UI endpoint itself).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, mpsc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use neon_editor::ChangeSet;
 use neon_protocol::{
@@ -33,25 +33,38 @@ enum EditorDocumentRequest {
         binding: UiEditorDocumentBinding,
         initial_source: String,
     },
+    /// Re-read of a document the bridge already holds. It carries no
+    /// `initial_source` on purpose: a re-poll that finds nothing open must not
+    /// open it itself, because the only source at hand here is the editor's own
+    /// buffer text and the language to open it with is not known at this layer.
+    Refresh {
+        binding: UiEditorDocumentBinding,
+    },
     Change {
         binding: UiEditorDocumentBinding,
         change_set: ChangeSet,
     },
 }
 
+/// How recently a document may have been asked for before another pull is worth
+/// sending. `refresh_provider_snapshots` runs on every drawn frame, and the editor
+/// service serialises behind document opens, so this is the ceiling on polling.
+const EDITOR_SNAPSHOT_REFRESH: Duration = Duration::from_millis(250);
+
 struct EditorRuntimeDocumentProvider {
     requests: mpsc::Sender<EditorDocumentRequest>,
     snapshots: Arc<Mutex<HashMap<String, EditorDocumentFrame>>>,
-    pending: Arc<Mutex<HashSet<String>>>,
+    /// When each document was last asked for. Doubles as the in-flight dedupe the
+    /// first fetch needs and the refresh ceiling the re-poll needs.
+    pending: Arc<Mutex<HashMap<String, Instant>>>,
 }
 
 impl EditorRuntimeDocumentProvider {
     fn start(endpoint: SocketAddr) -> Arc<Self> {
         let (requests, receiver) = mpsc::channel();
         let snapshots = Arc::new(Mutex::new(HashMap::new()));
-        let pending = Arc::new(Mutex::new(HashSet::new()));
+        let pending = Arc::new(Mutex::new(HashMap::new()));
         let cache = snapshots.clone();
-        let pending_worker = pending.clone();
         std::thread::spawn(move || {
             let mut sequence = 0_u64;
             while let Ok(request) = receiver.recv() {
@@ -75,6 +88,23 @@ impl EditorRuntimeDocumentProvider {
                             }),
                             document_id,
                             Some(initial_source),
+                        )
+                    }
+                    EditorDocumentRequest::Refresh { binding } => {
+                        let mut binding = binding;
+                        if binding.epoch == 0 {
+                            binding.epoch = 1;
+                        }
+                        let document_id = binding.document_id.clone();
+                        (
+                            "editor.document.snapshot.get",
+                            serde_json::json!({
+                                "document_id": binding.document_id,
+                                "session_id": binding.session_id,
+                                "epoch": binding.epoch,
+                            }),
+                            document_id,
+                            None,
                         )
                     }
                     EditorDocumentRequest::Change {
@@ -175,9 +205,6 @@ impl EditorRuntimeDocumentProvider {
                         }
                     }
                 }
-                if let Ok(mut pending) = pending_worker.lock() {
-                    pending.remove(&document_id);
-                }
             }
         });
         Arc::new(Self {
@@ -188,12 +215,31 @@ impl EditorRuntimeDocumentProvider {
     }
 }
 
+impl EditorRuntimeDocumentProvider {
+    /// Claims the right to ask the editor runtime about this document *now*. The
+    /// stamp doubles as the first fetch's in-flight dedupe, so a document cannot be
+    /// polled more than once per `EDITOR_SNAPSHOT_REFRESH` however many frames get
+    /// drawn in between — and a fetch that failed retries on the same ceiling rather
+    /// than every frame.
+    fn claim(&self, document_id: &str) -> bool {
+        let Ok(mut pending) = self.pending.lock() else {
+            return false;
+        };
+        let now = Instant::now();
+        if pending
+            .get(document_id)
+            .is_some_and(|when| now.duration_since(*when) < EDITOR_SNAPSHOT_REFRESH)
+        {
+            return false;
+        }
+        pending.insert(document_id.to_owned(), now);
+        true
+    }
+}
+
 impl EditorDocumentProvider for EditorRuntimeDocumentProvider {
     fn request_snapshot(&self, binding: &UiEditorDocumentBinding, initial_source: &str) {
-        let Ok(mut pending) = self.pending.lock() else {
-            return;
-        };
-        if !pending.insert(binding.document_id.clone()) {
+        if !self.claim(&binding.document_id) {
             return;
         }
         if self
@@ -204,12 +250,31 @@ impl EditorDocumentProvider for EditorRuntimeDocumentProvider {
             })
             .is_err()
         {
-            pending.remove(&binding.document_id);
+            if let Ok(mut pending) = self.pending.lock() {
+                pending.remove(&binding.document_id);
+            }
         }
     }
 
     fn take_snapshot(&self, document_id: &str) -> Option<EditorDocumentFrame> {
         self.snapshots.lock().ok()?.get(document_id).cloned()
+    }
+
+    fn refresh_snapshot(&self, binding: &UiEditorDocumentBinding) {
+        if !self.claim(&binding.document_id) {
+            return;
+        }
+        if self
+            .requests
+            .send(EditorDocumentRequest::Refresh {
+                binding: binding.clone(),
+            })
+            .is_err()
+        {
+            if let Ok(mut pending) = self.pending.lock() {
+                pending.remove(&binding.document_id);
+            }
+        }
     }
 
     fn submit_change(&self, binding: &UiEditorDocumentBinding, change_set: ChangeSet) {
@@ -317,16 +382,18 @@ fn main() {
         let _ui_task = {
             let ui = ui;
             let wgpu = wgpu;
-            // Windowed IDE flows use the local UI adapter and eventd. The
-            // forwarder has a bounded local fallback when no domain host is
-            // present, so do not point semantic clicks at editor-runtime.
-            let dead_domain: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
+            // Windowed IDE flows use the local UI adapter and eventd. Semantic clicks
+            // must not be pointed at editor-runtime, and "no domain host" is spelled
+            // NO_DOMAIN_HOST rather than a closed port: this runtime answers requests
+            // one at a time, and Windows takes ~2 s to refuse a loopback connect, so a
+            // closed port would charge that wait to the next request on the UI lane.
+            let no_domain = neon_ui_runtime::NO_DOMAIN_HOST;
             let eventd = eventd;
             std::thread::spawn(move || {
                 if let Err(error) = neon_ui_runtime::UiRuntime::serve_forwarder(
                     ui,
                     wgpu,
-                    dead_domain,
+                    no_domain,
                     Some(eventd),
                     1,
                 ) {
@@ -378,6 +445,15 @@ fn main() {
                 let bridge = editor_bridge.clone();
                 Box::new(move |params, now| {
                     let path = params.get("path")?.as_str()?.to_string();
+                    // A reveal is the host asking "show me this document now", so it
+                    // is the one moment the presentation may not lag the authority.
+                    // Adoption otherwise only happens on a drawn frame, and an idle
+                    // window draws for seconds at a time, which is why an outside
+                    // write could sit unadopted long after the authority moved on.
+                    // The provider answers at its own per-document ceiling, so this
+                    // costs at most one extra snapshot RPC per document per 250 ms
+                    // however fast the caller polls.
+                    bridge.refresh_provider_snapshots();
                     bridge.reveal(
                         &path,
                         params.get("line")?.as_u64()? as u32,

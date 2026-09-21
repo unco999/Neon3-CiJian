@@ -100,7 +100,18 @@ impl AsyncRpcClient {
         outbound_capacity: usize,
     ) -> Result<Self, TransportError> {
         ensure_loopback(endpoint)?;
-        let stream = TcpStream::connect(endpoint).await.map_err(map_io_error)?;
+        // Bounded for the same reason as the blocking client: Windows takes ~2 s to
+        // report a refused loopback port, and an unbounded connect would park this
+        // future - and whoever awaits it - for that long.
+        let stream = match tokio::time::timeout(
+            crate::DEFAULT_CONNECT_TIMEOUT,
+            TcpStream::connect(endpoint),
+        )
+        .await
+        {
+            Ok(connected) => connected.map_err(map_io_error)?,
+            Err(_elapsed) => return Err(TransportError::Timeout),
+        };
         stream.set_nodelay(true).ok();
 
         let (read, write) = stream.into_split();

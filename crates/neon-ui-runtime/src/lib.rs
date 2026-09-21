@@ -2,7 +2,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
-    net::SocketAddr,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::mpsc::{self, Receiver, Sender},
     time::Instant,
 };
@@ -98,6 +98,17 @@ pub const CAPABILITY_NUMERIC_ANIMATION: &str = "ui.numeric.animation.v1";
 pub const CAPABILITY_TRANSFORM_ANIMATION: &str = "ui.transform.animation.v1";
 pub const CAPABILITY_TIMELINE_ANIMATION: &str = "ui.timeline.animation.v1";
 const INTERACTION_TRACE_CAPACITY: usize = 256;
+
+/// The domain endpoint a host uses when it has no domain service at all.
+///
+/// Semantic intents still resolve: the local UI adapter answers them, which is the
+/// fallback `forward_host_request` already builds for a failed host RPC. Port 0 is
+/// chosen over a closed port because the dial must be a no-op, not a wait: a closed
+/// loopback port takes seconds to refuse on Windows, and this runtime serves every
+/// request from one thread, so that wait would be charged to whatever request happens
+/// to arrive next - including the input frame that replies to a click.
+pub const NO_DOMAIN_HOST: SocketAddr =
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
 
 /// Materializes one visible instance from a hidden declarative template prototype.
 /// The prototype remains unchanged; instance IDs are scoped by the caller's stable key.
@@ -1823,7 +1834,12 @@ fn apply_transitions_to_fragment(fragment: &mut UiFragment, motions: &[PendingSt
                     node.style.transform = transform;
                 }
             }
-            node.enter_transition = Some(transition);
+            // `UiTransition::is_valid` demands a positive duration, so an instant
+            // record cannot be attached at all - and it must not be left stale
+            // either: the renderer reads an absent descriptor as "commit now" and
+            // cancels the node's running track, which is exactly what a state
+            // reached over a motion-less edge has to do to an in-flight animation.
+            node.enter_transition = (transition.duration_ms > 0).then_some(transition);
         }
         for child in &mut node.children {
             apply(child, motions, numeric_nodes, motion_scope);
@@ -3465,6 +3481,85 @@ impl PendingStateMotion {
     }
 }
 
+/// Resolves one executor transition into the record that paints it.
+///
+/// The `transition <machine> <from> -> <to> motion <key>` clause is parsed with
+/// no predicate, so the executor never fires it by itself: it is the motion
+/// lookup table `motion_key_for` reads. A named motion that was never declared
+/// resolves to nothing, which is how the pointer lane has always treated it.
+/// An edge with no motion at all becomes an instant record, so the target
+/// state's styles still land on the fragment.
+fn pending_motion_for(
+    document: &NuiFlowDocument,
+    transition: &NuiFlowStateTransitionResult,
+) -> Option<PendingStateMotion> {
+    let resolved = match &transition.motion_key {
+        Some(key) => document
+            .motions
+            .iter()
+            .find(|motion| &motion.key == key)
+            .map(|motion| motion.transition.clone())?,
+        None => UiTransition {
+            delay_ms: 0,
+            duration_ms: 0,
+            easing: neon_ui_schema::UiEasing::Linear,
+            from: neon_ui_schema::UiTransitionState::default(),
+            motion_key: None,
+            timeline: None,
+        },
+    };
+    Some(PendingStateMotion {
+        machine_key: transition.machine_key.clone(),
+        previous_state: transition.previous_state.clone(),
+        target_state: transition.state.clone(),
+        state_revision: transition.revision,
+        transition: resolved,
+        previous_styles: transition.previous_styles.clone(),
+        target_styles: transition.target_styles.clone(),
+    })
+}
+
+/// Each machine's *current* state as an instant style restore.
+///
+/// A patch clones a fresh node tree out of `document.ir.root`, which drops every
+/// `style` override the state lane wrote, while the machine itself is deliberately
+/// kept across patches (R2). Left alone the two disagree: the runtime reports the
+/// state and the screen paints the authored `fill`. Restoring through
+/// `apply_transitions_to_fragment` with a zero-duration descriptor writes the same
+/// fields the transition lane writes, and nothing else: a recompile is not a state
+/// change, so replaying the edge's motion for an unrelated text patch is exactly
+/// the failure the presentation rules forbid.
+fn current_state_style_restores(
+    document: &NuiFlowDocument,
+    machine: &NuiFlowStateMachineRuntime,
+) -> Vec<PendingStateMotion> {
+    document
+        .state_machines
+        .iter()
+        .filter_map(|declaration| {
+            let state = declaration.states.iter().find(|state| {
+                machine.state(&declaration.key) == Some(state.name.as_str())
+            })?;
+            (!state.styles.is_empty()).then(|| PendingStateMotion {
+                machine_key: declaration.key.clone(),
+                previous_state: state.name.clone(),
+                target_state: state.name.clone(),
+                state_revision: machine.revision(),
+                transition: UiTransition {
+                    delay_ms: 0,
+                    duration_ms: 0,
+                    easing: neon_ui_schema::UiEasing::Linear,
+                    from: neon_ui_schema::UiTransitionState::default(),
+                    motion_key: None,
+                    timeline: None,
+                },
+                previous_styles: Vec::new(),
+                target_styles: state.styles.clone(),
+            })
+        })
+        .collect()
+}
+
 fn pending_motion_debug(motion: &PendingStateMotion) -> Value {
     json!({
         "machine_key": motion.machine_key,
@@ -4696,6 +4791,15 @@ impl UiRuntime {
             &[],
         );
         self.record_fragment_refresh("ui.flow.patch", &request.request_id, &refresh);
+        // The refresh above re-evaluated every node from the recompiled program, so
+        // the appearance of a machine that is still in the state it was in is gone.
+        // Put it back before this fragment is what the renderer sees.
+        if let Some(machine) = self.flow_state_machine.as_ref() {
+            apply_transitions_to_fragment(
+                &mut fragment,
+                &current_state_style_restores(&new_doc, machine),
+            );
+        }
         self.host_adapter = Some(adapter);
         timings.fragment_ms = elapsed_ms(fragment_started);
         let forwarded = RpcRequest {
@@ -4956,25 +5060,9 @@ impl UiRuntime {
                 .snapshot()
                 .scalar_inputs;
             let transitions = machine.dispatch_semantic_event(document, &inputs, event);
-            for transition in transitions {
-                if let Some(motion_key) = transition.motion_key {
-                    let base = document
-                        .motions
-                        .iter()
-                        .find(|motion| motion.key == motion_key)
-                        .map(|motion| motion.transition.clone());
-                    if let Some(base_transition) = base {
-                        let pending = PendingStateMotion {
-                            machine_key: transition.machine_key,
-                            previous_state: transition.previous_state,
-                            target_state: transition.state,
-                            state_revision: transition.revision,
-                            transition: base_transition,
-                            previous_styles: transition.previous_styles,
-                            target_styles: transition.target_styles,
-                        };
-                        selected_motions.push(pending);
-                    }
+            for transition in transitions.iter() {
+                if let Some(pending) = pending_motion_for(document, transition) {
+                    selected_motions.push(pending);
                 }
             }
         }
@@ -5116,10 +5204,20 @@ impl UiRuntime {
         }
         // Sync path: host RPC + publication application synchronously.
         let _t_hrpc = std::time::Instant::now();
-        let host_response = match RpcClient::connect(host_endpoint)
-            .and_then(|client| client.with_timeout(std::time::Duration::from_millis(200)))
-            .and_then(|mut client| client.call(&forwarded))
-        {
+        // With no domain host configured there is nothing to dial, so fail the forward
+        // here and let the local adapter answer it below. `serve_until` runs every
+        // request on this one thread, so a dial that has to time out would be charged
+        // to whatever arrives next rather than to this click.
+        let host_response = if host_endpoint == NO_DOMAIN_HOST {
+            Err(TransportError::Io(std::io::Error::other(
+                "domain host is not configured",
+            )))
+        } else {
+            RpcClient::connect(host_endpoint)
+                .and_then(|client| client.with_timeout(std::time::Duration::from_millis(200)))
+                .and_then(|mut client| client.call(&forwarded))
+        };
+        let host_response = match host_response {
             Ok(response) => response,
             Err(_error) if local_semantic_event.is_some() => {
                 let adapter = self
@@ -5428,7 +5526,15 @@ impl UiRuntime {
                 submission: UiFragmentSubmission::new(updated.clone())
             }),
             expected_revision: Some(fragment.revision),
-            idempotency_key: Some(format!("ui-host-fragment:{idempotency_key}")),
+            // The revision belongs in the key: an idempotency key that a *later*
+            // fragment reuses makes `forward_fragment` replay the earlier accepted
+            // response, so the new content is dropped while the caller is told
+            // "accepted". One key per (command, revision) keeps a retry deduping
+            // without ever covering a different upload.
+            idempotency_key: Some(format!(
+                "ui-host-fragment:{idempotency_key}:{}",
+                updated.revision.0
+            )),
         };
         let _t_frag = std::time::Instant::now();
         eprintln!("[host] before_frag: {:?}", _t.elapsed());
@@ -6215,6 +6321,15 @@ impl UiRuntime {
                 );
             }
         };
+        // The upload identity has to be the frame's own key. `ui.input.frame` carries it
+        // in `params`, and a client that does not also set the transport-level field would
+        // otherwise make every frame in the process share one key — the renderer would
+        // answer with its cached idempotent replay and the fragment would never upload.
+        let frame_key = request
+            .idempotency_key
+            .clone()
+            .filter(|key| !key.trim().is_empty())
+            .unwrap_or_else(|| frame.idempotency_key.clone());
         let Some(adapter) = self.host_adapter.as_mut() else {
             return self.rejected(
                 request.request_id,
@@ -6279,8 +6394,8 @@ impl UiRuntime {
                         params,
                         expected_revision: Some(active.revision),
                         idempotency_key: Some(format!(
-                            "ui-input-fragment:{}",
-                            request.idempotency_key.clone().unwrap_or_default()
+                            "ui-input-fragment:{frame_key}:{}",
+                            updated.revision.0
                         )),
                     })
                 });
@@ -6305,8 +6420,8 @@ impl UiRuntime {
                             }),
                             expected_revision: Some(active.revision),
                             idempotency_key: Some(format!(
-                                "ui-input-fragment-full:{}",
-                                request.idempotency_key.clone().unwrap_or_default()
+                                "ui-input-fragment-full:{frame_key}:{}",
+                                updated.revision.0
                             )),
                         })
                     });
@@ -6322,6 +6437,12 @@ impl UiRuntime {
                     return submitted;
                 }
                 self.cached_fragment = Some(updated);
+                // A domain write is a *confirmed* state change, so it drives the
+                // presentation machine exactly the way a pointer intent does: the
+                // `sync` edges advance it and any motion declared on that edge
+                // rides this same frame. Running it after the submission keeps the
+                // machine from moving when the frame's own fragment was rejected.
+                self.synchronize_flow_states(&result.snapshot.scalar_inputs);
                 let response = self.accepted(
                     request.request_id,
                     json!({"input": result, "renderer": submitted.result}),
@@ -6359,6 +6480,39 @@ impl UiRuntime {
                 )
             }
         }
+    }
+
+    /// Runs the Flow `sync` edges against an applied input publication.
+    ///
+    /// A pointer advances a presentation machine through `dispatch`; until now
+    /// nothing evaluated the `sync` trigger at all, so `sync`/`style`/`transition`
+    /// in a submitted document were reachable from the renderer's clicks and from
+    /// nowhere else. Domain state is the other half of that contract: when the
+    /// authoritative value of a slot *is* the state, the frame that carries it has
+    /// to move the machine, or the shell can only paint the same state through the
+    /// patch channel and pay a whole-program recompile for it.
+    ///
+    /// The records land in `pending_motions`, which the frame's own pass drains
+    /// after its fragment refresh, so the state paint and the input paint reach
+    /// the renderer together.
+    fn synchronize_flow_states(&mut self, inputs: &UiResolvedInputs) {
+        let (Some(document), Some(machine)) =
+            (self.flow_document.as_ref(), self.flow_state_machine.as_mut())
+        else {
+            return;
+        };
+        let selected = machine
+            .synchronize(document, inputs)
+            .iter()
+            .filter_map(|transition| pending_motion_for(document, transition))
+            .collect::<Vec<_>>();
+        for motion in &selected {
+            let scope_key = motion.scope_key();
+            self.pending_motions
+                .retain(|pending| pending.scope_key() != scope_key);
+            self.pending_motions.push(motion.clone());
+        }
+        self.last_state_transitions = selected;
     }
 
     /// Refreshes the cached fragment with the current adapter inputs, applies

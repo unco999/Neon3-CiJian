@@ -16188,6 +16188,36 @@ fn clamp_dimension(value: f32, layout: &UiLayout, height: bool) -> f32 {
     value.clamp(minimum, maximum)
 }
 
+/// True when the child asks the container for whatever main-axis space is left
+/// over - `grow` with no authored main size and no explicit flex basis - so its
+/// base is the leftover space rather than its own content.
+///
+/// The distinction matters because a content-sized base and a free-space base
+/// disagree the moment the content is wider than the row: a `code_editor` with
+/// `wrap none` measures its longest line, and if that number is what the row
+/// lays out with, every sibling behind it is pushed past the row's own edge.
+/// They are then clipped to width 0, which the hit test reads as "nothing of
+/// this control is visible" and the click is never forwarded.
+fn asks_for_free_space(child: &UiNode, height: bool) -> bool {
+    let layout = child.layout.unwrap_or_default();
+    let declared = if height {
+        child.bounds.height
+    } else {
+        child.bounds.width
+    };
+    layout.flex_grow > 0.0 && layout.flex_basis.is_none() && declared == 0.0
+}
+
+/// What one visible child contributes to the main axis of a flow container.
+fn main_flow_contribution(child: &UiNode, size: [f32; 2], height: bool) -> f32 {
+    let measured = if height { size[1] } else { size[0] };
+    if asks_for_free_space(child, height) {
+        dimension_limits(&child.layout.unwrap_or_default(), height).0
+    } else {
+        measured
+    }
+}
+
 fn intrinsic_size(node: &UiNode, font: Option<&ResidentFont>) -> [f32; 2] {
     if let Some(text_ref) = node.text.as_ref() {
         let rich_text;
@@ -16249,27 +16279,39 @@ fn intrinsic_size(node: &UiNode, font: Option<&ResidentFont>) -> [f32; 2] {
         .children
         .iter()
         .filter(|child| child.visible)
-        .map(|child| intrinsic_size(child, font))
+        .map(|child| (child, intrinsic_size(child, font)))
         .collect::<Vec<_>>();
     let gap = layout.gap * children.len().saturating_sub(1) as f32;
     let padding_width = layout.padding[1] + layout.padding[3];
     let padding_height = layout.padding[0] + layout.padding[2];
     match layout.mode {
         UiLayoutMode::Row => [
-            node.bounds
-                .width
-                .max(children.iter().map(|size| size[0]).sum::<f32>() + gap + padding_width),
+            node.bounds.width.max(
+                children
+                    .iter()
+                    .map(|(child, size)| main_flow_contribution(child, *size, false))
+                    .sum::<f32>()
+                    + gap
+                    + padding_width,
+            ),
             node.bounds
                 .height
-                .max(children.iter().map(|size| size[1]).fold(0.0, f32::max) + padding_height),
+                .max(children.iter().map(|(_, size)| size[1]).fold(0.0, f32::max)
+                    + padding_height),
         ],
         UiLayoutMode::Column => [
             node.bounds
                 .width
-                .max(children.iter().map(|size| size[0]).fold(0.0, f32::max) + padding_width),
-            node.bounds
-                .height
-                .max(children.iter().map(|size| size[1]).sum::<f32>() + gap + padding_height),
+                .max(children.iter().map(|(_, size)| size[0]).fold(0.0, f32::max)
+                    + padding_width),
+            node.bounds.height.max(
+                children
+                    .iter()
+                    .map(|(child, size)| main_flow_contribution(child, *size, true))
+                    .sum::<f32>()
+                    + gap
+                    + padding_height,
+            ),
         ],
         _ => [0.0, 0.0],
     }
@@ -16342,17 +16384,25 @@ fn resolve_children(
             }
             let layout = child.layout.unwrap_or_default();
             layout.flex_basis.unwrap_or_else(|| {
-                resolved_dimension(
-                    if row {
-                        child.bounds.width
-                    } else {
-                        child.bounds.height
-                    },
-                    child,
-                    &layout,
-                    font,
-                    !row,
-                )
+                // Same rule as the container measure above: the flex base of an
+                // item that lives on leftover space is its min limit, so the grow
+                // pass below hands it the space the row actually has. Measuring it
+                // from content instead makes `grow` a request to overflow.
+                if asks_for_free_space(child, !row) {
+                    dimension_limits(&layout, !row).0
+                } else {
+                    resolved_dimension(
+                        if row {
+                            child.bounds.width
+                        } else {
+                            child.bounds.height
+                        },
+                        child,
+                        &layout,
+                        font,
+                        !row,
+                    )
+                }
             })
         })
         .collect::<Vec<_>>();
@@ -21696,6 +21746,86 @@ mod tests {
         assert_eq!(
             nodes[1].2.bounds.y, nodes[2].2.bounds.y,
             "center alignment uses common cross-axis placement"
+        );
+    }
+
+    /// A `grow` child with no authored width is a request for the space the row
+    /// has left over, not a request to widen the row. When its base came from
+    /// measured content instead, a wide `code_editor` inflated the row past its
+    /// own declared width and every sibling behind it landed outside the clip -
+    /// which the hit test then refused as `semantic_target_clipped`.
+    #[test]
+    fn wide_grow_child_leaves_a_fixed_sibling_inside_its_row() {
+        let mut root = node();
+        root.bounds = UiBounds {
+            x: 0.0,
+            y: 0.0,
+            width: 400.0,
+            height: 100.0,
+        };
+        root.layout = Some(UiLayout {
+            mode: UiLayoutMode::Row,
+            ..UiLayout::default()
+        });
+        for (id, grow, width, text) in [
+            ("side", 0.0, 40.0, None),
+            (
+                "wide",
+                1.0,
+                0.0,
+                Some("x".repeat(200).as_str()), /* measured far wider than the row */
+            ),
+            ("agent", 0.0, 60.0, None),
+        ] {
+            root.children.push(UiNode {
+                node_id: UiNodeId(id.into()),
+                kind: UiNodeKind::Label,
+                bounds: UiBounds {
+                    x: 0.0,
+                    y: 0.0,
+                    width,
+                    height: 0.0,
+                },
+                layout: Some(UiLayout {
+                    flex_grow: grow,
+                    ..UiLayout::default()
+                }),
+                visible: true,
+                enabled: true,
+                text_key: None,
+                text: text.map(|value| TextRef::Literal {
+                    value: value.into(),
+                }),
+                image: None,
+                surface: None,
+                style: UiStyle::default(),
+                enter_transition: None,
+                clip_shape: UiClipShape::default(),
+                children: Vec::new(),
+                world_depth: None,
+                world_scale: None,
+            });
+        }
+        let fragments = HashMap::from([(
+            UiFragmentId("row".into()),
+            UiFragment {
+                fragment_id: UiFragmentId("row".into()),
+                revision: Revision(1),
+                root,
+                effects: Vec::new(),
+            },
+        )]);
+        let nodes = flatten_fragments(&fragments, [400.0, 100.0], None);
+        assert_eq!(nodes[0].2.bounds.width, 400.0, "the row keeps its width");
+        assert_eq!(nodes[1].2.bounds.width, 40.0);
+        assert_eq!(
+            nodes[2].2.bounds.width, 300.0,
+            "grow takes the leftover 400 - 40 - 60, not its 1400 px of text"
+        );
+        assert_eq!(nodes[3].2.bounds.x, 340.0);
+        assert!(
+            nodes[3].2.bounds.x + nodes[3].2.bounds.width <= 400.0,
+            "the fixed sibling stays inside the row, so it keeps a clip wider than 0"
         );
     }
 

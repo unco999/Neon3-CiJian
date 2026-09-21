@@ -111,6 +111,13 @@ pub trait EditorDocumentProvider: Send + Sync {
     fn request_snapshot(&self, binding: &UiEditorDocumentBinding, initial_source: &str);
     fn take_snapshot(&self, document_id: &str) -> Option<EditorDocumentFrame>;
     fn submit_change(&self, binding: &UiEditorDocumentBinding, change_set: ChangeSet);
+    /// Asks again for a document the bridge already holds. `take_snapshot` can only
+    /// ever return what the provider has *already* received, and a write made outside
+    /// this process — an Agent applying a change through the editor runtime — touches
+    /// none of these objects, so a cached frame that matches the buffer is evidence
+    /// only up to the moment it was pulled. Default no-op: a provider with no cache
+    /// behind it has nothing to re-pull.
+    fn refresh_snapshot(&self, _binding: &UiEditorDocumentBinding) {}
 }
 
 /// The `code_editor` component: editing core + view state + semantics.
@@ -1480,13 +1487,25 @@ impl EditorBridge {
         };
         let mut registry = self.registry.lock().expect("editor bridge registry lock");
         for state in registry.editors.values_mut() {
-            let Some(binding) = state.declaration.document.as_ref() else {
+            let Some(binding) = state.declaration.document.clone() else {
                 continue;
             };
-            if let Some(frame) = provider.take_snapshot(&binding.document_id)
-                && (frame.binding != *binding || frame.source != state.adopted_source)
-            {
-                state.adopt_document_frame(&frame);
+            match provider.take_snapshot(&binding.document_id) {
+                Some(frame)
+                    if frame.binding != binding || frame.source != state.adopted_source =>
+                {
+                    // Text this editor typed and has not submitted yet is ahead of the
+                    // frame the authority holds, so adopting would delete the user's own
+                    // keystrokes. The commit goes out on blur/Esc/Ctrl+S and clears the
+                    // flag, and the next pass adopts what the authority agreed to.
+                    if !state.pending_edits {
+                        state.adopt_document_frame(&frame);
+                    }
+                }
+                // The cached frame is exactly what the buffer holds, which says nothing
+                // about now. Ask again — the provider answers at its own ceiling.
+                Some(_) => provider.refresh_snapshot(&binding),
+                None => provider.request_snapshot(&binding, &state.adopted_source),
             }
         }
         *self
@@ -1773,6 +1792,127 @@ mod tests {
         assert_eq!(presentation.source, "second.rs\n");
         assert_eq!(presentation.document.unwrap().document_id, "second.rs");
         assert!(!presentation.focus, "focus must not carry across documents");
+    }
+
+    /// A stand-in for the editor runtime: it publishes frames the test pushes into
+    /// it, and counts the two distinct ways the bridge can ask — first fetch of a
+    /// document it has never held, versus a re-poll of one it already served.
+    #[derive(Default)]
+    struct LiveAuthority {
+        frame: Mutex<Option<EditorDocumentFrame>>,
+        first_fetches: Mutex<usize>,
+        re_polls: Mutex<usize>,
+    }
+
+    impl LiveAuthority {
+        fn publish(&self, revision: u64, source: &str) {
+            let frame = EditorDocumentFrame {
+                binding: document_binding(revision),
+                source: source.to_string(),
+            };
+            *self.frame.lock().expect("authority frame lock") = Some(frame);
+        }
+    }
+
+    fn document_binding(revision: u64) -> UiEditorDocumentBinding {
+        UiEditorDocumentBinding {
+            document_id: "live.rs".into(),
+            session_id: "test".into(),
+            epoch: 1,
+            revision,
+            committed_revision: revision,
+            source_hash: format!("hash-{revision}"),
+            dirty: false,
+        }
+    }
+
+    impl EditorDocumentProvider for LiveAuthority {
+        fn request_snapshot(&self, _binding: &UiEditorDocumentBinding, _initial_source: &str) {
+            *self.first_fetches.lock().expect("counter lock") += 1;
+        }
+
+        fn take_snapshot(&self, _document_id: &str) -> Option<EditorDocumentFrame> {
+            self.frame.lock().expect("authority frame lock").clone()
+        }
+
+        fn submit_change(&self, _binding: &UiEditorDocumentBinding, _change_set: ChangeSet) {}
+
+        fn refresh_snapshot(&self, _binding: &UiEditorDocumentBinding) {
+            *self.re_polls.lock().expect("counter lock") += 1;
+        }
+    }
+
+    fn painted_source(bridge: &EditorBridge) -> String {
+        bridge
+            .presentations
+            .lock()
+            .expect("presentations lock")
+            .first()
+            .expect("one editor presentation")
+            .source
+            .clone()
+    }
+
+    /// What the editor runtime holds can move without anything in this process
+    /// touching the bridge — that is exactly an Agent's write. So a cached frame that
+    /// matches the buffer is only evidence up to the moment it was pulled, and the
+    /// bridge has to ask again; while text this editor typed has not round-tripped,
+    /// the answer must be held at the door.
+    #[test]
+    fn an_external_write_reaches_the_buffer_unless_local_edits_are_unsubmitted() {
+        register_providers();
+        let authority = Arc::new(LiveAuthority::default());
+        authority.publish(1, "one\n");
+        let mut declaration = ts_declaration();
+        declaration.document = Some(document_binding(1));
+        let bridge = EditorBridge::new().with_document_provider(authority.clone());
+        bridge
+            .registry
+            .lock()
+            .expect("registry lock")
+            .editors
+            .insert(
+                "surface.ide-shell/editor".into(),
+                EditorComponent::new(declaration, "one\n"),
+            );
+
+        // Settled: the cache says exactly what the buffer holds, which is the one case
+        // that must not be believed.
+        bridge.refresh_provider_snapshots();
+        assert_eq!(*authority.re_polls.lock().expect("counter lock"), 1);
+        assert_eq!(*authority.first_fetches.lock().expect("counter lock"), 0);
+        assert_eq!(painted_source(&bridge), "one\n");
+
+        authority.publish(2, "two\n");
+        bridge.refresh_provider_snapshots();
+        assert_eq!(painted_source(&bridge), "two\n");
+
+        authority.publish(3, "three\n");
+        bridge
+            .registry
+            .lock()
+            .expect("registry lock")
+            .editors
+            .get_mut("surface.ide-shell/editor")
+            .expect("editor")
+            .pending_edits = true;
+        bridge.refresh_provider_snapshots();
+        assert_eq!(
+            painted_source(&bridge),
+            "two\n",
+            "unsubmitted local edits were replaced by the pulled frame"
+        );
+
+        bridge
+            .registry
+            .lock()
+            .expect("registry lock")
+            .editors
+            .get_mut("surface.ide-shell/editor")
+            .expect("editor")
+            .pending_edits = false;
+        bridge.refresh_provider_snapshots();
+        assert_eq!(painted_source(&bridge), "three\n");
     }
 
     fn named_key(path: &str, name: &str, shift: bool) -> UiEditorInputEvent {
