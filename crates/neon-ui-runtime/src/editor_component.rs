@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex};
 
 use neon_editor::{
     ChangeSet, CompletionItem, EditEvent, EditEventKind, EditorCore, Language, LanguageKind,
-    Position,
+    Position, diff_edit_events,
 };
 use neon_ui_schema::{
     TextRef, UiCodeEditorDeclaration, UiCodeEditorPresentation, UiEditorCompletionItem,
@@ -50,10 +50,20 @@ fn core_language_for(declaration: &UiCodeEditorDeclaration) -> Language {
 /// (see `nui_flow_code_editor_demo`). Type-in plays once on insert, the
 /// delete fragment plays once on delete; both are removed when their
 /// duration elapses.
-const FX_TYPE_IN_PACKAGE: &str = "text-type-in";
-const FX_DELETE_PACKAGE: &str = "text-delete-fragment";
+const FX_TYPE_IN_PACKAGE: &str = neon_ui_schema::editor_fx::TYPE_IN_PACKAGE_ID;
+const FX_DELETE_PACKAGE: &str = neon_ui_schema::editor_fx::DELETE_PACKAGE_ID;
 const FX_TYPE_IN_DURATION_MS: u32 = 420;
 const FX_DELETE_DURATION_MS: u32 = 620;
+/// How many transient effects one component will carry. The renderer matches
+/// every fx against every glyph it draws, so this bounds a frame's cost; an
+/// Agent burst longer than this animates by its tail.
+const MAX_EDIT_FX_ENTRIES: usize = 16;
+/// The stamp an edit carries when it lands where no frame clock exists (an
+/// adopted document frame). It is not a time: the renderer replaces it with its
+/// own clock the first frame it sees the fx in, because lifetime is judged
+/// there. Publishing `0.0` is what makes that detectable — a real producer
+/// clock would be read as "started before this window existed".
+const FX_STAMPED_BY_DRAWER: f32 = 0.0;
 
 /// Monospaced advance factor used only for scroll-into-view / page navigation
 /// metric decisions. The renderer positions glyphs with real font metrics.
@@ -81,6 +91,9 @@ pub struct EditorEditFx {
     pub row: u32,
     pub col: u32,
     pub text: String,
+    /// Monotonic per-component ordinal, bumped for every effect produced. The
+    /// renderer ages effects by this, not by `started_seconds`.
+    pub sequence: u64,
     pub started_seconds: f32,
     pub duration_ms: u32,
 }
@@ -136,6 +149,8 @@ pub struct EditorComponent {
     pub last_edit_seconds: f32,
     pub pending_edits: bool,
     pub edit_fx: Vec<EditorEditFx>,
+    /// Last sequence handed to an effect; the renderer's watermark pairs with it.
+    pub fx_sequence: u64,
     pub font_scale: f32,
     pub revision: u64,
     pub clipboard: String,
@@ -159,6 +174,7 @@ impl EditorComponent {
             last_edit_seconds: 0.0,
             pending_edits: false,
             edit_fx: Vec::new(),
+            fx_sequence: 0,
             font_scale: 1.0,
             revision: 0,
             clipboard: String::new(),
@@ -168,6 +184,21 @@ impl EditorComponent {
     /// Adopts an authoritative document frame. Local undo/pending state is
     /// discarded because the host revision is now the source of truth.
     pub fn adopt_document_frame(&mut self, frame: &EditorDocumentFrame) {
+        // An external write has no keystroke to take fx from, so the two texts
+        // are the only evidence of what changed. Two conditions keep that honest:
+        // a frame for another document is a file *open*, and an opened file must
+        // not animate as though it had been typed; and a component that never
+        // held a frame has nothing to diff against, which is the same case.
+        let same_document = self
+            .declaration
+            .document
+            .as_ref()
+            .is_some_and(|binding| binding.document_id == frame.binding.document_id);
+        let events = if same_document && self.revision != 0 {
+            diff_edit_events(&self.adopted_source, &frame.source)
+        } else {
+            Vec::new()
+        };
         self.core
             .adopt_document(&frame.source, frame.binding.revision);
         self.declaration.document = Some(frame.binding.clone());
@@ -176,6 +207,7 @@ impl EditorComponent {
         self.completion = None;
         self.preedit.clear();
         self.revision = frame.binding.revision;
+        self.take_edit_fx(events, FX_STAMPED_BY_DRAWER);
     }
 
     /// Rebuilds the core when the declaration language or the external
@@ -220,12 +252,14 @@ impl EditorComponent {
                     FX_DELETE_DURATION_MS,
                 ),
             };
+            self.fx_sequence += 1;
             self.edit_fx.push(EditorEditFx {
                 kind,
                 package_id,
                 row: event.row,
                 col: event.column,
                 text: event.text,
+                sequence: self.fx_sequence,
                 started_seconds: now,
                 duration_ms,
             });
@@ -1067,17 +1101,24 @@ impl EditorComponent {
     // ------------------------------------------------------- presentation
 
     /// Projects the current editing state into the renderer presentation.
-    /// Expired transient fx are dropped here (the renderer also skips them
-    /// defensively). `now` drives fx lifetime.
-    pub fn to_presentation(&mut self, now: f32) -> UiCodeEditorPresentation {
+    /// Transient fx are *not* aged here: the drawer owns the only frame clock
+    /// that their lifetime can be measured against.
+    pub fn to_presentation(&mut self) -> UiCodeEditorPresentation {
         self.revision += 1;
         let presentation_revision = self
             .declaration
             .document
             .as_ref()
             .map_or(self.revision, |document| document.revision);
-        self.edit_fx
-            .retain(|fx| now - fx.started_seconds < fx.duration_ms as f32 / 1000.0);
+        // Lifetime is the drawer's call: it is the only side with a frame clock,
+        // and an fx stamped elsewhere would be pruned here by a difference
+        // between two unrelated clocks (see `age_seconds` in
+        // `UiWgpuRenderer::editor_render_readbacks`). This side bounds how many
+        // effects a component will hand over at all.
+        if self.edit_fx.len() > MAX_EDIT_FX_ENTRIES {
+            let overflow = self.edit_fx.len() - MAX_EDIT_FX_ENTRIES;
+            self.edit_fx.drain(0..overflow);
+        }
         let line_count = self.core.buffer().line_count();
         let mut token_rows: Vec<Vec<UiEditorTokenSpan>> = Vec::with_capacity(line_count as usize);
         for line in 0..line_count {
@@ -1144,6 +1185,7 @@ impl EditorComponent {
                     row: fx.row,
                     col: fx.col,
                     text: fx.text.clone(),
+                    sequence: fx.sequence,
                     started_seconds: fx.started_seconds,
                     duration_ms: fx.duration_ms,
                 })
@@ -1194,6 +1236,10 @@ impl EditorComponentRegistry {
                 }
             }
             if let Some(state) = self.editors.get_mut(path) {
+                // Text the component was drawing before this pass ran. The
+                // rebuild below overwrites the buffer, so this is the only
+                // moment an external write still has a "before".
+                let previous_source = state.adopted_source.clone();
                 // A retained renderer node can represent a different document
                 // after a Flow remount. Focus belongs to the old document and
                 // must not prevent replacing the component buffer.
@@ -1231,6 +1277,14 @@ impl EditorComponentRegistry {
                     state.scroll_y = 0.0;
                     state.preedit.clear();
                     state.revision += 1;
+                    // A new document is opened, not typed, so only a
+                    // same-document rebuild animates. Unlike an adopted frame,
+                    // this component has already drawn `previous_source`, so
+                    // there is no first-frame case to exclude.
+                    if !document_changed {
+                        let events = diff_edit_events(&previous_source, &source);
+                        state.take_edit_fx(events, FX_STAMPED_BY_DRAWER);
+                    }
                 }
             } else {
                 let mut state = EditorComponent::new(declaration.clone(), &source);
@@ -1311,10 +1365,10 @@ impl EditorComponentRegistry {
             .map(|(path, _)| path.as_str())
     }
 
-    pub fn to_presentations(&mut self, now: f32) -> Vec<UiCodeEditorPresentation> {
+    pub fn to_presentations(&mut self) -> Vec<UiCodeEditorPresentation> {
         self.editors
             .iter_mut()
-            .map(|(_, state)| state.to_presentation(now))
+            .map(|(_, state)| state.to_presentation())
             .collect()
     }
 }
@@ -1456,7 +1510,7 @@ impl EditorBridge {
         *self
             .presentations
             .lock()
-            .expect("editor bridge presentations lock") = registry.to_presentations(0.0);
+            .expect("editor bridge presentations lock") = registry.to_presentations();
     }
 
     /// Routes one renderer input event into the component registry, returns
@@ -1474,7 +1528,7 @@ impl EditorBridge {
         *self
             .presentations
             .lock()
-            .expect("editor bridge presentations lock") = registry.to_presentations(now);
+            .expect("editor bridge presentations lock") = registry.to_presentations();
         commits
     }
 
@@ -1511,7 +1565,7 @@ impl EditorBridge {
         *self
             .presentations
             .lock()
-            .expect("editor bridge presentations lock") = registry.to_presentations(0.0);
+            .expect("editor bridge presentations lock") = registry.to_presentations();
     }
 
     /// Host-directed editor reveal. The returned presentation is the
@@ -1527,7 +1581,6 @@ impl EditorBridge {
         viewport_width: f32,
         row_height: f32,
         gutter_width: f32,
-        now: f32,
     ) -> Option<UiCodeEditorPresentation> {
         let mut registry = self.registry.lock().expect("editor bridge registry lock");
         if !registry.reveal(
@@ -1543,7 +1596,7 @@ impl EditorBridge {
         ) {
             return None;
         }
-        let presentations = registry.to_presentations(now);
+        let presentations = registry.to_presentations();
         *self
             .presentations
             .lock()
@@ -1644,7 +1697,7 @@ mod tests {
     fn typescript_initial_presentation_has_keyword() {
         register_providers();
         let mut comp = EditorComponent::new(ts_declaration(), "interface Track\n");
-        let pres0 = comp.to_presentation(0.0);
+        let pres0 = comp.to_presentation();
         assert_eq!(pres0.token_rows.len(), 2);
         assert!(
             pres0.token_rows[0]
@@ -1666,7 +1719,7 @@ mod tests {
         for ch in "const test = 1;\nconst test = 2;\nclass e{".chars() {
             comp.handle_input(&type_key("source-view", ch), 0.5);
         }
-        let pres = comp.to_presentation(1.0);
+        let pres = comp.to_presentation();
         eprintln!("[ui] source={:?}", pres.source);
         eprintln!("[ui] source lines={}", pres.source.split('\n').count());
         eprintln!(
@@ -1730,7 +1783,7 @@ mod tests {
                 .collect::<String>(),
         );
         comp.reveal(220, 4, Some(222), Some(10), 200.0, 868.0, 20.0, 56.0);
-        let presentation = comp.to_presentation(1.0);
+        let presentation = comp.to_presentation();
         assert_eq!(presentation.caret_line, 220);
         assert_eq!(presentation.caret_column, 4);
         assert_eq!(presentation.selection_anchor_line, Some(222));
@@ -1786,7 +1839,7 @@ mod tests {
         )]));
 
         let presentation = registry
-            .to_presentations(0.0)
+            .to_presentations()
             .pop()
             .expect("editor presentation");
         assert_eq!(presentation.source, "second.rs\n");

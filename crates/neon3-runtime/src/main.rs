@@ -443,7 +443,9 @@ fn main() {
                     + Send,
             > = {
                 let bridge = editor_bridge.clone();
-                Box::new(move |params, now| {
+                // The sink hands over the renderer's clock; a reveal needs none
+                // of it now that fx lifetime is judged where frames are drawn.
+                Box::new(move |params, _now| {
                     let path = params.get("path")?.as_str()?.to_string();
                     // A reveal is the host asking "show me this document now", so it
                     // is the one moment the presentation may not lag the authority.
@@ -482,7 +484,6 @@ fn main() {
                             .get("gutter_width")
                             .and_then(|v| v.as_f64())
                             .unwrap_or(56.0) as f32,
-                        now,
                     )
                 })
             };

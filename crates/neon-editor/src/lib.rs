@@ -60,6 +60,53 @@ pub enum EditEventKind {
     Delete,
 }
 
+/// How many line-sized events an external replacement may report. The renderer
+/// matches fx inside its per-glyph loop, so this is a draw-cost bound rather
+/// than a nicety — and past the bound the diff says nothing at all.
+pub const MAX_DIFF_EDIT_EVENTS: usize = 16;
+
+/// Edit events describing an external replacement of `before` by `after`.
+///
+/// A keystroke knows what it inserted; an adopted document frame only knows the
+/// two texts. This trims the common leading and trailing lines and reports what
+/// is left: one `Delete` per departed line (row in the old text), one `Insert`
+/// per arrived line (row in the new one). It is deliberately coarse — it says
+/// "this region changed", it does not replay an edit — and deliberately silent
+/// when the change is large, because half a file arriving as a row of type-ins
+/// reads as a glitch rather than as a write.
+pub fn diff_edit_events(before: &str, after: &str) -> Vec<EditEvent> {
+    if before == after {
+        return Vec::new();
+    }
+    let old: Vec<&str> = before.split('\n').collect();
+    let new: Vec<&str> = after.split('\n').collect();
+    let prefix = old.iter().zip(new.iter()).take_while(|(a, b)| a == b).count();
+    let suffix = (0..(old.len() - prefix).min(new.len() - prefix))
+        .take_while(|k| old[old.len() - 1 - k] == new[new.len() - 1 - k])
+        .count();
+    let removed = old.len() - prefix - suffix;
+    let arrived = new.len() - prefix - suffix;
+    if removed + arrived > MAX_DIFF_EDIT_EVENTS {
+        return Vec::new();
+    }
+    let mut events = Vec::with_capacity(removed + arrived);
+    events.extend((prefix..prefix + removed).map(|row| EditEvent {
+        kind: EditEventKind::Delete,
+        row: row as u32,
+        column: 0,
+        text: old[row].to_string(),
+    }));
+    events.extend((prefix..prefix + arrived).map(|row| EditEvent {
+        kind: EditEventKind::Insert,
+        row: row as u32,
+        column: 0,
+        text: new[row].to_string(),
+    }));
+    // A blank row has no glyphs for a fx to ride on.
+    events.retain(|event| !event.text.is_empty());
+    events
+}
+
 pub struct EditorCore {
     buffer: TextBuffer,
     grammar: FlowGrammar,

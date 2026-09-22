@@ -2205,6 +2205,11 @@ pub struct UiWgpuRenderer {
     text_pipeline: wgpu::RenderPipeline,
     text_layout: wgpu::PipelineLayout,
     text_material_pipelines: BTreeMap<String, wgpu::RenderPipeline>,
+    /// Which source bytes each pipeline above was compiled from. A package id can
+    /// be spelled by more than one producer, and the registry keeps the newest
+    /// digest either way; without this, "what is registered" and "what is
+    /// compiled" are two claims that nothing can compare.
+    text_material_pipeline_digests: BTreeMap<String, String>,
     text_material_buffer: wgpu::Buffer,
     text_material_capacity: usize,
     node_text_materials: BTreeMap<String, neon_ui_schema::UiTextMaterialRef>,
@@ -2213,6 +2218,14 @@ pub struct UiWgpuRenderer {
     /// One-shot text materials that already played to completion; they stay
     /// suppressed while the fragment keeps declaring them.
     text_material_consumed: std::collections::HashSet<String>,
+    /// How many glyph batches the draw pass has skipped per package id that had
+    /// no compiled pipeline. A skip draws less rather than failing, so without a
+    /// counter here "an fx is alive" and "an fx is visible" are the same reading.
+    text_material_batches_skipped: std::collections::HashMap<String, u64>,
+    /// Why a registered text-material package got no pipeline, by package id.
+    /// The draw pass cannot report this — it silently skips what it cannot draw —
+    /// so a refusal has to be named at the one moment it is knowable.
+    text_material_refusals: BTreeMap<String, String>,
     text_buffer: wgpu::Buffer,
     text_capacity: usize,
     popup_text_buffer: wgpu::Buffer,
@@ -2465,15 +2478,37 @@ impl UiWgpuRenderer {
             if package.entry_point != "text_material" {
                 continue;
             }
-            if self
-                .text_material_pipelines
-                .contains_key(&package.package_id)
+            if self.text_material_pipeline_digests.get(&package.package_id)
+                == Some(&package.source_digest)
             {
+                // Same id, same bytes: the pipeline in hand already is this source.
                 continue;
             }
+            // Same id, different bytes — a second producer restyling a material the
+            // renderer already compiled. The registry records this package's digest
+            // whichever way the race goes, so if the pipeline stayed with the older
+            // source the two readings would disagree and neither would be wrong.
+            // Newest wins, and both digests are named for the moment it happens.
+            if let Some(superseded) =
+                self.text_material_pipeline_digests.get(&package.package_id)
+            {
+                eprintln!(
+                    "neon3-ui: text material {} recompiled from digest {} (was {})",
+                    package.package_id, package.source_digest, superseded
+                );
+            }
             let Ok(source) = std::str::from_utf8(&package.source_bytes) else {
+                self.text_material_refusals.insert(
+                    package.package_id.clone(),
+                    format!(
+                        "source is not UTF-8: {} bytes, digest {}",
+                        package.source_bytes.len(),
+                        package.source_digest
+                    ),
+                );
                 continue;
             };
+            let source = source.to_owned();
             // Optional displacement hook: a package that defines
             // `text_material_displace` (see the demo styles) warps the glyph
             // sample coordinates in UV space; without it the raw interpolated
@@ -2588,14 +2623,16 @@ impl UiWgpuRenderer {
             });
             self.text_material_pipelines
                 .insert(package.package_id.clone(), pipeline);
+            self.text_material_pipeline_digests
+                .insert(package.package_id.clone(), package.source_digest.clone());
         }
     }
     pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
-        Self::new_internal(device, format, None, "screen")
+        Self::new_built(device, format, None, "screen")
     }
 
     pub(crate) fn new_unified(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
-        Self::new_internal(device, format, None, "unified")
+        Self::new_built(device, format, None, "unified")
     }
 
     /// Renderer that also emits a per-pixel occlusion depth target (R32Float).
@@ -2606,7 +2643,23 @@ impl UiWgpuRenderer {
         format: wgpu::TextureFormat,
         depth_format: wgpu::TextureFormat,
     ) -> Self {
-        Self::new_internal(device, format, Some(depth_format), "world")
+        Self::new_built(device, format, Some(depth_format), "world")
+    }
+
+    /// Every renderer can paint the kernel's own edit change effects from its
+    /// first frame. An effect whose package has no pipeline draws less instead
+    /// of failing, so shipping the source with the renderer is the only
+    /// guarantee that a live edit is a visible one.
+    fn new_built(
+        device: &wgpu::Device,
+        format: wgpu::TextureFormat,
+        depth_format: Option<wgpu::TextureFormat>,
+        label: &'static str,
+    ) -> Self {
+        let mut renderer = Self::new_internal(device, format, depth_format, label);
+        let packages = crate::shader_registry::builtin_editor_fx_packages();
+        renderer.sync_text_material_packages(device, &packages);
+        renderer
     }
 
     fn new_internal(
@@ -3465,11 +3518,14 @@ impl UiWgpuRenderer {
             text_pipeline,
             text_layout,
             text_material_pipelines: BTreeMap::new(),
+            text_material_pipeline_digests: BTreeMap::new(),
             text_material_buffer: create_text_buffer(device, 512),
             text_material_capacity: 512,
             node_text_materials: BTreeMap::new(),
             text_material_started: BTreeMap::new(),
             text_material_consumed: std::collections::HashSet::new(),
+            text_material_batches_skipped: std::collections::HashMap::new(),
+            text_material_refusals: BTreeMap::new(),
             text_buffer: create_text_buffer(device, 512),
             text_capacity: 512,
             popup_text_buffer: create_text_buffer(device, 512),
@@ -3656,6 +3712,16 @@ impl UiWgpuRenderer {
     /// so a pointer readback and its lookup come from the same frame.
     pub(crate) fn hit_bindings_snapshot(&self) -> std::collections::HashMap<u32, UiHitBinding> {
         self.hit_bindings.clone()
+    }
+
+    /// The clock the last drawn frame was sampled at.
+    ///
+    /// A pixel capture reports this so a reader can say *which moment* the bytes
+    /// belong to: an animation package is a window on this clock, so without it a
+    /// capture is only "pixels of some frame", and a frame that missed the window
+    /// is indistinguishable from one that never had a package to draw.
+    pub(crate) fn animation_clock(&self) -> f32 {
+        self.animation_clock_seconds
     }
 
     /// Makes CPU-side pointer handling independent of a prior redraw or GPU hit readback.
@@ -10266,6 +10332,14 @@ impl UiWgpuRenderer {
             if let Some(packages) = text_material_ranges.get(&key) {
                 for (package_id, start, count) in packages {
                     let Some(pipeline) = self.text_material_pipelines.get(package_id) else {
+                        // Named, not swallowed: a batch with no pipeline draws
+                        // less rather than failing, so the only trace of "an
+                        // animation was asked for and nothing was painted" is
+                        // this counter.
+                        *self
+                            .text_material_batches_skipped
+                            .entry(package_id.clone())
+                            .or_insert(0) += 1;
                         continue;
                     };
                     pass.set_pipeline(pipeline);

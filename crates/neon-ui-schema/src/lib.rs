@@ -4350,6 +4350,14 @@ pub struct UiEditorCompletionItem {
     pub detail: String,
 }
 
+/// The two one-shot text-material packages an edit effect names. The producer
+/// picks the id, the renderer owns the source, and both read it from here: an id
+/// spelled twice is how an effect ends up animating a package nobody compiled.
+pub mod editor_fx {
+    pub const TYPE_IN_PACKAGE_ID: &str = "text-type-in";
+    pub const DELETE_PACKAGE_ID: &str = "text-delete-fragment";
+}
+
 /// One transient character-level edit effect. `text` carries the inserted or
 /// deleted fragment so the renderer can resolve glyphs without touching the
 /// editor buffer (insert fx follow the current layout; delete fx render a
@@ -4364,6 +4372,11 @@ pub struct UiEditorEditFx {
     pub row: u32,
     pub col: u32,
     pub text: String,
+    /// Producer-monotonic ordinal. The renderer stamps `started_seconds` with
+    /// its own frame clock the first time it sees a sequence, so replay of an
+    /// already-adopted fx (which the ui-runtime keeps shipping until its cap
+    /// drops it) can never restart an animation.
+    pub sequence: u64,
     pub started_seconds: f32,
     pub duration_ms: u32,
 }

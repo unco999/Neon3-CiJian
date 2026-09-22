@@ -11,7 +11,7 @@
 //! (line, column) here with the resident font; the editing semantics that
 //! consume them run in the ui-runtime.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use neon_ui_schema::{
     UiCodeEditorDeclaration, UiCodeEditorPresentation, UiEditorCompletionItem, UiEditorEditFx,
@@ -33,6 +33,9 @@ const COMPLETION_PAD: f32 = 8.0;
 const CARET_BLINK_SECONDS: f32 = 0.6;
 /// Keep the caret solid right after an edit.
 const CARET_SOLID_AFTER_EDIT_SECONDS: f32 = 0.5;
+/// How many edit effects one mirror will hold. The producer caps what it hands
+/// over (`MAX_EDIT_FX_ENTRIES`); this caps what this side keeps drawing.
+const MAX_ADOPTED_EDIT_FX: usize = 16;
 
 /// One queued editor commit for the UI host. Carries the stable node path,
 /// the declared `event` action and the full current document text.
@@ -91,6 +94,13 @@ pub(super) struct EditorRuntimeState {
     pub preedit: String,
     pub completion: Option<EditorCompletionState>,
     pub edit_fx: Vec<UiEditorEditFx>,
+    /// This renderer's frame clock for every fx sequence it has adopted. The
+    /// animation's identity is its `sequence` and the clock it runs on is the
+    /// render thread's, so a rebuild that re-reads the producer's list must not
+    /// lose either: without the map a still-running effect comes back on the
+    /// producer's sentinel clock, which this side reads as already expired, and
+    /// the draw pass prunes it mid-flight.
+    pub fx_stamps: BTreeMap<u64, f32>,
     pub font_scale: f32,
     pub last_edit_seconds: f32,
     /// Set when a new presentation arrives so the plan-reuse early return
@@ -107,7 +117,7 @@ pub(super) struct EditorRuntimeState {
 
 impl EditorRuntimeState {
     fn from_presentation(
-        declaration: UiCodeEditorDeclaration,
+        mut declaration: UiCodeEditorDeclaration,
         presentation: UiCodeEditorPresentation,
     ) -> Self {
         let lines: Vec<String> = presentation
@@ -138,6 +148,14 @@ impl EditorRuntimeState {
             items: c.items,
             selected: c.selected as usize,
         });
+        // The authored declaration names no document: the binding is bootstrapped
+        // by the ui-runtime when it adopts a provider frame, and only the
+        // presentation carries it. Completing it here is what stops every frame
+        // from reading as a document switch — a switch rebuilds the mirror, so a
+        // phantom one rebuilds it forever.
+        if declaration.document.is_none() {
+            declaration.document.clone_from(&presentation.document);
+        }
         Self {
             declaration,
             lines,
@@ -150,6 +168,7 @@ impl EditorRuntimeState {
             preedit: presentation.preedit,
             completion,
             edit_fx: presentation.edit_fx,
+            fx_stamps: BTreeMap::new(),
             font_scale: presentation.font_scale,
             last_edit_seconds: presentation.last_edit_seconds,
             layout_dirty: true,
@@ -161,6 +180,40 @@ impl EditorRuntimeState {
                 height: 0.0,
             },
         }
+    }
+
+    /// Gives every effect this mirror has not seen before this renderer's own
+    /// frame clock, and hands the same clock back to the ones it has. The
+    /// producer's `started_seconds` belongs to another process's clock, so it can
+    /// only order effects -- which is what `sequence` is for -- and a replay of an
+    /// already-adopted effect must never restart or cancel it.
+    fn stamp_edit_fx(&mut self, now: f32) {
+        for fx in &mut self.edit_fx {
+            fx.started_seconds = *self.fx_stamps.entry(fx.sequence).or_insert(now);
+        }
+        // Stamps only have to outlive the producer's replay window, which is the
+        // same cap the effect list carries.
+        if self.fx_stamps.len() > MAX_ADOPTED_EDIT_FX {
+            let newest = self
+                .fx_stamps
+                .keys()
+                .rev()
+                .nth(MAX_ADOPTED_EDIT_FX)
+                .copied()
+                .unwrap_or_default();
+            self.fx_stamps = self.fx_stamps.split_off(&newest);
+        }
+        if self.edit_fx.len() > MAX_ADOPTED_EDIT_FX {
+            let overflow = self.edit_fx.len() - MAX_ADOPTED_EDIT_FX;
+            self.edit_fx.drain(0..overflow);
+        }
+    }
+
+    /// Highest fx sequence this mirror has a clock for. Reported instead of the
+    /// map itself: a bump is the fact a probe asserts, and it survives the
+    /// sequence never appearing in `edit_fx` again.
+    fn fx_watermark(&self) -> u64 {
+        self.fx_stamps.keys().next_back().copied().unwrap_or(0)
     }
 }
 
@@ -1048,7 +1101,13 @@ impl super::UiWgpuRenderer {
                     || document_changed
                     || source_changed
                 {
+                    let stamps = std::mem::take(&mut state.fx_stamps);
                     *state = EditorRuntimeState::from_presentation(declaration, presentation);
+                    // A rebuild re-reads the producer's whole fx list, and that
+                    // list carries the producer's clock, not this one. The stamps
+                    // are the mirror's own knowledge and survive: without them a
+                    // rebuild restarts every animation mid-flight, or expires it.
+                    state.fx_stamps = stamps;
                 }
             } else {
                 self.editors.insert(
@@ -1056,6 +1115,13 @@ impl super::UiWgpuRenderer {
                     EditorRuntimeState::from_presentation(declaration, presentation),
                 );
             }
+        }
+        // New effects start their animation here, against the clock this
+        // renderer measures with. Every other frame sees the same list already
+        // stamped, and the watermark makes that a no-op.
+        let clock = self.animation_clock_seconds;
+        for state in self.editors.values_mut() {
+            state.stamp_edit_fx(clock);
         }
     }
 
@@ -1426,6 +1492,120 @@ impl super::UiWgpuRenderer {
     pub(crate) fn take_editor_commits(&mut self) -> Vec<EditorCommit> {
         std::mem::take(&mut self.editor_pending_commits)
     }
+
+    /// What the renderer *actually* holds for every editor mirror, plus how it
+    /// compares with the slot the ui-runtime publishes into.
+    ///
+    /// An fx is stamped with this renderer's clock the frame `reconcile_editors`
+    /// first adopts its `sequence`, so `age_seconds` (renderer time minus that
+    /// stamp) is the animation's real remaining life here: `alive: true` means a
+    /// glyph on this side is inside its package, and a non-zero age with no
+    /// sequence bump means the animation is over. `source_fnv1a` lets a probe
+    /// compare the painted document with the producer's without shipping text.
+    pub fn editor_render_readbacks(&self) -> Vec<serde_json::Value> {
+        let now = self.animation_clock_seconds;
+        let external = self
+            .editor_external_presentations
+            .as_ref()
+            .and_then(|slot| slot.lock().ok().map(|presentations| presentations.clone()))
+            .unwrap_or_default();
+        let mut node_keys: Vec<&String> = self.editors.keys().collect();
+        node_keys.sort();
+        node_keys
+            .into_iter()
+            .filter_map(|node_key| self.editors.get(node_key))
+            .map(|state| {
+                let fx = state
+                    .edit_fx
+                    .iter()
+                    .map(|edit_fx| {
+                        let age_seconds = now - edit_fx.started_seconds;
+                        serde_json::json!({
+                            "kind": edit_fx.kind,
+                            "package_id": edit_fx.package_id,
+                            // The draw pass looks the package up in
+                            // `text_material_pipelines` and skips the batch when
+                            // it is absent, so an alive fx with no pipeline here
+                            // is exactly "animating, painting nothing".
+                            "package_resident": self
+                                .text_material_pipelines
+                                .contains_key(&edit_fx.package_id),
+                            "row": edit_fx.row,
+                            "col": edit_fx.col,
+                            "text": edit_fx.text,
+                            "sequence": edit_fx.sequence,
+                            "started_seconds": edit_fx.started_seconds,
+                            "duration_ms": edit_fx.duration_ms,
+                            "age_seconds": age_seconds,
+                            "alive": age_seconds >= 0.0
+                                && age_seconds < edit_fx.duration_ms as f32 / 1000.0,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let matching = external
+                    .iter()
+                    .find(|p| p.node_key == state.declaration.node_key);
+                serde_json::json!({
+                    "node_key": state.declaration.node_key,
+                    "document_id": state
+                        .declaration
+                        .document
+                        .as_ref()
+                        .map(|binding| binding.document_id.clone()),
+                    "presentation_revision": state.presentation_revision,
+                    "renderer_time_seconds": now,
+                    "source_lines": state.lines.len(),
+                    "source_fnv1a": fnv1a_of(&state.lines.join("\n")),
+                    "caret_line": state.caret.line,
+                    "caret_column": state.caret.column,
+                    "focus": state.focus,
+                    "scroll_x": state.scroll_x,
+                    "scroll_y": state.scroll_y,
+                    "content_rect": [
+                        state.content_rect.x,
+                        state.content_rect.y,
+                        state.content_rect.width,
+                        state.content_rect.height,
+                    ],
+                    "layout_dirty": state.layout_dirty,
+                    "fx_watermark": state.fx_watermark(),
+                    "fx_stamps": state.fx_stamps.iter().map(|(sequence, started)| serde_json::json!({"sequence": sequence, "started_seconds": started})).collect::<Vec<_>>(),
+                    // id -> the digest the pipeline was compiled from, so this can
+                    // be compared with what the shader registry says is registered.
+                    "text_material_packages": self.text_material_pipeline_digests,
+                    // The two ways a pipeline can be missing: never registered
+                    // (no refusal, and the id is simply absent from the map
+                    // above) or refused at registration, with the reason here.
+                    "text_material_refusals": self.text_material_refusals,
+                    "text_material_batches_skipped": self.text_material_batches_skipped,
+                    "edit_fx": fx,
+                    "external": {
+                        "presentations": external.len(),
+                        "publishes_this_node": matching.is_some(),
+                        "revision": matching.map(|p| p.revision),
+                        "edit_fx": matching.map_or(0, |p| p.edit_fx.len()),
+                        "fx_sequence": matching.and_then(|p| {
+                            p.edit_fx.iter().map(|fx| fx.sequence).max()
+                        }),
+                        "source_fnv1a": matching.map(|p| fnv1a_of(&p.source)),
+                    },
+                })
+            })
+            .collect()
+    }
+}
+
+/// FNV-1a/64 over the UTF-8 bytes, as a 16-digit hex string — the same
+/// construction the editor runtime reports as a document's `source_hash`, so a
+/// probe can compare the painted document with the authority's without shipping
+/// the text.
+fn fnv1a_of(text: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in text.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
 }
 
 /// Stable name for a winit `NamedKey` (matches the ui-runtime's named-key

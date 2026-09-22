@@ -1661,6 +1661,11 @@ enum WindowCommand {
     ImageDebugSnapshot {
         completed: std::sync::mpsc::Sender<Value>,
     },
+    /// Reads back the render thread's editor mirrors: what the renderer holds
+    /// and will draw, as opposed to what the ui-runtime published.
+    EditorMirrorSnapshot {
+        completed: std::sync::mpsc::Sender<Vec<Value>>,
+    },
     UploadExternalImage {
         source: UiImageSource,
         completed: std::sync::mpsc::Sender<Result<Value, String>>,
@@ -3195,6 +3200,10 @@ impl WindowedRuntime {
             "scale_factor": gpu.scale_factor,
             "frame_sequence": gpu.frame_count,
             "composition_revision": gpu.final_composition_revision.0,
+            // The clock this frame was sampled at, so the bytes carry their own
+            // timestamp: `redraw` above drew at `gpu.started_at`, and an fx's
+            // lifetime is measured on exactly that clock.
+            "renderer_time_seconds": gpu.ui.animation_clock(),
             "checksum": {"algorithm": "fnv1a64", "value": format!("{checksum:016x}")},
             "rgba_bytes": rgba.len(),
             "artifact_path": artifact_path.to_string_lossy(),
@@ -9548,6 +9557,12 @@ impl ApplicationHandler<WindowCommand> for WindowedRuntime {
                 );
                 let _ = completed.send(value);
             }
+            WindowCommand::EditorMirrorSnapshot { completed } => {
+                let value = self.gpu.as_ref().map_or_else(Vec::new, |gpu| {
+                    gpu.ui.editor_render_readbacks()
+                });
+                let _ = completed.send(value);
+            }
             WindowCommand::UploadExternalImage { source, completed } => {
                 let result = self
                     .gpu
@@ -10032,6 +10047,39 @@ fn handle_window_debug_snapshot(
             request_id,
             "window_compositor_timeout",
             "window compositor did not report its debug snapshot",
+            None,
+        ),
+    }
+}
+
+fn handle_window_editor_presentation_snapshot(
+    runtime: &mut WgpuRuntime,
+    proxy: &EventLoopProxy<WindowCommand>,
+    request_id: RequestId,
+) -> RpcResponse {
+    // The published slot lives on this thread; the mirrors only exist on the
+    // render thread, so reading them is a window command. A window that cannot
+    // answer is named rather than reported as an editor with no presentations.
+    let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+    if proxy
+        .send_event(WindowCommand::EditorMirrorSnapshot {
+            completed: completed_tx,
+        })
+        .is_err()
+    {
+        return runtime.reject(
+            request_id,
+            "window_compositor_unavailable",
+            "window compositor is unavailable",
+            None,
+        );
+    }
+    match completed_rx.recv_timeout(std::time::Duration::from_secs(5)) {
+        Ok(mirrors) => runtime.editor_presentation_snapshot(request_id, mirrors),
+        Err(_) => runtime.reject(
+            request_id,
+            "window_compositor_timeout",
+            "window compositor did not report its editor mirrors",
             None,
         ),
     }
@@ -11057,6 +11105,12 @@ fn spawn_window_server(
                     handle_window_animation_control(&mut runtime, &proxy, request)
                 } else if request.method == "debug.snapshot.get" {
                     handle_window_debug_snapshot(&mut runtime, &proxy, request.request_id)
+                } else if request.method == "wgpu.ui.editor.presentation.snapshot" {
+                    handle_window_editor_presentation_snapshot(
+                        &mut runtime,
+                        &proxy,
+                        request.request_id,
+                    )
                 } else if request.method == "editor.visual.reveal" {
                     handle_editor_visual_reveal(&mut runtime, request)
                 } else if request.method == "debug.window.input.snapshot" {
@@ -12593,7 +12647,9 @@ impl WgpuRuntime {
                 )),
             ),
             "wgpu.ui.fragment.snapshot" => self.fragment_snapshot(request_id, request.params),
-            "wgpu.ui.editor.presentation.snapshot" => self.editor_presentation_snapshot(request_id),
+            "wgpu.ui.editor.presentation.snapshot" => {
+                self.editor_presentation_snapshot(request_id, Vec::new())
+            }
             "wgpu.render.target.capture" => self.target_capture(request_id, request.params),
             "wgpu.render.target.assert" => self.target_assert(request_id, request.params),
             "wgpu.ui.animation.cancel"
@@ -13274,7 +13330,11 @@ impl WgpuRuntime {
         )
     }
 
-    fn editor_presentation_snapshot(&mut self, request_id: RequestId) -> RpcResponse {
+    fn editor_presentation_snapshot(
+        &mut self,
+        request_id: RequestId,
+        mirrors: Vec<Value>,
+    ) -> RpcResponse {
         if let Some(refresh) = self.editor_presentation_refresh.as_mut() {
             refresh();
         }
@@ -13288,7 +13348,12 @@ impl WgpuRuntime {
             json!({
                 "epoch": self.epoch,
                 "sequence": self.graph_revision,
+                // What the ui-runtime published.
                 "presentations": presentations,
+                // What the renderer of the last completed frame holds. The two
+                // can differ, and only the second is ever drawn, so a probe has
+                // to see both to tell a missing producer from a lost adoption.
+                "mirrors": mirrors,
             }),
         )
     }
